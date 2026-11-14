@@ -182,9 +182,10 @@ impl Region {
 /// never blind-retry a settled absence or stale accessibility reference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorDisposition {
-    /// `"settled_absence" | "retryable_failure" | "stale_ref" | "terminal_failure"`
+    /// `"settled_absence" | "retryable_failure" | "delivery_uncertain" | "stale_ref" |
+    /// "terminal_failure"`
     pub kind: String,
-    /// `"safe" | "never"`
+    /// `"safe" | "verify_first" | "never"`
     pub retry: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
@@ -220,6 +221,18 @@ impl ErrorDisposition {
         }
     }
 
+    /// A mutating action failed in a way that does not say whether it reached
+    /// its target (a timeout after dispatch). Repeating it blindly could
+    /// deliver it twice; verify the current state first.
+    pub fn delivery_uncertain(hint: impl Into<String>) -> Self {
+        Self {
+            kind: "delivery_uncertain".to_string(),
+            retry: "verify_first".to_string(),
+            code: Some("DELIVERY_UNCERTAIN".to_string()),
+            hint: Some(hint.into()),
+        }
+    }
+
     pub fn terminal(hint: impl Into<String>) -> Self {
         Self {
             kind: "terminal_failure".to_string(),
@@ -245,8 +258,81 @@ pub fn format_computer_error(message: impl Into<String>, disposition: ErrorDispo
     format!("error: {msg} | {payload}")
 }
 
+/// The disposition of a transient failure, or `None` when `lower` (an error
+/// message in lower case) is not one. A read that timed out or was refused can
+/// be retried. A mutating action can be retried only when it was refused before
+/// dispatch (429 or 503 at admission, a browser that never started); a timeout
+/// may come after the action was delivered, so it is `delivery_uncertain`.
+pub(crate) fn transient_disposition(
+    lower: &str,
+    mutating: bool,
+    retry_hint: &str,
+    verify_hint: &str,
+) -> Option<ErrorDisposition> {
+    let timed_out = lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("temporarily unavailable");
+    if !mutating {
+        return (timed_out || lower.contains("429") || lower.contains("503"))
+            .then(|| ErrorDisposition::retryable(retry_hint));
+    }
+    if lower.contains("startup timed out") {
+        Some(ErrorDisposition::retryable(retry_hint))
+    } else if timed_out {
+        Some(ErrorDisposition::delivery_uncertain(verify_hint))
+    } else if mentions_status(lower, "429") || mentions_status(lower, "503") {
+        Some(ErrorDisposition::retryable(retry_hint))
+    } else {
+        None
+    }
+}
+
+/// Whether `code` appears in `text` as a number of its own, not as digits of
+/// a longer one.
+fn mentions_status(text: &str, code: &str) -> bool {
+    text.match_indices(code).any(|(at, _)| {
+        !text[..at].ends_with(|c: char| c.is_ascii_digit())
+            && !text[at + code.len()..].starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
+/// Whether a `tools.computer` request can change the desktop. Only the reads
+/// named here are not; a request this cannot parse counts as mutating.
+fn computer_request_mutates(req: &Value) -> bool {
+    let payload = req
+        .get("action_json")
+        .or_else(|| req.get("payload"))
+        .unwrap_or(req);
+    let raw_action = payload
+        .get("action")
+        .or_else(|| payload.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("screenshot")
+        .trim()
+        .to_ascii_lowercase();
+    match raw_action.as_str() {
+        "snapshot" | "list_windows" | "windows" | "clipboard_get" => false,
+        "focus_window" | "clipboard_set" | "open_url" | "device" => true,
+        _ => parse_computer_action(payload).map_or(true, |action| action.is_mutating()),
+    }
+}
+
+/// Whether a `tools.device` request can change the device: everything but a
+/// screenshot or a snapshot.
+fn device_request_mutates(req: &Value) -> bool {
+    let action = req
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("screenshot")
+        .trim()
+        .to_ascii_lowercase();
+    !matches!(action.as_str(), "screenshot" | "snapshot")
+}
+
 /// Classify a raw computer error string into a structured `ErrorDisposition`.
-pub fn classify_computer_error(err: &str) -> ErrorDisposition {
+/// `mutating`: whether the action can change the screen or device (a click, a
+/// keystroke, a scroll, a drag); see [`transient_disposition`].
+pub fn classify_computer_error(err: &str, mutating: bool) -> ErrorDisposition {
     let lower = err.to_ascii_lowercase();
     if lower.contains("stale_ref")
         || lower.contains("stale ref")
@@ -264,13 +350,14 @@ pub fn classify_computer_error(err: &str) -> ErrorDisposition {
         ErrorDisposition::settled_absence(
             "Target window or element is absent; inspect state via tools.computer.list_windows() or tools.computer.snapshot() instead of blind retrying.",
         )
-    } else if lower.contains("timed out")
-        || lower.contains("timeout")
-        || lower.contains("temporarily unavailable")
-        || lower.contains("429")
-        || lower.contains("503")
-    {
-        ErrorDisposition::retryable("Transient timeout or busy display server; safe to retry once.")
+    } else if let Some(disposition) = transient_disposition(
+        &lower,
+        mutating,
+        "Transient timeout or busy display server; safe to retry once.",
+        "The action may already have been delivered; call tools.computer.snapshot() or \
+         tools.computer.screenshot() and verify the result before repeating it.",
+    ) {
+        disposition
     } else {
         ErrorDisposition::terminal("Unrecoverable computer-use input or environment error.")
     }
@@ -704,7 +791,6 @@ const fn default_scroll_amount() -> u32 {
 
 impl ComputerAction {
     /// Returns true if the action mutates display or input state.
-    #[allow(dead_code)]
     pub fn is_mutating(&self) -> bool {
         !matches!(
             self,
@@ -1624,11 +1710,12 @@ pub async fn execute_computer_request(
     config_dir: &Path,
     req: Value,
 ) -> Result<Value, String> {
+    let mutating = computer_request_mutates(&req);
     match execute_computer_request_inner(data_dir, config_dir, req).await {
         Ok(val) => Ok(val),
         Err(err) if err.contains("\"disposition\"") => Err(err),
         Err(err) => {
-            let disp = classify_computer_error(&err);
+            let disp = classify_computer_error(&err, mutating);
             Err(format_computer_error(err, disp))
         }
     }
@@ -2350,13 +2437,15 @@ async fn run_adb(serial: Option<&str>, args: &[&str], timeout_ms: u64) -> Result
 
 /// Execute a `tools.device` (Android/iOS mobile device control) request.
 pub async fn execute_device_request(work_dir: &Path, req: Value) -> Result<Value, String> {
+    let mutating = device_request_mutates(&req);
     mobile::execute(work_dir, req).await.map_err(|err| {
         if err.contains("\"disposition\"") { err } else {
-            let mut disposition = classify_computer_error(&err);
+            let mut disposition = classify_computer_error(&err, mutating);
             disposition.hint = Some(match disposition.kind.as_str() {
                 "stale_ref" => "Call tools.device.snapshot() for fresh refs on this device.",
                 "settled_absence" => "Inspect the device and take a new tools.device.snapshot(); do not blindly retry.",
                 "retryable_failure" => "Transient device transport failure; retry once.",
+                "delivery_uncertain" => "The action may already have reached the device; take a new tools.device.snapshot() and verify before repeating it.",
                 _ => "Check platform, device identity, and adb/idb/simctl/WDA configuration.",
             }.into());
             format_computer_error(err, disposition)
@@ -2956,6 +3045,184 @@ pub async fn execute_media_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mutating_action_that_timed_out_is_delivery_uncertain() {
+        for err in [
+            "`xdotool` timed out after 2000ms",
+            "HTTP request failed: timeout: global",
+            "Resource temporarily unavailable (os error 11)",
+            "cloud computer sandbox returned 503: {\"error\":\"upstream timed out\"}",
+        ] {
+            let read = classify_computer_error(err, false);
+            assert_eq!(
+                (read.kind.as_str(), read.retry.as_str()),
+                ("retryable_failure", "safe")
+            );
+            let write = classify_computer_error(err, true);
+            assert_eq!(
+                (write.kind.as_str(), write.retry.as_str()),
+                ("delivery_uncertain", "verify_first"),
+                "{err}"
+            );
+            assert_eq!(write.code.as_deref(), Some("DELIVERY_UNCERTAIN"));
+            assert!(write.hint.unwrap().contains("snapshot()"));
+        }
+        // Refused at admission, so never delivered: safe to retry either way.
+        for err in [
+            "cloud computer sandbox returned 429: {\"error\":\"rate limited\"}",
+            "cloud computer sandbox returned 503: {\"error\":\"no capacity\"}",
+        ] {
+            assert_eq!(classify_computer_error(err, true).kind, "retryable_failure");
+            assert_eq!(
+                classify_computer_error(err, false).kind,
+                "retryable_failure"
+            );
+        }
+        // Digits of a longer number are not a status code.
+        let err = "cloud computer sandbox returned 500: {\"request\":\"r-14290\"}";
+        assert_eq!(classify_computer_error(err, true).kind, "terminal_failure");
+        // Refusals before dispatch keep their dispositions.
+        assert_eq!(
+            classify_computer_error("STALE_REF @s1:e1", true).kind,
+            "stale_ref"
+        );
+        assert_eq!(
+            classify_computer_error("no such window 0x42", true).kind,
+            "settled_absence"
+        );
+    }
+
+    #[test]
+    fn computer_and_device_requests_know_which_actions_mutate() {
+        for req in [
+            json!({"action": "left_click", "coordinate": [1, 2]}),
+            json!({"action": "click", "x": 1, "y": 2}),
+            json!({"type": "click", "x": 1, "y": 2, "button": "left"}),
+            json!({"action": "type", "text": "hello"}),
+            json!({"action": "key", "text": "Return"}),
+            json!({"action": "scroll", "coordinate": [1, 2], "scroll_direction": "down"}),
+            json!({"action": "left_click_drag", "start_coordinate": [1, 2], "coordinate": [3, 4]}),
+            json!({"action": "click", "ref": "@s1234567:e1"}),
+            json!({"action": "focus_window", "window_id": "0x42"}),
+            json!({"action": "clipboard_set", "text": "x"}),
+            json!({"action": "open_url", "url": "https://example.com"}),
+            json!({"action": "something_new"}),
+            json!({"action_json": {"action": "left_click", "coordinate": [1, 2]}}),
+            json!({"payload": {"action": "type", "text": "x"}}),
+        ] {
+            assert!(computer_request_mutates(&req), "{req}");
+        }
+        for req in [
+            json!({}),
+            json!({"action": "screenshot"}),
+            json!({"type": "screenshot"}),
+            json!({"action": "cursor_position"}),
+            json!({"action": "wait", "duration": 1}),
+            json!({"action": "zoom", "region": [0, 0, 10, 10]}),
+            json!({"action": "snapshot"}),
+            json!({"action": "list_windows"}),
+            json!({"action": "clipboard_get"}),
+            json!({"payload": {"action": "snapshot"}}),
+        ] {
+            assert!(!computer_request_mutates(&req), "{req}");
+        }
+        for action in [
+            "tap",
+            "swipe",
+            "type",
+            "press",
+            "launch_app",
+            "open_url",
+            "rotate",
+        ] {
+            assert!(
+                device_request_mutates(&json!({ "action": action })),
+                "{action}"
+            );
+        }
+        for req in [
+            json!({}),
+            json!({"action": "screenshot"}),
+            json!({"action": "snapshot"}),
+        ] {
+            assert!(!device_request_mutates(&req), "{req}");
+        }
+    }
+
+    /// End to end through the cloud sandbox: the same timed-out response is a
+    /// safe retry for a screenshot and `delivery_uncertain` for a click; a 429
+    /// at admission is a safe retry for both.
+    #[test]
+    fn a_cloud_click_that_timed_out_is_not_retried_blindly() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _environment = crate::server::tests::env_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responses = [
+            ("504 Gateway Timeout", r#"{"error":"upstream timed out"}"#),
+            ("504 Gateway Timeout", r#"{"error":"upstream timed out"}"#),
+            ("429 Too Many Requests", r#"{"error":"rate limited"}"#),
+        ];
+        let server = std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                std::io::Read::read_exact(&mut reader, &mut vec![0; length]).unwrap();
+                let mut stream = reader.into_inner();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let dir = crate::test_tempdir();
+        std::fs::create_dir_all(dir.path().join(".config/sylphx")).unwrap();
+        std::fs::write(dir.path().join(".config/sylphx/key"), "synthetic-key").unwrap();
+        unsafe { std::env::set_var("SYLPHX_SANDBOX_URL", format!("http://127.0.0.1:{port}")) };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut outcomes = Vec::new();
+        for req in [
+            json!({"session_id": "s1", "action": "screenshot"}),
+            json!({"session_id": "s1", "action": "left_click", "coordinate": [1, 2]}),
+            json!({"session_id": "s1", "action": "left_click", "coordinate": [1, 2]}),
+        ] {
+            outcomes.push(
+                runtime
+                    .block_on(execute_computer_request(None, dir.path(), req))
+                    .unwrap_err(),
+            );
+        }
+        unsafe { std::env::remove_var("SYLPHX_SANDBOX_URL") };
+        server.join().unwrap();
+        assert!(outcomes[0].contains("RETRYABLE_FAILURE"), "{}", outcomes[0]);
+        assert!(
+            outcomes[1].contains("DELIVERY_UNCERTAIN"),
+            "{}",
+            outcomes[1]
+        );
+        assert!(outcomes[1].contains("verify_first"), "{}", outcomes[1]);
+        assert!(outcomes[2].contains("RETRYABLE_FAILURE"), "{}", outcomes[2]);
+    }
 
     #[test]
     fn desktop_platform_detection_and_overrides() {

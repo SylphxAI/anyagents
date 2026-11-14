@@ -1,2 +1,6 @@
-//! Delivery guarantees. The tests live in `tests/` and drive the public mailbox
-//! and a scripted harness. This library exists so the package has a target.
+//! Delivery guarantees. `tests/guarantees.rs` drives the mailbox and a
+//! scripted in-memory harness through crash points; [`conformance`] runs the
+//! same delivery scenarios against every real harness adapter over a scripted
+//! vendor process (`tests/conformance.rs`).
+
+pub mod conformance;

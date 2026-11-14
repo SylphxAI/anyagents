@@ -1,6 +1,6 @@
 # 0004: One credential store with typed, immutable bindings and launch-time materialisation
 
-Status: proposed. Date: 2026-11-12.
+Status: proposed; simplified on 2026-11-14 by [0010](0010-execution-identity-and-trust.md) D4. AnyAgents authorizes and brokers credentials and is not a vault: secret storage is a pluggable backend, delivery follows D4's three tiers, and the vendor's own binary performs every refresh, one writer per account, so the store-owned refresh in decision 4 is withdrawn. Date: 2026-11-12.
 
 Part of [0003](0003-runtime-rebuild.md). Supersedes [0002](0002-runtime-drivers-and-capability-identity.md) decision 1 and the credential part of decision 3.
 

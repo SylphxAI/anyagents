@@ -222,6 +222,8 @@ exec "{scripted_bin}" "$@"
             let _ = self.0.wait();
         }
     }
+    // Declared first, dropped last: once the server is gone.
+    let _keepers = support::Keepers::of(&tier1_state);
     let _server_guard = KillOnDrop(server);
 
     let socket = tier1_state.join("anyagents.sock");

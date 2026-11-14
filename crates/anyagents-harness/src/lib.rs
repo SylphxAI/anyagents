@@ -7,11 +7,12 @@
 mod atomic_fs;
 mod fake;
 pub mod masking;
+pub mod media;
 mod name;
 mod seat;
 mod stamp;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::borrow::Cow;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -187,6 +188,11 @@ pub struct Context {
     /// when peers, siblings, children, or groups change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<String>,
+    /// The stored message a reply to this line names, when the line is not
+    /// one itself: a `[Recovery]` note names the last message of the turn it
+    /// covers, which the mailbox holds and a reply can bind to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message: Option<String>,
 }
 
 impl Context {
@@ -256,7 +262,7 @@ impl Context {
         }
         out.push_str(&format!(
             " reply_to=\"{}\"",
-            xml_attr_escape(&reply_ref(id))
+            xml_attr_escape(&reply_ref(self.reply_to_message.as_deref().unwrap_or(id)))
         ));
         if let Some(destination) = &self.destination {
             out.push_str(&format!(" answer_to=\"{}\"", xml_attr_escape(destination)));
@@ -266,7 +272,7 @@ impl Context {
     }
 
     /// The lines a model reads, in a fixed order. The reply reference is this
-    /// message's own id, so it is always there.
+    /// message's own id, or the stored message it names, so it is always there.
     pub fn lines(&self, id: &str) -> String {
         let mut out = String::from("----- message -----\n");
         out.push_str(&format!(
@@ -297,7 +303,10 @@ impl Context {
         if !self.participants.is_empty() {
             out.push_str(&format!("participants: {}\n", self.participants.join(", ")));
         }
-        out.push_str(&format!("{REPLY_HINT_PREFIX}{}\n", reply_ref(id)));
+        out.push_str(&format!(
+            "{REPLY_HINT_PREFIX}{}\n",
+            reply_ref(self.reply_to_message.as_deref().unwrap_or(id))
+        ));
         if let Some(destination) = &self.destination {
             out.push_str(&format!("answer to: {destination}\n"));
         }
@@ -340,6 +349,19 @@ pub fn spawn_command(
     {
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
+        let report = spawn_report::SPAWN_REPORT.load(std::sync::atomic::Ordering::SeqCst);
+        if report >= 0 {
+            // The child runs nothing until its group is recorded: it waits
+            // on a pipe of its own for the answer.
+            let waiting = spawn_report::Waiting::new()
+                .map_err(|err| HarnessError::Failed(format!("cannot report the process: {err}")))?;
+            // SAFETY: between fork and exec only `getpid`, one `write` of
+            // eight bytes to a pipe and `read` run, all async-signal-safe; the
+            // closure touches no lock and allocates nothing.
+            unsafe {
+                command.pre_exec(move || spawn_report::report(report, &waiting));
+            }
+        }
     }
     for (key, value) in environment {
         if !SERVER_ONLY_ENV.contains(&key.as_str()) {
@@ -350,6 +372,127 @@ pub fn spawn_command(
         command.env_remove(key);
     }
     Ok(command)
+}
+
+/// Where the process groups this process starts are reported, before each
+/// runs anything: a keeper records them, so that what a keeper that died
+/// left can be ended by what it recorded, never by guesswork. Each child
+/// waits, between fork and exec, until the recorder answers that its group
+/// is recorded.
+#[cfg(unix)]
+mod spawn_report {
+    use std::collections::BTreeMap;
+    use std::os::fd::{AsRawFd as _, OwnedFd};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+
+    pub(super) static SPAWN_REPORT: AtomicI32 = AtomicI32::new(-1);
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    /// The write end of each child's answer pipe, by its token: whoever
+    /// takes it out closes it, so it is closed once.
+    static ANSWERS: Mutex<BTreeMap<u32, OwnedFd>> = Mutex::new(BTreeMap::new());
+
+    /// The recorder recorded the child's group: it may run.
+    const RECORDED: u8 = 1;
+
+    unsafe extern "C" {
+        fn getpid() -> i32;
+        fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
+        fn read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;
+    }
+
+    fn answers() -> std::sync::MutexGuard<'static, BTreeMap<u32, OwnedFd>> {
+        ANSWERS.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// One child's wait for its answer, made before the fork. Dropped with
+    /// the command, it closes what was never answered.
+    pub(super) struct Waiting {
+        token: u32,
+        answer: OwnedFd,
+    }
+
+    impl Waiting {
+        pub(super) fn new() -> std::io::Result<Self> {
+            let (answer, writer) = std::io::pipe()?;
+            let token = NEXT.fetch_add(1, Ordering::SeqCst);
+            answers().insert(token, writer.into());
+            Ok(Self {
+                token,
+                answer: answer.into(),
+            })
+        }
+    }
+
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            answers().remove(&self.token);
+        }
+    }
+
+    /// In the child, between fork and exec: write its pid, which numbers the
+    /// process group it leads (`process_group(0)`), and its token to `fd`,
+    /// then wait for the answer. Anything but "recorded" fails the spawn.
+    pub(super) fn report(fd: i32, waiting: &Waiting) -> std::io::Result<()> {
+        let mut message = [0u8; 8];
+        // SAFETY: `getpid` cannot fail.
+        message[..4].copy_from_slice(&unsafe { getpid() }.to_ne_bytes());
+        message[4..].copy_from_slice(&waiting.token.to_ne_bytes());
+        // SAFETY: a write of eight bytes to a pipe is atomic.
+        if unsafe { write(fd, message.as_ptr().cast(), message.len()) } != 8 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut answer = 0u8;
+        loop {
+            // SAFETY: one byte into a local, from a descriptor `waiting` owns.
+            match unsafe { read(waiting.answer.as_raw_fd(), (&raw mut answer).cast(), 1) } {
+                1 if answer == RECORDED => return Ok(()),
+                -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {
+                }
+                _ => return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            }
+        }
+    }
+
+    /// Answer the child that reported `token`: its group is recorded, or it
+    /// is refused and its spawn fails.
+    pub(super) fn answer(token: u32, recorded: bool) {
+        let Some(writer) = answers().remove(&token) else {
+            return;
+        };
+        let byte = [if recorded { RECORDED } else { 0 }];
+        // SAFETY: one byte from a local to a descriptor this function owns.
+        unsafe { write(writer.as_raw_fd(), byte.as_ptr().cast(), 1) };
+    }
+}
+
+/// Report every process [`spawn_command`] starts from now on to `fd`, a
+/// pipe's write end this process keeps open, before the process runs
+/// anything; each waits for [`answer_spawn`]. Read the reports with
+/// [`read_spawn`].
+#[cfg(unix)]
+pub fn report_spawns_to(fd: i32) {
+    spawn_report::SPAWN_REPORT.store(fd, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The next report from a reading end of the pipe given to
+/// [`report_spawns_to`]: the child's pid, which numbers the process group it
+/// leads, and the token to answer it by.
+#[cfg(unix)]
+pub fn read_spawn(reports: &mut impl std::io::Read) -> std::io::Result<(i32, u32)> {
+    let mut message = [0u8; 8];
+    reports.read_exact(&mut message)?;
+    let [a, b, c, d, e, f, g, h] = message;
+    Ok((
+        i32::from_ne_bytes([a, b, c, d]),
+        u32::from_ne_bytes([e, f, g, h]),
+    ))
+}
+
+/// Let the child that reported `token` run (`recorded`), or fail its spawn.
+#[cfg(unix)]
+pub fn answer_spawn(token: u32, recorded: bool) {
+    spawn_report::answer(token, recorded);
 }
 
 #[cfg(unix)]
@@ -575,8 +718,41 @@ pub fn kill_child(child: &mut std::process::Child, environment: &[(String, Strin
     let _ = wait_child_or_group_exit(child, pid, KILL_REAP_GRACE);
 }
 
+/// End a harness process group this process did not start: the group a keeper
+/// that died left behind. `TERM` to the group, a grace for it to empty, then
+/// `KILL`, inside the seat UID boundary when `environment` names one. The
+/// group's exit is not an event here (nothing reports it to a non-parent), so
+/// emptiness is probed on a short interval within the grace.
+pub fn terminate_group(pgid: u32, environment: &[(String, String)]) {
+    const TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(800);
+    const KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+    const GROUP_PROBE: std::time::Duration = std::time::Duration::from_millis(25);
+    let emptied = |grace: std::time::Duration| {
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            if !pgid_alive(pgid) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(GROUP_PROBE);
+        }
+    };
+    if pgid <= 1 || !pgid_alive(pgid) {
+        return;
+    }
+    kill_process_group(pgid, "-TERM", environment);
+    if emptied(TERM_GRACE) {
+        return;
+    }
+    kill_process_group(pgid, "-KILL", environment);
+    let _ = emptied(KILL_GRACE);
+}
+
 /// How a harness takes input that arrives during a turn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeliveryMode {
     /// Input enters the active turn, including while a tool runs.
     Steer,
@@ -586,34 +762,81 @@ pub enum DeliveryMode {
     Queue,
 }
 
-/// Whether this harness has shown it can steer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SteerSupport {
-    Yes,
-    No,
-    Unproven,
+/// What a harness guarantees for mail that reaches an agent while its turn
+/// runs, as `docs/delivery.md` defines the levels. Each level keeps every
+/// guarantee of the one before it, and the conformance suite in
+/// `tests/invariants` holds every adapter to the level it reports.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeliveryLevel {
+    /// Mail for a busy agent is applied when the running turn ends: it starts
+    /// the next turn.
+    TurnEnd,
+    /// The vendor takes mail into the running turn as it arrives. Its
+    /// acceptance (a written line, an answered request) is the only proof;
+    /// nothing says at which step the turn read it.
+    MidTurn,
+    /// The vendor proves, message by message, that the running turn consumed
+    /// it at its next step, every pending message together in mailbox order.
+    NextStep,
+}
+
+impl DeliveryLevel {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::TurnEnd => "turn-end",
+            Self::MidTurn => "mid-turn",
+            Self::NextStep => "next-step",
+        }
+    }
+}
+
+/// The delivery one harness offers and what it rests on.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Delivery {
+    pub level: DeliveryLevel,
+    /// A message an earlier process of the same session already consumed is
+    /// recognised when it is handed over again, and is not applied twice.
+    pub idempotent: bool,
+    /// The vendor signal the level rests on, in a few words. Borrowed for an
+    /// adapter's own constant; owned when it crosses a process boundary.
+    pub proof: Cow<'static, str>,
+    /// What the running process said about itself in its handshake (vendor,
+    /// version, protocol, capabilities). `None` before a process announced
+    /// itself, and for a vendor whose handshake names nothing.
+    pub peer: Option<String>,
+}
+
+impl Delivery {
+    /// The same delivery, as the running process announced itself.
+    pub fn with_peer(mut self, peer: Option<String>) -> Self {
+        self.peer = peer;
+        self
+    }
 }
 
 /// Whether a turn is open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnState {
     Idle,
     InTurn,
 }
 
 /// What `health` reports. Quota and sign-in trouble are states, not crashes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HarnessHealth {
     pub process_alive: bool,
     pub turn_state: TurnState,
-    pub delivery_mode: DeliveryMode,
-    pub steer_support: SteerSupport,
+    pub delivery: Delivery,
     pub quota_reset_at_ms: Option<i64>,
     pub sign_in_fault: Option<String>,
 }
 
 /// One mailbox message handed to a harness. The id is what a replay is deduped on.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OutboundMessage {
     pub id: String,
     pub seq: i64,
@@ -627,7 +850,8 @@ pub struct OutboundMessage {
 }
 
 /// Result of one `deliver` call.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeliverOutcome {
     /// The harness has the message. `turn_finished` means the turn that
     /// contained it has already completed.
@@ -645,10 +869,67 @@ pub enum DeliverOutcome {
     Deferred,
     /// The vendor asked us to wait. Not a failure and not a restart.
     Quota { reset_at_ms: i64 },
+    /// The vendor refused the message for good, without applying it: no
+    /// retry and no new process can make it take this message (a malformed
+    /// request, an id another record holds, a code no retry clears). The
+    /// loop parks it as rejected, past the cursor, and tells its sender. An
+    /// adapter answers the same when the same id is offered again.
+    ///
+    /// `message_specific` says the reason belongs to this message alone (its
+    /// size, its content): it is parked at once and never counts toward the
+    /// loop's breaker. Any other reason might hold for every message, so the
+    /// same one twice, or too many in one pass, fails the harness instead.
+    Rejected {
+        reason: String,
+        message_specific: bool,
+    },
+}
+
+impl DeliverOutcome {
+    /// A refusal for good; see [`DeliverOutcome::Rejected`].
+    pub fn rejected(reason: impl Into<String>, message_specific: bool) -> Self {
+        Self::Rejected {
+            reason: reason.into(),
+            message_specific,
+        }
+    }
+}
+
+/// Whether a vendor's refusal names the size or length of the message itself
+/// ("too large", "exceeds the maximum length", `inputTooLarge`): a reason that
+/// belongs to that one message.
+pub fn names_message_size(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    [
+        "too large",
+        "too long",
+        "toolarge",
+        "toolong",
+        "too_large",
+        "too_long",
+        "exceeds the maximum",
+        "maximum length",
+        "payload too large",
+    ]
+    .iter()
+    .any(|phrase| reason.contains(phrase))
+}
+
+/// What a harness already proved about one message, read without writing
+/// anything (`Harness::proven`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Proof {
+    /// The vendor took it with the proof the harness's level requires;
+    /// `turn_finished` means the turn that contained it already ended.
+    Taken { turn_finished: bool },
+    /// The session already held it from an earlier process.
+    Duplicate,
 }
 
 /// The harness process could not take the message.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HarnessError {
     #[error("harness process is not running")]
     Dead,
@@ -656,28 +937,28 @@ pub enum HarnessError {
     Failed(String),
 }
 
-/// A mailbox message that entered an adapter's between-steps input, with the
-/// order it arrived in.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SteerItem {
-    pub message: OutboundMessage,
-    pub order: u64,
-}
-
-/// Reconciled unconfirmed input custody returned when a supervisor prepares
-/// to resume an interrupted turn via explicit `[Recovery]`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ReconciledUnconfirmed {
-    pub turn_id: Option<String>,
-    pub request_ids: Vec<String>,
-    pub journal_committed_ids: Vec<String>,
-    pub journal_missing_ids: Vec<String>,
-}
-
 /// Calls every harness adapter implements. The last calls have defaults so a
 /// scripted fake can stay a delivery double without a process.
 pub trait Harness: Send {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError>;
+
+    /// What this harness already proved about `message_id`, without writing
+    /// anything and whether or not its process still runs. The host commits
+    /// these before it replaces the process or waits out a quota: a proof
+    /// outlives the process that gave it, but not the adapter that holds it.
+    /// `deliver` answers a proven message the same way, before it looks at
+    /// liveness or quota. `None` when nothing is proven yet.
+    fn proven(&self, _message_id: &str) -> Option<Proof> {
+        None
+    }
+
+    /// Stop the vendor process and read everything it already wrote, so
+    /// every proof it gave is known to `proven` before the host replaces it.
+    /// The adapter stays usable for `proven` afterwards. Called once, right
+    /// before the host swaps in a new process; dropping the adapter must
+    /// still stop the process when this was never called.
+    fn stop(&mut self) {}
+
     fn background(&mut self) -> Result<(), HarnessError>;
     fn resume(&mut self, session: &str) -> Result<(), HarnessError>;
     fn cancel(&mut self) -> Result<(), HarnessError>;
@@ -724,63 +1005,6 @@ pub trait Harness: Send {
     /// Forget a quota wait so delivery can resume after the reset time.
     fn clear_quota(&mut self) {}
 
-    /// Drain steered message IDs whose mid-turn delivery became unconfirmed
-    /// before turn completion so mailbox custody rewinds their cursor.
-    fn take_reclaimed_steers(&mut self) -> Vec<String> {
-        Vec::new()
-    }
-
-    /// Return `true` when the adapter holds unconfirmed input custody or a
-    /// pending session-reset recovery marker that requires supervisor
-    /// `[Recovery]` reconciliation before ordinary raw mailbox delivery.
-    fn has_unconfirmed_hold(&self) -> bool {
-        false
-    }
-
-    /// Return `true` when the adapter has finished its in-flight turn on the
-    /// wire (`open` is empty) and is paused solely on an unconfirmed steer hold.
-    fn has_unconfirmed_idle_hold(&self) -> bool {
-        false
-    }
-
-    /// Non-destructively read message IDs recorded in an unconfirmed input hold
-    /// so the supervisor can promote them into `turn_recovery` before clearing
-    /// the on-disk hold.
-    fn peek_unconfirmed_request_ids(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    /// Reconcile an unconfirmed input hold against the vendor session journal
-    /// (when present), archive/clear the hold, and return reconciled IDs for
-    /// explicit `[Recovery]` delivery.
-    fn reconcile_unconfirmed_for_recovery(
-        &mut self,
-    ) -> Result<Option<ReconciledUnconfirmed>, HarnessError> {
-        Ok(None)
-    }
-
-    /// Take the oldest message that entered input the vendor reads between
-    /// model steps (a before-step hook, a steering socket), for the host to
-    /// write into the next step with [`Harness::inject`]. `None` means this
-    /// harness has no such channel, or nothing new arrived. A taken message
-    /// stays held until `inject` reports the vendor took it, so a crash loses
-    /// nothing.
-    fn poll_steer(&mut self) -> Result<Option<SteerItem>, HarnessError> {
-        Ok(None)
-    }
-
-    /// Put one message taken by [`Harness::poll_steer`] into the live process
-    /// through the harness's own mid-turn mechanism. `Ok(true)` means the vendor
-    /// took it: the host advances the delivered cursor exactly once. `Ok(false)`
-    /// means it is still held for the next step, cursor unchanged.
-    fn inject(&mut self, _message: &OutboundMessage) -> Result<bool, HarnessError> {
-        Ok(false)
-    }
-
-    /// Put the held messages back for the next step, except `keep`, which an
-    /// `inject` is still holding. Called when `inject` cannot take them now.
-    fn release_steer(&mut self, _keep: &str) {}
-
     /// Secret-safe process-exit evidence, never unfiltered vendor output.
     /// Kept separate from sign-in state and delivery/restart decisions.
     fn exit_diagnostic(&self) -> Option<String> {
@@ -812,7 +1036,7 @@ impl TurnUsage {
                 .cache_write_tokens
                 .saturating_sub(after.cache_write_tokens),
             reported_cost_micros: match (self.reported_cost_micros, after.reported_cost_micros) {
-                (Some(now), Some(before)) => Some(now - before),
+                (Some(now), Some(before)) => Some((now - before).max(0)),
                 (Some(now), None) => Some(now),
                 _ => None,
             },
@@ -824,186 +1048,13 @@ impl TurnUsage {
 ///
 /// Cost is in millionths of the vendor's currency unit when the vendor reports
 /// a cost. A vendor that reports only tokens leaves the cost empty.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TurnUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub reported_cost_micros: Option<i64>,
-}
-
-/// One line handed over by a between-steps channel: the mailbox id, its
-/// sequence, and the text.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SteerLine {
-    pub id: String,
-    pub seq: i64,
-    pub message: String,
-}
-
-/// The messages a before-step hook or a steering socket pushed, in arrival
-/// order, held until the vendor takes them.
-///
-/// The pushing side appends one JSON [`SteerLine`] per message to the file.
-/// The host takes the oldest `limit` lines and keeps them, so a crash between
-/// the take and the vendor's acceptance loses nothing: they are still held by
-/// the host that took them and, after a crash, [`SteerQueue::release_for`] puts
-/// them back. A file read or write failure leaves the cursor where it is.
-#[derive(Clone, Debug)]
-pub struct SteerQueue {
-    path: std::path::PathBuf,
-    limit: usize,
-    held: std::sync::Arc<std::sync::Mutex<Vec<SteerItem>>>,
-    order: std::sync::Arc<AtomicU64>,
-}
-
-impl SteerQueue {
-    /// `path` is the push file. `limit` is the most lines one step takes.
-    pub fn new(path: impl Into<std::path::PathBuf>, limit: usize) -> Self {
-        Self {
-            path: path.into(),
-            limit: limit.max(1),
-            held: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            order: std::sync::Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-
-    /// The push file's lines, oldest first. Failures are diagnosed and leave
-    /// pending bytes untouched. Use [`Self::try_lines`] to handle them directly.
-    pub fn lines(&self) -> Vec<SteerLine> {
-        self.try_lines().unwrap_or_else(|err| {
-            eprintln!("steer queue {}: {err}", self.path.display());
-            Vec::new()
-        })
-    }
-
-    /// Read every pending record, refusing corrupt input rather than skipping it.
-    pub fn try_lines(&self) -> std::io::Result<Vec<SteerLine>> {
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(err),
-        };
-        text.lines()
-            .enumerate()
-            .map(|(index, line)| {
-                serde_json::from_str::<SteerLine>(line).map_err(|err| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("invalid pending record at line {}: {err}", index + 1),
-                    )
-                })
-            })
-            .collect()
-    }
-
-    /// Take the oldest lines, unless one taken earlier is still held.
-    /// Errors are diagnosed; no pending record is consumed on a failed read.
-    pub fn take(&self) -> Option<SteerItem> {
-        self.try_take().unwrap_or_else(|err| {
-            eprintln!("steer queue {}: {err}", self.path.display());
-            None
-        })
-    }
-
-    pub fn try_take(&self) -> std::io::Result<Option<SteerItem>> {
-        let mut held = self.lock();
-        if !held.is_empty() {
-            return Ok(None);
-        }
-        let mut lines = self.try_lines()?;
-        if lines.is_empty() {
-            return Ok(None);
-        }
-        let rest = lines.split_off(lines.len().min(self.limit));
-        write_lines(&self.path, &rest)?;
-        *held = lines
-            .into_iter()
-            .map(|line| SteerItem {
-                order: self.order.fetch_add(1, Ordering::SeqCst),
-                message: OutboundMessage {
-                    id: line.id,
-                    seq: line.seq,
-                    text: line.message,
-                    sender: None,
-                    reply_to: None,
-                    source_time_ms: None,
-                    context: Context::default(),
-                },
-            })
-            .collect();
-        Ok(held.first().cloned())
-    }
-
-    /// Records the vendor's acceptance of `id`, keeping the older held ones.
-    pub fn settle(&self, id: &str) {
-        let mut held = self.lock();
-        held.retain(|item| item.message.id != id);
-    }
-
-    /// Drop a held line the state proves already taken, without writing it again.
-    pub fn consume(&self, id: &str) {
-        self.lock().retain(|item| item.message.id != id);
-    }
-
-    /// Put every held line except `except` back at the front of the push file,
-    /// oldest first, so the next step, or a restarted host, takes it again.
-    pub fn release_for(&self, except: &str) {
-        if let Err(err) = self.try_release_for(except) {
-            eprintln!("steer queue {}: {err}", self.path.display());
-        }
-    }
-
-    pub fn try_release_for(&self, except: &str) -> std::io::Result<()> {
-        let mut held = self.lock();
-        let back_lines: Vec<SteerItem> = held
-            .iter()
-            .filter(|item| item.message.id != except)
-            .cloned()
-            .collect();
-        if back_lines.is_empty() {
-            return Ok(());
-        }
-        let mut lines: Vec<SteerLine> = back_lines
-            .iter()
-            .map(|item| SteerLine {
-                id: item.message.id.clone(),
-                seq: item.message.seq,
-                message: item.message.text.clone(),
-            })
-            .collect();
-        let ids: std::collections::HashSet<String> = back_lines
-            .iter()
-            .map(|item| item.message.id.clone())
-            .collect();
-        let rest: Vec<SteerLine> = self
-            .try_lines()?
-            .into_iter()
-            .filter(|line| !ids.contains(&line.id))
-            .collect();
-        lines.extend(rest);
-        write_lines(&self.path, &lines)?;
-        held.retain(|item| item.message.id == except);
-        Ok(())
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<SteerItem>> {
-        self.held.lock().unwrap_or_else(|err| err.into_inner())
-    }
-}
-
-fn write_lines(path: &std::path::Path, lines: &[SteerLine]) -> std::io::Result<()> {
-    let mut text = String::new();
-    for line in lines {
-        text.push_str(&serde_json::to_string(line).map_err(std::io::Error::other)?);
-        text.push('\n');
-    }
-    atomic_write_file(path, text.as_bytes(), 0o600)
 }
 
 /// First line of user text. The rest of the text is the mailbox body.
@@ -1035,48 +1086,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn corrupt_pending_records_are_diagnosed_without_rewriting_any_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("steer.jsonl");
-        let queue = SteerQueue::new(&path, 1);
-        let original = "{\"id\":\"m1\",\"seq\":1,\"message\":\"one\"}\n{broken\n";
-        std::fs::write(&path, original).unwrap();
-        let error = queue.try_take().unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("line 2"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        assert!(queue.take().is_none()); // Legacy path diagnoses the same error.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        std::fs::write(&path, original.lines().next().unwrap()).unwrap();
-        assert_eq!(queue.try_take().unwrap().unwrap().message.id, "m1");
-    }
-
-    #[test]
-    fn release_refuses_corrupt_pending_data_and_keeps_held_work_retryable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("steer.jsonl");
-        let queue = SteerQueue::new(&path, 1);
-        std::fs::write(&path, "{\"id\":\"m1\",\"seq\":1,\"message\":\"one\"}\n").unwrap();
-        queue.try_take().unwrap().unwrap();
-        std::fs::write(&path, "corrupt\n").unwrap();
-        assert_eq!(
-            queue.try_release_for("").unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "corrupt\n");
-        assert!(queue.try_take().unwrap().is_none());
-        std::fs::write(&path, "").unwrap();
-        queue.try_release_for("").unwrap();
-        assert_eq!(queue.try_take().unwrap().unwrap().message.id, "m1");
-    }
-
-    #[test]
-    fn missing_queue_is_empty_but_unreadable_queue_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let queue = SteerQueue::new(dir.path().join("missing"), 1);
-        assert!(queue.try_take().unwrap().is_none());
-        std::fs::create_dir(queue.path()).unwrap();
-        assert!(queue.try_take().is_err());
+    fn a_size_refusal_is_one_messages_own_and_a_malformed_one_is_not() {
+        for reason in [
+            "muse refused the message: -32002 inputTooLarge",
+            "Input exceeds the maximum length of 1048576 characters.",
+            "dsh session/prompt: HTTP 413: payload too large",
+        ] {
+            assert!(names_message_size(reason), "{reason}");
+        }
+        for reason in [
+            "muse refused the message: -32602",
+            "spiron rejected the input: wrong_session",
+        ] {
+            assert!(!names_message_size(reason), "{reason}");
+        }
     }
 
     #[test]
@@ -1085,47 +1108,6 @@ mod tests {
         assert_eq!(message_id_in_text(&text), Some("msg_1"));
         assert_eq!(message_id_in_text("hello"), None);
         assert_eq!(message_id_in_text("anyagents-message:"), None);
-    }
-
-    #[test]
-    fn a_queue_take_settle_and_release_never_duplicates_a_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("steer.jsonl");
-        let queue = SteerQueue::new(&path, 2);
-        std::fs::write(
-            &path,
-            "{\"id\":\"m1\",\"seq\":1,\"message\":\"one\"}\n{\"id\":\"m2\",\"seq\":2,\"message\":\"two\"}\n{\"id\":\"m3\",\"seq\":3,\"message\":\"three\"}\n",
-        )
-        .unwrap();
-        let first = queue.take().expect("first");
-        assert_eq!(first.message.id, "m1");
-        assert!(
-            queue.take().is_none(),
-            "a held line is not taken twice into one step"
-        );
-        queue.settle("m1");
-        assert!(queue.take().is_none(), "m2 and m3 are already held");
-        queue.settle("m2");
-        // Taking m2 had already taken m3 with it, as one step takes a batch.
-        queue.release_for("m3");
-        queue.settle("m3");
-        let lines = queue.lines();
-        let ids: Vec<&str> = lines.iter().map(|line| line.id.as_str()).collect();
-        assert_eq!(ids, vec!["m3"]);
-        assert_eq!(queue.take().unwrap().message.id, "m3");
-    }
-
-    #[test]
-    fn a_release_puts_an_unsent_line_back_first() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("steer.jsonl");
-        std::fs::write(&path, "{\"id\":\"m1\",\"seq\":1,\"message\":\"one\"}\n").unwrap();
-        let queue = SteerQueue::new(&path, 4);
-        queue.take().expect("taken");
-        std::fs::write(&path, "{\"id\":\"m2\",\"seq\":2,\"message\":\"two\"}\n").unwrap();
-        queue.release_for("m2");
-        let ids: Vec<String> = queue.lines().into_iter().map(|line| line.id).collect();
-        assert_eq!(ids, vec!["m1", "m2"]);
     }
 
     #[cfg(unix)]
@@ -1155,5 +1137,29 @@ mod tests {
             matches!(unix_signal::signal_target(grandchild_pid, 0), Err(3)),
             "grandchild pid {grandchild_pid} still alive after kill_child"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_group_ends_a_group_this_process_does_not_wait_on() {
+        use std::io::{BufRead as _, BufReader};
+        use std::process::Stdio;
+        let mut cmd = spawn_command(std::path::Path::new("/bin/sh"), &[]).unwrap();
+        cmd.args(["-c", "trap '' TERM; sleep 30 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        let leader = child.id();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: i32 = line.trim().parse().expect("grandchild pid");
+        // The keeper that started this group is gone: something else reaps.
+        let reaper = std::thread::spawn(move || child.wait());
+        terminate_group(leader, &[]);
+        assert!(!pgid_alive(leader), "the group survived terminate_group");
+        assert!(matches!(unix_signal::signal_target(grandchild, 0), Err(3)));
+        reaper.join().unwrap().unwrap();
     }
 }

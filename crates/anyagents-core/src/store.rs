@@ -30,15 +30,20 @@ mod harness_leases;
 mod history_ops;
 mod lifecycle;
 mod mcp_ops;
+mod operator_inbox;
 mod outcomes;
 mod registry;
+mod remote_sessions;
 pub use registry::holds_store_writer;
+mod mail_notices;
 mod runtime;
 #[cfg(test)]
 #[path = "store/runtime_tests.rs"]
 mod runtime_tests;
 mod server_ops;
 mod steer_ops;
+pub use mail_notices::SYSTEM_SENDER;
+mod turn_errors;
 pub use credentials::{
     CredentialBinding, CredentialBindingAudit, CredentialKind, CredentialObservation,
     CredentialSlot, CredentialTarget,
@@ -46,14 +51,23 @@ pub use credentials::{
 pub use group_policy::{Group, GroupAction, GroupActor};
 pub use harness_leases::HarnessLease;
 pub use lifecycle::{LifecycleKind, LifecycleOp, LifecyclePhase, NewLifecycleOp, SchedulePending};
+pub use operator_inbox::{
+    OPERATOR_BURST, OPERATOR_FLEET_BURST, OPERATOR_FLEET_HOURLY_CAP, OPERATOR_HOURLY_CAP,
+    OperatorMessage, OperatorReceipt, OperatorReport,
+};
 pub use outcomes::{
     NewOutcome, Outcome, OutcomeCost, OutcomeGroup, OutcomeGroupBy, OutcomeKind, OutcomeReport,
 };
+pub use remote_sessions::{
+    REMOTE_SESSION_TOKEN_PREFIX, RemoteSession, RemoteSessionGrant, RemoteSessionToken,
+    is_remote_session_token,
+};
 pub use runtime::{
     AgentRuntime, BackfillReport, Fault, FaultKind, ProcessIdentity, QUOTA_ESTIMATE_MS, QuotaBlock,
-    QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState, SessionLease, SteerHold,
-    SteerState, Turn, TurnOutcome, TurnState, steer_allows,
+    QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState, SessionLease, Turn,
+    TurnOutcome, TurnState,
 };
+pub use turn_errors::{ErroredTurn, MAX_ERRORED_TURNS, TurnErrors, is_session_turn_error};
 
 /// A line's provider coordinates: the chat, the forum topic and the message id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -217,6 +231,8 @@ pub struct AgentQueryMetadata {
     pub oldest_undelivered: HashMap<String, i64>,
     pub open_turns: HashMap<String, i64>,
     pub schedules: HashMap<String, Vec<AgentSchedule>>,
+    /// Agents with a run of errored turns in progress, or parked for one.
+    pub turn_errors: HashMap<String, TurnErrors>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -543,6 +559,19 @@ impl std::fmt::Display for Ack {
     }
 }
 
+/// A mailbox message the harness refused for good, parked past the cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedMessage {
+    pub message_id: String,
+    pub agent_id: AgentId,
+    pub seq: i64,
+    pub sender: Option<String>,
+    pub reason: String,
+    pub rejected_at_ms: i64,
+    /// When its sender was told, if it was.
+    pub notified_at_ms: Option<i64>,
+}
+
 /// One mailbox entry. `ack` is derived from the cursors, not stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
@@ -781,17 +810,71 @@ pub struct OpenTurn {
 
 /// Held for one vendor loop or lifecycle mutation. Drop explicitly releases the
 /// flock even while a fork-inherited descriptor remains open.
+///
+/// A process lock can be shared with the keeper that owns the agent's harness
+/// process (see `docs/adr/0007-process-architecture.md`): every copy is a
+/// descriptor of the same open file description, so the lock is held while
+/// any copy, in any process, is open. Only the descriptor that took the lock
+/// (or adopted it from a keeper) unlocks on drop, and not once
+/// [`AgentLock::retain`] said the keeper keeps holding it after this process.
 #[derive(Debug)]
 pub struct AgentLock {
-    _file: File,
+    file: File,
+    /// This descriptor took the lock (or adopted it), so its drop releases it.
+    owner: bool,
+    /// Cleared by [`AgentLock::retain`] on any copy: no copy in this process
+    /// releases the lock, because a keeper holds it on after this process.
+    release: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AgentLock {
+    fn taken(file: File) -> Self {
+        Self {
+            file,
+            owner: true,
+            release: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    /// Another descriptor of this lock, for a keeper process to inherit or
+    /// for a later launch to hand on. The copy never unlocks on drop.
+    pub fn share(&self) -> std::io::Result<AgentLock> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            owner: false,
+            release: Arc::clone(&self.release),
+        })
+    }
+
+    /// The lock a keeper passed back on reattach: the same open file
+    /// description it holds. This process now owns releasing it, unless it
+    /// retains it again.
+    pub fn adopt(fd: std::os::fd::OwnedFd) -> AgentLock {
+        Self::taken(File::from(fd))
+    }
+
+    /// A keeper keeps holding this lock after this process lets go: no copy
+    /// in this process releases it on drop; each only closes its descriptor.
+    pub fn retain(&self) {
+        self.release.store(false, Ordering::SeqCst);
+    }
+}
+
+impl std::os::fd::AsFd for AgentLock {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.file.as_fd()
+    }
 }
 
 impl Drop for AgentLock {
     fn drop(&mut self) {
+        if !self.owner || !self.release.load(Ordering::SeqCst) {
+            return;
+        }
         // Closing only our descriptor leaves flock held by a concurrent fork's
         // inherited copy until exec. Release the open-file-description lock
         // explicitly so the next turn and busy probe see the intended lifetime.
-        let _ = unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -1310,9 +1393,10 @@ impl Store {
 
     /// Exclusive lock for this agent's vendor process. A second caller gets [`Error::AgentBusy`].
     pub fn try_lock_agent(&self, agent_id: &AgentId) -> Result<AgentLock, Error> {
-        let dir = self.data_dir.join("locks");
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.lock", agent_id.as_str()));
+        let path = agent_lock_path(&self.data_dir, agent_id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -1329,7 +1413,7 @@ impl Store {
             }
             return Err(Error::Io(err));
         }
-        Ok(AgentLock { _file: file })
+        Ok(AgentLock::taken(file))
     }
 
     /// Serialize lifecycle state and archive-marker changes across API/server
@@ -1370,7 +1454,7 @@ impl Store {
         loop {
             let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
             if rc == 0 {
-                return Ok(AgentLock { _file: file });
+                return Ok(AgentLock::taken(file));
             }
             let error = std::io::Error::last_os_error();
             if error.kind() == ErrorKind::WouldBlock {
@@ -1384,6 +1468,7 @@ impl Store {
 
     pub fn create_agent(&self, new: NewAgent) -> Result<Agent, Error> {
         validate_token(&new.name, "agent name")?;
+        refuse_reserved_agent_name(&new.name)?;
         let harness = normalize_harness_name(&new.harness);
         if harness.is_empty() {
             return Err(Error::Message("harness is empty".into()));
@@ -1528,6 +1613,7 @@ impl Store {
             .strip_prefix("agent:")
             .unwrap_or(new_name.trim());
         validate_token(clean, "agent name")?;
+        refuse_reserved_agent_name(clean)?;
         let (updated, changed) = self.write_tx(|tx| {
             let current = agent_by_id(tx, agent_id)?;
             if current.name == clean {
@@ -1852,6 +1938,11 @@ impl Store {
                 .or_default()
                 .push(schedule);
         }
+        metadata.turn_errors = self
+            .current_turn_errors()?
+            .into_iter()
+            .map(|(id, errors)| (id.to_string(), errors))
+            .collect();
         Ok(metadata)
     }
 
@@ -2398,6 +2489,7 @@ impl Store {
                 message: Message,
                 woke_agent: bool,
                 is_passive_reaction: bool,
+                recipient: Box<Agent>,
             },
         }
         let tx_outcome = self.write_tx(|tx| -> Result<ReceiveTx, Error> {
@@ -2667,6 +2759,7 @@ impl Store {
             mentions,
             participants,
             topology,
+            reply_to_message: None,
         };
         let message = Message {
             id: MessageId::generate(),
@@ -2747,6 +2840,7 @@ impl Store {
                 message,
                 woke_agent,
                 is_passive_reaction,
+                recipient: Box::new(agent),
             })
         })?;
         match tx_outcome {
@@ -2755,6 +2849,7 @@ impl Store {
                 message,
                 woke_agent,
                 is_passive_reaction,
+                recipient,
             } => {
                 if woke_agent {
                     self.notify(Wake::Agent {
@@ -2765,6 +2860,9 @@ impl Store {
                     self.notify(Wake::Mail {
                         agent_id: agent_id.clone(),
                     });
+                    // Mail that waits behind a pause, or that an archived
+                    // agent will not read, is announced (mail_notices.rs).
+                    self.announce_held_mail(&message, &recipient);
                 }
                 Ok(Some(ReceiveOutcome::New(message)))
             }
@@ -2872,6 +2970,9 @@ impl Store {
             )?;
             if updated == 0 {
                 return Err(Error::AgentNotFound(id.to_string()));
+            }
+            if state == "running" {
+                turn_errors::clear_parking(tx, id)?;
             }
             agent_by_id(tx, id)
         })?;
@@ -3072,17 +3173,23 @@ impl Store {
             for table in [
                 "agent_runtime",
                 "turns",
+                // Never written; kept, and kept cleared, for one release so a
+                // rollback to a binary that still deletes from it can delete
+                // agents. Drop the table and this entry together after that.
                 "steer_holds",
+                "rejected_messages",
                 "session_leases",
                 "quota_blocks",
                 "harness_leases",
                 "agent_aliases",
                 "agent_capabilities",
+                "remote_session_tokens",
                 "usage_records",
                 "outcomes",
                 "skill_reads",
                 "mailbox_cursors",
                 "turn_recovery",
+                "turn_errors",
                 "messages",
                 "message_versions",
                 "outbound_messages",
@@ -4395,114 +4502,6 @@ impl Store {
         })
     }
 
-    /// Ensure message IDs from a reconciled external input hold are recorded in
-    /// `turn_recovery` as an open interrupted turn (and past `delivered_seq`)
-    /// so recovery resumes them with `[Recovery]` rather than raw replay.
-    pub fn promote_messages_to_open_turn(
-        &self,
-        agent_id: &AgentId,
-        message_ids: &[String],
-    ) -> Result<(), Error> {
-        if message_ids.is_empty() {
-            return Ok(());
-        }
-        self.write_tx(|tx| {
-            agent_exists(tx, agent_id)?;
-            let mut seqs = Vec::new();
-            for msg_id in message_ids {
-                if let Some(seq) = tx
-                    .query_row(
-                        "SELECT seq FROM messages WHERE agent_id = ?1 AND id = ?2",
-                        params![agent_id.as_str(), msg_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?
-                {
-                    seqs.push(seq);
-                }
-            }
-            let (Some(&min_seq), Some(&max_seq)) = (seqs.iter().min(), seqs.iter().max()) else {
-                return Ok(());
-            };
-            let cur = cursor(tx, agent_id)?;
-            let now = now_ms();
-            if max_seq > cur {
-                tx.execute(
-                    "INSERT INTO mailbox_cursors (agent_id, delivered_seq) VALUES (?1, ?2)
-                     ON CONFLICT(agent_id) DO UPDATE SET delivered_seq = MAX(delivered_seq, ?2)",
-                    params![agent_id.as_str(), max_seq],
-                )?;
-                tx.execute(
-                    "UPDATE messages
-                     SET delivered_at_ms = COALESCE(delivered_at_ms, ?1)
-                     WHERE agent_id = ?2 AND seq > ?3 AND seq <= ?4",
-                    params![now, agent_id.as_str(), cur, max_seq],
-                )?;
-            }
-            let completed_floor = (min_seq - 1).max(0);
-            tx.execute(
-                "INSERT INTO turn_recovery (agent_id, opened_seq, completed_seq, recovery_count, opened_at_ms)
-                 VALUES (?1, ?2, ?3, 0, ?4)
-                 ON CONFLICT(agent_id) DO UPDATE SET
-                     opened_seq = MAX(turn_recovery.opened_seq, ?2),
-                     completed_seq = MIN(turn_recovery.completed_seq, ?3)",
-                params![agent_id.as_str(), max_seq, completed_floor, now],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Rewind mailbox delivery custody for mid-turn steered messages whose
-    /// execution became unconfirmed (e.g. cancelled before terminal commit).
-    pub fn reclaim_unconfirmed_steers(
-        &self,
-        agent_id: &AgentId,
-        message_ids: &[String],
-    ) -> Result<(), Error> {
-        if message_ids.is_empty() {
-            return Ok(());
-        }
-        self.write_tx(|tx| {
-            agent_exists(tx, agent_id)?;
-            let mut min_seq: Option<i64> = None;
-            for msg_id in message_ids {
-                if let Some(seq) = tx
-                    .query_row(
-                        "SELECT seq FROM messages
-                         WHERE agent_id = ?1 AND id = ?2 AND delivered_at_ms IS NOT NULL",
-                        params![agent_id.as_str(), msg_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?
-                {
-                    min_seq = Some(min_seq.map_or(seq, |cur| cur.min(seq)));
-                }
-            }
-            if let Some(first_reclaimed_seq) = min_seq {
-                let rewind_to = (first_reclaimed_seq - 1).max(0);
-                tx.execute(
-                    "UPDATE mailbox_cursors
-                     SET delivered_seq = MIN(delivered_seq, ?1)
-                     WHERE agent_id = ?2",
-                    params![rewind_to, agent_id.as_str()],
-                )?;
-                tx.execute(
-                    "UPDATE messages
-                     SET delivered_at_ms = NULL
-                     WHERE agent_id = ?1 AND seq >= ?2",
-                    params![agent_id.as_str(), first_reclaimed_seq],
-                )?;
-                tx.execute(
-                    "UPDATE turn_recovery
-                     SET opened_seq = MIN(opened_seq, ?1)
-                     WHERE agent_id = ?2",
-                    params![rewind_to, agent_id.as_str()],
-                )?;
-            }
-            Ok(())
-        })
-    }
-
     /// Set the internal communication and discovery scope (`"isolated"`, `"private"`, `"siblings"`, or `"public"`).
     pub fn set_agent_scope(&self, agent_id: &AgentId, scope: &str) -> Result<Agent, Error> {
         self.set_agent_scope_as(agent_id, scope, "system")
@@ -4634,11 +4633,170 @@ impl Store {
                  WHERE agent_id = ?1 AND completed_seq < opened_seq",
                 [agent_id.as_str()],
             )?;
+            turn_errors::end_run(tx, agent_id)?;
             Ok(())
         })
     }
 
     /// Record that one `[Recovery]` wake was delivered for `opened_seq`.
+    /// Park the next undelivered message as refused for good by the harness:
+    /// the cursor moves past it, no turn opens, and its reason is kept. An
+    /// agent sender is told once, in its own mailbox.
+    pub fn reject_message(
+        &self,
+        agent_id: &AgentId,
+        seq: i64,
+        reason: &str,
+    ) -> Result<RejectedMessage, Error> {
+        let rejected = self.write_tx(|tx| {
+            agent_exists(tx, agent_id)?;
+            let (message_id, sender): (String, Option<String>) = tx.query_row(
+                "SELECT id, sender FROM messages WHERE agent_id = ?1 AND seq = ?2",
+                params![agent_id.as_str(), seq],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            bump_delivered(tx, agent_id, seq)?;
+            let now = now_ms();
+            tx.execute(
+                "INSERT INTO rejected_messages (message_id, agent_id, seq, reason, rejected_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(message_id) DO NOTHING",
+                params![message_id, agent_id.as_str(), seq, reason, now],
+            )?;
+            Ok(RejectedMessage {
+                message_id,
+                agent_id: agent_id.clone(),
+                seq,
+                sender,
+                reason: reason.to_string(),
+                rejected_at_ms: now,
+                notified_at_ms: None,
+            })
+        })?;
+        // The message is parked either way; a notice that fails is sent again
+        // when the agent's delivery loop next starts.
+        if let Err(err) = self.notify_rejection(&rejected) {
+            eprintln!(
+                "anyagents: notice for parked message {}: {err}",
+                rejected.message_id
+            );
+        }
+        Ok(rejected)
+    }
+
+    /// Tell the sender of a parked message, once: the notice is keyed by the
+    /// message, and the parked row records that it was sent. A notice a crash
+    /// cut off is sent by `send_pending_rejection_notices`.
+    fn notify_rejection(&self, rejected: &RejectedMessage) -> Result<(), Error> {
+        if let Some(name) = rejected
+            .sender
+            .as_deref()
+            .and_then(|sender| sender.strip_prefix("agent:"))
+            && let Ok(sender) = self.agent_by_name(name)
+        {
+            let recipient = self
+                .agent(&rejected.agent_id)
+                .map(|agent| agent.name)
+                .unwrap_or_else(|_| rejected.agent_id.as_str().to_string());
+            let mut note = Incoming::new(format!(
+                "[Undeliverable] Your message anyagents-message:{} to {recipient} was refused by its harness and will not be delivered: {}",
+                rejected.message_id, rejected.reason
+            ));
+            note.sender = Some("anyagents".to_string());
+            note.source_key = Some(format!("anyagents:rejected:{}", rejected.message_id));
+            self.receive(&sender.id, note)?;
+        }
+        self.write_tx(|tx| {
+            tx.execute(
+                "UPDATE rejected_messages SET notified_at_ms = ?1 WHERE message_id = ?2",
+                params![now_ms(), rejected.message_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Send every notice for this agent's parked messages that a crash cut
+    /// off.
+    pub fn send_pending_rejection_notices(&self, agent_id: &AgentId) -> Result<(), Error> {
+        let pending: Vec<RejectedMessage> = self
+            .rejected_messages(agent_id)?
+            .into_iter()
+            .filter(|rejected| rejected.notified_at_ms.is_none())
+            .collect();
+        for rejected in pending {
+            self.notify_rejection(&rejected)?;
+        }
+        Ok(())
+    }
+
+    /// Put a parked message back in the mailbox: the same body, author and
+    /// origin, as a new message at the end, and the parked record removed.
+    /// Re-queueing the same parking twice adds it once.
+    pub fn requeue_rejected(&self, agent_id: &AgentId, message_id: &str) -> Result<Message, Error> {
+        let rejected_at_ms: Option<i64> = self
+            .read_conn()
+            .query_row(
+                "SELECT rejected_at_ms FROM rejected_messages
+                 WHERE agent_id = ?1 AND message_id = ?2",
+                params![agent_id.as_str(), message_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(rejected_at_ms) = rejected_at_ms else {
+            return Err(Error::Message(format!(
+                "{message_id} is not a parked message of this agent"
+            )));
+        };
+        let Some(original) = self.message(agent_id, message_id)? else {
+            return Err(Error::Message(format!("{message_id} is no longer stored")));
+        };
+        let incoming = Incoming {
+            text: original.text.clone(),
+            sender: original.sender.clone(),
+            source_time_ms: original.source_time_ms,
+            source_key: Some(format!("anyagents:requeue:{message_id}:{rejected_at_ms}")),
+            reply_to: original.reply_to.clone(),
+            quote: None,
+            origin: original.origin,
+            received_at_ms: None,
+        };
+        let message = match self.receive(agent_id, incoming)? {
+            ReceiveOutcome::New(message) | ReceiveOutcome::Duplicate(message) => message,
+        };
+        self.write_tx(|tx| {
+            tx.execute(
+                "DELETE FROM rejected_messages WHERE agent_id = ?1 AND message_id = ?2",
+                params![agent_id.as_str(), message_id],
+            )?;
+            Ok(())
+        })?;
+        Ok(message)
+    }
+
+    /// Messages the harness refused for good, oldest first.
+    pub fn rejected_messages(&self, agent_id: &AgentId) -> Result<Vec<RejectedMessage>, Error> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT r.message_id, r.seq, m.sender, r.reason, r.rejected_at_ms, r.notified_at_ms
+             FROM rejected_messages r LEFT JOIN messages m ON m.id = r.message_id
+             WHERE r.agent_id = ?1 ORDER BY r.seq",
+        )?;
+        let rows = stmt
+            .query_map([agent_id.as_str()], |row| {
+                Ok(RejectedMessage {
+                    message_id: row.get(0)?,
+                    agent_id: agent_id.clone(),
+                    seq: row.get(1)?,
+                    sender: row.get(2)?,
+                    reason: row.get(3)?,
+                    rejected_at_ms: row.get(4)?,
+                    notified_at_ms: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn note_turn_recovered(&self, agent_id: &AgentId, opened_seq: i64) -> Result<(), Error> {
         self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
@@ -4690,8 +4848,10 @@ impl Store {
             message_cols!(),
             " FROM messages
              WHERE agent_id = ?1 AND seq > ?2 AND seq <= ?3
+               AND id NOT IN (SELECT message_id FROM rejected_messages WHERE agent_id = ?1)
              ORDER BY seq ASC"
         ))?;
+        // A message the harness refused for good was never in any turn.
         let mut msg_rows = msg_stmt.query(params![agent_id.as_str(), completed_seq, opened_seq])?;
         let mut messages = Vec::new();
         while let Some(r) = msg_rows.next()? {
@@ -5253,6 +5413,12 @@ pub fn agent_config_dir(data_dir: &Path, id: &AgentId) -> PathBuf {
     data_dir.join("agents").join(id.as_str()).join("config")
 }
 
+/// `{data}/locks/{id}.lock`: the agent's process lock, held by whatever holds
+/// its vendor process (a delivery loop, a keeper).
+pub fn agent_lock_path(data_dir: &Path, id: &AgentId) -> PathBuf {
+    data_dir.join("locks").join(format!("{}.lock", id.as_str()))
+}
+
 fn open_roster_conn(data_dir: &Path) -> Option<ReadConn<'static>> {
     let db_path = data_dir.join("state.db");
     if !db_path.is_file() {
@@ -5787,6 +5953,17 @@ fn data_dir_for(path: &Path) -> PathBuf {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     }
+}
+
+/// `operator` addresses the operator's inbox in `send`, so no agent may hold
+/// that name, in any case.
+fn refuse_reserved_agent_name(name: &str) -> Result<(), Error> {
+    if name.eq_ignore_ascii_case("operator") {
+        return Err(Error::Message(
+            "`operator` is reserved for the operator's inbox and cannot name an agent".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_token(value: &str, what: &str) -> Result<(), Error> {
@@ -7910,6 +8087,86 @@ mod tests {
         (dir, store)
     }
 
+    #[test]
+    fn an_open_turn_never_quotes_a_message_parked_inside_it() {
+        let (_dir, store) = setup();
+        let bob = store.create_agent(NewAgent::new("bob", "codex")).unwrap();
+        let mut seqs = Vec::new();
+        for text in ["first", "refused", "third"] {
+            let ReceiveOutcome::New(message) = store.receive(&bob.id, Incoming::new(text)).unwrap()
+            else {
+                panic!("new message");
+            };
+            seqs.push(message);
+        }
+        store.note_delivered(&bob.id, seqs[0].seq).unwrap();
+        store
+            .reject_message(&bob.id, seqs[1].seq, "too large")
+            .unwrap();
+        store.note_delivered(&bob.id, seqs[2].seq).unwrap();
+        let open = store.open_turn(&bob.id).unwrap().expect("open turn");
+        let quoted: Vec<_> = open.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(quoted, [seqs[0].id.as_str(), seqs[2].id.as_str()]);
+    }
+
+    #[test]
+    fn a_rejected_message_is_parked_past_the_cursor_and_its_agent_sender_told_once() {
+        let (_dir, store) = setup();
+        let alice = store.create_agent(NewAgent::new("alice", "codex")).unwrap();
+        let bob = store.create_agent(NewAgent::new("bob", "codex")).unwrap();
+        let mut incoming = Incoming::new("a request bob's vendor cannot take");
+        incoming.sender = Some("agent:alice".into());
+        let ReceiveOutcome::New(message) = store.receive(&bob.id, incoming).unwrap() else {
+            panic!("new message");
+        };
+        let rejected = store
+            .reject_message(&bob.id, message.seq, "invalid params (-32602)")
+            .unwrap();
+        assert_eq!(rejected.message_id, message.id.as_str());
+        assert_eq!(store.delivered_cursor(&bob.id).unwrap(), message.seq);
+        // Parked, not delivered: it opened no turn.
+        assert!(store.open_turn(&bob.id).unwrap().is_none());
+        let parked = store.rejected_messages(&bob.id).unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].reason, "invalid params (-32602)");
+        assert_eq!(parked[0].sender.as_deref(), Some("agent:alice"));
+        assert!(parked[0].notified_at_ms.is_some(), "the notice is recorded");
+        // A notice already sent is not sent again.
+        store.send_pending_rejection_notices(&bob.id).unwrap();
+        let told = store.inbox(&alice.id, None).unwrap();
+        assert_eq!(told.len(), 1);
+        assert!(told[0].text.starts_with("[Undeliverable]"));
+        assert!(told[0].text.contains(message.id.as_str()));
+        assert!(told[0].text.contains("-32602"));
+        // A message that is not next in line is not parked.
+        assert!(store.reject_message(&bob.id, message.seq, "again").is_err());
+        assert_eq!(store.inbox(&alice.id, None).unwrap().len(), 1);
+        // Re-queued, it is a new message at the end of the mailbox, from the
+        // same author with the same body, and no longer parked.
+        let requeued = store
+            .requeue_rejected(&bob.id, message.id.as_str())
+            .unwrap();
+        assert!(requeued.seq > message.seq);
+        assert_eq!(requeued.text, message.text);
+        assert_eq!(requeued.sender.as_deref(), Some("agent:alice"));
+        assert_eq!(
+            store.next_undelivered(&bob.id).unwrap().unwrap().id,
+            requeued.id
+        );
+        assert!(store.rejected_messages(&bob.id).unwrap().is_empty());
+        assert!(
+            store
+                .requeue_rejected(&bob.id, message.id.as_str())
+                .is_err()
+        );
+        store
+            .reject_message(&bob.id, requeued.seq, "again")
+            .unwrap();
+        // Deleting the agent clears its parked rows.
+        store.delete_agent_by(&bob.id, "test").unwrap();
+        assert!(store.rejected_messages(&bob.id).unwrap().is_empty());
+    }
+
     fn agent(store: &Store, name: &str) -> Agent {
         store
             .create_agent(NewAgent::new(name, "claude-code"))
@@ -8831,10 +9088,56 @@ mod tests {
         let lock = store.try_lock_agent(&owner.id).unwrap();
         // A concurrent fork can inherit this open file description until exec.
         // A clone deterministically models that lifetime without timing a fork.
-        let inherited = lock._file.try_clone().unwrap();
+        let inherited = lock.file.try_clone().unwrap();
         drop(lock);
         let _next_turn = store.try_lock_agent(&owner.id).unwrap();
         drop(inherited);
+    }
+
+    #[test]
+    fn a_shared_copy_holds_the_lock_only_until_the_owner_releases_it() {
+        let (_dir, store) = setup();
+        let owner = agent(&store, "owner");
+        let lock = store.try_lock_agent(&owner.id).unwrap();
+        let keeper = lock.share().unwrap();
+        // A copy never unlocks: dropping it leaves the owner holding the lock.
+        drop(keeper);
+        assert!(matches!(
+            store.try_lock_agent(&owner.id),
+            Err(Error::AgentBusy)
+        ));
+        let keeper = lock.share().unwrap();
+        drop(lock);
+        // The owner released the open file description for every copy.
+        let _next = store.try_lock_agent(&owner.id).unwrap();
+        drop(keeper);
+    }
+
+    #[test]
+    fn a_retained_lock_stays_held_by_the_copy_a_keeper_keeps() {
+        let (_dir, store) = setup();
+        let owner = agent(&store, "owner");
+        let lock = store.try_lock_agent(&owner.id).unwrap();
+        let keeper = lock.share().unwrap();
+        let kernel_copy = lock.share().unwrap();
+        kernel_copy.retain();
+        drop(kernel_copy);
+        drop(lock);
+        // The keeper's descriptor still holds it after the kernel let go.
+        assert!(matches!(
+            store.try_lock_agent(&owner.id),
+            Err(Error::AgentBusy)
+        ));
+        // The next kernel adopts the keeper's descriptor and owns release.
+        let adopted =
+            AgentLock::adopt(std::os::fd::OwnedFd::from(keeper.file.try_clone().unwrap()));
+        drop(keeper);
+        assert!(matches!(
+            store.try_lock_agent(&owner.id),
+            Err(Error::AgentBusy)
+        ));
+        drop(adopted);
+        let _next = store.try_lock_agent(&owner.id).unwrap();
     }
 
     #[test]
@@ -8849,7 +9152,7 @@ mod tests {
             };
             // A duplicate shares the open file description inherited by fork,
             // even when the descriptor is close-on-exec. No fork timing needed.
-            let inherited = lock._file.try_clone().unwrap();
+            let inherited = lock.file.try_clone().unwrap();
             assert!(matches!(
                 store.try_lock_agent_lifecycle(&owner.id),
                 Err(Error::AgentBusy)
@@ -10741,7 +11044,7 @@ mod tests {
     }
 
     #[test]
-    fn steered_active_turn_advances_cursor_without_lag_and_reclaim_rewinds_custody() {
+    fn steered_active_turn_advances_cursor_without_lag() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store.create_agent(NewAgent::new("steered", "agy")).unwrap();
@@ -10771,24 +11074,6 @@ mod tests {
         );
         let open = store.open_turn(&agent.id).unwrap().unwrap();
         assert_eq!(open.messages.first().unwrap().received_at_ms, 1_000);
-
-        store
-            .reclaim_unconfirmed_steers(&agent.id, &[steer.id.to_string()])
-            .unwrap();
-        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), first.seq);
-        assert!(store.has_open_turn(&agent.id).unwrap());
-        assert_eq!(
-            store.next_undelivered(&agent.id).unwrap().unwrap().id,
-            steer.id
-        );
-        assert!(
-            store
-                .message(&agent.id, steer.id.as_str())
-                .unwrap()
-                .unwrap()
-                .delivered_at_ms
-                .is_none()
-        );
     }
     #[test]
     fn concurrent_turn_completion_never_sees_database_locked() {
@@ -11174,16 +11459,10 @@ mod tests {
         let db = dir.path().join("state.db");
         let worker = agent(&store, "recovery-lock-wait");
         store.set_agent_running(&worker.id, "/work").unwrap();
-        let mut ids: Vec<String> = Vec::new();
         for i in 1..=6 {
-            let out = store
+            store
                 .receive(&worker.id, Incoming::new(format!("task {i}")))
                 .unwrap();
-            let id = match out {
-                ReceiveOutcome::New(m) => m.id.to_string(),
-                ReceiveOutcome::Duplicate(m) => m.id.to_string(),
-            };
-            ids.push(id);
         }
         store.note_delivered(&worker.id, 1).unwrap();
         assert!(store.has_open_turn(&worker.id).unwrap());
@@ -11221,26 +11500,6 @@ mod tests {
         assert!(store.has_open_turn(&worker.id).unwrap());
         peer.join().unwrap();
 
-        // promote_messages_to_open_turn: reconciled external holds.
-        let started = std::time::Instant::now();
-        let peer = hold_writer_lock(&db, Duration::from_millis(400));
-        let promote_ids: Vec<String> = vec![ids[3].clone(), ids[4].clone()];
-        store
-            .promote_messages_to_open_turn(&worker.id, &promote_ids)
-            .unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(350));
-        assert!(store.has_open_turn(&worker.id).unwrap());
-        peer.join().unwrap();
-
-        // reclaim_unconfirmed_steers: rewind custody for unconfirmed steers.
-        let started = std::time::Instant::now();
-        let peer = hold_writer_lock(&db, Duration::from_millis(400));
-        let reclaim_ids: Vec<String> = vec![ids[2].clone()];
-        store
-            .reclaim_unconfirmed_steers(&worker.id, &reclaim_ids)
-            .unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(350));
-        peer.join().unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "budget bounds the wait"
@@ -11253,16 +11512,10 @@ mod tests {
         let db = dir.path().join("state.db");
         let worker = agent(&store, "recovery-lock-budget");
         store.set_agent_running(&worker.id, "/work").unwrap();
-        let mut ids: Vec<String> = Vec::new();
         for i in 1..=3 {
-            let out = store
+            store
                 .receive(&worker.id, Incoming::new(format!("task {i}")))
                 .unwrap();
-            let id = match out {
-                ReceiveOutcome::New(m) => m.id.to_string(),
-                ReceiveOutcome::Duplicate(m) => m.id.to_string(),
-            };
-            ids.push(id);
         }
         store.note_delivered(&worker.id, 1).unwrap();
         store
@@ -11274,8 +11527,6 @@ mod tests {
         let recovered = store.note_turn_recovered(&worker.id, 1);
         let advanced: Result<(), Error> = store.advance_delivered(&worker.id, 2).map(|_| ());
         let noted = store.note_delivered(&worker.id, 2);
-        let promoted = store.promote_messages_to_open_turn(&worker.id, &[ids[1].clone()]);
-        let reclaimed = store.reclaim_unconfirmed_steers(&worker.id, &[ids[0].clone()]);
         let elapsed = started.elapsed();
         peer.join().unwrap();
 
@@ -11283,8 +11534,6 @@ mod tests {
             ("note_turn_recovered", recovered),
             ("advance_delivered", advanced),
             ("note_delivered", noted),
-            ("promote", promoted),
-            ("reclaim", reclaimed),
         ] {
             let err = res.expect_err(&format!("{name} must surface lock after budget"));
             assert!(
@@ -11342,30 +11591,6 @@ mod tests {
             assert!(
                 started.elapsed() < Duration::from_millis(200),
                 "note_delivered must not retry"
-            );
-        }
-        {
-            let started = std::time::Instant::now();
-            let result = store.promote_messages_to_open_turn(&missing, &["x".to_string()]);
-            assert!(
-                matches!(result, Err(Error::AgentNotFound(_))),
-                "promote: {result:?}"
-            );
-            assert!(
-                started.elapsed() < Duration::from_millis(200),
-                "promote must not retry"
-            );
-        }
-        {
-            let started = std::time::Instant::now();
-            let result = store.reclaim_unconfirmed_steers(&missing, &["x".to_string()]);
-            assert!(
-                matches!(result, Err(Error::AgentNotFound(_))),
-                "reclaim: {result:?}"
-            );
-            assert!(
-                started.elapsed() < Duration::from_millis(200),
-                "reclaim must not retry"
             );
         }
     }

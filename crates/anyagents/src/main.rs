@@ -7,6 +7,7 @@ use anyagents_core::Error;
 use clap::{Args, Parser, Subcommand};
 
 mod agent;
+mod agent_file;
 mod api;
 mod auth;
 mod browser;
@@ -24,12 +25,15 @@ mod harness_double;
 mod host_memory;
 mod identity;
 mod install;
+mod keeper;
 mod mcp;
 mod mcp_config;
 mod memory_service;
 mod muse_config;
 mod opencode_config;
 mod operator;
+mod outbound;
+mod remote;
 mod reply;
 mod sandbox;
 mod sandbox_exec;
@@ -207,10 +211,15 @@ enum Command {
     /// Resume an archived or paused agent (`state = running`) and optionally send a task prompt.
     Resume {
         /// Agent name or `agt_...` id.
-        name: String,
+        #[arg(required_unless_present = "faulted")]
+        name: Option<String>,
         /// Optional task/message to deliver immediately after waking.
         #[arg(long)]
         prompt: Option<String>,
+        /// Resume every agent parked as `faulted` (its own session's errors
+        /// paused it), once its cause is fixed. Operator only.
+        #[arg(long, conflicts_with_all = ["name", "prompt"])]
+        faulted: bool,
     },
     /// Permanently delete an agent and its on-disk directory.
     Delete {
@@ -241,7 +250,7 @@ enum Command {
     },
     /// Send a message, media file, GPS location/venue, or poll to one or more agents, groups, or channels.
     Send {
-        /// Target(s): `agent:<name>`, bare name, comma-separated names (`planner,builder`), `parent`, `children`, `group:<name>`, `all`, or `telegram:chat:<id>[:<topic>]`.
+        /// Target(s): `agent:<name>`, bare name, comma-separated names (`planner,builder`), `parent`, `children`, `group:<name>`, `all`, `operator`, or `telegram:chat:<id>[:<topic>]`.
         to: String,
         /// Message text or caption (optional when sending media, location, or poll).
         #[arg(default_value = "")]
@@ -458,6 +467,11 @@ enum Command {
     /// The deployment's boundary contract: what an agent may read, and what it
     /// may write.
     Boundary,
+    /// The keepers that hold harness processes across server restarts.
+    Keepers {
+        #[command(subcommand)]
+        action: KeepersCommand,
+    },
     /// Test double for a streaming vendor. It prints text and no result line,
     /// and records its argv and stdin when `ANYAGENTS_FAKE_LOG` names a file.
     #[command(hide = true)]
@@ -484,6 +498,14 @@ enum Command {
     Flush {
         /// The agent name, or `all`.
         agent: String,
+    },
+    /// List the messages an agent's harness refused for good, or put one
+    /// back in its mailbox as a new message.
+    Requeue {
+        /// The agent name.
+        agent: String,
+        /// A parked message id (`msg_...`). Without it, list the parked ones.
+        message: Option<String>,
     },
     /// Record a channel. The secret is copied into the credential store.
     Channels {
@@ -604,6 +626,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Sent messages whose delivery could not be confirmed (a timeout, a
+    /// dropped connection, a post cut short). None is resent automatically:
+    /// list them, send one again, or settle it without sending. Operator only.
+    Outbound {
+        #[command(subcommand)]
+        action: Option<OutboundCommand>,
+        /// Output machine-readable JSON.
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// Inspect an agent's live state, schedules, quota/block status, and recent conversation turns.
     Inspect {
         /// Agent name or `agt_...` ID (defaults to `self` inside an agent).
@@ -627,6 +659,24 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum OutboundCommand {
+    /// List every unconfirmed send (the default).
+    List,
+    /// Send one again, as its agent and to its destination. The record
+    /// closes with the new receipt only when that send succeeds.
+    Retry {
+        /// The key `list` shows.
+        key: String,
+    },
+    /// Settle one without sending it: the recipient already has it, or it is
+    /// no longer wanted.
+    Discard {
+        /// The key `list` shows.
+        key: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum GroupsCommand {
     /// Add an agent to a named group, creating the group if it is new.
     Join {
@@ -644,6 +694,27 @@ enum GroupsCommand {
     Members { group: String },
     /// List all named groups and their members.
     List,
+}
+
+#[derive(Subcommand)]
+enum KeepersCommand {
+    /// List every keeper: its agent, its harness process and the binary it runs.
+    List,
+    /// End keepers and their harness processes: one agent's, or all of them.
+    /// A running server starts a running agent's harness again in a new
+    /// keeper; use this before rolling back to a binary without keepers.
+    Stop {
+        /// Agent name or `agt_...` id.
+        agent: Option<String>,
+        /// Every keeper.
+        #[arg(long, conflicts_with = "agent")]
+        all: bool,
+        /// Also end a keeper that does not answer while its process runs
+        /// (its socket is gone, or it is wedged), by signal, once its
+        /// recorded identity proves the process is that keeper.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -774,6 +845,10 @@ struct SearchArgs {
 #[derive(Args, Clone, Debug)]
 struct InboxArgs {
     agent: Option<String>,
+    /// Read the operator's inbox: what agents reported with `send operator`.
+    /// Only the operator may.
+    #[arg(long, conflicts_with_all = ["agent", "unread", "sender"])]
+    operator: bool,
     /// Exclusive mailbox sequence cursor.
     #[arg(long)]
     since: Option<i64>,
@@ -874,6 +949,14 @@ enum AgentsCommand {
     GrantAdmin { agent: String },
     /// Revoke administrative authority immediately (operator only).
     RevokeAdmin { agent: String },
+    /// End an agent's remote (cloud) sessions now: every token of each stops authenticating on its next call (operator or root admin).
+    RevokeRemote {
+        /// Agent name or `agt_...` ID.
+        agent: String,
+        /// Only this remote session (`rs_...`); all of the agent's sessions when omitted.
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Rename an agent in place while preserving its `agt_...` ID, history, mailbox, grants, seat, and Telegram binding, and keeping the old name as a live alias.
     Rename {
         /// Current agent name or `agt_...` ID.
@@ -987,8 +1070,15 @@ fn main() -> ExitCode {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv.get(1).is_some_and(|arg| arg == "internal") {
+        return internal(&argv[2..]);
+    }
     sandbox::hydrate_operator_groups_if_needed();
     let raw_argv: Vec<String> = std::env::args().collect();
+    if let Some(code) = keeper::try_run(&raw_argv) {
+        return ExitCode::from(u8::try_from(code).unwrap_or(1));
+    }
     if let Some(cloud_args) = cloud_harness::try_parse_from_raw_argv(&raw_argv) {
         return match cloud_harness::run(cloud_args) {
             Ok(()) => ExitCode::SUCCESS,
@@ -1022,6 +1112,21 @@ fn main() -> ExitCode {
         Err(err) => {
             eprintln!("{err}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Helpers AnyAgents runs as itself, never commands for an operator. They
+/// start before any deployment setup: no data directory, no group hydration,
+/// no inherited state beyond what the caller passed.
+fn internal(args: &[std::ffi::OsString]) -> ExitCode {
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("admission-probe") => worktree_access::admission_probe_main(&args[1..]),
+        Some("seat-file") => seat_tree::seat_file_main(&args[1..]),
+        Some("browser-jail") => browser::jail::main(&args[1..]),
+        _ => {
+            eprintln!("anyagents internal: unknown helper");
+            ExitCode::from(2)
         }
     }
 }
@@ -1067,6 +1172,17 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Mcp { config, profile } => mcp::run(&data, config.as_deref(), profile),
         Command::AgentRun { config, command } => sandbox::run(&data, config.as_deref(), &command),
         Command::Boundary => print_boundary(&data),
+        Command::Keepers { action } => match action {
+            KeepersCommand::List => keeper::list(&data),
+            KeepersCommand::Stop { agent, all, force } => {
+                if agent.is_none() && !all {
+                    return Err(anyagents_core::Error::Message(
+                        "name an agent, or pass --all".into(),
+                    ));
+                }
+                keeper::stop(&data, agent.as_deref(), force)
+            }
+        },
         Command::FakeOpencode => fake_opencode::run(),
         Command::Harness {
             config,
@@ -1190,9 +1306,13 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Archive { name } => agent::archive_cmd(&data, name),
         Command::Pause { name } => agent::pause_cmd(&data, name),
         Command::Wake { name, prompt } => agent::resume_cmd(&data, &name, prompt),
-        Command::Resume { name, prompt } => agent::resume_cmd(&data, &name, prompt),
+        Command::Resume { faulted: true, .. } => agent::resume_faulted(&data),
+        Command::Resume { name, prompt, .. } => {
+            agent::resume_cmd(&data, name.as_deref().unwrap_or_default(), prompt)
+        }
         Command::Delete { name } => agent::delete_cmd(&data, &name),
         Command::Flush { agent } => agent::flush(&data, &agent),
+        Command::Requeue { agent, message } => agent::requeue(&data, &agent, message.as_deref()),
         Command::Model {
             agent,
             target_model,
@@ -1493,6 +1613,11 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             json,
         } => schedule_cmd(&data, agent, at, every, watch, prompt, cancel, json),
         Command::Inspect { agent, limit, json } => inspect_cmd(&data, agent, limit, json),
+        Command::Outbound { action, json } => match action.unwrap_or(OutboundCommand::List) {
+            OutboundCommand::List => outbound::list(&data, json),
+            OutboundCommand::Retry { key } => outbound::retry(&data, &key, json),
+            OutboundCommand::Discard { key } => outbound::discard(&data, &key, json),
+        },
         Command::CloudHarness(args) => cloud_harness::run(args),
         Command::SandboxExec(args) => sandbox_exec::run(args),
         Command::MemoryService(args) => memory_service::run(&data, args),
@@ -1701,11 +1826,42 @@ fn inspect_cmd(data: &Path, agent: Option<String>, limit: usize, json: bool) -> 
             view.has_open_turn,
             view.profile.as_deref().unwrap_or("default")
         );
+        println!(
+            "Delivery: {} ({}){}",
+            view.delivery.label(),
+            view.delivery.proof,
+            view.delivery
+                .peer
+                .as_deref()
+                .map_or_else(String::new, |peer| format!("   Peer: {peer}"))
+        );
         for schedule in &view.schedules {
             println!("  {} {}: {}", schedule.kind, schedule.spec, schedule.prompt);
         }
         if let Some(error) = &view.last_error {
             println!("Error: {error}");
+        }
+        if let Some(errors) = &view.turn_errors {
+            println!(
+                "Errored turns: {} in a row (parked at {}){}",
+                errors.streak,
+                errors.limit,
+                errors.faulted_at_ms.map_or_else(String::new, |ms| format!(
+                    "   Faulted since {} UTC: resume to clear",
+                    ui::format_timestamp_ms(ms)
+                ))
+            );
+        }
+        for held in &view.unsettled_outbound {
+            println!(
+                "Unconfirmed send {} to {} since {} UTC (anyagents outbound retry|discard {}): {}",
+                held.key,
+                held.destination,
+                held.since_ms
+                    .map_or_else(|| "-".to_string(), ui::format_timestamp_ms),
+                held.key,
+                held.excerpt
+            );
         }
         channel::emit_turns(&turns, true, false)?;
     }
@@ -1836,11 +1992,14 @@ fn browser_cmd(
                     "the server answered nothing".into(),
                 ));
             }
-            Err(err) if err.contains("404") => browser::execute(data, "default", req)?,
+            // This process runs the browser itself, as its own user.
+            Err(err) if err.contains("404") => {
+                browser::execute(data, "default", req, &agent_file::FileAuthority::Own)?
+            }
             Err(err) => return Err(anyagents_core::Error::Message(err)),
         }
     } else {
-        browser::execute(data, "default", req)?
+        browser::execute(data, "default", req, &agent_file::FileAuthority::Own)?
     };
     println!(
         "{}",
@@ -2645,6 +2804,10 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let public_addr = std::fs::read_to_string(data.join("public.addr"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let boundary = sandbox::boundary_of(data).ok();
     let has_operator_token = operator::operator_token(data).is_some();
 
@@ -2660,7 +2823,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         let bin_path = install::program(data, &entry.id);
         let present = install::is_healthy(data, &entry.id) || bin_path.is_file();
         let version = install::recorded_version(data, &entry.id);
-        let (mode, steer) = anyagents_supervisor::declared(&entry.id);
+        let delivery = api::DeliveryView::from(&vendor::declared_delivery(&entry.id));
         let profiles: Vec<String> = provider_profiles
             .iter()
             .filter(|p| p.compatible_harnesses.iter().any(|h| h == &entry.id))
@@ -2671,8 +2834,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             "installed": present,
             "version": version,
             "binary": bin_path.display().to_string(),
-            "delivery_mode": anyagents_supervisor::mode_name(mode),
-            "steer_support": anyagents_supervisor::steer_name(steer),
+            "delivery": delivery,
             "profiles": profiles,
         }));
     }
@@ -2683,17 +2845,37 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
     };
     let archived_count = listed.archived_count;
     let agents_list = listed.agents;
+    // What needs the operator: agents parked after errored turns, and sends
+    // whose delivery is unconfirmed (held, never resent automatically).
+    let faulted: Vec<&api::AgentView> = agents_list
+        .iter()
+        .filter(|agent| agent.display_state() == "faulted")
+        .collect();
+    let unsettled: Vec<&api::UnsettledOutboundView> = agents_list
+        .iter()
+        .flat_map(|agent| agent.unsettled_outbound.iter())
+        .collect();
 
     if json_out {
         let doc = serde_json::json!({
             "server": if server_up { "running" } else { "stopped" },
             "socket": sock.display().to_string(),
             "webhook_addr": webhook_addr,
+            "public_addr": public_addr,
             "operator_token_present": has_operator_token,
             "boundary": boundary,
             "harnesses": harness_rows,
             "agents": agents_list,
             "archived_count": archived_count,
+            "attention": {
+                "faulted": faulted.iter().map(|agent| serde_json::json!({
+                    "id": agent.id,
+                    "name": agent.name,
+                    "parent": agent.parent,
+                    "turn_errors": agent.turn_errors,
+                })).collect::<Vec<_>>(),
+                "unsettled_outbound": unsettled,
+            },
         });
         println!(
             "{}",
@@ -2732,7 +2914,6 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             ("STATUS", false),
             ("VERSION", false),
             ("DELIVERY", false),
-            ("STEER", false),
             ("PROFILES", false),
         ]);
         for h in &harness_rows {
@@ -2748,8 +2929,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             } else {
                 ver.to_string()
             };
-            let mode = h["delivery_mode"].as_str().unwrap_or("-");
-            let steer = h["steer_support"].as_str().unwrap_or("-");
+            let delivery = delivery_label(&h["delivery"]);
             let profs = h["profiles"]
                 .as_array()
                 .map(|arr| {
@@ -2765,8 +2945,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                 ui::bold(&ui::cyan(id)),
                 inst,
                 ver_cell,
-                mode.to_string(),
-                steer.to_string(),
+                delivery,
                 profs,
             ]);
         }
@@ -2781,6 +2960,32 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                 .unwrap_or_else(|| "default".to_string())
         };
         ui::print_agents_table(&agents_list, Some(&profile_lookup), false);
+        if !faulted.is_empty() || !unsettled.is_empty() {
+            println!("\n  {}\n", ui::bold_cyan("Attention"));
+            for agent in &faulted {
+                println!(
+                    "  {} {} {}",
+                    ui::red("◐ faulted"),
+                    ui::bold(&agent.name),
+                    ui::dim(
+                        agent
+                            .turn_errors
+                            .as_ref()
+                            .and_then(|errors| errors.last_error.as_deref())
+                            .unwrap_or("-")
+                    )
+                );
+            }
+            for held in &unsettled {
+                println!(
+                    "  {} {} → {} {}",
+                    ui::yellow("? unconfirmed send"),
+                    held.key,
+                    held.destination,
+                    ui::dim("(anyagents outbound retry|discard <key>)")
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -2803,8 +3008,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         } else {
             "on-demand"
         };
-        let mode = h["delivery_mode"].as_str().unwrap_or("-");
-        let steer = h["steer_support"].as_str().unwrap_or("-");
+        let delivery = delivery_label(&h["delivery"]);
         let profs = h["profiles"]
             .as_array()
             .map(|arr| {
@@ -2816,7 +3020,28 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                 }
             })
             .unwrap_or_else(|| "auto".to_string());
-        println!("  {id}\t{inst}\tdelivery={mode}\tsteer={steer}\tprofiles={profs}");
+        println!("  {id}\t{inst}\tdelivery={delivery}\tprofiles={profs}");
+    }
+    for agent in &faulted {
+        println!(
+            "attention\tfaulted\t{}\t{}\t{}",
+            agent.name,
+            agent.id,
+            agent
+                .turn_errors
+                .as_ref()
+                .and_then(|errors| errors.last_error.as_deref())
+                .unwrap_or("-")
+        );
+    }
+    for held in &unsettled {
+        println!(
+            "attention\tunconfirmed_send\t{}\t{}\t{}\t{}",
+            held.key,
+            held.agent_id,
+            held.destination,
+            held.error.as_deref().unwrap_or("-")
+        );
     }
     let running_count = agents_list.iter().filter(|a| a.state == "running").count();
     let archived_count = agents_list.iter().filter(|a| a.state == "archived").count();
@@ -2831,11 +3056,24 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             .and_then(|id| create::bound_profile_name(&anyagents_core::agent_config_dir(data, id)))
             .unwrap_or_else(|| "default".to_string());
         println!(
-            "  {}\t{}\tharness={}\tprofile={prof}\tstate={}\tprocess={}\tmode={}",
-            a.name, a.id, a.harness, a.state, a.process, a.delivery_mode
+            "  {}\t{}\tharness={}\tprofile={prof}\tstate={}\tprocess={}\tdelivery={}",
+            a.name,
+            a.id,
+            a.harness,
+            a.state,
+            a.process,
+            a.delivery.label()
         );
     }
     Ok(())
+}
+
+/// The delivery column of one harness row: its level, `+idempotent` when a
+/// replay is recognised.
+fn delivery_label(value: &serde_json::Value) -> String {
+    serde_json::from_value::<api::DeliveryView>(value.clone())
+        .map(|delivery| delivery.label())
+        .unwrap_or_else(|_| "-".to_string())
 }
 
 fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Error> {
@@ -2999,6 +3237,18 @@ mod cli_query_tests {
                 Command::Peers { .. }
             ));
         }
+        // `resume` takes a name, or `--faulted` for every parked agent.
+        let faulted = Cli::try_parse_from(["anyagents", "resume", "--faulted"]).unwrap();
+        assert!(matches!(
+            faulted.command,
+            Command::Resume {
+                faulted: true,
+                name: None,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["anyagents", "resume"]).is_err());
+        assert!(Cli::try_parse_from(["anyagents", "resume", "vulcan", "--faulted"]).is_err());
         let inspected = Cli::try_parse_from(["anyagents", "inspect", "vulcan", "-n", "5"]).unwrap();
         assert!(matches!(
             inspected.command,

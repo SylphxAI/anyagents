@@ -1,6 +1,6 @@
 # 0002: Capability identity and runtime boundaries across local, container and cluster deployments
 
-Status: accepted. Date: 2026-10-23.
+Status: superseded on 2026-11-14 by [0009](0009-product-boundary.md) and [0010](0010-execution-identity-and-trust.md). Date: 2026-10-23.
 
 ## Context
 

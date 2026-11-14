@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
-    Context, DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnState,
+    Context, DeliverOutcome, DeliveryLevel, Harness, OutboundMessage, TurnState,
 };
 use anyagents_harness_claude::ClaudeHarness;
 use tempfile::TempDir;
@@ -41,6 +41,19 @@ fn read_log(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+/// Offer `id` the way the delivery loop does until Claude Code proves it
+/// entered the conversation.
+fn taken(harness: &mut ClaudeHarness, id: &str) -> DeliverOutcome {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let outcome = harness.deliver(&msg(id)).unwrap();
+        if outcome != DeliverOutcome::InFlight || Instant::now() > deadline {
+            return outcome;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn wait_log(path: &Path, needle: &str) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -56,13 +69,11 @@ fn wait_log(path: &Path, needle: &str) -> bool {
 fn finish_records_usage_and_dedupes() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "finish", None);
-    let first = harness.deliver(&msg("m1")).unwrap();
-    assert!(matches!(
-        first,
-        DeliverOutcome::Accepted {
-            turn_finished: false
-        }
-    ));
+    let first = taken(&mut harness, "m1");
+    assert!(
+        matches!(first, DeliverOutcome::Accepted { .. }),
+        "{first:?}"
+    );
     assert!(harness.wait_finished("m1", Duration::from_secs(5)));
     let usage = harness.usage_for("m1").expect("usage");
     assert_eq!(usage.input_tokens, 11);
@@ -72,10 +83,8 @@ fn finish_records_usage_and_dedupes() {
     assert_eq!(usage.reported_cost_micros, Some(500_000));
     assert_eq!(harness.session_id().as_deref(), Some("sess-from-vendor"));
     let health = harness.health();
-    // Claude Code reads a stream-json `user` line mid-turn, so the catalog
-    // steers rather than following up.
-    assert_eq!(health.delivery_mode, DeliveryMode::Steer);
-    assert_eq!(health.steer_support, SteerSupport::Yes);
+    // Claude Code proves each line entered the conversation, by its uuid.
+    assert_eq!(health.delivery.level, DeliveryLevel::NextStep);
     let again = harness.deliver(&msg("m1")).unwrap();
     assert!(matches!(
         again,
@@ -120,12 +129,29 @@ fn hold_keeps_one_turn_open() {
 }
 
 #[test]
-fn batch_promotes_the_followup() {
+fn a_line_proved_before_the_result_finishes_with_the_running_turn() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "batch", None);
     harness.deliver(&msg("m1")).unwrap();
     harness.deliver(&msg("m2")).unwrap();
+    assert!(harness.wait_finished("m2", Duration::from_secs(5)));
+    assert!(harness.is_finished("m1"));
+    assert_eq!(harness.turns_started(), 1, "a step folded m2 into the turn");
+    assert!(harness.usage_for("m1").is_some());
+    assert_eq!(harness.health().turn_state, TurnState::Idle);
+}
+
+#[test]
+fn a_line_still_queued_when_the_turn_ends_starts_the_next_turn() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "batch_late", None);
+    assert!(matches!(
+        taken(&mut harness, "m1"),
+        DeliverOutcome::Accepted { .. }
+    ));
+    harness.deliver(&msg("m2")).unwrap();
     assert!(harness.wait_finished("m1", Duration::from_secs(5)));
+    assert!(harness.wait_consumed("m2", Duration::from_secs(5)));
     assert!(!harness.is_finished("m2"));
     assert_eq!(harness.turns_started(), 2);
     assert!(harness.usage_for("m1").is_some());
@@ -173,6 +199,7 @@ fn interrupt_clears_the_open_turn() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "hold", None);
     harness.deliver(&msg("m1")).unwrap();
+    assert!(harness.wait_consumed("m1", Duration::from_secs(5)));
     harness.cancel().unwrap();
     let log = log_path(&dir);
     assert!(wait_log(&log, "control_request"));
@@ -186,7 +213,7 @@ fn resume_relaunches_with_the_session_and_keeps_seen() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "hold", None);
     harness.deliver(&msg("m1")).unwrap();
-    assert!(wait_log(&log_path(&dir), "anyagents-message:m1"));
+    assert!(harness.wait_consumed("m1", Duration::from_secs(5)));
     harness.resume("sess-1").unwrap();
     assert!(wait_log(&log_path(&dir), "--resume sess-1"));
     harness.deliver(&msg("m1")).unwrap();
@@ -207,20 +234,55 @@ fn launch_passes_resume_when_a_session_is_known() {
 }
 
 #[test]
-fn echoed_id_is_not_written_again() {
+fn a_line_the_resumed_transcript_holds_is_a_duplicate_and_not_written() {
     let dir = TempDir::new().unwrap();
-    let mut harness = start(&dir, "echo", None);
-    assert!(harness.wait_seen("echoed", Duration::from_secs(5)));
-    harness.deliver(&msg("echoed")).unwrap();
+    let config = dir.path().join("claude");
+    let project = config.join("projects").join("-work");
+    std::fs::create_dir_all(&project).unwrap();
+    // A prompt row and a line an earlier process folded in mid-turn.
+    std::fs::write(
+        project.join("sess-7.jsonl"),
+        concat!(
+            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"text","text":"anyagents-message:prior\nhello"}]}}"#,
+            "\n",
+            r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":[{"type":"text","text":"anyagents-message:folded\nmore"}],"source_uuid":"u2"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"anyagents-message:tool\nnot input"}]}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let log = log_path(&dir);
+    let config = config.display().to_string();
+    let mut harness = ClaudeHarness::start(
+        env!("CARGO_BIN_EXE_fake_claude"),
+        Some("sess-7"),
+        &[
+            ("ANYAGENTS_FAKE_MODE", "hold"),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("CLAUDE_CONFIG_DIR", config.as_str()),
+        ],
+    )
+    .unwrap();
+    for id in ["prior", "folded"] {
+        assert_eq!(
+            harness.deliver(&msg(id)).unwrap(),
+            DeliverOutcome::Duplicate
+        );
+    }
     assert!(harness.written_ids().is_empty());
-    assert!(!read_log(&log_path(&dir)).contains("echoed"));
+    // Tool output that happens to start with the marker is not input.
+    assert_eq!(
+        harness.deliver(&msg("tool")).unwrap(),
+        DeliverOutcome::InFlight
+    );
 }
 
 #[test]
 fn an_errored_result_is_a_failed_turn_with_no_usage() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "failed_turn", None);
-    harness.deliver(&msg("m1")).unwrap();
+    taken(&mut harness, "m1");
     assert!(
         harness.wait_finished("m1", Duration::from_secs(5)),
         "the errored result is still the end of its turn"
@@ -232,16 +294,16 @@ fn an_errored_result_is_a_failed_turn_with_no_usage() {
     assert!(reason.contains("error_during_execution"), "{reason}");
     assert!(reason.contains("Invalid API key"), "{reason}");
     assert_eq!(harness.health().turn_state, TurnState::Idle);
-    // Handing the failed message back writes it once more, because the turn that
-    // succeeds has to carry it; the replay starts a second turn.
-    assert!(
-        matches!(
-            harness.deliver(&msg("m1")).unwrap(),
-            DeliverOutcome::Accepted { .. }
-        ),
-        "the hand-over is accepted"
+    // It entered the conversation before its turn failed: it is taken, and
+    // the failed turn is the supervisor's to recover, not a second write.
+    assert_eq!(
+        harness.deliver(&msg("m1")).unwrap(),
+        DeliverOutcome::Accepted {
+            turn_finished: true
+        }
     );
-    assert_eq!(harness.turns_started(), 2);
+    assert_eq!(harness.turns_started(), 1);
+    assert_eq!(harness.written_ids(), ["m1"]);
 }
 
 #[test]
@@ -260,25 +322,22 @@ fn the_child_is_asked_to_replay_the_lines_it_reads() {
 
 #[test]
 fn three_lines_written_while_a_turn_is_open_are_all_taken_by_the_running_stream() {
-    // The child holds its turn open and echoes every line it reads. All three
-    // mailbox lines must reach it mid-turn: the adapter writes each one the
-    // moment it arrives, and the child's echo proves the running conversation
-    // took it. None is written twice, and no line waits for the turn to end.
+    // The child holds its turn open and proves every line it folds in. All
+    // three mailbox lines reach it mid-turn, each written once, and each is
+    // taken only on its proof.
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "steer", Some("sess-1"));
-    assert_eq!(harness.health().delivery_mode, DeliveryMode::Steer);
-    assert_eq!(harness.health().steer_support, SteerSupport::Yes);
+    assert_eq!(harness.health().delivery.level, DeliveryLevel::NextStep);
+    for id in ["m1", "m2", "m3"] {
+        assert_ne!(harness.deliver(&msg(id)).unwrap(), DeliverOutcome::Deferred);
+    }
     for id in ["m1", "m2", "m3"] {
         assert_eq!(
-            harness.deliver(&msg(id)).unwrap(),
+            taken(&mut harness, id),
             DeliverOutcome::Accepted {
                 turn_finished: false
             },
             "{id} is taken without waiting for a turn to end"
-        );
-        assert!(
-            harness.wait_echoed(id, Duration::from_secs(5)),
-            "{id} was not read by the running stream"
         );
     }
     assert_eq!(
@@ -286,10 +345,6 @@ fn three_lines_written_while_a_turn_is_open_are_all_taken_by_the_running_stream(
         1,
         "one running turn took all three"
     );
-    // A replay of any of them writes nothing.
-    for id in ["m1", "m2", "m3"] {
-        harness.deliver(&msg(id)).unwrap();
-    }
     assert_eq!(
         harness.written_ids(),
         vec!["m1".to_string(), "m2".to_string(), "m3".to_string()]
@@ -301,6 +356,7 @@ fn three_lines_written_while_a_turn_is_open_are_all_taken_by_the_running_stream(
             1,
             "{id} is written exactly once: {text}"
         );
+        assert!(text.contains(&anyagents_harness_claude::uuid_for(id)));
     }
     drop(harness);
 }
@@ -313,71 +369,119 @@ fn a_line_written_into_an_idle_stream_is_marked_idle_and_one_mid_turn_is_not() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "steer", Some("sess-1"));
     harness.deliver(&msg("m1")).unwrap();
-    assert!(harness.wait_echoed("m1", Duration::from_secs(5)));
+    assert!(harness.wait_consumed("m1", Duration::from_secs(5)));
     assert_eq!(harness.phase_of("m1"), Some("idle"));
     harness.deliver(&msg("m2")).unwrap();
-    assert!(harness.wait_echoed("m2", Duration::from_secs(5)));
+    assert!(harness.wait_consumed("m2", Duration::from_secs(5)));
     assert_eq!(harness.phase_of("m2"), Some("turn"));
     assert_eq!(harness.turns_started(), 1);
 }
 
 #[test]
-fn a_line_steered_mid_turn_is_echoed_and_never_written_twice() {
+fn a_line_steered_mid_turn_is_proved_and_never_written_twice() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "steer", Some("sess-1"));
     harness.deliver(&msg("m1")).unwrap();
     assert_eq!(harness.health().turn_state, TurnState::InTurn);
-    assert!(harness.wait_echoed("m1", Duration::from_secs(5)));
-    // The turn is still open after the echo: the agent is working.
+    assert!(harness.wait_consumed("m1", Duration::from_secs(5)));
+    // The turn is still open after the proof: the agent is working.
     assert!(!harness.is_finished("m1"));
-    let steered = harness.deliver(&msg("m2")).unwrap();
     assert_eq!(
-        steered,
+        taken(&mut harness, "m2"),
         DeliverOutcome::Accepted {
             turn_finished: false
         }
     );
-    assert!(harness.wait_echoed("m2", Duration::from_secs(5)));
     assert_eq!(harness.turns_started(), 1);
-    // Running the mailbox again, or a replay after a crash, writes nothing.
+    // Running the mailbox again writes nothing.
     harness.deliver(&msg("m2")).unwrap();
     assert_eq!(
         harness.written_ids(),
         vec!["m1".to_string(), "m2".to_string()]
     );
-    // The child logs each line it reads. Each was written to it exactly once:
-    // the echo proves the child took it, and `written_ids` above proves the
-    // hand-over was not repeated.
     assert!(wait_log(&log_path(&dir), "anyagents-message:m2"));
     let text = read_log(&log_path(&dir));
     assert_eq!(text.matches("anyagents-message:m1").count(), 1, "{text}");
     assert_eq!(text.matches("anyagents-message:m2").count(), 1, "{text}");
-    // Closing stdin lets the child exit; the turn ends with the child.
     drop(harness);
 }
 
+/// Claude Code's `total_cost_usd` is the running total of one process: each
+/// turn costs what it added, and a relaunched process counts from nothing.
 #[test]
-fn a_pushed_line_is_injected_once_and_settled_on_its_echo() {
-    use anyagents_harness::SteerQueue;
-
+fn each_turn_costs_what_it_added_across_a_relaunch() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().join("steer.jsonl");
-    std::fs::write(&path, "{\"id\":\"m7\",\"seq\":7,\"message\":\"later\"}\n").unwrap();
-    let queue = SteerQueue::new(&path, 4);
-    let mut harness = start(&dir, "steer", None).with_steer(queue.clone());
-    harness.deliver(&msg("m1")).unwrap();
-    let item = harness.poll_steer().unwrap().expect("taken");
-    // Still held while nothing is settled: it is not taken a second time into
-    // the same turn.
-    assert!(harness.poll_steer().unwrap().is_none());
-    // Once the host releases it, the line goes back on the queue and is offered
-    // again rather than being lost.
-    harness.release_steer("settled-elsewhere");
-    let lines = std::fs::read_to_string(&path).unwrap();
-    assert!(lines.contains("\"m7\""), "{lines}");
-    let again = harness.poll_steer().unwrap().expect("offered again");
-    assert_eq!(again.message.id, "m7");
-    let _ = item;
+    let mut harness = start(&dir, "turns", Some("sess-1"));
+    let cost = |harness: &mut ClaudeHarness, id: &str| {
+        let outcome = taken(harness, id);
+        assert!(
+            matches!(outcome, DeliverOutcome::Accepted { .. }),
+            "{id}: {outcome:?}"
+        );
+        assert!(harness.wait_finished(id, Duration::from_secs(5)));
+        harness.usage_for(id).expect("usage").reported_cost_micros
+    };
+    assert_eq!(cost(&mut harness, "m1"), Some(500_000));
+    assert_eq!(cost(&mut harness, "m2"), Some(500_000));
+    harness.resume("sess-2").unwrap();
+    assert_eq!(cost(&mut harness, "m3"), Some(500_000));
+    assert_eq!(harness.served_usage().reported_cost_micros, Some(1_500_000));
+}
+
+/// A resumed Claude Code process restores its session's running cost from
+/// the transcript's last `cost-state` row and counts on from it: the first
+/// turn of a later process costs what it added, not the session's total.
+#[test]
+fn a_resumed_session_charges_its_first_turn_only_what_it_added() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    let log = log_path(&dir);
+    let launch = || {
+        ClaudeHarness::start(
+            env!("CARGO_BIN_EXE_fake_claude"),
+            Some("sess-1"),
+            &[
+                ("ANYAGENTS_FAKE_MODE", "turns"),
+                ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+                ("CLAUDE_CONFIG_DIR", config.to_str().unwrap()),
+            ],
+        )
+        .expect("start")
+    };
+    let cost = |harness: &mut ClaudeHarness, id: &str| {
+        let outcome = taken(harness, id);
+        assert!(
+            matches!(outcome, DeliverOutcome::Accepted { .. }),
+            "{id}: {outcome:?}"
+        );
+        assert!(harness.wait_finished(id, Duration::from_secs(5)));
+        harness.usage_for(id).expect("usage").reported_cost_micros
+    };
+    let mut first = launch();
+    assert_eq!(cost(&mut first, "m1"), Some(500_000));
+    assert_eq!(cost(&mut first, "m2"), Some(500_000));
+    drop(first);
+    // A later process resumes the session: its running total starts at 1.0.
+    let mut later = launch();
+    assert_eq!(cost(&mut later, "m3"), Some(500_000));
+    assert_eq!(later.served_usage().reported_cost_micros, Some(500_000));
+}
+
+#[test]
+fn a_proof_stays_valid_across_a_relaunch() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "steer", Some("sess-1"));
+    assert!(matches!(
+        taken(&mut harness, "m1"),
+        DeliverOutcome::Accepted { .. }
+    ));
+    harness.resume("sess-2").unwrap();
+    assert!(matches!(
+        harness.deliver(&msg("m1")).unwrap(),
+        DeliverOutcome::Accepted { .. }
+    ));
+    assert_eq!(harness.written_ids(), ["m1"]);
 }
 
 #[test]
@@ -602,4 +706,44 @@ fn the_session_quota_reset_is_kept_until_a_transcript_or_marker_changes() {
         detect_session_quota_reset_ms(dir.path(), 1_792_970_000_000),
         None
     );
+}
+
+/// Claude Code announces a line (`started`, the replay echo) before it
+/// stores it in the session transcript. A line is committed only once it is
+/// stored: a process killed in between leaves it uncommitted, for the next
+/// process.
+#[test]
+fn a_line_is_committed_only_once_claude_code_stored_it() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    let log = log_path(&dir);
+    let config_text = config.display().to_string();
+    let env = |mode: &'static str| {
+        vec![
+            ("ANYAGENTS_FAKE_MODE", mode),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("CLAUDE_CONFIG_DIR", config_text.as_str()),
+        ]
+    };
+    let mut harness =
+        ClaudeHarness::start(env!("CARGO_BIN_EXE_fake_claude"), None, &env("unpersisted")).unwrap();
+    assert_eq!(
+        harness.deliver(&msg("m1")).unwrap(),
+        DeliverOutcome::InFlight
+    );
+    assert!(
+        harness.wait_dead(Duration::from_secs(5)),
+        "the fake exits after announcing the line"
+    );
+    // Announced, never stored: not committed, and no proof survives.
+    assert!(harness.proven("m1").is_none());
+    assert!(!harness.consumed("m1"));
+
+    let mut stored =
+        ClaudeHarness::start(env!("CARGO_BIN_EXE_fake_claude"), None, &env("hold")).unwrap();
+    assert!(matches!(
+        taken(&mut stored, "m2"),
+        DeliverOutcome::Accepted { .. }
+    ));
+    assert!(stored.consumed("m2"));
 }

@@ -54,6 +54,7 @@ fn mcp_send_once(mut child: Child) -> std::io::Result<std::process::Output> {
 /// A server child that is killed when this value drops.
 struct Server {
     child: Child,
+    _keepers: support::Keepers,
 }
 
 impl Server {
@@ -81,7 +82,10 @@ impl Server {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        Self { child }
+        Self {
+            child,
+            _keepers: support::Keepers::of(dir),
+        }
     }
 }
 

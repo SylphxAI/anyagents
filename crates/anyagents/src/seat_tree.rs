@@ -1,12 +1,12 @@
 //! Descriptor-bound sharing of mutable config and host overlays. Names select
 //! candidates only; metadata, recursion and effects use the opened inode.
 use std::{
-    ffi::{CString, OsStr},
+    ffi::{CString, OsStr, OsString},
     fs::File,
     io,
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::{AsRawFd, BorrowedFd, FromRawFd},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 fn open_child(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
@@ -40,7 +40,8 @@ fn open_root(path: &Path) -> io::Result<File> {
 fn names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
     // fdopendir owns a duplicate; neither enumeration nor recursion reopens a
     // pathname that the seat can replace while the grant is in progress.
-    let fd = unsafe { libc::dup(directory.as_raw_fd()) };
+    // Close-on-exec, so a process started meanwhile never inherits it.
+    let fd = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -72,6 +73,618 @@ fn names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
         }
     }
     Ok(out)
+}
+
+// These commands read stdin from an opened inode (never a pipe) and discard
+// stdout. Drain stderr while the child runs, retaining only a bounded prefix;
+// waiting first or stopping at the cap could deadlock a noisy launcher.
+const SEAT_STDERR_LIMIT: u64 = 4096;
+
+fn run_seat_command(command: &mut std::process::Command, stage: &str) -> io::Result<()> {
+    use std::io::Read;
+    let mut child = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| io::Error::new(error.kind(), format!("{stage} spawn failed: {error}")))?;
+    let mut stderr = child.stderr.take().expect("piped seat stderr");
+    let mut prefix = Vec::new();
+    let read_result = (&mut stderr)
+        .take(SEAT_STDERR_LIMIT + 1)
+        .read_to_end(&mut prefix)
+        .and_then(|_| io::copy(&mut stderr, &mut io::sink()).map(|_| ()));
+    // Close even on a read error before waiting, so the child cannot block on
+    // an undrained pipe. Always reap the child, including failed diagnostics.
+    drop(stderr);
+    let status = child
+        .wait()
+        .map_err(|error| io::Error::new(error.kind(), format!("{stage} wait failed: {error}")))?;
+    read_result.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("{stage} stderr read failed ({status}): {error}"),
+        )
+    })?;
+    if status.success() {
+        return Ok(());
+    }
+    let truncated = prefix.len() > SEAT_STDERR_LIMIT as usize;
+    prefix.truncate(SEAT_STDERR_LIMIT as usize);
+    // Debug escaping keeps control characters/newlines out of host log records.
+    let stderr = String::from_utf8_lossy(&prefix);
+    Err(io::Error::other(format!(
+        "{stage} failed ({status}); stderr={stderr:?}{}",
+        if truncated { " [truncated]" } else { "" }
+    )))
+}
+
+/// The only `PATH` a seat command sees. The helper resolves nothing on it; it
+/// is here for a launcher that wants one.
+const SEAT_PATH: &str = "/usr/bin:/bin";
+
+/// This binary, asked to run its `internal seat-file` helper.
+#[cfg(not(test))]
+fn seat_file_program() -> io::Result<(PathBuf, Vec<&'static str>)> {
+    Ok((
+        crate::data::current_exe_clean()?,
+        vec!["internal", "seat-file"],
+    ))
+}
+
+/// Under `cargo test` this binary is the test harness: its worker test takes
+/// the helper's arguments instead.
+#[cfg(test)]
+fn seat_file_program() -> io::Result<(PathBuf, Vec<&'static str>)> {
+    Ok((
+        crate::worktree_access::seat_executable_test_harness()?,
+        vec![
+            "--exact",
+            "seat_tree::tests::seat_file_worker",
+            "--nocapture",
+            "--",
+            "seat-file",
+        ],
+    ))
+}
+
+/// A command that runs this binary's `internal seat-file` helper as `uid`,
+/// `gid` and `groups` through `launcher`; the caller appends the operation.
+/// The seat runs no host tool, so a wrapper earlier on the daemon's `PATH`
+/// (the desk's `cat` once was one the seat could not run) cannot break it,
+/// and it sees a fixed environment, never the daemon's.
+fn seat_file_command(
+    launcher: &Path,
+    uid: u32,
+    gid: u32,
+    groups: &str,
+) -> io::Result<std::process::Command> {
+    let (program, helper) = seat_file_program()?;
+    let mut command = std::process::Command::new(launcher);
+    command
+        .args([
+            "--reuid",
+            &uid.to_string(),
+            "--regid",
+            &gid.to_string(),
+            "--groups",
+            groups,
+            "--no-new-privs",
+            "--",
+        ])
+        .arg(program)
+        .args(helper)
+        .env_clear()
+        .env("PATH", SEAT_PATH);
+    Ok(command)
+}
+
+/// `anyagents internal seat-file <operation>`: one file change the daemon
+/// needs made as a seat, run as that seat by [`seat_file_command`]. Each
+/// operation acts on standard input (an opened inode, never a pipe) or on one
+/// name in the working directory (an opened parent, entered with `fchdir`
+/// before the launcher runs). Exits 1 with the reason on stderr, 2 on a
+/// malformed call.
+///
+/// - `inode <mode> [<gid>]`: give standard input's inode group `gid`, then
+///   octal `mode`.
+/// - `op-dir`: mode 0700 on standard input's directory, then 0600 on its
+///   `config` when that is a regular file.
+/// - `copy <name>`: create `./<name>` (0660, never over an existing name),
+///   copy standard input into it and fsync it.
+/// - `readback <name>`: succeed only when `./<name>` holds exactly the bytes
+///   left on standard input.
+/// - `unlink <name>`: remove `./<name>` if it is there.
+/// - `open <path>`: open absolute `<path>` read-only as the seat, never
+///   through a final symbolic link, and hand the descriptor back over
+///   standard input (a Unix socket) when it is a regular file.
+/// - `create <path>`: the same for writing, creating or truncating it.
+/// - `kill <pid>`: SIGKILL one of the seat's own processes (a helper the
+///   daemon gave up on and may not signal itself).
+pub(crate) fn seat_file_main(args: &[OsString]) -> std::process::ExitCode {
+    let usage = || {
+        eprintln!(
+            "usage: anyagents internal seat-file inode <mode> [<gid>] | op-dir | \
+             copy <name> | readback <name> | unlink <name> | open <path> | create <path> | \
+             kill <pid>"
+        );
+        std::process::ExitCode::from(2)
+    };
+    // Standard input stays open for this process's life; borrowing never
+    // closes it.
+    let input = unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
+    let operation = args.first().and_then(|arg| arg.to_str());
+    let result = match (operation, &args[args.len().min(1)..]) {
+        (Some("inode"), [mode]) => match parse_mode(mode) {
+            Some(mode) => set_inode(input, None, mode),
+            None => return usage(),
+        },
+        (Some("inode"), [mode, gid]) => {
+            match (parse_mode(mode), gid.to_str().and_then(|g| g.parse().ok())) {
+                (Some(mode), Some(gid)) => set_inode(input, Some(gid), mode),
+                _ => return usage(),
+            }
+        }
+        (Some("op-dir"), []) => tighten_op_dir(input),
+        (Some(operation @ ("copy" | "readback" | "unlink")), [name]) => {
+            let Some(name) = single_name(name) else {
+                return usage();
+            };
+            match operation {
+                "copy" => copy_into(input, name),
+                "readback" => read_back(input, name),
+                _ => match std::fs::remove_file(Path::new(".").join(name)) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                },
+            }
+        }
+        (Some("kill"), [pid]) => match pid.to_str().and_then(|p| p.parse::<libc::pid_t>().ok()) {
+            // Only this seat's own process can be signalled from here.
+            Some(pid) if pid > 1 => {
+                if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }
+            _ => return usage(),
+        },
+        (Some(operation @ ("open" | "create")), [path]) if Path::new(path).is_absolute() => {
+            open_regular_file(Path::new(path), operation == "create")
+                .and_then(|file| hand_back(input, &file))
+        }
+        _ => return usage(),
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("seat-file {}: {error}", operation.unwrap_or_default());
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn parse_mode(mode: &OsStr) -> Option<libc::mode_t> {
+    libc::mode_t::from_str_radix(mode.to_str()?, 8)
+        .ok()
+        .filter(|mode| *mode <= 0o7777)
+}
+
+/// `name` when it names an entry of the working directory itself.
+fn single_name(name: &OsStr) -> Option<&OsStr> {
+    let bytes = name.as_bytes();
+    (!bytes.is_empty() && !bytes.contains(&b'/') && bytes != b"." && bytes != b"..").then_some(name)
+}
+
+/// Group `gid` (when given), then `mode`, on the inode `fd` refers to, which
+/// may be an `O_PATH` descriptor.
+fn set_inode(fd: BorrowedFd<'_>, gid: Option<libc::gid_t>, mode: libc::mode_t) -> io::Result<()> {
+    let raw = fd.as_raw_fd();
+    if let Some(gid) = gid {
+        // AT_EMPTY_PATH reaches an O_PATH descriptor too, which fchown refuses.
+        #[cfg(target_os = "linux")]
+        let changed =
+            unsafe { libc::fchownat(raw, c"".as_ptr(), u32::MAX, gid, libc::AT_EMPTY_PATH) };
+        #[cfg(not(target_os = "linux"))]
+        let changed = unsafe { libc::fchown(raw, u32::MAX, gid) };
+        if changed != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if unsafe { libc::fchmod(raw, mode) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EBADF) {
+        return Err(error);
+    }
+    // An O_PATH descriptor refuses fchmod; change the inode it names, as
+    // `chmod /dev/fd/0` did.
+    let fds = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let path = CString::new(format!("{fds}/{raw}")).map_err(io::Error::other)?;
+    if unsafe { libc::chmod(path.as_ptr(), mode) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn tighten_op_dir(dir: BorrowedFd<'_>) -> io::Result<()> {
+    set_inode(dir, None, 0o700)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let found = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            c"config".as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0;
+    if !found || unsafe { stat.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Ok(());
+    }
+    if unsafe { libc::fchmodat(dir.as_raw_fd(), c"config".as_ptr(), 0o600, 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn copy_into(source: BorrowedFd<'_>, name: &OsStr) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    unsafe {
+        libc::umask(0o007);
+    }
+    let mut copy = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o660)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(Path::new(".").join(name))?;
+    io::copy(&mut File::from(source.try_clone_to_owned()?), &mut copy)?;
+    copy.sync_all()
+}
+
+fn read_back(source: BorrowedFd<'_>, name: &OsStr) -> io::Result<()> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    fn fill(reader: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            match reader.read(&mut buffer[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(filled)
+    }
+    let mut copy = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(Path::new(".").join(name))?;
+    let mut source = File::from(source.try_clone_to_owned()?);
+    let (mut expected, mut actual) = (vec![0; 64 * 1024], vec![0; 64 * 1024]);
+    loop {
+        let want = fill(&mut source, &mut expected)?;
+        let have = fill(&mut copy, &mut actual)?;
+        if want != have || expected[..want] != actual[..have] {
+            return Err(io::Error::other("copy differs from its source"));
+        }
+        if want == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// `path` opened by this process's own identity: read-only, or for writing
+/// (created 0644 or truncated) when `create`. A final symbolic link, a FIFO,
+/// a device or a directory is refused; the kernel checks every directory
+/// above it against this identity.
+pub(crate) fn open_regular_file(path: &Path, create: bool) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut options = std::fs::OpenOptions::new();
+    if create {
+        options.write(true).create(true).truncate(true).mode(0o644);
+    } else {
+        options.read(true);
+    }
+    // O_NONBLOCK: opening a FIFO never waits for a peer.
+    let file = options
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok(file)
+}
+
+/// Send `file`'s descriptor to the daemon on `socket` (standard input).
+fn hand_back(socket: BorrowedFd<'_>, file: &File) -> io::Result<()> {
+    // Borrowed: standard input stays this process's to close.
+    let stream = std::mem::ManuallyDrop::new(unsafe {
+        std::os::unix::net::UnixStream::from_raw_fd(socket.as_raw_fd())
+    });
+    anyagents_keeper::wire::send_frame(&stream, &"opened", &[file.as_raw_fd()])
+}
+
+/// The descriptor came from a process running as the seat; take nothing
+/// but a regular file from it.
+fn regular_file(file: File, stage: &str) -> io::Result<File> {
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(format!("{stage}: not a regular file")));
+    }
+    Ok(file)
+}
+
+/// `child`'s exit status if it exits within `grace`, polling, never
+/// blocking past it.
+fn exit_within(
+    child: &mut std::process::Child,
+    grace: std::time::Duration,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// At most `limit` bytes of `pipe`, read until its writers close it or
+/// `deadline` passes, polling a non-blocking descriptor.
+fn read_until(
+    pipe: std::process::ChildStderr,
+    limit: usize,
+    deadline: std::time::Duration,
+) -> Vec<u8> {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: fcntl on a descriptor `pipe` owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let end = std::time::Instant::now() + deadline;
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while out.len() < limit {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = left.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: one pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+        if ready < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 {
+            break;
+        }
+        // SAFETY: a buffer of the length passed.
+        let read = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if read <= 0 {
+            if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        let take = (read as usize).min(limit - out.len());
+        out.extend_from_slice(&chunk[..take]);
+    }
+    out
+}
+
+/// Seat helpers one uid may leave with the reaper before its next open is
+/// refused.
+const SEAT_REAPER_PER_UID: usize = 8;
+
+fn reaped_for(uid: u32) -> usize {
+    SEAT_REAPER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(owner, _)| *owner == uid)
+        .count()
+}
+
+/// Kill a seat helper that did not exit, and hand it to the reaper. The
+/// daemon may not signal another uid's process, so a kill that is refused
+/// is asked of the seat itself (`seat-file kill <pid>`); that request is
+/// reaped the same way. The child stays unreaped until then, so its pid
+/// cannot be reused under the kill.
+fn stop_seat_child(
+    mut child: std::process::Child,
+    launcher: &Path,
+    uid: u32,
+    gid: u32,
+    groups: &str,
+) {
+    if child.kill().is_err()
+        && let Ok(mut kill) = seat_file_command(launcher, uid, gid, groups)
+    {
+        kill.arg("kill")
+            .arg(child.id().to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Ok(kill) = kill.spawn() {
+            reap_later(uid, kill);
+        }
+    }
+    reap_later(uid, child);
+}
+
+/// Children a request thread will not wait for, reaped by one background
+/// thread as they exit.
+static SEAT_REAPER: std::sync::Mutex<Vec<(u32, std::process::Child)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn reap_later(uid: u32, child: std::process::Child) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    SEAT_REAPER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((uid, child));
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("seat-reaper".into())
+            .spawn(|| {
+                loop {
+                    SEAT_REAPER
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .retain_mut(|(_, child)| !matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            });
+    });
+}
+
+/// How long the daemon waits for a seat to open one file.
+const SEAT_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Open absolute `path` as seat `uid` (`gid`, `groups`) through `launcher`
+/// and return the regular file the seat itself opened: read-only, or for
+/// writing when `create`. The daemon never resolves the name; what the seat
+/// cannot open, this cannot return (ADR 0010 D3).
+pub(crate) fn open_as_seat(
+    launcher: &Path,
+    uid: u32,
+    gid: u32,
+    groups: &str,
+    path: &Path,
+    create: bool,
+) -> io::Result<File> {
+    open_as_seat_within(launcher, uid, gid, groups, path, create, SEAT_OPEN_TIMEOUT)
+}
+
+/// How long a seat helper that answered may take to exit before it is
+/// stopped and left to the reaper.
+const SEAT_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn open_as_seat_within(
+    launcher: &Path,
+    uid: u32,
+    gid: u32,
+    groups: &str,
+    path: &Path,
+    create: bool,
+    timeout: std::time::Duration,
+) -> io::Result<File> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a seat opens an absolute path only",
+        ));
+    }
+    let stage = if create { "seat-create" } else { "seat-open" };
+    // A seat whose helpers keep not exiting gets no more: what the reaper
+    // holds for one uid stays bounded.
+    if reaped_for(uid) >= SEAT_REAPER_PER_UID {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("{stage}: this seat's earlier helpers have not exited"),
+        ));
+    }
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+    ours.set_read_timeout(Some(timeout))?;
+    // The command, and with it this process's copy of the seat's end, is
+    // dropped at spawn, so a seat that exits without answering reads as EOF.
+    let mut child = {
+        let mut command = seat_file_command(launcher, uid, gid, groups)?;
+        command
+            .arg(if create { "create" } else { "open" })
+            .arg(path)
+            .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+                theirs,
+            )))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        command.spawn().map_err(|error| {
+            io::Error::new(error.kind(), format!("{stage} spawn failed: {error}"))
+        })?
+    };
+    let stderr = child.stderr.take().expect("piped seat stderr");
+    let mut reader = anyagents_keeper::wire::FrameReader::new(&ours);
+    let answer = reader.next_frame();
+    let mut fds = reader.take_fds();
+    // The helper runs as the seat, which may stop or hang it; this thread
+    // never waits on it unbounded. One that does not exit promptly is
+    // killed (as the seat, when this process may not signal it) and left to
+    // the reaper.
+    let grace = if answer.is_err() {
+        std::time::Duration::ZERO
+    } else {
+        SEAT_EXIT_GRACE
+    };
+    let Some(status) = exit_within(&mut child, grace)? else {
+        stop_seat_child(child, launcher, uid, gid, groups);
+        return match (answer, fds.len()) {
+            (Ok(Some(frame)), 1) if frame == br#""opened""# => {
+                regular_file(File::from(fds.remove(0)), stage)
+            }
+            (Err(error), _) => Err(io::Error::new(
+                error.kind(),
+                format!("{stage}: the seat did not answer in time: {error}"),
+            )),
+            _ => Err(io::Error::other(format!(
+                "{stage}: the seat did not exit after answering without one opened file"
+            ))),
+        };
+    };
+    // The helper has exited. Its reason is what its stderr holds now, read
+    // without a thread and never past a deadline: a pipe the seat keeps
+    // open (a process it forked) cannot hold this one.
+    let prefix = read_until(stderr, SEAT_STDERR_LIMIT as usize, SEAT_EXIT_GRACE);
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&prefix);
+        // The helper's own reason, without its prefix; Debug escaping keeps
+        // control characters out of the caller's message.
+        let reason = stderr
+            .trim()
+            .strip_prefix(&format!(
+                "seat-file {}: ",
+                if create { "create" } else { "open" }
+            ))
+            .unwrap_or(stderr.trim());
+        return Err(io::Error::new(
+            if prefix.is_empty() {
+                io::ErrorKind::Other
+            } else {
+                io::ErrorKind::PermissionDenied
+            },
+            format!("{stage} failed ({status}): {reason:?}"),
+        ));
+    }
+    match (answer, fds.len()) {
+        (Ok(Some(frame)), 1) if frame == br#""opened""# => {
+            regular_file(File::from(fds.remove(0)), stage)
+        }
+        (Err(error), _) => Err(io::Error::new(
+            error.kind(),
+            format!("{stage} answer: {error}"),
+        )),
+        _ => Err(io::Error::other(format!(
+            "{stage}: the seat answered without one opened file"
+        ))),
+    }
 }
 
 fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool) -> io::Result<()> {
@@ -114,35 +727,25 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool)
     if group_ok && mode_ok {
         return Ok(());
     }
+    let mut repair_error = None;
     // Retain the configured owner's existing ability to repair a shared group,
     // but pass only the opened object, never its replaceable original path.
     if (!super::sandbox::is_isolated_test_env()
         || std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_some())
         && let Some(launcher) = super::sandbox::descriptor_launcher()
     {
-        let result = std::process::Command::new(launcher)
-            .args([
-                "--reuid",
-                &meta.uid().to_string(),
-                "--regid",
-                &meta.gid().to_string(),
-                "--groups",
-                &format!("{},{gid}", meta.gid()),
-                "--no-new-privs",
-                "--",
-                "/bin/sh",
-                "-c",
-                "chgrp \"$1\" /dev/fd/0 && chmod \"$2\" /dev/fd/0",
-                "seat-inode",
-                &gid.to_string(),
-                &format!("{mode:o}"),
-            ])
-            .stdin(file.try_clone()?)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-        if result.success() {
-            return Ok(());
+        let mut command = seat_file_command(
+            &launcher,
+            meta.uid(),
+            meta.gid(),
+            &format!("{},{gid}", meta.gid()),
+        )?;
+        command
+            .args(["inode", &format!("{mode:o}"), &gid.to_string()])
+            .stdin(file.try_clone()?);
+        match run_seat_command(&mut command, "seat-inode") {
+            Ok(()) => return Ok(()),
+            Err(error) => repair_error = Some(error),
         }
     }
     // Seat-owned objects with the intended effective grant need no mutation.
@@ -155,7 +758,13 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool)
     {
         return Ok(());
     }
-    Err(io::Error::other("cannot grant the opened seat inode"))
+    Err(match repair_error {
+        Some(error) => io::Error::new(
+            error.kind(),
+            format!("cannot grant the opened seat inode: {error}"),
+        ),
+        None => io::Error::other("cannot grant the opened seat inode"),
+    })
 }
 
 /// O_PATH binds even an unreadable inode before delegating its mode repair.
@@ -270,24 +879,16 @@ fn migrate_open_file(
                 }
             }
             let dir_fd = self.parent.as_raw_fd();
-            let mut rm = std::process::Command::new(self.launcher);
-            rm.args([
-                "--reuid",
-                &self.uid.to_string(),
-                "--regid",
-                &self.gid.to_string(),
-                "--groups",
-                &self.gid.to_string(),
-                "--no-new-privs",
-                "--",
-                "/bin/rm",
-                "-f",
-                "--",
-            ])
-            .arg(Path::new(".").join(self.temp))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            let Ok(mut rm) =
+                seat_file_command(self.launcher, self.uid, self.gid, &self.gid.to_string())
+            else {
+                return;
+            };
+            rm.arg("unlink")
+                .arg(self.temp)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
             unsafe {
                 rm.pre_exec(move || {
                     if libc::fchdir(dir_fd) != 0 {
@@ -307,26 +908,8 @@ fn migrate_open_file(
         gid,
         armed: true,
     };
-    let mut command = std::process::Command::new(&launcher);
-    command
-        .args([
-            "--reuid",
-            &uid.to_string(),
-            "--regid",
-            &gid.to_string(),
-            "--groups",
-            &gid.to_string(),
-            "--no-new-privs",
-            "--",
-            "/bin/sh",
-            "-c",
-            "set -euC; umask 007; cat > \"./$1\"",
-            "seat-copy",
-        ])
-        .arg(&temp)
-        .stdin(source.try_clone()?)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    let mut command = seat_file_command(&launcher, uid, gid, &gid.to_string())?;
+    command.arg("copy").arg(&temp).stdin(source.try_clone()?);
     // Bind working directory directly to the opened parent descriptor via fchdir
     // before privilege drop, avoiding /dev/fd/3 (/proc/self/fd/3) traversal when
     // setresuid sets PR_SET_DUMPABLE=0 (mode 0500 root:root on /proc/self/fd).
@@ -340,34 +923,17 @@ fn migrate_open_file(
     }
     let mut original = source.try_clone()?;
     original.seek(SeekFrom::Start(0))?;
-    if !command.status()?.success() {
-        return Err(io::Error::other(
-            "seat inode copy refused; original retained",
-        ));
-    }
+    run_seat_command(&mut command, "seat-copy").map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("seat inode copy refused; original retained: {error}"),
+        )
+    })?;
     original.seek(SeekFrom::Start(0))?;
     // The new inode belongs to the seat, which may not share a daemon group.
     // Read back under that exact owner rather than widening it for inspection.
-    let mut verify = std::process::Command::new(&launcher);
-    verify
-        .args([
-            "--reuid",
-            &uid.to_string(),
-            "--regid",
-            &gid.to_string(),
-            "--groups",
-            &gid.to_string(),
-            "--no-new-privs",
-            "--",
-            "/bin/sh",
-            "-c",
-            "set -eu; cmp -s - \"./$1\"; sync -f \"./$1\"",
-            "seat-readback",
-        ])
-        .arg(&temp)
-        .stdin(source.try_clone()?)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    let mut verify = seat_file_command(&launcher, uid, gid, &gid.to_string())?;
+    verify.arg("readback").arg(&temp).stdin(source.try_clone()?);
     unsafe {
         verify.pre_exec(move || {
             if libc::fchdir(fd) != 0 {
@@ -376,11 +942,12 @@ fn migrate_open_file(
             Ok(())
         });
     }
-    if !verify.status()?.success() {
-        return Err(io::Error::other(
-            "seat copy readback differs; original retained",
-        ));
-    }
+    run_seat_command(&mut verify, "seat-readback").map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("seat copy readback differs; original retained: {error}"),
+        )
+    })?;
     let after = source.metadata()?;
     if (
         before.dev(),
@@ -543,26 +1110,17 @@ fn tighten_private_inode(
         || std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_some())
         && let Some(launcher) = super::sandbox::descriptor_launcher()
     {
-        let status = std::process::Command::new(launcher)
-            .args([
-                "--reuid",
-                &meta.uid().to_string(),
-                "--regid",
-                &meta.gid().to_string(),
-                "--groups",
-                &format!("{},{gid}", meta.gid()),
-                "--no-new-privs",
-                "--",
-                "/bin/sh",
-                "-c",
-                "chmod $1 /dev/fd/0",
-                "seat-inode",
-                &format!("{mode:o}"),
-            ])
-            .stdin(file.try_clone()?)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
+        let status = seat_file_command(
+            &launcher,
+            meta.uid(),
+            meta.gid(),
+            &format!("{},{gid}", meta.gid()),
+        )?
+        .args(["inode", &format!("{mode:o}")])
+        .stdin(file.try_clone()?)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
         if status.success() {
             return Ok(());
         }
@@ -627,24 +1185,17 @@ fn tighten_private_op_dir(parent: &File, name: &OsStr, uid: u32, gid: u32) -> io
                         || std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_some())
                     && let Some(launcher) = super::sandbox::descriptor_launcher()
                 {
-                    let _ = std::process::Command::new(launcher)
-                        .args([
-                            "--reuid",
-                            &meta.uid().to_string(),
-                            "--regid",
-                            &meta.gid().to_string(),
-                            "--groups",
-                            &format!("{},{gid}", meta.gid()),
-                            "--no-new-privs",
-                            "--",
-                            "/bin/sh",
-                            "-c",
-                            "chmod 700 /dev/fd/0 && if [ -f /dev/fd/0/config ] && [ ! -L /dev/fd/0/config ]; then chmod 600 /dev/fd/0/config; fi",
-                        ])
-                        .stdin(bound.try_clone()?)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
+                    let _ = seat_file_command(
+                        &launcher,
+                        meta.uid(),
+                        meta.gid(),
+                        &format!("{},{gid}", meta.gid()),
+                    )?
+                    .arg("op-dir")
+                    .stdin(bound.try_clone()?)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
                 }
             }
         }
@@ -1266,34 +1817,132 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn migrate_open_file_uses_fchdir_without_dev_fd_3_and_unlinks_temp_on_failure() {
+    fn seat_command_bounds_and_drains_stderr_and_reports_stage_status() {
+        use std::process::{Command, Stdio};
+        for stage in ["seat-inode", "seat-copy", "seat-readback"] {
+            let error = run_seat_command(
+                Command::new("/bin/sh")
+                    .args(["-c", "printf 'synthetic\\n\\033failure\\377' >&2; exit 43"])
+                    .stdin(Stdio::null()),
+                stage,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(&format!("{stage} failed (exit status: 43)")),
+                "{error}"
+            );
+            assert!(error.contains("synthetic\\n"), "{error}");
+            assert!(!error.contains('\n') && !error.contains('\x1b'), "{error}");
+        }
+        // Exceeds a pipe buffer, so a wait-before-read or cap-without-drain
+        // implementation hangs instead of observing the child's exit status.
+        for code in [0, 44] {
+            let result = run_seat_command(
+                Command::new("/bin/sh")
+                    .args(["-c", &format!("head -c 1048576 /dev/zero >&2; exit {code}")])
+                    .stdin(Stdio::null()),
+                "seat-copy",
+            );
+            if code == 0 {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("exit status: 44"));
+                assert!(error.ends_with(" [truncated]"));
+                assert!(error.len() < 4 * SEAT_STDERR_LIMIT as usize + 100);
+            }
+        }
+    }
+
+    #[test]
+    fn seat_command_reports_spawn_failure_and_signal() {
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        let error = run_seat_command(
+            Command::new(dir.path().join("missing-launcher")).stdin(Stdio::null()),
+            "seat-copy",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("seat-copy spawn failed"));
+        let error = run_seat_command(
+            Command::new("/bin/sh")
+                .args(["-c", "kill -TERM $$"])
+                .stdin(Stdio::null()),
+            "seat-readback",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("seat-readback failed (signal:"));
+    }
+
+    /// The helper as a seat, under `cargo test`: the test harness stands in
+    /// for this binary's `internal seat-file`.
+    #[test]
+    fn seat_file_worker() {
+        let args: Vec<OsString> = std::env::args_os().collect();
+        let Some(start) = args.iter().position(|arg| arg == "seat-file") else {
+            return;
+        };
+        let code = seat_file_main(&args[start + 1..]);
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else if code == std::process::ExitCode::from(2) {
+            2
+        } else {
+            1
+        });
+    }
+
+    /// A stand-in for setpriv that runs the command as the same user. It
+    /// records the environment it was given in `launcher-env`, fails the stage
+    /// named by a `mode` file beside it, and puts a `hostile-bin` directory
+    /// beside it first on the command's `PATH` when there is one.
+    #[cfg(target_os = "linux")]
+    fn fake_seat_launcher(dir: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let _lock = crate::server::tests::env_lock();
-        let temp = crate::test_tempdir();
-        let launcher = temp.path().join("fake-seat-launcher.sh");
+        let launcher = dir.join("fake-seat-launcher.sh");
         std::fs::write(
             &launcher,
-            r#"#!/usr/bin/env python3
-import os, subprocess, sys
-args = sys.argv[1:]
-sep = args.index("--")
-cmd = args[sep + 1:]
-joined = " ".join(cmd)
-if "/dev/fd/3" in joined:
-    sys.exit(97)
-mode = os.environ.get("FAKE_LAUNCHER_MODE", "ok")
-if mode == "fail_copy_after_touch" and len(cmd) > 3 and cmd[3] == "seat-copy":
-    open("./" + cmd[4], "wb").close()
-    sys.exit(41)
-if mode == "fail_verify" and len(cmd) > 3 and cmd[3] == "seat-readback":
-    sys.exit(42)
-os.execvp(cmd[0], cmd)
+            r#"#!/bin/sh
+here=${0%/*}
+export -p > "$here/launcher-env"
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+shift
+case "$*" in *"/dev/fd/3"*) exit 97 ;; esac
+mode=ok
+if [ -f "$here/mode" ]; then read -r mode < "$here/mode"; fi
+op=
+for arg do
+  case $arg in copy|readback|unlink|inode|op-dir) op=$arg ;; esac
+  name=$arg
+done
+if [ "$mode" = fail_copy_after_touch ] && [ "$op" = copy ]; then
+  : > "./$name"
+  echo "synthetic copy denied" >&2
+  exit 41
+fi
+if [ "$mode" = fail_verify ] && [ "$op" = readback ]; then
+  echo "synthetic readback denied" >&2
+  exit 42
+fi
+if [ -d "$here/hostile-bin" ]; then PATH="$here/hostile-bin:$PATH"; export PATH; fi
+exec "$@"
 "#,
         )
         .unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        launcher
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn migrate_open_file_uses_fchdir_without_dev_fd_3_and_unlinks_temp_on_failure() {
+        let _lock = crate::server::tests::env_lock();
+        let temp = crate::test_tempdir();
+        let launcher = fake_seat_launcher(temp.path());
+        let mode = temp.path().join("mode");
 
         let cfg = temp.path().join("config");
         std::fs::create_dir_all(&cfg).unwrap();
@@ -1308,15 +1957,14 @@ os.execvp(cmd[0], cmd)
             fn drop(&mut self) {
                 unsafe {
                     std::env::remove_var("ANYAGENTS_LAUNCHER");
-                    std::env::remove_var("FAKE_LAUNCHER_MODE");
                 }
             }
         }
         let _reset = EnvReset;
         unsafe {
             std::env::set_var("ANYAGENTS_LAUNCHER", &launcher);
-            std::env::set_var("FAKE_LAUNCHER_MODE", "fail_copy_after_touch");
         }
+        std::fs::write(&mode, "fail_copy_after_touch\n").unwrap();
         let parent = open_root(&cfg).unwrap();
         let child = open_child(&parent, OsStr::new("sessions.sqlite3-shm"), false).unwrap();
         let err = migrate_open_file(
@@ -1328,6 +1976,16 @@ os.execvp(cmd[0], cmd)
         )
         .unwrap_err();
         assert!(err.to_string().contains("seat inode copy refused"));
+        assert!(
+            err.to_string()
+                .contains("seat-copy failed (exit status: 41)")
+        );
+        assert!(err.to_string().contains("synthetic copy denied"));
+        assert_eq!(std::fs::read(&shm).unwrap(), vec![0xABu8; 32768]);
+        assert_eq!(
+            std::fs::metadata(&shm).unwrap().ino(),
+            child.metadata().unwrap().ino()
+        );
         let leftovers: Vec<_> = std::fs::read_dir(&cfg)
             .unwrap()
             .flatten()
@@ -1339,9 +1997,7 @@ os.execvp(cmd[0], cmd)
             "failed copy must unlink 0-byte .seat-copy-* temp file: {leftovers:?}"
         );
 
-        unsafe {
-            std::env::set_var("FAKE_LAUNCHER_MODE", "fail_verify");
-        }
+        std::fs::write(&mode, "fail_verify\n").unwrap();
         let err2 = migrate_open_file(
             &parent,
             OsStr::new("sessions.sqlite3-shm"),
@@ -1351,6 +2007,16 @@ os.execvp(cmd[0], cmd)
         )
         .unwrap_err();
         assert!(err2.to_string().contains("seat copy readback differs"));
+        assert!(
+            err2.to_string()
+                .contains("seat-readback failed (exit status: 42)")
+        );
+        assert!(err2.to_string().contains("synthetic readback denied"));
+        assert_eq!(std::fs::read(&shm).unwrap(), vec![0xABu8; 32768]);
+        assert_eq!(
+            std::fs::metadata(&shm).unwrap().ino(),
+            child.metadata().unwrap().ino()
+        );
         let leftovers2: Vec<_> = std::fs::read_dir(&cfg)
             .unwrap()
             .flatten()
@@ -1362,9 +2028,7 @@ os.execvp(cmd[0], cmd)
             "failed readback must unlink .seat-copy-* temp file: {leftovers2:?}"
         );
 
-        unsafe {
-            std::env::set_var("FAKE_LAUNCHER_MODE", "ok");
-        }
+        std::fs::write(&mode, "ok\n").unwrap();
         migrate_open_file(
             &parent,
             OsStr::new("sessions.sqlite3-shm"),
@@ -1372,7 +2036,7 @@ os.execvp(cmd[0], cmd)
             other_uid,
             gid,
         )
-        .expect("fchdir ./$1 copy + verify + atomic swap must succeed without /dev/fd/3");
+        .expect("fchdir copy + verify + atomic swap must succeed without /dev/fd/3");
         assert_eq!(std::fs::read(&shm).unwrap().len(), 32768);
 
         let stale_orphan = cfg.join(".seat-copy-67774-1000-99");
@@ -1391,12 +2055,458 @@ os.execvp(cmd[0], cmd)
         unsafe {
             libc::utimensat(libc::AT_FDCWD, c_stale.as_ptr(), old_ts.as_ptr(), 0);
             std::env::remove_var("ANYAGENTS_LAUNCHER");
-            std::env::remove_var("FAKE_LAUNCHER_MODE");
         }
         share_config(&cfg, me, gid).unwrap();
         assert!(
             !stale_orphan.exists(),
             "share_config must reap stale .seat-copy-* orphan"
+        );
+    }
+
+    /// Every seat command runs this binary's own helper with a fixed
+    /// environment. A `PATH` whose `cat`, `cmp`, `sync`, `chmod`, `chgrp`,
+    /// `rm` and `sh` all fail (as the desk's guard wrappers did for a seat
+    /// that could not read them) changes nothing, and the seat never sees
+    /// the daemon's environment.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seat_file_commands_ignore_a_hostile_path_and_the_daemon_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::server::tests::env_lock();
+        let temp = crate::test_tempdir();
+        let launcher = fake_seat_launcher(temp.path());
+        let hostile = temp.path().join("hostile-bin");
+        std::fs::create_dir(&hostile).unwrap();
+        for tool in ["cat", "cmp", "sync", "chmod", "chgrp", "rm", "sh"] {
+            let path = hostile.join(tool);
+            std::fs::write(&path, "#!/bin/sh\necho \"hostile $0\" >&2\nexit 1\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        struct EnvReset;
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("ANYAGENTS_LAUNCHER");
+                    std::env::remove_var("ANYAGENTS_SEAT_TEST_DAEMON_ONLY");
+                }
+            }
+        }
+        let _reset = EnvReset;
+        unsafe {
+            std::env::set_var("ANYAGENTS_LAUNCHER", &launcher);
+            std::env::set_var("ANYAGENTS_SEAT_TEST_DAEMON_ONLY", "daemon-secret");
+        }
+        let me = crate::sandbox::server_uid();
+        let gid = crate::sandbox::server_gid();
+        let other_uid = if me == 42001 { 42002 } else { 42001 };
+
+        // The migration that stopped eight agents: copy, read back, swap.
+        let cfg = temp.path().join("config");
+        std::fs::create_dir(&cfg).unwrap();
+        let db = cfg.join("opencode.db");
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&db, &bytes).unwrap();
+        let parent = open_root(&cfg).unwrap();
+        let child = open_child(&parent, OsStr::new("opencode.db"), false).unwrap();
+        migrate_open_file(&parent, OsStr::new("opencode.db"), &child, other_uid, gid)
+            .expect("migration must not depend on PATH");
+        assert_eq!(std::fs::read(&db).unwrap(), bytes);
+        assert_ne!(
+            std::fs::metadata(&db).unwrap().ino(),
+            child.metadata().unwrap().ino()
+        );
+        let seen = std::fs::read_to_string(temp.path().join("launcher-env")).unwrap();
+        assert!(seen.contains(SEAT_PATH), "{seen}");
+        assert!(!seen.contains("daemon-secret"), "{seen}");
+        assert!(!seen.contains("ANYAGENTS_LAUNCHER"), "{seen}");
+
+        let run = |args: &[&str], stdin: File| {
+            let mut command = seat_file_command(&launcher, me, gid, &gid.to_string()).unwrap();
+            command.args(args).stdin(stdin);
+            unsafe {
+                use std::os::unix::process::CommandExt as _;
+                let dir = parent.as_raw_fd();
+                command.pre_exec(move || {
+                    if libc::fchdir(dir) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            run_seat_command(&mut command, "seat-test")
+        };
+        // A read-back that differs is refused by the helper itself.
+        let other = temp.path().join("other");
+        std::fs::write(&other, b"different").unwrap();
+        std::fs::write(cfg.join(".seat-copy-check"), b"different").unwrap();
+        run(
+            &["readback", ".seat-copy-check"],
+            File::open(&other).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&other, b"differenT").unwrap();
+        let error = run(
+            &["readback", ".seat-copy-check"],
+            File::open(&other).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("copy differs from its source"), "{error}");
+        run(&["unlink", ".seat-copy-check"], File::open(&other).unwrap()).unwrap();
+        assert!(!cfg.join(".seat-copy-check").exists());
+        // Group and mode through an O_PATH descriptor, as `grant` passes one.
+        let opath = |path: &Path| {
+            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let fd = unsafe {
+                libc::open(
+                    name.as_ptr(),
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            assert!(fd >= 0);
+            unsafe { File::from_raw_fd(fd) }
+        };
+        run(&["inode", "640", &gid.to_string()], opath(&other)).unwrap();
+        assert_eq!(std::fs::metadata(&other).unwrap().mode() & 0o7777, 0o640);
+        let op = temp.path().join("op");
+        std::fs::create_dir(&op).unwrap();
+        std::fs::write(op.join("config"), b"x").unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(op.join("config"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        run(&["op-dir"], opath(&op)).unwrap();
+        assert_eq!(std::fs::metadata(&op).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(
+            std::fs::metadata(op.join("config")).unwrap().mode() & 0o7777,
+            0o600
+        );
+        let error = run(&["copy", "../escape"], File::open(&other).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exit status: 2"), "{error}");
+    }
+
+    /// A launcher that records its arguments in `launcher-args` and runs the
+    /// command as this same user.
+    #[cfg(target_os = "linux")]
+    fn recording_launcher(dir: &Path) -> PathBuf {
+        let launcher = dir.join("recording-launcher.sh");
+        crate::worktree::tests::write_executable(
+            &launcher,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0%/*}/launcher-args\"\n\
+             while [ \"$#\" -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n",
+        );
+        launcher
+    }
+
+    /// `open` and `create` hand back only what the seat itself opened: a
+    /// regular file, never through a final link, by absolute path, with the
+    /// seat's own uid, gid and groups on the launcher's command line.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seat_opens_a_file_itself_and_hands_back_the_descriptor() {
+        use std::io::{Read as _, Write as _};
+        let temp = crate::test_tempdir();
+        let launcher = recording_launcher(temp.path());
+        let open = |path: &Path, create: bool| {
+            open_as_seat(&launcher, 42001, 42002, "42002,42003", path, create)
+        };
+        let photo = temp.path().join("photo.png");
+        std::fs::write(&photo, b"png bytes").unwrap();
+        let mut bytes = Vec::new();
+        open(&photo, false)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"png bytes");
+        let args = std::fs::read_to_string(temp.path().join("launcher-args")).unwrap();
+        let args: Vec<_> = args.lines().collect();
+        for pair in [
+            ["--reuid", "42001"],
+            ["--regid", "42002"],
+            ["--groups", "42002,42003"],
+        ] {
+            assert!(args.windows(2).any(|w| w == pair), "{args:?}");
+        }
+        assert!(args.contains(&"--no-new-privs"), "{args:?}");
+        assert_eq!(args[args.len() - 2..], ["open", photo.to_str().unwrap()]);
+
+        let secret = temp.path().join("operator-token");
+        std::fs::write(&secret, b"operator-secret").unwrap();
+        std::os::unix::fs::symlink(&secret, temp.path().join("link")).unwrap();
+        let fifo = temp.path().join("fifo");
+        let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let error = open(&temp.path().join("link"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("seat-open failed"), "{error}");
+        assert!(error.contains("symbolic links"), "{error}");
+        let error = open(&fifo, false).unwrap_err().to_string();
+        assert!(error.contains("not a regular file"), "{error}");
+        assert!(open(temp.path(), false).is_err());
+        assert!(open(&temp.path().join("missing"), false).is_err());
+        let error = open(Path::new("photo.png"), false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let out = temp.path().join("out.png");
+        open(&out, true).unwrap().write_all(b"written").unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"written");
+        assert!(open(&temp.path().join("link"), true).is_err());
+        assert_eq!(std::fs::read(&secret).unwrap(), b"operator-secret");
+    }
+
+    /// A seat that answers without a descriptor, or whose launcher fails,
+    /// yields an error, never a file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seat_that_hands_back_nothing_opens_nothing() {
+        let temp = crate::test_tempdir();
+        let launcher = temp.path().join("silent.sh");
+        crate::worktree::tests::write_executable(&launcher, "#!/bin/sh\nexit 0\n");
+        let file = temp.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let error = open_as_seat(&launcher, 42001, 42002, "42002", &file, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("without one opened file"), "{error}");
+        let launcher = temp.path().join("denying.sh");
+        crate::worktree::tests::write_executable(&launcher, "#!/bin/sh\necho denied >&2\nexit 3\n");
+        let error = open_as_seat(&launcher, 42001, 42002, "42002", &file, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("exit status: 3") && error.contains("denied"),
+            "{error}"
+        );
+    }
+
+    /// A seat that stops its own helper (or never answers) holds no daemon
+    /// thread: the open fails at its timeout, the helper is killed and left
+    /// to the reaper, and nothing waits on it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stopped_seat_helper_never_pins_the_caller() {
+        let temp = crate::test_tempdir();
+        let launcher = temp.path().join("stopping.sh");
+        crate::worktree::tests::write_executable(&launcher, "#!/bin/sh\nkill -STOP $$\nexit 0\n");
+        let file = temp.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let started = std::time::Instant::now();
+        let error = open_as_seat_within(
+            &launcher,
+            42001,
+            42002,
+            "42002",
+            &file,
+            false,
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not answer in time"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // The reaper collects the killed helper.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !SEAT_REAPER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+        {
+            assert!(std::time::Instant::now() < deadline, "helper never reaped");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// A helper whose stderr a process it forked keeps open still yields
+    /// its reason within the grace, and a seat's helpers held by the reaper
+    /// are bounded: past the bound its next open is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_held_stderr_and_a_full_reaper_never_pin_the_caller() {
+        let temp = crate::test_tempdir();
+        let launcher = temp.path().join("holding.sh");
+        crate::worktree::tests::write_executable(
+            &launcher,
+            "#!/bin/sh\n/bin/sleep 30 </dev/null >/dev/null &\necho denied >&2\nexit 3\n",
+        );
+        let file = temp.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let started = std::time::Instant::now();
+        let error = open_as_seat(&launcher, 42011, 42012, "42012", &file, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("exit status: 3") && error.contains("denied"),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let uid = 42021;
+        let mut sleepers = Vec::new();
+        for _ in 0..SEAT_REAPER_PER_UID {
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            sleepers.push(child.id());
+            reap_later(uid, child);
+        }
+        let error = open_as_seat(&launcher, uid, 42012, "42012", &file, false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        for pid in sleepers {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while reaped_for(uid) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sleepers never reaped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// `kill <pid>` signals one of the seat's own processes, and nothing
+    /// that is not a pid.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_seat_kills_its_own_helper_on_request() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let temp = crate::test_tempdir();
+        let launcher = recording_launcher(temp.path());
+        let mut sleeper = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let kill = |pid: &str| {
+            let mut command = seat_file_command(&launcher, 42001, 42002, "42002").unwrap();
+            command
+                .args(["kill", pid])
+                .stdin(std::process::Stdio::null());
+            run_seat_command(&mut command, "seat-kill")
+        };
+        kill(&sleeper.id().to_string()).unwrap();
+        assert_eq!(sleeper.wait().unwrap().signal(), Some(libc::SIGKILL));
+        for bad in ["1", "0", "-1", "self"] {
+            let error = kill(bad).unwrap_err().to_string();
+            assert!(error.contains("exit status: 2"), "{bad}: {error}");
+        }
+    }
+
+    /// With a real seat (root drops to a fixture uid through `setpriv`): the
+    /// seat cannot open the operator's token, a link to it, or create beside
+    /// it, and opens what it may. Required on the privileged Linux lane.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_seat_open_refuses_what_the_seat_cannot_read() {
+        use std::io::Read as _;
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let caps = std::fs::read_to_string("/proc/self/status").unwrap();
+        let effective = caps
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:\t"))
+            .and_then(|n| u64::from_str_radix(n, 16).ok())
+            .unwrap_or(0);
+        let required = (1 << 0) | (1 << 6) | (1 << 7); // CHOWN, SETGID, SETUID
+        if effective & required != required
+            || crate::sandbox::server_uid() != 0
+            || !Path::new("/usr/bin/setpriv").is_file()
+        {
+            assert!(
+                std::env::var_os("ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST").is_none(),
+                "requires root with CAP_CHOWN, CAP_SETGID, CAP_SETUID and /usr/bin/setpriv"
+            );
+            eprintln!("requires privilege; seat open acceptance not executed");
+            return;
+        }
+        let (uid, gid) = (24061u32, 24062u32);
+        let base = tempfile::Builder::new()
+            .prefix("seat-open-")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let chown = |path: &Path, u: u32, g: u32| {
+            let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::lchown(c.as_ptr(), u, g) }, 0);
+        };
+        let mode = |path: &Path, m: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        mode(&root, 0o711);
+        // The server's secrets: root's own, as the operator token is kyle's.
+        let secrets = root.join("secrets");
+        std::fs::create_dir(&secrets).unwrap();
+        mode(&secrets, 0o711);
+        let token = secrets.join("operator-token");
+        std::fs::write(&token, b"operator-secret").unwrap();
+        mode(&token, 0o600);
+        let public = root.join("public.png");
+        std::fs::write(&public, b"public").unwrap();
+        mode(&public, 0o644);
+        // The seat's own directory, with a link to the token in it.
+        let own = root.join("seat");
+        std::fs::create_dir(&own).unwrap();
+        chown(&own, uid, gid);
+        mode(&own, 0o700);
+        let mine = own.join("mine.png");
+        std::fs::write(&mine, b"mine").unwrap();
+        chown(&mine, uid, gid);
+        mode(&mine, 0o600);
+        symlink(&token, own.join("link")).unwrap();
+        chown(&own.join("link"), uid, gid);
+        let launcher = Path::new("/usr/bin/setpriv");
+        let open = |path: &Path, create: bool| {
+            open_as_seat(launcher, uid, gid, &gid.to_string(), path, create)
+        };
+        let read = |path: &Path| {
+            let mut bytes = Vec::new();
+            open(path, false)?.read_to_end(&mut bytes)?;
+            Ok::<_, io::Error>(bytes)
+        };
+        assert_eq!(read(&public).unwrap(), b"public");
+        assert_eq!(read(&mine).unwrap(), b"mine");
+        let error = read(&token).unwrap_err().to_string();
+        assert!(error.contains("Permission denied"), "{error}");
+        let error = read(&own.join("link")).unwrap_err().to_string();
+        assert!(error.contains("symbolic links"), "{error}");
+        assert!(open(&secrets.join("planted"), true).is_err());
+        assert!(!secrets.join("planted").exists());
+        let created = own.join("out.png");
+        drop(open(&created, true).unwrap());
+        assert_eq!(std::fs::metadata(&created).unwrap().uid(), uid);
+        assert_eq!(std::fs::read(&token).unwrap(), b"operator-secret");
+        // The same refusal through the authority a send uses.
+        let _lock = crate::server::tests::env_lock();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("ANYAGENTS_LAUNCHER") };
+            }
+        }
+        let _reset = Reset;
+        unsafe { std::env::set_var("ANYAGENTS_LAUNCHER", launcher) };
+        let seat = crate::agent_file::FileAuthority::Seat {
+            uid,
+            gid,
+            groups: gid.to_string(),
+        };
+        let why = seat
+            .read(&token, crate::agent_file::MEDIA_UPLOAD_LIMIT)
+            .unwrap_err();
+        assert!(why.contains("Permission denied"), "{why}");
+        assert_eq!(
+            seat.read(&public, crate::agent_file::MEDIA_UPLOAD_LIMIT)
+                .unwrap(),
+            b"public"
         );
     }
 }

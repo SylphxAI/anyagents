@@ -18,6 +18,7 @@ use anyagents_core::Store;
 /// A server child that is killed when this value drops.
 struct Server {
     child: Child,
+    _keepers: support::Keepers,
 }
 
 impl Server {
@@ -47,7 +48,10 @@ impl Server {
             assert!(Instant::now() < deadline, "no socket");
             std::thread::sleep(Duration::from_millis(20));
         }
-        Self { child }
+        Self {
+            child,
+            _keepers: support::Keepers::of(dir),
+        }
     }
 }
 
@@ -257,8 +261,9 @@ fn an_api_key_agent_gets_the_gateway_and_its_turn_reaches_the_provider() {
     let _server = Server::start(&data);
     read_policy();
 
-    // The restarted server binds a new port and repoints every agent at it, so
-    // the origin is read from the running server, not from before the restart.
+    // The restarted server binds its last port again, or a new one when that
+    // is taken, and points every agent at it, so the origin is read from the
+    // running server, not from before the restart.
     let store = Store::open(data.join("state.db")).unwrap();
     let agent = store.agent_by_name("alpha").unwrap();
     assert!(

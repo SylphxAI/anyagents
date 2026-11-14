@@ -9,6 +9,8 @@
 
 #![cfg(target_os = "linux")]
 
+mod support;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use anyagents_core::{AgentId, Incoming, NewAgent, Store};
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState,
+    DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    TurnState,
 };
 use anyagents_supervisor::{Clock, LaunchRequest, Supervisor, SystemClock};
 
@@ -81,8 +83,12 @@ impl Harness for IdleHarness {
         HarnessHealth {
             process_alive: true,
             turn_state: TurnState::Idle,
-            delivery_mode: DeliveryMode::Followup,
-            steer_support: SteerSupport::No,
+            delivery: Delivery {
+                level: DeliveryLevel::TurnEnd,
+                idempotent: false,
+                proof: std::borrow::Cow::Borrowed("scripted double"),
+                peer: None,
+            },
             quota_reset_at_ms: None,
             sign_in_fault: None,
         }
@@ -349,5 +355,5 @@ fn an_idle_fleet_on_a_large_store_sleeps_while_a_neighbour_is_busy() {
         "idle_cost: wake latency {} ms",
         sent_at.elapsed().as_millis()
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }

@@ -204,6 +204,7 @@ fn serve(
 
 struct Server {
     child: Child,
+    _keepers: support::Keepers,
 }
 
 impl Server {
@@ -228,7 +229,10 @@ impl Server {
             assert!(Instant::now() < deadline, "no socket");
             thread::sleep(Duration::from_millis(20));
         }
-        Self { child }
+        Self {
+            child,
+            _keepers: support::Keepers::of(dir),
+        }
     }
 }
 

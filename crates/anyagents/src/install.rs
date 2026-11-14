@@ -58,11 +58,30 @@ fn leases_for_root(root: &Path) -> Arc<dyn LeaseView> {
     }
 }
 
+/// What `<root>/harnesses.toml` looked like when an answer was computed: its
+/// modification time and length, or `None` when there is no such file.
+type ConfigStamp = Option<(std::time::SystemTime, u64)>;
+
+fn config_stamp(root: &Path) -> ConfigStamp {
+    let meta = std::fs::metadata(root.join(anyagents_installer::OVERRIDES)).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// One harness's install state.
+#[derive(Default)]
+struct Slot {
+    /// Held while this harness installs, so two callers never install it at
+    /// once. Status reads never take it.
+    installing: Mutex<()>,
+    /// The latest answer and the config it was computed under.
+    last: Mutex<Option<(ConfigStamp, Result<Install, String>)>>,
+}
+
 /// The harnesses one server has installed, keyed by canonical harness id.
 pub struct Installer {
     root: PathBuf,
     leases: Arc<dyn LeaseView>,
-    done: Mutex<HashMap<String, Result<Install, String>>>,
+    slots: Mutex<HashMap<String, Arc<Slot>>>,
 }
 
 impl Installer {
@@ -74,21 +93,49 @@ impl Installer {
         Self {
             root: root.to_path_buf(),
             leases,
-            done: Mutex::new(HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Install `harness` once. Every agent of that harness gets the same
-    /// answer, and a failure is remembered rather than retried.
+    /// Install `harness` if it is not already. A success is reused until
+    /// `harnesses.toml` changes; a failure is never reused, so the next caller
+    /// tries again. Only callers of the same harness wait on each other.
     pub fn ensure(&self, harness: &str) -> Result<Install, String> {
         let harness = normalize_harness_name(harness);
-        let mut done = self.done.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(answer) = done.get(harness) {
-            return answer.clone();
+        let slot = self.slot(harness);
+        let _installing = slot
+            .installing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let stamp = config_stamp(&self.root);
+        if let Some((seen, Ok(install))) =
+            &*slot.last.lock().unwrap_or_else(PoisonError::into_inner)
+            && *seen == stamp
+        {
+            return Ok(install.clone());
         }
         let outcome = self.ensure_uncached(harness);
-        done.insert(harness.to_string(), outcome.clone());
+        *slot.last.lock().unwrap_or_else(PoisonError::into_inner) = Some((stamp, outcome.clone()));
         outcome
+    }
+
+    fn slot(&self, harness: &str) -> Arc<Slot> {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(slots.entry(harness.to_string()).or_default())
+    }
+
+    /// The latest answer for `harness`, without waiting on an install that is
+    /// in progress.
+    fn last(&self, harness: &str) -> Option<Result<(), String>> {
+        let slot = Arc::clone(
+            self.slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(harness)?,
+        );
+        let last = slot.last.lock().unwrap_or_else(PoisonError::into_inner);
+        last.as_ref()
+            .map(|(_, answer)| answer.as_ref().map(|_| ()).map_err(String::clone))
     }
 
     fn ensure_uncached(&self, harness: &str) -> Result<Install, String> {
@@ -119,27 +166,23 @@ pub fn adapter(harness: &str) -> Result<(), anyagents_core::Error> {
 static INSTALLER: OnceLock<Installer> = OnceLock::new();
 
 /// Install a harness that has to be there now, from the data directory the
-/// server was started with. It happens once per harness: a later call gets the
-/// same answer.
+/// server was started with. A success is reused until `harnesses.toml`
+/// changes; a failure is retried by the next call.
 pub fn record(root: &Path, harness: &str) -> Result<Install, String> {
     let installer = INSTALLER.get_or_init(|| Installer::new(root));
     installer.ensure(harness)
 }
 
-/// What `record` already answered for an agent's harness: `Some(Ok(()))` once it
-/// is installed, `Some(Err(reason))` when it could not be, `None` while this
-/// server has not needed it. It never installs anything.
+/// What `record` last answered for an agent's harness: `Some(Ok(()))` once it
+/// is installed, `Some(Err(reason))` when the last attempt failed, `None` while
+/// this server has not needed it. It never installs anything and never waits
+/// on an install in progress.
 pub fn recorded(harness: &str) -> Option<Result<(), String>> {
     let harness = normalize_harness_name(harness);
-    let done = INSTALLER
+    INSTALLER
         .get()?
-        .done
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    done.get(harness).map(|answer| match answer {
-        Ok(_) => Ok(()),
-        Err(reason) => Err(format!("needed: {reason}")),
-    })
+        .last(harness)
+        .map(|answer| answer.map_err(|reason| format!("needed: {reason}")))
 }
 
 /// Deprecated per-harness binary override variable name for `harness`.
@@ -316,9 +359,9 @@ mod tests {
             assert!(is_healthy(root.path(), legacy));
             assert_eq!(recorded_version(root.path(), legacy), "1.0.0");
         }
-        let done = installer.done.lock().unwrap();
-        assert_eq!(done.len(), 1);
-        assert!(done.contains_key("spiron"));
+        let slots = installer.slots.lock().unwrap();
+        assert_eq!(slots.len(), 1);
+        assert!(slots.contains_key("spiron"));
     }
 
     #[cfg(unix)]
@@ -330,7 +373,73 @@ mod tests {
         let first = installer.ensure("opencode").unwrap();
         let second = installer.ensure("opencode").unwrap();
         assert_eq!(first.dir, second.dir);
-        assert!(installer.done.lock().unwrap().contains_key("opencode"));
+        assert_eq!(installer.last("opencode"), Some(Ok(())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_install_is_retried_and_a_config_edit_takes_effect() {
+        let _environment = crate::server::tests::env_lock();
+        let root = crate::test_tempdir();
+        let installer = Installer::new(root.path());
+        // `agy` ships Unconfigured: it cannot install until the operator
+        // names a source in harnesses.toml.
+        let first = installer.ensure("agy").unwrap_err();
+        assert!(first.contains("unverifiable source"), "{first}");
+        assert_eq!(installer.last("agy"), Some(Err(first.clone())));
+
+        // The operator edits harnesses.toml; the same server picks it up.
+        write_local_override(root.path(), "agy", "1.0.0");
+        let installed = installer.ensure("agy").unwrap();
+        assert_eq!(installed.dir, root.path().join("harnesses/agy/1.0.0"));
+        assert_eq!(installer.last("agy"), Some(Ok(())));
+        assert!(is_healthy(root.path(), "agy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_install_is_retried_with_the_config_unchanged() {
+        let _environment = crate::server::tests::env_lock();
+        let root = crate::test_tempdir();
+        let source = write_local_override(root.path(), "agy", "1.0.0");
+        let away = source.with_extension("away");
+        std::fs::rename(&source, &away).unwrap();
+        let installer = Installer::new(root.path());
+        assert!(installer.ensure("agy").is_err());
+        assert!(matches!(installer.last("agy"), Some(Err(_))));
+
+        // harnesses.toml is untouched; only the source came back.
+        std::fs::rename(&away, &source).unwrap();
+        let installed = installer.ensure("agy").unwrap();
+        assert_eq!(installed.dir, root.path().join("harnesses/agy/1.0.0"));
+        assert_eq!(installer.last("agy"), Some(Ok(())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_install_in_progress_blocks_neither_status_nor_other_harnesses() {
+        let _environment = crate::server::tests::env_lock();
+        let root = crate::test_tempdir();
+        write_local_override(root.path(), "spiron", "1.0.0");
+        let installer = Arc::new(Installer::new(root.path()));
+        assert!(installer.ensure("agy").is_err());
+
+        // Stand in for a long download of `agy`.
+        let agy = installer.slot("agy");
+        let _installing = agy.installing.lock().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = Arc::clone(&installer);
+        std::thread::spawn(move || {
+            let status = other.last("agy");
+            let spiron = other.ensure("spiron").map(|install| install.dir);
+            let _ = tx.send((status, spiron));
+        });
+        let (status, spiron) = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("status and another harness waited on agy's install");
+        assert!(matches!(status, Some(Err(_))));
+        assert_eq!(spiron.unwrap(), root.path().join("harnesses/spiron/1.0.0"));
     }
 
     #[test]

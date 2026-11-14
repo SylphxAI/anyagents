@@ -31,6 +31,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   embedder and reranked by a local cross-encoder, run by the new
   `anyagents memory-service` process. Every result cites its raw bytes; without
   the service the server ranks lexically and reports it in `retrieval`.
+- Security: the server no longer opens host files with its own access on an
+  agent's behalf (ADR 0010 D3). A `send` with a local media path uploads it
+  only when the sending agent can read it itself: a seat agent's file is
+  opened by that seat (`anyagents internal seat-file open`, which hands back
+  the descriptor), a seatless agent's only beneath its own directories
+  (`openat2(RESOLVE_BENEATH)`); a final symbolic link is refused, URL and
+  `file_id` media are unchanged. The browser navigates only `http(s)://` and
+  `about:blank`, refuses to read or drive a page on any other URL, writes a
+  screenshot `path` with the caller's access, keeps Chromium's home and
+  downloads inside its profile, and on Linux starts Chromium inside a
+  Landlock jail that opens only the system and its profile to it, required
+  whenever OS seats are configured.
+- Mail and turn trouble is no longer silent (`docs/delivery.md`). A turn the
+  harness ends with an error no longer stays open: its work comes back as a
+  `[Recovery]` note, stored in the same transaction that closes the turn.
+  Only an error of the agent's own session (a full context, content the
+  vendor refuses) is a strike; after three in a row the agent is parked
+  (`paused`, listed as `faulted`) and its nearest running ancestor, or the
+  operator's inbox, is told. Provider, model, auth, network, host and store
+  errors back off (15 s doubling to 10 minutes) and never park anyone.
+  `anyagents resume --faulted` resumes every parked agent. A send that cannot
+  wake an archived recipient is refused for it with the reason and who
+  answers for it, never stored unread. Mail queued to a paused agent tells
+  its sender, or whoever answers for the agent, once per pause. A channel
+  post whose outcome is unknown is held, never resent automatically, and its
+  sender is told once; `agents inspect` and `status` list it, and `anyagents
+  outbound` retries or discards it. A post the Telegram API refused leaves
+  no stuck record, and a long post cut short is recorded as partly
+  delivered. A legacy Spiron input hold is settled when its agent launches
+  another harness, and at server start when its agent is archived or has
+  taken the held mail since. Migration 033 adds `turn_errors`.
+- Agents report defects to whoever runs the deployment with `send` to
+  `operator`: a defect in AnyAgents, the harness or the host that an agent
+  cannot fix within its own work. Only the operator reads it, with
+  `anyagents inbox --operator`. Each sender and the whole fleet have a small
+  burst and an hourly cap, the same text within an hour is counted on the
+  first report, and reports are kept for 30 days. No agent may be named
+  `operator`.
+- Usage accounting no longer over-counts cost for Claude Code and OpenCode
+  agents. Claude Code's `total_cost_usd` is the session's running total: a
+  resumed process restores it from the transcript's last `cost-state` row
+  and counts on from there. From 2026-10-18 (`bca6c22`), and summed across a
+  process's turns from 2026-10-21 (`977d123`), each turn recorded that
+  running total, so usage rows from that window overstate cost (live rows
+  near $112-115 a turn), most of all for long sessions that were resumed
+  many times. OpenCode reports its session's running totals, which outlive a
+  process; from 2026-10-21 (`7210d6f`) the first reading after every process
+  replacement recorded the whole session again, so rows following a
+  replacement in that window overstate tokens and cost. Both adapters now
+  report what each turn, and each process, added. Historical rows are not
+  rewritten; read usage and cost from that window with this in mind.
 - Keep role labels methodology-neutral: roots and labelled children can self-archive
   and release idle processes under the same rules. Preserve legacy effective scopes
   on upgrade, default all new children to private, and retain browser profiles until
@@ -57,6 +108,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rework and cost per successful outcome by harness and model, role, profile,
   agent or skill. The parent reminder for idle task sub-agents now asks for a
   verdict. Usage docs no longer claim a price table or OpenTelemetry export.
+- Remote (cloud) agents call back with their own short-lived credential. Each
+  launch of a cloud harness or remote sandbox begins a remote session whose token
+  is bound to that agent and session, stored as a SHA-256 digest, rotated before
+  it expires (`remote_session_ttl_secs`, default one hour), and revoked on pause,
+  archive, relaunch or `anyagents agents revoke-remote`. The long-lived local
+  capability no longer leaves the host. Callback URLs derive from `public_url`
+  under `[server]` in `<data>/anyagents.toml`; without it a remote agent is not
+  created or started. Remote sessions get only the `remote` MCP profile, which
+  now holds coordination, `memory` and `skills`: `browser`, `computer`, `device`,
+  `media`, `web_search` and `web_fetch` run on or from the control-plane host and
+  are no longer in it. The public listener's `/`, `/healthz` and
+  `/v1/webhooks/healthz` return `{"ok":true}`; the serving identity stays on
+  `anyagents.sock`.
+- MCP over HTTP serves at most the `remote` profile, whatever credential is
+  presented: `?profile=full` is refused with 403 and no binding upgrades it,
+  because over HTTP the tools run inside the server process as its own user.
+  `full` remains available over stdio, where the tool server runs as the agent.
+  Calls over HTTP MCP also cannot place an agent on a host harness, wake an
+  agent that runs on the host (directly or by a send to an archived one), or
+  attach media by a local path.
+- A separate public listener (`public_listen` under `[server]`) serves only
+  readiness, Telegram webhooks and MCP for remote session tokens, and 404 for
+  everything else; once it is configured, the local TCP listener defaults to
+  loopback. Without `public_listen` nothing changes. A remote session token
+  stops authenticating once its agent's harness moves back onto the host.
 
 ## 0.1.3
 

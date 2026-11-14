@@ -8,7 +8,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyagents_harness::{
-    Context, DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnState,
+    Context, DeliverOutcome, DeliveryLevel, Harness, HarnessError, OutboundMessage, Proof,
+    TurnState,
 };
 use anyagents_harness_opencode::OpenCodeHarness;
 use tempfile::TempDir;
@@ -61,6 +62,36 @@ fn start_with_config(dir: &TempDir, mode: &str, config: &Path) -> OpenCodeHarnes
     .unwrap_or_else(|error| panic!("{error}: {}", log_of(dir)))
 }
 
+/// Offer `message` until the service has answered its prompt call: the call
+/// runs on a thread of its own, and the line is in flight until it answers.
+fn settle(
+    harness: &mut OpenCodeHarness,
+    message: &OutboundMessage,
+) -> Result<DeliverOutcome, HarnessError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match harness.deliver(message) {
+            Ok(DeliverOutcome::InFlight) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the prompt call never answered"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// Wait until `done` holds for the harness.
+fn eventually(harness: &OpenCodeHarness, what: &str, done: impl Fn(&OpenCodeHarness) -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !done(harness) {
+        assert!(std::time::Instant::now() < deadline, "never: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// What a line the prompt API took is reported as.
 fn accepted() -> DeliverOutcome {
     DeliverOutcome::Accepted {
@@ -77,7 +108,7 @@ fn a_delivered_line_is_a_prompt_carrying_its_mailbox_id() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "finish");
     assert_eq!(harness.session_id().as_deref(), Some("ses_fake"));
-    harness.deliver(&msg("m1")).unwrap();
+    settle(&mut harness, &msg("m1")).unwrap();
     let text = log_of(&dir);
     // The prompt is the real endpoint, and the line carries its id first.
     assert!(
@@ -96,23 +127,21 @@ fn a_delivered_line_is_a_prompt_carrying_its_mailbox_id() {
 fn a_finished_turn_reports_its_answer_from_the_session() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "finish");
-    harness.deliver(&msg("m1")).unwrap();
+    settle(&mut harness, &msg("m1")).unwrap();
     assert!(harness.wait_answered("m1", Duration::from_secs(10)));
     assert_eq!(harness.answer("m1").as_deref(), Some("pong from opencode"));
 }
 
 #[test]
 fn an_open_turn_never_blocks_the_next_line() {
-    // The service holds its turn open forever. The adapter reports steer, not
-    // followup: the second line is written at once, not deferred behind a turn
-    // the adapter cannot see the end of.
+    // The service holds its turn open forever. The second line is written
+    // into that turn at once, not deferred behind it.
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "hold");
-    assert_eq!(harness.deliver(&msg("m1")).unwrap(), accepted());
-    assert_eq!(harness.deliver(&msg("m2")).unwrap(), accepted());
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    assert_eq!(settle(&mut harness, &msg("m2")).unwrap(), accepted());
     assert_eq!(harness.health().turn_state, TurnState::InTurn);
-    assert_eq!(harness.health().delivery_mode, DeliveryMode::Steer);
-    assert_eq!(harness.health().steer_support, SteerSupport::Yes);
+    assert_eq!(harness.health().delivery.level, DeliveryLevel::MidTurn);
     assert_eq!(
         harness.written_ids(),
         vec!["m1".to_string(), "m2".to_string()]
@@ -135,12 +164,12 @@ fn three_lines_sent_while_a_turn_is_open_are_all_taken_at_once_and_never_twice()
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "inbox");
     for id in ["m1", "m2", "m3"] {
-        assert_eq!(harness.deliver(&msg(id)).unwrap(), accepted(), "{id}");
+        assert_eq!(settle(&mut harness, &msg(id)).unwrap(), accepted(), "{id}");
     }
     assert!(harness.wait_seen("m3", Duration::from_secs(5)));
     // A replay of every line writes nothing more.
     for id in ["m1", "m2", "m3"] {
-        assert_eq!(harness.deliver(&msg(id)).unwrap(), accepted(), "{id}");
+        assert_eq!(settle(&mut harness, &msg(id)).unwrap(), accepted(), "{id}");
     }
     assert_eq!(
         harness.written_ids(),
@@ -163,7 +192,8 @@ fn three_lines_sent_while_a_turn_is_open_are_all_taken_at_once_and_never_twice()
     assert_eq!(prompts.lines().count(), 3, "{prompts}");
     assert!(
         text.lines()
-            .all(|line| !line.starts_with("api:POST") || line.contains("\"delivery\":\"steer\"")),
+            .filter(|line| line.starts_with("api:POST") && line.contains("/prompt"))
+            .all(|line| line.contains("\"delivery\":\"steer\"")),
         "every prompt is a steer: {text}"
     );
 }
@@ -174,34 +204,11 @@ fn a_delivered_line_is_taken_even_when_the_session_reports_a_failed_turn() {
     // the session later reports failed does not hold the next line back.
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "failed");
-    assert_eq!(harness.deliver(&msg("m1")).unwrap(), accepted());
-    assert_eq!(harness.deliver(&msg("m2")).unwrap(), accepted());
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    assert_eq!(settle(&mut harness, &msg("m2")).unwrap(), accepted());
     assert_eq!(
         harness.written_ids(),
         vec!["m1".to_string(), "m2".to_string()]
-    );
-}
-
-#[test]
-fn a_pushed_line_joins_the_open_turn() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("steer.jsonl");
-    std::fs::write(&path, "{\"id\":\"m7\",\"seq\":7,\"message\":\"later\"}\n").unwrap();
-    let mut harness = start(&dir, "steer").with_steer(anyagents_harness::SteerQueue::new(&path, 4));
-    harness.deliver(&msg("m1")).unwrap();
-    let item = harness.poll_steer().unwrap().expect("taken");
-    assert_eq!(item.message.id, "m7");
-    assert!(harness.inject(&item.message).unwrap());
-    // A mailbox line the prompt API already took is taken, not written again.
-    assert!(harness.inject(&msg("m1")).unwrap());
-    let text = log_of(&dir);
-    assert!(text.contains("steered:anyagents-message:m7"), "{text}");
-    assert!(text.contains("\"delivery\":\"steer\""), "{text}");
-    // One turn, not two: the steer joined the open one.
-    assert_eq!(
-        text.matches("api:POST /api/session/ses_fake/prompt")
-            .count(),
-        2
     );
 }
 
@@ -218,10 +225,10 @@ fn a_missing_session_is_created_again() {
 fn the_duplicate_delivery_is_not_written_twice() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "finish");
-    harness.deliver(&msg("m1")).unwrap();
+    settle(&mut harness, &msg("m1")).unwrap();
     assert!(harness.wait_answered("m1", Duration::from_secs(10)));
     let before = log_of(&dir).matches("anyagents-message:m1").count();
-    harness.deliver(&msg("m1")).unwrap();
+    settle(&mut harness, &msg("m1")).unwrap();
     let after = log_of(&dir).matches("anyagents-message:m1").count();
     assert_eq!(before, after);
     let _ = Path::new("");
@@ -231,7 +238,7 @@ fn the_duplicate_delivery_is_not_written_twice() {
 fn an_earlier_turns_answer_does_not_close_this_turn() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "history");
-    harness.deliver(&msg("m1")).unwrap();
+    settle(&mut harness, &msg("m1")).unwrap();
     // The session holds an old completed turn; this one has not finished.
     assert!(!harness.wait_answered("m1", Duration::from_secs(2)));
     assert_eq!(
@@ -245,7 +252,7 @@ fn an_earlier_turns_answer_does_not_close_this_turn() {
 fn only_the_newest_answer_is_the_turns_answer() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "two-turns");
-    harness.deliver(&msg("m1")).unwrap();
+    settle(&mut harness, &msg("m1")).unwrap();
     assert!(harness.wait_answered("m1", Duration::from_secs(5)));
     assert_eq!(harness.answer("m1").as_deref(), Some("second answer"));
 }
@@ -257,7 +264,7 @@ fn an_answer_from_before_the_turn_is_never_returned() {
     // every reply repeat the first line's answer.
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "history");
-    harness.deliver(&msg("m1")).unwrap();
+    settle(&mut harness, &msg("m1")).unwrap();
     assert!(
         harness.answer("m1").is_none(),
         "an old answer is not this turn's"
@@ -292,7 +299,7 @@ fn a_stored_session_that_is_gone_starts_a_new_one() {
 fn the_models_thinking_is_never_the_answer() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "reasoning");
-    harness.deliver(&msg("m1")).unwrap();
+    settle(&mut harness, &msg("m1")).unwrap();
     assert!(harness.wait_answered("m1", Duration::from_secs(5)));
     assert_eq!(harness.answer("m1").as_deref(), Some("the real answer"));
 }
@@ -301,12 +308,12 @@ fn the_models_thinking_is_never_the_answer() {
 fn each_message_is_answered_by_the_message_that_follows_it() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "finish");
-    harness.deliver(&msg("m1")).unwrap();
+    settle(&mut harness, &msg("m1")).unwrap();
     assert!(harness.wait_answered("m1", Duration::from_secs(5)));
     assert_eq!(harness.answer("m1").as_deref(), Some("pong from opencode"));
     // The session now holds m1's prompt and answer. A second message is
     // answered by its own turn, not by m1's.
-    harness.deliver(&msg("m2")).unwrap();
+    settle(&mut harness, &msg("m2")).unwrap();
     assert!(harness.wait_answered("m2", Duration::from_secs(5)));
     assert_eq!(harness.answer("m2").as_deref(), Some("pong from opencode"));
 }
@@ -317,12 +324,12 @@ fn a_retried_line_does_not_hold_the_turn_open() {
     // reopen it, or the next line would defer forever.
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "finish");
-    harness.deliver(&msg("m1")).unwrap();
+    settle(&mut harness, &msg("m1")).unwrap();
     assert!(harness.wait_answered("m1", Duration::from_secs(5)));
-    harness.deliver(&msg("m1")).unwrap();
+    settle(&mut harness, &msg("m1")).unwrap();
     // A new line is delivered, not deferred behind a re-opened turn.
     assert_eq!(
-        harness.deliver(&msg("m2")).unwrap(),
+        settle(&mut harness, &msg("m2")).unwrap(),
         DeliverOutcome::Accepted {
             turn_finished: false
         }
@@ -463,7 +470,7 @@ fn inherited_host_roots_and_credentials_do_not_select_the_service() {
         &config,
     )
     .unwrap_or_else(|error| panic!("{error}: {}", log_of(&dir)));
-    harness.deliver(&msg("isolated")).unwrap();
+    settle(&mut harness, &msg("isolated")).unwrap();
     assert!(port_of(&config) > 0);
     assert!(log_of(&dir).contains(&format!(
         "config-root:{}",
@@ -599,19 +606,15 @@ fn failed_interrupt_keeps_the_turn_open_while_accepted_interrupt_closes_it() {
     for (mode, succeeds) in [("hold", true), ("interrupt-failed", false)] {
         let dir = TempDir::new().unwrap();
         let mut harness = start(&dir, mode);
-        harness.deliver(&msg("m1")).unwrap();
+        settle(&mut harness, &msg("m1")).unwrap();
         assert_eq!(harness.health().turn_state, TurnState::InTurn);
         let result = harness.cancel();
         if succeeds {
             result.unwrap();
             assert_eq!(harness.health().turn_state, TurnState::Idle);
         } else {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("interruption refused (503)")
-            );
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("interruption refused (HTTP 503)"), "{err}");
             assert_eq!(harness.health().turn_state, TurnState::InTurn);
         }
         assert_eq!(
@@ -683,7 +686,7 @@ fn prompt_404_creates_new_session_restores_context_retries_once_and_persists_ses
 
         let mut first = msg("m1");
         first.text = "resume work after restart".to_string();
-        assert_eq!(harness.deliver(&first).unwrap(), accepted());
+        assert_eq!(settle(&mut harness, &first).unwrap(), accepted());
         assert_eq!(harness.session_id().as_deref(), Some("ses_fresh"));
         assert_eq!(
             std::fs::read_to_string(config.join("opencode-session-id")).unwrap(),
@@ -719,7 +722,7 @@ fn prompt_404_creates_new_session_restores_context_retries_once_and_persists_ses
         // Subsequent wake/turn uses `ses_fresh` directly without hitting `ses_fake`.
         let mut second = msg("m2");
         second.text = "follow-up wake".to_string();
-        assert_eq!(harness.deliver(&second).unwrap(), accepted());
+        assert_eq!(settle(&mut harness, &second).unwrap(), accepted());
         let second_prompt = std::fs::read_to_string(dir.path().join("last-prompt")).unwrap();
         assert!(
             !second_prompt.contains("<session_recovery"),
@@ -756,12 +759,12 @@ fn prompt_404_after_prior_turn_restores_in_memory_history_and_topology_on_new_se
     first.text = "initial assignment context".to_string();
     first.context.topology =
         Some("<topology event=\"initial\" self=\"alpha\" scope=\"private\" />".to_string());
-    assert_eq!(harness.deliver(&first).unwrap(), accepted());
+    assert_eq!(settle(&mut harness, &first).unwrap(), accepted());
     assert_eq!(harness.session_id().as_deref(), Some("ses_fake"));
 
     let mut second = msg("m2");
     second.text = "second wake after service restart".to_string();
-    assert_eq!(harness.deliver(&second).unwrap(), accepted());
+    assert_eq!(settle(&mut harness, &second).unwrap(), accepted());
     assert_eq!(harness.session_id().as_deref(), Some("ses_fresh"));
     assert_eq!(
         std::fs::read_to_string(config.join("opencode-session-id")).unwrap(),
@@ -790,7 +793,11 @@ fn prompt_404_after_prior_turn_restores_in_memory_history_and_topology_on_new_se
 
 #[test]
 fn non_404_prompt_errors_and_repeated_404_fail_closed_without_minting_duplicate_sessions() {
-    for (mode, expected_status) in [("prompt-500", "500"), ("prompt-400", "400")] {
+    for (mode, refused) in [
+        ("prompt-500", false),
+        ("prompt-400", true),
+        ("prompt-409", true),
+    ] {
         let dir = TempDir::new().unwrap();
         let config = dir.path().join("config");
         std::fs::create_dir_all(&config).unwrap();
@@ -810,8 +817,33 @@ fn non_404_prompt_errors_and_repeated_404_fail_closed_without_minting_duplicate_
         )
         .unwrap();
 
-        let err = harness.deliver(&msg("m1")).unwrap_err().to_string();
-        assert!(err.contains(expected_status), "{err}");
+        let outcome = settle(&mut harness, &msg("m1"));
+        if refused {
+            // Nothing was admitted, and nothing ever will be: the line is
+            // rejected, and the process is not at fault.
+            assert!(
+                matches!(&outcome, Ok(DeliverOutcome::Rejected { reason, .. }) if reason.contains("HTTP 4")),
+                "{mode}: {outcome:?}"
+            );
+            assert!(harness.health().process_alive, "{mode}");
+        } else {
+            // A server error may or may not have admitted the line: the same
+            // id is written once more, and a second one is a fault.
+            let err = outcome.unwrap_err().to_string();
+            assert!(err.contains("500"), "{err}");
+            let log = log_of(&dir);
+            assert_eq!(
+                log.matches("api:POST /api/session/ses_404_keep/prompt")
+                    .count(),
+                2,
+                "{log}"
+            );
+            assert_eq!(
+                log.matches("\"id\":\"msg_m1\"").count(),
+                2,
+                "both carry the line's own id: {log}"
+            );
+        }
         assert_eq!(harness.session_id().as_deref(), Some("ses_404_keep"));
         assert_eq!(
             std::fs::read_to_string(config.join("opencode-session-id")).unwrap(),
@@ -831,7 +863,7 @@ fn non_404_prompt_errors_and_repeated_404_fail_closed_without_minting_duplicate_
     let config = dir.path().join("config");
     std::fs::create_dir_all(&config).unwrap();
     let mut harness = start_with_config(&dir, "prompt-404-always", &config);
-    let err = harness.deliver(&msg("m1")).unwrap_err().to_string();
+    let err = settle(&mut harness, &msg("m1")).unwrap_err().to_string();
     assert!(err.contains("404"), "{err}");
     let text = log_of(&dir);
     assert_eq!(
@@ -870,4 +902,370 @@ fn begin_reaps_prior_service_pid_and_reclaims_stable_port() {
     assert_ne!(second_pid, first_pid);
     drop(second);
     assert!(!config.join("opencode-service-pid").exists());
+}
+
+#[test]
+fn every_prompt_carries_the_lines_own_message_id() {
+    // OpenCode takes a prompt id that starts with `msg_` and admits it once.
+    // A mailbox id already is one; any other id gets the prefix.
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "finish");
+    settle(&mut harness, &msg("msg_01mailbox")).unwrap();
+    settle(&mut harness, &msg("recovery_msg_01mailbox_1")).unwrap();
+    let log = log_of(&dir);
+    assert!(log.contains("\"id\":\"msg_01mailbox\""), "{log}");
+    assert!(
+        log.contains("\"id\":\"msg_recovery_msg_01mailbox_1\""),
+        "{log}"
+    );
+}
+
+#[test]
+fn the_service_names_itself_and_delivery_is_mid_turn_and_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let harness = start(&dir, "finish");
+    let delivery = harness.health().delivery;
+    assert_eq!(delivery.level, DeliveryLevel::MidTurn);
+    assert!(delivery.idempotent);
+    assert_eq!(delivery.peer.as_deref(), Some("opencode 2.1.4"));
+}
+
+#[test]
+fn a_turn_ends_when_the_service_is_idle_and_says_so_to_the_host() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "finish");
+    let woken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = std::sync::Arc::clone(&woken);
+    harness.watch_activity(std::sync::Arc::new(move || {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    eventually(&harness, "the turn ends", |harness| {
+        harness.health().turn_state == TurnState::Idle && harness.turns_served() == 1
+    });
+    assert!(woken.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    let log = log_of(&dir);
+    assert!(
+        log.contains("api:POST /api/experimental/session/ses_fake/wait"),
+        "{log}"
+    );
+
+    // A turn the service never ends stays open.
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "hold");
+    settle(&mut harness, &msg("m1")).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(harness.health().turn_state, TurnState::InTurn);
+    assert_eq!(harness.turns_served(), 0);
+}
+
+#[test]
+fn a_line_an_earlier_process_applied_is_a_duplicate_and_opens_no_turn() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "applied");
+    assert_eq!(
+        settle(&mut harness, &msg("m1")).unwrap(),
+        DeliverOutcome::Duplicate
+    );
+    assert_eq!(harness.health().turn_state, TurnState::Idle);
+    assert!(harness.written_ids().is_empty());
+    assert!(log_of(&dir).contains("api:GET /api/session/ses_fake/message/msg_m1"));
+
+    // One an earlier process wrote and the session has not consumed yet is in
+    // its inbox now: this process's prompt woke the session for it.
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "parked");
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    assert_eq!(harness.written_ids(), vec!["m1".to_string()]);
+}
+
+#[test]
+fn an_unknown_outcome_is_settled_by_writing_the_same_id_once_more() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "prompt-502-once");
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    let log = log_of(&dir);
+    assert_eq!(log.matches("\"id\":\"msg_m1\"").count(), 2, "{log}");
+    assert_eq!(harness.written_ids(), vec!["m1".to_string()]);
+}
+
+#[test]
+fn a_line_the_readiness_gate_turned_away_waits_its_retry_after_and_the_host_is_woken() {
+    // OpenCode's readiness gate answers 503 `service_starting` before any
+    // route: nothing is admitted, and it asks to be called again after one
+    // second. The line goes back to the mailbox once that second is over, and
+    // the host is told so, which brings the next offer.
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "prompt-503-once");
+    let woken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = std::sync::Arc::clone(&woken);
+    harness.watch_activity(std::sync::Arc::new(move || {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    let before = woken.load(std::sync::atomic::Ordering::SeqCst);
+    let sent = std::time::Instant::now();
+    assert_eq!(
+        settle(&mut harness, &msg("m1")).unwrap(),
+        DeliverOutcome::Deferred
+    );
+    assert!(
+        sent.elapsed() >= Duration::from_millis(900),
+        "no retry-after"
+    );
+    eventually(&harness, "the host is woken", |_| {
+        woken.load(std::sync::atomic::Ordering::SeqCst) > before
+    });
+    assert!(harness.written_ids().is_empty());
+    assert!(harness.health().process_alive);
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    assert_eq!(harness.written_ids(), vec!["m1".to_string()]);
+    let log = log_of(&dir);
+    assert_eq!(log.matches("\"id\":\"msg_m1\"").count(), 2, "{log}");
+}
+
+#[test]
+fn a_poison_line_is_rejected_once_and_never_written_again() {
+    // A 409 (`ConflictError`: the id belongs to another durable record) or a
+    // 400 admits nothing and never will. The line is rejected; every later
+    // offer gets the same answer without another call, even once the
+    // process is gone, and the next line is not held behind it.
+    for (mode, status) in [("prompt-409", "HTTP 409"), ("prompt-400", "HTTP 400")] {
+        let dir = TempDir::new().unwrap();
+        let mut harness = start(&dir, mode);
+        let rejected = match settle(&mut harness, &msg("m1")) {
+            Ok(DeliverOutcome::Rejected { reason, .. }) => reason,
+            other => panic!("{mode}: {other:?}"),
+        };
+        assert!(rejected.contains(status), "{mode}: {rejected}");
+        for _ in 0..5 {
+            assert_eq!(
+                harness.deliver(&msg("m1")),
+                Ok(DeliverOutcome::Rejected {
+                    reason: rejected.clone(),
+                    message_specific: rejected.contains("(HTTP 409)"),
+                }),
+                "{mode}"
+            );
+        }
+        assert_eq!(
+            harness.proven("m1"),
+            None,
+            "{mode}: a rejection proves nothing"
+        );
+        assert!(harness.health().process_alive, "{mode}: no restart");
+        assert!(harness.written_ids().is_empty(), "{mode}");
+        // The send slot is free: the next line is written at once.
+        assert_eq!(
+            harness.deliver(&msg("m2")),
+            Ok(DeliverOutcome::InFlight),
+            "{mode}"
+        );
+        assert!(matches!(
+            settle(&mut harness, &msg("m2")),
+            Ok(DeliverOutcome::Rejected { .. })
+        ));
+        harness.stop();
+        assert_eq!(
+            harness.deliver(&msg("m1")),
+            Ok(DeliverOutcome::Rejected {
+                message_specific: rejected.contains("(HTTP 409)"),
+                reason: rejected,
+            }),
+            "{mode}: a rejection stands after the process"
+        );
+        let log = log_of(&dir);
+        assert_eq!(
+            log.matches("\"id\":\"msg_m1\"").count(),
+            1,
+            "{mode}: written once: {log}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_service_behind_the_readiness_gate_is_a_fault() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "prompt-503-failed");
+    let err = settle(&mut harness, &msg("m1")).unwrap_err();
+    assert!(
+        matches!(&err, HarnessError::Failed(reason) if reason.contains("HTTP 503")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn an_opencode_1x_service_fails_the_start_and_no_session_is_touched() {
+    for mode in ["v1", "info-404", "info-1x"] {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("log");
+        let started = OpenCodeHarness::start(
+            scripted_opencode(),
+            Some("ses_fake"),
+            &[
+                ("ANYAGENTS_FAKE_MODE", mode),
+                ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+                ("ANYAGENTS_FAKE_STATE", dir.path().to_str().unwrap()),
+            ],
+        );
+        let Err(HarnessError::Failed(reason)) = started else {
+            panic!("{mode}: a 1.x service started: {}", log_of(&dir));
+        };
+        assert!(
+            reason.contains("1.x") && reason.contains("2.x"),
+            "{mode}: {reason}"
+        );
+        let text = log_of(&dir);
+        assert!(
+            !text.contains("api:GET /api/session/ses_fake")
+                && !text.contains("api:POST /api/session"),
+            "{mode}: a session was touched: {text}"
+        );
+        if mode == "v1" {
+            // Known from its announcement: no `opencode api` call at all.
+            assert!(!text.contains("api:"), "{mode}: {text}");
+        } else {
+            assert!(text.contains("api:GET /api/info"), "{mode}: {text}");
+        }
+    }
+}
+
+#[test]
+fn a_proof_given_just_before_stop_is_still_proven_after_it() {
+    // The prompt call is still out when the host stops the process: `stop`
+    // waits for its answer, so the admission is known before a new process
+    // starts, and it stays readable after the service is gone.
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log");
+    let mut harness = OpenCodeHarness::start(
+        scripted_opencode(),
+        Some("ses_fake"),
+        &[
+            ("ANYAGENTS_FAKE_MODE", "hold"),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("ANYAGENTS_FAKE_DELAY_MS", "300"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(harness.deliver(&msg("m1")), Ok(DeliverOutcome::InFlight));
+    assert_eq!(harness.proven("m1"), None);
+    harness.stop();
+    assert_eq!(
+        harness.proven("m1"),
+        Some(Proof::Taken {
+            turn_finished: false
+        })
+    );
+    assert!(!harness.health().process_alive);
+    assert_eq!(harness.deliver(&msg("m1")), Ok(accepted()));
+    assert_eq!(harness.deliver(&msg("m2")), Err(HarnessError::Dead));
+
+    // A line an earlier process applied is proven a duplicate the same way.
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "applied");
+    assert_eq!(
+        settle(&mut harness, &msg("m1")).unwrap(),
+        DeliverOutcome::Duplicate
+    );
+    harness.stop();
+    assert_eq!(harness.proven("m1"), Some(Proof::Duplicate));
+    assert_eq!(harness.deliver(&msg("m1")), Ok(DeliverOutcome::Duplicate));
+}
+
+#[test]
+fn a_refused_credential_is_a_fault_and_never_waits_as_a_refusal() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "prompt-401");
+    let err = settle(&mut harness, &msg("m1")).unwrap_err();
+    assert!(
+        matches!(&err, HarnessError::Failed(reason) if reason.contains("HTTP 401")),
+        "{err:?}"
+    );
+    assert!(harness.written_ids().is_empty());
+}
+
+#[test]
+fn lines_are_written_one_at_a_time_in_mailbox_order() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log");
+    let mut harness = OpenCodeHarness::start(
+        scripted_opencode(),
+        Some("ses_fake"),
+        &[
+            ("ANYAGENTS_FAKE_MODE", "hold"),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("ANYAGENTS_FAKE_DELAY_MS", "300"),
+        ],
+    )
+    .unwrap();
+    // The first call is out: the second line waits behind it, unwritten.
+    assert_eq!(
+        harness.deliver(&msg("m1")).unwrap(),
+        DeliverOutcome::InFlight
+    );
+    assert_eq!(
+        harness.deliver(&msg("m2")).unwrap(),
+        DeliverOutcome::Deferred
+    );
+    assert_eq!(
+        harness.deliver(&msg("m1")).unwrap(),
+        DeliverOutcome::InFlight
+    );
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    assert_eq!(settle(&mut harness, &msg("m2")).unwrap(), accepted());
+    let text = log_of(&dir);
+    let first = text.find("\"id\":\"msg_m1\"").expect("m1 written");
+    let second = text.find("\"id\":\"msg_m2\"").expect("m2 written");
+    assert!(first < second, "{text}");
+    assert_eq!(text.matches("/prompt").count(), 2, "{text}");
+}
+
+#[test]
+fn what_the_service_admitted_stands_after_it_died() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    let mut harness = start_with_config(&dir, "hold", &config);
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    let pid = std::fs::read_to_string(config.join("opencode-service-pid")).unwrap();
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", pid.trim()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    eventually(&harness, "the service is gone", |harness| {
+        !harness.health().process_alive
+    });
+    assert_eq!(harness.deliver(&msg("m1")).unwrap(), accepted());
+    assert_eq!(harness.deliver(&msg("m2")), Err(HarnessError::Dead));
+}
+
+/// The session's running totals outlive a process; what a process serves is
+/// counted from its own start. The host's baseline starts again with each
+/// process, so the session's earlier totals are never counted again.
+#[test]
+fn a_process_serves_only_what_it_added_to_the_session() {
+    let dir = TempDir::new().unwrap();
+    // Earlier processes left these totals in the session.
+    std::fs::write(
+        dir.path().join("session-usage.json"),
+        r#"{"tokens":{"input":100,"output":50,"cache":{"read":0,"write":0}},"cost":1.0}"#,
+    )
+    .unwrap();
+    let harness = start(&dir, "finish");
+    // This process's turn added to them.
+    std::fs::write(
+        dir.path().join("session-usage.json"),
+        r#"{"tokens":{"input":110,"output":57,"cache":{"read":0,"write":0}},"cost":1.25}"#,
+    )
+    .unwrap();
+    let served = harness.served_usage();
+    assert_eq!(
+        (
+            served.input_tokens,
+            served.output_tokens,
+            served.reported_cost_micros
+        ),
+        (10, 7, Some(250_000)),
+        "the session's earlier totals were counted as this process's"
+    );
 }
