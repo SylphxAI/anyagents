@@ -284,9 +284,11 @@ its helper `PATH`, never an operator wrapper on the server's own `PATH`) is the
 only external program, so a host image that wraps, removes or kills `find`, `sh` or
 `test` cannot change the answer. Every seat user must therefore be able to
 execute the server binary, with every ancestor directory traversable; a seat
-that cannot is refused with a message that names the binary. A probe as the
-server's own uid and gid runs in the server process. New worktrees are shared
-with that seat's group.
+that cannot is refused with a message that names the binary. A seat's probe
+runs in its own process group and is killed with everything it started after
+300 seconds, so a seat that stops or stalls it cannot hold a creation. A probe
+as the server's own uid and gid runs in the server process. New worktrees are
+shared with that seat's group.
 On Linux, additive POSIX ACLs grant writes only to shared `objects/`, `refs/`,
 `logs/refs/`, an existing `packed-refs`, and the child's private `worktrees/<name>/`.
 The common root, `worktrees/` and `logs/` are traversal-only with no default ACLs;
@@ -295,10 +297,13 @@ exist only inside the shared content subtrees, the private gitdir and a dedicate
 `anyagents-config/` directory, never on mixed metadata ancestors. Admission
 refuses a store whose common root, `worktrees/`, `logs/`, `logs/refs/`,
 `objects/`, `refs/`, `packed-refs`, `HEAD`, `hooks/` or `info/` everyone may
-write, by mode or by a default ACL `other` entry, and, during its own walk of
-the store, any object below them that everyone may write. The refusal names the
-path and the owner's repair; granting on top of it would hand the same write to
-every object a seat adds later. Revocation is never stopped by it.
+write, by mode or by a default ACL `other` entry, and any object below them
+that everyone may write. Admission reads the whole store for this before it
+writes a journal, so a refused wake never leaves an active grant behind. The
+refusal names the path, its owning uid and the repair (as root for an object a
+seat owns: a seat can block admissions on a store by making its own file
+world-writable); granting on top of it would hand the same write to every
+object a seat adds later. Revocation is never stopped by it.
 
 Common `config` becomes an exact symlink to `anyagents-config/config`: the dedicated
 directory grants active readers traversal and read-only inheritance, so the
@@ -306,38 +311,55 @@ parent's ordinary `git config`, `git remote` and `git push -u` replacements
 remain readable immediately, without a launch or wake. Its defaults grant no
 owning-group or outsider access. The hub witnesses its own managed config; no
 journal records it. A managed config is trusted only when the link is exactly
-`anyagents-config/config`, and the link, the directory and the single-link
-config file all belong to the server's uid, no one else can write the directory
-or the file (a group named in `ANYAGENTS_TRUSTED_METADATA_GIDS` included), and
-the directory holds nothing but `config` and Git's `config.lock`. A plain common
+`anyagents-config/config` and belongs to the server's uid (only the server
+relocates), the directory and the single-link config file belong to the server
+or the store's owner (whose own Git keeps rewriting its configuration through
+the link, by lock and rename in the directory), no one else can write the
+directory or the file (a group named in `ANYAGENTS_TRUSTED_METADATA_GIDS`
+included), and the directory holds nothing but `config` and Git's
+`config.lock`. A plain common
 config, likewise, admits only its owner and the server as writers: a
 group-writable config is refused with its repair (`chmod go-w`), because every
 seat carries the trusted group and could have written it, or a server-owned
-group-writable file such as `description`, moved onto `config`. Only the server (or root) can create objects the server owns, so
-grant journals, a whole data directory or a changed device number can be lost
-without making a hub unusable, and a planted link, directory, symlinked or
-hard-linked file is refused. Only a config the server owns is relocated; a store
-owner's own config stays where it is. Relocation makes its own directory and
+group-writable file such as `description`, moved onto `config`. The same rule
+holds for `config.worktree`, the store's and each checkout's own, at admission
+and at launch: admission takes custody of a fresh checkout's own file, which
+the provider writes group-writable under `core.sharedRepository=group`, and
+removes that write; the store's is refused with its repair. Only the server (or
+root) can create a link the server owns, so grant journals, a whole data
+directory or a changed device number can be lost without making a hub
+unusable, and a planted link, directory, symlinked or hard-linked file is
+refused. The store's config is relocated whether the server or the store's
+owner owns it; the directory is handed to the config's owner. Relocation makes its own directory and
 uses an existing one only as its own interrupted state (empty, or already
 holding this inode); a directory moved in from elsewhere is refused, never
-filled. The relocated file keeps no group or other write. Relocation holds Git's original
+filled; a `config.lock` already there is named as Git's lock, stale or not.
+The relocated file keeps no group or other write; readers are granted named ACL
+entries after that, so the mask never hides them. Relocation holds Git's original
 `config.lock`, hard-links the inode into the dedicated directory, takes the new
 name's lock and atomically renames a staged symlink (`.anyagents-config.link`)
 over the original pathname, preserving config bytes and ownership. An
-interruption leaves either the plain file, or both names on one server-owned
-inode, which reads as an ordinary config; the next admission finishes the move.
+interruption leaves either the plain file, or both names on one inode owned by
+the server or the store's owner, which reads as an ordinary config; the next
+admission finishes the move.
 A stale `config.lock` from a crashed writer is a refusal that names the lock,
 never a lock AnyAgents removes. Revocation removes access and default entries
 only when no active same-seat reader remains, and a store's readers are
 recomputed from active grants after every revocation and at startup.
 AnyAgents grants a seat no write to common `config`, `hooks/` or `info/`, and
-trusts a managed config only while nobody but the server can write it. It does
+trusts configuration only while nobody but the server and the store's owner can
+write it. It does
 not make those paths unwritable to a seat that already has write through the
 store's own permissions: on a deployment whose store group every seat belongs
 to (`ANYAGENTS_TRUSTED_METADATA_GIDS`), whatever that group may write (on the
 desk: the common directory, `worktrees/`, `hooks/` and several top-level
 files) any seat may change or rename, so there is no seat-to-seat boundary for
-hooks, or for a configuration file the group can write. A parent-owned sticky
+hooks, or for a configuration file the group can write. In particular the
+name `config` in a common directory the group can write is replaceable by any
+seat, and every Git run in the store reads it, including the server's own Git
+and the checkout provider's (as the server's user). The managed config is a
+real boundary only once the hub's own layout gives the group no write to the
+common directory, `hooks/`, `info/` and the configuration files. A parent-owned sticky
 private gitdir protects `config.worktree` (and its unlink/rename), `commondir` and
 `gitdir` against the seat's own group entry; mutable HEAD/index files belong to
 the child so Git lock+rename works.
@@ -378,10 +400,15 @@ server process settles every journal of an agent that can never run again,
 once: its grant is revoked; a failed creation's checkout (the startup repair
 released its row before admission, so it never ran) and its registration are
 removed; the journal is then removed, or quarantined with the reason. The
-removal runs no Git and reads nothing the seat could write: the journal's own
-record decides, only while the checkout's `.git` pointer and the
-registration's `gitdir` name each other, and never for a path that is or holds
-an admitted agent's workdir or that another journal records. Its branch stays.
+removal runs no Git and holds descriptors throughout: both directories are
+opened component by component from `/` without following a symlink, the
+checkout's `.git` pointer and the registration's `gitdir` back link are read
+through those descriptors and must name each other by inode, and the trees are
+removed relative to the held descriptors, removing a symlink itself and never
+leaving the checkout's file system. A path that resolves only through a
+symlink, or to another inode, is kept and its journal quarantined. Never
+removed: a directory that is (or holds) an admitted agent's workdir, compared
+by inode, or one another journal records. Its branch stays.
 Only server-owned single-link journals that no one else can write, in a
 server-owned journal directory that no one else can write, are acted on. A
 deleted agent's checkout is never removed there and keeps its journal while it
