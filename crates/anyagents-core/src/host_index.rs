@@ -225,6 +225,50 @@ impl HostIndex {
     /// for one cleared source, all under the index's write lock and the
     /// owner's lifecycle lock. Files created before this index get it on
     /// their next open; a peer holding the write lock defers it to a later one.
+    /// Give an index built before generations existed its generation. A busy
+    /// index is left for the next open.
+    fn ensure_generation(conn: &Connection) -> Result<(), IndexError> {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_generation')",
+            [],
+            |r| r.get(0),
+        )?;
+        if present {
+            return Ok(());
+        }
+        match conn.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS host_generation(
+                id INTEGER PRIMARY KEY CHECK(id=1), generation TEXT NOT NULL);
+            INSERT OR IGNORE INTO host_generation VALUES(1, '{}');",
+            uuid::Uuid::now_v7()
+        )) {
+            Ok(()) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// This index's generation: a new one each time its documents table is
+    /// created, so a reader that keeps positions by rowid (the memory
+    /// service's dense marks) can tell its rowids started over.
+    pub fn generation(&self) -> Result<Option<String>, IndexError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT generation FROM host_generation WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     fn ensure_call_document_index(conn: &Connection) -> Result<(), IndexError> {
         let present: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='host_calls_document')",
@@ -282,6 +326,7 @@ impl HostIndex {
         let (_, already_initialized) = Self::schema_state(&conn)?;
         if already_initialized {
             Self::ensure_call_document_index(&conn)?;
+            Self::ensure_generation(&conn)?;
             return Ok(Self { conn });
         }
         // Serialize first-time schema creation and disposable-schema upgrades so
@@ -302,6 +347,7 @@ impl HostIndex {
                 DROP TABLE IF EXISTS host_documents;
                 DROP TABLE IF EXISTS host_sources;
                 DROP TABLE IF EXISTS host_agent_trees;
+                DROP TABLE IF EXISTS host_generation;
                 DROP TABLE IF EXISTS host_fts;",
                 )?;
             }
@@ -333,7 +379,14 @@ impl HostIndex {
             CREATE VIRTUAL TABLE IF NOT EXISTS host_fts USING fts5(tokens,content='',contentless_delete=1);
             CREATE TRIGGER IF NOT EXISTS host_windows_delete AFTER DELETE ON host_windows BEGIN
                 DELETE FROM host_fts WHERE rowid=old.id;
-            END;")?;
+            END;
+            CREATE TABLE IF NOT EXISTS host_generation(
+                id INTEGER PRIMARY KEY CHECK(id=1), generation TEXT NOT NULL);")?;
+            // Documents start over at rowid 1: a new generation.
+            conn.execute(
+                "INSERT OR REPLACE INTO host_generation VALUES(1, ?1)",
+                [uuid::Uuid::now_v7().to_string()],
+            )?;
             conn.execute(
                 "INSERT INTO host_fts(host_fts,rank) VALUES('secure-delete',1)",
                 [],
@@ -1856,6 +1909,45 @@ mod tests {
                 .is_empty()
         );
     }
+    /// A reader that keeps positions by rowid can tell when the index's
+    /// documents started over: a new file, or recreated tables, is a new
+    /// generation; reopening keeps it; an index made before generations gets
+    /// one on its next open.
+    #[test]
+    fn a_new_or_rebuilt_index_has_a_new_generation_and_reopening_keeps_it() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("host.db");
+        let first = HostIndex::open(&path)
+            .unwrap()
+            .generation()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            HostIndex::open(&path).unwrap().generation().unwrap(),
+            Some(first.clone())
+        );
+        // Made before generations: the table is absent until the next open.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE host_generation;")
+            .unwrap();
+        let adopted = HostIndex::open(&path)
+            .unwrap()
+            .generation()
+            .unwrap()
+            .unwrap();
+        assert_ne!(adopted, first);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        let rebuilt = HostIndex::open(&path)
+            .unwrap()
+            .generation()
+            .unwrap()
+            .unwrap();
+        assert_ne!(rebuilt, adopted);
+    }
+
     #[test]
     fn changed_metadata_reindexes_but_tampered_bytes_and_owner_do_not_publish() {
         let dir = crate::test_tempdir();
