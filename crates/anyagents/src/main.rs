@@ -7,6 +7,7 @@ use anyagents_core::Error;
 use clap::{Args, Parser, Subcommand};
 
 mod agent;
+mod agent_file;
 mod api;
 mod auth;
 mod browser;
@@ -1084,6 +1085,7 @@ fn internal(args: &[std::ffi::OsString]) -> ExitCode {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("admission-probe") => worktree_access::admission_probe_main(&args[1..]),
         Some("seat-file") => seat_tree::seat_file_main(&args[1..]),
+        Some("browser-jail") => browser::jail::main(&args[1..]),
         _ => {
             eprintln!("anyagents internal: unknown helper");
             ExitCode::from(2)
@@ -1921,11 +1923,14 @@ fn browser_cmd(
                     "the server answered nothing".into(),
                 ));
             }
-            Err(err) if err.contains("404") => browser::execute(data, "default", req)?,
+            // This process runs the browser itself, as its own user.
+            Err(err) if err.contains("404") => {
+                browser::execute(data, "default", req, &agent_file::FileAuthority::Own)?
+            }
             Err(err) => return Err(anyagents_core::Error::Message(err)),
         }
     } else {
-        browser::execute(data, "default", req)?
+        browser::execute(data, "default", req, &agent_file::FileAuthority::Own)?
     };
     println!(
         "{}",

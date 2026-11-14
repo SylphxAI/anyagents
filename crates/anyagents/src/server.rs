@@ -2781,7 +2781,8 @@ async fn browser_route(
         Principal::Operator => "default".to_string(),
     };
     spawn_store(move || {
-        let out = crate::browser::execute(state.store.data_dir(), &default_profile, body)
+        let files = crate::agent_file::FileAuthority::of(&state.store, &principal);
+        let out = crate::browser::execute(state.store.data_dir(), &default_profile, body, &files)
             .map_err(ApiError::from_store)?;
         Ok(Json(out))
     })
@@ -7033,6 +7034,7 @@ fn send_sync(
         ..body
     };
     check_targets(store, actor, &body, &plan)?;
+    let upload = media_upload(store, &body, &plan)?;
     let sender_agent_id = plan.sender_id.clone();
     let composed_body = anyagents_core::quote::compose(&body.text, body.quote.as_ref());
     // The operator inbox decides its limits in its own write transaction, so
@@ -7145,6 +7147,7 @@ fn send_sync(
                         store,
                         &channel_actor,
                         &body,
+                        upload.as_ref(),
                         address,
                         chat,
                         thread.as_deref(),
@@ -7182,6 +7185,40 @@ fn send_sync(
             .map_err(ApiError::from_store)?;
     }
     Ok(Json(response))
+}
+
+/// The bytes of a send's local media file, for its Telegram targets: read
+/// once, before any target is written, with the caller's own access and never
+/// the server's (ADR 0010 D3). A URL, a Telegram `file_id`, or a send with no
+/// Telegram target reads nothing; an agent's mailbox gets the path, which its
+/// recipient opens as itself.
+fn media_upload(
+    store: &Store,
+    body: &SendRequest,
+    plan: &SendPlan,
+) -> Result<Option<crate::telegram::MediaUpload>, ApiError> {
+    let Some(media) = &body.media else {
+        return Ok(None);
+    };
+    let source = media.source.trim();
+    if !crate::telegram::is_local_media(source)
+        || !plan
+            .targets
+            .iter()
+            .any(|target| matches!(target, Target::Telegram { .. }))
+    {
+        return Ok(None);
+    }
+    // The authenticated agent, never a sender the operator names.
+    let authority = match &plan.principal_id {
+        Some(id) => crate::agent_file::FileAuthority::of_agent_id(store, id),
+        None => crate::agent_file::FileAuthority::Own,
+    };
+    let path = Path::new(source);
+    let bytes = authority
+        .read(path, crate::agent_file::MEDIA_UPLOAD_LIMIT)
+        .map_err(|why| ApiError::forbidden(format!("media not sent: {why}")))?;
+    Ok(Some(crate::telegram::MediaUpload::new(path, bytes)))
 }
 
 /// The idempotency key of one call. The same call repeated after a lost
@@ -7631,6 +7668,7 @@ fn deliver_telegram(
     store: &Store,
     actor: &Actor,
     body: &SendRequest,
+    upload: Option<&crate::telegram::MediaUpload>,
     address: &str,
     chat: &str,
     thread: Option<&str>,
@@ -7658,6 +7696,7 @@ fn deliver_telegram(
             chat_id,
             &media.kind,
             &media.source,
+            upload,
             caption,
             media.title.as_deref(),
             media.performer.as_deref(),
@@ -9192,6 +9231,104 @@ pub(crate) mod tests {
     /// server started by one never reads another's settings.
     pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
         ENV.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// A send's local media is read with the sending agent's own access,
+    /// once, before any Telegram post: the operator token, a link to it and
+    /// a path outside the agent's directories are refused; the agent's own
+    /// file is read; a URL or `file_id` and an internal-only send read
+    /// nothing; the operator reads with its own access.
+    #[test]
+    fn send_media_is_read_with_the_senders_access_never_the_servers() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("ada", "opencode"))
+            .unwrap();
+        let secrets = data.join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let token = secrets.join("operator-token");
+        std::fs::write(&token, b"operator-secret").unwrap();
+        let work = anyagents_core::agent_work_dir(data, &agent.id);
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("photo.png"), b"png").unwrap();
+        std::os::unix::fs::symlink(&token, work.join("photo-link.png")).unwrap();
+        store
+            .create_agent(anyagents_core::NewAgent::new("bob", "opencode"))
+            .unwrap();
+        let plan = |principal: Option<&anyagents_core::AgentId>, to: &str| {
+            let request = SendRequest {
+                to: vec![to.into()],
+                text: "x".into(),
+                ..Default::default()
+            };
+            let mut plan = SendPlan::parse(&store, &Actor::Agent("ada".into()), &request)
+                .unwrap_or_else(|error| panic!("{}", error.message));
+            plan.principal_id = principal.cloned();
+            plan
+        };
+        let body = |source: &str| SendRequest {
+            to: vec!["telegram:chat:100".into()],
+            media: Some(crate::api::SendMedia {
+                kind: "photo".into(),
+                source: source.into(),
+                title: None,
+                performer: None,
+            }),
+            ..Default::default()
+        };
+        let as_agent = plan(Some(&agent.id), "telegram:chat:100");
+        for refused in [
+            token.clone(),
+            work.join("photo-link.png"),
+            work.join("../../../secrets/operator-token"),
+            data.join("state.db"),
+        ] {
+            let error = media_upload(&store, &body(refused.to_str().unwrap()), &as_agent)
+                .err()
+                .unwrap_or_else(|| panic!("{} must be refused", refused.display()));
+            assert_eq!(error.status, StatusCode::FORBIDDEN, "{}", error.message);
+            assert!(!error.message.contains("operator-secret"));
+        }
+        let relative = media_upload(&store, &body("./photo.png"), &as_agent)
+            .err()
+            .unwrap();
+        assert!(
+            relative.message.contains("absolute"),
+            "{}",
+            relative.message
+        );
+        let own = media_upload(
+            &store,
+            &body(work.join("photo.png").to_str().unwrap()),
+            &as_agent,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (own.file_name.as_str(), own.bytes.as_slice()),
+            ("photo.png", &b"png"[..])
+        );
+        for reference in ["https://example.test/a.png", "AgACAgUAAxkBAAIB"] {
+            assert!(
+                media_upload(&store, &body(reference), &as_agent)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let internal = plan(Some(&agent.id), "agent:bob");
+        assert!(
+            media_upload(&store, &body(token.to_str().unwrap()), &internal)
+                .unwrap()
+                .is_none()
+        );
+        let operator = plan(None, "telegram:chat:100");
+        let read = media_upload(&store, &body(token.to_str().unwrap()), &operator)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.bytes, b"operator-secret");
     }
 
     /// Process-local environment locks do not isolate forked children or

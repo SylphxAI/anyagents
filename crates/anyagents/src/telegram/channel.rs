@@ -2639,9 +2639,40 @@ pub fn post_poll(
     Ok(message_id)
 }
 
+/// Whether a media `source` names a local file: not an `http(s)://` URL,
+/// and not a Telegram `file_id` (which never holds a `/`).
+pub fn is_local_media(source: &str) -> bool {
+    let source = source.trim();
+    !source.starts_with("http://")
+        && !source.starts_with("https://")
+        && (source.contains('/') || source.starts_with('.') || source.starts_with('~'))
+}
+
+/// A local file's bytes, read by the caller with the requester's own access
+/// (ADR 0010 D3), and the name it is uploaded under.
+pub struct MediaUpload {
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+}
+
+impl MediaUpload {
+    /// `bytes` read from `path`, uploaded under its final name.
+    pub fn new(path: &std::path::Path, bytes: Vec<u8>) -> Self {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment.bin")
+            .replace(['"', '\r', '\n'], "_");
+        Self { file_name, bytes }
+    }
+}
+
 /// Post a media item (photo, video, audio/music, voice, document, animation) through
-/// the agent's bot. Accepts an `https://` URL, an existing Telegram `file_id`,
-/// or a local filesystem path (uploaded via `multipart/form-data`).
+/// the agent's bot. `source` is an `https://` URL or an existing Telegram
+/// `file_id`, which Telegram fetches itself, or a local path whose bytes the
+/// caller already read into `upload` (sent as `multipart/form-data`). This
+/// function never opens a local path: the server's own access is not the
+/// requester's.
 #[allow(clippy::too_many_arguments)]
 pub fn post_media(
     store: &Store,
@@ -2650,12 +2681,19 @@ pub fn post_media(
     chat_id: i64,
     kind: &str,
     source: &str,
+    upload: Option<&MediaUpload>,
     caption: Option<&str>,
     title: Option<&str>,
     performer: Option<&str>,
     reply_to: Option<i64>,
     thread: Option<i64>,
 ) -> Result<i64, anyagents_core::Error> {
+    if upload.is_none() && is_local_media(source) {
+        return Err(anyagents_core::Error::Message(
+            "a local media path is uploaded only from bytes read with the sender's own access"
+                .into(),
+        ));
+    }
     let channel = channel_for(store, from)?;
     let Some(credential_ref) = channel.credential_ref else {
         return Err(anyagents_core::Error::Message(
@@ -2663,17 +2701,13 @@ pub fn post_media(
         ));
     };
     let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
-    let local_path = std::path::Path::new(source);
-    let response = if !source.starts_with("http://")
-        && !source.starts_with("https://")
-        && local_path.is_file()
-    {
+    let response = if let Some(upload) = upload {
         match call_api_multipart(
             &token,
             &channel.id,
             chat_id,
             kind,
-            local_path,
+            upload,
             caption,
             title,
             performer,
@@ -2690,7 +2724,7 @@ pub fn post_media(
                     &channel.id,
                     chat_id,
                     kind,
-                    local_path,
+                    upload,
                     caption,
                     title,
                     performer,
@@ -3114,7 +3148,7 @@ fn call_api_multipart(
     channel_id: &anyagents_core::ChannelId,
     chat_id: i64,
     kind: &str,
-    file_path: &std::path::Path,
+    upload: &MediaUpload,
     caption: Option<&str>,
     title: Option<&str>,
     performer: Option<&str>,
@@ -3129,12 +3163,8 @@ fn call_api_multipart(
         "animation" | "gif" => ("sendAnimation", "animation"),
         _ => ("sendDocument", "document"),
     };
-    let file_bytes = std::fs::read(file_path)?;
-    let file_name = file_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("attachment.bin")
-        .replace('"', "_");
+    let file_bytes = &upload.bytes;
+    let file_name = &upload.file_name;
     let boundary = format!("----anyagents-tg-{}", anyagents_core::MessageId::generate());
     let mut payload: Vec<u8> = Vec::with_capacity(file_bytes.len() + 1024);
     let mut add_field = |name: &str, val: &str| {
@@ -3171,7 +3201,7 @@ fn call_api_multipart(
         )
         .as_bytes(),
     );
-    payload.extend_from_slice(&file_bytes);
+    payload.extend_from_slice(file_bytes);
     payload.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
     let url = format!("{}/bot{token}/{method}", api_base());

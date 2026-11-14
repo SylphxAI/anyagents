@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Security: the server no longer opens host files with its own access on an
+  agent's behalf (ADR 0010 D3). A `send` with a local media path uploads it
+  only when the sending agent can read it itself: a seat agent's file is
+  opened by that seat (`anyagents internal seat-file open`, which hands back
+  the descriptor), a seatless agent's only beneath its own directories
+  (`openat2(RESOLVE_BENEATH)`); a final symbolic link is refused, URL and
+  `file_id` media are unchanged. The browser navigates only `http(s)://` and
+  `about:blank`, refuses to read or drive a page on any other URL, writes a
+  screenshot `path` with the caller's access, keeps Chromium's home and
+  downloads inside its profile, and on Linux starts Chromium inside a
+  Landlock jail that opens only the system and its profile to it, required
+  whenever OS seats are configured.
 - Agents report defects to whoever runs the deployment with `send` to
   `operator`: a defect in AnyAgents, the harness or the host that an agent
   cannot fix within its own work. Only the operator reads it, with

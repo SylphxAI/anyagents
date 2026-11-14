@@ -106,6 +106,9 @@ jobs:
       - name: Build harness helper binaries
         run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
       - name: Test
+        env:
+          # The browser jail's acceptance fails, never skips, without Landlock.
+          ANYAGENTS_REQUIRE_LANDLOCK_TEST: '1'
         run: cargo test --workspace --locked
       - name: Takeover interaction acceptance
         if: github.event_name == 'workflow_dispatch' && inputs.takeover && github.event.repository.visibility == 'public'
@@ -161,6 +164,8 @@ jobs:
           test_binary=$(python3 -c 'import json,sys; artifacts=[a for line in open(sys.argv[1]) if (a:=json.loads(line)).get("reason")=="compiler-artifact" and a.get("target",{}).get("name")=="anyagents" and a.get("profile",{}).get("test") and a.get("executable")]; assert len(artifacts)==1; print(artifacts[0]["executable"])' "$RUNNER_TEMP/worktree-test-build.json")
           sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact create::tests::privileged_cross_uid_spawn_can_create_commit_and_status --nocapture
           sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact worktree::tests::privileged_pool_seat_workflow_receipt --nocapture
+          # A file the server opens for a seat is opened by that seat.
+          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact seat_tree::tests::privileged_seat_open_refuses_what_the_seat_cannot_read --nocapture
 
   # The macOS lane: the same gate on a second platform. macOS is a supported
   # host for a long-lived agent, so its build is checked before merge.
