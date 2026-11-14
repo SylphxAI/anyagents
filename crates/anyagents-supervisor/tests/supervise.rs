@@ -332,21 +332,16 @@ fn finished_turns_sum_by_agent_and_day() {
     let other = Store::open(dir.path().join("state.db")).unwrap();
     other.receive(&alpha.id, Incoming::new("one")).unwrap();
     other.receive(&beta.id, Incoming::new("two")).unwrap();
-    // The mock clock only moves when this test moves it. The supervisor skips a
-    // quota wait when the clock has reached the reset time and reads the
-    // harness's usage when the mailbox has drained, so each step below advances
-    // it past that reset and then past the idle review.
-    let due = 1_700_000_000_000;
-    let mut stepped = 0;
-    while store.list_usage(None).unwrap().len() < 2 {
-        assert!(stepped < 40, "{:?}", store.list_usage(None).unwrap());
-        stepped += 1;
-        clock.set_ms(due + i64::from(stepped) * 1_000);
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // The first turns ran after the quota reset the scripted child announced,
-    // on the day the clock reached it.
-    let first_day = utc_day(due + i64::from(stepped) * 1_000);
+    // The mock clock only moves when this test moves it. Each first turn ends
+    // and then announces a quota hold that lasts into another day: its usage
+    // is recorded before the hold, on the day the turn ran, whichever of the
+    // two lines the supervisor reads first. The clock stays on that day.
+    assert!(
+        wait_until(|| store.list_usage(None).unwrap().len() == 2),
+        "{:?}",
+        store.list_usage(None).unwrap()
+    );
+    let first_day = utc_day(started);
     for record in store.list_usage(None).unwrap() {
         assert_eq!(record.input_tokens, 11);
         assert_eq!(record.output_tokens, 7);

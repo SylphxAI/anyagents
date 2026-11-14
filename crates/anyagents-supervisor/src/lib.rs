@@ -1645,6 +1645,9 @@ impl<H: Harness + 'static> Session<H> {
             return (rotated_after_start || config_switched) && self.replace_process();
         }
         self.commit_proven();
+        // What the harness served before the hold is recorded on the day it
+        // was served, not on the day the hold ends.
+        self.record_usage_with(health);
         self.sleep(Some(reset_at));
         true
     }
