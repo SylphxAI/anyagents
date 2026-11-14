@@ -20,6 +20,7 @@ members = [
     "crates/anyagents-channel-telegram",
     "crates/anyagents-gateway",
     "crates/anyagents-tools",
+    "crates/anyagents-memory",
     "crates/anyagents",
     "tests/invariants",
 ]

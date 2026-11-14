@@ -20,6 +20,9 @@ use std::{
 
 const WINDOW_BYTES: usize = 4096;
 const OVERLAP_BYTES: usize = 256;
+/// The documents of one published source `?2`: the file itself, or each row
+/// of a native store, whose segments name rows below the store's path.
+const OF_SOURCE: &str = "(segment=?2 OR substr(segment,1,length(?2)+1)=?2||'/')";
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -222,6 +225,50 @@ impl HostIndex {
     /// for one cleared source, all under the index's write lock and the
     /// owner's lifecycle lock. Files created before this index get it on
     /// their next open; a peer holding the write lock defers it to a later one.
+    /// Give an index built before generations existed its generation. A busy
+    /// index is left for the next open.
+    fn ensure_generation(conn: &Connection) -> Result<(), IndexError> {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_generation')",
+            [],
+            |r| r.get(0),
+        )?;
+        if present {
+            return Ok(());
+        }
+        match conn.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS host_generation(
+                id INTEGER PRIMARY KEY CHECK(id=1), generation TEXT NOT NULL);
+            INSERT OR IGNORE INTO host_generation VALUES(1, '{}');",
+            uuid::Uuid::now_v7()
+        )) {
+            Ok(()) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// This index's generation: a new one each time its documents table is
+    /// created, so a reader that keeps positions by rowid (the memory
+    /// service's dense marks) can tell its rowids started over.
+    pub fn generation(&self) -> Result<Option<String>, IndexError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT generation FROM host_generation WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     fn ensure_call_document_index(conn: &Connection) -> Result<(), IndexError> {
         let present: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='host_calls_document')",
@@ -279,6 +326,7 @@ impl HostIndex {
         let (_, already_initialized) = Self::schema_state(&conn)?;
         if already_initialized {
             Self::ensure_call_document_index(&conn)?;
+            Self::ensure_generation(&conn)?;
             return Ok(Self { conn });
         }
         // Serialize first-time schema creation and disposable-schema upgrades so
@@ -299,6 +347,7 @@ impl HostIndex {
                 DROP TABLE IF EXISTS host_documents;
                 DROP TABLE IF EXISTS host_sources;
                 DROP TABLE IF EXISTS host_agent_trees;
+                DROP TABLE IF EXISTS host_generation;
                 DROP TABLE IF EXISTS host_fts;",
                 )?;
             }
@@ -330,7 +379,14 @@ impl HostIndex {
             CREATE VIRTUAL TABLE IF NOT EXISTS host_fts USING fts5(tokens,content='',contentless_delete=1);
             CREATE TRIGGER IF NOT EXISTS host_windows_delete AFTER DELETE ON host_windows BEGIN
                 DELETE FROM host_fts WHERE rowid=old.id;
-            END;")?;
+            END;
+            CREATE TABLE IF NOT EXISTS host_generation(
+                id INTEGER PRIMARY KEY CHECK(id=1), generation TEXT NOT NULL);")?;
+            // Documents start over at rowid 1: a new generation.
+            conn.execute(
+                "INSERT OR REPLACE INTO host_generation VALUES(1, ?1)",
+                [uuid::Uuid::now_v7().to_string()],
+            )?;
             conn.execute(
                 "INSERT INTO host_fts(host_fts,rank) VALUES('secure-delete',1)",
                 [],
@@ -419,7 +475,7 @@ impl HostIndex {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for segment in segments {
             tx.execute(
-                "DELETE FROM host_documents WHERE agent_id=?1 AND segment=?2",
+                &format!("DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE}"),
                 params![owner, segment],
             )?;
             tx.execute(
@@ -485,7 +541,7 @@ impl HostIndex {
             })
             .collect::<Result<Vec<_>, _>>()?;
         due.retain(|(_, _, c)| {
-            c.policy.starts_with("native-jsonl-v4:")
+            (c.policy.starts_with("native-jsonl-v4") || c.policy.starts_with("native-sqlite-v1"))
                 && c.full_verified_ms <= now_ms.saturating_sub(3_600_000)
         });
         due.sort_by(|a, b| {
@@ -528,7 +584,7 @@ impl HostIndex {
     }
     pub(crate) fn clear_source(&self, owner: &str, path: &Path) -> Result<(), IndexError> {
         self.conn.execute(
-            "DELETE FROM host_documents WHERE agent_id=?1 AND segment=?2",
+            &format!("DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE}"),
             params![owner, path.to_string_lossy()],
         )?;
         self.conn.execute(
@@ -690,65 +746,53 @@ impl HostIndex {
         metadata: &IndexMetadata,
         raw: &RawCoordinate,
     ) -> Result<bool, IndexError> {
+        if self.is_current(id, metadata, raw)? {
+            return Ok(false);
+        }
+        let prepared = prepare_document(source, id, metadata, raw)?;
         self.in_write_scope("host_document_index", |this| {
-            this.index_in_write_scope(source, id, metadata, raw)
+            this.publish_document(&prepared)
         })
     }
 
-    fn index_in_write_scope(
-        &mut self,
-        file: &mut RawSource,
+    /// Whether the index already holds `id` with exactly this coordinate and
+    /// metadata: a read, so a refresh can skip reading and projecting it.
+    pub(crate) fn is_current(
+        &self,
         id: &str,
         metadata: &IndexMetadata,
         raw: &RawCoordinate,
     ) -> Result<bool, IndexError> {
-        if raw.segment != file.path() {
-            return Err(io::Error::other("indexed coordinate names another source").into());
-        }
         let source = metadata
             .source
             .source()
             .ok_or_else(|| io::Error::other("an indexed document needs one source"))?;
-        let unchanged: Option<(String, String)> = self
-            .conn
-            .query_row(
-                "SELECT sha256, agent_id FROM host_documents WHERE id=?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        if unchanged
-            .as_ref()
-            .is_some_and(|(_, owner)| owner != &metadata.agent_id)
-        {
+        let old: Option<(String, String, String)> = self.conn.query_row(
+            "SELECT json_array(segment,offset,length,sha256,seq),json_array(agent_id,source,timestamp_ms,direction,sender,destination,tool_name,role),agent_id FROM host_documents WHERE id=?1",
+            [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let Some((raw_identity, meta_identity, owner)) = old else {
+            return Ok(false);
+        };
+        if owner != metadata.agent_id {
             return Err(io::Error::other("indexed document owner cannot change").into());
         }
-        let old: Option<(String, String)> = self.conn.query_row(
-            "SELECT json_array(segment,offset,length,sha256,seq),json_array(agent_id,source,timestamp_ms,direction,sender,destination,tool_name,role) FROM host_documents WHERE id=?1",
-            [id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-        let raw_identity =
-            serde_json::json!([raw.segment, raw.offset, raw.length, raw.sha256, raw.seq])
-                .to_string();
-        let meta_identity = serde_json::json!([
-            metadata.agent_id,
-            source,
-            metadata.timestamp_ms,
-            metadata.direction,
-            metadata.sender,
-            metadata.destination,
-            metadata.tool_name,
-            metadata.role
-        ])
-        .to_string();
-        let mut names = metadata.tool_names.clone();
-        names.extend(metadata.tool_name.iter().cloned());
-        names.sort();
-        names.dedup();
-        if self.document_tools(id)? == names
-            && old
-                .as_ref()
-                .is_some_and(|(r, m)| r == &raw_identity && m == &meta_identity)
-        {
+        Ok(raw_identity == raw_json(raw)
+            && meta_identity == meta_json(metadata, source)
+            && self.document_tools(id)? == tool_set(metadata))
+    }
+
+    /// Insert one prepared document inside the caller's write scope. All
+    /// reading, hashing and token projection happened before; this only
+    /// writes rows, so a write transaction never spans a raw read.
+    pub(crate) fn publish_document(&mut self, doc: &PreparedDocument) -> Result<bool, IndexError> {
+        let metadata = &doc.metadata;
+        let raw = &doc.raw;
+        let id = doc.id.as_str();
+        let source = metadata
+            .source
+            .source()
+            .ok_or_else(|| io::Error::other("an indexed document needs one source"))?;
+        if self.is_current(id, metadata, raw)? {
             return Ok(false);
         }
         let tx = self.conn.savepoint()?;
@@ -772,79 +816,77 @@ impl HostIndex {
                 raw.seq
             ],
         )?;
-        for name in names {
+        for name in tool_set(metadata) {
             tx.execute(
                 "INSERT INTO host_document_tools VALUES(?1,?2)",
                 params![id, name],
             )?;
         }
-        // One sequential pass: each window keeps the previous window's last
-        // OVERLAP_BYTES and reads only its new bytes, which are also hashed.
-        let mut reader = file.range(raw.offset, raw.length);
-        let mut hash = Sha256::new();
-        let mut carried = 0;
-        let mut relative = 0u64;
-        let mut json_state = JsonProjection::default();
-        let mut bytes = [0u8; WINDOW_BYTES];
-        while relative < raw.length {
-            let length = (raw.length - relative).min(WINDOW_BYTES as u64) as usize;
-            reader
-                .read_exact(&mut bytes[carried..length])
-                .map_err(|e| match e.kind() {
-                    io::ErrorKind::UnexpectedEof => integrity_mismatch(),
-                    _ => e,
-                })?;
-            hash.update(&bytes[carried..length]);
-            // Lossy projection is only for search over binary tool outputs.
-            // The stored coordinate and the returned range remain exact bytes.
-            let mut tokens =
-                crate::tokenize_hybrid_search_tokens(&String::from_utf8_lossy(&bytes[..length]));
-            // Decode string escapes without materializing an unbounded JSON event.
-            // Raw and decoded projections share the original exact-byte window.
-            let mut window_state = json_state.clone();
-            let decoded = window_state.feed(&bytes[..length]);
-            tokens.extend(crate::tokenize_hybrid_search_tokens(
-                &String::from_utf8_lossy(&decoded),
-            ));
-            let tokens = tokens.join(" ");
-            let step = if relative + length as u64 == raw.length {
-                length
-            } else {
-                length - OVERLAP_BYTES
-            };
-            json_state.feed(&bytes[..step]);
+        for window in &doc.windows {
             tx.execute(
                 "INSERT INTO host_windows(document_id,offset,length,sha256) VALUES(?1,?2,?3,?4)",
-                params![
-                    id,
-                    raw.offset + relative,
-                    length,
-                    crate::learned_memory::sha256(&bytes[..length])
-                ],
+                params![id, window.offset, window.length, window.sha256],
             )?;
             let row = tx.last_insert_rowid();
             tx.execute(
                 "INSERT INTO host_fts(rowid,tokens) VALUES(?1,?2)",
-                params![row, tokens],
+                params![row, window.tokens],
             )?;
-            if relative + length as u64 == raw.length {
-                break;
-            }
-            bytes.copy_within(length - OVERLAP_BYTES..length, 0);
-            carried = OVERLAP_BYTES;
-            relative += (length - OVERLAP_BYTES) as u64;
-        }
-        // Never publish a projection of bytes other than the coordinate's.
-        if format!("{:x}", hash.finalize()) != raw.sha256 {
-            return Err(integrity_mismatch().into());
         }
         tx.commit()?;
         Ok(true)
     }
 
+    /// Delete one source's documents numbered `from_seq` and above: what a
+    /// completed rebuild found no longer exists.
+    pub(crate) fn forget_documents_from(
+        &self,
+        owner: &str,
+        source: &Path,
+        from_seq: u64,
+    ) -> Result<usize, IndexError> {
+        Ok(self.conn.execute(
+            &format!("DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE} AND seq>=?3"),
+            params![owner, source.to_string_lossy(), from_seq as i64],
+        )?)
+    }
+
+    /// The document sequence numbers one source has published.
+    pub(crate) fn source_sequences(
+        &self,
+        owner: &str,
+        source: &Path,
+    ) -> Result<Vec<u64>, IndexError> {
+        Ok(self
+            .conn
+            .prepare(&format!(
+                "SELECT seq FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE}"
+            ))?
+            .query_map(params![owner, source.to_string_lossy()], |r| {
+                r.get::<_, i64>(0).map(|v| v as u64)
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Delete the named documents of one source.
+    pub(crate) fn forget_sequences(
+        &self,
+        owner: &str,
+        source: &Path,
+        seqs: &[u64],
+    ) -> Result<(), IndexError> {
+        let mut statement = self.conn.prepare(&format!(
+            "DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE} AND seq=?3"
+        ))?;
+        for seq in seqs {
+            statement.execute(params![owner, source.to_string_lossy(), *seq as i64])?;
+        }
+        Ok(())
+    }
+
     /// Resolve an opaque document ID only within the host-authorized owner set.
     /// This lookup performs no filesystem reads and accepts no caller path.
-    pub(crate) fn document(
+    pub fn document(
         &self,
         visible: &[String],
         scope: MemoryScope,
@@ -912,14 +954,39 @@ impl HostIndex {
         scope: MemoryScope,
         query: &HistorySearchQuery,
     ) -> Result<Vec<IndexHit>, IndexError> {
-        self.search_in_segment(visible_agents, scope, query, None)
+        self.search_in_segment(visible_agents, scope, query, None, None)
     }
+
+    /// Of the named documents, those of the authorized owners and scope that
+    /// match every structured filter of `query` (its text terms are not
+    /// applied): how another retriever's candidates meet the same rules as a
+    /// lexical hit. Ordering is left to the caller.
+    pub fn filter_documents(
+        &self,
+        visible_agents: &[String],
+        scope: MemoryScope,
+        query: &HistorySearchQuery,
+        ids: &[String],
+    ) -> Result<Vec<IndexHit>, IndexError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut filters = query.clone();
+        filters.query = None;
+        filters.queries.clear();
+        filters.radius = 0;
+        filters.sort = HistorySort::Oldest;
+        filters.limit = ids.len().min(200);
+        self.search_in_segment(visible_agents, scope, &filters, None, Some(ids))
+    }
+
     fn search_in_segment(
         &self,
         visible_agents: &[String],
         scope: MemoryScope,
         query: &HistorySearchQuery,
         segment: Option<&Path>,
+        ids: Option<&[String]>,
     ) -> Result<Vec<IndexHit>, IndexError> {
         if visible_agents.is_empty() {
             return Ok(Vec::new());
@@ -927,6 +994,13 @@ impl HostIndex {
         let mut values: Vec<Value> = visible_agents.iter().cloned().map(Value::Text).collect();
         let placeholders = vec!["?"; values.len()].join(",");
         let mut where_sql = format!("d.agent_id IN ({placeholders})");
+        if let Some(ids) = ids {
+            where_sql.push_str(&format!(
+                " AND d.id IN ({})",
+                vec!["?"; ids.len()].join(",")
+            ));
+            values.extend(ids.iter().cloned().map(Value::Text));
+        }
         let terms: Vec<String> = query
             .query
             .iter()
@@ -934,14 +1008,19 @@ impl HostIndex {
             .flat_map(|s| crate::tokenize_hybrid_search_tokens(s))
             .collect();
         let lexical = !terms.is_empty();
+        if let Some(segment) = segment {
+            // Sequence coordinates are local to one source: a file, or one
+            // native store whose rows each name their own segment.
+            let source = crate::host_sqlite::source_of(segment);
+            let source = source.to_string_lossy().to_string();
+            where_sql.push_str(" AND (d.segment=? OR substr(d.segment,1,length(?)+1)=?||'/')");
+            values.extend([source.clone().into(), source.clone().into(), source.into()]);
+        }
         let mut push = |clause: &str, value: Value| {
             where_sql.push_str(" AND ");
             where_sql.push_str(clause);
             values.push(value);
         };
-        if let Some(segment) = segment {
-            push("d.segment=?", segment.to_string_lossy().to_string().into());
-        }
         if let Some(agent) = query.agent.as_deref().filter(|a| *a != "all") {
             push("d.agent_id=?", agent.to_owned().into());
         }
@@ -1105,9 +1184,13 @@ impl HostIndex {
                     scope,
                     &neighbors,
                     Some(&hit.raw.segment),
+                    None,
                 )? {
-                    // Sequence coordinates are local to one segment.
-                    if neighbor.raw.segment == hit.raw.segment && ids.insert(neighbor.id.clone()) {
+                    // Sequence coordinates are local to one source.
+                    if crate::host_sqlite::source_of(&neighbor.raw.segment)
+                        == crate::host_sqlite::source_of(&hit.raw.segment)
+                        && ids.insert(neighbor.id.clone())
+                    {
                         expanded.push(neighbor);
                     }
                 }
@@ -1190,6 +1273,128 @@ impl JsonProjection {
         }
         out
     }
+}
+
+/// One raw window of a document, read, hashed and projected to search
+/// tokens before any write scope opens.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedWindow {
+    pub offset: u64,
+    pub length: u64,
+    pub sha256: String,
+    pub tokens: String,
+}
+
+/// A document ready to publish: everything a write needs, nothing to read.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedDocument {
+    pub id: String,
+    pub metadata: IndexMetadata,
+    pub raw: RawCoordinate,
+    pub windows: Vec<PreparedWindow>,
+}
+
+fn raw_json(raw: &RawCoordinate) -> String {
+    serde_json::json!([raw.segment, raw.offset, raw.length, raw.sha256, raw.seq]).to_string()
+}
+fn meta_json(metadata: &IndexMetadata, source: &str) -> String {
+    serde_json::json!([
+        metadata.agent_id,
+        source,
+        metadata.timestamp_ms,
+        metadata.direction,
+        metadata.sender,
+        metadata.destination,
+        metadata.tool_name,
+        metadata.role
+    ])
+    .to_string()
+}
+fn tool_set(metadata: &IndexMetadata) -> Vec<String> {
+    let mut names = metadata.tool_names.clone();
+    names.extend(metadata.tool_name.iter().cloned());
+    names.sort();
+    names.dedup();
+    names
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Documents read and projected on this thread.
+    pub(crate) static PREPARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Read one coordinate's bytes from `file` in one sequential pass of 4 KiB
+/// windows (each keeping the previous window's last `OVERLAP_BYTES`), hash
+/// them, and project each window to search tokens. Bytes other than the
+/// coordinate's are refused: nothing is prepared from them.
+pub(crate) fn prepare_document(
+    file: &mut RawSource,
+    id: &str,
+    metadata: &IndexMetadata,
+    raw: &RawCoordinate,
+) -> Result<PreparedDocument, IndexError> {
+    #[cfg(test)]
+    PREPARED.with(|n| n.set(n.get() + 1));
+    if raw.segment != file.path() {
+        return Err(io::Error::other("indexed coordinate names another source").into());
+    }
+    let mut windows = Vec::new();
+    let mut reader = file.range(raw.offset, raw.length);
+    let mut hash = Sha256::new();
+    let mut carried = 0;
+    let mut relative = 0u64;
+    let mut json_state = JsonProjection::default();
+    let mut bytes = [0u8; WINDOW_BYTES];
+    while relative < raw.length {
+        let length = (raw.length - relative).min(WINDOW_BYTES as u64) as usize;
+        reader
+            .read_exact(&mut bytes[carried..length])
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::UnexpectedEof => integrity_mismatch(),
+                _ => e,
+            })?;
+        hash.update(&bytes[carried..length]);
+        // Lossy projection is only for search over binary tool outputs.
+        // The stored coordinate and the returned range remain exact bytes.
+        let mut tokens =
+            crate::tokenize_hybrid_search_tokens(&String::from_utf8_lossy(&bytes[..length]));
+        // Decode string escapes without materializing an unbounded JSON event.
+        // Raw and decoded projections share the original exact-byte window.
+        let mut window_state = json_state.clone();
+        let decoded = window_state.feed(&bytes[..length]);
+        tokens.extend(crate::tokenize_hybrid_search_tokens(
+            &String::from_utf8_lossy(&decoded),
+        ));
+        let step = if relative + length as u64 == raw.length {
+            length
+        } else {
+            length - OVERLAP_BYTES
+        };
+        json_state.feed(&bytes[..step]);
+        windows.push(PreparedWindow {
+            offset: raw.offset + relative,
+            length: length as u64,
+            sha256: crate::learned_memory::sha256(&bytes[..length]),
+            tokens: tokens.join(" "),
+        });
+        if relative + length as u64 == raw.length {
+            break;
+        }
+        bytes.copy_within(length - OVERLAP_BYTES..length, 0);
+        carried = OVERLAP_BYTES;
+        relative += (length - OVERLAP_BYTES) as u64;
+    }
+    // Never publish a projection of bytes other than the coordinate's.
+    if format!("{:x}", hash.finalize()) != raw.sha256 {
+        return Err(integrity_mismatch().into());
+    }
+    Ok(PreparedDocument {
+        id: id.to_owned(),
+        metadata: metadata.clone(),
+        raw: raw.clone(),
+        windows,
+    })
 }
 
 fn integrity_mismatch() -> io::Error {
@@ -1704,6 +1909,45 @@ mod tests {
                 .is_empty()
         );
     }
+    /// A reader that keeps positions by rowid can tell when the index's
+    /// documents started over: a new file, or recreated tables, is a new
+    /// generation; reopening keeps it; an index made before generations gets
+    /// one on its next open.
+    #[test]
+    fn a_new_or_rebuilt_index_has_a_new_generation_and_reopening_keeps_it() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("host.db");
+        let first = HostIndex::open(&path)
+            .unwrap()
+            .generation()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            HostIndex::open(&path).unwrap().generation().unwrap(),
+            Some(first.clone())
+        );
+        // Made before generations: the table is absent until the next open.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE host_generation;")
+            .unwrap();
+        let adopted = HostIndex::open(&path)
+            .unwrap()
+            .generation()
+            .unwrap()
+            .unwrap();
+        assert_ne!(adopted, first);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        let rebuilt = HostIndex::open(&path)
+            .unwrap()
+            .generation()
+            .unwrap()
+            .unwrap();
+        assert_ne!(rebuilt, adopted);
+    }
+
     #[test]
     fn changed_metadata_reindexes_but_tampered_bytes_and_owner_do_not_publish() {
         let dir = crate::test_tempdir();
