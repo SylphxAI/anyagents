@@ -240,125 +240,25 @@ this adapter does not invoke a setter or edit shared service configuration.
 
 ### Managed local checkouts
 
-Repository-backed local agents use a caller-configured checkout provider through
-`ANYAGENTS_CHECKOUT_PROVIDER_BIN`. Repository slugs and GitHub URLs, `repo: "inherit"`, and
-local repository paths use that provider for fetching and checkout. The provider
-owns sparse-checkout and hook policy. Fetch, checkout and executable-launch failures
-refuse the spawn with its diagnostic; an unavailable configured provider never
-silently selects a different checkout mechanism.
+Each repository-backed agent gets a Git repository of its own ([ADR 0010](adr/0010-execution-identity-and-trust.md) D5, [0006](adr/0006-runtime-state-and-lifecycle.md) decision 11). Its config, refs, index and hooks belong to it alone; the only thing it shares is objects, which it borrows read-only from a pool through `objects/info/alternates`. So a new checkout costs a checkout, not a download, and two agents on one repository cannot see each other's branches or configuration.
 
-Explicit `workdir` paths, including `/scratch/wt/...` and `/scratch/tmp/...`, are
-honoured or refused, never replaced by the default directory. Before an agent
-becomes running, its execution seat must be able to write and traverse its
-working tree, the per-worktree Git directory and the common objects/refs
-storage, and create lock files. The admission probe that checks this is the
-server binary's own `anyagents internal admission-probe`, run under the seat's
-uid and groups with a cleared environment (the toolchain's helper `PATH`, no
-user or system Git configuration): it walks the tree in Rust without following
-symlinks, creates and removes a uniquely named lock file in the tree, the
-private gitdir, `objects/` and `refs/`, and runs `git status` with fsmonitor and
-hooks disabled. Git (the toolchain's declared `git`, else the first `git` on
-its helper `PATH`, never an operator wrapper on the server's own `PATH`) is the
-only external program, so a host image that wraps, removes or kills `find`, `sh` or
-`test` cannot change the answer. Every seat user must therefore be able to
-execute the server binary, with every ancestor directory traversable; a seat
-that cannot is refused with a message that names the binary. A probe as the
-server's own uid and gid runs in the server process. New worktrees are shared
-with that seat's group.
-On Linux, additive POSIX ACLs grant writes only to shared `objects/`, `refs/`,
-`logs/refs/`, an existing `packed-refs`, and the child's private `worktrees/<name>/`.
-The common root, `worktrees/` and `logs/` are traversal-only with no default ACLs;
-the main worktree's `logs/HEAD` stays child-unwritable. Defaults
-exist only inside the shared content subtrees, the private gitdir and a dedicated
-`anyagents-config/` directory, never on mixed metadata ancestors. Common `config`
-is an exact symlink to `anyagents-config/config`: the dedicated directory grants
-recorded active readers traversal and read-only inheritance, so the parent's
-ordinary `git config`, `git remote` and `git push -u` replacements remain readable
-immediately, without a launch or wake. Its defaults grant no owning-group or
-outsider access. Adoption holds Git's original `config.lock`, journals a
-quarantined intent, hard-links the original inode into the dedicated directory
-and atomically replaces the old pathname with the link, preserving config bytes
-and ownership. The journal pins the directory and symlink identities, while Git
-may replace only the target config inode. Interrupted adoption preserves the
-original bytes and refuses launch/reap pending operator recovery. Revocation
-removes access and default entries only when no active same-seat reader remains.
-Retired server-owned journals retain the dedicated directory/link provenance for
-later admission, even after their private gitdirs are reaped; that provenance
-never restores a retired reader's access.
-Common `config`, `hooks/` and `info/` are not child-writable. A parent-owned sticky
-private gitdir protects `config.worktree` (and its unlink/rename), `commondir` and
-`gitdir`; mutable HEAD/index files belong to the child so Git lock+rename works.
-Temporary cleanup inspections persist each ACL target's exact path, device and
-inode before granting read/traverse access. Startup recovers those objects through
-no-follow descriptors; legacy intents use a best-effort no-follow tree walk.
-An unsafe recovery target or failed revocation quarantines only the recorded
-worktree and emits a warning, never aborting unrelated server startup.
-Quarantine preserves checkout data and refuses automatic harness launch, wake and
-reap until the operator repairs the recorded recovery state; it does not assert
-that an unreachable or hard-linked object's residual ACL was removed.
-Shared refs remain a same-repository integrity boundary: a child can move another
-branch ref. This is not hostile-repository isolation, and AnyAgents does not
-intercept arbitrary harness commit/push commands or provide a branch-tip guard.
-AnyAgents production code never runs `git commit` or `git push`; the supported
-source-publication path belongs to the caller's checkout and publication tools. Its Git metadata reads, skill sync and cleanup
-commands pin `core.hooksPath=/dev/null` and disable fsmonitor. The parent commit
-and its parent-owned hooks-path pin in the three-UID proof belong to the test fixture.
-Shared common and worktree configs refuse `include`/`includeIf` rather than
-following a potentially child-controlled configuration graph.
-Caller-configured commit identity is set in the protected private
-`config.worktree`, never by replacing the parent's common config. The consumer
-must enable `extensions.worktreeConfig`; otherwise admission refuses. Seat Git
-configuration resets legacy wildcard trust and lists only the seat's exact
-checkout and recorded common gitdir, preserving other settings. Cleanup loads
-its gitdir/worktree pair from the server journal, verifies the protected metadata
-ownership and effective ACLs, and passes both paths explicitly: a child-edited
-`.git` pointer never selects metadata. Shared metadata that a group can write is
-untrusted unless the deployment names that group in
-`ANYAGENTS_TRUSTED_METADATA_GIDS` (comma-separated gids or group names): a
-deployment whose seats share Git hubs by design declares those seats one trust
-domain for that metadata; world-writable metadata is never trusted. A missing, broken or changed pointer on a
-journaled checkout preserves its entire workdir (including build-named output)
-and emits a diagnostic; it cannot select non-Git directory deletion. Cleanup Git
-runs as the journaled seat UID/GID, with no inherited secret environment or socket
-group, because checkout and index attributes can select drivers from trusted
-configuration. It excludes global/system config and attribute files and keeps
-default dubious-ownership checks; unrecorded legacy or arbitrary repositories
-are preserved rather than inspected through their `.git` pointer. After archive
-revokes access, inspection adds only temporary read/traverse ACL entries to the
-journaled metadata allowlist, never write or default entries, and retains active
-same-seat bindings. Inspection intent is synced before granting; ACL changes are
-serialized without holding the global journal lock during Git. Success and
-failure both revoke and read back temporary access. Both server modes recover
-any open inspection intent before starting consumers; failed recovery refuses
-startup. A completed check never stands in for a fresh deletion eligibility check.
-Deletion additionally requires an empty pinned status and zero commits in HEAD
-or any local branch outside the recorded remote-tracking refs. A seat-owned
-initial-head marker cannot waive that test. Dirty or unpushed checkouts and their
-private registration remain; clean, pushed pairs are removed without invoking
-`git worktree remove` or its nested Git subprocesses. Remote-tracking refs remain
-within the documented shared-ref integrity boundary, not a live publication proof.
-A server-owned grant journal is file- and directory-synced before sharing. Its
-serialized transitions preserve bindings needed by another active agent on the
-same OS seat; retiring one agent revokes its private metadata without removing
-the surviving agent's shared-store access. Archive, reap and failed
-admission revoke the seat's named group/user ACL entries and defaults through
-opened descriptors, read the result back, and retain the journal on failure.
-Revocation runs even when dirty or external checkout bytes must be retained.
-An ACL write or readback failure is a typed permission error; non-Linux hosts
-accept only already-permitted metadata access. Existing explicit directories are
-validated without rewriting their permissions. Sharing does not follow symlinks
-or alter hard-linked files that require permission changes.
+- **The pool.** One bare repository per remote under `ANYAGENTS_GIT_POOL_DIR` (default `<data>/git-pool`), laid out as `<pool>/<org>/<repo>.git`. Only the control plane fetches into it, under a per-pool lock. It is created readable by every agent (`core.sharedRepository=0644`) and is never pruned (`gc.auto=0`, `gc.pruneExpire=never`, `gc.cruftPacks=true`): pruning a reference repository can corrupt the clones that borrow from it. Agents' branches never reach it.
+- **A checkout.** `git init`, an alternates line naming the pool's `objects/`, `origin` set to the remote, the default branch and the requested base as remote-tracking refs, then `git checkout -b <branch> <commit>` (or `--detach`). A caller-configured identity (`ANYAGENTS_GIT_AUTHOR_NAME` and `ANYAGENTS_GIT_AUTHOR_EMAIL`, both or neither) is written into the repository's own config. Pushes go to `origin` with whatever credentials the agent already has.
+- **Refreshing a base.** `git fetch origin` refreshes what the repository's fetch refspecs cover: every branch for a pool checkout; for an adopted checkout, the store's own refspec plus the agent's branch and its base. Any other branch is fetched explicitly with `git fetch origin +refs/heads/<base>:refs/remotes/origin/<base>`; `git fetch origin <base>` alone only updates `FETCH_HEAD` under a single-branch refspec. Objects the pool already has are not downloaded again.
+- **A checkout provider.** A deployment may name one with `ANYAGENTS_CHECKOUT_PROVIDER_BIN`; it accepts `fetch <source> <ref>` and `worktree <source> <target> <branch> [base]` and owns its sparse-checkout and hook policy. If it makes a linked worktree of its own store, AnyAgents adopts the result in place (below), and the provider's store becomes that repository's pool, so it must never prune either: adoption refuses a store without `gc.pruneExpire=never` and `gc.cruftPacks=true`. A failure or a result that cannot be adopted refuses the spawn with the reason; an unavailable provider never falls back to the pool.
+- **Seat access.** A new checkout is shared with its seat's group with ordinary permissions (group, `g+rw`, setgid directories), its own `.git` included, and `.git` is closed to everyone else. There are no ACLs, no shared metadata to protect and no grant journal. Before an agent becomes running, the admission probe (`anyagents internal admission-probe`, run as the seat with a cleared environment and Git as its only external program) walks the tree, creates and removes a lock file in the tree, in `.git`, `.git/objects` and `.git/refs`, and runs `git status`. A seat that cannot execute the server binary is refused with a message naming it. Seat Git configuration lists only the exact checkout in `safe.directory`.
+- **Local sources.** For `repo: "inherit"` and local paths, AnyAgents selects a GitHub remote (preferring `origin`) from the source's config and requires the source HEAD and the requested base to be reachable from the remote's live advertised branches and tags. The remote is asked from outside the source, so a source an agent owns never selects a program the server runs; only plain reads (`config`, `rev-parse`, `merge-base`) run inside it. Push unpublished commits before spawning. Sources without a GitHub remote are refused. A nonempty target is refused, never adopted.
+- **Adopting a linked worktree.** A linked worktree of a shared store is converted in place, without touching the working tree:
+  - The store must never prune (`gc.pruneExpire=never`, `gc.cruftPacks=true`); otherwise nothing changes.
+  - A new Git directory is built beside the `.git` pointer: the store's config minus other checkouts' branch settings, this checkout's `config.worktree`, glob fetch refspecs for the agent's branch and base (a glob, because an exact refspec for a branch the remote lacks makes every `git fetch origin` fail), HEAD and branch, index (and split-index part), reflogs, sparse patterns, excludes, attributes, hooks (a linked hook stays a link, to an absolute target), remote-tracking refs and tags, with the store as its pool. Copies keep their modification time: Git rechecks an index entry only while it is no older than the index, so a newer copy would hide a same-size edit.
+  - Objects only this checkout reaches (unpushed and reflog-only commits, staged blobs) are packed into it.
+  - A keep ref in the store, `refs/anyagents/keep/<hash of the checkout path>`, points at one commit whose parents are every commit the new repository's refs reach, so the store holds the base even if its own refs move and it is pruned explicitly. The ref goes when the repository is reaped.
+  - The conversion stands only if `git status` reads the same before and after. The new directory is synced to disk, then exchanged with the pointer in one rename (`renameat2(RENAME_EXCHANGE)`, `renamex_np(RENAME_SWAP)` on macOS); the store's registration is removed, and its branch when the keep ref or another ref holds every commit. A crash after the exchange leaves the old pointer at the staging path, and the next call finishes the release from it, accepting it only when the registration names this checkout back.
+  - An operation in progress (merge, rebase, cherry-pick, revert, bisect, a held index lock, submodules in the private Git directory), a locked worktree, or a registration that does not name the checkout back declines and changes nothing.
+- **Existing checkouts.** Linked worktrees made before this change keep working as they are for the life of their agent; nothing in AnyAgents writes their store's metadata any more. Archive cleanup adopts one first, then judges it like any checkout.
+- **Cleanup.** A managed checkout is removed on archive only when `.git` is its own directory (a pointer could name any other repository), `git status` is clean apart from harness files, and the remote holds everything else: no stash, no tag or note the remote does not advertise with the same object, and no commit of HEAD, a branch, a tag, a note or any other ref but remote-tracking ones that no advertised ref reaches. The proof is the remote's own answer (`ls-remote`, asked by the server from outside the checkout with its own credentials, for a GitHub repository or a local path only), never the checkout's own remote-tracking refs; a checkout it cannot ask about stays. Status and the reachability check run as the agent's seat, with the Git directory and working tree named explicitly, no inherited environment, no global or system configuration, hooks and fsmonitor off. Dirty or unproven checkouts stay, and only their build output goes; a managed repository checkout whose `.git` has gone is kept the same way. Repositories an agent made inside a private workdir are kept. AnyAgents production code never runs `git commit` or `git push`.
 
-For inherit/local sources, AnyAgents selects a GitHub remote (preferring
-`origin`), reads its live advertised branches and tags, and requires both the
-source HEAD and requested base to be reachable from them. Push unpublished
-commits before spawning. If a remote tip is not available in local history,
-fetch that remote before trying again. The consumer fetches the verified ref
-and checks out the exact selected commit, including a published feature-branch
-commit that is not on the default branch. Sources without a GitHub remote are
-refused. Existing nonempty checkout targets are not silently adopted by
-repository provisioning. `workdir: "private"` remains an empty directory and
-needs no Git consumer. Cloud-sandbox workspace preparation is unchanged.
+Explicit `workdir` paths, including `/scratch/wt/...` and `/scratch/tmp/...`, are honoured or refused, never replaced by the default directory, and never reaped. `workdir: "private"` remains an empty directory and needs no checkout. Cloud-sandbox workspace preparation is unchanged.
 
 ## Mailbox: one log per agent
 

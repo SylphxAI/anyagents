@@ -777,6 +777,44 @@ impl anyagents_harness::Harness for ContractHarness {
     }
 }
 
+/// The tool caches a harness writes into, by the environment key that names
+/// them, and the name of the private cache a seat gets in their place.
+const WRITTEN_TOOL_CACHES: &[(&str, &str)] = &[
+    ("BUN_INSTALL_CACHE_DIR", "bun"),
+    ("UV_CACHE_DIR", "uv"),
+    ("PIP_CACHE_DIR", "pip"),
+    ("NPM_CONFIG_CACHE", "npm"),
+    ("SCCACHE_DIR", "sccache"),
+];
+
+/// What a harness gets for one tool setting the server's environment names.
+///
+/// A seated harness (`seat` is its launch spec) runs as another uid, and a
+/// tool cache it cannot write breaks the tool outright: the desk's shared
+/// `/scratch/bun-cache` is `kyle:root 2755`, so `bun install` in a seat ended
+/// with `bun is unable to write files to tempdir: EACCES` (bun stages each
+/// download in the cache directory). Such a seat gets its own cache under its
+/// scratch build root instead; a cache it can write is shared as before, and
+/// every other setting passes unchanged.
+fn tool_env_value(key: &str, value: String, seat: Option<&str>, build_root: &Path) -> String {
+    let Some(seat) = seat else {
+        return value;
+    };
+    let Some((_, name)) = WRITTEN_TOOL_CACHES.iter().find(|(k, _)| *k == key) else {
+        return value;
+    };
+    let writable = crate::sandbox::seat_principal(seat)
+        .is_some_and(|principal| crate::sandbox::seat_can_write_dir(Path::new(&value), &principal));
+    if writable {
+        return value;
+    }
+    build_root
+        .join(crate::sandbox::SEAT_CACHE_DIR)
+        .join(name)
+        .display()
+        .to_string()
+}
+
 pub fn child_env() -> Vec<(String, String)> {
     let mut env = Vec::new();
     for key in ["ANYAGENTS_FAKE_MODE", "ANYAGENTS_FAKE_LOG"] {
@@ -1077,8 +1115,6 @@ fn vendor_launch_inner(
     authority: Option<&anyagents_core::Store>,
     host: &HarnessHost,
 ) -> Result<VendorHarness, String> {
-    crate::worktree_access::ensure_launchable(&request.data_dir, &request.agent.id)
-        .map_err(|error| error.to_string())?;
     // Strip any untrusted launch or authority variables from caller/stored env.
     let mut env: Vec<(String, String)> = std::mem::take(&mut request.extra_env)
         .into_iter()
@@ -1322,12 +1358,7 @@ fn vendor_launch_inner(
                 && managed_work.is_dir()
                 && !managed_work.join(".git").exists()
             {
-                let _ = crate::sandbox::share_worktree_with_seat(
-                    &managed_work,
-                    uid,
-                    gid,
-                    &crate::worktree_access::grant_path(&request.data_dir, &request.agent.id),
-                );
+                let _ = crate::sandbox::share_worktree_with_seat(&managed_work, gid);
             }
         }
         crate::create::ensure_seat_op_config(&request.config_dir, seat_launch);
@@ -1396,6 +1427,9 @@ fn vendor_launch_inner(
             "DERIVED_DATA_PATH".to_string(),
             derived_data.display().to_string(),
         ));
+        // A seated harness runs as another uid. A shared cache the server's
+        // environment names is passed on only when that uid can write it.
+        let seat = seat_spec.as_ref().map(|(_, spec)| spec.as_str());
         for key in [
             "RUSTUP_HOME",
             "CARGO_HOME",
@@ -1415,7 +1449,11 @@ fn vendor_launch_inner(
                 .or_else(|| std::env::var_os(key))
                 .filter(|v| !v.is_empty())
             {
-                env.push((key.to_string(), value.to_string_lossy().into_owned()));
+                let value = value.to_string_lossy().into_owned();
+                env.push((
+                    key.to_string(),
+                    tool_env_value(key, value, seat, &build_root),
+                ));
             }
         }
     }
@@ -2758,6 +2796,82 @@ fn session_from_file(config_dir: &Path, file_name: &str) -> Result<Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Report #16: a seat inherited the desk's `kyle:root 2755` bun cache and
+    /// every `bun install` failed. A seat keeps a shared cache it can write and
+    /// gets a private one otherwise; settings that are not written caches, and
+    /// unseated harnesses, are unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn a_seat_never_inherits_a_tool_cache_it_cannot_write() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("bun-cache");
+        std::fs::create_dir(&shared).unwrap();
+        let meta = std::fs::metadata(&shared).unwrap();
+        let (uid, gid) = (meta.uid().wrapping_add(7919), meta.gid().wrapping_add(7919));
+        let seat = format!(
+            "/usr/local/bin/anyagents-setpriv\t{uid}\t{gid}\t{gid},{}",
+            meta.gid()
+        );
+        let build_root = dir.path().join("builds").join("agt_x");
+        let shared_text = shared.display().to_string();
+        let private = build_root.join("cache").join("bun").display().to_string();
+
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o2755)).unwrap();
+        assert_eq!(
+            tool_env_value(
+                "BUN_INSTALL_CACHE_DIR",
+                shared_text.clone(),
+                Some(&seat),
+                &build_root
+            ),
+            private
+        );
+        assert_eq!(
+            tool_env_value(
+                "BUN_INSTALL_CACHE_DIR",
+                shared_text.clone(),
+                None,
+                &build_root
+            ),
+            shared_text
+        );
+        assert_eq!(
+            tool_env_value("CARGO_HOME", shared_text.clone(), Some(&seat), &build_root),
+            shared_text
+        );
+        // A group-writable shared cache stays shared for a seat in that group.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o2775)).unwrap();
+        assert_eq!(
+            tool_env_value(
+                "BUN_INSTALL_CACHE_DIR",
+                shared_text.clone(),
+                Some(&seat),
+                &build_root
+            ),
+            shared_text
+        );
+        // A cache that does not exist yet, or an unreadable seat spec, is private.
+        assert_eq!(
+            tool_env_value(
+                "UV_CACHE_DIR",
+                dir.path().join("absent").display().to_string(),
+                Some(&seat),
+                &build_root
+            ),
+            build_root.join("cache").join("uv").display().to_string()
+        );
+        assert_eq!(
+            tool_env_value(
+                "BUN_INSTALL_CACHE_DIR",
+                shared_text,
+                Some("garbled"),
+                &build_root
+            ),
+            private
+        );
+    }
 
     #[test]
     fn claude_native_memory_preserves_operator_choice() {

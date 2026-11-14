@@ -602,14 +602,10 @@ pub(crate) fn prepare_config_with_seat_uid(config: &Path, uid: u32, gid: u32) ->
     })
 }
 
-/// Share a working directory and both per-worktree and common Git metadata.
-/// A protected shared root or failed permission change is a typed refusal.
-pub fn share_worktree_with_seat(
-    path: &Path,
-    uid: u32,
-    gid: u32,
-    journal: &Path,
-) -> Result<(), Error> {
+/// Share a working directory, and its own Git repository, with a seat's
+/// group. A protected shared root or failed permission change is a typed
+/// refusal.
+pub fn share_worktree_with_seat(path: &Path, gid: u32) -> Result<(), Error> {
     let canon = std::fs::canonicalize(path).map_err(|error| Error::WorkdirPermission {
         path: path.display().to_string(),
         message: error.to_string(),
@@ -629,7 +625,7 @@ pub fn share_worktree_with_seat(
             message: "refusing recursive permission changes to a shared root".into(),
         });
     }
-    crate::worktree_access::share(path, uid, gid, journal)
+    crate::repo::share(path, gid)
 }
 
 fn protected_roots() -> Vec<PathBuf> {
@@ -880,11 +876,76 @@ pub(crate) fn prepare_scratch_dirs_for_seat(
         build_root.join("cargo"),
         build_root.join("gradle"),
         build_root.join("derived-data"),
+        build_root.join(SEAT_CACHE_DIR),
         tmp_root,
     ] {
         ensure_seat_dir_as_owner(&dir, uid, gid, 0o2770)?;
     }
     give_tree(&root, uid, gid)
+}
+
+/// The directory under an agent's scratch build root that holds the tool
+/// caches a seat gets when the server's shared cache is not writable by it.
+pub(crate) const SEAT_CACHE_DIR: &str = "cache";
+
+/// The uid and the gids (primary first) a seat process runs with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SeatPrincipal {
+    pub(crate) uid: u32,
+    pub(crate) gids: Vec<u32>,
+}
+
+/// The principal a seat launch spec (`launcher\tuid\tgid\tgroups`, the
+/// `ANYAGENTS_SEAT_LAUNCH` value) starts its process as.
+pub(crate) fn seat_principal(spec: &str) -> Option<SeatPrincipal> {
+    let mut parts = spec.split('\t');
+    let (Some(_launcher), Some(uid), Some(gid), groups) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let uid = uid.parse().ok()?;
+    let mut gids = vec![gid.parse().ok()?];
+    for group in groups.unwrap_or("").split(',').filter(|g| !g.is_empty()) {
+        let group = group.parse().ok()?;
+        if !gids.contains(&group) {
+            gids.push(group);
+        }
+    }
+    Some(SeatPrincipal { uid, gids })
+}
+
+/// Whether `principal` can create entries in the directory `path`, judged by
+/// its permission bits the way the kernel picks them: the owner's bits when
+/// it owns the directory, else the group's when one of its gids does, else
+/// the others'. A missing path, or one that is not a directory, is not
+/// writable.
+pub(crate) fn seat_can_write_dir(path: &Path, principal: &SeatPrincipal) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        if !meta.is_dir() {
+            return false;
+        }
+        let mode = meta.mode();
+        let bits = if meta.uid() == principal.uid {
+            mode >> 6
+        } else if principal.gids.contains(&meta.gid()) {
+            mode >> 3
+        } else {
+            mode
+        };
+        // Creating an entry needs both write and search on the directory.
+        bits & 0o3 == 0o3
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, principal);
+        false
+    }
 }
 
 /// Start one admitted agent command, or say what admission is missing.
@@ -965,6 +1026,75 @@ fn unadmitted(boundary: &Boundary, why: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_seat_spec_names_its_uid_and_every_gid_once() {
+        assert_eq!(
+            seat_principal("/usr/local/bin/anyagents-setpriv\t2106\t2106\t2106,2100"),
+            Some(SeatPrincipal {
+                uid: 2106,
+                gids: vec![2106, 2100],
+            })
+        );
+        assert_eq!(
+            seat_principal("/l\t2104\t2104"),
+            Some(SeatPrincipal {
+                uid: 2104,
+                gids: vec![2104],
+            })
+        );
+        assert_eq!(seat_principal("/l\tseat\t2104\t2104"), None);
+        assert_eq!(seat_principal("/l"), None);
+    }
+
+    /// The desk's shared bun cache is `kyle:root 2755`: a seat that is neither
+    /// its owner nor in its group cannot create the cache's temporary files.
+    #[cfg(unix)]
+    #[test]
+    fn a_seat_writes_a_directory_only_through_the_bits_that_apply_to_it() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("bun-cache");
+        std::fs::create_dir(&cache).unwrap();
+        let meta = std::fs::metadata(&cache).unwrap();
+        let (owner, group) = (meta.uid(), meta.gid());
+        let other_uid = owner.wrapping_add(7919);
+        let other_gid = group.wrapping_add(7919);
+        let stranger = SeatPrincipal {
+            uid: other_uid,
+            gids: vec![other_gid],
+        };
+        let member = SeatPrincipal {
+            uid: other_uid,
+            gids: vec![other_gid, group],
+        };
+        let set = |mode: u32| {
+            std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+
+        set(0o2755);
+        assert!(!seat_can_write_dir(&cache, &stranger));
+        assert!(!seat_can_write_dir(&cache, &member));
+        set(0o2775);
+        assert!(!seat_can_write_dir(&cache, &stranger));
+        assert!(seat_can_write_dir(&cache, &member));
+        set(0o1777);
+        assert!(seat_can_write_dir(&cache, &stranger));
+        // The owner's bits decide for the owner, even when others' would allow.
+        set(0o0577);
+        assert!(!seat_can_write_dir(
+            &cache,
+            &SeatPrincipal {
+                uid: owner,
+                gids: vec![group],
+            }
+        ));
+        set(0o0755);
+        assert!(!seat_can_write_dir(&dir.path().join("missing"), &member));
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(!seat_can_write_dir(&file, &member));
+    }
 
     /// Sessions created by the daemon as a private 0700 directory (as a harness
     /// switch or an older daemon leaves them) are re-admitted to the agent's
@@ -1341,33 +1471,11 @@ mod tests {
             std::env::set_var(key, std::env::join_paths([&alias]).unwrap());
         }
         assert_eq!(protected_roots(), vec![selected.canonicalize().unwrap()]);
-        assert!(
-            share_worktree_with_seat(
-                &selected,
-                server_uid(),
-                server_gid(),
-                &dir.path().join("refused.json")
-            )
-            .is_err()
-        );
+        assert!(share_worktree_with_seat(&selected, server_gid()).is_err());
         let nested = selected.join("nested");
         std::fs::create_dir(&nested).unwrap();
-        assert!(
-            share_worktree_with_seat(
-                &nested,
-                server_uid(),
-                server_gid(),
-                &dir.path().join("nested-refused.json")
-            )
-            .is_err()
-        );
-        share_worktree_with_seat(
-            &allowed,
-            server_uid(),
-            server_gid(),
-            &dir.path().join("allowed.json"),
-        )
-        .unwrap();
+        assert!(share_worktree_with_seat(&nested, server_gid()).is_err());
+        share_worktree_with_seat(&allowed, server_gid()).unwrap();
         unsafe {
             match old {
                 Some(value) => std::env::set_var(key, value),
