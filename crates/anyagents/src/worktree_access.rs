@@ -1958,6 +1958,12 @@ fn grants_except(journal: &Path) -> std::io::Result<Vec<Grant>> {
     Ok(grants)
 }
 
+/// How deep any walk of a tree goes. Deeper nesting is refused (admission,
+/// revocation) or kept (removal), never followed on an unbounded stack: the
+/// first maintenance pass and every admission run on a thread with a small
+/// stack, and a seat decides how deep its own directories go.
+const MAX_TREE_DEPTH: usize = 512;
+
 /// Remove a failed creation's checkout and its registration, the two
 /// directories Git keeps for a linked worktree, as cleanup does: no Git
 /// process runs, so nothing in the seat-writable checkout (a `.git` pointer,
@@ -3230,175 +3236,167 @@ fn walk_tree_policy(
             Err(error)
         }
     }
-    fn visit(
-        file: &std::fs::File,
-        path: &Path,
-        skip_git: bool,
-        before_open: &dyn Fn(&Path),
-        apply: &dyn Fn(&std::fs::File, &Path) -> std::io::Result<()>,
-        descend: bool,
-        issues: Option<&std::cell::RefCell<Vec<String>>>,
-    ) -> std::io::Result<()> {
-        use std::os::fd::{AsRawFd, FromRawFd};
-        use std::os::unix::fs::MetadataExt;
-        let meta = file.metadata()?;
-        let fd = file.as_raw_fd();
-        if let Err(error) = apply(file, path) {
-            record(issues, path, error)?;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    // Iterative, never recursive: a seat decides how deep its directories
+    // (in a checkout, in refs/ or objects/) go, and this runs on threads with
+    // small stacks. Each open directory holds one descriptor.
+    struct Frame {
+        directory: std::fs::File,
+        path: PathBuf,
+        names: Vec<std::ffi::OsString>,
+    }
+    let mut stack: Vec<Frame> = Vec::new();
+    // Apply to an opened object; a directory to descend is pushed.
+    let enter = |stack: &mut Vec<Frame>, file: std::fs::File, path: PathBuf| {
+        if let Err(error) = apply(&file, &path) {
+            record(issues, &path, error)?;
         }
-        if !meta.is_dir() || !descend {
+        if !file.metadata()?.is_dir() || !descend {
             return Ok(());
         }
-        // fdopendir owns only the duplicate; closing it does not close file.
-        let raw = unsafe { libc::dup(fd) };
-        if raw < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let dir = unsafe { libc::fdopendir(raw) };
-        if dir.is_null() {
-            unsafe { libc::close(raw) };
-            return Err(std::io::Error::last_os_error());
-        }
-        struct Directory(*mut libc::DIR);
-        impl Drop for Directory {
-            fn drop(&mut self) {
-                unsafe { libc::closedir(self.0) };
-            }
-        }
-        let dir = Directory(dir);
-        loop {
-            #[cfg(target_os = "linux")]
-            let errno = unsafe { libc::__errno_location() };
-            #[cfg(not(target_os = "linux"))]
-            let errno = unsafe { libc::__error() };
-            unsafe {
-                *errno = 0;
-            }
-            let entry = unsafe { libc::readdir(dir.0) };
-            if entry.is_null() {
-                if unsafe { *errno } != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                break;
-            }
-            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-            if name.to_bytes() == b"." || name.to_bytes() == b".." {
-                continue;
-            }
-            use std::os::unix::ffi::OsStrExt;
-            let child_path = path.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            if unsafe {
-                libc::fstatat(
-                    fd,
-                    name.as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } != 0
-            {
-                record(issues, &child_path, std::io::Error::last_os_error())?;
-                continue;
-            }
-            let stat = unsafe { stat.assume_init() };
-            let kind = stat.st_mode & libc::S_IFMT;
-            if kind == libc::S_IFLNK {
-                // The managed config link (and adoption's staged copy of it)
-                // is the server's own; any other symlink is reported.
-                let managed_link = std::fs::read_link(&child_path)
-                    .is_ok_and(|target| target == Path::new(CONFIG_DIRECTORY).join("config"));
-                if issues.is_some()
-                    && !(managed_link
-                        && (child_path == path.join(CONFIG_LINK_STAGE)
-                            || child_path == path.join("config")
-                                && open_common_config(path).is_ok()))
-                {
-                    record(
-                        issues,
-                        &child_path,
-                        std::io::Error::other("symlink skipped during ACL recovery"),
-                    )?;
-                }
-                continue;
-            }
-            if skip_git && name.to_bytes() == b".git" {
-                // The common store gets additive ACLs, never a group replacement.
-                continue;
-            }
-            if kind != libc::S_IFDIR && kind != libc::S_IFREG {
-                record(
-                    issues,
-                    &child_path,
-                    std::io::Error::other("unsupported file type skipped"),
-                )?;
-                continue;
-            }
-            let flags = libc::O_RDONLY
-                | libc::O_NOFOLLOW
-                | libc::O_CLOEXEC
-                | libc::O_NONBLOCK
-                | if kind == libc::S_IFDIR {
-                    libc::O_DIRECTORY
-                } else {
-                    0
-                };
-            before_open(&child_path);
-            #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-            let mut child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
-            if child < 0 {
-                // Captured before any later syscall can overwrite errno.
-                let error = std::io::Error::last_os_error();
-                // Another principal's unreadable regular file (e.g. a 0600 pack
-                // marker another seat wrote) is bound read-only by inode so the
-                // callback can inspect its ACL. Directories are never bound
-                // this way: their entries could not be enumerated.
-                #[cfg(target_os = "linux")]
-                if error.raw_os_error() == Some(libc::EACCES)
-                    && kind == libc::S_IFREG
-                    && stat.st_uid != crate::sandbox::server_uid()
-                {
-                    child = unsafe {
-                        libc::openat(
-                            fd,
-                            name.as_ptr(),
-                            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                        )
-                    };
-                }
-                if child < 0 {
-                    record(issues, &child_path, error)?;
-                    continue;
-                }
-            }
-            let child = unsafe { std::fs::File::from_raw_fd(child) };
-            let opened = child.metadata()?;
-            #[allow(
-                clippy::unnecessary_cast,
-                reason = "stat fields differ across Unix targets"
-            )]
-            if opened.dev() != stat.st_dev as u64 || opened.ino() != stat.st_ino as u64 {
-                record(
-                    issues,
-                    &child_path,
-                    std::io::Error::other("object replaced during sharing"),
-                )?;
-                continue;
-            }
-            if let Err(error) = visit(
-                &child,
-                &child_path,
-                skip_git,
-                before_open,
-                apply,
-                descend,
+        if stack.len() >= MAX_TREE_DEPTH {
+            return record(
                 issues,
-            ) {
+                &path,
+                std::io::Error::other(format!("nested deeper than {MAX_TREE_DEPTH} directories")),
+            );
+        }
+        match entry_names(&file) {
+            Ok(mut names) => {
+                // Popped from the end: keep directory order.
+                names.reverse();
+                stack.push(Frame {
+                    directory: file,
+                    path,
+                    names,
+                });
+                Ok(())
+            }
+            Err(error) => record(issues, &path, error),
+        }
+    };
+    enter(&mut stack, file, path.to_path_buf())?;
+    while let Some(frame) = stack.last_mut() {
+        let Some(name) = frame.names.pop() else {
+            stack.pop();
+            continue;
+        };
+        let fd = frame.directory.as_raw_fd();
+        let child_path = frame.path.join(&name);
+        let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
+            continue;
+        };
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                fd,
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            record(issues, &child_path, std::io::Error::last_os_error())?;
+            continue;
+        }
+        let stat = unsafe { stat.assume_init() };
+        let kind = stat.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFLNK {
+            // The managed config link (and adoption's staged copy of it)
+            // is the server's own; any other symlink is reported.
+            let parent = frame.path.clone();
+            let managed_link = std::fs::read_link(&child_path)
+                .is_ok_and(|target| target == Path::new(CONFIG_DIRECTORY).join("config"));
+            if issues.is_some()
+                && !(managed_link
+                    && (child_path == parent.join(CONFIG_LINK_STAGE)
+                        || child_path == parent.join("config")
+                            && open_common_config(&parent).is_ok()))
+            {
+                record(
+                    issues,
+                    &child_path,
+                    std::io::Error::other("symlink skipped during ACL recovery"),
+                )?;
+            }
+            continue;
+        }
+        if skip_git && name.to_bytes() == b".git" {
+            // The common store gets additive ACLs, never a group replacement.
+            continue;
+        }
+        if kind != libc::S_IFDIR && kind != libc::S_IFREG {
+            record(
+                issues,
+                &child_path,
+                std::io::Error::other("unsupported file type skipped"),
+            )?;
+            continue;
+        }
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK
+            | if kind == libc::S_IFDIR {
+                libc::O_DIRECTORY
+            } else {
+                0
+            };
+        before_open(&child_path);
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
+        if child < 0 {
+            // Captured before any later syscall can overwrite errno.
+            let error = std::io::Error::last_os_error();
+            // Another principal's unreadable regular file (e.g. a 0600 pack
+            // marker another seat wrote) is bound read-only by inode so the
+            // callback can inspect its ACL. Directories are never bound
+            // this way: their entries could not be enumerated.
+            #[cfg(target_os = "linux")]
+            if error.raw_os_error() == Some(libc::EACCES)
+                && kind == libc::S_IFREG
+                && stat.st_uid != crate::sandbox::server_uid()
+            {
+                child = unsafe {
+                    libc::openat(
+                        fd,
+                        name.as_ptr(),
+                        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+            }
+            if child < 0 {
                 record(issues, &child_path, error)?;
+                continue;
             }
         }
-        Ok(())
+        let child = unsafe { std::fs::File::from_raw_fd(child) };
+        let opened = match child.metadata() {
+            Ok(opened) => opened,
+            Err(error) => {
+                record(issues, &child_path, error)?;
+                continue;
+            }
+        };
+        #[allow(
+            clippy::unnecessary_cast,
+            reason = "stat fields differ across Unix targets"
+        )]
+        if opened.dev() != stat.st_dev as u64 || opened.ino() != stat.st_ino as u64 {
+            record(
+                issues,
+                &child_path,
+                std::io::Error::other("object replaced during sharing"),
+            )?;
+            continue;
+        }
+        if let Err(error) = enter(&mut stack, child, child_path.clone()) {
+            record(issues, &child_path, error)?;
+        }
     }
-    visit(&file, path, skip_git, before_open, apply, descend, issues)
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -6821,6 +6819,89 @@ mod tests {
             error.to_string().contains("writable by no one else"),
             "{error}"
         );
+    }
+
+    /// Nest `depth` directories named `d` under `root`, relative to
+    /// descriptors (the full path is far longer than `PATH_MAX`).
+    fn nest(root: &Path, depth: usize) {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        std::fs::create_dir_all(root).unwrap();
+        let mut current = std::fs::File::open(root).unwrap();
+        for _ in 0..depth {
+            assert_eq!(
+                unsafe { libc::mkdirat(current.as_raw_fd(), c"d".as_ptr(), 0o755) },
+                0
+            );
+            let fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    c"d".as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(fd >= 0);
+            current = unsafe { std::fs::File::from_raw_fd(fd) };
+        }
+    }
+
+    /// Undo [`nest`] without recursion (a recursive removal would overflow
+    /// the test thread's stack): lift the subtree one level at a time.
+    fn unnest(root: &Path) {
+        use std::os::fd::AsRawFd;
+        let Ok(top) = std::fs::File::open(root) else {
+            return;
+        };
+        let fd = top.as_raw_fd();
+        loop {
+            let lifted = unsafe { libc::renameat(fd, c"d/d".as_ptr(), fd, c"t".as_ptr()) } == 0;
+            unsafe { libc::unlinkat(fd, c"d".as_ptr(), libc::AT_REMOVEDIR) };
+            if !lifted {
+                break;
+            }
+            assert_eq!(
+                unsafe { libc::renameat(fd, c"t".as_ptr(), fd, c"d".as_ptr()) },
+                0
+            );
+        }
+    }
+
+    /// The review's availability attack on admission: a seat nests some
+    /// 20 000 directories in the store's refs/, and the pre-journal scan runs
+    /// on a thread with a 2 MiB stack. Nothing recurses: admission refuses.
+    #[test]
+    fn a_deep_store_is_refused_without_recursing() {
+        let dir = crate::test_tempdir();
+        let common = plain_common(dir.path());
+        nest(&common.join("refs/heads/deep"), 20_000);
+        let journal = grant_path(dir.path(), &anyagents_core::AgentId::generate());
+        let outcome = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn({
+                let (data, common, journal) =
+                    (dir.path().to_path_buf(), common.clone(), journal.clone());
+                move || {
+                    share_known(
+                        &data.join("child"),
+                        &common.join("worktrees/child"),
+                        &common,
+                        crate::sandbox::server_uid(),
+                        crate::sandbox::server_gid(),
+                        &journal,
+                    )
+                    .map_err(|e| e.to_string())
+                }
+            })
+            .unwrap()
+            .join();
+        // Before any assertion: the temporary directory's own (recursive)
+        // removal must never meet the deep tree.
+        unnest(&common.join("refs/heads/deep"));
+        let error = outcome.unwrap().unwrap_err();
+        assert!(
+            error.contains("nested deeper than 512 directories"),
+            "{error}"
+        );
+        assert!(!journal.exists());
     }
 
     /// Another process of the seat may hold the probe's output pipe open
