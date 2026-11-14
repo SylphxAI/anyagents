@@ -12,6 +12,14 @@
 //!   reuses it. Receipts settled before this layout stay at the top level as
 //!   `<key>.done`, are read there, and move into `receipts/` on the first scan.
 //!
+//! An effect that fails is never left as an obligation when its error proves
+//! it did not happen (a Telegram API refusal of the whole post) or when its
+//! destination dedupes a replay (a mailbox): the obligation is removed and the
+//! caller has the error. Any other failure leaves the outcome unknown: the
+//! obligation stays, with the error, and is never resent automatically. The
+//! sender is told once through its mailbox, `agents inspect` and `status` list
+//! it, and the operator retries or discards it (`anyagents outbound`).
+//!
 //! `<key>` is the hexadecimal effect key. Only this daemon opens obligations,
 //! so it knows each one: the first reconcile lists the directory once,
 //! registering the obligations a previous process left, and every obligation
@@ -38,6 +46,89 @@ struct Intent {
     reply_to: Option<String>,
     body: Option<String>,
     receipt: Option<Vec<Delivery>>,
+    /// When the obligation was opened. Absent in obligations from before it
+    /// was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at_ms: Option<i64>,
+    /// The error that left the effect's outcome unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uncertain: Option<String>,
+    /// How an operator settled it without its own effect's receipt:
+    /// `discarded`, or `retried` (the receipt is then the new send's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcome: Option<String>,
+}
+
+/// An obligation whose effect's outcome is unknown and that nothing resends
+/// automatically: its sender was told, and the operator retries or discards
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Unsettled {
+    pub effect_key: String,
+    pub agent_id: AgentId,
+    pub destination: String,
+    pub reply_to: Option<String>,
+    pub since_ms: Option<i64>,
+    pub error: Option<String>,
+    pub body: String,
+}
+
+impl Unsettled {
+    fn of(intent: &Intent, since_ms: Option<i64>) -> Self {
+        Unsettled {
+            effect_key: intent.effect_key.clone(),
+            agent_id: intent.agent_id.clone(),
+            destination: intent.destination.clone(),
+            reply_to: intent.reply_to.clone(),
+            since_ms: intent.created_at_ms.or(since_ms),
+            error: intent.uncertain.clone(),
+            body: intent.body.clone().unwrap_or_default(),
+        }
+    }
+
+    /// The first characters of the body, for a listing.
+    pub fn excerpt(&self) -> String {
+        let mut chars = self.body.chars();
+        let head: String = chars.by_ref().take(160).collect();
+        let head = head.replace('\n', " ");
+        if chars.next().is_some() {
+            format!("{head}…")
+        } else {
+            head
+        }
+    }
+}
+
+/// Telegram error classes that do not prove the API posted nothing.
+const UNCERTAIN_TELEGRAM_CLASSES: &[&str] = &[
+    "timeout",
+    "network",
+    "transport",
+    "response_read",
+    "invalid_response",
+    "partial_delivery",
+];
+
+/// Whether an effect's error proves the effect did not happen: the Telegram
+/// API answered the whole post with a refusal (a 4xx status), so nothing was
+/// posted. Any other error (a timeout, a dropped connection, a later part of
+/// a post, a local failure after the post) proves nothing.
+fn proves_not_sent(message: &str) -> bool {
+    let Some(detail) = message
+        .strip_prefix("telegram ")
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+    else {
+        return false;
+    };
+    let class = detail
+        .get("class")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    !UNCERTAIN_TELEGRAM_CLASSES.contains(&class)
+        && detail
+            .get("status")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|status| (400..500).contains(&status))
 }
 
 impl Intent {
@@ -103,6 +194,10 @@ struct Open {
     /// Files the listing found that a previous process left to tidy, worked
     /// off at most [`TIDY_BATCH`] per reconcile.
     leftovers: Vec<String>,
+    /// Encoded keys of obligations whose outcome is unknown, moved out of
+    /// `keys` so that a reconcile no longer visits them, with whether their
+    /// sender was told.
+    stuck: std::collections::BTreeMap<String, (Unsettled, bool)>,
 }
 
 /// Leftover files one reconcile tidies. A flat-layout journal held 11k
@@ -332,13 +427,19 @@ fn settle(store: &Store, directory: &Path, name: &str, intent: &Intent) -> Resul
         reply_to: intent.reply_to.clone(),
         body: None,
         receipt: intent.receipt.clone(),
+        created_at_ms: intent.created_at_ms,
+        uncertain: intent.uncertain.clone(),
+        outcome: intent.outcome.clone(),
     };
     let files = Files::new(directory, name);
     create_receipts(directory)?;
     write(&files.staged_done, &files.done, &done)?;
     std::fs::remove_file(&files.pending)?;
     sync_directory(directory)?;
-    with_open(directory, |open| open.keys.remove(name));
+    with_open(directory, |open| {
+        open.keys.remove(name);
+        open.stuck.remove(name);
+    });
     Ok(())
 }
 
@@ -428,12 +529,44 @@ where
             reply_to: reply_to.map(str::to_owned),
             body: Some(body.into()),
             receipt: None,
+            created_at_ms: Some(anyagents_core::now_ms()),
+            uncertain: None,
+            outcome: None,
         }
     };
     // Registered before it can exist, so no outcome leaves it unreconciled.
     with_open(&directory, |open| open.keys.insert(name.clone()));
     write(&files.staged_pending, &files.pending, &intent).map_err(ApiError::from_store)?;
-    let receipt = effect()?;
+    let receipt = match effect() {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            if replay_safe || proves_not_sent(&error.message) {
+                // Nothing took effect, or a replay is deduped by its
+                // destination: no obligation is left to settle, and a
+                // later send (keyed or not) runs the effect afresh.
+                if let Err(cleanup) =
+                    remove_if_present(&files.pending).and_then(|()| sync_directory(&directory))
+                {
+                    eprintln!(
+                        "outbound history: cannot drop the obligation of a send that did not happen: {cleanup}"
+                    );
+                } else {
+                    with_open(&directory, |open| {
+                        open.keys.remove(&name);
+                        open.stuck.remove(&name);
+                    });
+                }
+            } else {
+                // The outcome is unknown: the obligation stays, with why,
+                // and is never resent automatically (see `reconcile`).
+                intent.uncertain = Some(error.message.clone());
+                if let Err(record) = write(&files.staged_pending, &files.pending, &intent) {
+                    eprintln!("outbound history: cannot record why a send is uncertain: {record}");
+                }
+            }
+            return Err(error);
+        }
+    };
     intent.receipt = Some(receipt.clone());
     write(&files.staged_pending, &files.pending, &intent).map_err(ApiError::from_store)?;
     settle(store, &directory, &name, &intent).map_err(ApiError::from_store)?;
@@ -447,7 +580,10 @@ where
 pub(super) fn reconcile(store: &Store) -> Result<(), Error> {
     let directory = directory(store);
     if with_open(&directory, |open| {
-        open.scanned && open.keys.is_empty() && open.leftovers.is_empty()
+        open.scanned
+            && open.keys.is_empty()
+            && open.leftovers.is_empty()
+            && open.stuck.values().all(|(_, told)| *told)
     }) {
         return Ok(());
     }
@@ -482,6 +618,12 @@ pub(super) fn reconcile(store: &Store) -> Result<(), Error> {
             };
             recover_staged(&directory, &name)?;
             match load(&files.pending)? {
+                // Its effect's outcome is unknown: it is never resent, and
+                // no longer visited; its sender is told below.
+                Some(intent) if intent.receipt.is_none() => {
+                    hold_unsettled(&directory, &name, &intent);
+                    Ok(())
+                }
                 Some(intent) => settle(store, &directory, &name, &intent),
                 None => {
                     with_open(&directory, |open| open.keys.remove(&name));
@@ -493,10 +635,218 @@ pub(super) fn reconcile(store: &Store) -> Result<(), Error> {
             first_error.get_or_insert(error);
         }
     }
+    tell_senders(store, &directory);
     match first_error {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// Move an obligation whose effect's outcome is unknown out of the keys a
+/// reconcile visits, into the held list `unsettled` reports. Called with the
+/// key's lock held.
+fn hold_unsettled(directory: &Path, name: &str, intent: &Intent) {
+    let since = std::fs::metadata(Files::new(directory, name).pending)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|age| i64::try_from(age.as_millis()).ok());
+    let unsettled = Unsettled::of(intent, since);
+    with_open(directory, |open| {
+        open.keys.remove(name);
+        open.stuck
+            .entry(name.to_string())
+            .or_insert((unsettled, false));
+    });
+}
+
+/// Tell each held obligation's sender, once, through its own mailbox. The
+/// notice is keyed by the effect key, so a restart does not repeat it.
+fn tell_senders(store: &Store, directory: &Path) {
+    let untold: Vec<(String, Unsettled)> = with_open(directory, |open| {
+        open.stuck
+            .iter()
+            .filter(|(_, (_, told))| !told)
+            .map(|(name, (unsettled, _))| (name.clone(), unsettled.clone()))
+            .collect()
+    });
+    for (name, unsettled) in untold {
+        let since = unsettled.since_ms.map_or_else(String::new, |ms| {
+            format!(" at {} UTC", crate::ui::format_timestamp_ms(ms))
+        });
+        let why = unsettled
+            .error
+            .as_deref()
+            .map_or_else(String::new, |error| {
+                format!(" The send failed with: {error}.")
+            });
+        let text = format!(
+            "[Delivery Uncertain] Your message to {} (sent{since}) could not be confirmed delivered, and it is not resent automatically, so that a delivered message is never sent twice.{why}\n\nCheck whether the recipient has it. If not, send it again yourself. The operator can also retry or discard it: `anyagents outbound retry {}` / `anyagents outbound discard {}`.\n\nThe message began: {}",
+            unsettled.destination,
+            unsettled.effect_key,
+            unsettled.effect_key,
+            unsettled.excerpt(),
+        );
+        let told = match store.post_notice(
+            &unsettled.agent_id,
+            format!("anyagents:outbound-unsettled:{}", unsettled.effect_key),
+            text,
+        ) {
+            Ok(_) => true,
+            // A sender that is gone cannot be told; the operator still sees it.
+            Err(Error::AgentNotFound(_)) => true,
+            Err(error) => {
+                eprintln!(
+                    "outbound history: cannot tell {} that {} is unconfirmed: {error}",
+                    unsettled.agent_id, unsettled.effect_key
+                );
+                false
+            }
+        };
+        if told {
+            // Reported once per obligation, when its sender is told.
+            eprintln!(
+                "outbound history: {} from {} to {} could not be confirmed and is held, not resent; `anyagents outbound` retries or discards it{}",
+                unsettled.effect_key,
+                unsettled.agent_id,
+                unsettled.destination,
+                unsettled
+                    .error
+                    .as_deref()
+                    .map_or_else(String::new, |error| format!(": {error}"))
+            );
+            with_open(directory, |open| {
+                if let Some((_, flag)) = open.stuck.get_mut(&name) {
+                    *flag = true;
+                }
+            });
+        }
+    }
+}
+
+/// The obligations whose effect's outcome is unknown, oldest first. Reads
+/// only: the directory is listed once per process, as a reconcile would, and
+/// a key some send still holds is in flight, not unsettled.
+pub(crate) fn unsettled(store: &Store) -> Vec<Unsettled> {
+    let directory = directory(store);
+    if !with_open(&directory, |open| open.scanned)
+        && let Ok((pending, leftovers)) = list(&directory)
+    {
+        with_open(&directory, |open| {
+            if !open.scanned {
+                open.keys.extend(pending);
+                open.leftovers = leftovers;
+                open.scanned = true;
+            }
+        });
+    }
+    let keys: Vec<String> = with_open(&directory, |open| open.keys.iter().cloned().collect());
+    for name in keys {
+        let files = Files::new(&directory, &name);
+        let Ok(Some(_lock)) = KeyLock::acquire(&files.lock, false) else {
+            continue;
+        };
+        if let Ok(Some(intent)) = load(&files.pending)
+            && intent.receipt.is_none()
+        {
+            hold_unsettled(&directory, &name, &intent);
+        }
+    }
+    let mut held: Vec<Unsettled> = with_open(&directory, |open| {
+        open.stuck.values().map(|(held, _)| held.clone()).collect()
+    });
+    held.sort_by(|a, b| {
+        a.since_ms
+            .cmp(&b.since_ms)
+            .then_with(|| a.effect_key.cmp(&b.effect_key))
+    });
+    held
+}
+
+/// One held obligation, under its key's lock, for an operator's decision.
+fn held_obligation(
+    store: &Store,
+    effect_key: &str,
+) -> Result<(PathBuf, String, KeyLock, Intent), Error> {
+    let directory = directory(store);
+    let name = encode(effect_key);
+    let files = Files::new(&directory, &name);
+    let lock = KeyLock::acquire(&files.lock, true)?.expect("a waiting acquire holds the lock");
+    recover_staged(&directory, &name)?;
+    match load(&files.pending)? {
+        Some(intent) if intent.receipt.is_none() && intent.effect_key == effect_key => {
+            Ok((directory, name, lock, intent))
+        }
+        Some(_) => Err(Error::Message(format!(
+            "{effect_key} was delivered; it is being settled, not held"
+        ))),
+        None => Err(Error::Message(format!(
+            "{effect_key} is not an unsettled outbound message"
+        ))),
+    }
+}
+
+/// Close a held obligation with the operator's `outcome` and the receipt it
+/// ends with, keeping no body. Called with the key's lock held.
+fn close_held(
+    directory: &Path,
+    name: &str,
+    intent: &Intent,
+    outcome: &str,
+    receipt: Vec<Delivery>,
+) -> Result<(), Error> {
+    let done = Intent {
+        effect_key: intent.effect_key.clone(),
+        agent_id: intent.agent_id.clone(),
+        destination: intent.destination.clone(),
+        reply_to: intent.reply_to.clone(),
+        body: None,
+        receipt: Some(receipt),
+        created_at_ms: intent.created_at_ms,
+        uncertain: intent.uncertain.clone(),
+        outcome: Some(outcome.to_string()),
+    };
+    let files = Files::new(directory, name);
+    create_receipts(directory)?;
+    write(&files.staged_done, &files.done, &done)?;
+    std::fs::remove_file(&files.pending)?;
+    sync_directory(directory)?;
+    with_open(directory, |open| {
+        open.keys.remove(name);
+        open.stuck.remove(name);
+    });
+    Ok(())
+}
+
+/// The operator settles a held obligation without sending it: the message is
+/// not sent again, and a keyed retry of the same send gets an empty receipt.
+pub(crate) fn discard(store: &Store, effect_key: &str) -> Result<Unsettled, Error> {
+    let _barrier = publication_barrier(store)?;
+    let (directory, name, _lock, intent) = held_obligation(store, effect_key)?;
+    close_held(&directory, &name, &intent, "discarded", Vec::new())?;
+    Ok(Unsettled::of(&intent, None))
+}
+
+/// The operator sends a held obligation's message again, as its agent and to
+/// its destination, through `resend`, which opens an obligation of its own.
+/// The held one is closed with the new receipt only when that send succeeds;
+/// otherwise it stays held, unchanged.
+pub(crate) fn retry<F>(
+    store: &Store,
+    effect_key: &str,
+    resend: F,
+) -> Result<Vec<Delivery>, ApiError>
+where
+    F: FnOnce(&Unsettled) -> Result<Vec<Delivery>, ApiError>,
+{
+    let (directory, name, _lock, intent) =
+        held_obligation(store, effect_key).map_err(ApiError::from_store)?;
+    let held = Unsettled::of(&intent, None);
+    let receipt = resend(&held)?;
+    let _barrier = publication_barrier(store).map_err(ApiError::from_store)?;
+    close_held(&directory, &name, &intent, "retried", receipt.clone())
+        .map_err(ApiError::from_store)?;
+    Ok(receipt)
 }
 
 /// The one directory listing a process makes. It returns the obligations a
@@ -677,7 +1027,31 @@ mod tests {
             reply_to: None,
             body: Some("hello".into()),
             receipt,
+            created_at_ms: None,
+            uncertain: None,
+            outcome: None,
         }
+    }
+
+    fn notices(store: &Store, agent: &AgentId) -> Vec<String> {
+        store
+            .inbox(agent, None)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.sender.as_deref() == Some(anyagents_core::SYSTEM_SENDER))
+            .map(|m| m.text)
+            .collect()
+    }
+
+    fn telegram_refusal(status: u16, class: &str) -> ApiError {
+        ApiError::from_store(Error::Message(format!(
+            "telegram {}",
+            serde_json::json!({
+                "method": "sendMessage", "channel_id": null, "class": class,
+                "status": status, "error_code": status,
+                "description": "Bad Request: message thread not found", "retry_after": null,
+            })
+        )))
     }
 
     fn put(path: &Path, intent: &Intent) {
@@ -793,7 +1167,19 @@ mod tests {
             )
             .is_err()
         );
-        assert!(reconcile(&store).is_err());
+        // Held, not an error on every pass: its sender is told once instead.
+        reconcile(&store).unwrap();
+        let held = unsettled(&store);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].effect_key, "unknown-call");
+        assert_eq!(
+            held[0].error.as_deref(),
+            Some("lost remote acknowledgement")
+        );
+        let told = notices(&store, &sender.id);
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].starts_with("[Delivery Uncertain] Your message to agent:recipient"));
+        assert!(told[0].contains("anyagents outbound retry unknown-call"));
         assert!(
             deliver(
                 &store,
@@ -818,9 +1204,12 @@ mod tests {
                 .count(),
             1
         );
-        // The retained obligation stays open across a restart, too.
+        // The retained obligation stays open across a restart, too, and
+        // its sender is not told again.
         forget(&store);
-        assert!(reconcile(&store).is_err());
+        reconcile(&store).unwrap();
+        assert_eq!(unsettled(&store).len(), 1);
+        assert_eq!(notices(&store, &sender.id).len(), 1);
     }
 
     #[test]
@@ -1075,10 +1464,14 @@ mod tests {
             &intent(&sender, "send:unknown:0", None),
         );
         forget(&store);
-        let outcome = reconcile(&store);
-        assert!(
-            outcome.is_err_and(|error| error.to_string().contains("no terminal receipt")),
-            "the obligation without a receipt stays open"
+        reconcile(&store).unwrap();
+        assert_eq!(
+            unsettled(&store)
+                .into_iter()
+                .map(|held| held.effect_key)
+                .collect::<Vec<_>>(),
+            ["send:unknown:0"],
+            "the obligation without a receipt stays open, held"
         );
         assert_eq!(
             names(&journal),
@@ -1194,5 +1587,220 @@ mod tests {
         waiter.join().unwrap();
         assert!(!path.exists(), "no lock file outlives its holder");
         assert!(KeyLock::acquire(&path, false).unwrap().is_some());
+    }
+
+    /// The Telegram API refused the whole post: nothing was posted, so no
+    /// obligation is left, and the same call later runs its effect again.
+    #[test]
+    fn a_refused_post_leaves_no_obligation() {
+        let (_dir, store, sender) = fixture();
+        let effects = Cell::new(0);
+        let send = || {
+            deliver(
+                &store,
+                &sender,
+                "telegram:chat:1951959493:3662",
+                None,
+                "a reply",
+                Some("refused-call"),
+                false,
+                || {
+                    effects.set(effects.get() + 1);
+                    Err(telegram_refusal(400, "provider"))
+                },
+            )
+        };
+        assert!(send().is_err());
+        assert!(send().is_err(), "a refusal is never 'outcome unknown'");
+        assert_eq!(effects.get(), 2);
+        reconcile(&store).unwrap();
+        assert!(unsettled(&store).is_empty());
+        assert!(notices(&store, &sender).is_empty());
+        assert_eq!(names(&directory(&store)), [".publication.lock"]);
+    }
+
+    /// A mailbox write dedupes a replay by its source key, so a failed one
+    /// leaves nothing to settle either.
+    #[test]
+    fn a_failed_replay_safe_send_leaves_no_obligation() {
+        let (_dir, store, sender) = fixture();
+        assert!(
+            deliver(
+                &store,
+                &sender,
+                "agent:recipient",
+                None,
+                "hello",
+                None,
+                true,
+                || Err(ApiError::from_store(Error::AgentNotFound(
+                    "recipient".into()
+                ))),
+            )
+            .is_err()
+        );
+        reconcile(&store).unwrap();
+        assert!(unsettled(&store).is_empty());
+        assert_eq!(names(&directory(&store)), [".publication.lock"]);
+    }
+
+    /// A timeout, or a later chunk of a post refused after earlier ones were
+    /// posted, proves nothing: held, never resent, its sender told once.
+    #[test]
+    fn an_unconfirmed_post_is_held_and_its_sender_told_once() {
+        let (_dir, store, sender) = fixture();
+        for error in [
+            telegram_refusal(0, "timeout"),
+            telegram_refusal(400, "partial_delivery"),
+            telegram_refusal(502, "provider"),
+        ] {
+            assert!(
+                deliver(
+                    &store,
+                    &sender,
+                    "telegram:chat:1951959493",
+                    None,
+                    "a reply",
+                    None,
+                    false,
+                    || Err(error),
+                )
+                .is_err()
+            );
+        }
+        reconcile(&store).unwrap();
+        let held = unsettled(&store);
+        assert_eq!(held.len(), 3, "{held:?}");
+        assert!(
+            held.iter()
+                .all(|h| h.destination == "telegram:chat:1951959493")
+        );
+        assert!(held.iter().all(|h| h.since_ms.is_some()));
+        assert!(held.iter().all(|h| {
+            h.error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("telegram "))
+        }));
+        assert_eq!(notices(&store, &sender).len(), 3);
+        reconcile(&store).unwrap();
+        forget(&store);
+        reconcile(&store).unwrap();
+        assert_eq!(notices(&store, &sender).len(), 3, "told once each");
+    }
+
+    /// An obligation a binary from before this layout left (no time, no
+    /// error) is held all the same, aged by its file.
+    #[test]
+    fn an_old_obligation_without_a_receipt_is_held() {
+        let (_dir, store, sender) = fixture();
+        let journal = directory(&store);
+        std::fs::create_dir_all(&journal).unwrap();
+        let name = encode("msg_01m7b8rp7ve8n9s9cns8z8fafp");
+        std::fs::write(
+            journal.join(format!("{name}.pending")),
+            serde_json::json!({
+                "effect_key": "msg_01m7b8rp7ve8n9s9cns8z8fafp",
+                "agent_id": sender.to_string(),
+                "destination": "telegram:chat:1951959493:3662",
+                "reply_to": "telegram:chat:1951959493:3662",
+                "body": "a reply the human never got",
+                "receipt": null,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        forget(&store);
+        let held = unsettled(&store);
+        assert_eq!(held.len(), 1);
+        assert!(held[0].since_ms.is_some());
+        assert!(held[0].error.is_none());
+        assert!(notices(&store, &sender).is_empty(), "a read tells no one");
+        reconcile(&store).unwrap();
+        let told = notices(&store, &sender);
+        assert_eq!(told.len(), 1);
+        assert!(told[0].contains("telegram:chat:1951959493:3662"));
+        assert!(told[0].contains("a reply the human never got"));
+    }
+
+    /// The operator discards a held obligation: it is closed without being
+    /// sent, and nothing about it is held or retried any more.
+    #[test]
+    fn the_operator_discards_a_held_obligation() {
+        let (_dir, store, sender) = fixture();
+        assert!(
+            deliver(
+                &store,
+                &sender,
+                "telegram:chat:1",
+                None,
+                "hello",
+                Some("held-call"),
+                false,
+                || Err(telegram_refusal(0, "timeout")),
+            )
+            .is_err()
+        );
+        reconcile(&store).unwrap();
+        let discarded = discard(&store, "held-call").unwrap();
+        assert_eq!(discarded.destination, "telegram:chat:1");
+        assert!(unsettled(&store).is_empty());
+        assert!(discard(&store, "held-call").is_err(), "settled once");
+        let receipts = directory(&store).join("receipts");
+        let done: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(receipts.join(format!("{}.done", encode("held-call")))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(done["outcome"], "discarded");
+        assert!(done["body"].is_null());
+        assert!(
+            !directory(&store)
+                .join(format!("{}.pending", encode("held-call")))
+                .exists()
+        );
+    }
+
+    /// The operator retries a held obligation through a new send; it is
+    /// closed with that send's receipt only when the send succeeds.
+    #[test]
+    fn the_operator_retries_a_held_obligation() {
+        let (_dir, store, sender) = fixture();
+        assert!(
+            deliver(
+                &store,
+                &sender,
+                "telegram:chat:1",
+                None,
+                "hello",
+                Some("held-call"),
+                false,
+                || Err(telegram_refusal(0, "timeout")),
+            )
+            .is_err()
+        );
+        let failed = retry(&store, "held-call", |held| {
+            assert_eq!(held.body, "hello");
+            Err(ApiError::from_store(Error::Message("still down".into())))
+        });
+        assert!(failed.is_err());
+        assert_eq!(unsettled(&store).len(), 1, "a failed retry keeps it held");
+        let receipt = retry(&store, "held-call", |held| {
+            assert_eq!(held.agent_id, sender);
+            Ok(delivery())
+        })
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(receipt.len(), 1);
+        assert_eq!(receipt[0].id, "provider-receipt");
+        assert!(unsettled(&store).is_empty());
+        let done: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                directory(&store)
+                    .join("receipts")
+                    .join(format!("{}.done", encode("held-call"))),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(done["outcome"], "retried");
+        assert!(retry(&store, "held-call", |_| Ok(delivery())).is_err());
     }
 }

@@ -14,7 +14,12 @@
 //!   expires. The long-lived local mailbox capability never leaves this host.
 //! * A remote session token only ever gets the `remote` MCP profile
 //!   ([`crate::mcp::McpProfile::resolve_http`]).
+//! * `public_listen` in the same table binds the public listener: its own port,
+//!   serving readiness, Telegram webhooks and MCP for remote session tokens
+//!   only. Every local credential stays on the socket and the loopback API
+//!   (ADR 0010 D2). The separation is by listener, never by source address.
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -70,6 +75,7 @@ struct ConfigFile {
 #[serde(deny_unknown_fields)]
 struct ServerTable {
     public_url: Option<String>,
+    public_listen: Option<String>,
     remote_session_ttl_secs: Option<u64>,
 }
 
@@ -78,6 +84,8 @@ struct ServerTable {
 pub struct Settings {
     /// The normalized public origin (and optional base path), no trailing `/`.
     pub public_url: Option<String>,
+    /// Where the public listener binds, when it is configured.
+    pub public_listen: Option<SocketAddr>,
     pub remote_session_ttl: Duration,
 }
 
@@ -85,6 +93,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             public_url: None,
+            public_listen: None,
             remote_session_ttl: DEFAULT_TTL,
         }
     }
@@ -112,6 +121,19 @@ impl Settings {
             .map(normalize_public_url)
             .transpose()
             .map_err(|err| format!("{}: [server] public_url {err}", origin.display()))?;
+        let public_listen = file
+            .server
+            .public_listen
+            .as_deref()
+            .map(|raw| {
+                raw.trim().parse::<SocketAddr>().map_err(|_| {
+                    format!(
+                        "{}: [server] public_listen `{raw}` must be an `address:port` such as `0.0.0.0:8789`",
+                        origin.display()
+                    )
+                })
+            })
+            .transpose()?;
         let remote_session_ttl = match file.server.remote_session_ttl_secs {
             None => DEFAULT_TTL,
             Some(secs) => {
@@ -129,6 +151,7 @@ impl Settings {
         };
         Ok(Self {
             public_url,
+            public_listen,
             remote_session_ttl,
         })
     }
@@ -191,7 +214,8 @@ pub fn normalize_public_url(raw: &str) -> Result<String, String> {
 }
 
 /// Whether this agent's harness runs off this host: a cloud harness, or a
-/// harness spawned into a remote sandbox.
+/// harness spawned into a remote sandbox. These are the agents that hold
+/// remote session tokens.
 pub fn runs_off_host(agent: &Agent, config_dir: &Path) -> bool {
     crate::vendor::is_cloud_harness(&agent.harness)
         || anyagents_tools::SandboxConfig::resolve(Some(config_dir))
@@ -349,7 +373,7 @@ mod tests {
 
         std::fs::write(
             dir.path().join(CONFIG_FILE),
-            "[server]\npublic_url = \"https://Agents.Example.com/base/\"\nremote_session_ttl_secs = 1800\n",
+            "[server]\npublic_url = \"https://Agents.Example.com/base/\"\npublic_listen = \"0.0.0.0:8789\"\nremote_session_ttl_secs = 1800\n",
         )
         .unwrap();
         let settings = Settings::load(dir.path()).unwrap();
@@ -358,6 +382,11 @@ mod tests {
             Some("https://Agents.Example.com/base")
         );
         assert_eq!(settings.remote_session_ttl, Duration::from_secs(1800));
+        assert_eq!(
+            settings.public_listen,
+            Some("0.0.0.0:8789".parse().unwrap())
+        );
+        assert_eq!(Settings::default().public_listen, None);
         assert_eq!(
             settings.mcp_url().as_deref(),
             Some("https://Agents.Example.com/base/v1/webhooks/mcp")
@@ -396,6 +425,10 @@ mod tests {
             assert!(err.contains("remote_session_ttl_secs"), "{err}");
         }
         assert!(parse("[server]\npublic-url = \"https://a.example.com\"\n").is_err());
+        for bad in ["8789", "agents.example.com:8789", "0.0.0.0", ""] {
+            let err = parse(&format!("[server]\npublic_listen = \"{bad}\"\n")).unwrap_err();
+            assert!(err.contains("public_listen"), "{bad}: {err}");
+        }
     }
 
     #[test]

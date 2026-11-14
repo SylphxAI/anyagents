@@ -150,6 +150,83 @@ pub struct AgentView {
     /// Active self-scheduled wakes (`at`, `every`) and event watches (`watch`) owned by this agent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedules: Vec<ScheduleView>,
+    /// Turns in a row that ended in an error, and the parking that follows
+    /// `limit` of them (`docs/delivery.md`). Absent once a turn completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_errors: Option<TurnErrorsView>,
+    /// Messages this agent sent whose delivery could not be confirmed. None
+    /// is resent automatically; `anyagents outbound` retries or discards one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsettled_outbound: Vec<UnsettledOutboundView>,
+}
+
+impl AgentView {
+    /// The lifecycle a listing shows: `faulted` for an agent parked because
+    /// its turns kept ending in an error (its `state` is `paused`).
+    pub fn display_state(&self) -> &str {
+        if self.state == "paused"
+            && self
+                .turn_errors
+                .as_ref()
+                .is_some_and(|errors| errors.faulted_at_ms.is_some())
+        {
+            "faulted"
+        } else {
+            &self.state
+        }
+    }
+}
+
+/// An agent's run of errored turns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TurnErrorsView {
+    /// Turns in a row that ended in an error of the agent's own session
+    /// (strikes). A provider, model, auth, network or host error is recorded
+    /// as `last_error` but is no strike.
+    pub streak: i64,
+    /// Strikes in a row that park the agent.
+    pub limit: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_at_ms: Option<i64>,
+    /// When the agent was parked (`paused`) for them; a resume clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faulted_at_ms: Option<i64>,
+}
+
+impl From<anyagents_core::TurnErrors> for TurnErrorsView {
+    fn from(errors: anyagents_core::TurnErrors) -> Self {
+        Self {
+            streak: errors.streak,
+            limit: anyagents_core::MAX_ERRORED_TURNS,
+            last_error: errors.last_error,
+            last_error_at_ms: errors.last_error_at_ms,
+            faulted_at_ms: errors.faulted_at_ms,
+        }
+    }
+}
+
+/// A sent message whose delivery could not be confirmed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UnsettledOutboundView {
+    /// What `anyagents outbound retry|discard` takes.
+    pub key: String,
+    pub agent_id: String,
+    pub destination: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
+    /// The error that left the outcome unknown, when one was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The first characters of the message.
+    pub excerpt: String,
+}
+
+/// `GET /v1/outbound`: every unsettled outbound message.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct UnsettledOutboundResponse {
+    pub unsettled: Vec<UnsettledOutboundView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
