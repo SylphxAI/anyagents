@@ -985,11 +985,11 @@ struct McpRouteQuery {
 /// Who made one MCP call, and with which kind of credential.
 struct McpCaller {
     agent: Agent,
-    /// What the call's tools present on the internal socket: the presented
-    /// local capability, or for a remote session the agent's own local
-    /// capability, which the server reads and which never leaves this host.
+    /// What the call's tools present on the internal socket: the agent's own
+    /// local capability, which the server reads and which never leaves this
+    /// host.
     internal_token: String,
-    /// Set when the caller presented a remote session token.
+    /// The remote session the presented token belongs to.
     remote: Option<anyagents_core::RemoteSessionGrant>,
 }
 
@@ -1012,10 +1012,9 @@ impl McpCaller {
     }
 }
 
-/// Authenticate one MCP call. A token with the remote session prefix is only
-/// ever checked as a remote session token (bound to one agent and session,
-/// unexpired, unrevoked); any other token is a local mailbox capability,
-/// checked exactly as before.
+/// Authenticate one MCP call over HTTP. Only a remote session token (bound to
+/// one agent and session, unexpired, unrevoked) is accepted. A valid local
+/// mailbox capability is refused with 403, and anything else with 401.
 fn authenticate_mcp_request(
     store: &Store,
     headers: &axum::http::HeaderMap,
@@ -1069,17 +1068,21 @@ fn authenticate_mcp_request(
             remote: Some(grant),
         });
     }
-    let agent = store.authenticate_agent(token).map_err(|_| {
-        ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "invalid or expired MCP capability token",
-        )
-    })?;
-    Ok(McpCaller {
-        agent,
-        internal_token: token.to_string(),
-        remote: None,
-    })
+    // MCP over HTTP runs the tools inside the server process, as the server's
+    // own user, on every listener including the Unix socket. A local agent's
+    // tools run over stdio (`anyagents mcp`) as the agent itself, so its
+    // capability is never accepted here.
+    if store.authenticate_agent(token).is_ok() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "MCP over HTTP accepts only remote session tokens; a local agent's tools run over stdio \
+             (`anyagents mcp`), as the agent itself",
+        ));
+    }
+    Err(ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "invalid or expired MCP capability token",
+    ))
 }
 
 fn ensure_internal_socket_listener(state: &AppState) -> PathBuf {
@@ -11413,16 +11416,38 @@ exec '{}' "$@"
         let _env = env_lock();
         let dir = crate::test_tempdir();
         let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
         let cloud_agent = state
             .store
-            .create_agent(anyagents_core::NewAgent::new("cloud-worker", "claude-code"))
+            .create_agent(anyagents_core::NewAgent::new(
+                "cloud-worker",
+                "claude-cloud",
+            ))
             .unwrap();
         let spiron_agent = state
             .store
-            .create_agent(anyagents_core::NewAgent::new("spiron-worker", "spiron"))
+            .create_agent(anyagents_core::NewAgent::new(
+                "spiron-worker",
+                "spiron-cloud",
+            ))
             .unwrap();
-        let cloud_cap = state.store.issue_capability(&cloud_agent.id).unwrap();
-        let spiron_cap = state.store.issue_capability(&spiron_agent.id).unwrap();
+        // HTTP MCP takes remote session tokens only; a local capability is
+        // refused below.
+        let remote_token = |agent: &Agent| {
+            crate::remote::begin_session(&state.store, agent).unwrap();
+            crate::remote::session_token(&anyagents_core::agent_config_dir(
+                state.store.data_dir(),
+                &agent.id,
+            ))
+            .unwrap()
+        };
+        let cloud_cap = remote_token(&cloud_agent);
+        let spiron_cap = remote_token(&spiron_agent);
+        let local_cap = state.store.issue_capability(&cloud_agent.id).unwrap();
 
         // Seed a skill inside the agent's config dir so `skills` list/read works deterministically.
         let skill_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &cloud_agent.id)
@@ -11474,6 +11499,43 @@ exec '{}' "$@"
             .await
             .expect_err("invalid token must fail with 401");
             assert_eq!(bad_err.status, StatusCode::UNAUTHORIZED);
+
+            // A valid local capability is refused with 403: local agents use
+            // stdio MCP, which runs as the agent, never HTTP inside the server.
+            for header in [
+                axum::http::header::AUTHORIZATION.as_str(),
+                crate::operator::AGENT_HEADER,
+            ] {
+                let mut local_headers = axum::http::HeaderMap::new();
+                let value = if header == "authorization" {
+                    format!("Bearer {local_cap}")
+                } else {
+                    local_cap.clone()
+                };
+                local_headers.insert(
+                    axum::http::HeaderName::from_static(header),
+                    value.parse().unwrap(),
+                );
+                let refused = mcp_post_route(
+                    State(state.clone()),
+                    local_headers,
+                    Query(McpRouteQuery::default()),
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/list",
+                        "params": {}
+                    })),
+                )
+                .await
+                .expect_err("a local capability must be refused over HTTP");
+                assert_eq!(refused.status, StatusCode::FORBIDDEN, "{header}");
+                assert!(
+                    refused.message.contains("only remote session tokens"),
+                    "{}",
+                    refused.message
+                );
+            }
 
             // Helper to call `mcp_post_route` with a Bearer token and optional profile query.
             let post_mcp = |token: &str, profile: Option<&str>, body: serde_json::Value| {
@@ -11996,15 +12058,13 @@ exec '{}' "$@"
                 StatusCode::FORBIDDEN
             );
 
-            // Over HTTP a local capability gets no more than a remote token.
-            let local_full = post_mcp_as(&state, &peer_cap, Some("full"), tools_list())
-                .await
-                .unwrap_err();
-            assert_eq!(local_full.status, StatusCode::FORBIDDEN);
-            let (_, local_default) = post_mcp_as(&state, &peer_cap, None, tools_list())
-                .await
-                .unwrap();
-            assert_eq!(listed_tools(&local_default), expected_remote);
+            // Over HTTP a local capability is refused outright.
+            for asked in [None, Some("full")] {
+                let refused = post_mcp_as(&state, &peer_cap, asked, tools_list())
+                    .await
+                    .unwrap_err();
+                assert_eq!(refused.status, StatusCode::FORBIDDEN, "{asked:?}");
+            }
         });
     }
 
@@ -12224,11 +12284,19 @@ exec '{}' "$@"
         let _env = env_lock();
         let dir = crate::test_tempdir();
         let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
         let local = state
             .store
-            .create_agent(anyagents_core::NewAgent::new("seat-agent", "claude-code"))
+            .create_agent(anyagents_core::NewAgent::new("seat-agent", "claude-cloud"))
             .unwrap();
-        let cap = state.store.issue_capability(&local.id).unwrap();
+        crate::remote::begin_session(&state.store, &local).unwrap();
+        let cap =
+            crate::remote::session_token(&anyagents_core::agent_config_dir(dir.path(), &local.id))
+                .unwrap();
         // Neither a sandbox binding nor disabled built-in tools upgrades HTTP
         // any more: over HTTP the tools would run as the server.
         let cfg = anyagents_core::agent_config_dir(dir.path(), &local.id);
@@ -12347,7 +12415,8 @@ exec '{}' "$@"
             crate::remote::session_token(&anyagents_core::agent_config_dir(dir.path(), &cloud.id))
                 .unwrap();
         let mut children = Vec::new();
-        for parent in [&local, &cloud] {
+        {
+            let parent = &cloud;
             let child = state
                 .store
                 .create_agent(anyagents_core::NewAgent {
@@ -12378,7 +12447,19 @@ exec '{}' "$@"
         std::fs::write(&secret, "not for a remote caller").unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            for (token, (child, sleeper)) in [&local_cap, &remote].into_iter().zip(&children) {
+            // A local capability never reaches these tools over HTTP.
+            let refused_local = post_mcp_as(
+                &state,
+                &local_cap,
+                None,
+                tool_call("agents", serde_json::json!({ "action": "list" })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refused_local.status, StatusCode::FORBIDDEN);
+            {
+                let token = &remote;
+                let (child, sleeper) = &children[0];
                 let call = |tool: &str, args: serde_json::Value| {
                     let state = state.clone();
                     let token = token.to_string();
@@ -12395,13 +12476,10 @@ exec '{}' "$@"
                     assert!(result.to_string().contains(why), "{why}: {result}");
                 };
 
-                // Spawning a host-executed agent, through either tool. Left to
-                // the default, a host caller's child resolves to its own host
-                // harness and is refused too; a cloud caller's inherits a
-                // cloud harness, which is allowed.
+                // Spawning a host-executed agent, through either tool.
                 let prefix = token.chars().take(6).collect::<String>();
                 let named = |n: &str| format!("host-{prefix}-{n}");
-                let mut attempts = vec![
+                let attempts = vec![
                     (
                         "agents",
                         serde_json::json!({ "action": "spawn", "name": named("a"), "harness": "claude-code" }),
@@ -12413,13 +12491,6 @@ exec '{}' "$@"
                         named("c"),
                     ),
                 ];
-                if token == &local_cap {
-                    attempts.push((
-                        "agents",
-                        serde_json::json!({ "action": "spawn", "name": named("b") }),
-                        named("b"),
-                    ));
-                }
                 for (tool, args, name) in attempts {
                     refused(&call(tool, args).await, "only on a cloud harness");
                     assert!(state.store.agent_by_name(&name).is_err(), "{name}");
@@ -12478,6 +12549,103 @@ exec '{}' "$@"
                         .unwrap()
                         .iter()
                         .any(|message| message.text.contains("with a link"))
+                );
+            }
+        });
+    }
+
+    /// The review's probe, kept as a regression: a seat plants links in the
+    /// memory and skill directories it can write, then asks over HTTP MCP,
+    /// where the tools run as the server. A local capability is refused
+    /// outright; a remote session token's reads never follow the links.
+    #[test]
+    fn http_mcp_never_reads_a_link_a_seat_planted() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let canary = "OPERATOR-SECRET-CANARY-7731";
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let secret = secrets.join("operator-token");
+        std::fs::write(&secret, canary).unwrap();
+        // Makes the linked directory look like a skill to discovery.
+        std::fs::write(secrets.join("SKILL.md"), "---\nname: x\n---\n").unwrap();
+
+        let seat = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("mem-seat", "claude-code"))
+            .unwrap();
+        let seat_cap = state.store.issue_capability(&seat.id).unwrap();
+        let cloud = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("mem-cloud", "claude-cloud"))
+            .unwrap();
+        for agent in [&seat, &cloud] {
+            let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+            std::fs::create_dir_all(&config).unwrap();
+            let root = config.parent().unwrap().to_path_buf();
+            let memory = root.join("memory");
+            std::fs::create_dir_all(&memory).unwrap();
+            std::os::unix::fs::symlink(&secret, memory.join("MEMORY.md")).unwrap();
+            std::os::unix::fs::symlink(&secret, memory.join("leak.md")).unwrap();
+            let overlay = root.join("skills").join("leaky");
+            std::fs::create_dir_all(&overlay).unwrap();
+            std::os::unix::fs::symlink(&secret, overlay.join("SKILL.md")).unwrap();
+            let view = root.join("skills-view");
+            std::fs::create_dir_all(&view).unwrap();
+            std::os::unix::fs::symlink(&secrets, view.join("borrowed")).unwrap();
+        }
+        crate::remote::begin_session(&state.store, &cloud).unwrap();
+        let remote =
+            crate::remote::session_token(&anyagents_core::agent_config_dir(dir.path(), &cloud.id))
+                .unwrap();
+
+        let probes = [
+            ("memory", serde_json::json!({ "action": "list" })),
+            (
+                "memory",
+                serde_json::json!({ "action": "read", "topic": "leak" }),
+            ),
+            (
+                "memory",
+                serde_json::json!({ "action": "read", "topic": "MEMORY" }),
+            ),
+            ("memory", serde_json::json!({ "action": "status" })),
+            ("skills", serde_json::json!({ "action": "list" })),
+            (
+                "skills",
+                serde_json::json!({ "action": "read", "name": "leaky" }),
+            ),
+            (
+                "skills",
+                serde_json::json!({ "action": "read", "name": "borrowed", "file": "operator-token" }),
+            ),
+            (
+                "skills",
+                serde_json::json!({ "action": "search", "query": "CANARY" }),
+            ),
+        ];
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (tool, args) in &probes {
+                let refused = post_mcp_as(&state, &seat_cap, None, tool_call(tool, args.clone()))
+                    .await
+                    .unwrap_err();
+                assert_eq!(refused.status, StatusCode::FORBIDDEN, "{tool} {args}");
+                assert!(!refused.message.contains(canary));
+
+                let (status, body) =
+                    post_mcp_as(&state, &remote, None, tool_call(tool, args.clone()))
+                        .await
+                        .unwrap();
+                assert_eq!(status, StatusCode::OK, "{tool} {args}");
+                assert!(
+                    !body.to_string().contains(canary),
+                    "{tool} {args} leaked: {body}"
                 );
             }
         });
