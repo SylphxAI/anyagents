@@ -71,6 +71,11 @@ pub(crate) fn get<T: serde::de::DeserializeOwned>(
     }
     match call_inner(data, "GET", path, None, &authority) {
         Err(err) if may_read_offline(&err, agent_identity().is_some()) => Ok(None),
+        // The agent waited and no server came back (its socket is still
+        // gone): answer as when there is none, so each command gives its own
+        // refusal ("... requires the authenticated server") rather than a
+        // transport error.
+        Err(CallError::Transport(_)) if waits && !server::socket_path(data).exists() => Ok(None),
         result => result.map_err(CallError::message),
     }
 }
@@ -96,12 +101,18 @@ fn may_read_offline(error: &CallError, is_agent: bool) -> bool {
 /// missing or refusing, so nothing was sent). An operator's read does not
 /// wait: it is answered from the store at once. Everything else (an agent's
 /// command, any change) waits the restart out.
+///
+/// `ANYAGENTS_RECONNECT_WAIT_MS` replaces the wait (an operator's choice, or
+/// a test of something other than restarts), up to ten minutes.
 fn restart_wait(method: &str, authority: &Authority) -> std::time::Duration {
     if method.eq_ignore_ascii_case("GET") && matches!(authority, Authority::Operator) {
-        std::time::Duration::ZERO
-    } else {
-        crate::mcp::RECONNECT_WITHIN
+        return std::time::Duration::ZERO;
     }
+    std::env::var("ANYAGENTS_RECONNECT_WAIT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|ms| std::time::Duration::from_millis(ms).min(std::time::Duration::from_secs(600)))
+        .unwrap_or(crate::mcp::RECONNECT_WITHIN)
 }
 
 fn capability(data: &Path, id: &AgentId) -> Option<String> {
