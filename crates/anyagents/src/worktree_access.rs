@@ -2785,13 +2785,27 @@ fn probe_program() -> std::io::Result<(PathBuf, Vec<&'static str>)> {
 }
 
 /// Under `cargo test` this binary is the test harness: its probe worker test
-/// takes the probe's arguments instead. A seat must be able to execute it, as
-/// it must execute the server binary, but a build tree usually sits below a
-/// home directory no other uid can traverse. The harness therefore runs from
-/// one seat-executable copy in a fresh 0755 directory under the system
-/// temporary directory.
+/// takes the probe's arguments instead.
 #[cfg(test)]
 fn probe_program() -> std::io::Result<(PathBuf, Vec<&'static str>)> {
+    Ok((
+        seat_executable_test_harness()?,
+        vec![
+            "--exact",
+            "worktree_access::tests::admission_probe_worker",
+            "--nocapture",
+            "--",
+        ],
+    ))
+}
+
+/// The test harness, for a seat to execute in place of this binary. A seat
+/// must be able to execute it, as it must execute the server binary, but a
+/// build tree usually sits below a home directory no other uid can traverse.
+/// The harness therefore runs from one seat-executable copy in a fresh 0755
+/// directory under the system temporary directory.
+#[cfg(test)]
+pub(crate) fn seat_executable_test_harness() -> std::io::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     static COPY: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
     let copy = COPY.get_or_init(|| {
@@ -2822,15 +2836,7 @@ fn probe_program() -> std::io::Result<(PathBuf, Vec<&'static str>)> {
         };
         copy().map_err(|error| error.to_string())
     });
-    Ok((
-        copy.clone().map_err(std::io::Error::other)?,
-        vec![
-            "--exact",
-            "worktree_access::tests::admission_probe_worker",
-            "--nocapture",
-            "--",
-        ],
-    ))
+    copy.clone().map_err(std::io::Error::other)
 }
 
 /// `anyagents internal admission-probe --git <git> -- <path>`, run as the
