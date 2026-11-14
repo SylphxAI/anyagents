@@ -1369,4 +1369,35 @@ pub(crate) mod tests {
             &Endpoint::for_test("https://openrouter.ai.example.com/v1", "k")
         ));
     }
+
+    /// The desk's configuration, exactly as `docs/host-memory.md` prints it,
+    /// is what this build reads, and names the pair the owner chose.
+    #[test]
+    fn the_documented_desk_configuration_parses_as_the_chosen_pair() {
+        let doc = include_str!("../../../docs/host-memory.md");
+        let section = doc.split("### Desk configuration").nth(1).unwrap();
+        let block = section.split("```json\n").nth(1).unwrap();
+        let text = block.split("\n```").next().unwrap();
+        let config: ProviderConfig = serde_json::from_str(text).unwrap();
+        let EmbedderConfig::OpenAi(embedder) = &config.embedder else {
+            panic!("{config:?}");
+        };
+        assert_eq!(
+            (
+                embedder.profile.as_str(),
+                embedder.model.as_str(),
+                embedder.dimensions
+            ),
+            ("openrouter/default", "qwen/qwen3-embedding-8b", Some(1024))
+        );
+        assert!(embedder.usd_per_million_tokens.is_some());
+        let RerankerConfig::Rerank(reranker) = &config.reranker else {
+            panic!("{config:?}");
+        };
+        assert_eq!(
+            (reranker.profile.as_str(), reranker.model.as_str()),
+            ("openrouter/default", "mongodb/rerank-3")
+        );
+        assert_eq!(config.max_rebuild_usd, Some(10.0));
+    }
 }

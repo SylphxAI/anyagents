@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `conversation` searches every harness's native history: Spiron's
   `sessions.sqlite3`, OpenCode's `opencode.db` (tool parts included), Claude
   Code subagents, Codex rollouts, AGY, Muse, OMP and Grok sessions, read
-  without ever creating a file beside a harness's store.
+  without ever creating a file beside a harness's store. A harness directory
+  the server may not read (Claude Code's owner-only `config/sessions` under a
+  seat) no longer stops the agent's other history from being indexed. The
+  server logs once when its pre-warm has indexed every agent.
 - History indexing never holds an agent's lifecycle lock or the index's write
   lock across a long read: sources are read and projected unlocked and publish
   in short batches that check the source is unchanged. A search indexes at most
@@ -25,8 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profile: an OpenAI-compatible `/embeddings` endpoint or a Cohere/Voyage/Jina
   style `/rerank`, chosen in `<data>/memory-service/config.json`. With nothing
   configured the pinned local models run offline. Each dense index is stamped
-  with its vector space; a new embedding model is rebuilt in the background
-  after its estimated tokens and cost are reported, within `max_rebuild_usd`.
+  with its vector space (provider, model, dimension, preprocessing); a new
+  embedding model is rebuilt in the background (niced, resumable, batched)
+  after its estimated tokens and cost are reported, and only within
+  `max_rebuild_usd`; while it builds, all embedding stops when the spend the
+  provider reports reaches the cap. `anyagents memory-service estimate`
+  previews the rebuild without calling a model. Every OpenRouter request
+  carries `provider.data_collection = "deny"`, and a remote reranker reads at
+  most `passage_chars` (1,000) characters of each passage. The desk's choice,
+  `qwen/qwen3-embedding-8b` with `mongodb/rerank-3` through
+  `openrouter/default` (MRR@10 0.296 and recall@10 0.463 on our history,
+  against 0.192 and 0.362 for the local pair), is documented with its exact
+  configuration in `docs/host-memory.md`.
 - Hybrid retrieval: BM25 fused with dense candidates from a local multilingual
   embedder and reranked by a local cross-encoder, run by the new
   `anyagents memory-service` process. Every result cites its raw bytes; without

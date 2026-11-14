@@ -8,9 +8,18 @@ summarizes or deletes it, and every index over it is a rebuildable
 projection whose results cite the raw bytes they came from. Native transcript
 and runtime-state writers remain the harnesses' own.
 
-Retrieval is hybrid: BM25 over the host index, dense candidates from a local
-multilingual embedder fused by reciprocal rank, and a local cross-encoder
-reranking the fused head. The model work runs in a separate process,
+Memory has three tiers. L1 is `MEMORY.md`, the catalog pinned into every
+session; L2 is the topic files an agent writes with the `memory` tool; L3 is
+recall over raw history through `conversation`. Raw history is the truth the
+other two point back to.
+
+Retrieval is hybrid: BM25 over the host index (CJK text indexed as character
+bigrams beside ASCII words), dense candidates from an embedding model fused by
+reciprocal rank, and a cross-encoder reranking the fused head. Which embedding
+and rerank models run is chosen through AnyAgents profiles
+([providers](#embedding-and-rerank-providers)); with nothing configured, the
+default for an open-source install, both are pinned local ONNX models and no
+request leaves the host. The model work runs in a separate process,
 `anyagents memory-service`; without it the server ranks lexically and says so
 in each response.
 
@@ -38,6 +47,15 @@ included; a copy of the headless stream written beside it would be a second,
 masked record that could disagree with the first. A `spiron-cloud` agent's
 history lives with the cloud service and is not on the host; only its mailbox
 is searchable here.
+
+Every location is looked for under every agent, whatever its harness. A
+harness directory the server may not read (Claude Code keeps `config/sessions`
+owner-only under a seat, the path where Codex keeps its rollouts) holds nothing
+it can index and does not stop the agent's other history from being indexed;
+a private directory that does hold history, such as a seat's owner-only
+Claude Code `projects/`, is not searchable until the server may read it.
+AnyAgents' own `transcripts/` stays strict: an unreadable file there fails the
+refresh.
 
 A harness's own JSONL can carry a line its writer tore or concatenated; such a
 complete line is indexed as text with unknown metadata instead of failing the
@@ -249,10 +267,13 @@ it, and to a model id:
                "model": "qwen/qwen3-embedding-8b", "dimensions": 1024,
                "usd_per_million_tokens": 0.01},
   "reranker": {"provider": "rerank", "profile": "openrouter/default",
-               "model": "cohere/rerank-5-pro"},
+               "model": "mongodb/rerank-3"},
   "max_rebuild_usd": 10
 }
 ```
+
+The configuration a deployment runs is in
+[Desk configuration](#desk-configuration-2026-11-14).
 
 | Provider | Request |
 | --- | --- |
@@ -264,10 +285,17 @@ it, and to a model id:
 `google-gemini` (Google's OpenAI-compatible endpoint), `sylphx`, `openai`,
 `voyage`, `cohere` and `jina`. `query_prefix`, `passage_prefix`, `body`,
 `query_body` and `passage_body` add a model's instruction text or request
-fields (for example `input_type`, or OpenRouter's
-`provider.data_collection`). Remote calls retry throttling and upstream
-failures, and record the cost the provider reports (`usage.cost`) or, failing
-that, the configured price.
+fields (for example `input_type`, or OpenRouter's `provider.sort`). Every
+request to OpenRouter (by profile, or by a `base_url` on `openrouter.ai`)
+carries `provider.data_collection = "deny"`, merged into whatever routing the
+configuration sets: OpenRouter then routes only to upstream providers that
+neither keep nor train on the text. That is code, not configuration, and
+covers embedding, the width probe and rerank. A remote reranker reads the
+first `passage_chars` characters of each passage (1,000 unless configured,
+what the desk's pair was measured with), which also bounds what one search
+costs. Remote calls retry throttling and upstream failures, and record the
+cost the provider reports (`usage.cost`) or, failing that, the configured
+price.
 
 Every dense index is stamped with its space: provider, model, dimension and
 preprocessing (projection, piece budget, token counter and passage prefix).
@@ -279,10 +307,20 @@ reads, from a uniform sample of 256 documents cut exactly as the embedder will
 cut them, and what it costs at the model's price; the estimate is logged,
 written beside the index (`dense-<space>.estimate.json`) and reported in
 `status.rebuild`. A remote build starts only when its price is known and the
-estimate is within `max_rebuild_usd` (US$10 by default), and stops taking
-backlog when the spend providers report reaches it; new history keeps being
-embedded. Once the new space has no backlog, other spaces' files are deleted.
-Changing the reranker rebuilds nothing.
+estimate is within `max_rebuild_usd` (US$10 by default); above it, or with no
+price, `status.rebuild.state` says why it waits and nothing is embedded. While
+the space is building, everything it embeds counts toward the rebuild, history
+published meanwhile included, and all embedding stops (`stopped: …`) when the
+spend the provider reports reaches the cap. Once every worker has embedded its
+backlog the space is recorded as built: from then on new history is embedded
+as it comes, a restart with another `--index-threads` is not a rebuild, and
+other spaces' files are deleted at the next sweep. Changing the reranker, or
+only `query_prefix`, rebuilds nothing.
+
+`anyagents memory-service estimate` makes the same estimate for the configured
+embedder over the host index as it stands, without calling a model, reading a
+profile's key or writing anything, prints it with the state `serve` would
+start in, and exits non-zero when `serve` would wait.
 
 Models and runtime are pinned in `crates/anyagents-memory/src/pins.rs` by
 Hugging Face commit and per-file SHA-256, and ONNX Runtime 1.31.0 by the
@@ -291,6 +329,83 @@ downloads and verifies them into `<data>/memory-service/models`; `serve`
 refuses to start unless every file matches its pin. ONNX Runtime is loaded at
 run time (`ort` with `load-dynamic`); the server binary links no model
 runtime.
+
+### Desk configuration (2026-11-14)
+
+The desk runs `qwen/qwen3-embedding-8b` and `mongodb/rerank-3` through the
+`openrouter/default` profile, chosen on its own history
+([comparison](#openrouter-models-compared-2026-11-14)).
+`<data>/memory-service/config.json`:
+
+```json
+{
+  "embedder": {
+    "provider": "openai",
+    "profile": "openrouter/default",
+    "model": "qwen/qwen3-embedding-8b",
+    "dimensions": 1024,
+    "usd_per_million_tokens": 0.01,
+    "query_prefix": "Instruct: Given a search query, retrieve relevant passages from earlier conversation history\nQuery: "
+  },
+  "reranker": {
+    "provider": "rerank",
+    "profile": "openrouter/default",
+    "model": "mongodb/rerank-3",
+    "usd_per_million_tokens": 0.05,
+    "passage_chars": 1000
+  },
+  "max_rebuild_usd": 10
+}
+```
+
+- The API key is the profile's (`refs.OPENROUTER_API_KEY` in its
+  `.dsh/.credentials.yaml`); the file holds no secret.
+  `provider.data_collection = "deny"` is sent on every request without being
+  configured.
+- `dimensions`: 1024 of the model's 4096 (Matryoshka), as measured.
+- `usd_per_million_tokens`: OpenRouter's list price for the embedder, used for
+  the estimate. The measured build was billed US$0.0111 per million tokens on
+  average, because some requests route to a dearer upstream; the cap is held
+  against the spend OpenRouter reports, not the estimate. The reranker's cost
+  is reported per request (US$0.05 per million tokens in the measurement); its
+  price here only covers an answer that reports none.
+- `query_prefix`: Qwen3-Embedding's instruction for queries; passages carry
+  none. It shapes queries only and is not part of the vector space.
+- `passage_chars`: as measured; it also bounds one search's rerank to about
+  20,000 characters.
+
+The first start with this file builds the qwen3 space over everything the host
+index holds. After the host index covers every agent's native history, that is
+an estimated 275 to 570 million tokens: about US$3 to 6 at list price, inside
+the US$10 cap. Measured throughput was about 5,300 tokens a second per
+worker, so four workers (`--index-threads 4`) take roughly 4 to 8 hours; the
+dense index takes about 1.8 KB per 1024-dimension piece, roughly 2 to 4 GB.
+Each search then costs one query embedding and one rerank of at most 20
+passages, at most about US$0.001.
+
+To build it:
+
+1. Deploy the server, and wait for its log to say
+   `anyagents-host-history: pre-warm done: N agents' history indexed`. The
+   rebuild's cap covers what it embeds while the space builds, history the
+   pre-warm publishes meanwhile included; history published after the space
+   is built is embedded as new history, outside the cap.
+2. Write the configuration above.
+3. `anyagents --data <data> memory-service estimate`: the documents, tokens
+   and US$ the rebuild will read and spend, and `"state": "running"`; it
+   exits non-zero if `serve` would wait.
+4. `anyagents --data <data> memory-service serve --index-threads 4`, as the
+   same user and groups as `anyagents serve`, so it can read every source the
+   server indexed.
+5. `anyagents --data <data> memory-service status` shows `rebuild.state`
+   (`running`, then `done`), `rebuild.spent_usd` and the pending documents.
+   A `conversation` search then reports `retrieval.stages`
+   `["lexical", "dense", "rerank"]`.
+
+Stopping the service returns search to BM25 and says so in
+`retrieval.degraded`; the dense index stays for a later start. Without the
+file the service runs the pinned local pair, which is another space and builds
+its own index on local CPU at no cost.
 
 ## Retrieval quality on real history
 
@@ -387,7 +502,9 @@ the providers' model listings and their documentation:
 The OpenRouter account had US$0.01 of credit left (US$3,026.12 bought, all
 used), so its candidates could not be run: the first request past a pilot was
 refused with `402 in_flight_budget_exhausted`. The comparison below therefore
-covers the Gemini API profile's two embedders and the local pair.
+covers the Gemini API profile's two embedders and the local pair; the
+OpenRouter candidates were run the next day
+([below](#openrouter-models-compared-2026-11-14)).
 
 A second sample of the same two lead agents (2026-11-08 14:33 to 2026-11-13
 22:08 UTC: 7,538 messages, 188 queries) was built read-only into a private
@@ -421,6 +538,38 @@ list price (US$0.20 per million tokens for `gemini-embedding-2`, US$0.15 for
 `gemini-embedding-001`, about 3.1 million tokens per build; the endpoint
 reports no usage, so this is the estimate the run recorded), and US$0.006 on
 OpenRouter, from its key usage before and after.
+
+### OpenRouter models compared (2026-11-14)
+
+With credit on the OpenRouter account, the same 188-query sample was run
+through six remote embedders and two remote rerankers, all requests with
+`provider.data_collection = "deny"` and remote passages cut to 1,000
+characters. Each hybrid list is BM25 fused with that embedder's dense list.
+
+| Ranking | R@1 | R@10 | MRR@10 | nDCG@10 |
+| --- | --- | --- | --- | --- |
+| BM25 | 0.074 | 0.245 | 0.121 | 0.151 |
+| BM25 + `rerank-3` (no embeddings) | 0.181 | 0.298 | 0.215 | 0.234 |
+| Hybrid + rerank, local pair (today's default) | 0.133 | 0.362 | 0.192 | 0.232 |
+| Hybrid local + `rerank-3` | 0.202 | 0.399 | 0.260 | 0.293 |
+| Dense, `qwen3-embedding-8b` | 0.128 | 0.383 | 0.199 | 0.243 |
+| Dense, `voyage-4-large` | 0.122 | 0.388 | 0.203 | 0.247 |
+| Dense, `embed-5-fast` | 0.160 | 0.404 | 0.223 | 0.265 |
+| Hybrid `voyage-4-large` + `rerank-3` | 0.213 | 0.447 | 0.278 | 0.318 |
+| Hybrid `embed-5-fast` + `rerank-3` | 0.223 | 0.431 | 0.284 | 0.318 |
+| Hybrid `qwen3-embedding-8b` + `rerank-5-pro` | **0.245** | 0.426 | 0.291 | 0.323 |
+| Hybrid `gemini-embedding-001` + `rerank-3` | 0.234 | 0.452 | **0.296** | 0.333 |
+| Hybrid `qwen3-embedding-8b` + `rerank-3` | 0.229 | **0.463** | **0.296** | **0.335** |
+
+`qwen3-embedding-8b` with `rerank-3` ties for the best MRR@10 and has the best
+recall@10 and nDCG@10, against 0.192 MRR@10 for the local pair. It ties with
+`gemini-embedding-001`, which costs fifteen times as much per token (US$0.15
+against US$0.01 per million), so the desk runs qwen3. `rerank-3` beat
+`rerank-5-pro` on MRR@10 with every embedder, local included, and answered
+faster (0.44 s against 0.62 s per query, mean). Reranking BM25 alone with
+`rerank-3` already passes the local pair's MRR@10, but it can only reorder the
+lexical head: embeddings lift recall@10 from 0.298 to 0.463. The comparison
+run reported US$0.49 of spend, most of it rerank.
 
 ## Incremental indexing and migration
 
