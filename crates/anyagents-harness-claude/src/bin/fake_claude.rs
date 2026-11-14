@@ -1,6 +1,7 @@
 //! Speaks just enough stream-json for the adapter tests.
 //!
-//! `ANYAGENTS_FAKE_MODE` selects the script: `hold`, `finish`, `batch`,
+//! `ANYAGENTS_FAKE_MODE` selects the script: `hold`, `finish`, `turns`
+//! (`finish` without the quota event: every line is a turn), `batch`,
 //! `batch_late`, `quota`, `failed_turn`, `synthetic_401`, `steer`, `die`,
 //! `prove_exit` (proves its first line, then exits) or `unpersisted` (proves
 //! its first line, then exits before its transcript row is written).
@@ -25,7 +26,16 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-const RESULT: &str = r#"{"type":"result","subtype":"success","session_id":"sess-from-vendor","total_cost_usd":0.5,"usage":{"input_tokens":11,"output_tokens":7,"cache_read_input_tokens":3,"cache_creation_input_tokens":2}}"#;
+/// A successful turn's result. `total_cost_usd` is this process's running
+/// total, as Claude Code reports it: each turn here costs 0.5.
+fn result(results: &mut u32) -> String {
+    *results += 1;
+    json!({"type": "result", "subtype": "success", "session_id": "sess-from-vendor",
+           "total_cost_usd": 0.5 * f64::from(*results),
+           "usage": {"input_tokens": 11, "output_tokens": 7,
+                     "cache_read_input_tokens": 3, "cache_creation_input_tokens": 2}})
+    .to_string()
+}
 const QUOTA: &str = r#"{"type":"system","subtype":"api_retry","category":"rate_limit","resets_at_ms":1700000000000}"#;
 const FAILED: &str = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"sess-from-vendor","result":"Invalid API key · Please run /login","usage":{"input_tokens":0,"output_tokens":0}}"#;
 const SYNTHETIC_401_ASSISTANT: &str = r#"{"type":"assistant","session_id":"sess-from-vendor","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Failed to authenticate. API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth access token has expired.\"}}"}]}}"#;
@@ -77,6 +87,7 @@ fn main() {
     }
 
     let mut users = 0usize;
+    let mut results = 0u32;
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         log(&log_path, &line);
@@ -96,7 +107,7 @@ fn main() {
         }
         let late = mode == "batch_late" && users == 2;
         if late {
-            let _ = writeln!(stdout, "{RESULT}");
+            let _ = writeln!(stdout, "{}", result(&mut results));
         }
         prove(&mut stdout, &value);
         if mode == "unpersisted" {
@@ -116,8 +127,8 @@ fn main() {
                 let _ = writeln!(file, "{row}");
             }
         }
-        if mode == "finish" || (mode == "batch" && users == 2) {
-            let _ = writeln!(stdout, "{RESULT}");
+        if mode == "finish" || mode == "turns" || (mode == "batch" && users == 2) {
+            let _ = writeln!(stdout, "{}", result(&mut results));
         }
         if mode == "failed_turn" && users == 1 {
             let _ = writeln!(stdout, "{FAILED}");

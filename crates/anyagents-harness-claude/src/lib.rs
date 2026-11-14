@@ -7,8 +7,9 @@
 //! Declared delivery mode is steer. A stream-json child reads a `user` message
 //! at any point, mid-turn included, so every mailbox line is written the moment
 //! it arrives and the running conversation takes it. `turn_finished` becomes
-//! true when a `result` event closes the open turn. Token counts and
-//! `total_cost_usd` from that event are kept on the finished ids.
+//! true when a `result` event closes the open turn. Token counts from that
+//! event, and the cost the turn added to the process's running
+//! `total_cost_usd`, are kept on the finished ids.
 //!
 //! Mid-turn delivery: every line carries a `uuid` derived from its mailbox id.
 //! Claude Code queues a line that arrives during a turn and folds every queued
@@ -117,6 +118,9 @@ struct State {
     sign_in_fault: Option<String>,
     session_id: Option<String>,
     usages: Vec<(String, TurnUsage)>,
+    /// The process's running `total_cost_usd` at the last turn that counted
+    /// it: each turn costs what it added.
+    cost_seen: Option<i64>,
     failures: Vec<(String, String)>,
     turns: std::collections::BTreeMap<String, u64>,
     request_seq: u64,
@@ -451,6 +455,8 @@ impl ClaudeHarness {
             state.alive = true;
             state.exited_at = None;
             state.sign_in_fault = None;
+            // A new process's running cost starts again from nothing.
+            state.cost_seen = None;
             state.open.clear();
             state.followups.clear();
             // What the last process wrote and the session holds is the
@@ -1031,7 +1037,15 @@ fn apply_result(state: &mut State, value: &Value) {
         promote_followups(state);
         return;
     }
-    finish_open(state, usage_from_claude(value));
+    let mut usage = usage_from_claude(value);
+    // `total_cost_usd` is the running total of this process, not the turn's:
+    // the turn cost what it added since the last turn counted. An errored
+    // turn's cost is left in the total, and counted with the next turn.
+    if let Some(total) = usage.reported_cost_micros {
+        usage.reported_cost_micros = Some((total - state.cost_seen.unwrap_or(0)).max(0));
+        state.cost_seen = Some(total);
+    }
+    finish_open(state, usage);
 }
 
 /// The vendor's error text from a `result` event, or `None` when it succeeded.
@@ -1739,6 +1753,33 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `total_cost_usd` is the process's running total: each turn is
+    /// charged what it added, so the served total is the last running total,
+    /// never the sum of every running total seen.
+    #[test]
+    fn a_turn_costs_what_it_added_to_the_running_total() {
+        let mut state = State::default();
+        let result = |total: f64| {
+            serde_json::json!({
+                "type": "result", "subtype": "success", "session_id": "s",
+                "total_cost_usd": total,
+                "usage": {"input_tokens": 10, "output_tokens": 4},
+            })
+        };
+        state.open.push("m1".into());
+        apply_result(&mut state, &result(0.10));
+        state.open.push("m2".into());
+        apply_result(&mut state, &result(0.25));
+        let costs: Vec<Option<i64>> = state
+            .usages
+            .iter()
+            .map(|(_, usage)| usage.reported_cost_micros)
+            .collect();
+        assert_eq!(costs, [Some(100_000), Some(150_000)]);
+        let served: i64 = costs.into_iter().flatten().sum();
+        assert_eq!(served, 250_000);
+    }
 
     #[test]
     fn a_line_uuid_is_stable_per_message_and_well_formed() {

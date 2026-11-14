@@ -406,6 +406,28 @@ fn a_line_steered_mid_turn_is_proved_and_never_written_twice() {
     drop(harness);
 }
 
+/// Claude Code's `total_cost_usd` is the running total of one process: each
+/// turn costs what it added, and a relaunched process counts from nothing.
+#[test]
+fn each_turn_costs_what_it_added_across_a_relaunch() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "turns", Some("sess-1"));
+    let cost = |harness: &mut ClaudeHarness, id: &str| {
+        let outcome = taken(harness, id);
+        assert!(
+            matches!(outcome, DeliverOutcome::Accepted { .. }),
+            "{id}: {outcome:?}"
+        );
+        assert!(harness.wait_finished(id, Duration::from_secs(5)));
+        harness.usage_for(id).expect("usage").reported_cost_micros
+    };
+    assert_eq!(cost(&mut harness, "m1"), Some(500_000));
+    assert_eq!(cost(&mut harness, "m2"), Some(500_000));
+    harness.resume("sess-2").unwrap();
+    assert_eq!(cost(&mut harness, "m3"), Some(500_000));
+    assert_eq!(harness.served_usage().reported_cost_micros, Some(1_500_000));
+}
+
 #[test]
 fn a_proof_stays_valid_across_a_relaunch() {
     let dir = TempDir::new().unwrap();
