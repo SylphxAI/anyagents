@@ -1,27 +1,35 @@
 //! Reclaiming an archived agent's work directory without losing work.
 //!
-//! When an agent is archived its managed work directory is reclaimed, one
-//! checkout at a time:
+//! Every checkout is the agent's own repository ([`crate::repo`], ADR 0010
+//! D5); a linked worktree from before that is converted with
+//! [`crate::repo::adopt`] first. Then, one checkout at a time:
 //!
-//! - a Git checkout with nothing unpushed and nothing uncommitted is deleted;
-//! - a checkout with unpushed commits or uncommitted files is first saved to the
-//!   rescue area, as a `git bundle` and a tar of the uncommitted files, and
-//!   then deleted;
+//! - one [`crate::server::is_git_worktree_safe_to_reap`] passes (status clean,
+//!   HEAD and every local branch on a remote-tracking ref) is deleted;
+//! - any other is first saved to the rescue area, as a `git bundle` and a tar
+//!   of its uncommitted files, and then deleted;
 //! - files outside any checkout are saved as one tar, without build output,
 //!   tool homes or caches;
-//! - a checkout whose state cannot be read is kept where it is, its build output
-//!   removed, and the operator is told.
+//! - a checkout that cannot be converted or read, or whose rescue fails, is
+//!   kept where it is, its build output removed, and the operator is told.
 //!
-//! Git and tar run as the owner of the checkout (the agent's seat) whenever that
-//! is not the server, so configuration an agent wrote into its own repository
-//! never runs with the server's rights.
+//! A clone with an object store of its own is bundled with `--all`, so it
+//! restores on its own. A repository that borrows objects from the read-only
+//! pool (`objects/info/alternates`) is bundled down to what the remotes
+//! already have: its own unpushed commits, which [`crate::repo::adopt`] copied
+//! into it. Bundling all of its refs would copy the pool's whole history once
+//! per checkout.
+//!
+//! Git reads run through [`crate::repo::inspect_command`] as the agent's seat,
+//! and tar runs as the seat too, so configuration an agent wrote into its own
+//! repository never runs with the server's rights.
 //!
 //! A rescue lands in `{rescue}/{agent id}/{time}/` with a `manifest.json`
 //! that says what each file is and how to restore it. Nothing is deleted
 //! before the rescue is complete on disk.
 
 use std::io::Write as _;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -57,70 +65,28 @@ fn disposable(name: &std::ffi::OsStr) -> bool {
 /// The rescue area keeps at least this much free space.
 const MIN_FREE_BYTES: u64 = 2 << 30;
 
-/// Uncommitted paths that never make a checkout worth rescuing: what
-/// AnyAgents and the harnesses write into a checkout, and build output.
-fn incidental(path: &str) -> bool {
-    let path = path.trim_end_matches('/');
-    matches!(
-        path,
-        "CLAUDE.md" | "AGENTS.md" | "GEMINI.md" | ".claude" | ".gemini"
-    ) || path.starts_with(".desk-worktree")
-        || path.starts_with(".claude/")
-        || path.starts_with(".gemini/")
-        || BUILD_OUTPUT
-            .iter()
-            .any(|dir| path == *dir || path.starts_with(&format!("{dir}/")))
-}
-
-/// Who runs Git and tar on a checkout.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Runner {
-    /// `(uid, gid, groups)` through the privileged launcher, or `None` to run
-    /// as the server itself.
-    user: Option<(u32, u32, String)>,
+/// Runs tar, and plain Git outside any repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Runner {
+    /// `(uid, gid)` through the privileged launcher, or `None` to run as the
+    /// server itself.
+    seat: Option<(u32, u32)>,
 }
 
 impl Runner {
-    /// The server itself.
-    pub(crate) fn server() -> Self {
-        Self { user: None }
-    }
-
-    /// Whoever owns `path`: the server when it owns it, else that uid through
-    /// the launcher. A root-owned path, or a foreign one without a launcher,
-    /// is refused.
-    pub(crate) fn owner_of(path: &Path, seat_ids: Option<(u32, u32, u32)>) -> Result<Self, String> {
-        let meta = std::fs::symlink_metadata(path)
-            .map_err(|error| format!("cannot read its owner: {error}"))?;
-        let uid = meta.uid();
-        if uid == crate::sandbox::server_uid() {
-            return Ok(Self::server());
+    /// As `seat`, unless that is this process already.
+    fn as_seat(seat: Option<(u32, u32)>) -> Self {
+        // SAFETY: geteuid and getegid take no arguments and cannot fail.
+        let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        Self {
+            seat: seat.filter(|&(uid, gid)| euid != uid || egid != gid),
         }
-        if uid == 0 {
-            return Err("it is owned by root".into());
-        }
-        let launcher = crate::sandbox::launcher();
-        if !launcher.is_file() {
-            return Err(format!(
-                "it is owned by uid {uid} and {} is not installed to act as it",
-                launcher.display()
-            ));
-        }
-        let seat = seat_ids.filter(|(seat_uid, _, _)| *seat_uid == uid);
-        let gid = seat.map_or(meta.gid(), |(_, gid, _)| gid);
-        let groups = match seat {
-            Some((_, gid, socket)) if socket != gid && socket != 0 => format!("{gid},{socket}"),
-            _ => gid.to_string(),
-        };
-        Ok(Self {
-            user: Some((uid, gid, groups)),
-        })
     }
 
     fn command(&self, program: &Path) -> Command {
-        let mut cmd = match &self.user {
+        let mut cmd = match self.seat {
             None => Command::new(program),
-            Some((uid, gid, groups)) => {
+            Some((uid, gid)) => {
                 let mut cmd = Command::new(crate::sandbox::launcher());
                 cmd.args([
                     "--reuid",
@@ -128,7 +94,7 @@ impl Runner {
                     "--regid",
                     &gid.to_string(),
                     "--groups",
-                    groups,
+                    &gid.to_string(),
                     "--no-new-privs",
                     "--",
                 ]);
@@ -146,32 +112,9 @@ impl Runner {
             .env("XDG_CONFIG_HOME", "/nonexistent")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_ATTR_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
             .env("LC_ALL", "C")
             .stdin(Stdio::null());
         cmd
-    }
-
-    /// Git in `repo`, with the repository's hooks, fsmonitor and the user's
-    /// configuration turned off and no optional lock taken.
-    pub(crate) fn git(&self, repo: &Path) -> Result<Command, String> {
-        let git = anyagents_toolchain::tool("git", "archive rescue").map_err(|e| e.to_string())?;
-        let mut cmd = self.command(git.path());
-        cmd.args([
-            "--no-optional-locks",
-            "-c",
-            "safe.directory=*",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.attributesFile=/dev/null",
-            "-C",
-        ])
-        .arg(repo);
-        Ok(cmd)
     }
 
     fn tar(&self, dir: &Path) -> Result<Command, String> {
@@ -180,6 +123,12 @@ impl Runner {
         cmd.arg("-C").arg(dir);
         Ok(cmd)
     }
+}
+
+/// Git reading `checkout`, its own `.git` named explicitly.
+fn git_in(checkout: &Path, seat: Option<(u32, u32)>) -> Result<Command, String> {
+    crate::repo::inspect_command(seat, &checkout.join(".git"), Some(checkout))
+        .map_err(|error| error.to_string())
 }
 
 fn first_line(bytes: &[u8]) -> String {
@@ -194,6 +143,7 @@ fn first_line(bytes: &[u8]) -> String {
 
 fn output(mut cmd: Command, args: &[&str]) -> Result<std::process::Output, String> {
     cmd.args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -220,6 +170,7 @@ pub(crate) struct Change {
 }
 
 impl Change {
+    #[cfg(test)]
     fn path_text(&self) -> String {
         String::from_utf8_lossy(&self.path).into_owned()
     }
@@ -255,58 +206,32 @@ fn parse_status(raw: &[u8]) -> Vec<Change> {
 pub(crate) struct RepoState {
     /// The checked-out commit (`None` for a repository with no commits).
     pub(crate) head: Option<String>,
-    /// A linked worktree of a shared repository, not a clone of its own.
-    pub(crate) linked: bool,
     /// The checked-out branch, `refs/heads/...`, if any.
     pub(crate) branch: Option<String>,
     /// `remote.origin.url`, to restore a checkout from.
     pub(crate) origin: Option<String>,
-    /// Commits no remote-tracking ref has: on HEAD or any local branch of a
-    /// clone of its own; on HEAD alone of a linked worktree, whose branches
-    /// live on in the shared repository when the checkout is deleted.
+    /// It borrows objects from a pool (`objects/info/alternates`).
+    pub(crate) borrows: bool,
+    /// Commits of HEAD and the local branches that no remote-tracking ref has,
+    /// counted as [`crate::server::is_git_worktree_safe_to_reap`] does.
     pub(crate) unpushed: u64,
     pub(crate) changes: Vec<Change>,
     status: Vec<u8>,
 }
 
-impl RepoState {
-    /// Uncommitted changes that are worth keeping.
-    pub(crate) fn dirty(&self) -> impl Iterator<Item = &Change> {
-        self.changes.iter().filter(|c| !incidental(&c.path_text()))
+/// Read an own repository's state.
+pub(crate) fn inspect(checkout: &Path, seat: Option<(u32, u32)>) -> Result<RepoState, String> {
+    if !std::fs::symlink_metadata(checkout.join(".git")).is_ok_and(|meta| meta.is_dir()) {
+        return Err("it is not a repository of its own".into());
     }
-
-    /// Deleting this checkout would lose something.
-    pub(crate) fn owes_rescue(&self) -> bool {
-        self.unpushed > 0 || self.dirty().next().is_some()
-    }
-}
-
-/// Read a checkout's state through `git`, which returns a Git command already
-/// pointed at the checkout.
-pub(crate) fn inspect(git: &dyn Fn() -> Result<Command, String>) -> Result<RepoState, String> {
-    let dirs = stdout(
-        git()?,
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-            "--git-common-dir",
-        ],
-    )?;
-    let dirs = String::from_utf8_lossy(&dirs);
-    let mut lines = dirs.lines();
-    let (git_dir, common_dir) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
-    if git_dir.is_empty() || common_dir.is_empty() {
-        return Err("git rev-parse named no repository".into());
-    }
-    let linked = Path::new(git_dir) != Path::new(common_dir);
+    let git = || git_in(checkout, seat);
     let status = stdout(
         git()?,
         &[
             "status",
             "--porcelain=v1",
             "-z",
-            "--untracked-files=all",
+            "--untracked-files=normal",
             "--ignore-submodules=none",
         ],
     )?;
@@ -317,12 +242,17 @@ pub(crate) fn inspect(git: &dyn Fn() -> Result<Command, String>) -> Result<RepoS
         .then(|| String::from_utf8_lossy(&head.stdout).trim().to_string())
         .filter(|sha| !sha.is_empty());
     let unpushed = if head.is_some() {
-        let mut args = vec!["rev-list", "--count", "HEAD"];
-        if !linked {
-            args.push("--branches");
-        }
-        args.extend(["--not", "--remotes"]);
-        let count = stdout(git()?, &args)?;
+        let count = stdout(
+            git()?,
+            &[
+                "rev-list",
+                "--count",
+                "HEAD",
+                "--branches",
+                "--not",
+                "--remotes",
+            ],
+        )?;
         String::from_utf8_lossy(&count)
             .trim()
             .parse::<u64>()
@@ -342,9 +272,12 @@ pub(crate) fn inspect(git: &dyn Fn() -> Result<Command, String>) -> Result<RepoS
     let origin = text(&["config", "--get", "remote.origin.url"])?;
     Ok(RepoState {
         head,
-        linked,
         branch,
         origin,
+        borrows: checkout
+            .join(".git/objects/info/alternates")
+            .symlink_metadata()
+            .is_ok(),
         unpushed,
         changes: parse_status(&status),
         status,
@@ -359,8 +292,8 @@ pub(crate) struct SavedRepo {
     pub(crate) head: Option<String>,
     pub(crate) branch: Option<String>,
     pub(crate) origin: Option<String>,
-    /// A linked worktree: its bundle holds only commits no remote has.
-    pub(crate) linked: bool,
+    /// It borrowed from a pool: its bundle holds only commits no remote has.
+    pub(crate) borrowed_objects: bool,
     pub(crate) unpushed_commits: u64,
     pub(crate) uncommitted_paths: usize,
     pub(crate) bundle: Option<String>,
@@ -368,6 +301,12 @@ pub(crate) struct SavedRepo {
     pub(crate) uncommitted_tar: Option<String>,
     pub(crate) status: String,
     pub(crate) bytes: u64,
+}
+
+type OsStrLike = std::ffi::OsStr;
+
+fn os(text: &str) -> &OsStrLike {
+    OsStrLike::new(text)
 }
 
 fn write_to(
@@ -384,9 +323,11 @@ fn write_to(
     cmd.args(args)
         .stdout(Stdio::from(file.try_clone().map_err(|e| e.to_string())?))
         .stderr(Stdio::piped());
-    if input.is_some() {
-        cmd.stdin(Stdio::piped());
-    }
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     let mut child = cmd.spawn().map_err(|error| error.to_string())?;
     if let Some(input) = input {
         let mut stdin = child.stdin.take().ok_or("no stdin")?;
@@ -402,17 +343,10 @@ fn write_to(
     Ok(file.metadata().map_err(|e| e.to_string())?.len())
 }
 
-type OsStrLike = std::ffi::OsStr;
-
-fn os(text: &str) -> &OsStrLike {
-    OsStrLike::new(text)
-}
-
 /// Save one checkout into `out` under the file name prefix `slug`.
-pub(crate) fn save_repo(
-    git: &dyn Fn() -> Result<Command, String>,
-    tar: &Runner,
+fn save_repo(
     checkout: &Path,
+    seat: Option<(u32, u32)>,
     state: &RepoState,
     rel: &str,
     out: &Path,
@@ -423,9 +357,9 @@ pub(crate) fn save_repo(
         head: state.head.clone(),
         branch: state.branch.clone(),
         origin: state.origin.clone(),
-        linked: state.linked,
+        borrowed_objects: state.borrows,
         unpushed_commits: state.unpushed,
-        uncommitted_paths: state.dirty().count(),
+        uncommitted_paths: state.changes.len(),
         bundle: None,
         bundle_refs: Vec::new(),
         uncommitted_tar: None,
@@ -438,28 +372,17 @@ pub(crate) fn save_repo(
         .map(|byte| if *byte == 0 { b'\n' } else { *byte })
         .collect();
     std::fs::write(out.join(&saved.status), &status_text).map_err(|error| error.to_string())?;
-    // A clone of its own carries every ref, so it restores on its own. A
-    // linked worktree shares its history and branches with every other
-    // worktree of its repository, which this does not delete: bundling all of
-    // it would copy the whole shared repository once per checkout. It
-    // carries HEAD (and its branch) down to what the remotes already have,
-    // and nothing when HEAD is pushed.
-    let refs: Option<Vec<String>> = match (&state.head, state.linked) {
+    let refs: Option<&[&str]> = match (&state.head, state.borrows) {
         (None, _) => None,
-        (Some(_), false) => Some(vec!["--all".to_string()]),
+        (Some(_), false) => Some(&["--all"]),
         (Some(_), true) if state.unpushed == 0 => None,
-        (Some(_), true) => Some(
-            std::iter::once("HEAD".to_string())
-                .chain(state.branch.clone())
-                .chain(["--not".to_string(), "--remotes".to_string()])
-                .collect(),
-        ),
+        (Some(_), true) => Some(&["HEAD", "--branches", "--not", "--remotes"]),
     };
     if let Some(refs) = refs {
         let file = out.join(format!("{slug}.bundle"));
         let mut args: Vec<&OsStrLike> = vec![os("bundle"), os("create"), os("-")];
         args.extend(refs.iter().map(|r| os(r)));
-        saved.bytes += write_to(&file, git()?, &args, None)
+        saved.bytes += write_to(&file, git_in(checkout, seat)?, &args, None)
             .map_err(|error| format!("git bundle failed: {error}"))?;
         // The bundle must name its refs when read back on its own.
         let listed = bundle_heads(&file)?;
@@ -476,9 +399,19 @@ pub(crate) fn save_repo(
     }
     if !names.is_empty() {
         let file = out.join(format!("{slug}.uncommitted.tar"));
-        let args = [os("--null"), os("-T"), os("-"), os("-cf"), os("-")];
-        saved.bytes += write_to(&file, tar.tar(checkout)?, &args, Some(&names))
-            .map_err(|error| format!("tar of uncommitted files failed: {error}"))?;
+        let mut args: Vec<String> = BUILD_OUTPUT
+            .iter()
+            .map(|dir| format!("--exclude={dir}"))
+            .collect();
+        args.extend(["--null", "-T", "-", "-cf", "-"].map(String::from));
+        let args: Vec<&OsStrLike> = args.iter().map(|a| os(a)).collect();
+        saved.bytes += write_to(
+            &file,
+            Runner::as_seat(seat).tar(checkout)?,
+            &args,
+            Some(&names),
+        )
+        .map_err(|error| format!("tar of uncommitted files failed: {error}"))?;
         saved.uncommitted_tar = Some(format!("{slug}.uncommitted.tar"));
     }
     Ok(saved)
@@ -487,7 +420,7 @@ pub(crate) fn save_repo(
 /// The refs a bundle file lists, read with no repository and no user config.
 fn bundle_heads(file: &Path) -> Result<Vec<String>, String> {
     let git = anyagents_toolchain::tool("git", "archive rescue").map_err(|e| e.to_string())?;
-    let mut cmd = Runner::server().command(git.path());
+    let mut cmd = Runner::as_seat(None).command(git.path());
     cmd.arg("bundle").arg("list-heads").arg(file);
     let out = cmd
         .stdout(Stdio::piped())
@@ -532,13 +465,6 @@ fn slug(rel: &str, taken: &mut std::collections::BTreeSet<String>) -> String {
     name
 }
 
-/// One checkout inside the work directory and how to reach its Git.
-pub(crate) struct Checkout {
-    pub(crate) path: PathBuf,
-    /// The journal AnyAgents recorded when it created this checkout.
-    pub(crate) recorded: Option<crate::worktree_access::RecordedWorktree>,
-}
-
 /// What reclaiming one work directory did.
 #[derive(Debug, Default)]
 pub(crate) struct Outcome {
@@ -553,7 +479,7 @@ pub(crate) struct Outcome {
 }
 
 /// The checkouts directly in `work` (or `work` itself), and its other
-/// top-level entries that are not build output.
+/// top-level entries that are not build output, tool homes or caches.
 fn survey(work: &Path) -> std::io::Result<(Vec<PathBuf>, Vec<std::ffi::OsString>)> {
     if work.join(".git").symlink_metadata().is_ok() {
         return Ok((vec![work.to_path_buf()], Vec::new()));
@@ -584,28 +510,13 @@ fn rescue_has_room(dir: &Path) -> Result<(), String> {
         .ancestors()
         .find(|p| p.exists())
         .unwrap_or(Path::new("/"));
-    let c_path =
-        std::ffi::CString::new(probe.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
-    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: c_path is NUL-terminated and stat is written by the call.
-    if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
-        return Err(format!(
-            "cannot read free space at {}: {}",
-            probe.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: statvfs returned 0, so it filled the struct.
-    let stat = unsafe { stat.assume_init() };
-    #[allow(clippy::unnecessary_cast)]
-    let free = stat.f_bavail as u64 * stat.f_frsize as u64;
-    #[allow(clippy::unnecessary_cast)]
-    let size = stat.f_blocks as u64 * stat.f_frsize as u64;
-    if free < MIN_FREE_BYTES.max(size / 20) {
+    let fs = crate::server::scratch_budget::filesystem(probe)
+        .ok_or_else(|| format!("cannot read free space at {}", probe.display()))?;
+    if fs.available_bytes < MIN_FREE_BYTES.max(fs.size_bytes / 20) {
         return Err(format!(
             "the rescue area {} has only {} MiB free",
             probe.display(),
-            free >> 20
+            fs.available_bytes >> 20
         ));
     }
     Ok(())
@@ -617,43 +528,43 @@ pub(crate) struct Reclaim<'a> {
     pub(crate) agent_id: &'a AgentId,
     pub(crate) agent_name: Option<&'a str>,
     pub(crate) generation: &'a [u8],
+    /// `(uid, gid, socket gid)` of the agent's seat, for removals.
     pub(crate) seat_ids: Option<(u32, u32, u32)>,
 }
 
 enum Plan {
-    Delete(Checkout),
-    Save(Checkout, RepoState, Runner),
+    Delete(PathBuf),
+    Save(PathBuf, RepoState),
 }
 
 impl Reclaim<'_> {
-    fn state_of(&self, checkout: &Checkout) -> Result<(RepoState, Runner), String> {
-        let tar = Runner::owner_of(&checkout.path, self.seat_ids)?;
-        match &checkout.recorded {
-            Some(record) => {
-                if !record.checkout_pointer_matches() {
-                    return Err("its .git pointer is missing or changed".into());
-                }
-                let state = record
-                    .inspect(|| {
-                        inspect(&|| record.command().map_err(|e| e.to_string()))
-                            .map_err(std::io::Error::other)
-                    })
-                    .map_err(|error| error.to_string())?;
-                Ok((state, tar))
-            }
-            None => {
-                let state = inspect(&|| tar.git(&checkout.path))?;
-                Ok((state, tar))
-            }
+    fn seat(&self) -> Option<(u32, u32)> {
+        self.seat_ids.map(|(uid, gid, _)| (uid, gid))
+    }
+
+    /// What to do with one checkout: convert a linked worktree, then delete
+    /// it when it is safe to, else save it. `Err` keeps it.
+    fn plan(&self, checkout: PathBuf) -> Result<Plan, (PathBuf, String)> {
+        let seat = self.seat();
+        if std::fs::symlink_metadata(checkout.join(".git")).is_ok_and(|meta| meta.is_file())
+            && let crate::repo::Adoption::Declined(reason) = crate::repo::adopt(&checkout, seat)
+        {
+            return Err((
+                checkout,
+                format!("not converted to its own repository: {reason}"),
+            ));
+        }
+        if crate::server::is_git_worktree_safe_to_reap(&checkout, seat) {
+            return Ok(Plan::Delete(checkout));
+        }
+        match inspect(&checkout, seat) {
+            Ok(state) => Ok(Plan::Save(checkout, state)),
+            Err(reason) => Err((checkout, reason)),
         }
     }
 
-    /// Reclaim `work`, finding each checkout's journal with `recorded`.
-    pub(crate) fn work_dir(
-        &self,
-        work: &Path,
-        recorded: &dyn Fn(&Path) -> Option<crate::worktree_access::RecordedWorktree>,
-    ) -> Outcome {
+    /// Reclaim `work`: one checkout, or a directory of checkouts and files.
+    pub(crate) fn work_dir(&self, work: &Path) -> Outcome {
         let mut outcome = Outcome {
             complete: true,
             ..Outcome::default()
@@ -669,20 +580,13 @@ impl Reclaim<'_> {
             }
         };
         let mut plans = Vec::new();
-        for path in repos {
-            let checkout = Checkout {
-                recorded: recorded(&path),
-                path,
-            };
-            match self.state_of(&checkout) {
-                Ok((state, _)) if !state.owes_rescue() => plans.push(Plan::Delete(checkout)),
-                Ok((state, runner)) => plans.push(Plan::Save(checkout, state, runner)),
-                Err(reason) => {
-                    outcome.complete &= crate::server::reap_build_outputs_in_worktree(
-                        &checkout.path,
-                        self.seat_ids,
-                    );
-                    outcome.kept.push((checkout.path, reason));
+        for checkout in repos {
+            match self.plan(checkout) {
+                Ok(plan) => plans.push(plan),
+                Err((checkout, reason)) => {
+                    outcome.complete &=
+                        crate::server::reap_build_outputs_in_worktree(&checkout, self.seat_ids);
+                    outcome.kept.push((checkout, reason));
                 }
             }
         }
@@ -698,14 +602,14 @@ impl Reclaim<'_> {
                     // Keep everything that needed saving; still delete what
                     // was clean.
                     plans.retain(|plan| match plan {
-                        Plan::Save(checkout, ..) => {
+                        Plan::Save(checkout, _) => {
                             outcome.complete &= crate::server::reap_build_outputs_in_worktree(
-                                &checkout.path,
+                                checkout,
                                 self.seat_ids,
                             );
                             outcome
                                 .kept
-                                .push((checkout.path.clone(), format!("rescue failed: {reason}")));
+                                .push((checkout.clone(), format!("rescue failed: {reason}")));
                             false
                         }
                         Plan::Delete(_) => true,
@@ -720,11 +624,11 @@ impl Reclaim<'_> {
             }
         }
         for plan in &plans {
-            let (Plan::Delete(checkout) | Plan::Save(checkout, ..)) = plan;
+            let (Plan::Delete(checkout) | Plan::Save(checkout, _)) = plan;
             if matches!(plan, Plan::Delete(_)) {
                 outcome.clean += 1;
             }
-            outcome.complete &= self.delete_checkout(checkout);
+            outcome.complete &= crate::server::remove_path_with_seat(checkout, self.seat_ids);
         }
         if outcome.kept.is_empty() && loose_saved {
             outcome.complete &= crate::server::remove_path_with_seat(work, self.seat_ids);
@@ -735,20 +639,6 @@ impl Reclaim<'_> {
             }
         }
         outcome
-    }
-
-    fn delete_checkout(&self, checkout: &Checkout) -> bool {
-        let mut complete = crate::server::remove_path_with_seat(&checkout.path, self.seat_ids);
-        // A recorded worktree's private Git directory goes with it; only the
-        // journal's validated path, never one read back from the checkout.
-        if let Some(record) = &checkout.recorded {
-            if record.validate().is_ok() {
-                complete &= crate::server::remove_path_with_seat(record.private(), self.seat_ids);
-            } else {
-                complete = false;
-            }
-        }
-        complete
     }
 
     /// Write every owed checkout and the loose files into a new rescue
@@ -801,48 +691,22 @@ impl Reclaim<'_> {
         let mut taken = std::collections::BTreeSet::new();
         let mut repos = Vec::new();
         for plan in plans {
-            let Plan::Save(checkout, state, runner) = plan else {
+            let Plan::Save(checkout, state) = plan else {
                 continue;
             };
             let rel = checkout
-                .path
                 .strip_prefix(work)
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned())
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| ".".to_string());
             let name = slug(&rel, &mut taken);
-            let saved = match &checkout.recorded {
-                Some(record) => record
-                    .inspect(|| {
-                        save_repo(
-                            &|| record.command().map_err(|e| e.to_string()),
-                            runner,
-                            &checkout.path,
-                            state,
-                            &rel,
-                            out,
-                            &name,
-                        )
-                        .map_err(std::io::Error::other)
-                    })
-                    .map_err(|error| error.to_string()),
-                None => save_repo(
-                    &|| runner.git(&checkout.path),
-                    runner,
-                    &checkout.path,
-                    state,
-                    &rel,
-                    out,
-                    &name,
-                ),
-            }
-            .map_err(|error| format!("{rel}: {error}"))?;
+            let saved = save_repo(checkout, self.seat(), state, &rel, out, &name)
+                .map_err(|error| format!("{rel}: {error}"))?;
             repos.push(saved);
         }
         let mut loose_tar = None;
         if !loose.is_empty() {
-            let runner = Runner::owner_of(work, self.seat_ids)?;
             let mut names = Vec::new();
             for name in loose {
                 names.extend_from_slice(name.as_encoded_bytes());
@@ -856,8 +720,13 @@ impl Reclaim<'_> {
             args.extend(["--null", "-T", "-", "-cf", "-"].map(String::from));
             let args: Vec<&OsStrLike> = args.iter().map(|a| os(a)).collect();
             let file = out.join("loose.tar");
-            write_to(&file, runner.tar(work)?, &args, Some(&names))
-                .map_err(|error| format!("tar of files outside a checkout failed: {error}"))?;
+            write_to(
+                &file,
+                Runner::as_seat(self.seat()).tar(work)?,
+                &args,
+                Some(&names),
+            )
+            .map_err(|error| format!("tar of files outside a checkout failed: {error}"))?;
             loose_tar = Some("loose.tar");
         }
         Ok(serde_json::json!({
@@ -868,7 +737,7 @@ impl Reclaim<'_> {
             "rescued_at_ms": anyagents_core::now_ms(),
             "checkouts": repos,
             "loose_tar": loose_tar,
-            "restore": "A clone of its own: git clone <name>.bundle <dir>. A linked worktree: clone its origin, git fetch <name>.bundle HEAD if there is one, and check out its head. Then tar -xf <name>.uncommitted.tar -C <dir>. loose.tar holds the files that sat outside any checkout.",
+            "restore": "A clone with its own objects: git clone <name>.bundle <dir>. One that borrowed from a pool: clone its origin, git fetch <name>.bundle if there is one, and check out its head. Then tar -xf <name>.uncommitted.tar -C <dir>. loose.tar holds the files that sat outside any checkout.",
         }))
     }
 }
@@ -933,6 +802,15 @@ mod tests {
         }
     }
 
+    fn manifest(rescued: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(rescued.join("manifest.json")).unwrap()).unwrap()
+    }
+
+    fn listing(tar: &Path) -> String {
+        let out = Command::new("tar").arg("-tf").arg(tar).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     #[test]
     fn status_parsing_skips_rename_sources_and_spots_deletions() {
         let raw = b"R  new.rs\0old.rs\0 M src/lib.rs\0?? notes.md\0 D gone.rs\0D  staged-gone.rs\0";
@@ -954,10 +832,6 @@ mod tests {
             .map(Change::path_text)
             .collect();
         assert_eq!(present, ["new.rs", "src/lib.rs", "notes.md"]);
-        assert!(incidental("CLAUDE.md"));
-        assert!(incidental("target/debug/x"));
-        assert!(incidental(".claude/settings.json"));
-        assert!(!incidental("src/target.rs"));
     }
 
     #[test]
@@ -975,7 +849,9 @@ mod tests {
         let unpushed_head = git(&ahead, &["rev-parse", "HEAD"]);
         let dirty = published(dir.path(), "dirty");
         std::fs::write(dirty.join("README.md"), b"edited\n").unwrap();
-        std::fs::write(dirty.join("draft.md"), b"untracked draft\n").unwrap();
+        std::fs::create_dir_all(dirty.join("drafts/target")).unwrap();
+        std::fs::write(dirty.join("drafts/plan.md"), b"untracked draft\n").unwrap();
+        std::fs::write(dirty.join("drafts/target/out"), b"built").unwrap();
         std::fs::create_dir_all(dirty.join("target/debug")).unwrap();
         std::fs::write(dirty.join("target/debug/huge"), b"build output").unwrap();
         let work = dir.path().join("work");
@@ -987,17 +863,19 @@ mod tests {
         std::fs::write(work.join("notes/plan.md"), b"plan\n").unwrap();
         std::fs::write(work.join("notes/target/out"), b"built").unwrap();
 
-        let outcome = reclaim(&data, &id).work_dir(&work, &|_| None);
+        let outcome = reclaim(&data, &id).work_dir(&work);
         assert!(outcome.complete, "{outcome:?}");
         assert!(outcome.kept.is_empty(), "{:?}", outcome.kept);
         assert_eq!(outcome.clean, 1);
         assert!(!work.exists(), "the reclaimed work directory remains");
         let rescued = outcome.rescued.expect("owed work was rescued");
         assert!(rescued.starts_with(data.join("rescue").join(id.as_str())));
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(rescued.join("manifest.json")).unwrap()).unwrap();
-        let checkouts = manifest["checkouts"].as_array().unwrap();
-        assert_eq!(checkouts.len(), 2, "{manifest:#}");
+        let manifest = manifest(&rescued);
+        assert_eq!(
+            manifest["checkouts"].as_array().unwrap().len(),
+            2,
+            "{manifest:#}"
+        );
         assert_eq!(manifest["loose_tar"], "loose.tar");
 
         // The unpushed commit comes back from its bundle.
@@ -1017,25 +895,17 @@ mod tests {
         assert!(restored.join("feature.rs").exists());
 
         // The uncommitted edits come back from the tar, without build output.
-        let listing = Command::new("tar")
-            .arg("-tf")
-            .arg(rescued.join("dirty.uncommitted.tar"))
-            .output()
-            .unwrap();
-        let listing = String::from_utf8_lossy(&listing.stdout);
+        let saved = listing(&rescued.join("dirty.uncommitted.tar"));
         assert!(
-            listing.contains("README.md") && listing.contains("draft.md"),
-            "{listing}"
+            saved.contains("README.md") && saved.contains("drafts/plan.md"),
+            "{saved}"
         );
-        assert!(!listing.contains("target"), "{listing}");
-        let loose = Command::new("tar")
-            .arg("-tf")
-            .arg(rescued.join("loose.tar"))
-            .output()
-            .unwrap();
-        let loose = String::from_utf8_lossy(&loose.stdout);
-        assert!(loose.contains("report.md"), "{loose}");
-        assert!(loose.contains("notes/plan.md"), "{loose}");
+        assert!(!saved.contains("target"), "{saved}");
+        let loose = listing(&rescued.join("loose.tar"));
+        assert!(
+            loose.contains("report.md") && loose.contains("notes/plan.md"),
+            "{loose}"
+        );
         assert!(!loose.contains("node_modules"), "{loose}");
         assert!(!loose.contains(".bun-cache"), "{loose}");
         assert!(!loose.contains("notes/target"), "{loose}");
@@ -1043,51 +913,46 @@ mod tests {
     }
 
     #[test]
-    fn a_linked_worktree_bundles_only_what_no_remote_has() {
+    fn a_repository_borrowing_from_a_pool_bundles_only_what_no_remote_has() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         let id = AgentId::generate();
-        // The shared repository lives outside the work directory.
-        let shared = published(&dir.path().join("shared"), "repo");
+        // The pool: a clone that already holds the published history.
+        let pool = published(&dir.path().join("pool"), "repo");
+        let origin = dir.path().join("pool/repo.git");
         let work = dir.path().join("work");
-        std::fs::create_dir_all(&work).unwrap();
-        let ahead = work.join("ahead");
-        let dirty = work.join("dirty");
-        git(
-            &shared,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                ahead.to_str().unwrap(),
-                "-b",
-                "feature",
-            ],
-        );
-        git(
-            &shared,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                dirty.to_str().unwrap(),
-                "-b",
-                "drafts",
-            ],
-        );
+        let make = |name: &str| {
+            let checkout = work.join(name);
+            let out = Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(["clone", "-q", "--reference"])
+                .arg(&pool)
+                .arg(&origin)
+                .arg(&checkout)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(checkout.join(".git/objects/info/alternates").is_file());
+            checkout
+        };
+        let ahead = make("ahead");
         std::fs::write(ahead.join("feature.rs"), b"fn feature() {}\n").unwrap();
         git(&ahead, &["add", "feature.rs"]);
         git(&ahead, &["commit", "-qm", "Unpushed feature"]);
         let unpushed_head = git(&ahead, &["rev-parse", "HEAD"]);
+        let dirty = make("dirty");
         std::fs::write(dirty.join("README.md"), b"edited\n").unwrap();
         let pushed_head = git(&dirty, &["rev-parse", "HEAD"]);
 
-        let outcome = reclaim(&data, &id).work_dir(&work, &|_| None);
+        let outcome = reclaim(&data, &id).work_dir(&work);
         assert!(outcome.complete && outcome.kept.is_empty(), "{outcome:?}");
         assert!(!work.exists());
         let rescued = outcome.rescued.unwrap();
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(rescued.join("manifest.json")).unwrap()).unwrap();
+        let manifest = manifest(&rescued);
         let entry = |path: &str| {
             manifest["checkouts"]
                 .as_array()
@@ -1099,11 +964,11 @@ mod tests {
         };
         // The unpushed commit is in a bundle that needs the remote's history.
         let ahead_entry = entry("ahead");
-        assert_eq!(ahead_entry["linked"], true);
+        assert_eq!(ahead_entry["borrowed_objects"], true);
         assert_eq!(ahead_entry["head"], unpushed_head.as_str());
         let verify = Command::new("git")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .args(["-C", shared.to_str().unwrap(), "bundle", "verify", "-q"])
+            .args(["-C", pool.to_str().unwrap(), "bundle", "verify", "-q"])
             .arg(rescued.join("ahead.bundle"))
             .output()
             .unwrap();
@@ -1113,10 +978,7 @@ mod tests {
             String::from_utf8_lossy(&verify.stderr)
         );
         let heads = bundle_heads(&rescued.join("ahead.bundle")).unwrap();
-        assert!(
-            heads.contains(&"refs/heads/feature".to_string()),
-            "{heads:?}"
-        );
+        assert!(heads.contains(&"refs/heads/main".to_string()), "{heads:?}");
         // A pushed HEAD needs no bundle: its commit and the tar restore it.
         let dirty_entry = entry("dirty");
         assert_eq!(dirty_entry["head"], pushed_head.as_str());
@@ -1128,11 +990,65 @@ mod tests {
                 .unwrap()
                 .ends_with("repo.git")
         );
-        // Deleting the checkouts leaves the shared repository's branches.
-        assert_eq!(
-            git(&shared, &["rev-parse", "refs/heads/feature"]),
-            unpushed_head
+    }
+
+    #[test]
+    fn a_linked_worktree_is_converted_before_it_is_judged() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let id = AgentId::generate();
+        let shared = published(&dir.path().join("shared"), "repo");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let ahead = work.join("ahead");
+        git(
+            &shared,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                ahead.to_str().unwrap(),
+                "-b",
+                "feature",
+            ],
         );
+        std::fs::write(ahead.join("feature.rs"), b"fn feature() {}\n").unwrap();
+        git(&ahead, &["add", "feature.rs"]);
+        git(&ahead, &["commit", "-qm", "Unpushed feature"]);
+        let unpushed_head = git(&ahead, &["rev-parse", "HEAD"]);
+
+        let outcome = reclaim(&data, &id).work_dir(&work);
+        assert!(outcome.complete && outcome.kept.is_empty(), "{outcome:?}");
+        assert!(!work.exists());
+        let rescued = outcome.rescued.unwrap();
+        let heads = bundle_heads(&rescued.join("ahead.bundle")).unwrap();
+        assert!(
+            heads.contains(&"refs/heads/feature".to_string()),
+            "{heads:?}"
+        );
+        let restored = dir.path().join("restored");
+        git(
+            &shared,
+            &[
+                "clone",
+                "-q",
+                "--no-checkout",
+                ".",
+                restored.to_str().unwrap(),
+            ],
+        );
+        git(
+            &restored,
+            &[
+                "fetch",
+                "-q",
+                rescued.join("ahead.bundle").to_str().unwrap(),
+                "refs/heads/feature",
+            ],
+        );
+        assert_eq!(git(&restored, &["rev-parse", "FETCH_HEAD"]), unpushed_head);
+        // The shared store forgot the converted checkout.
+        assert!(!git(&shared, &["worktree", "list"]).contains("ahead"));
     }
 
     #[test]
@@ -1146,7 +1062,7 @@ mod tests {
         std::fs::write(work.join("source.rs"), b"fn local() {}\n").unwrap();
         git(&work, &["add", "source.rs"]);
         git(&work, &["commit", "-qm", "Never pushed"]);
-        let outcome = reclaim(&data, &id).work_dir(&work, &|_| None);
+        let outcome = reclaim(&data, &id).work_dir(&work);
         assert!(outcome.complete && outcome.kept.is_empty(), "{outcome:?}");
         let rescued = outcome.rescued.unwrap();
         assert!(rescued.join("work.bundle").is_file());
@@ -1156,7 +1072,7 @@ mod tests {
         std::fs::create_dir_all(&unborn).unwrap();
         git(&unborn, &["init", "-q"]);
         std::fs::write(unborn.join("first.rs"), b"fn first() {}\n").unwrap();
-        let outcome = reclaim(&data, &id).work_dir(&unborn, &|_| None);
+        let outcome = reclaim(&data, &id).work_dir(&unborn);
         assert!(outcome.complete && outcome.kept.is_empty(), "{outcome:?}");
         let rescued = outcome.rescued.unwrap();
         assert!(!rescued.join("work.bundle").exists(), "no commit to bundle");
@@ -1174,11 +1090,17 @@ mod tests {
         std::fs::create_dir_all(broken.join(".git")).unwrap();
         std::fs::create_dir_all(broken.join("target/debug")).unwrap();
         std::fs::write(broken.join("source.rs"), b"fn unknown() {}\n").unwrap();
-        let outcome = reclaim(&data, &id).work_dir(&work, &|_| None);
-        assert_eq!(outcome.kept.len(), 1, "{outcome:?}");
-        assert_eq!(outcome.kept[0].0, broken);
+        // A pointer that names no registered worktree is not converted.
+        let pointer = work.join("pointer");
+        std::fs::create_dir_all(&pointer).unwrap();
+        std::fs::write(pointer.join(".git"), b"gitdir: /nonexistent/broken\n").unwrap();
+        std::fs::write(pointer.join("source.rs"), b"fn kept() {}\n").unwrap();
+        let outcome = reclaim(&data, &id).work_dir(&work);
+        let kept: Vec<_> = outcome.kept.iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(kept, [broken.clone(), pointer.clone()], "{outcome:?}");
         assert!(outcome.rescued.is_none());
         assert!(broken.join("source.rs").exists());
+        assert!(pointer.join("source.rs").exists());
         assert!(!broken.join("target").exists());
     }
 
@@ -1194,7 +1116,7 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         std::fs::write(data.join("rescue"), b"not a directory").unwrap();
         let work = dir.path().join("work");
-        let outcome = reclaim(&data, &id).work_dir(&work, &|_| None);
+        let outcome = reclaim(&data, &id).work_dir(&work);
         assert!(outcome.rescued.is_none());
         assert_eq!(outcome.kept.len(), 1, "{outcome:?}");
         assert!(ahead.join(".git").exists(), "unpushed work was deleted");

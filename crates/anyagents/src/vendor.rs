@@ -1077,8 +1077,6 @@ fn vendor_launch_inner(
     authority: Option<&anyagents_core::Store>,
     host: &HarnessHost,
 ) -> Result<VendorHarness, String> {
-    crate::worktree_access::ensure_launchable(&request.data_dir, &request.agent.id)
-        .map_err(|error| error.to_string())?;
     // Strip any untrusted launch or authority variables from caller/stored env.
     let mut env: Vec<(String, String)> = std::mem::take(&mut request.extra_env)
         .into_iter()
@@ -1322,12 +1320,7 @@ fn vendor_launch_inner(
                 && managed_work.is_dir()
                 && !managed_work.join(".git").exists()
             {
-                let _ = crate::sandbox::share_worktree_with_seat(
-                    &managed_work,
-                    uid,
-                    gid,
-                    &crate::worktree_access::grant_path(&request.data_dir, &request.agent.id),
-                );
+                let _ = crate::sandbox::share_worktree_with_seat(&managed_work, gid);
             }
         }
         crate::create::ensure_seat_op_config(&request.config_dir, seat_launch);

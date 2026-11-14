@@ -17,7 +17,7 @@ const ALLOW_LIST: &[(&str, &str, usize)] = &[
     ("crates/anyagents-harness/src/lib.rs", "bare_command_new", 1),
     ("crates/anyagents-installer/src/lib.rs", "env_path", 1),
     ("crates/anyagents/src/create.rs", "anyagents_bin_env", 1),
-    ("crates/anyagents/src/create.rs", "bare_command_new", 9),
+    ("crates/anyagents/src/create.rs", "bare_command_new", 8),
     ("crates/anyagents/src/create.rs", "env_path", 1),
     ("crates/anyagents/src/install.rs", "bare_command_new", 2),
     ("crates/anyagents/src/install.rs", "env_path", 1),

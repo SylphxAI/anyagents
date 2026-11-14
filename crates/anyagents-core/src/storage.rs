@@ -7,7 +7,8 @@
 //! - `ANYAGENTS_WORKSPACES_DIR`: managed per-agent workspaces (`{workspaces}/{id}`)
 //! - `ANYAGENTS_SCRATCH_DIR`: each agent's own storage root on local disk
 //!   (`{scratch}/agents/{id}`), holding its disposable `build/` and `tmp/`
-//! - `ANYAGENTS_GIT_POOL_DIR`: shared bare Git object pool (`{pool}/{org}/{repo}.git`)
+//! - `ANYAGENTS_GIT_POOL_DIR`: the read-only Git object pool agents' own repositories
+//!   borrow from (`{pool}/{org}/{repo}.git`; `{data}/git-pool` when unset)
 //!
 //! Source and other state that cannot be rebuilt stay on the workspaces and
 //! state tiers. Everything under an agent's scratch root can be rebuilt, so the
@@ -85,7 +86,8 @@ pub fn configured_scratch_dir() -> Option<PathBuf> {
     non_empty_path_env(SCRATCH_DIR_ENV)
 }
 
-/// Configured root directory for shared bare Git object pools (`{pool}/{org}/{repo}.git`).
+/// Configured root directory for the Git object pool (`{pool}/{org}/{repo}.git`).
+/// Unset, the checkout code uses `{data}/git-pool`.
 pub fn configured_git_pool_dir() -> Option<PathBuf> {
     if !storage_env_enabled() {
         return None;
