@@ -61,6 +61,7 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         30,
         include_str!("../migrations/031_remote_session_tokens.sql"),
     ),
+    (31, include_str!("../migrations/032_operator_inbox.sql")),
 ];
 
 /// Apply pending migrations. Each migration commits on its own, in order.
