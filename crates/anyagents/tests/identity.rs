@@ -630,6 +630,102 @@ fn health_reports_running_image_and_survives_atomic_install() {
     assert_eq!(health(&serve.socket), serving);
 }
 
+/// `public_listen` binds a second TCP listener with only the public surface;
+/// the local listener keeps the rest. Which credentials each accepts follows
+/// from the listener a request arrives on.
+#[test]
+fn a_configured_public_listener_serves_only_the_public_surface() {
+    use std::io::{Read, Write};
+
+    let _env = support::lock();
+    let dir = support::physical_tempdir();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(
+        data.join("anyagents.toml"),
+        "[server]\npublic_url = \"https://agents.example.com\"\npublic_listen = \"127.0.0.1:0\"\n",
+    )
+    .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .arg("--data")
+        .arg(&data)
+        .arg("serve")
+        .env("ANYAGENTS_FAKE_MODE", "1")
+        .env("ANYAGENTS_TESTS", "own-seat")
+        .env("ANYAGENTS_WEBHOOK_LISTEN", "127.0.0.1:0")
+        .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+        .env_remove("ANYAGENTS_AGENT_UID")
+        .env_remove("ANYAGENTS_AGENT_GID")
+        .env_remove("ANYAGENTS_SOCKET_GID")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _server = Serve {
+        child,
+        socket: data.join("anyagents.sock"),
+    };
+    support::wait_for(
+        || data.join("public.addr").is_file() && data.join("webhook.addr").is_file(),
+        "the listeners did not bind",
+    );
+    let read_addr = |file: &str| {
+        std::fs::read_to_string(data.join(file))
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    let public = read_addr("public.addr");
+    let local = read_addr("webhook.addr");
+    assert_ne!(public, local);
+    let call = |addr: &str, method: &str, path: &str, headers: &str, body: &str| {
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: local\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        raw
+    };
+    let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+
+    let root = call(&public, "GET", "/", "", "");
+    assert!(root.starts_with("HTTP/1.1 200"), "{root}");
+    assert_eq!(
+        serde_json::from_str::<Value>(root.split_once("\r\n\r\n").unwrap().1).unwrap(),
+        json!({ "ok": true })
+    );
+    // No body: a 404 closes the connection without reading one, and unread
+    // bytes would turn that close into a reset on some platforms.
+    for path in ["/v1/mcp", "/mcp", "/v1/agents"] {
+        let raw = call(&public, "POST", path, "", "");
+        assert!(raw.starts_with("HTTP/1.1 404"), "{path}: {raw}");
+    }
+    let refused = call(
+        &public,
+        "POST",
+        "/v1/webhooks/mcp",
+        &format!("Authorization: Bearer {}\r\n", "ab".repeat(32)),
+        list,
+    );
+    assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+    assert!(refused.contains("only remote session tokens"), "{refused}");
+
+    // The local listener still serves the MCP aliases for every credential.
+    let local_mcp = call(&local, "POST", "/v1/mcp", "", list);
+    assert!(local_mcp.starts_with("HTTP/1.1 401"), "{local_mcp}");
+    assert!(
+        !local_mcp.contains("only remote session tokens"),
+        "{local_mcp}"
+    );
+}
+
 #[test]
 fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     use anyagents_core::{AgentId, Incoming, Store};

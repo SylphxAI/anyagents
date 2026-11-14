@@ -421,7 +421,51 @@ async fn serve(
         });
         start_schedule_loops(Arc::clone(&store), state.health.clone());
     }
-    if let Some(addr) = webhook_listen_addr() {
+    // `public_listen` decides whether the local TCP listener is also the
+    // public one. A configuration file that cannot be read fails closed: no
+    // public listener, and the local listener defaults to loopback.
+    let (public_listen, public_configured) = match crate::remote::Settings::load(data) {
+        Ok(settings) => (settings.public_listen, settings.public_listen.is_some()),
+        Err(why) => {
+            eprintln!(
+                "warning: {why}; the public listener is off and the local listener defaults to loopback"
+            );
+            (None, true)
+        }
+    };
+    if public_listen.is_none() {
+        let _ = std::fs::remove_file(data.join("public.addr"));
+    }
+    if let Some(addr) = public_listen {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(tcp_listener) => {
+                if let Ok(local) = tcp_listener.local_addr() {
+                    let addr_path = data.join("public.addr");
+                    if let Err(err) = anyagents_harness::atomic_write_nonempty_file(
+                        &addr_path,
+                        format!("{local}\n").as_bytes(),
+                        0o644,
+                    ) {
+                        eprintln!("cannot persist {}: {err}", addr_path.display());
+                    }
+                }
+                let public_app = build_public_router(state.clone());
+                tokio::spawn(async move {
+                    let _ = axum::serve(tcp_listener, public_app).await;
+                });
+            }
+            Err(err) => {
+                eprintln!("warning: public TCP listener ({addr}) did not bind: {err}");
+            }
+        }
+    }
+    if let Some(addr) = webhook_listen_addr(public_configured) {
+        if public_configured && !binds_loopback(&addr) {
+            eprintln!(
+                "warning: the local TCP listener ({addr}) is not loopback while `public_listen` is set; \
+                 it accepts every local credential, so bind it to 127.0.0.1"
+            );
+        }
         match tokio::net::TcpListener::bind(&addr).await {
             Ok(tcp_listener) => {
                 if let Ok(local) = tcp_listener.local_addr() {
@@ -869,20 +913,73 @@ async fn telegram_webhook(
     .await
 }
 
-fn webhook_listen_addr() -> Option<String> {
-    if let Ok(addr) = std::env::var("ANYAGENTS_WEBHOOK_LISTEN") {
+/// The TCP listener for the local API surface: readiness, Telegram webhooks
+/// and MCP for every credential kind. Until a deployment configures
+/// `public_listen` it is also the public one and keeps the `0.0.0.0:8788`
+/// default; once the public listener exists it defaults to loopback.
+fn webhook_listen_addr(public_configured: bool) -> Option<String> {
+    local_listen_addr(
+        std::env::var("ANYAGENTS_WEBHOOK_LISTEN").ok().as_deref(),
+        std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+            || std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some(),
+        public_configured,
+    )
+}
+
+fn local_listen_addr(
+    explicit: Option<&str>,
+    test_double: bool,
+    public_configured: bool,
+) -> Option<String> {
+    if let Some(addr) = explicit {
         let trimmed = addr.trim();
         if trimmed.is_empty() || trimmed == "0" || trimmed.eq_ignore_ascii_case("off") {
             return None;
         }
         return Some(trimmed.to_string());
     }
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
-        || std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some()
-    {
+    if test_double {
         return None;
     }
-    Some("0.0.0.0:8788".to_string())
+    Some(if public_configured {
+        "127.0.0.1:8788".to_string()
+    } else {
+        "0.0.0.0:8788".to_string()
+    })
+}
+
+/// Whether `addr` binds only the loopback interface.
+fn binds_loopback(addr: &str) -> bool {
+    addr.parse::<std::net::SocketAddr>()
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or_else(|_| addr.starts_with("localhost:"))
+}
+
+/// The public listener (`[server] public_listen`): the only surface a network
+/// peer reaches once it is configured. It serves readiness, Telegram webhooks
+/// (each verified by its channel's secret token) and MCP for remote session
+/// tokens only; every other path is 404. Which credentials it accepts is
+/// decided by the listener the request arrived on, never by a source address
+/// or a forwarding header.
+pub(crate) fn build_public_router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(public_healthz))
+        .route("/healthz", get(public_healthz))
+        .route("/v1/webhooks/healthz", get(public_healthz))
+        .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
+        .route(
+            "/v1/webhooks/mcp",
+            get(public_mcp_get_route).post(public_mcp_post_route),
+        )
+        .fallback(public_not_found)
+        .with_state(state)
+}
+
+async fn public_not_found() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "not found" })),
+    )
 }
 
 pub(crate) fn build_webhook_router(state: AppState) -> Router {
@@ -982,6 +1079,15 @@ struct McpRouteQuery {
     profile: Option<String>,
 }
 
+/// Which listener an MCP call arrived on. Every listener takes remote session
+/// tokens only; the public one also answers anything else with a plain 401,
+/// so a network peer never learns whether a token is a valid local capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpListener {
+    Local,
+    Public,
+}
+
 /// Who made one MCP call, and with which kind of credential.
 struct McpCaller {
     agent: Agent,
@@ -1018,6 +1124,7 @@ impl McpCaller {
 fn authenticate_mcp_request(
     store: &Store,
     headers: &axum::http::HeaderMap,
+    listener: McpListener,
 ) -> Result<McpCaller, ApiError> {
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -1056,6 +1163,12 @@ fn authenticate_mcp_request(
         let agent = store
             .agent(&grant.agent_id)
             .map_err(|_| unauthenticated())?;
+        // A remote token is for an agent that runs off this host. One whose
+        // harness was moved back onto the host no longer has a remote session.
+        let config_dir = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+        if !crate::remote::runs_off_host(&agent, &config_dir) {
+            return Err(unauthenticated());
+        }
         operator::ensure(store, &agent.id).map_err(ApiError::from_store)?;
         let internal_token = crate::mcp::capability_of(&anyagents_core::agent_config_dir(
             store.data_dir(),
@@ -1067,6 +1180,14 @@ fn authenticate_mcp_request(
             internal_token,
             remote: Some(grant),
         });
+    }
+    // The public listener never tells a network peer whether a token is a
+    // valid local capability: anything but a remote session token is 401.
+    if listener == McpListener::Public {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "this listener accepts only remote session tokens",
+        ));
     }
     // MCP over HTTP runs the tools inside the server process, as the server's
     // own user, on every listener including the Unix socket. A local agent's
@@ -1104,9 +1225,26 @@ async fn mcp_get_route(
     headers: axum::http::HeaderMap,
     Query(query): Query<McpRouteQuery>,
 ) -> Result<axum::response::Response, ApiError> {
+    mcp_get(McpListener::Local, state, headers, query).await
+}
+
+async fn public_mcp_get_route(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<McpRouteQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    mcp_get(McpListener::Public, state, headers, query).await
+}
+
+async fn mcp_get(
+    listener: McpListener,
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    query: McpRouteQuery,
+) -> Result<axum::response::Response, ApiError> {
     let presented = headers.clone();
     let (caller, profile) = spawn_store(move || {
-        let caller = authenticate_mcp_request(&state.store, &presented)?;
+        let caller = authenticate_mcp_request(&state.store, &presented, listener)?;
         let profile = caller.profile(query.profile.as_deref())?;
         Ok((caller, profile))
     })
@@ -1162,8 +1300,27 @@ async fn mcp_post_route(
     Query(query): Query<McpRouteQuery>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<axum::response::Response, ApiError> {
+    mcp_post(McpListener::Local, state, headers, query, payload).await
+}
+
+async fn public_mcp_post_route(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<McpRouteQuery>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<axum::response::Response, ApiError> {
+    mcp_post(McpListener::Public, state, headers, query, payload).await
+}
+
+async fn mcp_post(
+    listener: McpListener,
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    query: McpRouteQuery,
+    payload: serde_json::Value,
+) -> Result<axum::response::Response, ApiError> {
     let mcp = spawn_store(move || {
-        let caller = authenticate_mcp_request(&state.store, &headers)?;
+        let caller = authenticate_mcp_request(&state.store, &headers, listener)?;
         let profile = caller.profile(query.profile.as_deref())?;
         let McpCaller {
             agent,
@@ -12276,6 +12433,301 @@ exec '{}' "$@"
                 state.store.agent_by_name("local-first").unwrap().harness,
                 "claude-code"
             );
+        });
+    }
+
+    /// One HTTP/1.1 exchange with a TCP listener: the status and the JSON body
+    /// (`Null` when there is none).
+    fn raw_http(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (u16, serde_json::Value) {
+        use std::io::{Read as _, Write as _};
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: public.example\r\nConnection: close\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        if !body.is_empty() {
+            request.push_str("Content-Type: application/json\r\n");
+        }
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        request.push_str(body);
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        let (head, rest) = raw.split_once("\r\n\r\n").unwrap();
+        let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (
+            status,
+            serde_json::from_str(rest).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[test]
+    fn the_public_listener_serves_only_the_public_surface_and_remote_tokens() {
+        use anyagents_core::CredentialStore as _;
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\npublic_listen = \"127.0.0.1:0\"\n",
+        )
+        .unwrap();
+        let cloud = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new(
+                "cloud-public",
+                "claude-cloud",
+            ))
+            .unwrap();
+        let local = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("local-public", "claude-code"))
+            .unwrap();
+        let local_cap = state.store.issue_capability(&local.id).unwrap();
+        crate::remote::begin_session(&state.store, &cloud).unwrap();
+        let remote =
+            crate::remote::session_token(&anyagents_core::agent_config_dir(dir.path(), &cloud.id))
+                .unwrap();
+        // A Telegram channel, so the webhook route reaches its secret check.
+        let channel = state
+            .store
+            .create_channel(anyagents_core::NewChannel {
+                kind: "telegram".into(),
+                identity: None,
+                config: "{}".into(),
+                credential_ref: None,
+            })
+            .unwrap();
+        let cred_ref = format!("channels/{}", channel.id);
+        anyagents_core::FileCredentialStore::new(dir.path())
+            .write(&cred_ref, b"777:fake-token-not-real")
+            .unwrap();
+        state
+            .store
+            .set_credential_ref(&channel.id, &cred_ref)
+            .unwrap();
+        state.store.attach_channel(&channel.id, &local.id).unwrap();
+        let telegram_path = format!("/v1/webhooks/telegram/{}", channel.id);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let public = build_public_router(state.clone());
+            let served = tokio::spawn(async move {
+                let _ = axum::serve(listener, public).await;
+            });
+            let call = move |method: &'static str,
+                             path: String,
+                             headers: Vec<(&'static str, String)>,
+                             body: String| {
+                tokio::task::spawn_blocking(move || {
+                    let headers: Vec<(&str, &str)> =
+                        headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    raw_http(addr, method, &path, &headers, &body)
+                })
+            };
+            let list = tools_list().to_string();
+
+            for path in ["/", "/healthz", "/v1/webhooks/healthz"] {
+                let (status, body) = call("GET", path.into(), vec![], String::new())
+                    .await
+                    .unwrap();
+                assert_eq!(status, 200, "{path}");
+                assert_eq!(body, serde_json::json!({ "ok": true }), "{path}");
+            }
+
+            // Nothing of the local API, nor the MCP aliases, is reachable here,
+            // whatever credential is presented.
+            for (method, path) in [
+                ("GET", "/v1/agents"),
+                ("GET", "/v1/whoami"),
+                ("POST", "/v1/send"),
+                ("POST", "/v1/browser"),
+                ("POST", "/v1/operator/agents/local-public/capability"),
+                (
+                    "POST",
+                    "/v1/operator/agents/cloud-public/remote-sessions/revoke",
+                ),
+                ("POST", "/v1/mcp"),
+                ("POST", "/mcp"),
+                ("GET", "/v1/webhooks/unknown"),
+            ] {
+                // No body: a 404 closes without reading one, and unread bytes
+                // would turn that close into a reset on some platforms.
+                let (status, _) = call(
+                    method,
+                    path.into(),
+                    vec![("x-anyagents-agent", local_cap.clone())],
+                    String::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(status, 404, "{method} {path}");
+            }
+
+            // MCP takes remote session tokens only. A local capability is
+            // refused in either header, and no forwarding header changes that.
+            for headers in [
+                vec![("authorization", format!("Bearer {local_cap}"))],
+                vec![("x-anyagents-agent", local_cap.clone())],
+                vec![
+                    ("authorization", format!("Bearer {local_cap}")),
+                    ("x-forwarded-for", "127.0.0.1".to_string()),
+                    ("forwarded", "for=127.0.0.1".to_string()),
+                ],
+            ] {
+                let (status, body) = call("POST", "/v1/webhooks/mcp".into(), headers, list.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(status, 401, "{body}");
+                assert!(
+                    body["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("only remote session tokens"),
+                    "{body}"
+                );
+            }
+            let (status, body) = call(
+                "GET",
+                "/v1/webhooks/mcp".into(),
+                vec![("authorization", format!("Bearer {local_cap}"))],
+                String::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, 401, "{body}");
+
+            let (status, body) = call(
+                "POST",
+                "/v1/webhooks/mcp".into(),
+                vec![("authorization", format!("Bearer {remote}"))],
+                list.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(listed_tools(&body), crate::mcp::REMOTE_MCP_TOOLS);
+
+            // Telegram's webhook is verified by the channel's secret token here
+            // too: a missing or wrong secret is refused before any delivery.
+            let update = serde_json::json!({ "update_id": 1 }).to_string();
+            for headers in [
+                vec![],
+                vec![("x-telegram-bot-api-secret-token", "wrong".to_string())],
+            ] {
+                let (status, _) = call("POST", telegram_path.clone(), headers, update.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(status, 401);
+            }
+            assert!(state.store.inbox(&local.id, None).unwrap().is_empty());
+            served.abort();
+        });
+
+        // The local listener refuses a local capability too (#272), with 403
+        // there, and serves the remote token.
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let refused = post_mcp_as(&state, &local_cap, None, tools_list())
+                .await
+                .unwrap_err();
+            assert_eq!(refused.status, StatusCode::FORBIDDEN);
+            let (status, _) = post_mcp_as(&state, &remote, None, tools_list())
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::OK);
+        });
+    }
+
+    #[test]
+    fn the_local_listener_keeps_its_default_until_a_public_listener_exists() {
+        // Unset public listener: today's behaviour.
+        assert_eq!(
+            local_listen_addr(None, false, false).as_deref(),
+            Some("0.0.0.0:8788")
+        );
+        // A configured public listener moves the local default to loopback.
+        assert_eq!(
+            local_listen_addr(None, false, true).as_deref(),
+            Some("127.0.0.1:8788")
+        );
+        // An explicit address or `off` always wins; test doubles bind nothing.
+        assert_eq!(
+            local_listen_addr(Some(" 127.0.0.1:9000 "), false, true).as_deref(),
+            Some("127.0.0.1:9000")
+        );
+        assert_eq!(local_listen_addr(Some("off"), false, false), None);
+        assert_eq!(local_listen_addr(None, true, false), None);
+        assert!(binds_loopback("127.0.0.1:8788"));
+        assert!(binds_loopback("[::1]:8788"));
+        assert!(binds_loopback("localhost:8788"));
+        assert!(!binds_loopback("0.0.0.0:8788"));
+        assert!(!binds_loopback("10.0.0.5:8788"));
+    }
+
+    #[test]
+    fn a_remote_token_stops_authenticating_once_its_agent_runs_on_the_host() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let cloud = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("cloud-moved", "claude-cloud"))
+            .unwrap();
+        let sandboxed = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("sandboxed", "claude-code"))
+            .unwrap();
+        let sandbox_cfg = anyagents_core::agent_config_dir(dir.path(), &sandboxed.id);
+        anyagents_tools::SandboxConfig {
+            endpoint: "https://sandbox.example.com".into(),
+            sandbox_id: "sbx-1".into(),
+            token: None,
+            workdir: "/workspace".into(),
+            remote_spawn: true,
+        }
+        .write_to_config_dir(&sandbox_cfg)
+        .unwrap();
+        assert!(crate::remote::runs_off_host(&sandboxed, &sandbox_cfg));
+        assert!(crate::remote::runs_off_host(
+            &cloud,
+            &anyagents_core::agent_config_dir(dir.path(), &cloud.id)
+        ));
+
+        crate::remote::begin_session(&state.store, &cloud).unwrap();
+        let remote =
+            crate::remote::session_token(&anyagents_core::agent_config_dir(dir.path(), &cloud.id))
+                .unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (status, _) = post_mcp_as(&state, &remote, None, tools_list())
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::OK);
+            state
+                .store
+                .set_agent_harness(&cloud.id, "claude-code")
+                .unwrap();
+            let err = post_mcp_as(&state, &remote, None, tools_list())
+                .await
+                .unwrap_err();
+            assert_eq!(err.status, StatusCode::UNAUTHORIZED);
         });
     }
 

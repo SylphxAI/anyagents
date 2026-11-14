@@ -73,6 +73,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Calls over HTTP MCP also cannot place an agent on a host harness, wake an
   agent that runs on the host (directly or by a send to an archived one), or
   attach media by a local path.
+- A separate public listener (`public_listen` under `[server]`) serves only
+  readiness, Telegram webhooks and MCP for remote session tokens, and 404 for
+  everything else; once it is configured, the local TCP listener defaults to
+  loopback. Without `public_listen` nothing changes. A remote session token
+  stops authenticating once its agent's harness moves back onto the host.
 
 ## 0.1.3
 
