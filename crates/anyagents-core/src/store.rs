@@ -1640,10 +1640,14 @@ impl Store {
                 "UPDATE rag_chunks SET agent_name = ?2 WHERE agent_id = ?1",
                 params![agent_id.as_str(), clean],
             );
-            let _ = tx.execute(
-                "UPDATE rag_chunks_fts SET agent_name = ?2 WHERE agent_name = ?1",
-                params![current.name, clean],
-            );
+            // This agent's search rows, chunk by chunk through the index; a
+            // name filter would read every agent's rows with the writer held.
+            for chunk_id in agent_chunk_ids(tx, agent_id).unwrap_or_default() {
+                let _ = tx.execute(
+                    FTS_RENAME_CHUNK,
+                    params![chunk_id, clean, fts_exact_phrase(&chunk_id)],
+                );
+            }
             Ok((agent_by_id(tx, agent_id)?, true))
         })?;
         if changed {
@@ -3170,6 +3174,17 @@ impl Store {
         let deleted = self.write_tx(|tx| {
             let agent = agent_by_id(tx, id)?;
             credentials::delete_bindings_for_deleted_agent(tx, id, actor)?;
+            // The agent's own search rows, found through its chunks before
+            // they go, never by a name filter: FTS5 answers `agent_name = ?`
+            // only by reading every row of every agent, and this transaction
+            // holds the writer meanwhile. A failed creation, which has no
+            // chunks, used to stall every write of the server for minutes.
+            for chunk_id in agent_chunk_ids(tx, id)? {
+                let _ = tx.execute(
+                    FTS_DELETE_CHUNK,
+                    params![chunk_id, fts_exact_phrase(&chunk_id)],
+                );
+            }
             for table in [
                 "agent_runtime",
                 "turns",
@@ -3202,10 +3217,6 @@ impl Store {
                     [id.as_str()],
                 )?;
             }
-            let _ = tx.execute(
-                "DELETE FROM rag_chunks_fts WHERE agent_name = ?1",
-                [agent.name.as_str()],
-            );
             tx.execute("DELETE FROM agents WHERE id = ?1", [id.as_str()])?;
             Ok(agent)
         })?;
@@ -6804,6 +6815,32 @@ fn ensure_lexical_fts_backfilled(conn: &mut Connection) -> Result<(), Error> {
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Remove one chunk's row from the search index. FTS5 answers only `rowid`
+/// and `MATCH` constraints from its index: a plain `column = ?` filter reads
+/// every row of the shared index, which on a fleet-sized store holds the Store
+/// writer for minutes and stalls every write. `MATCH` finds the row through
+/// the index; `=` keeps the match exact.
+pub(crate) const FTS_DELETE_CHUNK: &str =
+    "DELETE FROM rag_chunks_fts WHERE chunk_id MATCH ?2 AND chunk_id = ?1";
+
+/// Rename one chunk's search row, found the same way as [`FTS_DELETE_CHUNK`].
+pub(crate) const FTS_RENAME_CHUNK: &str =
+    "UPDATE rag_chunks_fts SET agent_name = ?2 WHERE chunk_id MATCH ?3 AND chunk_id = ?1";
+
+/// `value` as one FTS5 phrase: quoted, with any quote doubled.
+pub(crate) fn fts_exact_phrase(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// The chunk ids one agent owns, through the `rag_chunks` agent index.
+fn agent_chunk_ids(conn: &Connection, agent_id: &AgentId) -> Result<Vec<String>, Error> {
+    let mut stmt = conn.prepare_cached("SELECT chunk_id FROM rag_chunks WHERE agent_id = ?1")?;
+    let ids = stmt
+        .query_map([agent_id.as_str()], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
 }
 
 #[allow(clippy::too_many_arguments)]

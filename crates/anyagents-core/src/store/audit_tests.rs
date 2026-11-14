@@ -763,3 +763,76 @@ fn deleted_immutable_sender_refuses_receive_before_wake_mail_or_index_mutation()
         before.len() + 1
     );
 }
+
+/// Search rows filed under `name`, found through the index.
+fn fts_rows_named(store: &Store, name: &str) -> i64 {
+    store
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM rag_chunks_fts WHERE agent_name MATCH ?1 AND agent_name = ?2",
+            params![fts_exact_phrase(name), name],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn deleting_or_renaming_an_agent_changes_only_its_own_search_rows() {
+    let (_dir, store, kept) = setup();
+    let leaving = store
+        .create_agent(NewAgent::new("leaving", "test"))
+        .unwrap();
+    let renamed = store
+        .create_agent(NewAgent::new("before-rename", "test"))
+        .unwrap();
+    for (agent, text) in [
+        (&kept, "keptneedle"),
+        (&leaving, "leavingneedle"),
+        (&renamed, "renamedneedle"),
+    ] {
+        store.receive(&agent.id, Incoming::new(text)).unwrap();
+    }
+    assert_eq!(fts_rows_named(&store, "leaving"), 1);
+
+    store.delete_agent(&leaving.id).unwrap();
+    assert_eq!(fts_rows_named(&store, "leaving"), 0);
+    assert_fts(&store, "keptneedle");
+    assert_eq!(count(&store, "rag_chunks_fts"), count(&store, "rag_chunks"));
+
+    store.rename_agent(&renamed.id, "after-rename").unwrap();
+    assert_eq!(fts_rows_named(&store, "before-rename"), 0);
+    assert_eq!(fts_rows_named(&store, "after-rename"), 1);
+    assert_eq!(fts_rows_named(&store, "worker"), 1);
+    assert_fts(&store, "renamedneedle");
+}
+
+#[test]
+fn a_creation_rolled_back_before_any_history_reads_no_search_row() {
+    // The rollback of a failed spawn deletes a row with no chunks. Its index
+    // work must be proportional to that agent, not to the whole fleet's index.
+    let (_dir, store, kept) = setup();
+    store
+        .receive(&kept.id, Incoming::new("fleetneedle"))
+        .unwrap();
+    let failed = store
+        .create_agent(NewAgent::new("failed-spawn", "test"))
+        .unwrap();
+    store.delete_agent(&failed.id).unwrap();
+    assert_fts(&store, "fleetneedle");
+    for sql in [FTS_DELETE_CHUNK, FTS_RENAME_CHUNK] {
+        let conn = store.conn();
+        let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let nulls = vec![rusqlite::types::Null; plan.parameter_count()];
+        let details: Vec<String> = plan
+            .query_map(rusqlite::params_from_iter(nulls), |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("VIRTUAL TABLE INDEX 0:M")),
+            "{sql} must reach its row through MATCH, not a full scan: {details:?}"
+        );
+    }
+}
