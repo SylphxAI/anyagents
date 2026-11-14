@@ -9,10 +9,7 @@ use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyagents_harness::{
-    DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessHealth, OutboundMessage, Proof,
-    TurnState,
-};
+use anyagents_harness::{DeliverOutcome, DeliveryLevel, Harness, OutboundMessage, Proof};
 use anyagents_keeper::{Hosted as _, Program, RemoteHarness, Spec, attach, testing};
 use serde_json::json;
 
@@ -871,10 +868,10 @@ fn fake_hello(keeper: &serde_json::Value, health: serde_json::Value) -> serde_js
 
 #[cfg(target_os = "linux")]
 fn idle_health() -> serde_json::Value {
-    serde_json::to_value(HarnessHealth {
+    serde_json::to_value(anyagents_harness::HarnessHealth {
         process_alive: true,
-        turn_state: TurnState::Idle,
-        delivery: Delivery {
+        turn_state: anyagents_harness::TurnState::Idle,
+        delivery: anyagents_harness::Delivery {
             level: DeliveryLevel::NextStep,
             idempotent: true,
             proof: "took <id>".into(),
