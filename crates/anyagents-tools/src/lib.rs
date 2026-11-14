@@ -27,8 +27,8 @@ pub use encoding::{base64_decode, base64_encode, sha256_hex};
 pub use path::{normalize_lexical_path, resolve_workspace_path};
 pub use sandbox::{SandboxConfig, SandboxProvider, SandboxProviderConfig};
 pub use workspace::{
-    DockerWorkspace, ExecEnv, ExecOutput, LocalWorkspace, RemoteSandboxWorkspace, WorkspaceBackend,
-    resolve_workspace_backend,
+    DockerWorkspace, ExecEnv, ExecOutput, LocalWorkspace, REMOTE_EXEC_MAX_TIMEOUT_MS,
+    RemoteSandboxWorkspace, WorkspaceBackend, resolve_workspace_backend,
 };
 
 #[cfg(test)]
