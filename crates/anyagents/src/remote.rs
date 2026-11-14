@@ -13,7 +13,7 @@
 //!   before each turn. The maintenance pass rotates the token before it
 //!   expires. The long-lived local mailbox capability never leaves this host.
 //! * A remote session token only ever gets the `remote` MCP profile
-//!   ([`crate::mcp::McpProfile::resolve_remote_session`]).
+//!   ([`crate::mcp::McpProfile::resolve_http`]).
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -188,6 +188,14 @@ pub fn normalize_public_url(raw: &str) -> Result<String, String> {
         _ => return Err(format!("`{trimmed}` must start with `https://`")),
     }
     Ok(format!("{}://{rest}", scheme.to_ascii_lowercase()))
+}
+
+/// Whether this agent's harness runs off this host: a cloud harness, or a
+/// harness spawned into a remote sandbox.
+pub fn runs_off_host(agent: &Agent, config_dir: &Path) -> bool {
+    crate::vendor::is_cloud_harness(&agent.harness)
+        || anyagents_tools::SandboxConfig::resolve(Some(config_dir))
+            .is_some_and(|sandbox| sandbox.remote_spawn)
 }
 
 /// Why a remote agent cannot be created or started here, when it cannot.
