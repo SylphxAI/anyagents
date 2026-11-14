@@ -277,8 +277,24 @@ mod landlock {
                 continue;
             };
             // SAFETY: a NUL-terminated path.
-            let fd = unsafe { libc::open(name.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+            // A writable grant is never taken through a link: the server
+            // checked these are its own directories, and a link swapped in
+            // would hand Chromium whatever it names.
+            let no_follow = if *access == Access::ReadWrite {
+                libc::O_NOFOLLOW | libc::O_DIRECTORY
+            } else {
+                0
+            };
+            let fd =
+                unsafe { libc::open(name.as_ptr(), libc::O_PATH | libc::O_CLOEXEC | no_follow) };
             if fd < 0 {
+                let error = io::Error::last_os_error();
+                if *access == Access::ReadWrite {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("writable {}: {error}", path.display()),
+                    ));
+                }
                 // Not on this host: nothing to grant.
                 continue;
             }
@@ -290,6 +306,12 @@ mod landlock {
                 .metadata()
                 .map(|meta| meta.is_dir())
                 .unwrap_or(false);
+            if *access == Access::ReadWrite && !is_dir {
+                return Err(io::Error::other(format!(
+                    "writable {} is not a directory",
+                    path.display()
+                )));
+            }
             let wanted = if is_dir {
                 wanted
             } else {
@@ -562,6 +584,35 @@ pub(crate) mod tests {
         assert!(!stdout.contains("operator-secret") && !stdout.contains("shm-secret"));
         assert_eq!(std::fs::read(profile.join("made")).unwrap(), b"made\n");
         assert!(!root.join("planted").exists());
+    }
+
+    /// A writable directory given as a link is refused, never followed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linked_writable_directory_starts_nothing() {
+        if !landlock_or_skip() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(temp.path()).unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = real.with_file_name("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (helper, mut args) = wrap(&[&link], &[], &[], true, Path::new("/bin/sh")).unwrap();
+        args.extend(["-c", "echo started"].map(OsString::from));
+        let out = std::process::Command::new(helper)
+            .args(args)
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && !stdout.contains("started"),
+            "{stdout}{stderr}"
+        );
+        assert!(stderr.contains("writable"), "{stderr}");
     }
 
     /// Where Landlock is missing, `--require` refuses to start the program;

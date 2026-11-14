@@ -271,6 +271,82 @@ pub fn profile_dir(data: &Path, profile: &str) -> PathBuf {
     profiles_root(data).join(profile)
 }
 
+/// `name` below the opened directory `parent`, created with `mode` when
+/// `create` and it is absent: a directory owned by this process's user,
+/// opened without following a link. `None` when absent and not created.
+fn owned_child_dir(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    mode: libc::mode_t,
+    create: bool,
+) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let c = std::ffi::CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: a directory descriptor and a NUL-terminated name.
+    if create && unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), mode) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    // SAFETY: a directory descriptor and a NUL-terminated name.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT) if !create => Ok(None),
+            Some(libc::ELOOP | libc::ENOTDIR) => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "a link or a file where a directory belongs",
+            )),
+            _ => Err(error),
+        };
+    }
+    // SAFETY: openat returned a new descriptor.
+    let dir = unsafe { std::fs::File::from_raw_fd(fd) };
+    if dir.metadata()?.uid() != crate::sandbox::server_uid() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "a directory another user made",
+        ));
+    }
+    Ok(Some(dir))
+}
+
+/// The profile's directory, when it is the server's own: `browser-profiles`
+/// and `<profile>` both plain directories owned by this user, never a link.
+/// The parent is writable by every seat (the socket group), and the profile
+/// name is the caller's, so a seat could otherwise point a profile at the
+/// data directory and have Chromium, the jail and every profile write follow
+/// it (ADR 0010 D3). A profile made here is the server's; the parent's
+/// sticky bit keeps a seat from renaming it away afterwards. `None` when it
+/// is absent and `create` is false.
+fn server_profile_dir(data: &Path, profile: &str, create: bool) -> Result<Option<PathBuf>, Error> {
+    let refuse = |error: std::io::Error| {
+        Error::Message(format!(
+            "browser profile `{profile}` is not the server's own directory: {error}"
+        ))
+    };
+    let data_dir = std::fs::File::open(data)?;
+    let Some(root) =
+        owned_child_dir(&data_dir, "browser-profiles".as_ref(), 0o755, create).map_err(refuse)?
+    else {
+        return Ok(None);
+    };
+    match owned_child_dir(&root, profile.as_ref(), 0o755, create).map_err(refuse)? {
+        Some(_) => Ok(Some(profile_dir(data, profile))),
+        None => Ok(None),
+    }
+}
+
 fn detect_chromium_version() -> (String, String) {
     if let Ok(bin) = chromium_binary()
         && let Ok(out) = Command::new(&bin).arg("--version").output()
@@ -348,8 +424,8 @@ fn remove_profile_file(path: &Path) -> Result<(), Error> {
 }
 
 pub fn ensure_fingerprint(data: &Path, profile: &str) -> Result<BrowserFingerprint, Error> {
-    let dir = profile_dir(data, profile);
-    std::fs::create_dir_all(&dir)?;
+    let dir = server_profile_dir(data, profile, true)?
+        .ok_or_else(|| Error::Message(format!("browser profile `{profile}` is missing")))?;
     let fp_path = dir.join("fingerprint.json");
     if let Some(existing) = read_profile_json::<BrowserFingerprint>(&fp_path)? {
         return Ok(existing);
@@ -599,8 +675,9 @@ fn candidate_profiles(data: &Path) -> Vec<String> {
         if let Ok(entries) = std::fs::read_dir(&root) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if (path.join("runtime.json").is_file() || path.join("takeover.json").is_file())
-                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && matches!(server_profile_dir(data, name, false), Ok(Some(_)))
+                    && (path.join("runtime.json").is_file() || path.join("takeover.json").is_file())
                 {
                     active.names.insert(name.to_string());
                 }
@@ -759,38 +836,31 @@ fn chromium_environment(
     env
 }
 
-/// The server's X display and the authority file Chromium reads to use it
-/// (its `XAUTHORITY`, else `~/.Xauthority`), when one is set.
+/// The server's X display and the authority file its `XAUTHORITY` names,
+/// when one is set. No guessed `~/.Xauthority`: only a file the operator
+/// named is opened to the jail.
 fn x11_display() -> Option<(std::ffi::OsString, Option<PathBuf>)> {
     let name = std::env::var_os("DISPLAY").filter(|v| !v.is_empty())?;
     let authority = std::env::var_os("XAUTHORITY")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".Xauthority")))
         .filter(|path| path.is_absolute() && path.is_file());
     Some((name, authority))
 }
 
 /// `path` as a directory only this user may enter: created 0700, or an
-/// existing one of this user's narrowed to 0700.
+/// existing one of this user's narrowed to 0700 through its own descriptor,
+/// never through a link.
 fn private_dir(path: &Path) -> Result<(), Error> {
-    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
-    match std::fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => return Ok(()),
-        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
-            return Err(error.into());
-        }
-        Err(_) => {}
-    }
-    let meta = std::fs::symlink_metadata(path)?;
-    if !meta.is_dir() || meta.uid() != crate::sandbox::server_uid() {
-        return Err(Error::Message(format!(
-            "{} is not this user's own directory",
-            path.display()
-        )));
-    }
-    if meta.mode() & 0o077 != 0 {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(Error::Message(format!("{} has no parent", path.display())));
+    };
+    let dir = owned_child_dir(&std::fs::File::open(parent)?, name, 0o700, true)
+        .map_err(|error| Error::Message(format!("{}: {error}", path.display())))?
+        .ok_or_else(|| Error::Message(format!("{} is missing", path.display())))?;
+    if dir.metadata()?.mode() & 0o077 != 0 {
+        dir.set_permissions(std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -844,7 +914,8 @@ fn ensure_browser_running(
         return Ok((running, fp));
     }
 
-    let dir = profile_dir(data, profile);
+    let dir = server_profile_dir(data, profile, true)?
+        .ok_or_else(|| Error::Message(format!("browser profile `{profile}` is missing")))?;
     let user_data_dir = dir.join("user-data");
     let screenshots_dir = dir.join("screenshots");
     std::fs::create_dir_all(&user_data_dir)?;
@@ -1097,7 +1168,18 @@ fn stop_process_group(pid: u32) {
 }
 
 pub fn stop_profile(data: &Path, profile: &str) -> Result<serde_json::Value, Error> {
-    let dir = profile_dir(data, profile);
+    // A profile that is not the server's (a planted link, a seat's own
+    // directory) names no browser this server started, and its runtime.json
+    // is never trusted for a pid to signal.
+    let Ok(Some(dir)) = server_profile_dir(data, profile, false) else {
+        return Ok(serde_json::json!({
+            "profile": profile,
+            "status": "stopped",
+            "stopped_pid": null,
+            "released_keys": [],
+            "user_data_preserved": true,
+        }));
+    };
     let rt_path = dir.join("runtime.json");
     let mut stopped_pid = None;
     let mut released_keys = Vec::new();
@@ -1136,7 +1218,7 @@ pub fn reap_idle_browsers(data: &Path) {
     let now = now_ms();
     for name in candidate_profiles(data) {
         let name = name.as_str();
-        if !profile_dir(data, name).is_dir() {
+        if !matches!(server_profile_dir(data, name, false), Ok(Some(_))) {
             forget_active_profile(data, name);
             continue;
         }
@@ -4592,8 +4674,8 @@ pub fn list_profiles(data: &Path) -> Result<Vec<BrowserProfileSummary>, Error> {
     names.insert("default".to_string());
     if let Ok(entries) = std::fs::read_dir(&root) {
         for entry in entries.flatten() {
-            if entry.path().is_dir()
-                && let Some(name) = entry.file_name().to_str()
+            if let Some(name) = entry.file_name().to_str()
+                && matches!(server_profile_dir(data, name, false), Ok(Some(_)))
             {
                 names.insert(name.to_string());
             }
@@ -4721,6 +4803,11 @@ fn execute_inner(
     .to_ascii_lowercase();
 
     let profile = sanitize_profile_name(req.profile.as_deref(), default_profile);
+    // Every action but the listing works in this profile's directory, which
+    // must be the server's own before anything is read from or written to it.
+    if !matches!(action.as_str(), "profiles" | "list") {
+        server_profile_dir(data, &profile, true)?;
+    }
     if req.proxy.is_some()
         && matches!(
             action.as_str(),
@@ -9872,5 +9959,79 @@ esac
             assert_eq!(mode, 0o700, "{}", dir.display());
         }
         stop_profile(data.path(), "envtest").unwrap();
+    }
+
+    /// A seat can put a link (or its own directory) where a profile goes:
+    /// `browser-profiles` is writable by the socket group and the profile
+    /// name is the caller's. Nothing is then read, written or signalled
+    /// through it, and Chromium is never started on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_profile_is_never_used() {
+        let data = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(target.path().join("runtime.json"), br#"{"planted":true}"#).unwrap();
+        std::fs::create_dir_all(profiles_root(data.path())).unwrap();
+        std::os::unix::fs::symlink(target.path(), profile_dir(data.path(), "pwn")).unwrap();
+        std::fs::write(profile_dir(data.path(), "afile"), b"not a dir").unwrap();
+        let before: Vec<_> = std::fs::read_dir(target.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        for profile in ["pwn", "afile"] {
+            for action in ["status", "snapshot", "open", "screenshot", "cookies"] {
+                let error = execute(
+                    data.path(),
+                    "default",
+                    BrowserRequest {
+                        action: action.into(),
+                        profile: Some(profile.into()),
+                        url: (action == "open").then(|| "https://example.test".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    error.contains("not the server's own directory"),
+                    "{action}: {error}"
+                );
+            }
+            assert!(ensure_fingerprint(data.path(), profile).is_err());
+            assert!(ensure_browser_running(data.path(), profile, Some(true), None).is_err());
+            assert_eq!(
+                stop_profile(data.path(), profile).unwrap()["stopped_pid"],
+                serde_json::Value::Null
+            );
+        }
+        let listed = list_profiles(data.path()).unwrap();
+        assert!(
+            listed
+                .iter()
+                .all(|p| p.profile != "pwn" && p.profile != "afile")
+        );
+        let after: Vec<_> = std::fs::read_dir(target.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(
+            std::fs::read(target.path().join("runtime.json")).unwrap(),
+            br#"{"planted":true}"#
+        );
+        // A private directory is never narrowed through a link either.
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let linked_home = data.path().join("linked-home");
+        std::os::unix::fs::symlink(target.path(), &linked_home).unwrap();
+        assert!(private_dir(&linked_home).is_err());
+        assert_eq!(
+            std::fs::metadata(target.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
     }
 }

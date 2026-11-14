@@ -440,6 +440,70 @@ fn exit_within(
     }
 }
 
+/// At most `limit` bytes of `pipe`, read until its writers close it or
+/// `deadline` passes, polling a non-blocking descriptor.
+fn read_until(
+    pipe: std::process::ChildStderr,
+    limit: usize,
+    deadline: std::time::Duration,
+) -> Vec<u8> {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: fcntl on a descriptor `pipe` owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let end = std::time::Instant::now() + deadline;
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while out.len() < limit {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = left.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: one pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+        if ready < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 {
+            break;
+        }
+        // SAFETY: a buffer of the length passed.
+        let read = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if read <= 0 {
+            if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        let take = (read as usize).min(limit - out.len());
+        out.extend_from_slice(&chunk[..take]);
+    }
+    out
+}
+
+/// Seat helpers one uid may leave with the reaper before its next open is
+/// refused.
+const SEAT_REAPER_PER_UID: usize = 8;
+
+fn reaped_for(uid: u32) -> usize {
+    SEAT_REAPER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(owner, _)| *owner == uid)
+        .count()
+}
+
 /// Kill a seat helper that did not exit, and hand it to the reaper. The
 /// daemon may not signal another uid's process, so a kill that is refused
 /// is asked of the seat itself (`seat-file kill <pid>`); that request is
@@ -461,22 +525,23 @@ fn stop_seat_child(
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         if let Ok(kill) = kill.spawn() {
-            reap_later(kill);
+            reap_later(uid, kill);
         }
     }
-    reap_later(child);
+    reap_later(uid, child);
 }
 
 /// Children a request thread will not wait for, reaped by one background
 /// thread as they exit.
-static SEAT_REAPER: std::sync::Mutex<Vec<std::process::Child>> = std::sync::Mutex::new(Vec::new());
+static SEAT_REAPER: std::sync::Mutex<Vec<(u32, std::process::Child)>> =
+    std::sync::Mutex::new(Vec::new());
 
-fn reap_later(child: std::process::Child) {
+fn reap_later(uid: u32, child: std::process::Child) {
     static STARTED: std::sync::Once = std::sync::Once::new();
     SEAT_REAPER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(child);
+        .push((uid, child));
     STARTED.call_once(|| {
         let _ = std::thread::Builder::new()
             .name("seat-reaper".into())
@@ -485,7 +550,7 @@ fn reap_later(child: std::process::Child) {
                     SEAT_REAPER
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
+                        .retain_mut(|(_, child)| !matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
             });
@@ -523,7 +588,6 @@ fn open_as_seat_within(
     create: bool,
     timeout: std::time::Duration,
 ) -> io::Result<File> {
-    use std::io::Read as _;
     if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -531,6 +595,14 @@ fn open_as_seat_within(
         ));
     }
     let stage = if create { "seat-create" } else { "seat-open" };
+    // A seat whose helpers keep not exiting gets no more: what the reaper
+    // holds for one uid stays bounded.
+    if reaped_for(uid) >= SEAT_REAPER_PER_UID {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("{stage}: this seat's earlier helpers have not exited"),
+        ));
+    }
     let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
     ours.set_read_timeout(Some(timeout))?;
     // The command, and with it this process's copy of the seat's end, is
@@ -550,18 +622,6 @@ fn open_as_seat_within(
         })?
     };
     let stderr = child.stderr.take().expect("piped seat stderr");
-    // The reason a helper failed, read off its stderr by a thread nobody
-    // joins: a pipe the seat keeps open never holds this one.
-    let (reason_sender, reason) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut stderr = stderr;
-        let mut prefix = Vec::new();
-        let _ = (&mut stderr)
-            .take(SEAT_STDERR_LIMIT)
-            .read_to_end(&mut prefix);
-        let _ = reason_sender.send(prefix);
-        let _ = io::copy(&mut stderr, &mut io::sink());
-    });
     let mut reader = anyagents_keeper::wire::FrameReader::new(&ours);
     let answer = reader.next_frame();
     let mut fds = reader.take_fds();
@@ -589,7 +649,10 @@ fn open_as_seat_within(
             ))),
         };
     };
-    let prefix = reason.recv_timeout(SEAT_EXIT_GRACE).unwrap_or_default();
+    // The helper has exited. Its reason is what its stderr holds now, read
+    // without a thread and never past a deadline: a pipe the seat keeps
+    // open (a process it forked) cannot hold this one.
+    let prefix = read_until(stderr, SEAT_STDERR_LIMIT as usize, SEAT_EXIT_GRACE);
     if !status.success() {
         let stderr = String::from_utf8_lossy(&prefix);
         // The helper's own reason, without its prefix; Debug escaping keeps
@@ -2255,6 +2318,59 @@ exec "$@"
             .is_empty()
         {
             assert!(std::time::Instant::now() < deadline, "helper never reaped");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// A helper whose stderr a process it forked keeps open still yields
+    /// its reason within the grace, and a seat's helpers held by the reaper
+    /// are bounded: past the bound its next open is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_held_stderr_and_a_full_reaper_never_pin_the_caller() {
+        let temp = crate::test_tempdir();
+        let launcher = temp.path().join("holding.sh");
+        crate::worktree::tests::write_executable(
+            &launcher,
+            "#!/bin/sh\n/bin/sleep 30 </dev/null >/dev/null &\necho denied >&2\nexit 3\n",
+        );
+        let file = temp.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let started = std::time::Instant::now();
+        let error = open_as_seat(&launcher, 42011, 42012, "42012", &file, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("exit status: 3") && error.contains("denied"),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let uid = 42021;
+        let mut sleepers = Vec::new();
+        for _ in 0..SEAT_REAPER_PER_UID {
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            sleepers.push(child.id());
+            reap_later(uid, child);
+        }
+        let error = open_as_seat(&launcher, uid, 42012, "42012", &file, false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        for pid in sleepers {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while reaped_for(uid) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sleepers never reaped"
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
