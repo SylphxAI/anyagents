@@ -428,6 +428,46 @@ fn each_turn_costs_what_it_added_across_a_relaunch() {
     assert_eq!(harness.served_usage().reported_cost_micros, Some(1_500_000));
 }
 
+/// A resumed Claude Code process restores its session's running cost from
+/// the transcript's last `cost-state` row and counts on from it: the first
+/// turn of a later process costs what it added, not the session's total.
+#[test]
+fn a_resumed_session_charges_its_first_turn_only_what_it_added() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    let log = log_path(&dir);
+    let launch = || {
+        ClaudeHarness::start(
+            env!("CARGO_BIN_EXE_fake_claude"),
+            Some("sess-1"),
+            &[
+                ("ANYAGENTS_FAKE_MODE", "turns"),
+                ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+                ("CLAUDE_CONFIG_DIR", config.to_str().unwrap()),
+            ],
+        )
+        .expect("start")
+    };
+    let cost = |harness: &mut ClaudeHarness, id: &str| {
+        let outcome = taken(harness, id);
+        assert!(
+            matches!(outcome, DeliverOutcome::Accepted { .. }),
+            "{id}: {outcome:?}"
+        );
+        assert!(harness.wait_finished(id, Duration::from_secs(5)));
+        harness.usage_for(id).expect("usage").reported_cost_micros
+    };
+    let mut first = launch();
+    assert_eq!(cost(&mut first, "m1"), Some(500_000));
+    assert_eq!(cost(&mut first, "m2"), Some(500_000));
+    drop(first);
+    // A later process resumes the session: its running total starts at 1.0.
+    let mut later = launch();
+    assert_eq!(cost(&mut later, "m3"), Some(500_000));
+    assert_eq!(later.served_usage().reported_cost_micros, Some(500_000));
+}
+
 #[test]
 fn a_proof_stays_valid_across_a_relaunch() {
     let dir = TempDir::new().unwrap();

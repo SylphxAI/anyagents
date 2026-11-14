@@ -26,15 +26,40 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-/// A successful turn's result. `total_cost_usd` is this process's running
-/// total, as Claude Code reports it: each turn here costs 0.5.
-fn result(results: &mut u32) -> String {
-    *results += 1;
-    json!({"type": "result", "subtype": "success", "session_id": "sess-from-vendor",
-           "total_cost_usd": 0.5 * f64::from(*results),
+/// A successful turn's result. `total_cost_usd` is the session's running
+/// total, as Claude Code reports it: each turn here costs 0.5. As Claude Code
+/// does, the total is saved in the session transcript as a `cost-state` row,
+/// and a resumed process restores it from there.
+fn result(total: &mut f64, transcript: Option<&PathBuf>, session: &str) -> String {
+    *total += 0.5;
+    if let Some(transcript) = transcript
+        && let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(transcript)
+    {
+        let row = json!({"type": "cost-state", "sessionId": session, "totalCostUSD": *total});
+        let _ = writeln!(file, "{row}");
+    }
+    json!({"type": "result", "subtype": "success", "session_id": session,
+           "total_cost_usd": *total,
            "usage": {"input_tokens": 11, "output_tokens": 7,
                      "cache_read_input_tokens": 3, "cache_creation_input_tokens": 2}})
     .to_string()
+}
+
+/// The running cost the session's transcript last saved: what a resumed
+/// Claude Code process carries on from.
+fn restored_cost(transcript: Option<&PathBuf>) -> f64 {
+    let Some(text) = transcript.and_then(|path| std::fs::read_to_string(path).ok()) else {
+        return 0.0;
+    };
+    text.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|row| row.get("type").and_then(Value::as_str) == Some("cost-state"))
+        .and_then(|row| row.get("totalCostUSD").and_then(Value::as_f64))
+        .unwrap_or(0.0)
 }
 const QUOTA: &str = r#"{"type":"system","subtype":"api_retry","category":"rate_limit","resets_at_ms":1700000000000}"#;
 const FAILED: &str = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"sess-from-vendor","result":"Invalid API key · Please run /login","usage":{"input_tokens":0,"output_tokens":0}}"#;
@@ -87,7 +112,7 @@ fn main() {
     }
 
     let mut users = 0usize;
-    let mut results = 0u32;
+    let mut total = restored_cost(transcript.as_ref());
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         log(&log_path, &line);
@@ -107,7 +132,11 @@ fn main() {
         }
         let late = mode == "batch_late" && users == 2;
         if late {
-            let _ = writeln!(stdout, "{}", result(&mut results));
+            let _ = writeln!(
+                stdout,
+                "{}",
+                result(&mut total, transcript.as_ref(), &session)
+            );
         }
         prove(&mut stdout, &value);
         if mode == "unpersisted" {
@@ -128,7 +157,11 @@ fn main() {
             }
         }
         if mode == "finish" || mode == "turns" || (mode == "batch" && users == 2) {
-            let _ = writeln!(stdout, "{}", result(&mut results));
+            let _ = writeln!(
+                stdout,
+                "{}",
+                result(&mut total, transcript.as_ref(), &session)
+            );
         }
         if mode == "failed_turn" && users == 1 {
             let _ = writeln!(stdout, "{FAILED}");

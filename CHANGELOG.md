@@ -8,16 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 - Usage accounting no longer over-counts cost for Claude Code and OpenCode
-  agents. Claude Code's `total_cost_usd` is the process's running total; from
-  2026-10-18 (`bca6c22`), and summed across a process's turns from 2026-10-21
-  (`977d123`), each turn recorded that running total, so usage rows from that
-  window overstate cost (live rows near $112-115 a turn). OpenCode reports
-  its session's running totals, which outlive a process; from 2026-10-21
-  (`7210d6f`) the first reading after every process replacement recorded the
-  whole session again, so rows following a replacement in that window
-  overstate tokens and cost. Both adapters now report what each turn, and
-  each process, added. Historical rows are not rewritten; read usage and cost
-  from that window with this in mind.
+  agents. Claude Code's `total_cost_usd` is the session's running total: a
+  resumed process restores it from the transcript's last `cost-state` row
+  and counts on from there. From 2026-10-18 (`bca6c22`), and summed across a
+  process's turns from 2026-10-21 (`977d123`), each turn recorded that
+  running total, so usage rows from that window overstate cost (live rows
+  near $112-115 a turn), most of all for long sessions that were resumed
+  many times. OpenCode reports its session's running totals, which outlive a
+  process; from 2026-10-21 (`7210d6f`) the first reading after every process
+  replacement recorded the whole session again, so rows following a
+  replacement in that window overstate tokens and cost. Both adapters now
+  report what each turn, and each process, added. Historical rows are not
+  rewritten; read usage and cost from that window with this in mind.
 - Keep role labels methodology-neutral: roots and labelled children can self-archive
   and release idle processes under the same rules. Preserve legacy effective scopes
   on upgrade, default all new children to private, and retain browser profiles until

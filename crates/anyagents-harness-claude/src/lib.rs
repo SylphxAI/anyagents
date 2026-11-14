@@ -8,7 +8,7 @@
 //! at any point, mid-turn included, so every mailbox line is written the moment
 //! it arrives and the running conversation takes it. `turn_finished` becomes
 //! true when a `result` event closes the open turn. Token counts from that
-//! event, and the cost the turn added to the process's running
+//! event, and the cost the turn added to the session's running
 //! `total_cost_usd`, are kept on the finished ids.
 //!
 //! Mid-turn delivery: every line carries a `uuid` derived from its mailbox id.
@@ -118,8 +118,9 @@ struct State {
     sign_in_fault: Option<String>,
     session_id: Option<String>,
     usages: Vec<(String, TurnUsage)>,
-    /// The process's running `total_cost_usd` at the last turn that counted
-    /// it: each turn costs what it added.
+    /// The session's running `total_cost_usd` at the last turn that counted
+    /// it, or as a resumed session's transcript last saved it: each turn
+    /// costs what it added.
     cost_seen: Option<i64>,
     failures: Vec<(String, String)>,
     turns: std::collections::BTreeMap<String, u64>,
@@ -455,8 +456,10 @@ impl ClaudeHarness {
             state.alive = true;
             state.exited_at = None;
             state.sign_in_fault = None;
-            // A new process's running cost starts again from nothing.
-            state.cost_seen = None;
+            // A resumed process carries on from the cost its session's
+            // transcript last saved (Claude Code restores it); a new session
+            // starts from nothing.
+            state.cost_seen = scan.cost;
             state.open.clear();
             state.followups.clear();
             // What the last process wrote and the session holds is the
@@ -1038,9 +1041,10 @@ fn apply_result(state: &mut State, value: &Value) {
         return;
     }
     let mut usage = usage_from_claude(value);
-    // `total_cost_usd` is the running total of this process, not the turn's:
-    // the turn cost what it added since the last turn counted. An errored
-    // turn's cost is left in the total, and counted with the next turn.
+    // `total_cost_usd` is the session's running total, not the turn's (a
+    // resumed process restores it from the transcript): the turn cost what
+    // it added since the last turn counted. An errored turn's cost is left
+    // in the total, and counted with the next turn.
     if let Some(total) = usage.reported_cost_micros {
         usage.reported_cost_micros = Some((total - state.cost_seen.unwrap_or(0)).max(0));
         state.cost_seen = Some(total);
@@ -1379,6 +1383,9 @@ fn transcript_marks(environment: &[(String, String)], session: &str) -> Transcri
             let (ids, uuids) = row_marks(row);
             scan.ids.extend(ids);
             scan.uuids.extend(uuids);
+            if row.get("type").and_then(Value::as_str) == Some("cost-state") {
+                scan.cost = row.get("totalCostUSD").and_then(usd_to_micros);
+            }
         });
         // The live read starts where this scan ended.
         scan.tail = TranscriptTail {
@@ -1395,6 +1402,9 @@ struct TranscriptScan {
     ids: HashSet<String>,
     uuids: HashSet<String>,
     tail: TranscriptTail,
+    /// The session's running cost as its last `cost-state` row saved it,
+    /// which a resumed Claude Code process restores and counts on from.
+    cost: Option<i64>,
 }
 
 /// Call `row` for each complete JSONL row of `reader`, decoding lossily so
@@ -1754,7 +1764,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
-    /// `total_cost_usd` is the process's running total: each turn is
+    /// `total_cost_usd` is the session's running total: each turn is
     /// charged what it added, so the served total is the last running total,
     /// never the sum of every running total seen.
     #[test]
