@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Agents report defects to whoever runs the deployment with `send` to
+  `operator`: a defect in AnyAgents, the harness or the host that an agent
+  cannot fix within its own work. Only the operator reads it, with
+  `anyagents inbox --operator`. Each sender and the whole fleet have a small
+  burst and an hourly cap, the same text within an hour is counted on the
+  first report, and reports are kept for 30 days. No agent may be named
+  `operator`.
 - Usage accounting no longer over-counts cost for Claude Code and OpenCode
   agents. Claude Code's `total_cost_usd` is the session's running total: a
   resumed process restores it from the transcript's last `cost-state` row
@@ -59,6 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are no longer in it. The public listener's `/`, `/healthz` and
   `/v1/webhooks/healthz` return `{"ok":true}`; the serving identity stays on
   `anyagents.sock`.
+- MCP over HTTP serves at most the `remote` profile, whatever credential is
+  presented: `?profile=full` is refused with 403 and no binding upgrades it,
+  because over HTTP the tools run inside the server process as its own user.
+  `full` remains available over stdio, where the tool server runs as the agent.
+  Calls over HTTP MCP also cannot place an agent on a host harness, wake an
+  agent that runs on the host (directly or by a send to an archived one), or
+  attach media by a local path.
 - Tool contracts follow what agents write. `code` honours `timeout_ms` up to a
   configurable ceiling (default 30 s, max 10 min; `<data>/tool-limits.json` or
   `ANYAGENTS_CODE_TIMEOUT_MS` / `ANYAGENTS_CODE_MAX_TIMEOUT_MS`); an inner
