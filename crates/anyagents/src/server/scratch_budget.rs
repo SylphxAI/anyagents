@@ -66,6 +66,8 @@ const REPORT_EVERY_MS: i64 = 6 * 3_600_000;
 const EVICTING: &str = ".evicting-";
 /// The desk Cargo wrapper's scope leases, beside the targets they guard.
 const DESK_CACHE_LOCKS: &str = ".desk-cache-locks";
+/// The locks Cargo holds in a target directory or profile while it builds.
+const CARGO_LOCKS: &[&str] = &[".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
 /// The first line of a valid `CACHEDIR.TAG` (bford.info/cachedir).
 const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 /// What Gradle keeps under its user home that it downloads or builds again.
@@ -557,20 +559,19 @@ fn lock_exclusive(file: &std::fs::File) -> bool {
 
 /// Take, without waiting, every lock a build of `dir` holds: the desk Cargo
 /// wrapper's scope lease (held shared for a whole build, never created or
-/// removed here) and Cargo's `.cargo-lock` in the unit or a profile directly
-/// in it. `None` when any is held or cannot be read: the unit is in use.
+/// removed here) and Cargo's own locks in the unit or a profile directly in
+/// it. `None` when any is held or cannot be read: the unit is in use.
 fn take_leases(dir: &Path) -> Option<Leases> {
     let mut held = Vec::new();
     let mut candidates = Vec::new();
     if let (Some(key), Some(parent)) = (scope_key(dir), dir.parent()) {
         candidates.push(parent.join(DESK_CACHE_LOCKS).join(format!("{key}.lock")));
     }
-    candidates.push(dir.join(".cargo-lock"));
-    candidates.extend(
-        subdirs(dir)
-            .into_iter()
-            .map(|(_, sub)| sub.join(".cargo-lock")),
-    );
+    let mut levels = vec![dir.to_path_buf()];
+    levels.extend(subdirs(dir).into_iter().map(|(_, sub)| sub));
+    for level in levels {
+        candidates.extend(CARGO_LOCKS.iter().map(|name| level.join(name)));
+    }
     for path in candidates {
         match open_lock(&path) {
             Ok(None) => {}
