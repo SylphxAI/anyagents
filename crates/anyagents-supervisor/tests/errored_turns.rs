@@ -243,6 +243,8 @@ fn turns_that_keep_erroring_park_the_agent_and_tell_its_parent() {
         "the last turn waits for a resume to recover it"
     );
 
+    // The parking commits first; its notice follows.
+    assert!(wait_until(|| !notices(&fx.store, &fx.lead).is_empty()));
     let told = notices(&fx.store, &fx.lead);
     assert_eq!(told.len(), 1, "{told:?}");
     assert!(
@@ -356,6 +358,6 @@ fn transient_errors_back_off_and_park_only_after_a_long_run() {
         MAX_TRANSIENT_ERRORED_TURNS
     );
     assert_eq!(given(), MAX_TRANSIENT_ERRORED_TURNS as usize);
-    assert_eq!(notices(&fx.store, &fx.lead).len(), 1);
+    assert!(wait_until(|| notices(&fx.store, &fx.lead).len() == 1));
     support::stop(fx.supervisor);
 }
