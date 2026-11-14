@@ -18,6 +18,7 @@ use anyagents_core::{Error, now_ms};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod jail;
 mod proxy;
 
 const DEFAULT_IDLE_TIMEOUT_MS: i64 = 15 * 60 * 1000;
@@ -631,6 +632,122 @@ fn cleanup_singleton_locks(user_data_dir: &Path) {
     }
 }
 
+/// Flags that would let a page read host files, or lift the same-origin
+/// policy that keeps one from another. Chromium runs as the server's user, so
+/// none is ever passed (ADR 0010 D3).
+const FILE_ACCESS_FLAGS: &[&str] = &[
+    "--allow-file-access-from-files",
+    "--allow-file-access",
+    "--disable-web-security",
+    "--enable-local-file-accesses",
+];
+
+fn refuse_file_access_flags(args: &[String]) -> Result<(), Error> {
+    match args.iter().find(|arg| {
+        let name = arg.split('=').next().unwrap_or(arg);
+        FILE_ACCESS_FLAGS.contains(&name)
+    }) {
+        Some(flag) => Err(Error::Message(format!(
+            "refusing to start Chromium with `{flag}`"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// `<profile>/chromium-tmp`: names the private temporary directory the
+/// profile's running Chromium was given.
+fn chromium_tmp_record(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("chromium-tmp")
+}
+
+const CHROMIUM_TMP_PREFIX: &str = "/tmp/anyagents-chromium-";
+
+/// Remove the private temporary directory recorded for a profile, when it is
+/// still this user's own directory.
+fn remove_chromium_tmp(profile_dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let record = chromium_tmp_record(profile_dir);
+        if let Ok(text) = std::fs::read_to_string(&record) {
+            let path = Path::new(text.trim());
+            if text.trim().starts_with(CHROMIUM_TMP_PREFIX)
+                && path.parent() == Some(Path::new("/tmp"))
+                && let Ok(meta) = std::fs::symlink_metadata(path)
+                && meta.is_dir()
+                && meta.uid() == crate::sandbox::server_uid()
+            {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+        let _ = std::fs::remove_file(record);
+    }
+}
+
+/// A new private (0700) temporary directory for a profile's Chromium, with a
+/// short name: Chromium's singleton socket lives there and must fit a Unix
+/// socket address (108 bytes), which a path inside the profile does not.
+fn new_chromium_tmp(profile_dir: &Path) -> Result<PathBuf, Error> {
+    use std::os::unix::ffi::OsStringExt as _;
+    remove_chromium_tmp(profile_dir);
+    let mut template = format!("{CHROMIUM_TMP_PREFIX}XXXXXX\0").into_bytes();
+    // SAFETY: a writable NUL-terminated template ending in XXXXXX.
+    if unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) }.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    template.pop();
+    let path = PathBuf::from(std::ffi::OsString::from_vec(template));
+    std::fs::write(
+        chromium_tmp_record(profile_dir),
+        path.as_os_str().as_encoded_bytes(),
+    )?;
+    Ok(path)
+}
+
+/// `<profile>/home`: the `HOME` Chromium runs with.
+fn chromium_home(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("home")
+}
+
+/// The environment that keeps Chromium's per-user files under `home`.
+fn chromium_env(home: &Path) -> [(&'static str, PathBuf); 4] {
+    [
+        ("HOME", home.to_path_buf()),
+        ("XDG_CONFIG_HOME", home.join(".config")),
+        ("XDG_CACHE_HOME", home.join(".cache")),
+        ("XDG_DATA_HOME", home.join(".local/share")),
+    ]
+}
+
+/// The Chromium command line for one profile, before display and proxy.
+fn chromium_args(user_data_dir: &Path, port: u16, fp: &BrowserFingerprint) -> Vec<String> {
+    vec![
+        format!("--user-data-dir={}", user_data_dir.display()),
+        format!("--remote-debugging-port={port}"),
+        "--remote-debugging-address=127.0.0.1".to_string(),
+        "--remote-allow-origins=*".to_string(),
+        "--disable-blink-features=AutomationControlled".to_string(),
+        "--disable-infobars".to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--password-store=basic".to_string(),
+        "--use-mock-keychain".to_string(),
+        "--disable-background-timer-throttling".to_string(),
+        "--disable-backgrounding-occluded-windows".to_string(),
+        "--disable-renderer-backgrounding".to_string(),
+        "--disable-dev-shm-usage".to_string(),
+        "--no-sandbox".to_string(),
+        "--enable-webgl".to_string(),
+        "--ignore-gpu-blocklist".to_string(),
+        "--enable-unsafe-swiftshader".to_string(),
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string(),
+        format!("--user-agent={}", fp.user_agent),
+        format!("--window-size={},{}", fp.screen_width, fp.screen_height),
+        "--lang=zh-HK".to_string(),
+        "about:blank".to_string(),
+    ]
+}
+
 fn ensure_browser_running(
     data: &Path,
     profile: &str,
@@ -664,39 +781,31 @@ fn ensure_browser_running(
     let has_display = std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty());
     let bin = chromium_binary()?;
 
-    let mut chrome_args = vec![
-        format!("--user-data-dir={}", user_data_dir.display()),
-        format!("--remote-debugging-port={port}"),
-        "--remote-debugging-address=127.0.0.1".to_string(),
-        "--remote-allow-origins=*".to_string(),
-        "--disable-blink-features=AutomationControlled".to_string(),
-        "--disable-infobars".to_string(),
-        "--no-first-run".to_string(),
-        "--no-default-browser-check".to_string(),
-        "--password-store=basic".to_string(),
-        "--use-mock-keychain".to_string(),
-        "--disable-background-timer-throttling".to_string(),
-        "--disable-backgrounding-occluded-windows".to_string(),
-        "--disable-renderer-backgrounding".to_string(),
-        "--disable-dev-shm-usage".to_string(),
-        "--no-sandbox".to_string(),
-        "--enable-webgl".to_string(),
-        "--ignore-gpu-blocklist".to_string(),
-        "--enable-unsafe-swiftshader".to_string(),
-        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string(),
-        format!("--user-agent={}", fp.user_agent),
-        format!("--window-size={},{}", fp.screen_width, fp.screen_height),
-        "--lang=zh-HK".to_string(),
-        "about:blank".to_string(),
-    ];
+    let mut chrome_args = chromium_args(&user_data_dir, port, &fp);
 
     if let Some(arg) = proxy::launch_argument(proxy.as_deref()) {
         chrome_args.insert(0, arg);
     }
+    refuse_file_access_flags(&chrome_args)?;
 
+    // On Linux Chromium starts inside a Landlock jail that opens only the
+    // system and this profile to it; required whenever seats share the host.
+    let private_tmp = if cfg!(target_os = "linux") {
+        Some(new_chromium_tmp(&dir)?)
+    } else {
+        None
+    };
+    let (program, program_args) = match &private_tmp {
+        Some(tmp) => jail::wrap(
+            &[&std::path::absolute(&dir)?, tmp],
+            crate::sandbox::seats_configured(),
+            &bin,
+        )?,
+        None => (bin.clone(), Vec::new()),
+    };
     let (mut cmd, display_mode, actual_headless) = if !want_headless && has_display {
-        let mut c = Command::new(&bin);
-        c.args(&chrome_args);
+        let mut c = Command::new(&program);
+        c.args(&program_args).args(&chrome_args);
         (c, "x11-display".to_string(), false)
     } else if !want_headless && has_xvfb {
         let mut c = Command::new("/usr/bin/xvfb-run");
@@ -704,7 +813,8 @@ fn ensure_browser_running(
         c.arg("-a")
             .arg("-s")
             .arg(xvfb_server_args)
-            .arg(&bin)
+            .arg(&program)
+            .args(&program_args)
             .args(&chrome_args);
         (c, "xvfb-headed".to_string(), false)
     } else {
@@ -712,8 +822,8 @@ fn ensure_browser_running(
         chrome_args.insert(1, "--hide-scrollbars".to_string());
         chrome_args.insert(2, "--disable-gpu".to_string());
         chrome_args.insert(3, "--no-zygote".to_string());
-        let mut c = Command::new(&bin);
-        c.args(&chrome_args);
+        let mut c = Command::new(&program);
+        c.args(&program_args).args(&chrome_args);
         (c, "headless-new".to_string(), true)
     };
 
@@ -723,6 +833,22 @@ fn ensure_browser_running(
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(err_file))
         .env("TZ", &fp.timezone);
+    // Chromium's home is inside its profile, so a download, a cache or a
+    // certificate store lands there and never in the server user's home; the
+    // distribution wrapper takes extra flags only from root's /etc.
+    let home = chromium_home(&std::path::absolute(&dir)?);
+    std::fs::create_dir_all(home.join("Downloads"))?;
+    for (name, value) in chromium_env(&home) {
+        cmd.env(name, value);
+    }
+    // xvfb-run's X authority file and Chromium's own temporary files, its
+    // singleton socket among them: in a private directory the jail opens.
+    if let Some(tmp) = &private_tmp {
+        cmd.env("TMPDIR", tmp);
+    }
+    for name in ["CHROMIUM_FLAGS", "CHROMIUM_USER_FLAGS", "XDG_DOWNLOAD_DIR"] {
+        cmd.env_remove(name);
+    }
 
     #[cfg(unix)]
     {
@@ -910,6 +1036,7 @@ pub fn stop_profile(data: &Path, profile: &str) -> Result<serde_json::Value, Err
     cleanup_takeover_session(data, profile)?;
     remove_profile_file(&rt_path)?;
     cleanup_singleton_locks(&dir.join("user-data"));
+    remove_chromium_tmp(&dir);
     Ok(serde_json::json!({
         "profile": profile,
         "status": "stopped",
@@ -2374,7 +2501,79 @@ fn render_takeover_html(profile: &str, token: &str, reason: Option<&str>) -> Str
         .replace("{{SCRIPT}}", include_str!("browser_takeover.js"))
 }
 
+/// The URL a page may be sent to for a caller: `http(s)://` or
+/// `about:blank`, as Chromium itself will read it. A URL without a scheme is
+/// `https://`. Chromium runs as the server's user, so `file:`, `view-source:`,
+/// `chrome:`, `devtools:`, `data:`, `javascript:` and every other scheme would
+/// reach host files or browser internals the caller could not (ADR 0010 D3).
+fn navigable_url(raw: &str) -> Result<String, Error> {
+    // What Chromium's URL parser drops before it reads a scheme: leading and
+    // trailing C0 controls and spaces, and every tab or newline anywhere.
+    let url: String = raw
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    if url.is_empty() {
+        return Err(Error::Message("browser navigation requires a URL".into()));
+    }
+    if url.eq_ignore_ascii_case("about:blank") {
+        return Ok("about:blank".to_string());
+    }
+    match url_scheme(&url) {
+        // `example.com` or `localhost:8080/x`: a host, over https.
+        None => Ok(format!("https://{url}")),
+        Some(scheme) if scheme == "http" || scheme == "https" => Ok(url),
+        Some(scheme) => Err(Error::Message(format!(
+            "browser navigation allows only http://, https:// and about:blank, not `{scheme}:`"
+        ))),
+    }
+}
+
+/// The lowercased scheme `url` names, if it names one: the letters before
+/// its first `:` when they form a scheme and what follows is not a port.
+fn url_scheme(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once(':')?;
+    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    let after_port = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    let is_port = after_port.len() < rest.len()
+        && after_port
+            .chars()
+            .next()
+            .is_none_or(|c| matches!(c, '/' | '?' | '#'));
+    (is_scheme && !is_port).then(|| scheme.to_ascii_lowercase())
+}
+
+/// Whether a page now showing `url` may be read or driven for a caller:
+/// what [`navigable_url`] admits, plus Chromium's own error page for a
+/// navigation that failed.
+fn readable_page_url(url: &str) -> bool {
+    let url = url.trim();
+    url.is_empty()
+        || url.eq_ignore_ascii_case("about:blank")
+        || url
+            .to_ascii_lowercase()
+            .starts_with("chrome-error://chromewebdata/")
+        || matches!(url_scheme(url).as_deref(), Some("http" | "https"))
+}
+
+/// A CDP target id as Chromium writes it, so one is never a path or query in
+/// a DevTools HTTP request.
+fn checked_target_id(tid: &str) -> Result<&str, Error> {
+    if !tid.is_empty() && tid.len() <= 64 && tid.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        Ok(tid)
+    } else {
+        Err(Error::Message(format!(
+            "`{tid}` is not a browser target id"
+        )))
+    }
+}
+
 fn navigate_page(cdp: &mut CdpSession, url: &str) -> Result<(), Error> {
+    let url = navigable_url(url)?;
     let result = cdp.call("Page.navigate", serde_json::json!({ "url": url }))?;
     if let Some(error) = result["errorText"].as_str().filter(|s| !s.is_empty()) {
         return Err(Error::Message(format!("Page.navigate: {error}")));
@@ -4356,10 +4555,13 @@ pub fn list_profiles(data: &Path) -> Result<Vec<BrowserProfileSummary>, Error> {
     Ok(out)
 }
 
+/// Run one browser request. `files` is whose access opens any host file the
+/// request names (a screenshot `path`): the caller's, never the server's.
 pub fn execute(
     data: &Path,
     default_profile: &str,
     req: BrowserRequest,
+    files: &crate::agent_file::FileAuthority,
 ) -> Result<serde_json::Value, Error> {
     let secret = req.secret_ref.is_some()
         || req.text.as_deref().is_some_and(|s| {
@@ -4367,7 +4569,8 @@ pub fn execute(
             s.starts_with("op://") || s.starts_with("op-otp://") || s.starts_with("secret://")
         });
     let mutating = !browser_action_reads(&req);
-    execute_inner(data, default_profile, req).map_err(|err| browser_error(err, secret, mutating))
+    execute_inner(data, default_profile, req, files)
+        .map_err(|err| browser_error(err, secret, mutating))
 }
 
 /// Whether a browser request only reads. Anything else, including an action
@@ -4427,6 +4630,7 @@ fn execute_inner(
     data: &Path,
     default_profile: &str,
     req: BrowserRequest,
+    files: &crate::agent_file::FileAuthority,
 ) -> Result<serde_json::Value, Error> {
     reap_idle_browsers(data);
     let action = if req.action.trim().is_empty() {
@@ -4486,6 +4690,11 @@ fn execute_inner(
         _ => {}
     }
 
+    // Any URL a request carries is checked before a browser starts or a page
+    // is touched.
+    if let Some(url) = req.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        navigable_url(url)?;
+    }
     check_human_takeover_fence(data, &profile, &action)?;
 
     // Reject stale refs before launching a browser, connecting CDP, or resolving secrets.
@@ -4517,7 +4726,8 @@ fn execute_inner(
                 }));
             }
             "new" | "open" => {
-                let u = req.url.as_deref().unwrap_or("about:blank");
+                let u = navigable_url(req.url.as_deref().unwrap_or("about:blank"))?;
+                let u = u.as_str();
                 let page = select_page_target(data, &mut rt, None)?;
                 let ws_url = page
                     .ws_url
@@ -4544,6 +4754,7 @@ fn execute_inner(
                     .target_id
                     .as_deref()
                     .ok_or_else(|| Error::Message("tabs activate requires target_id".into()))?;
+                let tid = checked_target_id(tid)?;
                 cdp_http_get(rt.cdp_port, &format!("/json/activate/{tid}"))?;
                 rt.active_target_id = Some(tid.to_string());
                 save_runtime(data, &rt)?;
@@ -4559,6 +4770,7 @@ fn execute_inner(
                     .or(rt.active_target_id.as_deref())
                     .ok_or_else(|| Error::Message("tabs close requires target_id".into()))?
                     .to_string();
+                checked_target_id(&tid)?;
                 cdp_http_get(rt.cdp_port, &format!("/json/close/{tid}"))?;
                 if rt.active_target_id.as_deref() == Some(&tid) {
                     rt.active_target_id = None;
@@ -4580,6 +4792,14 @@ fn execute_inner(
         .ws_url
         .ok_or_else(|| Error::Message("browser page has no WebSocket debugger URL".into()))?;
     let mut cdp = CdpSession::connect(rt.cdp_port, &ws_url)?;
+    // A page showing a host file or a browser-internal page is never read or
+    // driven for a caller, however it got there; it goes back to blank.
+    if !readable_page_url(&target.url) {
+        let _ = cdp.call("Page.navigate", serde_json::json!({ "url": "about:blank" }));
+        return Err(Error::Message(
+            "the browser page was showing a URL other than http(s) or about:blank; it was reset to about:blank".into(),
+        ));
+    }
     apply_stealth(&mut cdp, &fp)?;
 
     match action.as_str() {
@@ -4590,11 +4810,7 @@ fn execute_inner(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| Error::Message("browser open requires `url`".into()))?;
-            let url = if raw_url.contains("://") || raw_url.starts_with("about:") {
-                raw_url.to_string()
-            } else {
-                format!("https://{raw_url}")
-            };
+            let url = navigable_url(raw_url)?;
             release_recorded_held_keys(data, &profile, &mut cdp)?;
             navigate_page(&mut cdp, &url)?;
             let wait_ms = req.wait_ms.unwrap_or(1000);
@@ -5259,66 +5475,35 @@ fn execute_inner(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from);
-            let final_path = if let Some(ref target) = requested_path {
-                if let Some(parent) = target.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if std::fs::write(target, &png_bytes).is_ok() {
-                    target.clone()
-                } else {
-                    std::fs::write(&fallback_path, &png_bytes)?;
-                    #[cfg(unix)]
-                    let copied_to_seat = {
-                        use std::os::unix::fs::MetadataExt as _;
-                        if let Some(parent) = target.parent()
-                            && let Ok(meta) = std::fs::metadata(parent)
-                            && meta.uid() != unsafe { libc::geteuid() }
-                            && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
-                        {
-                            let uid_s = meta.uid().to_string();
-                            let gid_s = meta.gid().to_string();
-                            Command::new("/usr/local/bin/anyagents-setpriv")
-                                .args([
-                                    "--reuid",
-                                    &uid_s,
-                                    "--regid",
-                                    &gid_s,
-                                    "--groups",
-                                    &gid_s,
-                                    "--no-new-privs",
-                                    "--",
-                                    "/bin/cp",
-                                    "-f",
-                                ])
-                                .arg(&fallback_path)
-                                .arg(target)
-                                .status()
-                                .is_ok_and(|s| s.success())
-                        } else {
-                            false
-                        }
-                    };
-                    #[cfg(not(unix))]
-                    let copied_to_seat = false;
-                    if copied_to_seat {
-                        target.clone()
-                    } else {
+            // A requested path is written with the caller's own access, never
+            // the server's: a seat writes it as itself (ADR 0010 D3). One it
+            // cannot write still gets the profile's copy, and says why.
+            let mut path_refused = None;
+            let final_path = match requested_path {
+                Some(target) => match files.write(&target, &png_bytes) {
+                    Ok(()) => target,
+                    Err(why) => {
+                        path_refused = Some(why);
+                        std::fs::write(&fallback_path, &png_bytes)?;
                         fallback_path
                     }
+                },
+                None => {
+                    std::fs::write(&fallback_path, &png_bytes)?;
+                    fallback_path
                 }
-            } else {
-                std::fs::write(&fallback_path, &png_bytes)?;
-                fallback_path
             };
-            Ok(serde_json::json!({
+            let mut out = serde_json::json!({
                 "profile": profile,
                 "path": final_path.display().to_string(),
                 "bytes": png_bytes.len(),
                 "mime_type": "image/png",
                 "image_base64": b64,
-            }))
+            });
+            if let Some(why) = path_refused {
+                out["path_refused"] = serde_json::json!(why);
+            }
+            Ok(out)
         }
         "cookies" => {
             if let Some(new_cookies) = req.cookies {
@@ -5341,12 +5526,7 @@ fn execute_inner(
         }
         "takeover" | "human_takeover" | "user_takeover" => {
             if let Some(raw_url) = req.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                let url = if raw_url.contains("://") || raw_url.starts_with("about:") {
-                    raw_url.to_string()
-                } else {
-                    format!("https://{raw_url}")
-                };
-                navigate_page(&mut cdp, &url)?;
+                navigate_page(&mut cdp, &navigable_url(raw_url)?)?;
                 std::thread::sleep(Duration::from_millis(800));
             }
             let cap = detect_captcha(&mut cdp);
@@ -5741,6 +5921,7 @@ mod tests {
                 secret_ref: Some("op://vault/item/password".into()),
                 ..Default::default()
             },
+            &crate::agent_file::FileAuthority::Own,
         )
         .unwrap_err()
         .to_string();
@@ -5859,6 +6040,21 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    /// The tests' requests come from this process's own user, as the CLI's
+    /// do; shadows the glob-imported [`super::execute`].
+    fn execute(
+        data: &Path,
+        default_profile: &str,
+        req: BrowserRequest,
+    ) -> Result<serde_json::Value, Error> {
+        super::execute(
+            data,
+            default_profile,
+            req,
+            &crate::agent_file::FileAuthority::Own,
+        )
+    }
+
     // A real local HTTP/WebSocket peer exercises the production CDP transport,
     // including server refusals. No Chromium or process-global env is needed.
     struct ScriptedBrowser {
@@ -5945,8 +6141,10 @@ mod tests {
                             } else {
                                 let path = header.split_whitespace().nth(1).unwrap();
                                 let (status, body) = if path == "/json/list" {
+                                    let listed = respond(&serde_json::json!({"method":"list_url"}));
+                                    let url = listed["url"].as_str().unwrap_or("https://example.test/").to_string();
                                     ("200 OK", serde_json::json!([{
-                                        "id":"page", "type":"page", "url":"https://example.test/", "title":"Fixture",
+                                        "id":"page", "type":"page", "url":url, "title":"Fixture",
                                         "webSocketDebuggerUrl":format!("ws://127.0.0.1:{port}/devtools/page/page")
                                     }]).to_string())
                                 } else {
@@ -9189,5 +9387,291 @@ esac
         assert_eq!(response["focus"]["editable"], true, "{response}");
         assert_eq!(response["focus"]["rect"]["x"], 60.0);
         assert_eq!(response["focus"]["rect"]["y"], 80.0);
+    }
+
+    /// Chromium runs as the server's user, so a caller's navigation reaches
+    /// http(s) and about:blank only, however the URL is spelled.
+    #[test]
+    fn navigation_allows_only_http_https_and_blank() {
+        for (raw, want) in [
+            ("https://example.test/a", "https://example.test/a"),
+            ("HTTP://example.test", "HTTP://example.test"),
+            ("example.test/path", "https://example.test/path"),
+            ("localhost:8080/x", "https://localhost:8080/x"),
+            ("127.0.0.1:9", "https://127.0.0.1:9"),
+            ("about:blank", "about:blank"),
+            (" ABOUT:BLANK ", "about:blank"),
+            ("  https://example.test  ", "https://example.test"),
+        ] {
+            assert_eq!(navigable_url(raw).unwrap(), want, "{raw}");
+        }
+        for raw in [
+            "file:///scratch/coordinator/anyagents-data/secrets/operator-token",
+            "FILE:///etc/passwd",
+            "file:/etc/passwd",
+            "fi\tle:///etc/passwd",
+            "\u{1}file:///etc/passwd",
+            "fi\nle:///etc/passwd",
+            "view-source:https://example.test",
+            "view-source:file:///etc/passwd",
+            "chrome://settings",
+            "chrome-untrusted://x",
+            "devtools://devtools/bundled/inspector.html",
+            "data:text/html,<script>1</script>",
+            "javascript:alert(1)",
+            "blob:https://example.test/x",
+            "filesystem:https://example.test/temporary/x",
+            "about:config",
+            "ftp://example.test/x",
+            "",
+            "   ",
+        ] {
+            assert!(navigable_url(raw).is_err(), "{raw:?} must be refused");
+        }
+        for (url, readable) in [
+            ("https://example.test/", true),
+            ("about:blank", true),
+            ("chrome-error://chromewebdata/", true),
+            ("file:///etc/passwd", false),
+            ("view-source:https://example.test/", false),
+            ("chrome://version/", false),
+            ("data:text/html,x", false),
+        ] {
+            assert_eq!(readable_page_url(url), readable, "{url}");
+        }
+        assert!(checked_target_id("8F2A0B").is_ok());
+        for bad in ["", "../new?file:///etc/passwd", "a/b", "a b"] {
+            assert!(checked_target_id(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// A refused URL never reaches Chromium: no navigation, no new tab,
+    /// whatever action carries it; an http(s) one is navigated as before.
+    #[test]
+    fn a_file_url_is_refused_before_any_cdp_call() {
+        let fixture = ScriptedBrowser::new(cdp_ok_response);
+        let methods = || -> Vec<String> {
+            fixture
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| c["method"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        for (action, tab_action) in [
+            ("open", None),
+            ("goto", None),
+            ("takeover", None),
+            ("tabs", Some("new")),
+            ("snapshot", None),
+        ] {
+            let error = fixture
+                .execute(BrowserRequest {
+                    action: action.into(),
+                    tab_action: tab_action.map(Into::into),
+                    url: Some("file:///etc/passwd".into()),
+                    ..Default::default()
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("allows only http"), "{action}: {error}");
+        }
+        assert!(methods().is_empty(), "{:?}", methods());
+        fixture
+            .execute(BrowserRequest {
+                action: "open".into(),
+                url: Some("https://example.test/ok".into()),
+                wait_ms: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+        let navigated: Vec<_> = fixture
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c["method"] == "Page.navigate")
+            .map(|c| c["params"]["url"].clone())
+            .collect();
+        assert_eq!(navigated, [serde_json::json!("https://example.test/ok")]);
+    }
+
+    /// A page already on a host file is neither read nor driven: it goes
+    /// back to about:blank and the request fails.
+    #[test]
+    fn a_page_showing_a_file_is_reset_not_read() {
+        let fixture = ScriptedBrowser::new(|request| {
+            if request["method"] == "list_url" {
+                return serde_json::json!({"url": "file:///etc/passwd"});
+            }
+            cdp_ok_response(request)
+        });
+        for action in ["snapshot", "eval", "screenshot"] {
+            let error = fixture
+                .execute(BrowserRequest {
+                    action: action.into(),
+                    script: Some("document.body.innerText".into()),
+                    ..Default::default()
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("reset to about:blank"), "{action}: {error}");
+        }
+        let calls = fixture.calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .all(|c| c["method"] == "Page.navigate" && c["params"]["url"] == "about:blank"),
+            "{calls:?}"
+        );
+    }
+
+    /// A screenshot `path` is written with the caller's access: one the
+    /// caller may not write is never written by the server, and the shot
+    /// stays in the profile.
+    #[test]
+    fn a_screenshot_path_is_written_only_with_the_callers_access() {
+        let fixture = ScriptedBrowser::new(|request| {
+            if request["method"] == "Page.captureScreenshot" {
+                return serde_json::json!({"result": {"data": "iVBORw0KGgo="}});
+            }
+            cdp_ok_response(request)
+        });
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("victim.txt");
+        std::fs::write(&target, b"keep").unwrap();
+        let shot = |files: &crate::agent_file::FileAuthority| {
+            super::execute(
+                fixture.data.path(),
+                "fixture",
+                BrowserRequest {
+                    action: "screenshot".into(),
+                    path: Some(target.display().to_string()),
+                    ..Default::default()
+                },
+                files,
+            )
+            .unwrap()
+        };
+        let refused = shot(&crate::agent_file::FileAuthority::Refused("no seat".into()));
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        assert!(
+            refused["path_refused"]
+                .as_str()
+                .unwrap()
+                .contains("no seat")
+        );
+        let kept = PathBuf::from(refused["path"].as_str().unwrap());
+        assert!(kept.starts_with(fixture.data.path()), "{}", kept.display());
+        assert_eq!(std::fs::read(&kept).unwrap(), b"\x89PNG\r\n\x1a\n");
+        let own = shot(&crate::agent_file::FileAuthority::Own);
+        assert_eq!(own["path"], target.display().to_string());
+        assert!(own.get("path_refused").is_none());
+        assert_eq!(std::fs::read(&target).unwrap(), b"\x89PNG\r\n\x1a\n");
+    }
+
+    /// No flag that opens host files to pages is ever passed, and Chromium's
+    /// home, where downloads land, is inside its profile.
+    #[test]
+    fn chromium_starts_without_file_access_and_downloads_into_its_profile() {
+        let data = tempfile::tempdir().unwrap();
+        let fp = ensure_fingerprint(data.path(), "p").unwrap();
+        let args = chromium_args(&profile_dir(data.path(), "p").join("user-data"), 9222, &fp);
+        refuse_file_access_flags(&args).unwrap();
+        for flag in FILE_ACCESS_FLAGS {
+            let mut with = args.clone();
+            with.push(flag.to_string());
+            assert!(refuse_file_access_flags(&with).is_err(), "{flag}");
+        }
+        let home = chromium_home(&profile_dir(data.path(), "p"));
+        for (_, value) in chromium_env(&home) {
+            assert!(value.starts_with(profile_dir(data.path(), "p")));
+        }
+    }
+
+    /// Real Chromium, headless and on Xvfb as the server starts it: a page
+    /// still loads over http, and even a raw DevTools client (any process on
+    /// the host can reach the port) cannot make it read a file outside its
+    /// profile, because the jail, not the URL check, closes the host to it.
+    #[test]
+    #[ignore = "launches real Chromium; run on a Linux host with Landlock"]
+    fn chromium_in_its_jail_reads_no_host_file_even_over_raw_cdp() {
+        let _browser = browser_fixture_guard();
+        if !has_chromium() || jail::landlock_abi() < 1 {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = "<html><body>hello from the jail test</body></html>";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let modes: &[Option<bool>] = if Path::new("/usr/bin/xvfb-run").is_file() {
+            &[Some(true), Some(false)]
+        } else {
+            &[Some(true)]
+        };
+        for headless in modes {
+            // As long as a live data directory's profile path, which no Unix
+            // socket name can hold.
+            let data = tempfile::Builder::new()
+                .prefix(&"long-data-directory-".repeat(4))
+                .tempdir()
+                .unwrap();
+            let secrets = data.path().join("secrets");
+            std::fs::create_dir_all(&secrets).unwrap();
+            let token = secrets.join("operator-token");
+            std::fs::write(&token, "operator-secret").unwrap();
+            let (mut runtime, _) =
+                ensure_browser_running(data.path(), "jail", *headless, None).unwrap();
+            let target = select_page_target(data.path(), &mut runtime, None).unwrap();
+            let mut session =
+                CdpSession::connect(runtime.cdp_port, target.ws_url.as_deref().unwrap()).unwrap();
+            let text = |session: &mut CdpSession| {
+                eval_js(session, "document.body ? document.body.innerText : ''")
+                    .unwrap()
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            session
+                .call(
+                    "Page.navigate",
+                    serde_json::json!({ "url": format!("http://127.0.0.1:{port}/") }),
+                )
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(1500));
+            assert!(
+                text(&mut session).contains("hello from the jail test"),
+                "{headless:?}"
+            );
+            // What a raw DevTools client would do, past every server check.
+            let _ = session.call(
+                "Page.navigate",
+                serde_json::json!({ "url": format!("file://{}", token.display()) }),
+            );
+            std::thread::sleep(Duration::from_millis(1500));
+            let shown = text(&mut session);
+            assert!(!shown.contains("operator-secret"), "{headless:?}: {shown}");
+            let downloads = chromium_home(&profile_dir(data.path(), "jail")).join("Downloads");
+            drop(session);
+            let tmp =
+                std::fs::read_to_string(chromium_tmp_record(&profile_dir(data.path(), "jail")))
+                    .unwrap();
+            assert!(Path::new(tmp.trim()).is_dir());
+            stop_profile(data.path(), "jail").unwrap();
+            assert!(!Path::new(tmp.trim()).exists());
+            assert!(downloads.is_dir());
+            assert_eq!(std::fs::read_to_string(&token).unwrap(), "operator-secret");
+        }
     }
 }

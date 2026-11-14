@@ -194,11 +194,15 @@ fn seat_file_command(
 /// - `readback <name>`: succeed only when `./<name>` holds exactly the bytes
 ///   left on standard input.
 /// - `unlink <name>`: remove `./<name>` if it is there.
+/// - `open <path>`: open absolute `<path>` read-only as the seat, never
+///   through a final symbolic link, and hand the descriptor back over
+///   standard input (a Unix socket) when it is a regular file.
+/// - `create <path>`: the same for writing, creating or truncating it.
 pub(crate) fn seat_file_main(args: &[OsString]) -> std::process::ExitCode {
     let usage = || {
         eprintln!(
             "usage: anyagents internal seat-file inode <mode> [<gid>] | op-dir | \
-             copy <name> | readback <name> | unlink <name>"
+             copy <name> | readback <name> | unlink <name> | open <path> | create <path>"
         );
         std::process::ExitCode::from(2)
     };
@@ -230,6 +234,10 @@ pub(crate) fn seat_file_main(args: &[OsString]) -> std::process::ExitCode {
                     other => other,
                 },
             }
+        }
+        (Some(operation @ ("open" | "create")), [path]) if Path::new(path).is_absolute() => {
+            open_regular_file(Path::new(path), operation == "create")
+                .and_then(|file| hand_back(input, &file))
         }
         _ => return usage(),
     };
@@ -357,6 +365,138 @@ fn read_back(source: BorrowedFd<'_>, name: &OsStr) -> io::Result<()> {
         if want == 0 {
             return Ok(());
         }
+    }
+}
+
+/// `path` opened by this process's own identity: read-only, or for writing
+/// (created 0644 or truncated) when `create`. A final symbolic link, a FIFO,
+/// a device or a directory is refused; the kernel checks every directory
+/// above it against this identity.
+pub(crate) fn open_regular_file(path: &Path, create: bool) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut options = std::fs::OpenOptions::new();
+    if create {
+        options.write(true).create(true).truncate(true).mode(0o644);
+    } else {
+        options.read(true);
+    }
+    // O_NONBLOCK: opening a FIFO never waits for a peer.
+    let file = options
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok(file)
+}
+
+/// Send `file`'s descriptor to the daemon on `socket` (standard input).
+fn hand_back(socket: BorrowedFd<'_>, file: &File) -> io::Result<()> {
+    // Borrowed: standard input stays this process's to close.
+    let stream = std::mem::ManuallyDrop::new(unsafe {
+        std::os::unix::net::UnixStream::from_raw_fd(socket.as_raw_fd())
+    });
+    anyagents_keeper::wire::send_frame(&stream, &"opened", &[file.as_raw_fd()])
+}
+
+/// How long the daemon waits for a seat to open one file.
+const SEAT_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Open absolute `path` as seat `uid` (`gid`, `groups`) through `launcher`
+/// and return the regular file the seat itself opened: read-only, or for
+/// writing when `create`. The daemon never resolves the name; what the seat
+/// cannot open, this cannot return (ADR 0010 D3).
+pub(crate) fn open_as_seat(
+    launcher: &Path,
+    uid: u32,
+    gid: u32,
+    groups: &str,
+    path: &Path,
+    create: bool,
+) -> io::Result<File> {
+    use std::io::Read as _;
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a seat opens an absolute path only",
+        ));
+    }
+    let stage = if create { "seat-create" } else { "seat-open" };
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+    ours.set_read_timeout(Some(SEAT_OPEN_TIMEOUT))?;
+    // The command, and with it this process's copy of the seat's end, is
+    // dropped at spawn, so a seat that exits without answering reads as EOF.
+    let mut child = {
+        let mut command = seat_file_command(launcher, uid, gid, groups)?;
+        command
+            .arg(if create { "create" } else { "open" })
+            .arg(path)
+            .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+                theirs,
+            )))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        command.spawn().map_err(|error| {
+            io::Error::new(error.kind(), format!("{stage} spawn failed: {error}"))
+        })?
+    };
+    let stderr = child.stderr.take().expect("piped seat stderr");
+    let drain = std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut prefix = Vec::new();
+        let _ = (&mut stderr)
+            .take(SEAT_STDERR_LIMIT)
+            .read_to_end(&mut prefix);
+        let _ = io::copy(&mut stderr, &mut io::sink());
+        prefix
+    });
+    let mut reader = anyagents_keeper::wire::FrameReader::new(&ours);
+    let answer = reader.next_frame();
+    let mut fds = reader.take_fds();
+    if answer.is_err() {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|error| io::Error::new(error.kind(), format!("{stage} wait failed: {error}")))?;
+    let prefix = drain.join().unwrap_or_default();
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&prefix);
+        // The helper's own reason, without its prefix; Debug escaping keeps
+        // control characters out of the caller's message.
+        let reason = stderr
+            .trim()
+            .strip_prefix(&format!(
+                "seat-file {}: ",
+                if create { "create" } else { "open" }
+            ))
+            .unwrap_or(stderr.trim());
+        return Err(io::Error::new(
+            if prefix.is_empty() {
+                io::ErrorKind::Other
+            } else {
+                io::ErrorKind::PermissionDenied
+            },
+            format!("{stage} failed ({status}): {reason:?}"),
+        ));
+    }
+    match (answer, fds.len()) {
+        (Ok(Some(frame)), 1) if frame == br#""opened""# => {
+            let file = File::from(fds.remove(0));
+            // The descriptor came from a process running as the seat; take
+            // nothing but a regular file from it.
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::other(format!("{stage}: not a regular file")));
+            }
+            Ok(file)
+        }
+        (Err(error), _) => Err(io::Error::new(
+            error.kind(),
+            format!("{stage} answer: {error}"),
+        )),
+        _ => Err(io::Error::other(format!(
+            "{stage}: the seat answered without one opened file"
+        ))),
     }
 }
 
@@ -1857,5 +1997,208 @@ exec "$@"
             .unwrap_err()
             .to_string();
         assert!(error.contains("exit status: 2"), "{error}");
+    }
+
+    /// A launcher that records its arguments in `launcher-args` and runs the
+    /// command as this same user.
+    #[cfg(target_os = "linux")]
+    fn recording_launcher(dir: &Path) -> PathBuf {
+        let launcher = dir.join("recording-launcher.sh");
+        crate::worktree::tests::write_executable(
+            &launcher,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0%/*}/launcher-args\"\n\
+             while [ \"$#\" -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n",
+        );
+        launcher
+    }
+
+    /// `open` and `create` hand back only what the seat itself opened: a
+    /// regular file, never through a final link, by absolute path, with the
+    /// seat's own uid, gid and groups on the launcher's command line.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seat_opens_a_file_itself_and_hands_back_the_descriptor() {
+        use std::io::{Read as _, Write as _};
+        let temp = crate::test_tempdir();
+        let launcher = recording_launcher(temp.path());
+        let open = |path: &Path, create: bool| {
+            open_as_seat(&launcher, 42001, 42002, "42002,42003", path, create)
+        };
+        let photo = temp.path().join("photo.png");
+        std::fs::write(&photo, b"png bytes").unwrap();
+        let mut bytes = Vec::new();
+        open(&photo, false)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"png bytes");
+        let args = std::fs::read_to_string(temp.path().join("launcher-args")).unwrap();
+        let args: Vec<_> = args.lines().collect();
+        for pair in [
+            ["--reuid", "42001"],
+            ["--regid", "42002"],
+            ["--groups", "42002,42003"],
+        ] {
+            assert!(args.windows(2).any(|w| w == pair), "{args:?}");
+        }
+        assert!(args.contains(&"--no-new-privs"), "{args:?}");
+        assert_eq!(args[args.len() - 2..], ["open", photo.to_str().unwrap()]);
+
+        let secret = temp.path().join("operator-token");
+        std::fs::write(&secret, b"operator-secret").unwrap();
+        std::os::unix::fs::symlink(&secret, temp.path().join("link")).unwrap();
+        let fifo = temp.path().join("fifo");
+        let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let error = open(&temp.path().join("link"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("seat-open failed"), "{error}");
+        assert!(error.contains("symbolic links"), "{error}");
+        let error = open(&fifo, false).unwrap_err().to_string();
+        assert!(error.contains("not a regular file"), "{error}");
+        assert!(open(temp.path(), false).is_err());
+        assert!(open(&temp.path().join("missing"), false).is_err());
+        let error = open(Path::new("photo.png"), false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let out = temp.path().join("out.png");
+        open(&out, true).unwrap().write_all(b"written").unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"written");
+        assert!(open(&temp.path().join("link"), true).is_err());
+        assert_eq!(std::fs::read(&secret).unwrap(), b"operator-secret");
+    }
+
+    /// A seat that answers without a descriptor, or whose launcher fails,
+    /// yields an error, never a file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seat_that_hands_back_nothing_opens_nothing() {
+        let temp = crate::test_tempdir();
+        let launcher = temp.path().join("silent.sh");
+        crate::worktree::tests::write_executable(&launcher, "#!/bin/sh\nexit 0\n");
+        let file = temp.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let error = open_as_seat(&launcher, 42001, 42002, "42002", &file, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("without one opened file"), "{error}");
+        let launcher = temp.path().join("denying.sh");
+        crate::worktree::tests::write_executable(&launcher, "#!/bin/sh\necho denied >&2\nexit 3\n");
+        let error = open_as_seat(&launcher, 42001, 42002, "42002", &file, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("exit status: 3") && error.contains("denied"),
+            "{error}"
+        );
+    }
+
+    /// With a real seat (root drops to a fixture uid through `setpriv`): the
+    /// seat cannot open the operator's token, a link to it, or create beside
+    /// it, and opens what it may. Required on the privileged Linux lane.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_seat_open_refuses_what_the_seat_cannot_read() {
+        use std::io::Read as _;
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let caps = std::fs::read_to_string("/proc/self/status").unwrap();
+        let effective = caps
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:\t"))
+            .and_then(|n| u64::from_str_radix(n, 16).ok())
+            .unwrap_or(0);
+        let required = (1 << 0) | (1 << 6) | (1 << 7); // CHOWN, SETGID, SETUID
+        if effective & required != required
+            || crate::sandbox::server_uid() != 0
+            || !Path::new("/usr/bin/setpriv").is_file()
+        {
+            assert!(
+                std::env::var_os("ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST").is_none(),
+                "requires root with CAP_CHOWN, CAP_SETGID, CAP_SETUID and /usr/bin/setpriv"
+            );
+            eprintln!("requires privilege; seat open acceptance not executed");
+            return;
+        }
+        let (uid, gid) = (24061u32, 24062u32);
+        let base = tempfile::Builder::new()
+            .prefix("seat-open-")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let chown = |path: &Path, u: u32, g: u32| {
+            let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::lchown(c.as_ptr(), u, g) }, 0);
+        };
+        let mode = |path: &Path, m: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        mode(&root, 0o711);
+        // The server's secrets: root's own, as the operator token is kyle's.
+        let secrets = root.join("secrets");
+        std::fs::create_dir(&secrets).unwrap();
+        mode(&secrets, 0o711);
+        let token = secrets.join("operator-token");
+        std::fs::write(&token, b"operator-secret").unwrap();
+        mode(&token, 0o600);
+        let public = root.join("public.png");
+        std::fs::write(&public, b"public").unwrap();
+        mode(&public, 0o644);
+        // The seat's own directory, with a link to the token in it.
+        let own = root.join("seat");
+        std::fs::create_dir(&own).unwrap();
+        chown(&own, uid, gid);
+        mode(&own, 0o700);
+        let mine = own.join("mine.png");
+        std::fs::write(&mine, b"mine").unwrap();
+        chown(&mine, uid, gid);
+        mode(&mine, 0o600);
+        symlink(&token, own.join("link")).unwrap();
+        chown(&own.join("link"), uid, gid);
+        let launcher = Path::new("/usr/bin/setpriv");
+        let open = |path: &Path, create: bool| {
+            open_as_seat(launcher, uid, gid, &gid.to_string(), path, create)
+        };
+        let read = |path: &Path| {
+            let mut bytes = Vec::new();
+            open(path, false)?.read_to_end(&mut bytes)?;
+            Ok::<_, io::Error>(bytes)
+        };
+        assert_eq!(read(&public).unwrap(), b"public");
+        assert_eq!(read(&mine).unwrap(), b"mine");
+        let error = read(&token).unwrap_err().to_string();
+        assert!(error.contains("Permission denied"), "{error}");
+        let error = read(&own.join("link")).unwrap_err().to_string();
+        assert!(error.contains("symbolic links"), "{error}");
+        assert!(open(&secrets.join("planted"), true).is_err());
+        assert!(!secrets.join("planted").exists());
+        let created = own.join("out.png");
+        drop(open(&created, true).unwrap());
+        assert_eq!(std::fs::metadata(&created).unwrap().uid(), uid);
+        assert_eq!(std::fs::read(&token).unwrap(), b"operator-secret");
+        // The same refusal through the authority a send uses.
+        let _lock = crate::server::tests::env_lock();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("ANYAGENTS_LAUNCHER") };
+            }
+        }
+        let _reset = Reset;
+        unsafe { std::env::set_var("ANYAGENTS_LAUNCHER", launcher) };
+        let seat = crate::agent_file::FileAuthority::Seat {
+            uid,
+            gid,
+            groups: gid.to_string(),
+        };
+        let why = seat
+            .read(&token, crate::agent_file::MEDIA_UPLOAD_LIMIT)
+            .unwrap_err();
+        assert!(why.contains("Permission denied"), "{why}");
+        assert_eq!(
+            seat.read(&public, crate::agent_file::MEDIA_UPLOAD_LIMIT)
+                .unwrap(),
+            b"public"
+        );
     }
 }
