@@ -482,7 +482,7 @@ fn open_common_config_as(common: &Path, server: u32) -> std::io::Result<CommonCo
         if !meta.is_file()
             || meta.nlink() != 1
             || meta.uid() != server
-            || writable_file_by_untrusted(&file, &[server])?
+            || writable_by_anyone_else(&file, &[server])?
         {
             return Err(std::io::Error::other(format!(
                 "untrusted managed Git config {}/config: it must be a single-link regular \
@@ -503,18 +503,33 @@ fn open_common_config_as(common: &Path, server: u32) -> std::io::Result<CommonCo
         && let Ok(linked) = open_at_nofollow(&directory, c"config").and_then(|f| f.metadata())
         && linked.dev() == meta.dev()
         && linked.ino() == meta.ino()
-        && !writable_file_by_untrusted(&file, &owners)?
+        && !writable_by_anyone_else(&file, &[server])?
     {
         return Ok(CommonConfig::Linked(file));
     }
-    if !meta.is_file()
-        || meta.nlink() != 1
-        || !owners.contains(&meta.uid())
-        || writable_file_by_untrusted(&file, &owners)?
-    {
+    if !meta.is_file() || meta.nlink() != 1 || !owners.contains(&meta.uid()) {
         return Err(std::io::Error::other("untrusted Git configuration"));
     }
+    if writable_by_anyone_else(&file, &owners)? {
+        return Err(std::io::Error::other(format!(
+            "Git configuration {} is writable by someone other than its owner (mode {:04o}): \
+             any seat in its group could rewrite it, and a trusted metadata group is no \
+             exception for configuration. Its owner repairs it with `chmod go-w {}`",
+            path.display(),
+            meta.mode() & 0o7777,
+            path.display()
+        )));
+    }
     Ok(CommonConfig::Plain(file))
+}
+
+/// Configuration and its directory admit exactly their owners as writers. A
+/// deployment's trusted metadata groups (`ANYAGENTS_TRUSTED_METADATA_GIDS`)
+/// are no exception: every seat carries such a group, so a group-writable
+/// file could have been written by any of them, and a server-owned one moved
+/// into place by any seat that can rename in the common directory.
+fn writable_by_anyone_else(file: &std::fs::File, owners: &[u32]) -> std::io::Result<bool> {
+    writable_file_by_untrusted_with(file, owners, &[])
 }
 
 /// The dedicated directory, trusted only as the server's own: owned by the
@@ -525,8 +540,7 @@ fn managed_directory(common: &Path, server: u32) -> std::io::Result<std::fs::Fil
     let path = common.join(CONFIG_DIRECTORY);
     let directory = open_nofollow(&path)?;
     let meta = directory.metadata()?;
-    if !meta.is_dir() || meta.uid() != server || writable_file_by_untrusted(&directory, &[server])?
-    {
+    if !meta.is_dir() || meta.uid() != server || writable_by_anyone_else(&directory, &[server])? {
         return Err(std::io::Error::other(format!(
             "untrusted managed Git config directory {}: it must be a directory owned by the \
              server (uid {server}) that no one else can write",
@@ -704,18 +718,44 @@ fn relocate_config(
         return Ok(None);
     }
     let path = common.join(CONFIG_DIRECTORY);
-    match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+    let created = match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(error) => return Err(error),
-    }
+    };
     let directory = managed_directory(common, server)?;
-    clear_default_acl(&directory)?;
-    let target_lock = lock_config(path.join("config.lock"))?;
     let same = |file: &std::fs::File| {
         file.metadata()
             .is_ok_and(|m| m.is_file() && m.dev() == meta.dev() && m.ino() == meta.ino())
     };
+    // An existing directory is used only as this relocation's own interrupted
+    // state: still empty, or already holding this very inode. Anything else
+    // (a directory moved in from elsewhere) is refused, never filled.
+    if !created {
+        let entries = entry_names(&directory)?;
+        let interrupted = entries.is_empty()
+            || entries == ["config"]
+                && open_at_nofollow(&directory, c"config").is_ok_and(|f| same(&f));
+        if !interrupted {
+            return Err(std::io::Error::other(format!(
+                "{} exists and is not an interrupted relocation of {}; move it aside to \
+                 relocate the config",
+                path.display(),
+                common.join("config").display()
+            )));
+        }
+    }
+    // Owner-only, as created (keeping a set-group-ID bit inherited from the
+    // common directory); readers get named ACL entries below.
+    let directory_mode = directory.metadata()?.mode() & 0o7777;
+    if directory_mode & 0o7777 != (directory_mode & 0o2000) | 0o700 {
+        descriptor_fchmod(
+            &directory,
+            ((directory_mode & 0o2000) | 0o700) as libc::mode_t,
+        )?;
+    }
+    clear_default_acl(&directory)?;
+    let target_lock = lock_config(path.join("config.lock"))?;
     match open_at_nofollow(&directory, c"config") {
         Ok(linked) if same(&linked) => {}
         Ok(_) => {
@@ -733,6 +773,12 @@ fn relocate_config(
             }
         }
         Err(error) => return Err(error),
+    }
+    // Only the server writes the relocated config: no group or other write,
+    // whatever mode Git or an ACL mask gave the original.
+    let mode = source.metadata()?.mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        descriptor_fchmod(&source, (mode & !0o022) as libc::mode_t)?;
     }
     source.sync_all()?;
     directory.sync_all()?;
@@ -4573,7 +4619,10 @@ mod tests {
         .unwrap();
         std::fs::write(common.join(CONFIG_DIRECTORY).join("config"), "planted").unwrap();
         let error = relocate_config(&common, &|| Ok(())).err().unwrap();
-        assert!(error.to_string().contains("different config"), "{error}");
+        assert!(
+            error.to_string().contains("not an interrupted relocation"),
+            "{error}"
+        );
         assert!(
             std::fs::symlink_metadata(common.join("config"))
                 .unwrap()
@@ -5644,6 +5693,52 @@ mod tests {
             }
         }
         refuse_world_writable(&common).unwrap();
+    }
+
+    /// The review's attack: a seat in the trusted store group writes config
+    /// text into a server-owned group-writable file (`.git/description` is
+    /// 0664 on the desk) and renames it onto `config`, or swaps a
+    /// group-writable server-owned directory in as `anyagents-config`.
+    /// Configuration admits exactly its owners as writers, trusted group or
+    /// not, so neither is accepted, relocated or managed.
+    #[test]
+    fn group_writable_config_objects_are_never_trusted() {
+        let dir = crate::test_tempdir();
+        let common = plain_common(dir.path());
+        let config = common.join("config");
+        let original = std::fs::read(&config).unwrap();
+        let description = common.join("description");
+        std::fs::write(&description, "[core]\n\tfsmonitor = /tmp/payload\n").unwrap();
+        std::fs::set_permissions(&description, std::fs::Permissions::from_mode(0o664)).unwrap();
+        std::fs::rename(&config, common.join("config.saved")).unwrap();
+        std::fs::rename(&description, &config).unwrap();
+        let error = open_common_config(&common).err().unwrap().to_string();
+        assert!(
+            error.contains("writable by someone other than its owner")
+                && error.contains("chmod go-w"),
+            "{error}"
+        );
+        assert!(relocate_config(&common, &|| Ok(())).is_err());
+        assert!(!common.join(CONFIG_DIRECTORY).exists());
+        assert!(validate_config_files(&common.join("worktrees/none"), &common).is_err());
+        // The store's own config, not group-writable, relocates; the managed
+        // file carries no group or other write.
+        std::fs::remove_file(&config).unwrap();
+        std::fs::rename(common.join("config.saved"), &config).unwrap();
+        drop(relocate_config(&common, &|| Ok(())).unwrap());
+        assert!(is_managed(&common));
+        let managed = common.join(CONFIG_DIRECTORY).join("config");
+        assert_eq!(std::fs::metadata(&managed).unwrap().mode() & 0o022, 0);
+        assert_eq!(std::fs::read(&managed).unwrap(), original);
+        // A group-writable server-owned directory swapped in is refused.
+        let swapped = common.join("hooks-like");
+        std::fs::create_dir(&swapped).unwrap();
+        std::fs::write(swapped.join("config"), "[core]\n\thooksPath = /tmp\n").unwrap();
+        std::fs::set_permissions(&swapped, std::fs::Permissions::from_mode(0o775)).unwrap();
+        std::fs::rename(common.join(CONFIG_DIRECTORY), common.join("managed.saved")).unwrap();
+        std::fs::rename(&swapped, common.join(CONFIG_DIRECTORY)).unwrap();
+        let error = open_common_config(&common).err().unwrap().to_string();
+        assert!(error.contains("no one else can write"), "{error}");
     }
 
     /// The same, for a default ACL alone: every object a seat adds later
