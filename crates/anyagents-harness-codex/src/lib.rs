@@ -1996,6 +1996,45 @@ mod tests {
         assert!(harness.wait_dead(Duration::from_secs(5)));
     }
 
+    /// The answer to `turn/start` names the turn and proves nothing: the
+    /// message stays in flight until its `userMessage` item enters the turn.
+    #[test]
+    fn the_answer_to_turn_start_is_not_a_proof() {
+        let mut state = State {
+            thread_id: Some("thread-1".into()),
+            alive: true,
+            ..State::default()
+        };
+        let rpc = state.register(Request::Input {
+            id: "m1".into(),
+            start: true,
+        });
+        state.inflight.insert(
+            "m1".into(),
+            Custody {
+                stage: Stage::Sent { start: true },
+                turn: None,
+            },
+        );
+        apply_line(
+            &mut state,
+            &json!({"id": rpc, "result": {"turn": {"id": "t1", "status": "inProgress"}}}),
+        );
+        assert_eq!(state.known("m1"), Some(Ok(DeliverOutcome::InFlight)));
+        assert_eq!(state.proof("m1"), None);
+        apply_line(
+            &mut state,
+            &json!({"method": "item/completed", "params": {"threadId": "thread-1",
+                "turnId": "t1", "item": user_message(json!("m1"), "anyagents-message:m1\nhello")}}),
+        );
+        assert_eq!(
+            state.known("m1"),
+            Some(Ok(DeliverOutcome::Accepted {
+                turn_finished: false
+            }))
+        );
+    }
+
     /// A proof the child printed before the host stopped it is read, and
     /// answered by `proven` once the process is gone.
     #[cfg(unix)]
