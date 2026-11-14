@@ -227,6 +227,7 @@ fn answer(
 
 struct Server {
     child: Child,
+    _keepers: support::Keepers,
 }
 
 impl Server {
@@ -262,7 +263,10 @@ impl Server {
             );
             thread::sleep(Duration::from_millis(20));
         }
-        Self { child }
+        Self {
+            child,
+            _keepers: support::Keepers::of(dir),
+        }
     }
 }
 
@@ -1044,7 +1048,10 @@ fn a_telegram_webhook_verifies_the_secret_and_delivers_to_the_mailbox() {
         .stderr(Stdio::null())
         .spawn()
         .expect("server");
-    let server = Server { child };
+    let server = Server {
+        child,
+        _keepers: support::Keepers::of(&data),
+    };
     let addr_file = data.join("webhook.addr");
     wait_for(|| addr_file.exists(), "webhook listener did not bind");
     let webhook_addr = std::fs::read_to_string(&addr_file)

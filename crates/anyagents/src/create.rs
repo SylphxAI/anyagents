@@ -2625,7 +2625,6 @@ pub(crate) fn reset_agent_session_locked(
     }
     let _process = store.try_lock_agent(&agent.id)?;
     let root = store.data_dir().join("agents").join(agent.id.as_str());
-    promote_retired_spiron_hold_to_recovery(store, agent, &root)?;
     let session = anyagents_core::host_session::reset_session_with_source(
         &root,
         &agent.harness,
@@ -2637,42 +2636,6 @@ pub(crate) fn reset_agent_session_locked(
         "generation": session.generation, "harness": session.harness,
         "memory_sha256": session.memory.sha256,
     }))
-}
-
-fn promote_retired_spiron_hold_to_recovery(
-    store: &Store,
-    agent: &Agent,
-    root: &Path,
-) -> Result<(), Error> {
-    let hold_path = root.join("config/spiron-unconfirmed-steers.json");
-    if let Ok(meta) = std::fs::symlink_metadata(&hold_path)
-        && meta.file_type().is_file()
-        && meta.len() > 0
-        && let Ok(bytes) = std::fs::read(&hold_path)
-        && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
-    {
-        let mut ids: Vec<String> = val
-            .get("request_ids")
-            .and_then(serde_json::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(turn_id) = val.get("turn_id").and_then(serde_json::Value::as_str)
-            && !turn_id.is_empty()
-            && !ids.iter().any(|id| id == turn_id)
-        {
-            ids.insert(0, turn_id.to_string());
-        }
-        if !ids.is_empty() {
-            store.promote_messages_to_open_turn(&agent.id, &ids)?;
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
@@ -3057,7 +3020,11 @@ pub(crate) fn reconcile_agent_runtime_config(
                     &command,
                     &args,
                 )?;
-                crate::vendor::ensure_agy_steering_settings(config, work_dir, &data.join("media"))?;
+                crate::vendor::ensure_agy_steering_settings(
+                    config,
+                    work_dir,
+                    &data.join(anyagents_harness::media::MEDIA_DIR),
+                )?;
             }
             "muse" => {
                 muse_config::write(config, agent.model.as_deref(), &command, &args)?;
@@ -11532,14 +11499,12 @@ stderr: {}",
         persist_fault(1_700_000_000_000);
 
         let health = anyagents_supervisor::HealthBoard::default();
-        let (delivery_mode, steer_support) = anyagents_supervisor::declared(&child.harness);
         health.publish(
             &child.id,
             anyagents_supervisor::LiveState {
                 process_alive: true,
                 turn_state: anyagents_harness::TurnState::InTurn,
-                delivery_mode,
-                steer_support,
+                delivery: Some(crate::vendor::declared_delivery(&child.harness)),
                 quota_reset_at_ms: None,
                 restart_at_ms: None,
                 pid: None,
@@ -15479,7 +15444,7 @@ Connection: close
     }
 
     #[test]
-    fn reset_agent_session_clears_zero_byte_and_archives_nonempty_spiron_steer_hold() {
+    fn reset_agent_session_clears_the_last_error_and_leaves_mail_to_the_cursor() {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let mut agent = store
@@ -15490,79 +15455,31 @@ Connection: close
         let config_dir = root.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
         anyagents_core::host_session::new_session(&root, "spiron").unwrap();
-
-        let hold_path = config_dir.join("spiron-unconfirmed-steers.json");
         let err_path = config_dir.join(".anyagents-last-error.json");
-        std::fs::write(&hold_path, b"").unwrap();
-        std::fs::write(
-            &err_path,
-            r#"{"error":"Spiron reported unconfirmed steering input; Reconcile spiron-unconfirmed-steers.json","timestamp_ms":100}"#,
-        )
-        .unwrap();
-
-        let out1 = reset_agent_session_locked(&store, &agent).unwrap();
-        let gen1 = out1["generation"].as_str().unwrap().to_string();
-        assert!(!gen1.is_empty());
-        assert!(!hold_path.exists(), "0-byte hold file must be removed");
-        assert!(
-            !err_path.exists(),
-            "stale unconfirmed-steers error must be cleared"
-        );
-
+        std::fs::write(&err_path, r#"{"error":"stale","timestamp_ms":100}"#).unwrap();
         let anyagents_core::ReceiveOutcome::New(m1) = store
-            .receive(&agent.id, anyagents_core::Incoming::new("turn 1"))
+            .receive(&agent.id, anyagents_core::Incoming::new("taken"))
             .unwrap()
         else {
             panic!("expected m1");
         };
         store.note_delivered(&agent.id, m1.seq).unwrap();
         let anyagents_core::ReceiveOutcome::New(m2) = store
-            .receive(&agent.id, anyagents_core::Incoming::new("steered"))
+            .receive(&agent.id, anyagents_core::Incoming::new("not taken"))
             .unwrap()
         else {
             panic!("expected m2");
         };
-        store.note_delivered(&agent.id, m2.seq).unwrap();
-        std::fs::write(
-            &hold_path,
-            serde_json::json!({
-                "turn_id": m1.id,
-                "request_ids": [m1.id, m2.id]
-            })
-            .to_string(),
-        )
-        .unwrap();
 
-        let out2 = reset_agent_session_locked(&store, &agent).unwrap();
-        let gen2 = out2["generation"].as_str().unwrap().to_string();
-        assert_ne!(gen1, gen2);
-        assert!(
-            !hold_path.exists(),
-            "non-empty hold must move out of config/"
-        );
-        assert!(
-            root.join("sessions")
-                .join(format!("retired-{gen2}"))
-                .join("spiron-unconfirmed-steers.json")
-                .is_file(),
-            "forensic hold copy must be archived under sessions/"
-        );
-        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), m2.seq);
-        assert!(
-            store.next_undelivered(&agent.id).unwrap().is_none(),
-            "reset-session must keep unconfirmed messages in turn_recovery rather than raw replay"
-        );
-        let open = store
-            .open_turn(&agent.id)
-            .unwrap()
-            .expect("open turn retained for [Recovery]");
-        assert_eq!(open.messages.len(), 2);
-        assert_eq!(open.messages[0].id, m1.id);
-        assert_eq!(open.messages[1].id, m2.id);
-        assert!(
-            config_dir
-                .join(".anyagents-session-reset-recovery")
-                .is_file()
+        let first = reset_agent_session_locked(&store, &agent).unwrap();
+        let second = reset_agent_session_locked(&store, &agent).unwrap();
+        assert_ne!(first["generation"], second["generation"]);
+        assert!(!err_path.exists(), "a reset clears the stale error");
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), m1.seq);
+        assert_eq!(
+            store.next_undelivered(&agent.id).unwrap().unwrap().id,
+            m2.id,
+            "the new session is handed what the old one never took"
         );
     }
 

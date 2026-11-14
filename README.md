@@ -48,7 +48,7 @@ AnyAgents is a **100% vendor-neutral multi-agent orchestrator**. It never implem
 - **External harnesses, one coordinator.** Run `spiron`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh` and `grok` side-by-side in the same agent organization with isolated per-agent context windows (`arXiv:2611.05306`) and persona-neutral system envelopes (`arXiv:2611.03931`).
 - **Vendor-owned sign-in.** AnyAgents launches each harness's sign-in command in its isolated configuration directory and refuses unmapped profile-to-harness combinations fail-closed.
 - **Decoupled Harness × Profile × Sandbox.** Switch an agent's harness, credential profile, or sandbox substrate independently without losing its identity, mailbox cursor, history, groups, or channels.
-- **Nothing gets lost, and messages steer live.** Every message goes through a durable per-agent mailbox with ordered, idempotent delivery, visible lag and real-time mid-turn steering into active sessions. The guarantees are tested with crash injection.
+- **Nothing gets lost, and messages steer live.** Every message goes through a durable per-agent mailbox with ordered delivery and visible lag. Each harness is held to the delivery level it can prove, from messages that wait for the turn to end up to messages its running turn consumes at its next step as one batch, and reports that level ([delivery.md](docs/delivery.md)). Crash injection and a conformance suite run against every adapter test the guarantees.
 - **Zero-config local tools & clean sandbox boundaries.** In local mode (default), agents run under your own user and keep your `$HOME`, CLI tools and hardware while isolating each agent's harness state and `mcp-capability`. Workspace execution belongs to the selected harness; AnyAgents passes the preserved worktree path and MCP configuration to that process.
 - **Audited erasure for accidental captures.** Ancestors and admins can redact a body/span without changing message ids, order or cursors, including managed JSONL session copies. See [redaction](docs/redaction.md) for permissions, selectors and incomplete-copy receipts.
 - **Groups have explicit owners.** New groups belong to their creator; existing groups without an owner remain operator-owned. Members may invite agents to private groups but cannot change visibility or evict unrelated members. `public` on a join only configures a new group; use `members` with `public` to change an existing group as its owner, the owner’s ancestor, an operator or a root admin.
@@ -57,14 +57,14 @@ AnyAgents is a **100% vendor-neutral multi-agent orchestrator**. It never implem
 
 ## How it works
 
-`anyagents serve` is one long-lived server. The CLI, an MCP server registered into each agent, and channels such as Telegram are its clients. Each agent is one vendor process in that vendor's programmatic mode, supervised by the server.
+`anyagents serve` is one long-lived server. The CLI, an MCP server registered into each agent, and channels such as Telegram are its clients. Each agent is one vendor process in that vendor's programmatic mode, supervised by the server and held by its own keeper process, so restarting or upgrading the server does not stop any agent. Keepers are Linux-only for now: on macOS the server hosts each harness itself, so a server restart there restarts its agents ([ADR 0007](docs/adr/0007-process-architecture.md#9-where-in-process-hosting-remains)).
 
 - [Vision](docs/vision.md): goal, first-version scope, boundaries.
 - [Architecture](docs/architecture.md): state, the three axes, harnesses, the mailbox and its guarantees, runtime boundaries, channels, the gateway, usage.
 - [Verification](docs/verification.md): reproducible scripted harness checks, coverage and live-acceptance boundaries.
 - [Serving identity](docs/serving-identity.md): read back the version, source, binary hash and PID on both server sockets.
 - [Desktop and mobile control](docs/computer-and-device.md): OS backends, Android/iOS setup, semantic snapshots and stale-ref handling.
-- [Decisions](docs/adr/): [0001](docs/adr/0001-server-first-one-binary.md) (server-first single binary) and [0002](docs/adr/0002-runtime-drivers-and-capability-identity.md) (capability identity and runtime boundaries).
+- [Decisions](docs/adr/): [0001](docs/adr/0001-server-first-one-binary.md) (server-first single binary), [0002](docs/adr/0002-runtime-drivers-and-capability-identity.md) (capability identity and runtime boundaries) and [0007](docs/adr/0007-process-architecture.md) (a small kernel, keepers that hold harness processes, services and connectors outside).
 
 ## Licence
 

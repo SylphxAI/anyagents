@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use anyagents_core::{Address, Agent, Error, Incoming, ReceiveOutcome, Store, now_ms};
 use anyagents_gateway::MemoryRoutes;
 use anyagents_installer::{CommandRunner, InstallError, LineSink, builtin_catalog, sign_in};
-use anyagents_supervisor::{HealthBoard, Supervisor, SystemClock, declared, mode_name, steer_name};
+use anyagents_supervisor::{HealthBoard, Supervisor, SystemClock};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
@@ -34,7 +34,7 @@ use crate::auth::{self, Principal};
 use crate::create::{self, CreateRequest};
 use crate::identity::ServingIdentity;
 use crate::operator;
-use crate::vendor::{self, VendorHarness};
+use crate::vendor::{self, HarnessHost, VendorHarness};
 
 mod file_cache;
 #[cfg(test)]
@@ -58,19 +58,36 @@ pub fn socket_path(data: &Path) -> PathBuf {
     data.join(SOCKET_NAME)
 }
 
+/// Run the server. Every harness runs in a keeper started from this binary,
+/// so stopping, crashing or upgrading the server ends no agent's work.
 pub fn run(data: &Path) -> Result<(), Error> {
     let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-    run_with(data, Arc::new(Mutex::new(ProcessRunner)), stop_rx)
+    let host = crate::keeper::host().map_err(Error::Message)?;
+    run_with_identity(
+        data,
+        Arc::new(Mutex::new(ProcessRunner)),
+        stop_rx,
+        Arc::new(ServingIdentity::capture()),
+        host,
+    )
 }
 
-/// Run the server with a sign-in runner the caller supplies. Tests use this so
-/// no vendor command is started. `stop` ends the server when the caller drops it.
+/// Run the server with a sign-in runner the caller supplies, so no vendor
+/// command is started. `stop` ends the server when the caller drops it.
+/// Harnesses run in this process: a test binary has no keeper mode.
+#[cfg(test)]
 pub fn run_with(
     data: &Path,
     runner: Arc<Mutex<dyn CommandRunner + Send>>,
     stop: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), Error> {
-    run_with_identity(data, runner, stop, Arc::new(ServingIdentity::capture()))
+    run_with_identity(
+        data,
+        runner,
+        stop,
+        Arc::new(ServingIdentity::capture()),
+        HarnessHost::InProcess,
+    )
 }
 
 fn run_with_identity(
@@ -78,14 +95,41 @@ fn run_with_identity(
     runner: Arc<Mutex<dyn CommandRunner + Send>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
     identity: Arc<ServingIdentity>,
+    host: HarnessHost,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         tokio::select! {
-            result = serve(data, runner, identity) => result,
+            result = serve(data, runner, identity, host) => result,
             _ = &mut stop => Ok(()),
         }
     })
+}
+
+/// The supervisor of a serving kernel. However the kernel stops (a signal, an
+/// error, a test dropping it), its harness processes are left to the next
+/// kernel when they live in keepers; hosted in this process, they end.
+struct Retaining(Option<Supervisor<VendorHarness>>, bool);
+
+impl std::ops::Deref for Retaining {
+    type Target = Supervisor<VendorHarness>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("supervisor until drop")
+    }
+}
+
+impl Drop for Retaining {
+    fn drop(&mut self) {
+        if let Some(supervisor) = self.0.take() {
+            // A keeper still starting is not waited for: it finishes its
+            // start on its own, and the next kernel takes it over.
+            if self.1 {
+                anyagents_keeper::abandon_starts();
+            }
+            supervisor.retain_processes();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -149,6 +193,7 @@ async fn serve(
     data: &Path,
     sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
     identity: Arc<ServingIdentity>,
+    host: HarnessHost,
 ) -> Result<(), Error> {
     let _server_lock = acquire_server_lock(data)?;
     anyagents_toolchain::init_server(data, crate::sandbox::host_home_dir());
@@ -218,7 +263,7 @@ async fn serve(
     // The gateway is up and every agent repointed before anything is bound or
     // started: a client that sees the socket must find a live origin, not the
     // port of the server that just stopped.
-    crate::gateway::start(data)?;
+    let gateway = crate::gateway::start(data)?;
     // The API is bound before any vendor starts: an agent that is slow, silent
     // or wedged must never stop the server from answering.
     prepare_socket(&path)?;
@@ -229,13 +274,30 @@ async fn serve(
         crate::sandbox::share_socket_with_seats(&path);
     }
     let launch_store = Arc::clone(&store);
-    let supervisor = Supervisor::<VendorHarness>::start(
-        Arc::clone(&store),
-        Arc::new(SystemClock::new()),
-        Arc::new(move |request| vendor::vendor_launch_with_store(request, &launch_store)),
-        vendor::child_env(),
-    )
-    .map_err(Error::Message)?;
+    // A harness kept from the last server on a gateway origin that moved
+    // would send its token wherever that port now leads: it is replaced.
+    let refused = if gateway.moved {
+        gateway.agents
+    } else {
+        Vec::new()
+    };
+    let custody = crate::keeper::custody(data, &host, refused);
+    let kept = matches!(host, HarnessHost::Keeper(_));
+    let supervisor = Retaining(
+        Some(
+            Supervisor::<VendorHarness>::start_with_custody(
+                Arc::clone(&store),
+                Arc::new(SystemClock::new()),
+                Arc::new(move |request| {
+                    vendor::vendor_launch_hosted(request, &launch_store, &host)
+                }),
+                vendor::child_env(),
+                custody,
+            )
+            .map_err(Error::Message)?,
+        ),
+        kept,
+    );
     if auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&data.join("wake.sock"));
     }
@@ -2753,10 +2815,10 @@ async fn add_channel_route(
 
 /// A loopback port the operating system picked, held open until the caller
 /// serves on it, or why none could be bound.
-pub fn listen_on_loopback() -> Result<(u16, tokio::net::TcpListener), Error> {
+pub fn listen_on_loopback(port: u16) -> Result<(u16, tokio::net::TcpListener), Error> {
     // A non-blocking listener before it joins the runtime; the runtime makes it
     // blocking-polled itself.
-    let address = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let address = std::net::TcpListener::bind(("127.0.0.1", port))?;
     address.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(address)?;
     let port = listener.local_addr()?.port();
@@ -3387,7 +3449,8 @@ fn persisted_fault(
 }
 
 fn archived_agent_view_fast(agent: &Agent) -> AgentView {
-    let (mode, steer) = declared(&agent.harness);
+    let delivery: crate::api::DeliveryView =
+        (&crate::vendor::declared_delivery(&agent.harness)).into();
     AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -3411,8 +3474,9 @@ fn archived_agent_view_fast(agent: &Agent) -> AgentView {
         state: agent.state.clone(),
         process: "down".to_string(),
         turn_state: "idle".to_string(),
-        delivery_mode: mode_name(mode).to_string(),
-        steer_support: steer_name(steer).to_string(),
+        delivery_mode: delivery.legacy_mode(),
+        steer_support: delivery.legacy_steer(),
+        delivery,
         quota_reset_at_ms: None,
         block_reason: None,
         last_error: None,
@@ -3502,8 +3566,7 @@ fn agent_view_preloaded(
     let (
         process,
         mut turn_state,
-        mode,
-        steer,
+        delivery,
         quota,
         live_harness,
         live_model,
@@ -3528,8 +3591,9 @@ fn agent_view_preloaded(
             (
                 if live.process_alive { "alive" } else { "down" },
                 if working { "working" } else { "idle" },
-                mode_name(live.delivery_mode),
-                steer_name(live.steer_support),
+                live.delivery
+                    .clone()
+                    .unwrap_or_else(|| crate::vendor::declared_delivery(&agent.harness)),
                 effective_quota,
                 if live.process_alive {
                     live.live_harness.clone()
@@ -3547,7 +3611,6 @@ fn agent_view_preloaded(
             )
         }
         _ => {
-            let (mode, steer) = declared(&agent.harness);
             let lock_busy = crate::vendor::is_spiron_harness(&agent.harness)
                 && matches!(
                     store.try_lock_agent(&agent.id),
@@ -3558,8 +3621,7 @@ fn agent_view_preloaded(
             (
                 proc_str,
                 turn_str,
-                mode_name(mode),
-                steer_name(steer),
+                crate::vendor::declared_delivery(&agent.harness),
                 session_quota,
                 if proc_str == "alive" {
                     Some(agent.harness.clone())
@@ -3672,8 +3734,9 @@ fn agent_view_preloaded(
         state: agent.state.clone(),
         process: process.to_string(),
         turn_state: turn_state.to_string(),
-        delivery_mode: mode.to_string(),
-        steer_support: steer.to_string(),
+        delivery_mode: crate::api::DeliveryView::from(&delivery).legacy_mode(),
+        steer_support: crate::api::DeliveryView::from(&delivery).legacy_steer(),
+        delivery: (&delivery).into(),
         quota_reset_at_ms: quota,
         block_reason,
         last_error,
@@ -7518,6 +7581,37 @@ pub(crate) mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn an_agent_view_keeps_the_fields_a_client_from_before_delivery_requires() {
+        // A CLI or MCP client from the release before `delivery` requires both.
+        #[derive(serde::Deserialize)]
+        struct OlderClientView {
+            delivery_mode: String,
+            steer_support: String,
+        }
+        let temp = crate::test_tempdir();
+        let store = Store::open(temp.path().join("state.db")).unwrap();
+        for (harness, mode, steer) in [
+            ("spiron", "steer", "yes"),
+            ("grok", "steer", "unproven"),
+            ("spiron-cloud", "followup", "no"),
+        ] {
+            let agent = store
+                .create_agent(anyagents_core::NewAgent::new(
+                    format!("view-{harness}"),
+                    harness,
+                ))
+                .unwrap();
+            let json = serde_json::to_string(&archived_agent_view_fast(&agent)).unwrap();
+            let older: OlderClientView = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                (older.delivery_mode.as_str(), older.steer_support.as_str()),
+                (mode, steer),
+                "{harness}"
+            );
+        }
+    }
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
 
@@ -7928,8 +8022,7 @@ pub(crate) mod tests {
         let live = |quota: Option<i64>, error: Option<&str>| anyagents_supervisor::LiveState {
             process_alive: true,
             turn_state: anyagents_harness::TurnState::Idle,
-            delivery_mode: anyagents_harness::DeliveryMode::Steer,
-            steer_support: anyagents_harness::SteerSupport::Yes,
+            delivery: Some(crate::vendor::declared_delivery("claude-code")),
             quota_reset_at_ms: quota,
             restart_at_ms: None,
             pid: Some(42),
@@ -7984,8 +8077,7 @@ pub(crate) mod tests {
                 anyagents_supervisor::LiveState {
                     process_alive: false,
                     turn_state: anyagents_harness::TurnState::Idle,
-                    delivery_mode: anyagents_harness::DeliveryMode::Steer,
-                    steer_support: anyagents_harness::SteerSupport::Yes,
+                    delivery: Some(crate::vendor::declared_delivery("spiron")),
                     quota_reset_at_ms: None,
                     restart_at_ms: None,
                     pid: None,
@@ -8057,12 +8149,10 @@ pub(crate) mod tests {
         let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(config.join("preserve"), "retained state").unwrap();
-        let (delivery_mode, steer_support) = declared(&agent.harness);
         let mut live = anyagents_supervisor::LiveState {
             process_alive: true,
             turn_state: anyagents_harness::TurnState::Idle,
-            delivery_mode,
-            steer_support,
+            delivery: Some(crate::vendor::declared_delivery(&agent.harness)),
             quota_reset_at_ms: None,
             restart_at_ms: None,
             pid: None,
@@ -9195,7 +9285,13 @@ pub(crate) mod tests {
         let path = data.path().to_path_buf();
         let serving = Arc::clone(&identity);
         let server = std::thread::spawn(move || {
-            run_with_identity(&path, Arc::new(Mutex::new(ProcessRunner)), stopped, serving)
+            run_with_identity(
+                &path,
+                Arc::new(Mutex::new(ProcessRunner)),
+                stopped,
+                serving,
+                HarnessHost::InProcess,
+            )
         });
         struct Stop(
             Option<tokio::sync::oneshot::Sender<()>>,
@@ -9711,12 +9807,10 @@ pub(crate) mod tests {
         let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
         std::fs::create_dir_all(cfg.join(".claude")).unwrap();
         let health = HealthBoard::default();
-        let (delivery_mode, steer_support) = declared(&child.harness);
         let mut live = anyagents_supervisor::LiveState {
             process_alive: true,
             turn_state: anyagents_harness::TurnState::Idle,
-            delivery_mode,
-            steer_support,
+            delivery: Some(crate::vendor::declared_delivery(&child.harness)),
             quota_reset_at_ms: None,
             restart_at_ms: None,
             pid: None,

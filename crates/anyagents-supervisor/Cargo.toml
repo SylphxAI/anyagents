@@ -13,6 +13,7 @@ anyagents-harness = { path = "../anyagents-harness" }
 # `scripted_claude` below is a bin, and a bin links the crate's normal dependencies.
 anyagents-harness-claude = { path = "../anyagents-harness-claude" }
 libc = "0.2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 

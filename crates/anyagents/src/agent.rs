@@ -5,7 +5,6 @@
 use std::path::Path;
 
 use anyagents_core::{Agent, AgentId, Error, Store};
-use anyagents_supervisor::{declared, mode_name, steer_name};
 
 use crate::api::{AgentView, AgentsResponse, GroupActionRequest, GroupView, GroupsResponse};
 use crate::client;
@@ -810,12 +809,13 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         }
     }
     let lag = store.lag(&agent.id, anyagents_core::now_ms())?;
-    let (mode, steer) = declared(&agent.harness);
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     let public_desc = agent.public_description();
     let scope_val = agent.scope().to_string();
     let lifecycle_val = agent.lifecycle().to_string();
+    let delivery: crate::api::DeliveryView =
+        (&crate::vendor::declared_delivery(&agent.harness)).into();
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -839,8 +839,9 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         state: agent.state,
         process: "-".to_string(),
         turn_state: "idle".to_string(),
-        delivery_mode: mode_name(mode).to_string(),
-        steer_support: steer_name(steer).to_string(),
+        delivery_mode: delivery.legacy_mode(),
+        steer_support: delivery.legacy_steer(),
+        delivery,
         quota_reset_at_ms: None,
         block_reason: None,
         last_error: None,
@@ -960,12 +961,13 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let lag = store
         .lag(&agent.id, anyagents_core::now_ms())
         .map_err(|err| err.to_string())?;
-    let (mode, steer) = declared(&agent.harness);
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     let public_desc = agent.public_description();
     let scope_val = agent.scope().to_string();
     let lifecycle_val = agent.lifecycle().to_string();
+    let delivery: crate::api::DeliveryView =
+        (&crate::vendor::declared_delivery(&agent.harness)).into();
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -989,8 +991,9 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         state: agent.state,
         process: "-".to_string(),
         turn_state: "idle".to_string(),
-        delivery_mode: mode_name(mode).to_string(),
-        steer_support: steer_name(steer).to_string(),
+        delivery_mode: delivery.legacy_mode(),
+        steer_support: delivery.legacy_steer(),
+        delivery,
         quota_reset_at_ms: None,
         block_reason: None,
         last_error: None,
@@ -1189,8 +1192,7 @@ fn list_filtered(
                     harness: &agent.harness,
                     state: &agent.state,
                     process: &agent.process,
-                    mode: &agent.delivery_mode,
-                    steer: &agent.steer_support,
+                    delivery: agent.delivery.label(),
                     undelivered: agent.oldest_undelivered_age_ms,
                     quota: agent.quota_reset_at_ms,
                 });
@@ -1396,22 +1398,20 @@ struct AgentLine<'a> {
     harness: &'a str,
     state: &'a str,
     process: &'a str,
-    mode: &'a str,
-    steer: &'a str,
+    delivery: String,
     undelivered: Option<i64>,
     quota: Option<i64>,
 }
 
 fn print_agent(agent: AgentLine<'_>) {
     println!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         agent.id,
         agent.name,
         agent.harness,
         agent.state,
         agent.process,
-        agent.mode,
-        agent.steer,
+        agent.delivery,
         show_optional(agent.undelivered),
         show_optional(agent.quota),
     );
@@ -1426,6 +1426,35 @@ fn show_optional(value: Option<i64>) -> String {
 /// Hand every line the running server may have left to the harness, through the
 /// vendor's own input API. A line the harness already took is not written again:
 /// the adapter remembers the ids in the session it resumed.
+/// List an agent's parked messages, or put one back in its mailbox.
+pub fn requeue(
+    data: &Path,
+    name: &str,
+    message: Option<&str>,
+) -> Result<(), anyagents_core::Error> {
+    let store = open(data)?;
+    let agent = store.agent_by_name(name)?;
+    let Some(message) = message else {
+        for parked in store.rejected_messages(&agent.id)? {
+            println!(
+                "{}\t{}\t{}\t{}",
+                parked.message_id,
+                parked.seq,
+                parked.sender.as_deref().unwrap_or("-"),
+                parked.reason
+            );
+        }
+        return Ok(());
+    };
+    let requeued = store.requeue_rejected(&agent.id, message)?;
+    println!(
+        "{}\trequeued\t{message}\t{}",
+        agent.name,
+        requeued.id.as_str()
+    );
+    Ok(())
+}
+
 pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
     let store = open(data)?;
     let agents = if name == "all" {
@@ -1437,6 +1466,16 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
         if agent.state != "running" {
             continue;
         }
+        // One vendor process per agent: a harness a server or a keeper holds
+        // takes its own mail; this one-shot process would be a second.
+        let _process = match store.try_lock_agent(&agent.id) {
+            Ok(lock) => lock,
+            Err(anyagents_core::Error::AgentBusy) => {
+                println!("{}	skipped	its harness process is live", agent.name);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let config_dir = anyagents_core::agent_config_dir(data, &agent.id);
         let work_dir = agent
             .workdir
@@ -1449,6 +1488,7 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
             config_dir,
             work_dir,
             extra_env: Vec::new(),
+            lock: None,
         };
         let mut harness = match crate::vendor::vendor_launch_with_store(request, &store) {
             Ok(harness) => harness,
@@ -1459,6 +1499,9 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
         };
         let mut flushed = 0u32;
         let mut failure = None;
+        // The delivery loop's breaker: the same refusal twice is a vendor that
+        // refuses everything, so nothing more is parked.
+        let mut last_rejection: Option<String> = None;
         loop {
             let message = store.next_undelivered(&agent.id)?;
             let Some(message) = message else {
@@ -1483,6 +1526,7 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                 ) => {
                     store.note_delivered(&agent.id, message.seq)?;
                     flushed += 1;
+                    last_rejection = None;
                 }
                 Ok(anyagents_harness::DeliverOutcome::InFlight) => {
                     failure = Some("not yet consumed by the harness; left queued".into());
@@ -1495,6 +1539,27 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                 Ok(anyagents_harness::DeliverOutcome::Quota { reset_at_ms }) => {
                     failure = Some(format!("quota until {reset_at_ms}; left queued"));
                     break;
+                }
+                // Refused for good: parked past the cursor, its sender told.
+                Ok(anyagents_harness::DeliverOutcome::Rejected {
+                    reason,
+                    message_specific,
+                }) => {
+                    if !message_specific && last_rejection.as_deref() == Some(reason.as_str()) {
+                        failure = Some(format!(
+                            "the harness refuses message after message ({reason}); left queued"
+                        ));
+                        break;
+                    }
+                    store.reject_message(&agent.id, message.seq, &reason)?;
+                    println!(
+                        "{}\trejected\t{}\t{reason}",
+                        agent.name,
+                        message.id.as_str()
+                    );
+                    if !message_specific {
+                        last_rejection = Some(reason);
+                    }
                 }
                 Err(err) => {
                     failure = Some(err.to_string());

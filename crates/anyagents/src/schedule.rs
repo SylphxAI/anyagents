@@ -2337,7 +2337,7 @@ fn probe_github_check_terminal(
 mod tests {
     use super::*;
     use anyagents_core::NewAgent;
-    use anyagents_harness::{DeliveryMode, SteerSupport, TurnState};
+    use anyagents_harness::TurnState;
     use anyagents_supervisor::LiveState;
 
     fn publish_turn(
@@ -2351,8 +2351,7 @@ mod tests {
             LiveState {
                 process_alive: true,
                 turn_state,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
+                delivery: None,
                 quota_reset_at_ms,
                 restart_at_ms: None,
                 pid: None,
@@ -2670,8 +2669,7 @@ mod tests {
             let mut live = LiveState {
                 process_alive: true,
                 turn_state: TurnState::Idle,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
+                delivery: None,
                 quota_reset_at_ms: None,
                 restart_at_ms: None,
                 pid: None,
@@ -2872,8 +2870,7 @@ mod tests {
         let mut live = LiveState {
             process_alive: true,
             turn_state: TurnState::Idle,
-            delivery_mode: DeliveryMode::Steer,
-            steer_support: SteerSupport::Yes,
+            delivery: None,
             quota_reset_at_ms: Some(now - 1_000),
             restart_at_ms: None,
             pid: None,
