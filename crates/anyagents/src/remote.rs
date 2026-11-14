@@ -35,10 +35,22 @@ pub const MCP_PATH: &str = "/v1/webhooks/mcp";
 
 /// Remote session token lifetime when `remote_session_ttl_secs` is unset.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60);
-/// Bounds on `remote_session_ttl_secs`. The rotation pass runs every minute
-/// and rotates at half the lifetime, so the floor leaves it several chances.
-pub const MIN_TTL: Duration = Duration::from_secs(5 * 60);
+/// How often the maintenance pass looks for tokens to rotate.
+pub const ROTATION_INTERVAL: Duration = Duration::from_secs(60);
+/// The longest a remote turn may hold the token it started with: the cloud
+/// adapter's 300 s request timeout plus its default 300 s job-poll window
+/// (`cloud_harness.rs`). A remote sandbox turn is bounded at 305 s.
+pub const LONGEST_TURN: Duration = Duration::from_secs(600);
+/// Bounds on `remote_session_ttl_secs`. A turn reads the token when it
+/// starts; rotation happens within one interval of half the lifetime, so a
+/// token read at turn start has at least `ttl / 2 - ROTATION_INTERVAL` left.
+/// The floor keeps that above the longest turn.
+pub const MIN_TTL: Duration = Duration::from_secs(30 * 60);
 pub const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const _: () = assert!(
+    MIN_TTL.as_secs() / 2 > ROTATION_INTERVAL.as_secs() + LONGEST_TURN.as_secs(),
+    "a token read at turn start must outlive the longest turn"
+);
 /// Revoked and expired token rows are forgotten after this long.
 const PRUNE_AFTER_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -371,7 +383,7 @@ mod tests {
                 "{ok}"
             );
         }
-        for secs in [0, 299, 86_401] {
+        for secs in [0, 299, 1_799, 86_401] {
             let err = parse(&format!("[server]\nremote_session_ttl_secs = {secs}\n")).unwrap_err();
             assert!(err.contains("remote_session_ttl_secs"), "{err}");
         }
