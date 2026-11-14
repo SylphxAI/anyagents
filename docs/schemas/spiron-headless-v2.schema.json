@@ -200,7 +200,12 @@
         "reported_window_tokens": { "type": "integer", "minimum": 1 },
         "output_reserve_tokens": { "type": "integer", "minimum": 0 },
         "request_limit_bytes": { "type": "integer", "minimum": 1 },
-        "compaction_threshold_bytes": { "type": "integer", "minimum": 0 }
+        "compaction_threshold_bytes": {
+          "description": "null under the window policy: it compacts only to fit.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "policy": { "enum": ["fixed", "window"] }
       }
     },
     "accepted": {

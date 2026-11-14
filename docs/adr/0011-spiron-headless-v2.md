@@ -76,7 +76,7 @@ The server answers, in order:
 | `protocol`, `protocols` | the version this connection speaks, and every version the binary speaks |
 | `version`, `commit` | the Spiron build (`commit` is `null` for a build without one) |
 | `model` | the model id requests are sent with |
-| `context` | the effective context policy: `window_tokens` and `window_source` (`catalogue`, `config` or `fallback`), `reported_window_tokens` (what the model is told), `output_reserve_tokens`, `request_limit_bytes` (the largest request sent), `compaction_threshold_bytes` |
+| `context` | the effective context policy: `window_tokens` and `window_source` (`catalogue`, `config` or `fallback`), `reported_window_tokens` (what the model is told), `output_reserve_tokens`, `request_limit_bytes` (the largest request sent), `compaction_threshold_bytes` (`null` under the `window` policy, which compacts only to fit), and `policy` (`fixed` or `window`) |
 | `host_tools` | names of the host tools Spiron accepted (D7) |
 | `replay` | `{after_seq, complete}`: `complete` is false when the journal no longer held every frame after `after_seq` |
 
