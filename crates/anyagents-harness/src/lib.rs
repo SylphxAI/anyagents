@@ -902,7 +902,7 @@ impl TurnUsage {
                 .cache_write_tokens
                 .saturating_sub(after.cache_write_tokens),
             reported_cost_micros: match (self.reported_cost_micros, after.reported_cost_micros) {
-                (Some(now), Some(before)) => Some(now - before),
+                (Some(now), Some(before)) => Some((now - before).max(0)),
                 (Some(now), None) => Some(now),
                 _ => None,
             },

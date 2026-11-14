@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyagents_core::{AgentId, AgentLock, Incoming, NewAgent, Store};
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, FakeHarness, Harness, HarnessError, HarnessHealth,
-    OutboundMessage, Proof, TurnUsage,
+    OutboundMessage, Proof, TurnState, TurnUsage,
 };
 use anyagents_supervisor::{Attached, Clock, Custody, LaunchRequest, ManualClock, Supervisor};
 
@@ -81,8 +81,14 @@ impl Harness for Handle {
         Ok(())
     }
 
+    /// A process that is gone reads idle, as a keeper's link that closed
+    /// does.
     fn health(&self) -> HarnessHealth {
-        self.kept().fake.lock().unwrap().health()
+        let mut health = self.kept().fake.lock().unwrap().health();
+        if !health.process_alive {
+            health.turn_state = TurnState::Idle;
+        }
+        health
     }
 
     fn process_id(&self) -> Option<u32> {
@@ -205,6 +211,8 @@ struct Fixture {
     store: Arc<Store>,
     left: Arc<Left>,
     launches: Arc<AtomicUsize>,
+    /// Every process this kernel launched, to look at after.
+    launched: Arc<Mutex<Vec<Kept>>>,
     clock: Arc<ManualClock>,
 }
 
@@ -217,6 +225,7 @@ impl Fixture {
             store,
             left: Arc::new(Left::default()),
             launches: Arc::new(AtomicUsize::new(0)),
+            launched: Arc::default(),
             clock: Arc::new(ManualClock::new(1_699_000_000_000)),
         }
     }
@@ -254,6 +263,7 @@ impl Fixture {
 
     fn start(&self) -> Supervisor<Handle> {
         let launches = Arc::clone(&self.launches);
+        let launched = Arc::clone(&self.launched);
         Supervisor::start_with_custody(
             Arc::clone(&self.store),
             Arc::clone(&self.clock) as Arc<dyn Clock>,
@@ -263,7 +273,9 @@ impl Fixture {
                     .as_ref()
                     .expect("a keeper launch carries the lock");
                 launches.fetch_add(1, Ordering::SeqCst);
-                Ok(Handle(Some(Kept::new()), Some(lock.share().unwrap())))
+                let kept = Kept::new();
+                launched.lock().unwrap().push(kept.clone());
+                Ok(Handle(Some(kept), Some(lock.share().unwrap())))
             }),
             Vec::new(),
             Arc::new(FakeCustody(Arc::clone(&self.left))),
@@ -434,7 +446,7 @@ fn the_note_a_kernel_kept_restores_its_usage_accounting() {
     let fx = Fixture::new();
     let agent = fx.running("alpha", "claude-code");
     let kept = Kept::new();
-    let note = r#"{"served":{"input_tokens":5,"output_tokens":3,"cache_read_tokens":0,"cache_write_tokens":0,"reported_cost_micros":null},"turns_recorded":2,"written":0,"profile_rotated_ms":0,"completed_turn":true}"#;
+    let note = r#"{"served":{"input_tokens":5,"output_tokens":3,"cache_read_tokens":0,"cache_write_tokens":0,"reported_cost_micros":9},"turns_recorded":2,"written":0,"profile_rotated_ms":0,"completed_turn":true}"#;
     fx.leave(&agent, &kept, "claude-code", Some(note));
     let supervisor = fx.start();
     assert!(wait_until(|| !fx.left.notes.lock().unwrap().is_empty()));
@@ -458,6 +470,7 @@ fn usage_a_previous_kernel_recorded_is_not_recorded_again() {
         TurnUsage {
             input_tokens: 5,
             output_tokens: 3,
+            reported_cost_micros: Some(7),
             ..TurnUsage::default()
         },
         1,
@@ -529,6 +542,7 @@ fn a_turn_that_ended_while_no_kernel_ran_is_completed_not_recovered() {
         TurnUsage {
             input_tokens: 5,
             output_tokens: 3,
+            reported_cost_micros: Some(7),
             ..TurnUsage::default()
         },
         1,
@@ -667,6 +681,99 @@ fn a_process_found_dead_is_recovered_not_completed() {
     );
     assert!(fx.store.has_open_turn(&agent).unwrap());
     assert!(fx.launches.load(Ordering::SeqCst) >= 1);
+    drop(supervisor);
+}
+
+fn costed(input: u64, output: u64, cost: i64) -> TurnUsage {
+    TurnUsage {
+        input_tokens: input,
+        output_tokens: output,
+        reported_cost_micros: Some(cost),
+        ..TurnUsage::default()
+    }
+}
+
+/// A keeper that dies in the middle of a turn still reports the totals it
+/// had, cost included, and they equal what was recorded: that is no turn
+/// ending. The turn is recovered by the replacement, never completed.
+#[test]
+fn a_process_that_dies_mid_turn_with_cost_bearing_usage_is_recovered() {
+    let fx = Fixture::new();
+    let agent = fx.running("alpha", "claude-code");
+    fx.store.receive(&agent, Incoming::new("working")).unwrap();
+    let first = fx.store.next_undelivered(&agent).unwrap().unwrap();
+    fx.store.note_delivered(&agent, first.seq).unwrap();
+    let kept = Kept::new();
+    // The process is in the turn this mail opened.
+    kept.fake
+        .lock()
+        .unwrap()
+        .deliver(&OutboundMessage {
+            id: first.id.as_str().to_string(),
+            seq: first.seq,
+            text: first.text.clone(),
+            sender: None,
+            reply_to: None,
+            source_time_ms: None,
+            context: Default::default(),
+        })
+        .unwrap();
+    *kept.usage.lock().unwrap() = (costed(5, 3, 7), 1);
+    let note = r#"{"served":{"input_tokens":5,"output_tokens":3,"cache_read_tokens":0,"cache_write_tokens":0,"reported_cost_micros":7},"turns_recorded":1,"written":1,"profile_rotated_ms":0,"completed_turn":true,"pending_recovery":false}"#;
+    fx.leave(&agent, &kept, "claude-code", Some(note));
+    let supervisor = fx.start();
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent)
+            .is_some_and(|live| live.process_alive)
+    }));
+    // Its keeper dies; mail wakes the worker.
+    kept.fake.lock().unwrap().kill();
+    fx.store.receive(&agent, Incoming::new("more")).unwrap();
+    let mut now = 1_699_000_000_000;
+    assert!(
+        wait_until(|| {
+            now += 60_000;
+            fx.clock.set_ms(now);
+            fx.launched
+                .lock()
+                .unwrap()
+                .first()
+                .is_some_and(|replacement| {
+                    replacement
+                        .given()
+                        .first()
+                        .is_some_and(|id| id.starts_with("recovery_"))
+                })
+        }),
+        "the turn the dead process held was completed, not recovered: {:?}",
+        fx.launched.lock().unwrap().first().map(Kept::given)
+    );
+    drop(supervisor);
+}
+
+/// An idle pass over a live process whose cost-bearing totals did not move
+/// changes nothing: no turn ends, nothing written since is reset.
+#[test]
+fn an_idle_pass_with_unchanged_cost_bearing_usage_writes_nothing() {
+    let fx = Fixture::new();
+    let agent = fx.running("alpha", "claude-code");
+    let kept = Kept::new();
+    *kept.usage.lock().unwrap() = (costed(5, 3, 7), 1);
+    let note = r#"{"served":{"input_tokens":5,"output_tokens":3,"cache_read_tokens":0,"cache_write_tokens":0,"reported_cost_micros":7},"turns_recorded":1,"written":1,"profile_rotated_ms":0,"completed_turn":true,"pending_recovery":false}"#;
+    fx.leave(&agent, &kept, "claude-code", Some(note));
+    let supervisor = fx.start();
+    assert!(wait_until(|| !fx.left.notes.lock().unwrap().is_empty()));
+    std::thread::sleep(Duration::from_millis(500));
+    let notes = fx.left.notes.lock().unwrap().clone();
+    for note in &notes {
+        let note: serde_json::Value = serde_json::from_str(note).unwrap();
+        assert_eq!(
+            note["written"], 1,
+            "an idle pass reset the lines written: {notes:?}"
+        );
+    }
+    assert!(fx.store.list_usage(None).unwrap().is_empty());
     drop(supervisor);
 }
 

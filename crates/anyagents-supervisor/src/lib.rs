@@ -338,10 +338,20 @@ struct ProcessNote {
     pending_recovery: bool,
 }
 
-/// Whether served totals grew past `before`: any count, or a cost where
-/// there was none.
+/// Whether served totals grew past `before`, field by field: a token count
+/// above its last reading, or a cost above the last one (a positive cost
+/// where there was none). Equal totals are no news, whatever they carry.
 fn usage_advanced(served: &TurnUsage, before: &TurnUsage) -> bool {
-    served.difference(before.clone()) != TurnUsage::default()
+    let cost = match (served.reported_cost_micros, before.reported_cost_micros) {
+        (Some(now), Some(then)) => now > then,
+        (Some(now), None) => now > 0,
+        _ => false,
+    };
+    served.input_tokens > before.input_tokens
+        || served.output_tokens > before.output_tokens
+        || served.cache_read_tokens > before.cache_read_tokens
+        || served.cache_write_tokens > before.cache_write_tokens
+        || cost
 }
 
 /// How soon a worker looks again after it handed lines over, or while a turn
@@ -1895,10 +1905,13 @@ impl<H: Harness + 'static> Session<H> {
         let served = delivery.harness().last_usage();
         let before = self.served.clone().unwrap_or_default();
         let turns_served = delivery.harness().turns_served();
-        // Served totals only grow: a lower reading (a process that is gone
-        // and answers nothing) is no news, neither usage nor a turn's end.
+        // Served totals only grow: a lower or equal reading is no news. And
+        // only a live process says its turn ended: one that is gone (or a
+        // keeper that no longer answers) reads idle with its last totals,
+        // which proves nothing; its turn is recovered by the next process.
         let advanced = usage_advanced(&served, &before);
         let completed = (turns_served > self.turns_recorded || advanced)
+            && health.process_alive
             && health.turn_state == TurnState::Idle
             && health.sign_in_fault.is_none();
         // Persist completion before publishing progress or resetting the usage
@@ -3494,6 +3507,31 @@ mod persistence_tests {
 #[cfg(test)]
 mod custody_tests {
     use super::*;
+
+    /// Equal totals are no news, whatever cost they carry; any total above
+    /// its last reading is.
+    #[test]
+    fn usage_advances_only_when_a_total_grows() {
+        let usage = |tokens: u64, cost: Option<i64>| TurnUsage {
+            input_tokens: tokens,
+            output_tokens: tokens,
+            reported_cost_micros: cost,
+            ..TurnUsage::default()
+        };
+        assert!(!usage_advanced(&usage(5, Some(7)), &usage(5, Some(7))));
+        assert!(!usage_advanced(&usage(5, None), &usage(5, Some(7))));
+        assert!(!usage_advanced(&usage(4, Some(6)), &usage(5, Some(7))));
+        assert!(!usage_advanced(&usage(5, Some(0)), &usage(5, None)));
+        assert!(usage_advanced(&usage(5, Some(8)), &usage(5, Some(7))));
+        assert!(usage_advanced(&usage(5, Some(1)), &usage(5, None)));
+        assert!(usage_advanced(&usage(6, Some(7)), &usage(5, Some(7))));
+        assert_eq!(
+            usage(4, Some(6))
+                .difference(usage(5, Some(7)))
+                .reported_cost_micros,
+            Some(0)
+        );
+    }
     use anyagents_core::NewAgent;
     use anyagents_harness::{HarnessError, OutboundMessage};
 
