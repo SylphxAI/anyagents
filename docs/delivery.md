@@ -130,7 +130,9 @@ and never causes another notice; a child's own lifecycle notices
   the paused agent's parent when the sender is a person, a schedule or the
   operator, is told once per pause (`[Queued]`); the notice is keyed by the
   paused agent's delivery cursor, which a pause holds still. A parked agent's
-  notice says why it was parked.
+  notice says why it was parked. An answer to something the paused agent
+  asked (a message with `reply_to`) waits for it without a notice: whoever
+  answered has nothing to act on.
 
 ### A send whose outcome is unknown
 

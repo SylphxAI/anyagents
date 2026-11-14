@@ -5,7 +5,8 @@
 //! - Mail queued to a **paused** agent: its sender, when the sender is an
 //!   agent, or else the paused agent's parent, is told once per pause: the key
 //!   names the paused agent and its delivery cursor, which a pause holds
-//!   still, so the next pause (after the cursor moved) is told again.
+//!   still, so the next pause (after the cursor moved) is told again. An
+//!   answer to something the paused agent asked is not announced.
 //! - Mail stored for an **archived** agent without waking it: its agent
 //!   sender is told, once per message, that it will not be read unless the
 //!   agent is resumed, and who the agent's parent is.
@@ -101,6 +102,11 @@ impl Store {
     }
 
     fn announce_paused_mail(&self, message: &Message, recipient: &Agent) -> Result<(), Error> {
+        // An answer to what the paused agent asked waits for it; whoever
+        // answered has nothing to act on.
+        if message.reply_to.is_some() {
+            return Ok(());
+        }
         let parent = self.live_ancestor(recipient)?;
         let cursor = self.delivered_cursor(&recipient.id)?;
         let key = format!("anyagents:paused-mail:{}:{cursor}", recipient.id);
@@ -257,6 +263,12 @@ mod tests {
         let peer = store.create_agent(NewAgent::new("peer", "spiron")).unwrap();
         store.set_agent_state(&worker.id, "paused").unwrap();
 
+        // An answer to what the paused agent asked tells no one.
+        let mut answer = Incoming::new("pong");
+        answer.sender = Some(format!("agent:{}", peer.id));
+        answer.reply_to = Some("msg_asked_earlier".into());
+        store.receive(&worker.id, answer).unwrap();
+        assert!(notices(&store, &peer).is_empty());
         let first = send(&store, &worker, &peer, "one");
         send(&store, &worker, &peer, "two");
         let told = notices(&store, &peer);
