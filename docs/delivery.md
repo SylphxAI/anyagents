@@ -82,7 +82,12 @@ crashes or is upgraded ends no vendor process and loses no proof: the next
 server takes the keeper over and offers the mail past the cursor again, and
 the adapter answers what it already wrote from its own memory (`InFlight`,
 `Accepted`, `Duplicate`) and writes nothing twice. No turn was interrupted,
-so no `[Recovery]` note is sent beyond one the last server still owed. Every
+so no `[Recovery]` note is sent beyond one the last server still owed, and a
+turn the process finished meanwhile is recorded as completed. The refusal
+breaker goes on from the last parked message unless a message was taken
+after it. Two keepers of one agent (a server that died in the middle of a
+replacement) are settled as a replacement is: the older one's proofs are
+committed before it ends. Every
 call the server makes across the keeper is a read (`proven`, `health`) or a
 command that is safe to repeat (`deliver` by id, `stop`), so an answer lost
 with a dying server loses nothing.

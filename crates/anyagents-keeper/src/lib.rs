@@ -5,8 +5,9 @@
 //! protocol over them, and holds a copy of the agent's process lock. The
 //! kernel (`anyagents serve`) drives the adapter through the keeper's Unix
 //! socket. When the kernel stops, crashes or is replaced by a newer binary,
-//! nothing the harness can see changes: its stdin stays open, its stdout is
-//! still read, the adapter keeps every id it was given. The next kernel
+//! the harness keeps running: its stdin stays open, its stdout is still read,
+//! the adapter keeps every id it was given. (Its tool calls see the server's
+//! socket gone for that moment, and wait for it.) The next kernel
 //! connects, takes over, and resumes delivery from the mailbox cursor; a
 //! message the old kernel handed over is answered from the adapter's memory
 //! instead of being written twice.
