@@ -983,6 +983,10 @@ fn main() -> ExitCode {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv.get(1).is_some_and(|arg| arg == "internal") {
+        return internal(&argv[2..]);
+    }
     sandbox::hydrate_operator_groups_if_needed();
     let raw_argv: Vec<String> = std::env::args().collect();
     if let Some(cloud_args) = cloud_harness::try_parse_from_raw_argv(&raw_argv) {
@@ -1018,6 +1022,19 @@ fn main() -> ExitCode {
         Err(err) => {
             eprintln!("{err}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Helpers AnyAgents runs as itself, never commands for an operator. They
+/// start before any deployment setup: no data directory, no group hydration,
+/// no inherited state beyond what the caller passed.
+fn internal(args: &[std::ffi::OsString]) -> ExitCode {
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("admission-probe") => worktree_access::admission_probe_main(&args[1..]),
+        _ => {
+            eprintln!("anyagents internal: unknown helper");
+            ExitCode::from(2)
         }
     }
 }
