@@ -3484,7 +3484,8 @@ impl Store {
         }
 
         if let Some(peer) = peer_filter {
-            turns.retain(|turn| matches_conversation_peer(turn, peer));
+            let peers = self.conversation_peer_forms(peer);
+            turns.retain(|turn| peers.iter().any(|p| matches_conversation_peer(turn, p)));
         }
 
         turns.sort_by(|a, b| {
@@ -3572,7 +3573,8 @@ impl Store {
             });
         }
         if let Some(peer) = peer_filter {
-            turns.retain(|turn| matches_conversation_peer(turn, peer));
+            let peers = self.conversation_peer_forms(peer);
+            turns.retain(|turn| peers.iter().any(|p| matches_conversation_peer(turn, p)));
         }
         turns.sort_by(|a, b| {
             a.timestamp_ms
@@ -7923,6 +7925,26 @@ fn telegram_sender_user_key(sender: Option<&str>) -> Option<String> {
         return Some(s.to_string());
     }
     None
+}
+
+impl Store {
+    /// A peer as written, plus the name and id of the agent it names: a
+    /// message records its sender by id and its recipient as addressed, so
+    /// either form alone misses half an exchange.
+    fn conversation_peer_forms(&self, peer: &str) -> Vec<String> {
+        let mut forms = vec![peer.to_string()];
+        let bare = peer.strip_prefix("agent:").unwrap_or(peer);
+        if !bare.contains(':')
+            && let Ok(agent) = self.agent_by_name(bare)
+        {
+            for form in [agent.name, agent.id.to_string()] {
+                if !forms.contains(&form) {
+                    forms.push(form);
+                }
+            }
+        }
+        forms
+    }
 }
 
 fn matches_conversation_peer(turn: &ConversationTurn, peer: &str) -> bool {

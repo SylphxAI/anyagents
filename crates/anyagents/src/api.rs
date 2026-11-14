@@ -320,10 +320,18 @@ pub struct SendMedia {
     /// Local file path, `https://` URL, or Telegram `file_id`.
     pub source: String,
     /// Optional track title (for `kind = "audio"` or `"music"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub title: Option<String>,
     /// Optional artist/performer name (for `kind = "audio"` or `"music"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub performer: Option<String>,
 }
 
@@ -332,10 +340,18 @@ pub struct SendLocation {
     pub latitude: f64,
     pub longitude: f64,
     /// Optional venue title (when both `title` and `address` are set, sends a rich venue card).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub title: Option<String>,
     /// Optional venue street address.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub address: Option<String>,
 }
 
@@ -356,7 +372,11 @@ pub struct SendChecklist {
     /// Checklist items (`1..=30` task descriptions; prefix with `[x]` or `☑` for pre-checked items).
     pub tasks: Vec<String>,
     /// Optional Telegram Business Connection ID for native `sendChecklist`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub business_connection_id: Option<String>,
 }
 
@@ -365,14 +385,75 @@ pub struct SendArticle {
     /// Article title.
     pub title: String,
     /// Markdown or plain-text body to publish as a Telegram Telegraph (`telegra.ph`) Instant View article.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub content: Option<String>,
     /// Optional external article URL (when already hosted).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub url: Option<String>,
     /// Optional author name shown on the Instant View header.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub author_name: Option<String>,
+}
+
+/// An optional field written as `null`, `"null"`, `"undefined"`, `"none"` or
+/// `""` is absent. Models fill unused optional fields with these, and a
+/// `"null"` URL or object is never what they meant.
+pub fn absent_if_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    absent_if(deserializer, is_null_word)
+}
+
+/// [`absent_if_null`] for a field where `""` means something (an emoji
+/// reaction's `""` clears it).
+pub fn absent_if_placeholder<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    absent_if(deserializer, |text| {
+        !text.trim().is_empty() && is_null_word(text)
+    })
+}
+
+fn absent_if<'de, D, T>(
+    deserializer: D,
+    absent: impl Fn(&str) -> bool,
+) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) if absent(&text) => Ok(None),
+        Some(value) => T::deserialize(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+/// Empty, or a word models write for "no value".
+pub(crate) fn is_null_word(text: &str) -> bool {
+    let text = text.trim();
+    text.is_empty()
+        || ["null", "undefined", "none", "nil"]
+            .iter()
+            .any(|word| text.eq_ignore_ascii_case(word))
 }
 
 pub fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>

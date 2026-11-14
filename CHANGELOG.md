@@ -33,6 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rework and cost per successful outcome by harness and model, role, profile,
   agent or skill. The parent reminder for idle task sub-agents now asks for a
   verdict. Usage docs no longer claim a price table or OpenTelemetry export.
+- Tool contracts follow what agents write. `code` honours `timeout_ms` up to a
+  configurable ceiling (default 30 s, max 10 min; `<data>/tool-limits.json` or
+  `ANYAGENTS_CODE_TIMEOUT_MS` / `ANYAGENTS_CODE_MAX_TIMEOUT_MS`); an inner
+  `workspace.exec` inherits the call's remaining time, and its own `timeout_ms`
+  stretches the call. Longer commands run as jobs (`background: true`, then
+  `workspace.job`) recorded in the agent's `state-home`. Failed snippets name
+  their fix (ESM imports, `require`/Node globals, Python, guessed API names,
+  double-escaped code), and the description lists the exact sandbox API.
+  `schedules` accepts `action: "at"|"every"|"watch"` and `"null"` placeholders,
+  and its errors quote a correct call. `send` treats `"null"` optional fields as
+  absent; `self` and `parent` resolve in `conversation`, `agents` and
+  `schedules`. An ancestor may message any non-isolated descendant, and
+  messaging refusals name the route.
 
 ## 0.1.3
 
