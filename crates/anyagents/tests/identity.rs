@@ -701,8 +701,10 @@ fn a_configured_public_listener_serves_only_the_public_surface() {
         serde_json::from_str::<Value>(root.split_once("\r\n\r\n").unwrap().1).unwrap(),
         json!({ "ok": true })
     );
+    // No body: a 404 closes the connection without reading one, and unread
+    // bytes would turn that close into a reset on some platforms.
     for path in ["/v1/mcp", "/mcp", "/v1/agents"] {
-        let raw = call(&public, "POST", path, "", list);
+        let raw = call(&public, "POST", path, "", "");
         assert!(raw.starts_with("HTTP/1.1 404"), "{path}: {raw}");
     }
     let refused = call(

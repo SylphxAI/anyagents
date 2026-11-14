@@ -12378,11 +12378,13 @@ exec '{}' "$@"
                 ("POST", "/mcp"),
                 ("GET", "/v1/webhooks/unknown"),
             ] {
+                // No body: a 404 closes without reading one, and unread bytes
+                // would turn that close into a reset on some platforms.
                 let (status, _) = call(
                     method,
                     path.into(),
                     vec![("x-anyagents-agent", local_cap.clone())],
-                    "{}".into(),
+                    String::new(),
                 )
                 .await
                 .unwrap();
