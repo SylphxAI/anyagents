@@ -22,31 +22,72 @@ use serde_json::{Value, json};
 
 struct Server {
     child: Child,
+    _keepers: support::Keepers,
 }
 
 impl Server {
     fn start(dir: &Path, harness_bin: &Path) -> Self {
-        let child = support::contract_server()
+        Self::start_from(dir, harness_bin, Path::new(env!("CARGO_BIN_EXE_anyagents")))
+    }
+
+    /// A server run from `server_bin`, appending to the shared log so a test
+    /// that restarts it keeps the whole story.
+    fn start_from(dir: &Path, harness_bin: &Path, server_bin: &Path) -> Self {
+        Self::start_with(dir, harness_bin, server_bin, &[])
+    }
+
+    /// [`Server::start_from`] with extra environment for the server (and so
+    /// for the keepers it starts).
+    fn start_with(dir: &Path, harness_bin: &Path, server_bin: &Path, env: &[(&str, &str)]) -> Self {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("shared.log"))
+            .unwrap();
+        let mut child = support::contract_server_at(server_bin)
             .env("ANYAGENTS_HARNESS_BIN", harness_bin)
             .arg("--data")
             .arg(dir)
             .arg("serve")
             .stdout(Stdio::null())
-            .stderr(std::fs::File::create(dir.join("shared.log")).unwrap())
+            .stderr(log)
             .env("ANYAGENTS_SHARED_LOG", dir.join("shared.log"))
+            .envs(env.iter().copied())
             .spawn()
             .expect("server");
+        // A server that died leaves its socket file: ready is a connection.
         let socket = dir.join("anyagents.sock");
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !socket.exists() {
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
             assert!(
-                Instant::now() < deadline,
+                Instant::now() < deadline && child.try_wait().unwrap().is_none(),
                 "no socket: {}",
                 std::fs::read_to_string(dir.join("shared.log")).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        Self { child }
+        Self {
+            child,
+            _keepers: support::Keepers::of(dir),
+        }
+    }
+
+    /// The server dies without a word, as a crash or an OOM kill does. Its
+    /// keepers are left running.
+    #[cfg(target_os = "linux")]
+    fn crash(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        std::mem::forget(self);
+    }
+
+    /// A clean stop, as a deployment's restart sends.
+    #[cfg(target_os = "linux")]
+    fn terminate(mut self) {
+        // SAFETY: SIGTERM to the server this test started.
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        let _ = self.child.wait();
+        std::mem::forget(self);
     }
 }
 
@@ -129,7 +170,10 @@ fn the_real_server_refuses_a_matching_uid_but_accepts_the_fixture() {
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
-    let mut refused = Server { child };
+    let mut refused = Server {
+        child,
+        _keepers: support::Keepers::of(&data),
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(status) = refused.child.try_wait().unwrap() {
@@ -163,7 +207,10 @@ fn the_real_server_refuses_a_matching_uid_but_accepts_the_fixture() {
         .stderr(std::fs::File::create(&accepted_log).unwrap())
         .spawn()
         .unwrap();
-    let mut accepted = Server { child };
+    let mut accepted = Server {
+        child,
+        _keepers: support::Keepers::of(&data),
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
     while !data.join("anyagents.sock").exists() {
         assert!(
@@ -352,6 +399,18 @@ fn repeated_replies(harness: &str) {
     let _server = Server::start(&data, Path::new(env!("CARGO_BIN_EXE_anyagents")));
     one_round(&data, name, harness);
     one_round(&data, name, harness);
+    // The double ends each turn with a `result` line: the turn closes, and
+    // nothing is left open for a recovery note.
+    let store = Store::open(data.join("state.db")).unwrap();
+    let responder = store.agent_by_name(name).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while let Some(open) = store.open_turn(&responder.id).unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "{harness}: an answered turn stayed open: {open:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 macro_rules! reply_cases {
@@ -416,5 +475,613 @@ fn an_agy_agent_and_a_muse_agent_each_answer_a_mailbox_message() {
     let text = String::from_utf8_lossy(&listed.stdout);
     assert!(text.contains("agy\tAGY_CONFIG_DIR\t"), "{text}");
     assert!(text.contains("muse\tMUSE_CONFIG_HOME\t"), "{text}");
+    drop(server);
+}
+
+// Keepers host harnesses on Linux only (`docs/adr/0007-process-architecture.md`):
+// what follows tests them, and the server elsewhere hosts each harness itself.
+
+/// Send `text` to `name` as the asker; the id of the message it became.
+#[cfg(target_os = "linux")]
+fn send(data: &Path, name: &str) -> String {
+    let sent = call(
+        &data.join("anyagents.sock"),
+        &json!({"to": [name], "text": "ping", "sender": "agent:kind"}).to_string(),
+    );
+    let text = sent.to_string();
+    sent["deliveries"][0]["id"]
+        .as_str()
+        .expect(&text)
+        .to_string()
+}
+
+/// Wait for the shared log to say `line`; on failure show the log.
+#[cfg(target_os = "linux")]
+fn wait_logged(data: &Path, line: &str, why: &str) {
+    let deadline = Instant::now() + support::WAIT;
+    while !shared_log(data).contains(line) {
+        assert!(Instant::now() < deadline, "{why}:\n{}", shared_log(data));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// How many answers to `sent_id` reached the asker.
+#[cfg(target_os = "linux")]
+fn answers(data: &Path, sent_id: &str) -> usize {
+    let store = Store::open(data.join("state.db")).unwrap();
+    let asker = store.agent_by_name("kind").unwrap();
+    store
+        .inbox(&asker.id, None)
+        .unwrap()
+        .iter()
+        .filter(|message| message.text == "pong" && message.reply_to.as_deref() == Some(sent_id))
+        .count()
+}
+
+/// Make the agent's contract double hold each turn open while `hold` exists.
+#[cfg(target_os = "linux")]
+fn hold_turns(data: &Path, agent_id: &str, hold: &Path) {
+    let path = data
+        .join("agents")
+        .join(agent_id)
+        .join("config")
+        .join("adapter.json");
+    let mut adapter: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    adapter["hold_while"] = json!(hold.display().to_string());
+    std::fs::write(&path, serde_json::to_vec_pretty(&adapter).unwrap()).unwrap();
+}
+
+/// The harness process the agent's newest live keeper holds.
+#[cfg(target_os = "linux")]
+fn kept_harness(data: &Path, agent_id: &str) -> u32 {
+    let mut found = None;
+    support::wait_for(
+        || {
+            let Ok(entries) = std::fs::read_dir(data.join("keepers")) else {
+                return false;
+            };
+            let mut dirs: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+            dirs.sort();
+            found = dirs.iter().rev().find_map(|dir| {
+                let agent = std::fs::read_to_string(dir.join("agent")).ok()?;
+                if agent.trim() != agent_id {
+                    return None;
+                }
+                let record: Value =
+                    serde_json::from_slice(&std::fs::read(dir.join("keeper.json")).ok()?).ok()?;
+                let pid = u32::try_from(record["harness_process"]["pid"].as_u64()?).ok()?;
+                alive(pid).then_some(pid)
+            });
+            found.is_some()
+        },
+        "no keeper holds a live harness for the agent",
+    );
+    found.unwrap()
+}
+
+/// No keeper directory serves the agent.
+#[cfg(target_os = "linux")]
+fn no_keeper(data: &Path, agent_id: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(data.join("keepers")) else {
+        return true;
+    };
+    entries.flatten().all(|entry| {
+        std::fs::read_to_string(entry.path().join("agent"))
+            .ok()
+            .is_none_or(|agent| agent.trim() != agent_id)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only asks whether the process exists.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(target_os = "linux")]
+fn shared_log(data: &Path) -> String {
+    std::fs::read_to_string(data.join("shared.log")).unwrap_or_default()
+}
+
+/// A running agent's harness outlives its server. The server crashes in the
+/// middle of a turn with a second message already handed over, and comes back
+/// as another binary (an upgrade); later it stops cleanly in the middle of a
+/// turn and starts again. Each time the same vendor process finishes the turn,
+/// every message is answered exactly once, and delivery resumes from the
+/// mailbox cursor.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_harness_outlives_a_server_crash_an_upgrade_and_a_clean_stop() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let name = "responder";
+    let agent_file = data.join("responder-name");
+    std::fs::write(&agent_file, name).unwrap();
+    let id = create(&data, name, "claude-code", &agent_file);
+    let hold = data.join("hold-turn");
+    hold_turns(&data, &id, &hold);
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    let agent_id = anyagents_core::AgentId::parse(&id).unwrap();
+
+    // A turn in progress, and a second message handed over behind it.
+    std::fs::write(&hold, b"").unwrap();
+    let server = Server::start(&data, anyagents);
+    let first = send(&data, name);
+    support::wait_for(
+        || shared_log(&data).contains(&format!("holding {first}")),
+        "the first turn did not start",
+    );
+    let second = send(&data, name);
+    let store = Store::open(data.join("state.db")).unwrap();
+    support::wait_for(
+        || store.next_undelivered(&agent_id).unwrap().is_none(),
+        "the second message was not handed over",
+    );
+    let harness = kept_harness(&data, &id);
+
+    server.crash();
+    assert!(alive(harness), "the server's crash ended the harness");
+    let upgraded = dir.path().join("anyagents-next");
+    std::fs::copy(anyagents, &upgraded).unwrap();
+    let server = Server::start_from(&data, anyagents, &upgraded);
+    assert_eq!(
+        kept_harness(&data, &id),
+        harness,
+        "the upgraded server started another harness"
+    );
+    std::fs::remove_file(&hold).unwrap();
+    ask(&data, name, "claude-code", &first);
+    ask(&data, name, "claude-code", &second);
+
+    // A clean stop in the middle of the next turn.
+    std::fs::write(&hold, b"").unwrap();
+    let third = send(&data, name);
+    support::wait_for(
+        || shared_log(&data).contains(&format!("holding {third}")),
+        "the third turn did not start",
+    );
+    let harness = kept_harness(&data, &id);
+    server.terminate();
+    assert!(alive(harness), "a clean stop ended the harness");
+    let server = Server::start(&data, anyagents);
+    assert_eq!(kept_harness(&data, &id), harness);
+    std::fs::remove_file(&hold).unwrap();
+    ask(&data, name, "claude-code", &third);
+
+    for sent in [&first, &second, &third] {
+        assert_eq!(
+            answers(&data, sent),
+            1,
+            "{sent} was not answered exactly once"
+        );
+    }
+    let starts = shared_log(&data).matches("harness: start").count();
+    assert!(starts <= 2, "the harness double started {starts} times");
+    drop(server);
+    support::wait_for(|| !alive(harness), "stopping the keepers left the harness");
+}
+
+/// The real binary across protocol versions. A server whose keepers speak a
+/// range overlapping the next server's has them taken over; one whose
+/// keepers speak no version the next server speaks has them stopped and
+/// started again, and mail sent before and after is answered exactly once.
+#[cfg(target_os = "linux")]
+#[test]
+fn keepers_across_protocol_versions_are_taken_over_or_replaced() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let name = "responder";
+    let agent_file = data.join("responder-name");
+    std::fs::write(&agent_file, name).unwrap();
+    let id = create(&data, name, "claude-code", &agent_file);
+    let hold = data.join("hold-turn");
+    hold_turns(&data, &id, &hold);
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    let speaking = |range: &'static str| [(anyagents_keeper::PROTOCOL_ENV, range)];
+
+    // A newer binary that also speaks this one's version: taken over.
+    std::fs::write(&hold, b"").unwrap();
+    let server = Server::start_with(&data, anyagents, anyagents, &speaking("2-3"));
+    let first = send(&data, name);
+    support::wait_for(
+        || shared_log(&data).contains(&format!("holding {first}")),
+        "the first turn did not start",
+    );
+    let harness = kept_harness(&data, &id);
+    server.crash();
+    let server = Server::start(&data, anyagents);
+    assert_eq!(
+        kept_harness(&data, &id),
+        harness,
+        "a shared version was not spoken"
+    );
+    std::fs::remove_file(&hold).unwrap();
+    ask(&data, name, "claude-code", &first);
+    // A keeper only the later binary speaks to: none of the older ones
+    // may be left, so they are stopped while no server runs.
+    std::fs::write(&hold, b"").unwrap();
+    server.crash();
+    let stopped = Command::new(anyagents)
+        .arg("--data")
+        .arg(&data)
+        .args(["keepers", "stop", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(no_keeper(&data, &id));
+
+    // A binary that speaks only a later version: stopped and replaced. The
+    // turn it held is interrupted once, and recovered by the replacement.
+    let server = Server::start_with(&data, anyagents, anyagents, &speaking("3-3"));
+    let second = send(&data, name);
+    wait_logged(
+        &data,
+        &format!("holding {second}"),
+        "the second turn did not start",
+    );
+    let unspoken = kept_harness(&data, &id);
+    server.crash();
+    let server = Server::start(&data, anyagents);
+    support::wait_for(
+        || !alive(unspoken),
+        "a keeper no version is shared with was left",
+    );
+    assert_ne!(kept_harness(&data, &id), unspoken);
+    std::fs::remove_file(&hold).unwrap();
+    ask(&data, name, "claude-code", &second);
+    for sent in [&first, &second] {
+        assert_eq!(
+            answers(&data, sent),
+            1,
+            "{sent} was not answered exactly once"
+        );
+    }
+    drop(server);
+}
+
+/// A harness kept across a restart sends its gateway token to the port the
+/// last server held. When something else listens there by the next start,
+/// the gateway moves: every agent's token is replaced, and an API-key agent's
+/// kept harness is replaced rather than taken over, so none keeps sending its
+/// token to the old port. The turn it held is recovered and answered once.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_moved_gateway_replaces_the_kept_harnesses_of_api_key_agents() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let name = "responder";
+    let agent_file = data.join("responder-name");
+    std::fs::write(&agent_file, name).unwrap();
+    let id = create(&data, name, "claude-code", &agent_file);
+    let key_file = dir.path().join("key");
+    std::fs::write(&key_file, "sk-provider-secret\n").unwrap();
+    let keyed = bin()
+        .arg("--data")
+        .arg(&data)
+        .args([
+            "model",
+            name,
+            "--base-url",
+            "http://127.0.0.1:9",
+            "--model",
+            "claude",
+        ])
+        .arg("--key-file")
+        .arg(&key_file)
+        .output()
+        .unwrap();
+    assert!(
+        keyed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&keyed.stderr)
+    );
+    let hold = data.join("hold-turn");
+    hold_turns(&data, &id, &hold);
+    std::fs::write(&hold, b"").unwrap();
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    let server = Server::start(&data, anyagents);
+    let sent = send(&data, name);
+    wait_logged(&data, &format!("holding {sent}"), "the turn did not start");
+    let harness = kept_harness(&data, &id);
+    let token_file = data.join("agents").join(&id).join("gateway-token.txt");
+    let token = std::fs::read_to_string(&token_file).unwrap();
+    let port: u16 = std::fs::read_to_string(data.join("gateway.port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    server.crash();
+
+    // Something else takes the port while no server runs.
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let server = Server::start(&data, anyagents);
+    support::wait_for(|| !alive(harness), "the kept harness was taken over");
+    let moved: u16 = std::fs::read_to_string(data.join("gateway.port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(moved, port, "the gateway stayed on a port it does not hold");
+    assert_ne!(
+        std::fs::read_to_string(&token_file).unwrap(),
+        token,
+        "the token handed out before the move still works"
+    );
+    assert_ne!(kept_harness(&data, &id), harness);
+    std::fs::remove_file(&hold).unwrap();
+    ask(&data, name, "claude-code", &sent);
+    assert_eq!(
+        answers(&data, &sent),
+        1,
+        "{sent} was not answered exactly once"
+    );
+    drop(server);
+    drop(squatter);
+}
+
+/// A server that stops while one of its agents' keepers is still starting
+/// does not wait for that start: it stops at once, and the keeper finishes
+/// its start on its own for the next server.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_server_stops_at_once_while_a_keeper_is_still_starting() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let name = "slow-start";
+    let out = bin()
+        .env("PATH", machine_path(&data))
+        .arg("--data")
+        .arg(&data)
+        .args(["agents", "create", name, "--harness", "spiron"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A vendor that never says it is ready: its keeper's start takes as long
+    // as Spiron's own ready wait.
+    let spiron = data.join("bin").join("spiron-never-ready");
+    std::fs::create_dir_all(spiron.parent().unwrap()).unwrap();
+    std::fs::write(&spiron, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    std::fs::set_permissions(&spiron, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    let server = Server::start_with(
+        &data,
+        anyagents,
+        anyagents,
+        &[("ANYAGENTS_SPIRON_BIN", spiron.to_str().unwrap())],
+    );
+    send(&data, name);
+    support::wait_for(
+        || {
+            std::fs::read_dir(data.join("keepers"))
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .any(|entry| entry.path().join("spawned").exists())
+                })
+                .unwrap_or(false)
+        },
+        "no keeper started",
+    );
+    let started = Instant::now();
+    server.terminate();
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the server waited {:?} for a keeper's start",
+        started.elapsed()
+    );
+    let stopped = bin()
+        .arg("--data")
+        .arg(&data)
+        .args(["keepers", "stop", "--all", "--force"])
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+}
+
+/// Stopping keepers is the step before a rollback to a binary without them.
+/// It refuses while a server runs (that server would start them again),
+/// exits non-zero when it refuses, and once no server runs it ends every
+/// harness and frees every agent lock.
+#[cfg(target_os = "linux")]
+#[test]
+fn keepers_stop_only_when_no_server_runs() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let name = "responder";
+    let agent_file = data.join("responder-name");
+    std::fs::write(&agent_file, name).unwrap();
+    let id = create(&data, name, "claude-code", &agent_file);
+    let hold = data.join("hold-turn");
+    hold_turns(&data, &id, &hold);
+    std::fs::write(&hold, b"").unwrap();
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    let server = Server::start(&data, anyagents);
+    let sent = send(&data, name);
+    support::wait_for(
+        || shared_log(&data).contains(&format!("holding {sent}")),
+        "the turn did not start",
+    );
+    let harness = kept_harness(&data, &id);
+    let stop = || {
+        Command::new(anyagents)
+            .arg("--data")
+            .arg(&data)
+            .args(["keepers", "stop", "--all"])
+            .output()
+            .unwrap()
+    };
+    let refused = stop();
+    assert!(
+        !refused.status.success(),
+        "stop went ahead under a running server"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("a server is running"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(alive(harness));
+    server.terminate();
+    assert!(
+        alive(harness),
+        "a clean stop of the server ended the harness"
+    );
+    let stopped = stop();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    support::wait_for(|| !alive(harness), "stop left the harness running");
+    let store = Store::open(data.join("state.db")).unwrap();
+    let agent = anyagents_core::AgentId::parse(&id).unwrap();
+    drop(
+        store
+            .try_lock_agent(&agent)
+            .expect("the agent lock is still held"),
+    );
+}
+
+/// A real adapter's dedupe under a keeper: Spiron (here its protocol fake)
+/// has a prompt and a steer written into a turn it has not started when the
+/// server crashes. The next server, another binary, offers both again; the
+/// adapter in the keeper answers from its memory, and the vendor process reads
+/// each exactly once.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_spiron_adapter_in_its_keeper_never_writes_a_line_twice_across_a_restart() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let name = "spirited";
+    let out = bin()
+        .env("PATH", machine_path(&data))
+        .arg("--data")
+        .arg(&data)
+        .args(["agents", "create", name, "--harness", "spiron"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .split('\t')
+        .next()
+        .unwrap()
+        .to_string();
+    let config = data.join("agents").join(&id).join("config");
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../anyagents-harness-stream/tests/fake_spiron.py");
+    let spiron = data.join("bin").join("spiron-fake");
+    std::fs::write(
+        &spiron,
+        format!(
+            "#!/bin/sh\nexec /usr/bin/python3 {} \"$@\"\n",
+            fake.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&spiron, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let spiron_env = [
+        ("ANYAGENTS_SPIRON_BIN", spiron.to_str().unwrap()),
+        ("FAKE_SPIRON_CAPABLE", "1"),
+    ];
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    // No turn is announced yet: the prompt and the steer stay in flight.
+    std::fs::write(config.join("hold"), b"").unwrap();
+    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
+    let first = send(&data, name);
+    let second = send(&data, name);
+    let wire = || -> Vec<(u64, String)> {
+        std::fs::read_to_string(config.join("wire.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|line| {
+                Some((
+                    line["launch"].as_u64()?,
+                    line["msg"]["request_id"].as_str()?.to_string(),
+                ))
+            })
+            .collect()
+    };
+    support::wait_for(
+        || wire().len() == 2,
+        "the prompt and the steer did not reach the vendor",
+    );
+    let harness = kept_harness(&data, &id);
+    server.crash();
+    let upgraded = dir.path().join("anyagents-next");
+    std::fs::copy(anyagents, &upgraded).unwrap();
+    let server = Server::start_with(&data, anyagents, &upgraded, &spiron_env);
+    assert_eq!(
+        kept_harness(&data, &id),
+        harness,
+        "the vendor process was restarted"
+    );
+    // The turn starts, its step journals the steer, and it ends.
+    std::fs::remove_file(config.join("hold")).unwrap();
+    std::fs::write(config.join("step"), b"").unwrap();
+    let store = Store::open(data.join("state.db")).unwrap();
+    let agent = anyagents_core::AgentId::parse(&id).unwrap();
+    let last = store.inbox(&agent, None).unwrap().last().unwrap().seq;
+    support::wait_for(
+        || store.delivered_cursor(&agent).unwrap() >= last,
+        "the consumed lines were not committed",
+    );
+    assert_eq!(
+        wire(),
+        vec![(1, first.clone()), (1, second.clone())],
+        "a line was written twice, or by another process"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config.join("launches"))
+            .unwrap()
+            .trim(),
+        "1"
+    );
     drop(server);
 }

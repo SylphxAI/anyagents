@@ -24,6 +24,9 @@ impl Drop for Serve {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(data) = self.socket.parent() {
+            support::stop_keepers(data);
+        }
         // Say why it ended, when it ended before this test did.
         if let Some(mut stderr) = self.child.stderr.take() {
             let mut text = String::new();

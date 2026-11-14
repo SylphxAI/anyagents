@@ -1,6 +1,6 @@
 # AnyAgents architecture
 
-Status: design. Decisions behind it are in [adr/0001-server-first-one-binary.md](adr/0001-server-first-one-binary.md) and [adr/0002-runtime-drivers-and-capability-identity.md](adr/0002-runtime-drivers-and-capability-identity.md).
+Status: design. Decisions behind it are in [adr/0001-server-first-one-binary.md](adr/0001-server-first-one-binary.md), [adr/0002-runtime-drivers-and-capability-identity.md](adr/0002-runtime-drivers-and-capability-identity.md) and, for which process holds what, [adr/0007-process-architecture.md](adr/0007-process-architecture.md).
 
 ## The standard, and the shape
 
@@ -19,10 +19,12 @@ The established pattern for running vendor agents is a long-lived gateway that d
      |  sign-in    |  adapters   |  three acks |             |  aggregates |
      +-------------+-------------+-------------+-------------+-------------+
                                        |
+                       keepers: one `anyagents keeper` per harness
+                                       |
                     vendor processes: claude, codex, opencode, gemini, ...
 ```
 
-Everything runs in one process, `anyagents serve`, with one embedded database. Each module below is one crate with one public interface; the protocol gateway is a sixth module used only in API-key mode.
+`anyagents serve` is the kernel: the API, identity, the mailboxes, supervision, schedules and the one embedded database run in it. Each harness process is held by its own keeper, a small process (`anyagents keeper`, the same binary) that starts the harness, owns its pipes and hosts the vendor adapter, so the kernel can stop, crash or be replaced by a newer binary while every harness keeps running ([ADR 0007](adr/0007-process-architecture.md)); on Linux only, see [Agents](#agents-create-and-supervise). The protocol gateway, used only in API-key mode, runs inside the kernel.
 
 ## Three-axis vendor-neutral model (`Harness × Profile × Sandbox`)
 
@@ -61,7 +63,7 @@ Clients show only valid combinations, so an invalid one is never offered rather 
 
 ## Protocol gateway (API-key mode)
 
-A local HTTP server inside `anyagents serve`, bound to loopback, reachable only by the harness processes AnyAgents started (each gets a per-agent gateway token).
+A local HTTP server inside `anyagents serve`, bound to loopback, reachable only by the harness processes AnyAgents started (each gets a per-agent gateway token). Its port is kept in `<data>/gateway.port` and bound again at the next start, so a harness that outlived the last server in its keeper still reaches the gateway at the origin it was started with; only when that port is taken does the gateway take another and repoint every agent.
 
 - **Inbound protocols:** the Anthropic Messages API (`/v1/messages`, streaming), and the OpenAI Chat Completions and Responses APIs (`/v1/chat/completions`, `/v1/responses`, streaming), because those are what the supported harnesses speak.
 - **Outbound:** the provider's native API for the chosen model. When inbound and outbound are the same protocol the request passes through unchanged apart from the key and model; otherwise the gateway maps messages, system prompts, tool definitions, tool calls and results, streaming events, stop reasons and usage between them.
@@ -102,7 +104,8 @@ AnyAgents is a message switchboard plus a process supervisor. It never models a 
 
 Each agent is one long-lived vendor process in its programmatic mode, run under a supervisor:
 
-- A per-agent lock: a second process for the same agent is refused, never started beside the first.
+- Its own keeper. The vendor process and the adapter that speaks to it live in a keeper process, not in the server. A server that stops, crashes or is upgraded leaves every keeper running; the next server takes each running agent's keeper over, with the adapter's memory of the session intact, and resumes delivery from the mailbox cursor. A process taken over gets no `[Recovery]` note: its turn never stopped. A keeper whose agent no longer runs is stopped at startup. `anyagents keepers list` shows every keeper; `anyagents keepers stop` ends them. Keepers are Linux-only, a platform limitation: taking one over rests on proving a process's identity from `/proc`, which other platforms do not offer. On macOS the server hosts each harness in its own process, and a server restart restarts its agents; keepers there need a macOS process-identity source (`proc_pidinfo`, with the start time from `kinfo_proc`) ([ADR 0007](adr/0007-process-architecture.md#9-where-in-process-hosting-remains)).
+- A per-agent lock: a second process for the same agent is refused, never started beside the first. The keeper holds a copy of the lock for the life of its process, so the lock stays held while no server runs.
 - Restart with exponential backoff and jitter after a crash, resuming the same vendor session id. Starting a new session in place of a failed resume is reported as a failed resume, not hidden.
 - A quota or rate-limit answer from the vendor (for example an HTTP 429 with a reset time) is a health state with its reset time, not a crash and not a restart loop.
 - A process that has gone is replaced after its backoff, resuming the session, and the lines after the one cursor go to the new process. A line already taken is never written twice: each adapter remembers the ids its session holds.
@@ -182,47 +185,22 @@ One adapter per harness. A new harness is an adapter plus a catalog entry; the m
 
 | Call | Obligation |
 | --- | --- |
-| `deliver(message)` | Put one mailbox message into the live vendor process through that harness's own input or steer API. Return `accepted` once the vendor has taken it (its acknowledgement, echo or written line), or the reason it could not. |
+| `deliver(message)` | Put one mailbox message into the live vendor process through that harness's own input or steer API, and answer what the vendor has shown about it: taken with the proof the harness's level requires, in flight, already held by the session, not now, or a fault ([delivery.md](delivery.md)). |
 | `background()` | Ask the vendor tool to move running work off the turn, where the tool supports it. Never wrap the tool's own tools. |
 | `resume(session)` | Reattach to the same vendor session id. |
 | `cancel()` | The vendor's own interrupt for the current turn. |
-| `health()` | Process alive, declared delivery mode, steer support (yes, no or unproven), and any current quota or sign-in fault. |
+| `health()` | Process alive, the delivery level (`turn-end`, `mid-turn` or `next-step`, and whether a redelivery is recognised) with what the running process announced in its handshake, and any current quota or sign-in fault. |
 | `last_usage()` | Tokens and cost the vendor reported for the runs this process made, read once when the mailbox has drained. Never part of delivery. |
 
-Every harness is admitted. The delivery mode is whatever that tool does best, declared rather than hidden. Every line is written the moment it arrives; the vendor decides whether it joins the running turn or starts the next one.
+Every harness is admitted at the delivery level its protocol can prove, reported rather than assumed ([delivery.md](delivery.md)); the conformance suite in `tests/invariants` holds each adapter to it.
 
 The native Sylphx HTTP transport sends JSON request bodies as bytes. Its curl
 fallback reads the body from stdin, so growing conversation history does not
 become one command-line argument or encounter the operating system's per-argument
 size limit. HTTP refusals retain their status and response body.
 
-| Harness | Mode | How a line reaches it |
-| --- | --- | --- |
-| `spiron` (legacy `sylphx` alias) | `steer` | External `spiron --headless --json` process. When `ready` advertises `steer_consumed` and `idempotent_input`, the whole inbox is written at once: the first line as `prompt` if no turn is open, every other as `steer`. Spiron journals all pending input together, in order, at its next step and proves each with `accepted` or `steer_consumed`; only then does the cursor move, over the consumed prefix. Refused (`turn_closed`, `no_active_turn`, `turn_not_started`) and `undelivered_steer_ids` lines are delivered again, and Spiron deduplicates by `request_id`. An older Spiron gets one steer per turn and the unconfirmed-steer hold. Only the matching terminal `result` closes a turn; `cancel_ack` alone does not. |
-| `opencode` | `steer` | `POST /api/session/{id}/prompt` with `delivery: "steer"`; the session's own inbox decides whether it joins the running turn or starts the next one. Accepted when the prompt API answers with `data`. |
-| `codex` | `steer` | `turn/start`, with `ifBusy: "steer"` while a turn is open. |
-| `claude-code` | `steer` | Idle: a stream-json `user` message. Active turn: an SDK `PreToolUse` callback returns pending lines as `additionalContext` in the current transcript before the tool proceeds; stdin replay alone is not evidence of mid-turn delivery. |
-| `muse` | `steer` | `turn/start` with `ifBusy: "steer"`. |
-| `omp` | `steer` | Stream-json child stdin with `steer` delivery into the active turn. |
-| `dsh` | `steer` | `POST /api/session/prompt` with `mode: "steer"` on the session controller HTTP gateway. |
-| `grok` | `steer` | ACP JSON-RPC 2.0 `session/prompt` over stdio with `follow_up_behavior = "steer"`. |
-| `agy` | `steer` | Stream-json child stdin plus native `LanguageServerService/SendUserCascadeMessage` Connect RPC steering into an open cascade turn. |
-| `followup` mode | `followup` | The contract double (`ANYAGENTS_HARNESS_BIN`) reads one line per turn and answers with a `result`; a line written mid-turn waits for that turn to end. |
-
-Claude Code initializes its SDK hook before accepting input and fails startup if
-initialization is rejected or times out. A busy delivery is deferred, leaving the
-mailbox cursor unchanged, until its hook response is written successfully.
-Repeated offers of the same mailbox id are coalesced; messages retain their
-sender, room context and reply reference. If the turn finishes without another
-tool call, the undelivered line starts the next idle turn instead. The hook write
-is a transport acceptance, not proof that the model acted on the message. Dedupe
-between acceptance and cursor commit is local to the retained harness instance;
-this does not add transactional exactly-once delivery across a vendor process
-crash. Hook protocol, cursor replay and tool ordering are covered by scripted
-fixtures, not a live authenticated Claude model test.
-
-
-No harness here uses `queue`: none of them is a one-shot run that must wait.
+How a line reaches each harness, the level it holds and the vendor signal that
+level rests on are listed in [delivery.md](delivery.md#harnesses).
 
 The per-harness programmatic modes, sign-in methods and usage fields are listed with their sources in [harnesses.md](harnesses.md).
 
@@ -257,8 +235,8 @@ this adapter does not invoke a setter or edit shared service configuration.
 
 ### Antigravity and Muse
 
-- **Antigravity (`agy`).** The installed CLI documents a turn per stream-json input line and `--conversation <id>` for resume. The adapter reports followup/unproven. Its hook helpers are not wired to a confirmed customization root and have no vendor consumption acknowledgement. AGY 1.4.5's embedded lifecycle documentation specifies `hooks.json` in a customization root (for example `.agents/hooks.json`), with a named hook's flat `PreInvocation` command array and output `{"injectSteps":[{"userMessage":"..."}]}`. It does not specify the durable acceptance/replay contract needed to commit the mailbox cursor across hook abort or process restart. The existing `agy-hook` helper only offers `received` rows, while stream pipe writes already mark rows delivered; it cannot establish native mid-turn delivery. Do not advertise steer support or install a hook bound to a seat in a shared workspace until isolated hook discovery and consumption/recovery semantics are verified.
-- **Muse (`muse serve`).** One JSON-RPC child that owns the session: `initialize`, `session/start` (or `session/resume`), `session/setApprovalMode` `allowAll`. Delivery mode is steer: `turn/start` when no turn is open, and `turn/start` with `ifBusy: "steer"` during one. `turn/started` opens a turn, `turn/completed` closes it with its usage or its error, and an `approval/request` is answered by the host. `MUSE_CONFIG_HOME` points the vendor at the agent's config directory, where `settings.json` names the MCP server and the `:unrestricted` permission profile. On Windows the clone is a directory junction at `%APPDATA%\meta\muse`.
+- **Antigravity (`agy`).** The installed CLI runs a turn per stream-json input line and resumes with `--conversation <id>`. A message for a running cascade goes through the language server's `SendUserCascadeMessage`, which queues it in the cascade's durable mailbox for the next step; its level and settlement are in [delivery.md](delivery.md#harnesses). AGY's hook (`hooks.json`, `PreInvocation` with `injectSteps`) is not used: it has no acceptance or replay contract to commit the mailbox cursor on.
+- **Muse (`muse serve`).** One JSON-RPC child that owns the session: `initialize`, `session/start` (or `session/resume`), `session/setApprovalMode` `allowAll`. Every message is `turn/start` with `ifBusy: "steer"` and a `commandId` derived from its mailbox id; the `userMessage` item carrying that id proves it entered the conversation ([delivery.md](delivery.md#harnesses)). `turn/started` opens a turn, `turn/completed` closes it with its usage or its error, and an `approval/request` is answered by the host. `MUSE_CONFIG_HOME` points the vendor at the agent's config directory, where `settings.json` names the MCP server and the `:unrestricted` permission profile. On Windows the clone is a directory junction at `%APPDATA%\meta\muse`.
 
 ### Managed local checkouts
 
@@ -387,24 +365,25 @@ needs no Git consumer. Cloud-sandbox workspace preparation is unchanged.
 Every input to an agent (a Telegram message, another agent's `send`, a CLI or TUI message) is appended to that agent's mailbox. The mailbox is the only path into a harness.
 
 - **Sequence.** On durable receive the server assigns the next per-agent sequence number. Delivery, acknowledgement and replay key on that sequence. A message's source time (the Telegram `date`, the sender's clock) is kept as metadata and shown, but never used to order: a late, older event gets the next sequence and is not inserted behind messages already delivered.
-- **One delivery cursor.** A row is `received` when its insert commits, and `delivered` when the harness's own input or steer API has taken it, or, for a harness that proves consumption (Spiron), when the vendor proves it journaled the row. Rows written ahead of that proof are in flight; the cursor moves only over a contiguous consumed prefix. There is no second cursor and no turn bookkeeping.
+- **One delivery cursor.** A row is `received` when its insert commits, and `delivered` when the harness has shown the evidence its delivery level requires ([delivery.md](delivery.md)): the vendor's acceptance, or its proof that the running turn consumed the row. Rows written ahead of that proof are in flight; the cursor moves only over a contiguous consumed prefix. There is no second cursor and no turn bookkeeping.
 - **Contiguous cursor.** It advances only over a contiguous prefix of the sequence, one row at a time, so one row the harness did not take is visible as the oldest undelivered one rather than skipped.
-- **Idempotent delivery.** After a crash, rows past the cursor are handed over again. Each adapter remembers the ids its session holds and drops one it has already written, so a replay never reaches the agent twice. Claude Code and Codex also carry the id in the line itself, and Codex sends it as `clientUserMessageId`. Inbound channel events dedupe on their source key (for Telegram, the bot and its update id).
+- **Idempotent delivery.** After a crash, rows past the cursor are handed over again. An adapter never writes a row twice to one process, and an idempotent harness recognises a row an earlier process of the session consumed, by the vendor's own deduplication of an id AnyAgents sends or by reading the vendor's durable history first ([delivery.md](delivery.md)). The adapter lives in the harness's keeper, so a server crash or restart loses none of its memory of what it wrote, and a request the dying server was writing reaches the adapter whole or not at all. Inbound channel events dedupe on their source key (for Telegram, the bot and its update id).
 - **Egress is the agent's own `send`.** An agent replies by calling its MCP `send` tool, or a channel tool; the switchboard routes that immediately. A reply to a Telegram message carries that chat as its target, so the agent's `send` reaches the same chat. Nothing reads a vendor's transcript to find an answer.
 - **Retention.** Delivered messages are kept for a configurable period for `inbox` and audit, then compacted.
 
 ### Guarantees
 
-These are invariants with tests (`tests/invariants/`), run against a scripted fake harness that implements each delivery mode and can be killed at any point:
+These are invariants with tests (`tests/invariants/`): crash injection against a scripted in-memory harness that can be killed at any point, and the delivery conformance suite run against every real adapter over a scripted vendor process ([delivery.md](delivery.md#the-conformance-suite)):
 
 1. No message that reached `received` is lost across a server or harness crash.
-2. No message reaches the agent twice, including after a crash between the harness taking it and the cursor recording it.
+2. No message reaches the agent twice as input of its own, including after a crash between the harness taking it and the cursor recording it, for a harness whose level is idempotent. A harness that is not idempotent states the crash window in its level.
 3. Per agent, delivery follows sequence order. A late event never reorders what was already delivered.
 4. No source starves another: order is receipt order, not a priority among channels.
 5. Lag is always visible: `health` reports the age of the oldest message the harness has not taken, per agent.
 6. A quota fault is a reported state with a reset time, and the server keeps the mailbox growing durably while it lasts.
 7. One vendor process per agent.
 8. A line is handed over once per burst: never twice across a restart, never lost across one.
+9. A server restart, crash or upgrade ends no harness process and interrupts no turn; the next server resumes delivery from the cursor (`anyagents-keeper` process tests and `server_harnesses::a_harness_outlives_a_server_crash_an_upgrade_and_a_clean_stop`).
 
 ## Channels
 
@@ -414,6 +393,7 @@ A channel adapter has an inbound side (a stream of events, each with its source 
 
 - **Long polling.** A local server usually has no public URL, so the transport is `getUpdates` long polling, one poll per bot at a time on a thread that stops with the server. A webhook is the option for a server that is reachable; it is not built yet.
 - **What one update becomes.** A typed message, or a media message with a caption, becomes one mailbox message. Its source key is the bot and the update id, so the same update stored twice is one row. `sender` is `telegram:user:<id>:<message id>`. `reply_to` is the target a bare reply goes to: `telegram:chat:<chat id>`, or `telegram:chat:<chat id>:<message thread id>` for a forum topic, so a reply lands in the same chat and the same topic. Stickers, edited messages and membership changes are not delivered.
+- **Media.** A photo, document, voice note or other file (up to Telegram's 20 MB download limit) is downloaded once into `<data>/media` and named in the body with a `[Local media (<kind>) file: <path>]` line. The message carries only that path; the agent decides whether to look ([media.md](media.md)).
 - **Poll offset.** The next update id lives in the channel's `state` JSON and is saved only after the updates it covers are in the mailbox, so a restart asks for what it has not stored.
 - **Sending.** The `send` tool takes `telegram:chat:<id>[:<topic>]`, and `telegram:user:<id>[:<message>]` where the message is what the reply answers, plus `reply_to` for an explicit Telegram message id. A forum post carries its `message_thread_id`. The returned id is the Telegram message id.
 - **Bot to bot.** A bot generally does not receive messages sent by other bots ([bot FAQ](https://core.telegram.org/bots/faq#what-messages-will-my-bot-get)), and recent Bot API versions deliver only some of them. So a chat an agent's bot deals in is remembered in the channel state, and when an agent posts into a chat through its bot the server also delivers that post into the mailbox of every other agent on the same chat, keyed by the outbound message id; if Telegram also delivers the same post, the copy is dropped by its source key. The sender does not receive its own post.
@@ -424,11 +404,11 @@ A channel adapter has an inbound side (a stream of events, each with its source 
 
 AnyAgents selects the exposed MCP tool profile according to the execution boundary:
 
-1. **`full` (Default for Local 3rd-Party CLI Harnesses over `stdio` — `claude-code`, `codex`, `agy`, `opencode`):** Exposes the local workspace `code` tool (`read`, `write`, `edit`, `bash`, `search` inside the agent's local worktree), `memory`, `skills`, `web_search`, `web_fetch`, `browser`, `computer`, and the coordination tools (`send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`).
-2. **`remote` (Default for Streamable HTTPS `POST /mcp`, and the only profile a remote session token gets — Closed-Box 3rd-Party Cloud Agents such as Claude Cloud, OpenAI Responses/Codex Cloud, and Cursor Cloud Agents, and remote sandboxes):** Closed-box vendor cloud containers keep their own native file, shell and web tools; AnyAgents' remote `/mcp` exposes only control-plane state that belongs to the agent: `send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`, `memory` and `skills`. Everything that runs on or reaches out from the control-plane host (`code`, `files`, `browser`, `computer`, `device`, `media`, `web_search`, `web_fetch`) is omitted.
+1. **`full` (Default for Local 3rd-Party CLI Harnesses over `stdio` — `claude-code`, `codex`, `agy`, `opencode`; never served over HTTP, where the tools would run inside the server process as the server's own user):** Exposes the local workspace `code` tool (`read`, `write`, `edit`, `bash`, `search` inside the agent's local worktree), `memory`, `skills`, `web_search`, `web_fetch`, `browser`, `computer`, and the coordination tools (`send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`).
+2. **`remote` (Default and maximum for Streamable HTTP `POST /mcp` with any credential; `?profile=full` is refused with 403 — Closed-Box 3rd-Party Cloud Agents such as Claude Cloud, OpenAI Responses/Codex Cloud, and Cursor Cloud Agents, and remote sandboxes):** Closed-box vendor cloud containers keep their own native file, shell and web tools; AnyAgents' remote `/mcp` exposes only control-plane state that belongs to the agent: `send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`, `memory` and `skills`. Everything that runs on or reaches out from the control-plane host (`code`, `files`, `browser`, `computer`, `device`, `media`, `web_search`, `web_fetch`) is omitted. Calls made over HTTP also cannot place an agent on a host harness, wake an agent that runs on the host, or attach media by local path: the tool server behind HTTP marks its calls, and those routes refuse them.
 3. **`coordination` (Default when `harness == "spiron"` or `--profile coordination` / `?profile=coordination`):** Because the first-party `spiron` harness natively embeds the shared capability core's `code`, file, `web_search`, `web_fetch`, `memory`, and `skills` tools, AnyAgents exposes only the orchestration and host-device tools (`send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`, `browser`, `computer`), eliminating duplicate tool definitions and duplicate `<available_skills>` / `<memory>` prompt blocks.
 
-A remote session (a cloud harness or a remote sandbox) never holds the agent's local capability. Each launch begins a remote session: the server issues a token bound to that agent and session, stores only its SHA-256 digest, writes it with `<public_url>/v1/webhooks/mcp` into the agent's config directory, rotates it at half its lifetime (`remote_session_ttl_secs`, default one hour), and revokes it on pause, archive, relaunch, deletion or `anyagents agents revoke-remote`. `public_url` lives under `[server]` in `<data>/anyagents.toml`; without it a remote agent is neither created nor started. `public_listen` in the same table binds the public listener, which accepts remote session tokens only ([serving identity](serving-identity.md#listeners)). An agent that runs off this host creates or moves agents only onto cloud harnesses, so a remote session never starts code on the control-plane host through a child.
+A remote session (a cloud harness or a remote sandbox) never holds the agent's local capability. Each launch begins a remote session: the server issues a token bound to that agent and session, stores only its SHA-256 digest, writes it with `<public_url>/v1/webhooks/mcp` into the agent's config directory, rotates it at half its lifetime (`remote_session_ttl_secs`, default one hour), and revokes it on pause, archive, relaunch, deletion or `anyagents agents revoke-remote`. `public_url` lives under `[server]` in `<data>/anyagents.toml`; without it a remote agent is neither created nor started. `public_listen` in the same table binds the public listener, which accepts remote session tokens only ([serving identity](serving-identity.md#listeners)). A remote session token authenticates only while its agent runs off this host.
 
 ## Identity: one authenticated connection per agent session
 
@@ -533,6 +513,7 @@ Each row keeps the harness, model, role and profile the agent ran with. `skill_r
 ## Security model
 
 - The API listens on a Unix socket readable only by the user. A TCP listener is opt-in and requires a bearer token.
+- Each keeper listens on `<data>/keepers/<instance>/s`, in a directory that must be the server user's own with mode `0700`, and refuses (with an explicit `forbidden`) a peer of another uid; a harness, which runs as its seat, cannot reach it. Only the keeper's current owner, the server that took it over last, may act on it. A harness's launch, environment included, reaches its keeper through a pipe and is never written to disk. A recorded pid is signalled only when its boot id, pid namespace and start time prove it the recorded process.
 - Each agent's MCP capability is scoped to that agent, and minted fresh for each of its instances; the last one stops working at once.
 - The operator's authority is its own token, never an agent's.
 - Secrets (channel tokens, API keys, the capability itself) live in the OS keychain or a 0600 file, never in the database, logs, tool arguments or usage records.
@@ -726,23 +707,14 @@ deliveries and schedules remain intact. There is no role-based residency flag.
 Topology and child discovery follow relationships and explicit scope, never the
 presence of a role label. The default CLI depth limit applies equally to all roles.
 
-### External steering custody
+### Interrupted turns
 
-A Spiron `steer_ack` proves socket acceptance, not journal commit. AnyAgents
-writes an ID-only `spiron-unconfirmed-steers.json` hold in the agent's config
-directory before any input bytes are dispatched; a hold-write error refuses the
-unsent input without advancing its mailbox cursor, and confirmed terminal
-completion without `undelivered_steers` clears the hold. Standalone adapter and
-`DeliveryLoop::run_once` passes never silently replay raw input while a hold is
-present.
-
-Under `Supervisor`, mid-turn process exits, coordinator restarts, unconfirmed
-`undelivered_steers` receipts, and transient upstream stream/server failures
-automatically reconcile `spiron-unconfirmed-steers.json` against Spiron's local
-`sessions.sqlite3` (`session_entries`), promote all messages of the interrupted
-turn into `turn_recovery`, archive/clear the hold and stale error state, and
-resume via an explicit `[Recovery]` turn instructing the agent to verify actual
-state before repeating side effects. An explicit `reset-session` similarly
-archives any retired-generation hold under `sessions/retired-<generation>/`,
-clears `.anyagents-last-error.json`, and retains unfinished mail in
-`turn_recovery` so the new session generation starts cleanly with `[Recovery]`.
+A turn a vendor process exit, a server restart or a transient upstream fault
+cut short stays open in `turn_recovery`. Once the replacement process is up
+and the mailbox holds nothing it has not taken, the supervisor offers one
+`[Recovery]` note listing the interrupted turn's messages and the outbound
+messages already sent, and asking the agent to check the actual state before
+repeating anything that may have taken effect. New mail that arrives first
+supersedes the note. An explicit `reset-session` starts a new session
+generation and clears `.anyagents-last-error.json`; mail the old session never
+took is handed to the new one.

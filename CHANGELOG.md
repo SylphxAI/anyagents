@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Usage accounting no longer over-counts cost for Claude Code and OpenCode
+  agents. Claude Code's `total_cost_usd` is the session's running total: a
+  resumed process restores it from the transcript's last `cost-state` row
+  and counts on from there. From 2026-10-18 (`bca6c22`), and summed across a
+  process's turns from 2026-10-21 (`977d123`), each turn recorded that
+  running total, so usage rows from that window overstate cost (live rows
+  near $112-115 a turn), most of all for long sessions that were resumed
+  many times. OpenCode reports its session's running totals, which outlive a
+  process; from 2026-10-21 (`7210d6f`) the first reading after every process
+  replacement recorded the whole session again, so rows following a
+  replacement in that window overstate tokens and cost. Both adapters now
+  report what each turn, and each process, added. Historical rows are not
+  rewritten; read usage and cost from that window with this in mind.
 - Keep role labels methodology-neutral: roots and labelled children can self-archive
   and release idle processes under the same rules. Preserve legacy effective scopes
   on upgrade, default all new children to private, and retain browser profiles until
@@ -46,13 +59,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are no longer in it. The public listener's `/`, `/healthz` and
   `/v1/webhooks/healthz` return `{"ok":true}`; the serving identity stays on
   `anyagents.sock`.
+- MCP over HTTP serves at most the `remote` profile, whatever credential is
+  presented: `?profile=full` is refused with 403 and no binding upgrades it,
+  because over HTTP the tools run inside the server process as its own user.
+  `full` remains available over stdio, where the tool server runs as the agent.
+  Calls over HTTP MCP also cannot place an agent on a host harness, wake an
+  agent that runs on the host (directly or by a send to an archived one), or
+  attach media by a local path.
 - A separate public listener (`public_listen` under `[server]`) serves only
   readiness, Telegram webhooks and MCP for remote session tokens, and 404 for
   everything else; once it is configured, the local TCP listener defaults to
-  loopback. Without `public_listen` nothing changes. An agent that runs off
-  this host (a cloud harness or a remote-spawn sandbox) can create or move
-  agents only onto cloud harnesses, and its remote session token stops
-  authenticating once its harness moves back onto the host.
+  loopback. Without `public_listen` nothing changes. A remote session token
+  stops authenticating once its agent's harness moves back onto the host.
 
 ## 0.1.3
 

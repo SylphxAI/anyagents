@@ -4,9 +4,9 @@
 //! holds in flight never stops the lines behind it. It never looks at a turn.
 
 use anyagents_core::{AgentId, Message, Store};
-use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage, SteerItem};
+use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage};
 
-pub use anyagents_harness::{DeliveryMode, SteerSupport, TurnState};
+pub use anyagents_harness::{Delivery, DeliveryLevel, DeliveryMode, Proof, TurnState};
 
 /// Why one step of the loop stopped.
 #[derive(Debug, thiserror::Error)]
@@ -45,11 +45,18 @@ pub enum RunOutcome {
 pub struct AgentHealth {
     pub process_alive: bool,
     pub turn_state: TurnState,
-    pub delivery_mode: DeliveryMode,
-    pub steer_support: SteerSupport,
+    pub delivery: Delivery,
     pub quota_reset_at_ms: Option<i64>,
     pub sign_in_fault: Option<String>,
     pub oldest_undelivered_age_ms: Option<i64>,
+}
+
+/// A message the harness refused for good, parked past the cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rejection {
+    pub message_id: String,
+    pub seq: i64,
+    pub reason: String,
 }
 
 /// One running agent: the mailbox, the per-agent lock, and its harness.
@@ -60,7 +67,56 @@ pub struct DeliveryLoop<H: Harness> {
     // Held so the process lock stays until this loop is dropped.
     _lock: anyagents_core::AgentLock,
     quota_reset_at_ms: Option<i64>,
+    /// The recovery note being offered for an interrupted turn, kept so that
+    /// every offer carries the same id until the harness proves it took it.
+    recovery: Option<OutboundMessage>,
+    /// Rejections parked since the host last asked.
+    rejections: Vec<Rejection>,
+    /// The reason the last message was parked for, until a message is taken.
+    /// The same reason again means the vendor refuses everything, not one
+    /// message: the breaker stops parking.
+    last_rejection: Option<String>,
 }
+
+/// Commit, in sequence order, every message past the cursor `harness`
+/// proved it took, stopping at the first it has not.
+fn commit_proofs<H: Harness>(store: &Store, agent_id: &AgentId, harness: &H) -> Result<u64, Error> {
+    let mut committed = 0;
+    while let Some(message) = store.next_undelivered(agent_id)? {
+        match harness.proven(message.id.as_str()) {
+            Some(Proof::Taken { turn_finished }) => {
+                store.note_delivered(agent_id, message.seq)?;
+                if turn_finished && harness.health().sign_in_fault.is_none() {
+                    store.note_turn_completed(agent_id)?;
+                }
+            }
+            Some(Proof::Duplicate) => {
+                store.note_delivered(agent_id, message.seq)?;
+            }
+            None => break,
+        }
+        committed += 1;
+    }
+    Ok(committed)
+}
+
+/// The reason the newest parked message was refused for, when nothing was
+/// taken after it (the cursor still stands on it) and the reason can be
+/// told to be no single message's own (`names_message_size`). The store keeps
+/// no `message_specific` flag, so another reason of one message alone could
+/// be read as the vendor's; that only parks less, never loses mail. `None`
+/// when the store cannot say.
+fn last_refusal(store: &Store, agent_id: &AgentId) -> Option<String> {
+    let newest = store.rejected_messages(agent_id).ok()?.into_iter().last()?;
+    let cursor = store.delivered_cursor(agent_id).ok()?;
+    (cursor == newest.seq && !anyagents_harness::names_message_size(&newest.reason))
+        .then_some(newest.reason)
+}
+
+/// More refusals than this in one pass, of reasons that are not one
+/// message's own, are a vendor that refuses everything: the breaker stops
+/// parking and fails the harness instead.
+pub const MAX_REJECTIONS_PER_PASS: u32 = 2;
 
 impl<H: Harness> DeliveryLoop<H> {
     /// Take the per-agent lock and refuse a second loop for the same agent.
@@ -68,6 +124,35 @@ impl<H: Harness> DeliveryLoop<H> {
         store.agent(&agent_id)?;
         let lock = store.try_lock_agent(&agent_id)?;
         Self::start_with_lock(store, lock, agent_id, harness)
+    }
+
+    /// A delivery loop for a harness taken over from a previous kernel,
+    /// under the process lock its keeper handed back. The caller has read the
+    /// agent already; nothing here can fail, so a transient store error never
+    /// costs the running harness.
+    pub fn adopted(
+        store: Store,
+        lock: anyagents_core::AgentLock,
+        agent_id: AgentId,
+        harness: H,
+    ) -> Self {
+        // A sender notice a crash cut off is sent now.
+        if let Err(err) = store.send_pending_rejection_notices(&agent_id) {
+            eprintln!("anyagents: notices for parked messages: {err}");
+        }
+        // The process is the one that refused last: its breaker goes on from
+        // the last refusal, unless a message was taken since.
+        let last_rejection = last_refusal(&store, &agent_id);
+        Self {
+            store,
+            agent_id,
+            harness,
+            _lock: lock,
+            quota_reset_at_ms: None,
+            recovery: None,
+            rejections: Vec::new(),
+            last_rejection,
+        }
     }
 
     /// Construct a delivery loop from an already-acquired per-agent process lock.
@@ -78,12 +163,19 @@ impl<H: Harness> DeliveryLoop<H> {
         harness: H,
     ) -> Result<Self, Error> {
         store.agent(&agent_id)?;
+        // A sender notice a crash cut off is sent now.
+        if let Err(err) = store.send_pending_rejection_notices(&agent_id) {
+            eprintln!("anyagents: notices for parked messages: {err}");
+        }
         Ok(Self {
             store,
             agent_id,
             harness,
             _lock: lock,
             quota_reset_at_ms: None,
+            recovery: None,
+            rejections: Vec::new(),
+            last_rejection: None,
         })
     }
 
@@ -101,16 +193,6 @@ impl<H: Harness> DeliveryLoop<H> {
         }
     }
 
-    /// Rewind the cursor over steers the harness gave back as unconfirmed.
-    fn drain_reclaimed_steers(&mut self) -> Result<(), Error> {
-        let reclaimed = self.harness.take_reclaimed_steers();
-        if !reclaimed.is_empty() {
-            self.store
-                .reclaim_unconfirmed_steers(&self.agent_id, &reclaimed)?;
-        }
-        Ok(())
-    }
-
     /// One pass over the mailbox, in sequence order. Every line the harness
     /// can take is handed over in this pass; the cursor moves only over the
     /// contiguous prefix the harness proved consumed. Behind a line it holds
@@ -122,7 +204,6 @@ impl<H: Harness> DeliveryLoop<H> {
     /// already consumed in an earlier process (`Duplicate`) is committed too,
     /// but it woke nothing, so an interrupted turn still gets its recovery note.
     pub fn run_once(&mut self) -> Result<RunOutcome, Error> {
-        self.drain_reclaimed_steers()?;
         let mut delivered = 0u64;
         if self.harness.health().turn_state == TurnState::Idle
             && !self.store.has_actionable_undelivered(&self.agent_id)?
@@ -132,6 +213,7 @@ impl<H: Harness> DeliveryLoop<H> {
         // The last line handed over that is not committed: once there is one,
         // later lines are written behind it and none of them is committed.
         let mut behind: Option<i64> = None;
+        let mut rejected = 0u32;
         loop {
             if delivered > 0
                 && behind.is_none()
@@ -155,20 +237,53 @@ impl<H: Harness> DeliveryLoop<H> {
             match self.harness.deliver(&outbound(&message)) {
                 // Consumed, but an older line is not yet: the pass that sees
                 // that one consumed commits both, in order.
+                // A rejection behind an unproven line is answered again when
+                // that line is committed and this one is at the head.
                 Ok(
                     DeliverOutcome::Accepted { .. }
                     | DeliverOutcome::Duplicate
-                    | DeliverOutcome::InFlight,
+                    | DeliverOutcome::InFlight
+                    | DeliverOutcome::Rejected { .. },
                 ) if behind.is_some() => behind = Some(seq),
+                // A reason of this message alone (its size, its content)
+                // is parked at once and never trips the breaker: two
+                // oversize messages are two parked messages.
+                Ok(DeliverOutcome::Rejected {
+                    reason,
+                    message_specific: true,
+                }) => {
+                    self.reject(&message, &reason)?;
+                }
+                Ok(DeliverOutcome::Rejected {
+                    reason,
+                    message_specific: false,
+                }) => {
+                    // A breaker: a vendor that refuses message after message
+                    // for one reason refuses everything. That is the
+                    // harness's fault, not the mail's; nothing more is parked.
+                    rejected += 1;
+                    if self.last_rejection.as_deref() == Some(reason.as_str())
+                        || rejected > MAX_REJECTIONS_PER_PASS
+                    {
+                        return Err(Error::HarnessFailed(format!(
+                            "the harness refuses message after message ({reason}); \
+                             the mail stays in the mailbox"
+                        )));
+                    }
+                    self.reject(&message, &reason)?;
+                    self.last_rejection = Some(reason);
+                }
                 Ok(DeliverOutcome::InFlight) => behind = Some(seq),
                 Ok(DeliverOutcome::Duplicate) => {
                     // Part of the turn the earlier process ran: it extends
                     // that turn and never completes it.
                     self.store.note_delivered(&self.agent_id, seq)?;
                     self.quota_reset_at_ms = None;
+                    self.last_rejection = None;
                 }
                 Ok(DeliverOutcome::Accepted { turn_finished }) => {
                     self.store.note_delivered(&self.agent_id, seq)?;
+                    self.last_rejection = None;
                     if turn_finished && self.harness.health().sign_in_fault.is_none() {
                         self.store.note_turn_completed(&self.agent_id)?;
                     }
@@ -179,7 +294,6 @@ impl<H: Harness> DeliveryLoop<H> {
                 // The pass ends with what it did take, never with the line
                 // claimed as delivered.
                 Ok(DeliverOutcome::Deferred) => {
-                    self.drain_reclaimed_steers()?;
                     return Ok(if delivered == 0 {
                         RunOutcome::Idle
                     } else {
@@ -187,56 +301,56 @@ impl<H: Harness> DeliveryLoop<H> {
                     });
                 }
                 Ok(DeliverOutcome::Quota { reset_at_ms }) => {
-                    self.drain_reclaimed_steers()?;
                     self.quota_reset_at_ms = Some(reset_at_ms);
                     return Ok(RunOutcome::Quota { reset_at_ms });
                 }
-                Err(HarnessError::Dead) => {
-                    let _ = self.drain_reclaimed_steers();
-                    return Err(Error::HarnessDown);
-                }
-                Err(HarnessError::Failed(reason)) => {
-                    let _ = self.drain_reclaimed_steers();
-                    return Err(Error::HarnessFailed(reason));
-                }
-            }
-        }
-    }
-
-    /// Put every new mailbox message into the harness through its between-steps
-    /// channel, in sequence order, and move the cursor behind each one it takes.
-    pub fn steer_next(&mut self) -> Result<Option<SteerItem>, Error> {
-        let Some(message) = self.store.next_undelivered(&self.agent_id)? else {
-            return Ok(None);
-        };
-        // An older line the channel pushed before the mailbox stored it is
-        // written first; anything else waits for its own turn.
-        if let Some(item) = self.harness.poll_steer().map_err(inject_error)?
-            && item.message.id != message.id.as_str()
-        {
-            let id = item.message.id.clone();
-            match self.harness.inject(&item.message) {
-                Ok(true) => {}
-                Ok(false) => self.harness.release_steer(&id),
                 Err(HarnessError::Dead) => return Err(Error::HarnessDown),
                 Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
             }
         }
-        let item = SteerItem {
-            order: 0,
-            message: outbound(&message),
-        };
-        let taken = match self.harness.inject(&item.message) {
-            Ok(taken) => taken,
-            Err(HarnessError::Dead) => return Err(Error::HarnessDown),
-            Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
-        };
-        if !taken {
-            self.harness.release_steer(message.id.as_str());
-            return Ok(None);
+    }
+
+    /// Commit, in sequence order, every message past the cursor the harness
+    /// already proved it took, and stop at the first it has not. Nothing is
+    /// written, so this is safe on a process about to be replaced, a dead
+    /// one, or one held by a quota. Returns how many were committed.
+    pub fn commit_proven(&mut self) -> Result<u64, Error> {
+        let committed = commit_proofs(&self.store, &self.agent_id, &self.harness)?;
+        if committed > 0 {
+            self.last_rejection = None;
         }
-        self.store.note_delivered(&self.agent_id, message.seq)?;
-        Ok(Some(item))
+        Ok(committed)
+    }
+
+    /// Retire another process of this agent, one an earlier replacement
+    /// left beside this loop's (a kernel that died in the middle of it):
+    /// stop it, read it to the end, commit every proof it gave, then end it.
+    /// What it took is never handed to this loop's process again.
+    pub fn retire_other(&mut self, mut other: H) -> Result<u64, Error> {
+        other.stop();
+        let committed = commit_proofs(&self.store, &self.agent_id, &other)?;
+        if committed > 0 {
+            self.last_rejection = None;
+        }
+        Ok(committed)
+    }
+
+    /// Rejections parked since the last call, oldest first.
+    pub fn take_rejections(&mut self) -> Vec<Rejection> {
+        std::mem::take(&mut self.rejections)
+    }
+
+    /// Park a message the harness refused for good: past the cursor, with
+    /// its reason, and a note to its sender.
+    fn reject(&mut self, message: &Message, reason: &str) -> Result<(), Error> {
+        self.store
+            .reject_message(&self.agent_id, message.seq, reason)?;
+        self.rejections.push(Rejection {
+            message_id: message.id.as_str().to_string(),
+            seq: message.seq,
+            reason: reason.to_string(),
+        });
+        Ok(())
     }
 
     pub fn delivered_cursor(&self) -> Result<i64, Error> {
@@ -249,8 +363,7 @@ impl<H: Harness> DeliveryLoop<H> {
         Ok(AgentHealth {
             process_alive: harness.process_alive,
             turn_state: harness.turn_state,
-            delivery_mode: harness.delivery_mode,
-            steer_support: harness.steer_support,
+            delivery: harness.delivery,
             quota_reset_at_ms: harness.quota_reset_at_ms.or(self.quota_reset_at_ms),
             sign_in_fault: harness.sign_in_fault,
             oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
@@ -274,10 +387,21 @@ impl<H: Harness> DeliveryLoop<H> {
         &mut self.harness
     }
 
-    /// Swap the vendor process without releasing the agent lock.
+    /// Stop the vendor process and commit every proof it gave, so nothing
+    /// it took is handed to its replacement. The harness stays in place,
+    /// dead, until `replace_harness`.
+    pub fn retire_harness(&mut self) -> Result<u64, Error> {
+        self.harness.stop();
+        self.commit_proven()
+    }
+
+    /// Swap the vendor process without releasing the agent lock. A recovery
+    /// note the old process never proved is rebuilt for the new one. Call
+    /// `retire_harness` first, or the old process's last proofs are lost.
     pub fn replace_harness(&mut self, harness: H) {
         self.harness = harness;
         self.quota_reset_at_ms = None;
+        self.recovery = None;
     }
 
     /// Clear a quota wait on the loop and on the harness.
@@ -290,52 +414,62 @@ impl<H: Harness> DeliveryLoop<H> {
         &self.store
     }
 
-    /// Deliver a synthetic `[Recovery]` message for an open turn interrupted by
-    /// a process crash or server restart, advancing `recovery_count` once the
-    /// resumed harness accepts it.
+    /// Offer the `[Recovery]` note for an open turn a process crash or server
+    /// restart interrupted. The note goes ahead of any new mail: it carries
+    /// the interrupted turn's messages, which are older. Every offer carries
+    /// the same note until the harness proves it took it; then the turn is
+    /// marked recovered. `InFlight` means written and not yet proved: new
+    /// mail may follow it. `Deferred` or `Quota` means not written: new mail
+    /// waits behind it.
     pub fn recover_open_turn(
         &mut self,
         open: &anyagents_core::OpenTurn,
     ) -> Result<DeliverOutcome, Error> {
-        self.recover_open_turn_with_reconciliation(open, None)
-    }
-
-    /// Deliver a synthetic `[Recovery]` message annotated with external session
-    /// journal reconciliation details when available.
-    pub fn recover_open_turn_with_reconciliation(
-        &mut self,
-        open: &anyagents_core::OpenTurn,
-        reconciled: Option<&anyagents_harness::ReconciledUnconfirmed>,
-    ) -> Result<DeliverOutcome, Error> {
-        let note = recovery_outbound_with_reconciliation(open, reconciled);
-        match self.harness.deliver(&note) {
+        let note = self
+            .recovery
+            .get_or_insert_with(|| recovery_outbound(open))
+            .clone();
+        let outcome = match self.harness.deliver(&note) {
+            Ok(outcome) => outcome,
+            Err(HarnessError::Dead) => return Err(Error::HarnessDown),
+            Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
+        };
+        match &outcome {
             // A note an earlier process already consumed was delivered then.
-            Ok(DeliverOutcome::Duplicate) => {
+            DeliverOutcome::Duplicate | DeliverOutcome::Accepted { .. } => {
                 self.store
                     .note_turn_recovered(&self.agent_id, open.opened_seq)?;
-                self.quota_reset_at_ms = None;
-                Ok(DeliverOutcome::Accepted {
-                    turn_finished: false,
-                })
-            }
-            Ok(DeliverOutcome::Accepted { turn_finished }) => {
-                self.store
-                    .note_turn_recovered(&self.agent_id, open.opened_seq)?;
-                if turn_finished {
+                if matches!(
+                    outcome,
+                    DeliverOutcome::Accepted {
+                        turn_finished: true
+                    }
+                ) {
                     self.store.note_turn_completed(&self.agent_id)?;
                 }
+                self.recovery = None;
                 self.quota_reset_at_ms = None;
-                Ok(DeliverOutcome::Accepted { turn_finished })
+                Ok(DeliverOutcome::Accepted {
+                    turn_finished: matches!(
+                        outcome,
+                        DeliverOutcome::Accepted {
+                            turn_finished: true
+                        }
+                    ),
+                })
             }
-            // Written but not yet consumed: the note is offered again, by
-            // the same id, until the vendor proves it took it.
-            Ok(DeliverOutcome::Deferred | DeliverOutcome::InFlight) => Ok(DeliverOutcome::Deferred),
-            Ok(DeliverOutcome::Quota { reset_at_ms }) => {
-                self.quota_reset_at_ms = Some(reset_at_ms);
-                Ok(DeliverOutcome::Quota { reset_at_ms })
+            // A note the harness can never take is not offered again.
+            DeliverOutcome::Rejected { .. } => {
+                self.store
+                    .note_turn_recovered(&self.agent_id, open.opened_seq)?;
+                self.recovery = None;
+                Ok(outcome)
             }
-            Err(HarnessError::Dead) => Err(Error::HarnessDown),
-            Err(HarnessError::Failed(reason)) => Err(Error::HarnessFailed(reason)),
+            DeliverOutcome::InFlight | DeliverOutcome::Deferred => Ok(outcome),
+            DeliverOutcome::Quota { reset_at_ms } => {
+                self.quota_reset_at_ms = Some(*reset_at_ms);
+                Ok(outcome)
+            }
         }
     }
 }
@@ -343,13 +477,6 @@ impl<H: Harness> DeliveryLoop<H> {
 /// Build the synthetic `[Recovery]` user message that wakes a resumed CLI
 /// session when its previous process died mid-turn (`opened_seq > completed_seq`).
 pub fn recovery_outbound(open: &anyagents_core::OpenTurn) -> OutboundMessage {
-    recovery_outbound_with_reconciliation(open, None)
-}
-
-pub fn recovery_outbound_with_reconciliation(
-    open: &anyagents_core::OpenTurn,
-    reconciled: Option<&anyagents_harness::ReconciledUnconfirmed>,
-) -> OutboundMessage {
     let last = open
         .messages
         .last()
@@ -362,7 +489,8 @@ pub fn recovery_outbound_with_reconciliation(
     for msg in &open.messages {
         let from = msg.sender.as_deref().unwrap_or("unknown");
         lines.push(format!("- anyagents-message:{} (from {from}):", msg.id));
-        for line in clip_chars(&msg.text, 1500).lines() {
+        // Whole: the vendor may never have read it.
+        for line in msg.text.lines() {
             lines.push(format!("  > {line}"));
         }
     }
@@ -383,16 +511,6 @@ pub fn recovery_outbound_with_reconciliation(
             ));
         }
     }
-    if let Some(rec) = reconciled
-        && (!rec.journal_committed_ids.is_empty() || !rec.journal_missing_ids.is_empty())
-    {
-        lines.push(String::new());
-        lines.push(format!(
-            "Session journal reconciliation: committed=[{}], unconfirmed_before_journal=[{}].",
-            rec.journal_committed_ids.join(", "),
-            rec.journal_missing_ids.join(", "),
-        ));
-    }
     lines.push(String::new());
     lines.push(
         "Check the actual state before repeating anything that may have taken effect, then carry on with the task."
@@ -405,7 +523,12 @@ pub fn recovery_outbound_with_reconciliation(
         sender: last.sender.clone(),
         reply_to: last.reply_to.clone(),
         source_time_ms: last.source_time_ms,
-        context: last.context.clone(),
+        // The note is no stored message: a reply to it answers the last
+        // message of the turn it covers.
+        context: anyagents_harness::Context {
+            reply_to_message: Some(last.id.to_string()),
+            ..last.context.clone()
+        },
     }
 }
 
@@ -416,13 +539,6 @@ fn clip_chars(text: &str, max: usize) -> String {
         format!("{head}…")
     } else {
         head
-    }
-}
-
-fn inject_error(err: HarnessError) -> Error {
-    match err {
-        HarnessError::Dead => Error::HarnessDown,
-        HarnessError::Failed(reason) => Error::HarnessFailed(reason),
     }
 }
 
@@ -609,8 +725,12 @@ mod tests {
             anyagents_harness::HarnessHealth {
                 process_alive: true,
                 turn_state: TurnState::InTurn,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: SteerSupport::Yes,
+                delivery: Delivery {
+                    level: DeliveryLevel::NextStep,
+                    idempotent: true,
+                    proof: std::borrow::Cow::Borrowed("scripted proof"),
+                    peer: None,
+                },
                 quota_reset_at_ms: None,
                 sign_in_fault: None,
             }
@@ -739,6 +859,241 @@ mod tests {
             Err(err) => assert!(err.agent_busy()),
             Ok(_) => panic!("a second loop was accepted"),
         }
+    }
+
+    #[test]
+    fn a_message_refused_for_good_is_parked_and_the_mail_behind_it_flows() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        let poison = recv(loop_.store(), &id, "never taken");
+        let after = recv(loop_.store(), &id, "after it");
+        let poison_id = loop_
+            .store()
+            .inbox(&id, None)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.seq == poison)
+            .unwrap()
+            .id;
+        loop_
+            .harness_mut()
+            .refuse_forever(poison_id.as_str(), "malformed request");
+        assert_eq!(
+            loop_.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 1 }
+        );
+        assert_eq!(loop_.delivered_cursor().unwrap(), after);
+        let rejections = loop_.take_rejections();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].seq, poison);
+        assert_eq!(rejections[0].reason, "malformed request");
+        let parked = loop_.store().rejected_messages(&id).unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].message_id, poison_id.as_str());
+        // It was never written, and is not offered again.
+        assert_eq!(loop_.run_once().unwrap(), RunOutcome::Idle);
+        assert!(
+            !loop_
+                .harness()
+                .written_ids()
+                .contains(&poison_id.as_str().to_string())
+        );
+    }
+
+    #[test]
+    fn a_vendor_refusing_message_after_message_trips_the_breaker_instead_of_parking_them() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        let seqs: Vec<i64> = ["one", "two", "three"]
+            .iter()
+            .map(|text| recv(loop_.store(), &id, text))
+            .collect();
+        let ids: Vec<String> = loop_
+            .store()
+            .inbox(&id, None)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.id.as_str().to_string())
+            .collect();
+        for message in &ids {
+            loop_
+                .harness_mut()
+                .refuse_forever(message, "invalid params (-32602)");
+        }
+        // The first is parked; the second, refused for the same reason, is a
+        // vendor that refuses everything: it stays, and the harness failed.
+        assert!(matches!(loop_.run_once(), Err(Error::HarnessFailed(_))));
+        assert_eq!(loop_.delivered_cursor().unwrap(), seqs[0]);
+        assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 1);
+        assert!(matches!(loop_.run_once(), Err(Error::HarnessFailed(_))));
+        assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 1);
+        // Once a message is taken, a single refusal parks again.
+        let mut fresh = FakeHarness::new(DeliveryMode::Steer);
+        fresh.refuse_forever(&ids[2], "too large");
+        loop_.replace_harness(fresh);
+        assert_eq!(
+            loop_.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 1 }
+        );
+        assert_eq!(loop_.delivered_cursor().unwrap(), seqs[2]);
+        assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 2);
+    }
+
+    /// A kernel that takes over the process that refused last keeps its
+    /// breaker: the same reason again is still a vendor that refuses
+    /// everything. A message taken since the refusal resets it.
+    #[test]
+    fn the_breaker_survives_a_kernel_that_takes_the_process_over() {
+        for taken_since in [false, true] {
+            let (dir, mut loop_, id) = setup(DeliveryMode::Steer);
+            recv(loop_.store(), &id, "one");
+            let one = loop_.store().inbox(&id, None).unwrap()[0].id.to_string();
+            loop_
+                .harness_mut()
+                .refuse_forever(&one, "invalid params (-32602)");
+            loop_.run_once().unwrap();
+            assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 1);
+            if taken_since {
+                recv(loop_.store(), &id, "two");
+                assert_eq!(
+                    loop_.run_once().unwrap(),
+                    RunOutcome::Delivered { delivered: 1 }
+                );
+            }
+            drop(loop_);
+            let store = Store::open(dir.path().join("state.db")).unwrap();
+            let next = recv(&store, &id, "three");
+            let three = store
+                .inbox(&id, None)
+                .unwrap()
+                .into_iter()
+                .find(|message| message.seq == next)
+                .unwrap()
+                .id
+                .to_string();
+            let mut process = FakeHarness::new(DeliveryMode::Steer);
+            process.refuse_forever(&three, "invalid params (-32602)");
+            let lock = store.try_lock_agent(&id).unwrap();
+            let mut adopted = DeliveryLoop::adopted(store, lock, id.clone(), process);
+            let outcome = adopted.run_once();
+            let parked = adopted.store().rejected_messages(&id).unwrap().len();
+            if taken_since {
+                assert!(outcome.is_ok(), "{outcome:?}");
+                assert_eq!(parked, 2);
+            } else {
+                assert!(
+                    matches!(outcome, Err(Error::HarnessFailed(_))),
+                    "the breaker was reset by the restart: {outcome:?}"
+                );
+                assert_eq!(parked, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn oversize_messages_are_each_parked_and_never_trip_the_breaker() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        let seqs: Vec<i64> = ["huge one", "huge two", "huge three", "fine"]
+            .iter()
+            .map(|text| recv(loop_.store(), &id, text))
+            .collect();
+        let ids: Vec<String> = loop_
+            .store()
+            .inbox(&id, None)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.id.as_str().to_string())
+            .collect();
+        for message in &ids[..3] {
+            loop_
+                .harness_mut()
+                .refuse_this_message(message, "-32002 inputTooLarge");
+        }
+        // Three refusals of the same reason in one pass, each the message's
+        // own: three parked messages, and the mail behind them flows.
+        assert_eq!(
+            loop_.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 1 }
+        );
+        assert_eq!(loop_.delivered_cursor().unwrap(), seqs[3]);
+        assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_systemic_refusal_still_trips_the_breaker_after_an_oversize_one() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        let seqs: Vec<i64> = ["huge", "one", "two"]
+            .iter()
+            .map(|text| recv(loop_.store(), &id, text))
+            .collect();
+        let ids: Vec<String> = loop_
+            .store()
+            .inbox(&id, None)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.id.as_str().to_string())
+            .collect();
+        loop_
+            .harness_mut()
+            .refuse_this_message(&ids[0], "-32002 inputTooLarge");
+        for message in &ids[1..] {
+            loop_
+                .harness_mut()
+                .refuse_forever(message, "-32602 invalid params");
+        }
+        // The oversize one is parked; the first systemic refusal is parked
+        // too, the second, for the same reason, trips the breaker.
+        assert!(matches!(loop_.run_once(), Err(Error::HarnessFailed(_))));
+        assert_eq!(loop_.delivered_cursor().unwrap(), seqs[1]);
+        assert_eq!(loop_.store().rejected_messages(&id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn commit_proven_commits_the_proved_prefix_and_writes_nothing() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        let one = recv(loop_.store(), &id, "one");
+        recv(loop_.store(), &id, "two");
+        // A process took `one` and proved it, then the cursor was not moved.
+        loop_.deliver_next_without_commit().unwrap();
+        let written = loop_.harness().written_ids().to_vec();
+        assert_eq!(written.len(), 1);
+        loop_.harness_mut().kill();
+        assert_eq!(loop_.commit_proven().unwrap(), 1);
+        assert_eq!(loop_.delivered_cursor().unwrap(), one);
+        // `two` was never proved, and nothing was written for it.
+        assert_eq!(loop_.commit_proven().unwrap(), 0);
+        assert_eq!(loop_.harness().written_ids(), written.as_slice());
+    }
+
+    #[test]
+    fn a_recovery_note_keeps_its_id_until_taken_and_carries_long_messages_whole() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Queue);
+        let long = format!("{}the end", "z".repeat(3_000));
+        recv(loop_.store(), &id, &long);
+        assert_eq!(
+            loop_.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 1 }
+        );
+        let open = loop_.store().open_turn(&id).unwrap().expect("open turn");
+        // The queue harness takes nothing while its turn runs.
+        assert_eq!(
+            loop_.recover_open_turn(&open).unwrap(),
+            DeliverOutcome::Deferred
+        );
+        let note = loop_.recovery.clone().expect("the note is kept");
+        assert!(note.text.contains(&long), "the note clipped the message");
+        recv(loop_.store(), &id, "later mail");
+        let open = loop_.store().open_turn(&id).unwrap().expect("open turn");
+        assert_eq!(
+            loop_.recover_open_turn(&open).unwrap(),
+            DeliverOutcome::Deferred
+        );
+        assert_eq!(loop_.recovery.as_ref().map(|n| &n.id), Some(&note.id));
+        loop_.harness_mut().complete_turn();
+        assert!(matches!(
+            loop_.recover_open_turn(&open).unwrap(),
+            DeliverOutcome::Accepted { .. }
+        ));
+        assert!(loop_.recovery.is_none());
+        assert!(loop_.harness().written_ids().contains(&note.id));
     }
 }
 

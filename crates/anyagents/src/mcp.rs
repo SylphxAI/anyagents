@@ -46,14 +46,13 @@ pub enum McpProfile {
     /// Exposes all AnyAgents MCP tools (`send`, `inbox`, `agents`, `groups`, `schedules`,
     /// `conversation`, `code`, `web_search`, `web_fetch`, `memory`, `skills`, `browser`,
     /// `computer`). Default for `anyagents mcp` over `stdio` across all local CLI harnesses
-    /// (`spiron`, `claude-code`, `codex`, `agy`, `opencode`), and for an HTTP caller holding a
-    /// local capability whose agent is bound to a `SandboxConfig` or has built-in tools
-    /// disabled. Never available to a remote session token.
+    /// (`spiron`, `claude-code`, `codex`, `agy`, `opencode`). Never served over HTTP, where
+    /// tools run inside the server process ([`McpProfile::resolve_http`]).
     #[default]
     Full,
-    /// The only profile a remote session token gets, and the default for Streamable HTTP
-    /// `POST /mcp` across all Cloud Agents (`spiron-cloud`, `claude-cloud`, `openai-cloud`,
-    /// `cursor-cloud`). Exposes coordination, `memory` and `skills`: control-plane state that
+    /// The most any Streamable HTTP `POST /mcp` call gets, whatever its credential, and the
+    /// default there: all Cloud Agents (`spiron-cloud`, `claude-cloud`, `openai-cloud`,
+    /// `cursor-cloud`) and remote sandboxes. Exposes coordination, `memory` and `skills`: control-plane state that
     /// belongs to the agent. Every tool that runs on or from the control-plane host (`code`,
     /// `files`, `browser`, `computer`, `device`, `media`, `web_search`, `web_fetch`) is omitted.
     Remote,
@@ -150,41 +149,27 @@ impl McpProfile {
         explicit.unwrap_or(Self::Full)
     }
 
-    /// The profile a remote session token gets: `remote`, or the narrower
-    /// `coordination` when asked for. Nothing a remote session asks for widens
-    /// it.
-    pub fn resolve_remote_session(explicit: Option<&str>) -> Result<Self, String> {
+    /// The profile an MCP call over HTTP gets, whatever credential it
+    /// presents: `remote`, or the narrower `coordination` when asked for.
+    /// Over HTTP the tools run inside the server process, as the server's own
+    /// user, so `full` (files, exec, code, browser, computer, ...) would hand
+    /// the caller the server's identity. It is never served here; `full`
+    /// exists only on stdio, where the tool server runs as the agent itself.
+    pub fn resolve_http(explicit: Option<&str>) -> Result<Self, String> {
         match explicit.map(str::trim).filter(|s| !s.is_empty()) {
             None => Ok(Self::Remote),
             Some(raw) => match Self::from_str_opt(raw) {
                 Some(Self::Remote) => Ok(Self::Remote),
                 Some(Self::Coordination) => Ok(Self::Coordination),
                 Some(Self::Full) => Err(format!(
-                    "MCP profile `{raw}` is not available to a remote session; it gets `remote` or `coordination`"
+                    "MCP profile `{raw}` is not served over HTTP, where tools would run as the server; \
+                     HTTP serves `remote` or `coordination`, and `full` is available only over stdio \
+                     (`anyagents mcp`)"
                 )),
                 None => Err(format!(
-                    "invalid MCP profile `{raw}`; a remote session gets `remote` or `coordination`"
+                    "invalid MCP profile `{raw}`; HTTP serves `remote` or `coordination`"
                 )),
             },
-        }
-    }
-
-    pub fn resolve_http_with_config(
-        explicit: Option<&str>,
-        _harness: &str,
-        config_dir: Option<&Path>,
-    ) -> Result<Self, String> {
-        if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-            return Self::from_str_opt(raw).ok_or_else(|| {
-                format!("invalid MCP profile `{raw}`; expected `full`, `remote`, or `coordination`")
-            });
-        }
-        if anyagents_tools::SandboxConfig::resolve(config_dir).is_some()
-            || config_dir.is_some_and(crate::cloud_harness::disable_builtin_tools_flag)
-        {
-            Ok(Self::Full)
-        } else {
-            Ok(Self::Remote)
         }
     }
 }
@@ -588,6 +573,10 @@ pub(crate) struct Client {
     pub(crate) config: PathBuf,
     /// The capability read at start, used while the file cannot be read.
     pub(crate) capability: String,
+    /// Set for the tool server the HTTP MCP route runs inside the server
+    /// process: every call it makes carries [`HTTP_MCP_HEADER`], so routes
+    /// that would start or read something on the host refuse it.
+    via_http: bool,
     /// What every clone of this client shares: idle connections to the
     /// server and the capability file as last read.
     link: Arc<ServerLink>,
@@ -640,8 +629,15 @@ impl Client {
             socket,
             config,
             capability,
+            via_http: false,
             link: Arc::default(),
         }
+    }
+
+    /// The client of a tool server that answers MCP over HTTP.
+    fn over_http(mut self) -> Self {
+        self.via_http = true;
+        self
     }
 
     /// The capability in the agent's config directory now. The server may
@@ -679,12 +675,26 @@ impl Client {
         capability: &str,
         agent_id: Option<&str>,
     ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
-        let mut request = build_request(method, path, body, Some(capability), None, agent_id)?;
+        let mut request = build_request(
+            method,
+            path,
+            body,
+            Some(capability),
+            None,
+            agent_id,
+            self.via_http,
+        )?;
         loop {
             let (mut sender, reused) = match self.idle_connection().await {
                 Some(sender) => (sender, true),
-                None => (connect(&self.socket).await?, false),
+                // A tool call made while the server restarts waits for it,
+                // within what is left of the call's own wait.
+                None => (connect_waiting(&self.socket, &call_wait()).await?, false),
             };
+            // A call its harness gave up on while it waited is not sent.
+            if call_cancelled() {
+                return Err("the tool call was cancelled".into());
+            }
             let response = match sender.try_send_request(request).await {
                 Ok(response) => response,
                 Err(mut error) => match error.take_message() {
@@ -3544,8 +3554,13 @@ impl rmcp::ServerHandler for AgentMcp {
                 None,
             ));
         }
+        let ct = context.ct.clone();
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        Self::tool_router().call(tcc).await
+        as_call(
+            Call::new(Arc::new(move || ct.is_cancelled())),
+            Self::tool_router().call(tcc),
+        )
+        .await
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
@@ -4407,7 +4422,7 @@ impl AgentMcp {
     ) -> Self {
         Self {
             agent,
-            client: Client::new(socket, config, capability),
+            client: Client::new(socket, config, capability).over_http(),
             profile,
         }
     }
@@ -5063,7 +5078,8 @@ impl AgentMcp {
                         let stdin_clone = Arc::clone(&shared_stdin);
                         let deliveries = Arc::clone(&deliveries);
                         let media_blocks = Arc::clone(&media_blocks);
-                        in_flight.spawn(async move {
+                        let call = current_call();
+                        in_flight.spawn(as_call(call, async move {
                             let res = mcp.dispatch_code_tool(&tool_name, tool_args).await;
                             if tool_name.trim().trim_start_matches("mcp__anyagents__") == "send"
                                 && let Ok((val, _)) = &res
@@ -5098,7 +5114,7 @@ impl AgentMcp {
                                 let _ = writeln!(guard, "{reply}");
                                 let _ = guard.flush();
                             }
-                        });
+                        }));
                     }
                     "done" => {
                         return Ok(msg);
@@ -5214,9 +5230,17 @@ impl AgentMcp {
 pub struct MultimediaJson(pub serde_json::Value, pub Vec<rmcp::model::ContentBlock>);
 
 impl rmcp::handler::server::tool::IntoCallToolResult for MultimediaJson {
+    /// The JSON as text, then each media block. With media the JSON is not
+    /// also sent as `structuredContent`: a client that prefers structured
+    /// content gives its model that alone and drops the media (Codex does),
+    /// and no tool that returns media declares an output schema that would
+    /// require it.
     fn into_call_tool_result(self) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let mut res = rmcp::model::CallToolResult::structured(self.0);
-        res.content.extend(self.1);
+        if !self.1.is_empty() {
+            res.structured_content = None;
+            res.content.extend(self.1);
+        }
         Ok(res.into())
     }
 }
@@ -5546,23 +5570,38 @@ fn read_multimedia_file(
 
     if mime_type.starts_with("image/") {
         let dims = parse_image_dimensions(mime_type, full_bytes);
-        let (b64, attached_mime) = if matches!(
-            mime_type,
-            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-        ) {
-            (crate::computer::base64_encode(full_bytes), mime_type)
-        } else if let Some(png_bytes) = transcode_image_to_png_bytes(resolved) {
-            (crate::computer::base64_encode(&png_bytes), "image/png")
-        } else {
-            (crate::computer::base64_encode(full_bytes), mime_type)
-        };
-        media_blocks.push(rmcp::model::ContentBlock::image(b64, attached_mime));
+        // What a model is given: within every provider's limits, scaled or
+        // converted here when it is not (a format only the toolchain's
+        // converter reads goes through it first).
+        let prepared = anyagents_harness::media::model_image(full_bytes).or_else(|err| {
+            transcode_image_to_png_bytes(resolved)
+                .ok_or(err)
+                .and_then(|png| anyagents_harness::media::model_image(&png))
+        });
         let (width, height) = dims.unwrap_or((0, 0));
         let dim_str = if width > 0 && height > 0 {
             format!("{width}x{height}, ")
         } else {
             String::new()
         };
+        let content = match &prepared {
+            Ok(image) if image.converted => format!(
+                "[Native {mime_type} image ({dim_str}{total_bytes} bytes) attached as MCP image content block, as {} {}x{} ({} bytes)]",
+                image.mime,
+                image.width,
+                image.height,
+                image.data.len()
+            ),
+            Ok(_) => format!(
+                "[Native {mime_type} image ({dim_str}{total_bytes} bytes) attached as MCP image content block]"
+            ),
+            Err(err) => {
+                format!("[{mime_type} image ({dim_str}{total_bytes} bytes) not attached: {err}]")
+            }
+        };
+        if let Ok(image) = &prepared {
+            media_blocks.push(rmcp::model::ContentBlock::image(image.base64(), image.mime));
+        }
         return Ok((
             serde_json::json!({
                 "action": "read",
@@ -5575,10 +5614,8 @@ fn read_multimedia_file(
                 "total_bytes": total_bytes,
                 "truncated": false,
                 "sha256": sha256,
-                "image_attached": true,
-                "content": format!(
-                    "[Native {mime_type} image ({dim_str}{total_bytes} bytes) attached as MCP image content block]"
-                ),
+                "image_attached": prepared.is_ok(),
+                "content": content,
             }),
             media_blocks,
         ));
@@ -8261,7 +8298,7 @@ pub(crate) async fn request(
     capability: Option<&str>,
     operator: Option<&str>,
 ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
-    let request = build_request(method, path, body, capability, operator, None)?;
+    let request = build_request(method, path, body, capability, operator, None, false)?;
     let response = connect(socket)
         .await?
         .send_request(request)
@@ -8282,6 +8319,11 @@ pub(crate) async fn request(
 /// presents. The agent id is what a deployment without the boundary uses to
 /// name its one route; with the boundary only the capability decides, and an
 /// operator token alone is accepted beside it.
+/// Marks a call made by the tool server behind the HTTP MCP route. It can only
+/// narrow what a call may do, so a caller that omits it gains nothing: the
+/// tool server that runs as the server's own user always sets it.
+pub(crate) const HTTP_MCP_HEADER: &str = "x-anyagents-via-http-mcp";
+
 fn build_request(
     method: &str,
     path: &str,
@@ -8289,6 +8331,7 @@ fn build_request(
     capability: Option<&str>,
     operator: Option<&str>,
     agent_id: Option<&str>,
+    via_http: bool,
 ) -> Result<hyper::Request<Full<Bytes>>, String> {
     let payload = body.unwrap_or_default();
     let mut builder = hyper::Request::builder()
@@ -8305,17 +8348,195 @@ fn build_request(
     if let Some(id) = agent_id {
         builder = builder.header(crate::auth::AGENT_ID_HEADER, id);
     }
+    if via_http {
+        builder = builder.header(HTTP_MCP_HEADER, "1");
+    }
     builder
         .body(Full::new(Bytes::from(payload)))
         .map_err(|err| err.to_string())
 }
 
-/// A new HTTP/1 connection to the server's socket. Its driver runs as a task
-/// until the server closes it or the last sender is dropped.
+/// How long a tool server's call waits for the server's socket to come back.
+/// The harness outlives a server restart or upgrade (its keeper holds it),
+/// and for that moment nothing listens: the socket is missing or refuses.
+/// Only the connection is tried again; no request is ever sent twice. A
+/// one-shot command does not wait: an operator's read falls back to the
+/// store at once.
+///
+/// The wait stays well inside the shortest tool-call timeout found among the
+/// harnesses AnyAgents runs, so a call is not carried out after the harness
+/// gave up on it: Codex 60 s (`tool_timeout_sec`); Claude Code (stdio: about
+/// 28 h, 30 min idle), OpenCode (12 h) and Gemini CLI (10 min) wait longer.
+/// A harness that cancels the call (`notifications/cancelled`) ends the wait
+/// at once.
+const RECONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// One tool call as the requests it makes see it: whether its harness
+/// cancelled it, and the time it has spent waiting for the server's socket,
+/// shared by every request the call (and everything it spawns) makes.
+#[derive(Clone)]
+struct Call {
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    wait: SocketWait,
+}
+
+impl Call {
+    /// A call `cancelled` reports on, with the whole wait still ahead.
+    fn new(cancelled: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        Self {
+            cancelled,
+            wait: SocketWait::new(RECONNECT_WITHIN),
+        }
+    }
+
+    #[cfg(test)]
+    fn waiting_at_most(
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+        budget: std::time::Duration,
+    ) -> Self {
+        Self {
+            cancelled,
+            wait: SocketWait::new(budget),
+        }
+    }
+}
+
+/// The time spent waiting for the server's socket, against a budget: only
+/// the time some request actually waits counts (requests waiting at once
+/// count it once), so a call that has run long still has its whole wait.
+#[derive(Clone)]
+struct SocketWait {
+    budget: std::time::Duration,
+    spent: Arc<std::sync::Mutex<Spent>>,
+}
+
+#[derive(Default)]
+struct Spent {
+    before: std::time::Duration,
+    waiters: usize,
+    since: Option<tokio::time::Instant>,
+}
+
+impl SocketWait {
+    fn new(budget: std::time::Duration) -> Self {
+        Self {
+            budget,
+            spent: Arc::default(),
+        }
+    }
+
+    fn spent(&self) -> std::sync::MutexGuard<'_, Spent> {
+        self.spent.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// What is left of the budget.
+    fn left(&self) -> std::time::Duration {
+        let spent = self.spent();
+        let running = spent
+            .since
+            .map_or(std::time::Duration::ZERO, |since| since.elapsed());
+        self.budget.saturating_sub(spent.before + running)
+    }
+
+    /// One request starts waiting; the wait counts until the guard drops.
+    fn begin(&self) -> Waiting<'_> {
+        let mut spent = self.spent();
+        if spent.waiters == 0 {
+            spent.since = Some(tokio::time::Instant::now());
+        }
+        spent.waiters += 1;
+        Waiting(self)
+    }
+}
+
+/// A request waiting for the socket.
+struct Waiting<'a>(&'a SocketWait);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut spent = self.0.spent();
+        spent.waiters -= 1;
+        if spent.waiters == 0
+            && let Some(since) = spent.since.take()
+        {
+            spent.before += since.elapsed();
+        }
+    }
+}
+
+tokio::task_local! {
+    /// The tool call this task serves.
+    static CALL: Call;
+}
+
+/// The current tool call was cancelled by its harness.
+fn call_cancelled() -> bool {
+    CALL.try_with(|call| (call.cancelled)()).unwrap_or(false)
+}
+
+/// The current tool call's wait for the server's socket; a request outside
+/// any call has the whole wait to itself.
+fn call_wait() -> SocketWait {
+    CALL.try_with(|call| call.wait.clone())
+        .unwrap_or_else(|_| SocketWait::new(RECONNECT_WITHIN))
+}
+
+/// Run `body` as `call`, so the requests it makes are neither connected nor
+/// sent once its harness cancelled it, and wait no longer than it may.
+async fn as_call<F: std::future::Future>(call: Call, body: F) -> F::Output {
+    CALL.scope(call, body).await
+}
+
+/// The current call, to carry into a task it spawns.
+fn current_call() -> Call {
+    CALL.try_with(Call::clone)
+        .unwrap_or_else(|_| Call::new(Arc::new(|| false)))
+}
+/// How often a missing or refusing socket is tried again.
+const RECONNECT_PROBE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A new HTTP/1 connection to the server's socket, or an error at once when
+/// nothing listens. Its driver runs as a task until the server closes it or
+/// the last sender is dropped.
 async fn connect(socket: &Path) -> Result<http1::SendRequest<Full<Bytes>>, String> {
-    let stream = tokio::net::UnixStream::connect(socket)
-        .await
-        .map_err(|err| format!("cannot reach the server: {err}"))?;
+    connect_waiting(socket, &SocketWait::new(std::time::Duration::ZERO)).await
+}
+
+/// [`connect`], waiting up to `within` while nothing listens on `socket`.
+#[cfg(test)]
+async fn connect_within(
+    socket: &Path,
+    within: std::time::Duration,
+) -> Result<http1::SendRequest<Full<Bytes>>, String> {
+    connect_waiting(socket, &SocketWait::new(within)).await
+}
+
+/// [`connect`], waiting within what is left of `wait` while nothing listens
+/// on `socket`.
+async fn connect_waiting(
+    socket: &Path,
+    wait: &SocketWait,
+) -> Result<http1::SendRequest<Full<Bytes>>, String> {
+    let mut waiting = None;
+    let stream = loop {
+        if call_cancelled() {
+            return Err("the tool call was cancelled".into());
+        }
+        match tokio::net::UnixStream::connect(socket).await {
+            Ok(stream) => break stream,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) && !wait.left().is_zero() =>
+            {
+                waiting.get_or_insert_with(|| wait.begin());
+                tokio::time::sleep(RECONNECT_PROBE.min(wait.left())).await;
+            }
+            Err(err) => return Err(format!("cannot reach the server: {err}")),
+        }
+    };
+    drop(waiting);
     let (sender, connection) = http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|err| err.to_string())?;
@@ -8352,6 +8573,194 @@ fn parse_sequence_range(range: Option<&str>) -> Result<(Option<i64>, Option<i64>
         return Err("sequence range start must not exceed end".into());
     }
     Ok((Some(start), Some(end)))
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use std::sync::Arc;
+    /// A tool call made while the server restarts waits for its socket to
+    /// come back, and its request is sent once, on the new server.
+    #[tokio::test]
+    async fn a_call_made_while_the_server_restarts_reaches_the_next_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let listening = socket.clone();
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            let listener = tokio::net::UnixListener::bind(&listening).unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !String::from_utf8_lossy(&seen).contains("\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                seen.extend_from_slice(&buf[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            // A second request on another connection would block here.
+            drop(listener);
+            seen
+        });
+        let mut sender = super::connect_within(&socket, std::time::Duration::from_secs(20))
+            .await
+            .unwrap();
+        let request =
+            super::build_request("GET", "/v1/health", None, None, None, None, false).unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        let seen = server.await.unwrap();
+        let seen = String::from_utf8_lossy(&seen);
+        assert!(
+            seen.starts_with("GET ") && seen.contains("/v1/health"),
+            "{seen}"
+        );
+    }
+
+    /// A call its harness cancels while it waits for the server is never
+    /// carried out: the next server never sees it.
+    #[tokio::test]
+    async fn a_call_cancelled_while_it_waits_never_reaches_the_next_server() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let client = super::Client::new(
+            socket.clone(),
+            dir.path().join("config"),
+            "synthetic-test-capability".into(),
+        );
+        let call = tokio::spawn(super::as_call(
+            super::Call::new(Arc::new(move || flag.load(Ordering::SeqCst))),
+            async move {
+                client
+                    .send("POST", "/v1/send", Some(b"{}".to_vec()), "cap", None)
+                    .await
+            },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        cancelled.store(true, Ordering::SeqCst);
+        // The harness gave up; then the next server comes up.
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let error = call
+            .await
+            .unwrap()
+            .expect_err("a cancelled call was carried out");
+        assert!(error.contains("cancelled"), "{error}");
+        // It may have connected in the instant before it saw the cancel, but
+        // it sends nothing on that connection.
+        if let Ok(accepted) =
+            tokio::time::timeout(std::time::Duration::from_millis(800), listener.accept()).await
+        {
+            use tokio::io::AsyncReadExt as _;
+            let (mut stream, _) = accepted.unwrap();
+            let mut seen = Vec::new();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_to_end(&mut seen),
+            )
+            .await;
+            assert!(
+                seen.is_empty(),
+                "the cancelled call reached the next server: {}",
+                String::from_utf8_lossy(&seen)
+            );
+        }
+    }
+
+    /// The wait is the call's, not each request's: requests a call makes one
+    /// after another while the server is gone share it.
+    #[tokio::test]
+    async fn requests_in_one_call_share_its_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let client = super::Client::new(
+            socket,
+            dir.path().join("config"),
+            "synthetic-test-capability".into(),
+        );
+        let started = std::time::Instant::now();
+        let call = super::Call::waiting_at_most(
+            Arc::new(|| false),
+            std::time::Duration::from_millis(1_000),
+        );
+        let failures = super::as_call(call, async move {
+            let mut failures = 0;
+            for _ in 0..3 {
+                if client
+                    .send("GET", "/v1/whoami", None, "cap", None)
+                    .await
+                    .is_err()
+                {
+                    failures += 1;
+                }
+            }
+            failures
+        })
+        .await;
+        assert_eq!(failures, 3);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_900),
+            "each request waited on its own: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Only time spent waiting for the socket counts against a call's wait:
+    /// a call that has run long still waits the whole time for a server
+    /// that restarts.
+    #[tokio::test]
+    async fn a_call_that_ran_long_still_waits_for_a_restarting_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let client = super::Client::new(
+            socket.clone(),
+            dir.path().join("config"),
+            "synthetic-test-capability".into(),
+        );
+        let call = super::Call::waiting_at_most(
+            Arc::new(|| false),
+            std::time::Duration::from_millis(1_000),
+        );
+        let answer = tokio::spawn(super::as_call(call, async move {
+            // Longer than the whole wait, at work before the server goes.
+            tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+            client.send("GET", "/v1/whoami", None, "cap", None).await
+        }));
+        // The server comes back within the wait, after the call's work.
+        tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !String::from_utf8_lossy(&seen).contains("\r\n\r\n") {
+            let read = stream.read(&mut buf).await.unwrap();
+            seen.extend_from_slice(&buf[..read]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let answer = answer.await.unwrap();
+        assert!(answer.is_ok(), "{answer:?}");
+    }
+
+    /// Past the wait, a server that is still gone is an error, as before.
+    #[tokio::test]
+    async fn a_server_still_gone_after_the_wait_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let started = std::time::Instant::now();
+        let error = super::connect_within(&socket, std::time::Duration::from_millis(600))
+            .await
+            .expect_err("a missing server was reached");
+        assert!(error.starts_with("cannot reach the server"), "{error}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(600));
+    }
 }
 
 #[cfg(test)]
@@ -8702,8 +9111,9 @@ mod spawn_args_tests {
             state: state.to_string(),
             process: "none".to_string(),
             turn_state: turn_state.to_string(),
-            delivery_mode: "turn".to_string(),
-            steer_support: "send".to_string(),
+            delivery: Default::default(),
+            delivery_mode: String::new(),
+            steer_support: String::new(),
             quota_reset_at_ms: None,
             block_reason: None,
             last_error: None,
@@ -9363,7 +9773,8 @@ mod spawn_args_tests {
             gateway: None,
         })
         .unwrap();
-        let server = tokio::spawn(async move {
+        let (served, server) = tokio::sync::oneshot::channel::<()>();
+        let later = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
             loop {
@@ -9379,6 +9790,30 @@ mod spawn_args_tests {
             );
             stream.write_all(header.as_bytes()).await.unwrap();
             stream.write_all(&body).await.unwrap();
+            drop(stream);
+            let _ = served.send(());
+            // The server stays up, as a real one does: what it does not
+            // serve here (memory reads) is answered `404`, and the tools fall
+            // back to the agent's own files.
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    match stream.read_u8().await {
+                        Ok(byte) => request.push(byte),
+                        Err(_) => break,
+                    }
+                }
+                let body = br#"{"error":"not served here"}"#;
+                let head = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
         });
 
         let mcp = AgentMcp {
@@ -9432,6 +9867,7 @@ mod spawn_args_tests {
         assert_eq!(code_res["logs"], json!(["parallel calls done 2"]));
         assert!(workdir.join("computed.txt").is_file());
         server.await.unwrap();
+        let _serving = &later;
 
         // 2. Verify capability sandbox blocks `process`, `process.env`, `require`, `child_process`, `fs`, `fetch`, and Function constructor escapes.
         let sandbox_probe = mcp
@@ -9615,6 +10051,7 @@ mod spawn_args_tests {
         assert_eq!(evo_res["result"]["execExit"], 0);
         assert_eq!(evo_res["result"]["execStdout"], "hello-exec");
         assert_eq!(evo_res["result"]["hasWebHelpers"], true);
+        later.abort();
     }
 
     #[tokio::test]
@@ -9624,14 +10061,12 @@ mod spawn_args_tests {
         let workdir = dir.path().join("work");
         std::fs::create_dir_all(&workdir).unwrap();
 
-        // 1. Write a valid PNG header (640x480), WAV header, and minimal PDF file.
-        let mut png_bytes = Vec::new();
-        png_bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-        png_bytes.extend_from_slice(&13u32.to_be_bytes());
-        png_bytes.extend_from_slice(b"IHDR");
-        png_bytes.extend_from_slice(&640u32.to_be_bytes());
-        png_bytes.extend_from_slice(&480u32.to_be_bytes());
-        png_bytes.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        // 1. Write a 640x480 PNG, a WAV header, and a minimal PDF file.
+        let mut png_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(640, 480))
+            .write_to(&mut png_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let png_bytes = png_bytes.into_inner();
         std::fs::write(workdir.join("frame.png"), &png_bytes).unwrap();
 
         let mut wav_bytes = Vec::new();
@@ -9724,7 +10159,13 @@ mod spawn_args_tests {
         let rmcp::model::CallToolResponse::Complete(call_res) = call_tool_resp else {
             panic!("expected CallToolResponse::Complete");
         };
-        assert!(call_res.structured_content.is_some());
+        // The JSON goes as text, not also as structured content, which a
+        // client that prefers it would give its model instead of the media.
+        assert!(call_res.structured_content.is_none());
+        assert!(matches!(
+            &call_res.content[0],
+            rmcp::model::ContentBlock::Text(text) if text.text.contains("\"imgDims\":[640,480]")
+        ));
         assert!(call_res.content.iter().any(
             |c| matches!(c, rmcp::model::ContentBlock::Image(i) if i.mime_type == "image/png")
         ));
@@ -9742,8 +10183,117 @@ mod spawn_args_tests {
         )));
     }
 
+    /// What each harness's model is given when its agent reads a media path
+    /// with `code`, by that vendor's MCP client rules
+    /// (`tests/invariants/fakes/mcp_client.py`): the photo itself on every
+    /// harness whose client gives MCP images to its model; on AGY, which
+    /// gives one only up to 10,240 bytes, the path of the file it offloaded,
+    /// which its native `read_file` opens; and a small image inline there.
     #[tokio::test]
-    async fn remote_sandbox_backend_executes_files_and_code_and_upgrades_http_mcp_profile() {
+    async fn an_image_an_agent_reads_from_the_media_directory_reaches_each_model() {
+        use rmcp::handler::server::tool::IntoCallToolResult as _;
+        use sha2::Digest as _;
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("work");
+        let media = dir.path().join(anyagents_harness::media::MEDIA_DIR);
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::create_dir_all(&media).unwrap();
+        // A Telegram photo's shape: a 1280x697 JPEG of tens of kilobytes.
+        let jpeg = |width: u32, height: u32| {
+            let image = image::RgbImage::from_fn(width, height, |x, y| {
+                let noise = (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503)) >> 13;
+                image::Rgb([(x % 251) as u8, (y % 241) as u8, noise as u8])
+            });
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image)
+                .write_to(&mut bytes, image::ImageFormat::Jpeg)
+                .unwrap();
+            bytes.into_inner()
+        };
+        let photo = jpeg(1280, 697);
+        assert!(photo.len() > 10_240, "{} bytes", photo.len());
+        let thumb = jpeg(32, 32);
+        assert!(thumb.len() <= 10_240, "{} bytes", thumb.len());
+        let digest = |bytes: &[u8]| {
+            sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: AgentId::generate(),
+                name: "media-reader".into(),
+                workdir: Some(workdir.clone()),
+            },
+            client: Client::new(
+                dir.path().join("unused.sock"),
+                dir.path().join("config"),
+                "test-cap".into(),
+            ),
+            profile: McpProfile::Full,
+        };
+        let read = |name: &str, bytes: &[u8]| {
+            let path = media.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let line = anyagents_harness::media::local_media_line("photo", &path);
+            assert!(line.contains(&path.display().to_string()));
+            let mcp = mcp.clone();
+            async move {
+                let result = mcp
+                    .code(Parameters(CodeArgs {
+                        code: format!(
+                            "const img = await workspace.read({{ path: {:?} }}); return img.mime_type;",
+                            path.display().to_string()
+                        ),
+                        timeout_ms: Some(15_000),
+                    }))
+                    .await
+                    .unwrap();
+                let rmcp::model::CallToolResponse::Complete(result) =
+                    result.into_call_tool_result().unwrap()
+                else {
+                    panic!("expected a complete result");
+                };
+                serde_json::to_vec(&result).unwrap()
+            }
+        };
+        let seen_by = |harness: &str, result: &[u8]| -> serde_json::Value {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new("python3")
+                .args(["-I", anyagents_invariants::conformance::MCP_CLIENT, harness])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(result).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{harness}");
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+        let photo_result = read("complete_photo_large.jpg", &photo).await;
+        for harness in ["claude-code", "codex", "muse", "omp", "opencode"] {
+            let seen = seen_by(harness, &photo_result);
+            assert_eq!(
+                seen["images"],
+                json!([{"mime": "image/jpeg", "sha256": digest(&photo)}]),
+                "{harness}: {seen}"
+            );
+        }
+        let agy = seen_by("agy", &photo_result);
+        assert_eq!(agy["images"], json!([]), "{agy}");
+        assert_eq!(agy["offloaded"].as_array().unwrap().len(), 1, "{agy}");
+        let thumb_result = read("complete_photo_small.jpg", &thumb).await;
+        let agy = seen_by("agy", &thumb_result);
+        assert_eq!(
+            agy["images"],
+            json!([{"mime": "image/jpeg", "sha256": digest(&thumb)}]),
+            "{agy}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sandbox_backend_executes_files_and_code_and_never_upgrades_http_mcp_profile() {
         use axum::{
             Router,
             body::Bytes,
@@ -9899,11 +10449,8 @@ mod spawn_args_tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::create_dir_all(&host_workdir).unwrap();
 
-        // Without sandbox.json, HTTP MCP defaults to Remote profile (code disabled).
-        assert_eq!(
-            McpProfile::resolve_http_with_config(None, "claude-cloud", Some(&config_dir)),
-            Ok(McpProfile::Remote)
-        );
+        // HTTP MCP defaults to the Remote profile (code disabled).
+        assert_eq!(McpProfile::resolve_http(None), Ok(McpProfile::Remote));
 
         // Write sandbox.json into agent config_dir.
         std::fs::write(
@@ -9918,11 +10465,10 @@ mod spawn_args_tests {
         )
         .unwrap();
 
-        // With sandbox.json present, HTTP MCP upgrades to Full profile so remote sandbox agents can use `code` and `files`.
-        assert_eq!(
-            McpProfile::resolve_http_with_config(None, "claude-cloud", Some(&config_dir)),
-            Ok(McpProfile::Full)
-        );
+        // A sandbox.json never upgrades HTTP MCP: over HTTP the tools would run
+        // as the server, so `full` is refused there and served only over stdio.
+        assert_eq!(McpProfile::resolve_http(None), Ok(McpProfile::Remote));
+        assert!(McpProfile::resolve_http(Some("full")).is_err());
 
         let mcp = AgentMcp {
             agent: AgentRef {

@@ -496,6 +496,65 @@ fn internal_admission_probe_needs_no_host_tool_but_git() {
     assert!(reason.contains(file.to_str().unwrap()), "{reason}");
 }
 
+/// `anyagents internal seat-file`, the helper a seat runs for the daemon's
+/// file changes, needs no environment at all (no `PATH`, so no host tool).
+/// It exits 0 done, 1 refused with the reason on stderr, 2 misused.
+#[test]
+fn internal_seat_file_needs_no_host_tool() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let bytes: Vec<u8> = (0..100_000u32).map(|i| (i % 253) as u8).collect();
+    std::fs::write(&source, &bytes).unwrap();
+    let helper = |args: &[&str]| {
+        bin()
+            .env_clear()
+            .current_dir(dir.path())
+            .args(["internal", "seat-file"])
+            .args(args)
+            .stdin(std::fs::File::open(&source).unwrap())
+            .output()
+            .unwrap()
+    };
+    let copy = dir.path().join(".seat-copy-x");
+    let copied = helper(&["copy", ".seat-copy-x"]);
+    assert!(
+        copied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&copied.stderr)
+    );
+    assert_eq!(std::fs::read(&copy).unwrap(), bytes);
+    assert_eq!(
+        std::fs::metadata(&copy).unwrap().permissions().mode() & 0o7777,
+        0o660
+    );
+    assert!(helper(&["readback", ".seat-copy-x"]).status.success());
+    // A copy never replaces an existing name.
+    assert_eq!(helper(&["copy", ".seat-copy-x"]).status.code(), Some(1));
+    std::fs::write(&source, b"changed").unwrap();
+    let differs = helper(&["readback", ".seat-copy-x"]);
+    assert_eq!(differs.status.code(), Some(1));
+    let reason = String::from_utf8_lossy(&differs.stderr);
+    assert!(reason.contains("differs"), "{reason}");
+    assert!(helper(&["inode", "600"]).status.success());
+    assert_eq!(
+        std::fs::metadata(&source).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+    assert!(helper(&["unlink", ".seat-copy-x"]).status.success());
+    assert!(!copy.exists());
+    assert!(helper(&["unlink", ".seat-copy-x"]).status.success());
+    for misuse in [
+        &["copy", "../escape"][..],
+        &["copy"],
+        &["inode", "99999"],
+        &["inode", "600", "group"],
+        &["chmod", "600"],
+    ] {
+        assert_eq!(helper(misuse).status.code(), Some(2), "{misuse:?}");
+    }
+}
+
 #[test]
 fn plain_log_tail_keeps_the_bounded_conversation_route() {
     use std::io::{Read, Write};

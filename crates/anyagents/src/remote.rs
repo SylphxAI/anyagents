@@ -13,13 +13,11 @@
 //!   before each turn. The maintenance pass rotates the token before it
 //!   expires. The long-lived local mailbox capability never leaves this host.
 //! * A remote session token only ever gets the `remote` MCP profile
-//!   ([`crate::mcp::McpProfile::resolve_remote_session`]).
+//!   ([`crate::mcp::McpProfile::resolve_http`]).
 //! * `public_listen` in the same table binds the public listener: its own port,
 //!   serving readiness, Telegram webhooks and MCP for remote session tokens
 //!   only. Every local credential stays on the socket and the loopback API
 //!   (ADR 0010 D2). The separation is by listener, never by source address.
-//! * An agent that runs off this host creates children, and moves agents, only
-//!   onto harnesses that also run off it ([`may_place_on`]).
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -42,10 +40,22 @@ pub const MCP_PATH: &str = "/v1/webhooks/mcp";
 
 /// Remote session token lifetime when `remote_session_ttl_secs` is unset.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60);
-/// Bounds on `remote_session_ttl_secs`. The rotation pass runs every minute
-/// and rotates at half the lifetime, so the floor leaves it several chances.
-pub const MIN_TTL: Duration = Duration::from_secs(5 * 60);
+/// How often the maintenance pass looks for tokens to rotate.
+pub const ROTATION_INTERVAL: Duration = Duration::from_secs(60);
+/// The longest a remote turn may hold the token it started with: the cloud
+/// adapter's 300 s request timeout plus its default 300 s job-poll window
+/// (`cloud_harness.rs`). A remote sandbox turn is bounded at 305 s.
+pub const LONGEST_TURN: Duration = Duration::from_secs(600);
+/// Bounds on `remote_session_ttl_secs`. A turn reads the token when it
+/// starts; rotation happens within one interval of half the lifetime, so a
+/// token read at turn start has at least `ttl / 2 - ROTATION_INTERVAL` left.
+/// The floor keeps that above the longest turn.
+pub const MIN_TTL: Duration = Duration::from_secs(30 * 60);
 pub const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const _: () = assert!(
+    MIN_TTL.as_secs() / 2 > ROTATION_INTERVAL.as_secs() + LONGEST_TURN.as_secs(),
+    "a token read at turn start must outlive the longest turn"
+);
 /// Revoked and expired token rows are forgotten after this long.
 const PRUNE_AFTER_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -210,26 +220,6 @@ pub fn runs_off_host(agent: &Agent, config_dir: &Path) -> bool {
     crate::vendor::is_cloud_harness(&agent.harness)
         || anyagents_tools::SandboxConfig::resolve(Some(config_dir))
             .is_some_and(|sandbox| sandbox.remote_spawn)
-}
-
-/// Whether an agent that runs off this host may place an agent on `harness`:
-/// only a cloud harness, which runs off this host too. A host harness would
-/// let a remote session (prompt-injected, or holding a leaked token) start
-/// code on the control-plane host through a child. Refusing is explicit; a
-/// silent switch to a cloud harness would pick a vendor and spend on the
-/// caller's behalf. Every other caller may place any harness.
-pub fn may_place_on(store: &Store, caller: &AgentId, harness: &str) -> Result<(), String> {
-    let caller = store.agent(caller).map_err(|err| err.to_string())?;
-    let config = anyagents_core::agent_config_dir(store.data_dir(), &caller.id);
-    if !runs_off_host(&caller, &config) || crate::vendor::is_cloud_harness(harness) {
-        return Ok(());
-    }
-    Err(format!(
-        "`{}` runs off this host, so the agents it creates or moves must run off it too: \
-         `{harness}` would run on the control-plane host; use a cloud harness \
-         (`claude-cloud`, `openai-cloud`, `cursor-cloud`, `spiron-cloud`)",
-        caller.name
-    ))
 }
 
 /// Why a remote agent cannot be created or started here, when it cannot.
@@ -430,7 +420,7 @@ mod tests {
                 "{ok}"
             );
         }
-        for secs in [0, 299, 86_401] {
+        for secs in [0, 299, 1_799, 86_401] {
             let err = parse(&format!("[server]\nremote_session_ttl_secs = {secs}\n")).unwrap_err();
             assert!(err.contains("remote_session_ttl_secs"), "{err}");
         }

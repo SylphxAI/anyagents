@@ -37,7 +37,7 @@ fn fake_spiron(dir: &Path, capable: bool) -> StreamHarness {
         work_dir: None,
         session_id: None,
         mode: anyagents_harness::DeliveryMode::Steer,
-        steer: anyagents_harness::SteerSupport::Yes,
+        delivery: super::SPIRON,
     })
     .unwrap();
     harness.wait_ready(Duration::from_secs(15)).unwrap();
@@ -138,7 +138,7 @@ fn nothing_is_written_before_the_peer_says_what_it_can_do() {
         work_dir: None,
         session_id: None,
         mode: anyagents_harness::DeliveryMode::Steer,
-        steer: anyagents_harness::SteerSupport::Yes,
+        delivery: super::SPIRON,
     })
     .unwrap();
     assert_eq!(deliver(&mut harness, "m1"), Deferred);
@@ -210,10 +210,6 @@ fn every_input_is_written_at_once_and_answers_accepted_only_on_its_proof() {
         anyagents_harness::TurnState::Idle
     );
     assert_eq!(wire(dir.path()).len(), 6, "nothing was written twice");
-    assert!(
-        !dir.path().join("spiron-unconfirmed-steers.json").exists(),
-        "a peer that proves consumption needs no hold"
-    );
 }
 
 #[test]
@@ -307,9 +303,7 @@ fn steers_a_turn_ended_without_consuming_go_back_and_start_the_next_turn() {
         ]
     );
     assert_eq!(journaled(dir.path()), ["input:m1", "input:m2", "input:m3"]);
-    assert!(!harness.has_unconfirmed_hold());
     assert!(harness.health().sign_in_fault.is_none());
-    assert!(!dir.path().join("spiron-unconfirmed-steers.json").exists());
 }
 
 #[test]
@@ -436,7 +430,6 @@ fn a_turn_the_peer_could_not_start_is_offered_again_and_is_no_fault() {
     assert!(health.process_alive);
     assert!(health.sign_in_fault.is_none(), "{:?}", health.sign_in_fault);
     assert_eq!(health.turn_state, anyagents_harness::TurnState::Idle);
-    assert!(!harness.has_unconfirmed_hold());
     assert_eq!(wire(dir.path()).len(), 2);
     // The backoff ends with a wake, not a poll: nothing else moves until it.
     let changes = super::lock(&harness.shared).changes;
@@ -465,10 +458,13 @@ fn a_turn_the_peer_could_not_start_is_offered_again_and_is_no_fault() {
 }
 
 #[test]
-fn an_older_peer_keeps_its_acknowledged_steer_deferred_and_held() {
+fn an_older_peer_is_given_nothing_while_its_turn_runs() {
     let dir = tempfile::tempdir().unwrap();
     let mut harness = fake_spiron(dir.path(), false);
-    harness.set_state_dir(dir.path());
+    assert_eq!(
+        harness.health().delivery.level,
+        anyagents_harness::DeliveryLevel::TurnEnd
+    );
     until(
         &mut harness,
         "m1",
@@ -476,18 +472,18 @@ fn an_older_peer_keeps_its_acknowledged_steer_deferred_and_held() {
             turn_finished: false,
         },
     );
+    // Mail for a busy older peer stays in the mailbox: nothing would prove
+    // the running turn took it.
     assert_eq!(deliver(&mut harness, "m2"), Deferred);
-    eventually(|| super::lock(&harness.shared).acknowledged.contains("m2"));
-    assert_eq!(deliver(&mut harness, "m2"), Deferred);
-    assert!(dir.path().join("spiron-unconfirmed-steers.json").exists());
     act(dir.path(), "step");
     assert_eq!(deliver(&mut harness, "m2"), Deferred);
+    assert_eq!(wire(dir.path()).len(), 1);
     act(dir.path(), "finish");
     until(
         &mut harness,
         "m2",
         Accepted {
-            turn_finished: true,
+            turn_finished: false,
         },
     );
     let written: Vec<_> = wire(dir.path())
