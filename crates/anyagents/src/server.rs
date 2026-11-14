@@ -353,6 +353,13 @@ async fn serve(
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
         quota_rotation::start(Arc::clone(&store));
+        // Tool servers spill large results to each agent's own tmp; old ones
+        // go here, off the startup path (the socket is already bound).
+        let spill_root = data.to_path_buf();
+        std::thread::Builder::new()
+            .name("anyagents-spill-sweep".into())
+            .spawn(move || crate::mcp::sweep_agent_spills(&spill_root))
+            .ok();
         start_host_history_indexer(Arc::clone(&store));
         let memory_backlog = memory_backlog::start(&store);
         let reaper_root = data.to_path_buf();

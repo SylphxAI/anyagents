@@ -198,7 +198,9 @@ pub struct AgentRef {
 /// over it is spilled to a `0600` file and replaced by a compact summary so
 /// the pipe never breaks.
 pub(crate) const MCP_STDIO_FRAME_CAP_BYTES: usize = 15 * 1024 * 1024;
-// The served cap stays below the Go SDK's 16 MiB frame bound (agy).
+// The served cap stays below the smallest client bound: the Go SDK's 16 MiB
+// (agy) and Muse's MCP stdio `max_bytes`, measured on muse 1.4.20 at 16 MiB
+// (a 16,777,140-byte frame is read, a 16,777,240-byte one is refused).
 const _: () = assert!(MCP_STDIO_FRAME_CAP_BYTES < 16 * 1024 * 1024);
 const MCP_STDIO_FRAME_PREVIEW_CHARS: usize = 2_000;
 
@@ -221,6 +223,136 @@ fn spill_file(prefix: &str, bytes: &[u8], dir: &Path, seq: u64) -> std::io::Resu
     }
     options.open(&path)?.write_all(bytes)?;
     Ok(path)
+}
+
+/// The file name prefixes of what a tool server spills.
+pub(crate) const SPILL_PREFIXES: [&str; 2] =
+    ["anyagents-code-result-", "anyagents-mcp-stdio-frame-"];
+
+/// How long a spilled file is kept: the agent reads it within the turn that
+/// was answered with its path.
+pub(crate) const SPILL_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Where one agent's tool server writes what it spills: the agent's own tmp,
+/// the directory its harness gets as `TMPDIR` (`{scratch}/tmp/{id}` with a
+/// scratch tier, else `{config}/tmp`), never the host's shared temp dir.
+pub(crate) fn agent_spill_dir(config: &Path, agent: &AgentId) -> PathBuf {
+    match anyagents_core::configured_scratch_dir() {
+        Some(scratch) => anyagents_core::agent_scratch_tmp_dir(&scratch, agent),
+        None => config.join("tmp"),
+    }
+}
+
+/// `dir`, created private (`0700`) when it does not exist yet.
+fn ensure_spill_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// Remove spilled files in `dir` last modified more than `older_than` ago:
+/// regular files only, named with a [`SPILL_PREFIXES`] prefix and `.json`,
+/// and, when `owner` is given, owned by that uid. Returns how many went.
+pub(crate) fn sweep_spills(
+    dir: &Path,
+    older_than: std::time::Duration,
+    owner: Option<u32>,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(older_than) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.ends_with(".json") || !SPILL_PREFIXES.iter().any(|p| name.starts_with(p)) {
+            continue;
+        }
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        if let Some(uid) = owner {
+            use std::os::unix::fs::MetadataExt as _;
+            if meta.uid() != uid {
+                continue;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = owner;
+        if meta.modified().is_ok_and(|at| at < cutoff) && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// At a tool server's start: old spills in its own spill dir, and old ones
+/// it left in the shared temp dir before spills moved, never another user's.
+fn sweep_own_spills(spill_dir: &Path) {
+    #[cfg(unix)]
+    let me = Some(unsafe { libc::geteuid() });
+    #[cfg(not(unix))]
+    let me = None;
+    sweep_spills(spill_dir, SPILL_MAX_AGE, me);
+    let legacy = std::env::temp_dir();
+    if legacy != spill_dir {
+        sweep_spills(&legacy, SPILL_MAX_AGE, me);
+    }
+}
+
+/// At server start: old spills in every agent's tmp, `{scratch}/tmp/{id}`
+/// and `{config}/tmp`. Only directories named by an agent id are visited.
+pub(crate) fn sweep_agent_spills(data: &Path) {
+    let mut dirs = Vec::new();
+    if let Some(scratch) = anyagents_core::configured_scratch_dir()
+        && let Ok(entries) = std::fs::read_dir(scratch.join("tmp"))
+    {
+        for entry in entries.filter_map(Result::ok) {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| AgentId::parse(n).is_ok())
+            {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(data.join("agents")) {
+        for entry in entries.filter_map(Result::ok) {
+            if let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| AgentId::parse(n).ok())
+            {
+                dirs.push(anyagents_core::agent_config_dir(data, &id).join("tmp"));
+            }
+        }
+    }
+    let removed: usize = dirs
+        .iter()
+        .map(|dir| sweep_spills(dir, SPILL_MAX_AGE, None))
+        .sum();
+    if removed > 0 {
+        eprintln!("anyagents-mcp: removed {removed} spilled tool results older than a day");
+    }
 }
 
 /// Build the bounded replacement frame (with trailing newline) for one
@@ -275,8 +407,10 @@ pub(crate) struct FrameCapStdout<W> {
 }
 
 impl<W> FrameCapStdout<W> {
-    pub(crate) fn new(inner: W) -> Self {
-        Self::with_limits(inner, std::env::temp_dir(), MCP_STDIO_FRAME_CAP_BYTES)
+    /// The served gate: oversize frames spill to `spill_dir`, the agent's
+    /// own tmp ([`agent_spill_dir`]).
+    pub(crate) fn new(inner: W, spill_dir: PathBuf) -> Self {
+        Self::with_limits(inner, spill_dir, MCP_STDIO_FRAME_CAP_BYTES)
     }
 
     fn with_limits(inner: W, spill_dir: PathBuf, cap: usize) -> Self {
@@ -392,6 +526,137 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FrameCapStdout<
 mod stdio_frame_cap_tests {
     use super::*;
     use tokio::io::AsyncWriteExt as _;
+
+    /// A spill file in `dir`, last modified `age` ago.
+    fn aged(dir: &Path, name: &str, age: std::time::Duration) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"{}").unwrap();
+        let at = std::time::SystemTime::now() - age;
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn spills_go_to_the_agents_own_tmp_never_the_shared_one() {
+        // Tests run without a scratch tier: the agent's `{config}/tmp`, the
+        // TMPDIR its harness gets then.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("agents").join("agt_x").join("config");
+        let agent = AgentId::generate();
+        let spill = agent_spill_dir(&config, &agent);
+        assert_eq!(spill, config.join("tmp"));
+        assert_ne!(spill, std::env::temp_dir());
+        ensure_spill_dir(&spill).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&spill).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+        }
+    }
+
+    #[test]
+    fn a_sweep_removes_only_old_spills_with_our_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = SPILL_MAX_AGE;
+        let hour = std::time::Duration::from_secs(3600);
+        let old_result = aged(dir.path(), "anyagents-code-result-1-1.json", day + hour);
+        let old_frame = aged(dir.path(), "anyagents-mcp-stdio-frame-1-2.json", day + hour);
+        let fresh = aged(dir.path(), "anyagents-code-result-1-3.json", day - hour);
+        let other_name = aged(dir.path(), "notes-1.json", day + hour);
+        let other_ext = aged(dir.path(), "anyagents-code-result-1-4.txt", day + hour);
+        #[cfg(unix)]
+        let link = {
+            let link = dir.path().join("anyagents-code-result-1-5.json");
+            std::os::unix::fs::symlink(&other_name, &link).unwrap();
+            link
+        };
+
+        assert_eq!(sweep_spills(dir.path(), day, None), 2);
+        assert!(!old_result.exists() && !old_frame.exists());
+        for kept in [&fresh, &other_name, &other_ext] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
+        #[cfg(unix)]
+        assert!(
+            link.symlink_metadata().is_ok(),
+            "a link is never followed or removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_bound_to_an_owner_never_removes_another_users_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = aged(
+            dir.path(),
+            "anyagents-code-result-9-9.json",
+            SPILL_MAX_AGE * 2,
+        );
+        let me = unsafe { libc::geteuid() };
+        let someone_else = if me == 0 { 1 } else { me + 1 };
+        assert_eq!(
+            sweep_spills(dir.path(), SPILL_MAX_AGE, Some(someone_else)),
+            0
+        );
+        assert!(old.exists());
+        assert_eq!(sweep_spills(dir.path(), SPILL_MAX_AGE, Some(me)), 1);
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn the_server_sweep_visits_only_agent_directories() {
+        let data = tempfile::tempdir().unwrap();
+        let agent = AgentId::generate();
+        let tmp = anyagents_core::agent_config_dir(data.path(), &agent).join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old = aged(&tmp, "anyagents-code-result-3-3.json", SPILL_MAX_AGE * 2);
+        let stray = data
+            .path()
+            .join("agents")
+            .join("not-an-agent")
+            .join("config")
+            .join("tmp");
+        std::fs::create_dir_all(&stray).unwrap();
+        let kept = aged(&stray, "anyagents-code-result-4-4.json", SPILL_MAX_AGE * 2);
+        sweep_agent_spills(data.path());
+        assert!(!old.exists());
+        assert!(kept.exists());
+    }
+
+    #[test]
+    fn an_oversize_result_carries_the_commands_its_call_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let serialized = serde_json::to_string(&"x".repeat(MAX_CODE_RESULT_BYTES + 1)).unwrap();
+        let without = oversize_code_result(
+            &serialized,
+            dir.path(),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            serde_json::json!(1),
+            None,
+        );
+        assert!(without.get("stopped").is_none());
+        let with = oversize_code_result(
+            &serialized,
+            dir.path(),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            serde_json::json!(1),
+            Some("Stopped 1 command".into()),
+        );
+        assert_eq!(with["stopped"], "Stopped 1 command");
+        let file = with["result_file"].as_str().unwrap();
+        assert!(
+            file.starts_with(&dir.path().display().to_string()),
+            "{file}"
+        );
+    }
 
     #[test]
     fn tools_list_frame_stays_below_48_kib() {
@@ -570,6 +835,9 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
             ));
         }
         let resolved_profile = McpProfile::resolve_stdio(profile, harness.as_deref(), &config_buf);
+        let spill_dir = agent_spill_dir(&config_buf, &who.id);
+        let _ = ensure_spill_dir(&spill_dir);
+        sweep_own_spills(&spill_dir);
         let service = AgentMcp {
             agent: who,
             client,
@@ -577,7 +845,7 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
         }
         .serve({
             let (stdin, stdout) = rmcp::transport::io::stdio();
-            (stdin, FrameCapStdout::new(stdout))
+            (stdin, FrameCapStdout::new(stdout, spill_dir))
         })
         .await
         .map_err(|err| Error::Message(err.to_string()))?;
@@ -3771,10 +4039,12 @@ const HARD_LIST_MAX_RESULTS: usize = 5_000;
 /// How far past a command's own timeout the `code` call it runs in stays
 /// open, so the command's error reaches the snippet before the call ends.
 const CODE_CALL_GRACE_MS: u64 = 2_000;
-/// The largest `code` result returned inline, as serialized JSON: the hard
-/// bound of one `workspace.read`. A larger result is written whole to a file
-/// ([`oversize_code_result`]), never cut.
-const MAX_CODE_RESULT_BYTES: usize = 256 * 1024;
+/// The largest `code` result returned inline, as serialized JSON. Harnesses
+/// cut what they pass the model below the transport's frame: Claude Code at
+/// 100,000 characters (no tail), Spiron at 40,000. Under this bound a result
+/// reaches the model whole in every harness; a larger one is written whole
+/// to a file ([`oversize_code_result`]), never cut.
+const MAX_CODE_RESULT_BYTES: usize = 32 * 1024;
 const CODE_RESULT_PREVIEW_HEAD_BYTES: usize = 16 * 1024;
 const CODE_RESULT_PREVIEW_TAIL_BYTES: usize = 4 * 1024;
 
@@ -3790,6 +4060,7 @@ fn oversize_code_result(
     deliveries: serde_json::Value,
     logs: serde_json::Value,
     duration_ms: serde_json::Value,
+    stopped: Option<String>,
 ) -> serde_json::Value {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -3817,7 +4088,7 @@ fn oversize_code_result(
             dir.display()
         ),
     };
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "result": serde_json::Value::Null,
         "result_file": file.as_ref().ok().map(|path| path.display().to_string()),
         "result_preview": {
@@ -3831,7 +4102,12 @@ fn oversize_code_result(
         "max_bytes": MAX_CODE_RESULT_BYTES,
         "logs": logs,
         "duration_ms": duration_ms,
-    })
+    });
+    // The commands the call stopped (#282), carried like an inline result's.
+    if let Some(note) = stopped {
+        value["stopped"] = note.into();
+    }
+    value
 }
 const MAX_CODE_TOOL_CALLS: usize = 256;
 
@@ -4311,6 +4587,13 @@ impl AgentMcp {
             }
         }
         tools
+    }
+
+    /// This agent's spill dir ([`agent_spill_dir`]), created when missing.
+    fn spill_dir(&self) -> PathBuf {
+        let dir = agent_spill_dir(&self.client.config, &self.agent.id);
+        let _ = ensure_spill_dir(&dir);
+        dir
     }
 
     fn resolve_workdir(&self) -> PathBuf {
@@ -5653,10 +5936,11 @@ impl AgentMcp {
             return Ok(MultimediaJson(
                 oversize_code_result(
                     &serialized,
-                    &std::env::temp_dir(),
+                    &self.spill_dir(),
                     serde_json::json!(deliveries),
                     serde_json::json!(logs),
                     serde_json::json!(duration_ms),
+                    None,
                 ),
                 media_blocks,
             ));
@@ -10422,9 +10706,20 @@ mod spawn_args_tests {
             );
         }
 
-        // 4. A result the old 48 KiB cap cut (a 25 KB patch plus a receipt,
-        // report #13) comes back whole; one over the inline limit is written
-        // whole to a file, and `result` never holds a fragment.
+        // 4. Report #13: a 25 KB patch plus a receipt. A result within the
+        // inline limit comes back inline; one over it (this one serializes
+        // to about 45 KB) is written whole to a file in the agent's own tmp,
+        // never the shared temp dir, and `result` never holds a fragment.
+        let small_res = mcp
+            .code(Parameters(CodeArgs {
+                code: r#"return { receipt: { ok: true }, note: "y".repeat(20000) };"#.to_string(),
+                timeout_ms: Some(10_000),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(small_res["truncated"], false, "{small_res}");
+        assert_eq!(small_res["result"]["receipt"]["ok"], true);
         let patch_res = mcp
             .code(Parameters(CodeArgs {
                 code: r#"return { patch: "diff --git a/x b/x\n+\"line\"\n".repeat(1500), receipt: { ok: true } };"#
@@ -10434,10 +10729,20 @@ mod spawn_args_tests {
             .await
             .unwrap()
             .0;
-        assert_eq!(patch_res["truncated"], false, "{patch_res}");
-        assert_eq!(patch_res["result"]["receipt"]["ok"], true);
+        assert_eq!(patch_res["truncated"], true, "{patch_res}");
+        assert!(patch_res["result"].is_null(), "{}", patch_res["note"]);
+        let file = patch_res["result_file"].as_str().unwrap();
+        let spill_dir = dir.path().join("config").join("tmp");
+        assert!(
+            Path::new(file).starts_with(&spill_dir),
+            "{file} is not in the agent's tmp {}",
+            spill_dir.display()
+        );
+        let whole: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(whole["receipt"]["ok"], true);
         assert_eq!(
-            patch_res["result"]["patch"].as_str().unwrap().len(),
+            whole["patch"].as_str().unwrap().len(),
             "diff --git a/x b/x\n+\"line\"\n".len() * 1500
         );
         let huge_res = mcp
@@ -10455,7 +10760,6 @@ mod spawn_args_tests {
         let whole: serde_json::Value =
             serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
         assert_eq!(whole["big"].as_str().unwrap().len(), 300_000);
-        let _ = std::fs::remove_file(file);
 
         // 5. Pure Code Mode exposes only `code` in CANONICAL_MCP_TOOLS, and `anyagents.memory` + `workspace.{list,patch,edit}` work end-to-end inside `code`.
         assert_eq!(CANONICAL_MCP_TOOLS, &["code"]);
