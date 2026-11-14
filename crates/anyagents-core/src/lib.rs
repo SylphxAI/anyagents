@@ -58,6 +58,9 @@ pub use store::{
     QuotaBlock, QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState,
     SchedulePending, SessionLease, Turn, TurnOutcome, TurnState,
 };
+pub use store::{
+    ErroredTurn, MAX_ERRORED_TURNS, MAX_TRANSIENT_ERRORED_TURNS, SYSTEM_SENDER, TurnErrors,
+};
 
 /// The token a client presents as an agent, when it has one. A capability is
 /// written into the agent's own config directory; it is never an argument on a

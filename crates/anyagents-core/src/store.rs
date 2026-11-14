@@ -33,12 +33,15 @@ mod mcp_ops;
 mod outcomes;
 mod registry;
 pub use registry::holds_store_writer;
+mod mail_notices;
 mod runtime;
 #[cfg(test)]
 #[path = "store/runtime_tests.rs"]
 mod runtime_tests;
 mod server_ops;
 mod steer_ops;
+pub use mail_notices::SYSTEM_SENDER;
+mod turn_errors;
 pub use credentials::{
     CredentialBinding, CredentialBindingAudit, CredentialKind, CredentialObservation,
     CredentialSlot, CredentialTarget,
@@ -54,6 +57,7 @@ pub use runtime::{
     QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState, SessionLease, Turn,
     TurnOutcome, TurnState,
 };
+pub use turn_errors::{ErroredTurn, MAX_ERRORED_TURNS, MAX_TRANSIENT_ERRORED_TURNS, TurnErrors};
 
 /// A line's provider coordinates: the chat, the forum topic and the message id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -217,6 +221,8 @@ pub struct AgentQueryMetadata {
     pub oldest_undelivered: HashMap<String, i64>,
     pub open_turns: HashMap<String, i64>,
     pub schedules: HashMap<String, Vec<AgentSchedule>>,
+    /// Agents with a run of errored turns in progress, or parked for one.
+    pub turn_errors: HashMap<String, TurnErrors>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1920,6 +1926,11 @@ impl Store {
                 .or_default()
                 .push(schedule);
         }
+        metadata.turn_errors = self
+            .current_turn_errors()?
+            .into_iter()
+            .map(|(id, errors)| (id.to_string(), errors))
+            .collect();
         Ok(metadata)
     }
 
@@ -2466,6 +2477,7 @@ impl Store {
                 message: Message,
                 woke_agent: bool,
                 is_passive_reaction: bool,
+                recipient: Box<Agent>,
             },
         }
         let tx_outcome = self.write_tx(|tx| -> Result<ReceiveTx, Error> {
@@ -2816,6 +2828,7 @@ impl Store {
                 message,
                 woke_agent,
                 is_passive_reaction,
+                recipient: Box::new(agent),
             })
         })?;
         match tx_outcome {
@@ -2824,6 +2837,7 @@ impl Store {
                 message,
                 woke_agent,
                 is_passive_reaction,
+                recipient,
             } => {
                 if woke_agent {
                     self.notify(Wake::Agent {
@@ -2834,6 +2848,9 @@ impl Store {
                     self.notify(Wake::Mail {
                         agent_id: agent_id.clone(),
                     });
+                    // Mail that waits behind a pause, or that an archived
+                    // agent will not read, is announced (mail_notices.rs).
+                    self.announce_held_mail(&message, &recipient);
                 }
                 Ok(Some(ReceiveOutcome::New(message)))
             }
@@ -2941,6 +2958,9 @@ impl Store {
             )?;
             if updated == 0 {
                 return Err(Error::AgentNotFound(id.to_string()));
+            }
+            if state == "running" {
+                turn_errors::clear_parking(tx, id)?;
             }
             agent_by_id(tx, id)
         })?;
@@ -3156,6 +3176,7 @@ impl Store {
                 "skill_reads",
                 "mailbox_cursors",
                 "turn_recovery",
+                "turn_errors",
                 "messages",
                 "message_versions",
                 "outbound_messages",
@@ -4877,6 +4898,7 @@ impl Store {
                  WHERE agent_id = ?1 AND completed_seq < opened_seq",
                 [agent_id.as_str()],
             )?;
+            turn_errors::end_run(tx, agent_id)?;
             Ok(())
         })
     }

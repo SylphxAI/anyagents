@@ -40,7 +40,7 @@ mod file_cache;
 #[cfg(test)]
 mod latency_tests;
 mod memory_backlog;
-mod outbound_history;
+pub(crate) mod outbound_history;
 mod profiles;
 mod quota_rotation;
 mod reap_queue;
@@ -327,6 +327,7 @@ async fn serve(
                 interval.tick().await;
                 tick_count = tick_count.wrapping_add(1);
                 let run_verify = tick_count.is_multiple_of(15);
+                let first_pass = tick_count == 1;
                 let root = reaper_root.clone();
                 let store = Arc::clone(&reaper_store);
                 let health = reaper_health.clone();
@@ -347,6 +348,9 @@ async fn serve(
                     }
                     if let Err(error) = outbound_history::reconcile(&store) {
                         eprintln!("outbound history settlement remains pending: {error}");
+                    }
+                    if first_pass {
+                        crate::vendor::settle_stale_spiron_holds(&store);
                     }
                     reap_archived_agents(&store, &root, &health);
                     consolidate_idle_agent_memory(&store, &root, &health, &memory_backlog);
@@ -904,6 +908,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/outcomes", get(outcome_report))
         .route("/v1/agents/{name}/verdict", post(verdict_route))
         .route("/v1/skills/reads", post(skill_read_route))
+        .route("/v1/outbound", get(outbound_list_route))
+        .route("/v1/outbound/{key}/retry", post(outbound_retry_route))
+        .route("/v1/outbound/{key}/discard", post(outbound_discard_route))
         .route("/v1/webhooks/healthz", get(webhook_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
@@ -3488,6 +3495,8 @@ fn archived_agent_view_fast(agent: &Agent) -> AgentView {
         seat_uid: None,
         seat_gid: None,
         schedules: Vec::new(),
+        turn_errors: None,
+        unsettled_outbound: Vec::new(),
     }
 }
 
@@ -3660,7 +3669,33 @@ fn agent_view_preloaded(
             let _ = std::fs::remove_file(cfg.join(NOTIFIED_PARENT));
         }
     }
-    let block_reason = compute_block_reason(quota, last_error.as_deref(), now);
+    // Turns that ended in an error, and a parking for them (docs/delivery.md).
+    let turn_errors = if let Some(metadata) = metadata.as_mut() {
+        metadata.turn_errors.remove(agent.id.as_str())
+    } else {
+        store
+            .turn_errors(&agent.id)
+            .ok()
+            .flatten()
+            .filter(anyagents_core::TurnErrors::is_current)
+    };
+    let parked = agent.state == "paused"
+        && turn_errors
+            .as_ref()
+            .is_some_and(|errors| errors.faulted_at_ms.is_some());
+    let last_error = if parked {
+        last_error.or_else(|| turn_errors.as_ref().and_then(|e| e.last_error.clone()))
+    } else {
+        last_error
+    };
+    if parked {
+        turn_state = "faulted";
+    }
+    let block_reason = if parked {
+        Some("faulted".to_string())
+    } else {
+        compute_block_reason(quota, last_error.as_deref(), now)
+    };
     let open_turn_age_ms = if has_open_turn {
         if let Some(metadata) = metadata.as_ref() {
             metadata
@@ -3748,7 +3783,119 @@ fn agent_view_preloaded(
         seat_uid: seat_info.as_ref().map(|(_, uid, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid)| *gid),
         schedules,
+        turn_errors: turn_errors.map(Into::into),
+        unsettled_outbound: outbound_history::unsettled(store)
+            .iter()
+            .filter(|held| held.agent_id == agent.id)
+            .map(unsettled_view)
+            .collect(),
     })
+}
+
+/// `GET /v1/outbound`: every sent message whose delivery could not be
+/// confirmed, held instead of resent. Operator only.
+async fn outbound_list_route(
+    principal: Principal,
+    State(state): State<AppState>,
+) -> Result<Json<crate::api::UnsettledOutboundResponse>, ApiError> {
+    require_operator(&principal)?;
+    spawn_store(move || {
+        Ok(Json(crate::api::UnsettledOutboundResponse {
+            unsettled: outbound_history::unsettled(&state.store)
+                .iter()
+                .map(unsettled_view)
+                .collect(),
+        }))
+    })
+    .await
+}
+
+/// `POST /v1/outbound/{key}/retry`: send a held message again, as its agent
+/// and to its destination, through the ordinary send path. The held record
+/// closes with the new receipt only when that send succeeds. Operator only.
+async fn outbound_retry_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+) -> Result<Json<SendResponse>, ApiError> {
+    require_operator(&principal)?;
+    spawn_store(move || {
+        let store = &state.store;
+        let mut skipped = Vec::new();
+        let deliveries = outbound_history::retry(store, &key, |held| {
+            if non_text_post(&held.body) {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "{key} was a media, location, poll, checklist or article post; its record keeps only its text. Discard it and ask the agent to post it again."
+                    ),
+                ));
+            }
+            let sender = store.agent(&held.agent_id).map_err(ApiError::from_store)?;
+            let actor = Actor::Agent(sender.name.clone());
+            let body = SendRequest {
+                to: vec![held.destination.clone()],
+                text: held.body.clone(),
+                sender: Some(actor.as_address()),
+                reply_to: held.reply_to.clone(),
+                ..SendRequest::default()
+            };
+            let plan = plan_send(store, &Principal::Operator, &actor, &body)?;
+            let response = send_sync(store, &actor, body, plan, None)?.0;
+            skipped = response.skipped;
+            Ok(response.deliveries)
+        })?;
+        Ok(Json(SendResponse {
+            deliveries,
+            skipped,
+        }))
+    })
+    .await
+}
+
+/// `POST /v1/outbound/{key}/discard`: settle a held message without sending
+/// it. Operator only.
+async fn outbound_discard_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+) -> Result<Json<crate::api::UnsettledOutboundView>, ApiError> {
+    require_operator(&principal)?;
+    spawn_store(move || {
+        outbound_history::discard(&state.store, &key)
+            .map(|held| Json(unsettled_view(&held)))
+            .map_err(ApiError::from_store)
+    })
+    .await
+}
+
+/// Whether a sent body is the text record of a post that was not plain text
+/// (`format_internal_send_text`): a retry from it would post its description.
+fn non_text_post(body: &str) -> bool {
+    [
+        "[Attachment (",
+        "[Location GPS:",
+        "[Venue: ",
+        "[Poll: \"",
+        "📰 ",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+        || body.starts_with("☑️ **")
+}
+
+/// How the API shows an outbound message whose delivery is unconfirmed.
+pub(crate) fn unsettled_view(
+    held: &outbound_history::Unsettled,
+) -> crate::api::UnsettledOutboundView {
+    crate::api::UnsettledOutboundView {
+        key: held.effect_key.clone(),
+        agent_id: held.agent_id.to_string(),
+        destination: held.destination.clone(),
+        since_ms: held.since_ms,
+        error: held.error.clone(),
+        excerpt: held.excerpt(),
+    }
 }
 
 /// `installed` once this harness is on the machine, `needed` when the reason it
@@ -6783,6 +6930,7 @@ fn send_sync(
     let composed_body = anyagents_core::quote::compose(&body.text, body.quote.as_ref());
     let mut deliveries = Vec::with_capacity(plan.targets.len());
     let mut skipped = Vec::new();
+    let mut refused_archived = Vec::new();
     for (target_index, target) in plan.targets.iter().enumerate() {
         let history_key = key.as_ref().map(|key| format!("{key}:{target_index}"));
         match target {
@@ -6796,6 +6944,13 @@ fn send_sync(
                     && body.to.len() == 1
                     && matches!(Address::parse(&body.to[0]), Ok(Address::Agent(ref name))
                         if !matches!(name.as_str(), "all" | "peers" | "siblings" | "team" | "children" | "parent"));
+                // An archived recipient this send cannot wake would never read
+                // it: refused with the reason, never stored unread.
+                if !wake_archived && let Some(refusal) = archived_refusal(store, name) {
+                    refused_archived.push(refusal.reason.clone());
+                    skipped.push(refusal);
+                    continue;
+                }
                 let sent = if let Some(sid) = &sender_agent_id {
                     outbound_history::deliver(
                         store,
@@ -6896,6 +7051,15 @@ fn send_sync(
                 deliveries.extend(sent);
             }
         }
+    }
+    if deliveries.is_empty() && !refused_archived.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "nothing was sent: {}. Message a live agent instead, or wake this one by sending to it alone, by name.",
+                refused_archived.join("; ")
+            ),
+        ));
     }
     let response = SendResponse {
         deliveries,
@@ -7094,6 +7258,26 @@ fn deliver_room(
             }
         })
         .collect())
+}
+
+/// The refusal of a send to `name` when that agent is archived: it reads
+/// nothing until it is resumed. Names who answers for it instead.
+fn archived_refusal(store: &Store, name: &str) -> Option<crate::api::SkippedDelivery> {
+    let recipient = store.agent_by_name(name).ok()?;
+    if !is_explicitly_archived(store.data_dir(), &recipient) {
+        return None;
+    }
+    let answers = match store.live_ancestor(&recipient).ok().flatten() {
+        Some(parent) if recipient.parent_id.as_ref() == Some(&parent.id) => {
+            format!("its parent is `{}`", parent.name)
+        }
+        Some(ancestor) => format!("its nearest live ancestor is `{}`", ancestor.name),
+        None => "it has no live parent".to_string(),
+    };
+    Some(crate::api::SkippedDelivery {
+        to: format!("agent:{}", recipient.name),
+        reason: format!("agent `{}` is archived; {answers}", recipient.name),
+    })
 }
 
 fn deliver_agent(
@@ -10234,6 +10418,115 @@ exec '{}' "$@"
             .0
     }
 
+    /// A send that cannot wake an archived recipient (through an alias, or to
+    /// several recipients) is refused for it with who answers for it, and
+    /// nothing is stored unread. A send with no live recipient fails.
+    #[test]
+    fn a_send_an_archived_agent_would_never_read_is_refused_with_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let root = store
+            .create_agent(anyagents_core::NewAgent::new("root", "opencode"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("lead", "opencode");
+        new.parent_id = Some(root.id.clone());
+        let lead = store.create_agent(new).unwrap();
+        let mut new = anyagents_core::NewAgent::new("worker", "opencode");
+        new.parent_id = Some(lead.id.clone());
+        let worker = store.create_agent(new).unwrap();
+        let peer = store
+            .create_agent(anyagents_core::NewAgent::new("peer", "opencode"))
+            .unwrap();
+        // A public sub-agent may also write to a root agent.
+        store.set_agent_scope(&worker.id, "public").unwrap();
+        mark_explicitly_archived(&store, dir.path(), &lead);
+        let actor = Actor::Agent(worker.name.clone());
+        let send = |to: Vec<&str>| {
+            let body = SendRequest {
+                sender: Some(actor.as_address()),
+                to: to.into_iter().map(str::to_string).collect(),
+                text: "status report".to_string(),
+                ..Default::default()
+            };
+            let plan = SendPlan::parse(&store, &actor, &body)?;
+            send_sync(&store, &actor, body, plan, None).map(|response| response.0)
+        };
+
+        let refused = send(vec!["parent"]).expect_err("no live recipient");
+        assert_eq!(refused.status, StatusCode::CONFLICT);
+        assert!(
+            refused
+                .message
+                .contains("agent `lead` is archived; its parent is `root`"),
+            "{}",
+            refused.message
+        );
+        assert!(
+            store.inbox(&lead.id, None).unwrap().is_empty(),
+            "nothing stored unread"
+        );
+        assert_eq!(store.agent(&lead.id).unwrap().state, "archived");
+
+        let mixed =
+            send(vec!["parent", "agent:peer"]).unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(mixed.deliveries.len(), 1);
+        assert_eq!(mixed.deliveries[0].to, "agent:peer");
+        assert_eq!(mixed.skipped.len(), 1);
+        assert_eq!(mixed.skipped[0].to, "agent:lead");
+        assert_eq!(
+            mixed.skipped[0].reason,
+            "agent `lead` is archived; its parent is `root`"
+        );
+        assert!(store.inbox(&lead.id, None).unwrap().is_empty());
+        assert_eq!(store.inbox(&peer.id, None).unwrap().len(), 1);
+    }
+
+    /// A parked agent lists as `faulted`, with its errored turns and why it
+    /// is blocked; a resume lists it as it was.
+    #[test]
+    fn a_parked_agent_is_shown_faulted_until_it_is_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("worker", "spiron"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "running").unwrap();
+        for _ in 0..anyagents_core::MAX_ERRORED_TURNS {
+            store
+                .note_turn_errored(&agent.id, "context_length_exceeded")
+                .unwrap();
+        }
+        assert!(store.park_faulted(&agent.id).unwrap());
+        let health = HealthBoard::default();
+        let agent = store.agent(&agent.id).unwrap();
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.state, "paused");
+        assert_eq!(view.display_state(), "faulted");
+        assert_eq!(view.turn_state, "faulted");
+        assert_eq!(view.block_reason.as_deref(), Some("faulted"));
+        assert_eq!(view.last_error.as_deref(), Some("context_length_exceeded"));
+        let errors = view.turn_errors.expect("errored turns are shown");
+        assert_eq!(errors.streak, anyagents_core::MAX_ERRORED_TURNS);
+        assert_eq!(errors.limit, anyagents_core::MAX_ERRORED_TURNS);
+        assert!(errors.faulted_at_ms.is_some());
+        let (roster, _) = store.roster_agents(None).unwrap();
+        let listed = roster_views(
+            &store,
+            &health,
+            &roster.iter().collect::<Vec<_>>(),
+            0,
+            &ListAgentsQuery::default(),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(listed.agents[0].display_state(), "faulted");
+
+        store.set_agent_state(&agent.id, "running").unwrap();
+        let agent = store.agent(&agent.id).unwrap();
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.display_state(), "running");
+        assert!(view.turn_errors.is_none());
+    }
+
     #[test]
     fn closing_sends_do_not_store_messages_receipts_or_wake_archived_targets() {
         let dir = tempfile::tempdir().unwrap();
@@ -10433,16 +10726,39 @@ exec '{}' "$@"
             assert!(SendPlan::parse(&store, &actor, &body).is_err());
         }
         for from in ["telegram:user:123", "telegram:chat:-456"] {
-            authored_send(
-                &store,
-                &Actor::parse(from).unwrap_or_else(|e| panic!("{}", e.message)),
-                "worker",
-                "channel update",
-                from,
+            // A channel sender cannot wake it, so the send is refused with
+            // the reason instead of stored unread.
+            let channel = Actor::parse(from).unwrap_or_else(|e| panic!("{}", e.message));
+            let body = SendRequest {
+                sender: Some(channel.as_address()),
+                to: vec!["worker".into()],
+                text: "channel update".into(),
+                idempotency_key: Some(from.into()),
+                ..Default::default()
+            };
+            let key = send_key(&body);
+            let plan = SendPlan::parse(&store, &channel, &body)
+                .unwrap_or_else(|e| panic!("{}", e.message));
+            let refused = send_sync(&store, &channel, body, plan, key).expect_err("archived");
+            assert_eq!(refused.status, StatusCode::CONFLICT);
+            assert!(
+                refused
+                    .message
+                    .contains("agent `worker` is archived; its parent is `parent-agent`"),
+                "{}",
+                refused.message
             );
             assert_eq!(store.agent(&child.id).unwrap().state, "archived");
             assert!(has_explicit_archive_marker(dir.path(), &child.id));
         }
+        assert!(
+            store
+                .inbox(&child.id, None)
+                .unwrap()
+                .iter()
+                .all(|message| message.text != "channel update"),
+            "nothing is stored unread"
+        );
         let deleted_id = child.id.clone();
         store.delete_agent(&deleted_id).unwrap();
         let body = SendRequest {

@@ -880,6 +880,11 @@ fn vendor_launch_authorized(
         }
     })?;
     prepare_host_session(&request)?;
+    // A Spiron hold means something only to a Spiron session; any other
+    // harness starts its own, so the hold is settled before it launches.
+    if !is_spiron_harness(&request.agent.harness) {
+        settle_legacy_spiron_hold(&request.config_dir)?;
+    }
     let config_dir = request.config_dir.clone();
     let res = vendor_launch_inner(request, store, host);
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
@@ -2232,6 +2237,82 @@ fn settle_legacy_spiron_hold(config_dir: &Path) -> Result<Vec<String>, String> {
     std::fs::remove_file(&hold)
         .map_err(|err| format!("cannot retire {}: {err}", hold.display()))?;
     Ok(applied)
+}
+
+/// Settle every legacy Spiron hold that no Spiron launch is due to settle,
+/// once, at server start. A hold is settled when its agent runs another
+/// harness (only a Spiron session can consume it), is archived (the launch
+/// that would settle it may never come), or has a delivery cursor past every
+/// id it names with no turn left open over them (the mail it held was taken
+/// since). A hold on a Spiron agent that still owes those ids is left for
+/// its next launch, which settles it against the journal. Returns how many
+/// were settled.
+pub(crate) fn settle_stale_spiron_holds(store: &anyagents_core::Store) -> usize {
+    let Ok(agents) = store.agent_summaries(true) else {
+        return 0;
+    };
+    let mut settled = 0;
+    for agent in agents {
+        let config_dir = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+        let hold = config_dir.join(LEGACY_SPIRON_HOLD);
+        let Ok(bytes) = std::fs::read(&hold) else {
+            continue;
+        };
+        let stale = !is_spiron_harness(&agent.harness)
+            || agent.state == "archived"
+            || hold_is_behind_cursor(store, &agent.id, &bytes);
+        if !stale {
+            continue;
+        }
+        match settle_legacy_spiron_hold(&config_dir) {
+            Ok(_) => settled += 1,
+            Err(err) => eprintln!(
+                "anyagents: stale Spiron hold of {} ({}) not settled: {err}",
+                agent.name, agent.id
+            ),
+        }
+    }
+    if settled > 0 {
+        eprintln!("anyagents: settled {settled} stale Spiron input hold(s)");
+    }
+    settled
+}
+
+/// Whether every id a hold names is a message at or before the agent's
+/// delivery cursor, outside any turn the store holds open. An id the mailbox
+/// does not hold (a recovery note's) is owed only to the Spiron session.
+fn hold_is_behind_cursor(
+    store: &anyagents_core::Store,
+    agent: &anyagents_core::AgentId,
+    hold: &[u8],
+) -> bool {
+    let value: serde_json::Value = serde_json::from_slice(hold).unwrap_or_default();
+    let ids: Vec<&str> = value
+        .get("request_ids")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .chain(value.get("turn_id").and_then(serde_json::Value::as_str))
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return true;
+    }
+    let Ok(cursor) = store.delivered_cursor(agent) else {
+        return false;
+    };
+    let open_from = match store.open_turn(agent) {
+        Ok(Some(open)) => open.completed_seq + 1,
+        Ok(None) => i64::MAX,
+        Err(_) => return false,
+    };
+    ids.iter().all(|id| {
+        matches!(
+            store.message(agent, id),
+            Ok(Some(message)) if message.seq <= cursor && message.seq < open_from
+        )
+    })
 }
 
 /// The ids among `ids` that a user input in any session of the agent's
@@ -4322,3 +4403,85 @@ done
 #[cfg(test)]
 #[path = "vendor/spiron_tests.rs"]
 mod spiron_tests;
+
+#[cfg(test)]
+mod stale_hold_tests {
+    use anyagents_core::{Incoming, NewAgent, ReceiveOutcome, Store};
+
+    fn hold(store: &Store, agent: &anyagents_core::Agent, ids: &[&str]) -> std::path::PathBuf {
+        let config = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+        std::fs::create_dir_all(&config).unwrap();
+        let path = config.join(super::LEGACY_SPIRON_HOLD);
+        std::fs::write(
+            &path,
+            serde_json::json!({"turn_id": ids[0], "request_ids": ids}).to_string(),
+        )
+        .unwrap();
+        path
+    }
+
+    fn mail(store: &Store, agent: &anyagents_core::Agent, text: &str) -> String {
+        match store.receive(&agent.id, Incoming::new(text)).unwrap() {
+            ReceiveOutcome::New(message) => message.id.to_string(),
+            ReceiveOutcome::Duplicate(_) => unreachable!(),
+        }
+    }
+
+    /// A hold is settled at start when no Spiron launch is due to settle it:
+    /// its agent runs another harness, is archived, or has taken that mail
+    /// since. A Spiron agent that still owes the held mail keeps it for the
+    /// journal check its next launch makes.
+    #[test]
+    fn stale_spiron_holds_are_settled_and_owed_ones_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let switched = store
+            .create_agent(NewAgent::new("switched", "claude-code"))
+            .unwrap();
+        let archived = store.create_agent(NewAgent::new("gone", "spiron")).unwrap();
+        let taken = store
+            .create_agent(NewAgent::new("taken", "spiron"))
+            .unwrap();
+        let owed = store.create_agent(NewAgent::new("owed", "spiron")).unwrap();
+        store.set_agent_state(&archived.id, "archived").unwrap();
+        store.set_agent_state(&taken.id, "running").unwrap();
+        store.set_agent_state(&owed.id, "running").unwrap();
+
+        let switched_hold = hold(&store, &switched, &["msg_old"]);
+        let archived_hold = hold(&store, &archived, &["msg_old"]);
+        let first = mail(&store, &taken, "one");
+        let second = mail(&store, &taken, "two");
+        store.note_delivered(&taken.id, 1).unwrap();
+        store.note_delivered(&taken.id, 2).unwrap();
+        store.note_turn_completed(&taken.id).unwrap();
+        let taken_hold = hold(&store, &taken, &[&first, &second]);
+        let pending = mail(&store, &owed, "not taken yet");
+        let owed_hold = hold(&store, &owed, &[&pending]);
+
+        assert_eq!(super::settle_stale_spiron_holds(&store), 3);
+        for settled in [&switched_hold, &archived_hold, &taken_hold] {
+            assert!(!settled.exists(), "{}", settled.display());
+            let record = settled.with_file_name(super::LEGACY_SPIRON_RECONCILED);
+            assert!(record.exists(), "the settled hold is kept as a record");
+        }
+        assert!(
+            owed_hold.exists(),
+            "held mail still owed waits for a launch"
+        );
+        assert_eq!(super::settle_stale_spiron_holds(&store), 0);
+    }
+
+    /// Mail inside a turn the store still holds open is still owed.
+    #[test]
+    fn a_hold_over_an_open_turn_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store.create_agent(NewAgent::new("busy", "spiron")).unwrap();
+        store.set_agent_state(&agent.id, "running").unwrap();
+        let id = mail(&store, &agent, "in the open turn");
+        store.note_delivered(&agent.id, 1).unwrap();
+        let path = hold(&store, &agent, &[&id]);
+        assert_eq!(super::settle_stale_spiron_holds(&store), 0);
+        assert!(path.exists());
+    }
+}

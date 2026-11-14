@@ -73,6 +73,86 @@ so the note goes first, and new mail follows it once it is written. A
 message a `mid-turn` vendor accepted but never read reaches the agent this
 way.
 
+### A turn that ends in an error
+
+A turn the adapter saw end (`turns_served` moved, or `Accepted {
+turn_finished }`) with a fault on the harness (`sign_in_fault`, not a quota
+wait) is never left holding the mailbox. The supervisor counts it at once in
+`turn_errors` (migration 031) and follows it up:
+
+- **Retry with a note.** The work the turn held comes back as a `[Recovery]`
+  note in the agent's own mailbox, from `anyagents`. It names the error,
+  quotes the turn's messages (each clipped; the whole message stays in the
+  mailbox under its id) and the outbound messages already sent, and says
+  which errored turn in a row this is. Only once the note is stored is the
+  turn closed with its error, so a restart in between finds the turn open and
+  recovers it as an interrupted turn. Being mail, the note is durable and
+  ordered behind any mail that waits; the next turn starts with both.
+- **Transient errors back off.** A fault the provider may clear on its own
+  (overloaded, unavailable, rate limited, a dropped stream) is first retried
+  in a new process, as before (up to three times). After that, each
+  follow-up waits 15 s, doubling to at most 10 minutes; the turn stays open
+  while it waits, and mail waits behind it.
+- **Park at the limit.** At `MAX_ERRORED_TURNS` (3) errored turns in a row,
+  or `MAX_TRANSIENT_ERRORED_TURNS` (8, about 25 minutes) while each error is
+  transient, the agent is parked: `state = paused`, its process stopped, its
+  mail held, `turn_errors.faulted_at_ms` set, and the turn left open so that
+  a resume recovers it. Its nearest live ancestor is told the error
+  (`[Sub-Agent Faulted]`), once per parking; an agent with no live ancestor
+  is reported to the operator in the server log and `anyagents status`.
+  `agents list` and `status` show it as `faulted`, and `agents inspect`
+  shows the run and the last error.
+- A completed turn ends the run. A resume (`agents resume`, a wake) clears
+  the parking and the count.
+
+A recovery note whose own turn ends with a fault is not completed; it is
+counted like any other errored turn.
+
+### Mail that cannot be delivered now
+
+No message waits or goes unread without someone being told. Every notice
+comes from `anyagents`, is keyed by its source key so it is written once,
+and never causes another notice; a child's own lifecycle notices
+(`[Sub-Agent Completed]`, `[Sub-Agent Error]`) are not announced back to it.
+
+- **To an archived agent.** A send that cannot wake its archived recipient
+  (one sent through `parent` or another alias, or to several recipients) is
+  refused for that recipient: the response lists it in `skipped` with
+  `agent X is archived; its parent is Y`, and nothing is stored unread. A
+  send with no other recipient fails with that reason. A direct send to the
+  archived agent alone, by name, still wakes it. Mail that reaches an
+  archived agent another way is stored, and its agent sender is told
+  (`[Undeliverable]`), once per message.
+- **To a paused agent.** The mail is stored and waits. Its agent sender, or
+  the paused agent's parent when the sender is a person, a schedule or the
+  operator, is told once per pause (`[Queued]`); the notice is keyed by the
+  paused agent's delivery cursor, which a pause holds still. A parked agent's
+  notice says why it was parked.
+
+### A send whose outcome is unknown
+
+A post to a channel cannot share the store's transaction, so it is journaled
+first (`outbound-history/<key>.pending`) and settled with its receipt. A
+send that fails is never left as an obligation when its error proves it did
+not happen (the Telegram API answered the whole post with a 4xx refusal) or
+when its destination dedupes a replay (a mailbox): the caller has the error,
+and the same call runs afresh. Any other failure (a timeout, a dropped
+connection, a later part of a long post refused after earlier parts were
+posted, a local failure after the post) leaves the outcome unknown. That
+send is held, with its error, and is never resent automatically, because a
+delivered message must not be delivered twice:
+
+- its sender is told once, through its mailbox (`[Delivery Uncertain]`);
+- `agents inspect` and `status` list it (`unsettled_outbound`);
+- `anyagents outbound` lists every one, `anyagents outbound retry <key>`
+  sends it again as its agent through the ordinary send path (plain text
+  only; the record closes with the new receipt only when that send
+  succeeds), and `anyagents outbound discard <key>` settles it without
+  sending.
+
+A held send is no longer revisited by the maintenance pass, so it is
+reported once, not on every pass.
+
 ### Where the adapter runs: a server restart, and a keeper that dies
 
 The adapter runs in a keeper, a process of its own beside the vendor

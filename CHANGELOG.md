@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Mail and turn trouble is no longer silent (`docs/delivery.md`). A turn the
+  harness ends with an error is closed with that outcome instead of staying
+  open; its work comes back as a `[Recovery]` note, and after three errored
+  turns in a row the agent is parked (`paused`, listed as `faulted`) and its
+  parent, or the operator, is told the error. A resume clears it. A send that
+  cannot wake an archived recipient is refused for it with the reason and its
+  parent, never stored unread. Mail queued to a paused agent tells its sender,
+  or the agent's parent, once per pause. A channel post whose outcome is
+  unknown is held, never resent automatically, and its sender is told once;
+  `agents inspect` and `status` list it, and `anyagents outbound` retries or
+  discards it. A post the Telegram API refused leaves no stuck record, and a
+  long post cut short is recorded as partly delivered. A legacy Spiron input
+  hold is settled when its agent launches another harness, and at server start
+  when its agent is archived or has taken the held mail since. Migration 031
+  adds `turn_errors`.
 - Usage accounting no longer over-counts cost for Claude Code and OpenCode
   agents. Claude Code's `total_cost_usd` is the session's running total: a
   resumed process restores it from the transcript's last `cost-state` row

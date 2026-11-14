@@ -9092,6 +9092,8 @@ mod spawn_args_tests {
             seat_uid: None,
             seat_gid: None,
             schedules: Vec::new(),
+            turn_errors: None,
+            unsettled_outbound: Vec::new(),
         }
     }
 

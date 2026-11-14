@@ -30,6 +30,7 @@ mod mcp_config;
 mod muse_config;
 mod opencode_config;
 mod operator;
+mod outbound;
 mod reply;
 mod sandbox;
 mod sandbox_exec;
@@ -617,6 +618,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Sent messages whose delivery could not be confirmed (a timeout, a
+    /// dropped connection, a post cut short). None is resent automatically:
+    /// list them, send one again, or settle it without sending. Operator only.
+    Outbound {
+        #[command(subcommand)]
+        action: Option<OutboundCommand>,
+        /// Output machine-readable JSON.
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// Inspect an agent's live state, schedules, quota/block status, and recent conversation turns.
     Inspect {
         /// Agent name or `agt_...` ID (defaults to `self` inside an agent).
@@ -634,6 +645,24 @@ enum Command {
     /// Run a local CLI harness inside a remote sandbox (`POST /v1/sandboxes/{id}/exec`) speaking `stream-json`.
     #[command(name = "sandbox-exec")]
     SandboxExec(sandbox_exec::SandboxExecArgs),
+}
+
+#[derive(Subcommand)]
+enum OutboundCommand {
+    /// List every unconfirmed send (the default).
+    List,
+    /// Send one again, as its agent and to its destination. The record
+    /// closes with the new receipt only when that send succeeds.
+    Retry {
+        /// The key `list` shows.
+        key: String,
+    },
+    /// Settle one without sending it: the recipient already has it, or it is
+    /// no longer wanted.
+    Discard {
+        /// The key `list` shows.
+        key: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1557,6 +1586,11 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             json,
         } => schedule_cmd(&data, agent, at, every, watch, prompt, cancel, json),
         Command::Inspect { agent, limit, json } => inspect_cmd(&data, agent, limit, json),
+        Command::Outbound { action, json } => match action.unwrap_or(OutboundCommand::List) {
+            OutboundCommand::List => outbound::list(&data, json),
+            OutboundCommand::Retry { key } => outbound::retry(&data, &key, json),
+            OutboundCommand::Discard { key } => outbound::discard(&data, &key, json),
+        },
         Command::CloudHarness(args) => cloud_harness::run(args),
         Command::SandboxExec(args) => sandbox_exec::run(args),
     }
@@ -1778,6 +1812,28 @@ fn inspect_cmd(data: &Path, agent: Option<String>, limit: usize, json: bool) -> 
         }
         if let Some(error) = &view.last_error {
             println!("Error: {error}");
+        }
+        if let Some(errors) = &view.turn_errors {
+            println!(
+                "Errored turns: {} in a row (parked at {}){}",
+                errors.streak,
+                errors.limit,
+                errors.faulted_at_ms.map_or_else(String::new, |ms| format!(
+                    "   Faulted since {} UTC: resume to clear",
+                    ui::format_timestamp_ms(ms)
+                ))
+            );
+        }
+        for held in &view.unsettled_outbound {
+            println!(
+                "Unconfirmed send {} to {} since {} UTC (anyagents outbound retry|discard {}): {}",
+                held.key,
+                held.destination,
+                held.since_ms
+                    .map_or_else(|| "-".to_string(), ui::format_timestamp_ms),
+                held.key,
+                held.excerpt
+            );
         }
         channel::emit_turns(&turns, true, false)?;
     }
@@ -2754,6 +2810,16 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
     };
     let archived_count = listed.archived_count;
     let agents_list = listed.agents;
+    // What needs the operator: agents parked after errored turns, and sends
+    // whose delivery is unconfirmed (held, never resent automatically).
+    let faulted: Vec<&api::AgentView> = agents_list
+        .iter()
+        .filter(|agent| agent.display_state() == "faulted")
+        .collect();
+    let unsettled: Vec<&api::UnsettledOutboundView> = agents_list
+        .iter()
+        .flat_map(|agent| agent.unsettled_outbound.iter())
+        .collect();
 
     if json_out {
         let doc = serde_json::json!({
@@ -2765,6 +2831,15 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             "harnesses": harness_rows,
             "agents": agents_list,
             "archived_count": archived_count,
+            "attention": {
+                "faulted": faulted.iter().map(|agent| serde_json::json!({
+                    "id": agent.id,
+                    "name": agent.name,
+                    "parent": agent.parent,
+                    "turn_errors": agent.turn_errors,
+                })).collect::<Vec<_>>(),
+                "unsettled_outbound": unsettled,
+            },
         });
         println!(
             "{}",
@@ -2849,6 +2924,32 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                 .unwrap_or_else(|| "default".to_string())
         };
         ui::print_agents_table(&agents_list, Some(&profile_lookup), false);
+        if !faulted.is_empty() || !unsettled.is_empty() {
+            println!("\n  {}\n", ui::bold_cyan("Attention"));
+            for agent in &faulted {
+                println!(
+                    "  {} {} {}",
+                    ui::red("◐ faulted"),
+                    ui::bold(&agent.name),
+                    ui::dim(
+                        agent
+                            .turn_errors
+                            .as_ref()
+                            .and_then(|errors| errors.last_error.as_deref())
+                            .unwrap_or("-")
+                    )
+                );
+            }
+            for held in &unsettled {
+                println!(
+                    "  {} {} → {} {}",
+                    ui::yellow("? unconfirmed send"),
+                    held.key,
+                    held.destination,
+                    ui::dim("(anyagents outbound retry|discard <key>)")
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -2884,6 +2985,27 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             })
             .unwrap_or_else(|| "auto".to_string());
         println!("  {id}\t{inst}\tdelivery={delivery}\tprofiles={profs}");
+    }
+    for agent in &faulted {
+        println!(
+            "attention\tfaulted\t{}\t{}\t{}",
+            agent.name,
+            agent.id,
+            agent
+                .turn_errors
+                .as_ref()
+                .and_then(|errors| errors.last_error.as_deref())
+                .unwrap_or("-")
+        );
+    }
+    for held in &unsettled {
+        println!(
+            "attention\tunconfirmed_send\t{}\t{}\t{}\t{}",
+            held.key,
+            held.agent_id,
+            held.destination,
+            held.error.as_deref().unwrap_or("-")
+        );
     }
     let running_count = agents_list.iter().filter(|a| a.state == "running").count();
     let archived_count = agents_list.iter().filter(|a| a.state == "archived").count();

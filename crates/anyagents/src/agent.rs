@@ -854,6 +854,8 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
         schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)
             .map_err(Error::Message)?,
+        turn_errors: None,
+        unsettled_outbound: Vec::new(),
     })
 }
 
@@ -1005,6 +1007,8 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
         schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)?,
+        turn_errors: None,
+        unsettled_outbound: Vec::new(),
     })
 }
 
@@ -1181,7 +1185,7 @@ fn list_filtered(
                     agent.parent.as_deref().unwrap_or("-"),
                     agent.harness,
                     agent.model.as_deref().unwrap_or("-"),
-                    agent.state,
+                    agent.display_state(),
                     agent.process,
                     show_optional(agent.oldest_undelivered_age_ms)
                 );
@@ -1190,7 +1194,7 @@ fn list_filtered(
                     id: &agent.id,
                     name: &agent.name,
                     harness: &agent.harness,
-                    state: &agent.state,
+                    state: agent.display_state(),
                     process: &agent.process,
                     delivery: agent.delivery.label(),
                     undelivered: agent.oldest_undelivered_age_ms,

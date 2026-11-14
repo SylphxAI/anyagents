@@ -325,6 +325,7 @@ pub fn format_agent_status(
         }
         ("running", other, _) => cyan(&format!("● {other}")),
         ("idle", _, _) => dim("◌ idle"),
+        ("paused", _, "faulted") => red("◐ faulted"),
         ("paused", _, _) => yellow("◐ paused"),
         ("archived", _, _) => dim("▫ archived"),
         (other, _, _) => dim(other),
