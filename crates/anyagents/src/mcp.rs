@@ -29,6 +29,7 @@ use crate::api::{
 use crate::operator::CAPABILITY_FILE;
 use crate::server;
 
+mod code_children;
 pub(crate) mod code_contract;
 #[cfg(test)]
 mod contract_tests;
@@ -3491,7 +3492,11 @@ impl AgentMcp {
         let base_dir = self.resolve_workdir();
         let config_dir = self.client.config.clone();
         let limits = CodeLimits::current();
+        // The blocking thread outlives an aborted await: it carries what it
+        // needs to stop a command once the call that started it is over.
+        let scope = current_call().scope();
         let (val, media) = tokio::task::spawn_blocking(move || {
+            let _scope = code_children::enter(scope);
             let backend = <dyn anyagents_tools::WorkspaceBackend>::resolve(
                 Some(&config_dir),
                 base_dir.clone(),
@@ -5383,6 +5388,11 @@ impl AgentMcp {
         let media_blocks = Arc::new(Mutex::new(Vec::<rmcp::model::ContentBlock>::new()));
         let mut in_flight = tokio::task::JoinSet::new();
         let mut call_count = 0usize;
+        // Every command the snippet starts ends with this call, however it
+        // ends: on time, out of time, or dropped by a cancelling harness.
+        let children = Arc::new(code_children::CodeChildren::default());
+        let _end_children = code_children::EndOnDrop(Arc::clone(&children));
+        let code_call = current_call().with_children(Arc::clone(&children));
 
         let loop_res = until_deadline(started, &deadline_ms, async {
             while let Some(msg) = rx.recv().await {
@@ -5424,7 +5434,7 @@ impl AgentMcp {
                         let stdin_clone = Arc::clone(&shared_stdin);
                         let deliveries = Arc::clone(&deliveries);
                         let media_blocks = Arc::clone(&media_blocks);
-                        let call = current_call();
+                        let call = code_call.clone();
                         in_flight.spawn(as_call(call, async move {
                             let res = mcp.dispatch_code_tool(&tool_name, tool_args).await;
                             if tool_name.trim().trim_start_matches("mcp__anyagents__") == "send"
@@ -5474,6 +5484,11 @@ impl AgentMcp {
 
         in_flight.abort_all();
         let ran_until_ms = deadline_ms.load(std::sync::atomic::Ordering::SeqCst);
+        // A command still running belongs to a call that is over: stop it
+        // (its whole group) and say so, so a partial write is checked.
+        children.end();
+        let stopped = children.settle(code_children::SETTLE).await;
+        let stopped_note = code_children::stopped_note(&stopped);
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(ran_until_ms);
 
         let done_msg = match loop_res {
@@ -5481,17 +5496,25 @@ impl AgentMcp {
             Ok(Err(err)) => {
                 let stderr_text = stderr_handle.join().unwrap_or_default();
                 let stderr_trimmed = stderr_text.trim();
+                let err = match stopped_note {
+                    Some(note) => format!("{err}. {note}"),
+                    None => err,
+                };
                 if stderr_trimmed.is_empty() {
                     return Err(err);
                 }
                 return Err(format!("{err}: {stderr_trimmed}"));
             }
             Err(()) => {
-                return Err(code_contract::code_timeout_message(
+                let message = code_contract::code_timeout_message(
                     ran_until_ms,
                     args.timeout_ms,
                     limits.max_ms,
-                ));
+                );
+                return Err(match stopped_note {
+                    Some(note) => format!("{message} {note}"),
+                    None => message,
+                });
             }
         };
 
@@ -5521,6 +5544,10 @@ impl AgentMcp {
             if let Some(fix) = code_contract::diagnose(&args.code, err, compile) {
                 text.push_str("\nfix: ");
                 text.push_str(&fix);
+            }
+            if let Some(note) = &stopped_note {
+                text.push('\n');
+                text.push_str(note);
             }
             if !logs.is_empty() {
                 text.push_str("\nlogs:\n");
@@ -5553,30 +5580,33 @@ impl AgentMcp {
                 MAX_CODE_RESULT_BYTES,
                 &serialized[tail_start..]
             );
-            return Ok(MultimediaJson(
-                serde_json::json!({
-                    "result": preview,
-                    "deliveries": deliveries,
-                    "truncated": true,
-                    "original_bytes": serialized.len(),
-                    "max_bytes": MAX_CODE_RESULT_BYTES,
-                    "logs": logs,
-                    "duration_ms": duration_ms,
-                }),
-                media_blocks,
-            ));
-        }
-
-        Ok(MultimediaJson(
-            serde_json::json!({
-                "result": raw_result,
+            let mut value = serde_json::json!({
+                "result": preview,
                 "deliveries": deliveries,
-                "truncated": false,
+                "truncated": true,
+                "original_bytes": serialized.len(),
+                "max_bytes": MAX_CODE_RESULT_BYTES,
                 "logs": logs,
                 "duration_ms": duration_ms,
-            }),
-            media_blocks,
-        ))
+            });
+            if let Some(note) = stopped_note {
+                value["stopped"] = note.into();
+            }
+            return Ok(MultimediaJson(value, media_blocks));
+        }
+
+        let mut value = serde_json::json!({
+            "result": raw_result,
+            "deliveries": deliveries,
+            "truncated": false,
+            "logs": logs,
+            "duration_ms": duration_ms,
+        });
+        // The snippet returned while a command it started still ran.
+        if let Some(note) = stopped_note {
+            value["stopped"] = note.into();
+        }
+        Ok(MultimediaJson(value, media_blocks))
     }
 }
 
@@ -7114,12 +7144,24 @@ fn execute_files_tool(
             });
             let mut guard = CodeChildGuard { child: Some(child) };
             let deadline = started + std::time::Duration::from_millis(timeout_ms);
+            // A command a `code` call started ends with that call, and one
+            // whose tool call the harness cancelled ends then.
+            let scope = code_children::current();
+            let registration = scope
+                .children
+                .as_ref()
+                .map(code_children::CodeChildren::start);
+            let mut stopped_early = false;
             let status_opt = loop {
                 if let Some(ref mut c) = guard.child {
                     match c.try_wait() {
                         Ok(Some(st)) => break Some(st),
                         Ok(None) => {
                             if std::time::Instant::now() >= deadline {
+                                break None;
+                            }
+                            if scope.should_stop(registration.as_ref()) {
+                                stopped_early = true;
                                 break None;
                             }
                             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -7130,6 +7172,16 @@ fn execute_files_tool(
                     break None;
                 }
             };
+            if status_opt.is_none()
+                && let Some(mut child) = guard.child.take()
+            {
+                // The whole group, gently first: git removes its lock files
+                // on SIGTERM and leaves them behind on SIGKILL.
+                code_children::stop_group(&mut child, code_children::TERM_GRACE);
+                if stopped_early && let Some(registration) = &registration {
+                    registration.stopped(cmd_str, started.elapsed());
+                }
+            }
             drop(guard);
             let stdout = stdout_handle.join().unwrap_or_default();
             let stderr = stderr_handle.join().unwrap_or_default();
@@ -7140,6 +7192,16 @@ fn execute_files_tool(
                 &limits.ceiling_reason(),
             );
             let Some(status) = status_opt else {
+                if stopped_early {
+                    return Err(format!(
+                        "workspace.exec was stopped after {}ms because the call that started it ended; \
+                         its whole process group was ended (SIGTERM, then SIGKILL), so a write it was making may be partial \
+                         (stdout: {}, stderr: {})",
+                        started.elapsed().as_millis(),
+                        stdout.trim(),
+                        stderr.trim()
+                    ));
+                }
                 return Err(format!(
                     "workspace.exec timed out after {timeout_ms}ms and was killed{}; {} (stdout: {}, stderr: {})",
                     note.as_deref()
@@ -8762,6 +8824,9 @@ const RECONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(45)
 struct Call {
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
     wait: SocketWait,
+    /// The commands of the `code` call this tool call runs inside, which
+    /// end with it.
+    children: Option<Arc<code_children::CodeChildren>>,
 }
 
 impl Call {
@@ -8770,6 +8835,21 @@ impl Call {
         Self {
             cancelled,
             wait: SocketWait::new(RECONNECT_WITHIN),
+            children: None,
+        }
+    }
+
+    /// This call, serving a `code` call whose commands are `children`.
+    fn with_children(mut self, children: Arc<code_children::CodeChildren>) -> Self {
+        self.children = Some(children);
+        self
+    }
+
+    /// What a blocking tool thread needs to stop a command this call started.
+    fn scope(&self) -> code_children::Scope {
+        code_children::Scope {
+            children: self.children.clone(),
+            cancelled: Some(Arc::clone(&self.cancelled)),
         }
     }
 
@@ -8781,6 +8861,7 @@ impl Call {
         Self {
             cancelled,
             wait: SocketWait::new(budget),
+            children: None,
         }
     }
 }
