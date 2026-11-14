@@ -88,6 +88,24 @@ async fn a_command_with_its_own_timeout_stretches_the_call_and_one_without_inher
     assert!(!timed_out.contains("background"), "{timed_out}");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_that_ignores_sigterm_still_answers_before_its_call_ends() {
+    // The command's own timeout fires, its group gets the SIGTERM grace and
+    // then SIGKILL; the call stays open long enough for that answer, so the
+    // snippet sees the command's timeout rather than the call's.
+    let dir = tempfile::tempdir().unwrap();
+    let mcp = agent_with_limits(dir.path(), limits(4000, 15_000));
+    let err = run(
+        &mcp,
+        "return await workspace.exec({cmd: \"trap '' TERM; sleep 20\", timeout_ms: 1500});",
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("workspace.exec timed out"), "{err}");
+}
+
 #[tokio::test]
 async fn a_call_that_runs_out_of_time_says_how_to_get_more() {
     let dir = tempfile::tempdir().unwrap();
@@ -376,7 +394,7 @@ fn a_code_call_budgets_the_commands_it_runs() {
         &deadline,
         600_000,
     );
-    assert_eq!(args["timeout_ms"], 27_000);
+    assert_eq!(args["timeout_ms"], 29_000 - CODE_CALL_GRACE_MS);
     assert_eq!(deadline.load(Ordering::SeqCst), 30_000);
     // Its own timeout moves the call's end out.
     let args = budget_code_call(
@@ -387,7 +405,10 @@ fn a_code_call_budgets_the_commands_it_runs() {
         600_000,
     );
     assert_eq!(args["timeout"], 120_000);
-    assert_eq!(deadline.load(Ordering::SeqCst), 123_000);
+    assert_eq!(
+        deadline.load(Ordering::SeqCst),
+        121_000 + CODE_CALL_GRACE_MS
+    );
     // Past the ceiling's room, the command is cut to fit.
     let deadline = AtomicU64::new(30_000);
     let args = budget_code_call(
@@ -397,7 +418,7 @@ fn a_code_call_budgets_the_commands_it_runs() {
         &deadline,
         600_000,
     );
-    assert_eq!(args["timeout_ms"], 597_000);
+    assert_eq!(args["timeout_ms"], 599_000 - CODE_CALL_GRACE_MS);
     assert_eq!(deadline.load(Ordering::SeqCst), 600_000);
     assert_eq!(args["requested_timeout_ms"], 599_500);
     // A command beyond the ceiling is clamped the same way, never left to
@@ -410,13 +431,13 @@ fn a_code_call_budgets_the_commands_it_runs() {
         &deadline,
         600_000,
     );
-    assert_eq!(args["timeout_ms"], 597_000);
+    assert_eq!(args["timeout_ms"], 599_000 - CODE_CALL_GRACE_MS);
     assert_eq!(args["requested_timeout_ms"], 900_000);
     assert_eq!(deadline.load(Ordering::SeqCst), 600_000);
     // A `files` call naming no action but a `cmd` is an exec too.
     let deadline = AtomicU64::new(30_000);
     let args = budget_code_call("files", json!({"cmd": "make"}), elapsed, &deadline, 600_000);
-    assert_eq!(args["timeout_ms"], 27_000);
+    assert_eq!(args["timeout_ms"], 29_000 - CODE_CALL_GRACE_MS);
     // Other actions and tools are untouched.
     for (tool, call) in [
         ("files", json!({"action": "read", "path": "x"})),

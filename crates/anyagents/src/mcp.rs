@@ -3729,7 +3729,10 @@ const DEFAULT_LIST_MAX_RESULTS: usize = 500;
 const HARD_LIST_MAX_RESULTS: usize = 5_000;
 /// How far past a command's own timeout the `code` call it runs in stays
 /// open, so the command's error reaches the snippet before the call ends.
-const CODE_CALL_GRACE_MS: u64 = 2_000;
+/// A timed-out command's group gets [`code_children::TERM_GRACE`] after
+/// SIGTERM before SIGKILL; the call must outlast that and the answer.
+const CODE_CALL_GRACE_MS: u64 = code_children::TERM_GRACE.as_millis() as u64 + 1_500;
+const _: () = assert!(CODE_CALL_GRACE_MS >= code_children::TERM_GRACE.as_millis() as u64 + 1_000);
 const MAX_CODE_RESULT_BYTES: usize = 48 * 1024;
 const MAX_CODE_TOOL_CALLS: usize = 256;
 

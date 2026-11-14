@@ -190,8 +190,11 @@ pub(crate) fn stop_group(child: &mut std::process::Child, grace: Duration) {
             unsafe {
                 libc::kill(-pgid, libc::SIGTERM);
             }
+            // Wait for the whole group, not just its leader: in `git ... |
+            // tail` the shell leading the group exits at once on SIGTERM
+            // while git is still removing `index.lock`.
             let until = Instant::now() + grace;
-            while Instant::now() < until && !exited_unreaped(pgid) {
+            while Instant::now() < until && group_running(pgid) {
                 std::thread::sleep(Duration::from_millis(20));
             }
             // SAFETY: as above; the unreaped leader keeps the group id ours.
@@ -202,6 +205,53 @@ pub(crate) fn stop_group(child: &mut std::process::Child, grace: Duration) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Whether anything in group `pgid` (led by an unreaped child of this
+/// process) still runs. The exited leader stays in the group as a zombie
+/// until it is reaped, so `kill(-pgid, 0)` alone cannot say the group is
+/// done; on Linux the members are read from `/proc`, elsewhere only the
+/// leader is known.
+#[cfg(unix)]
+fn group_running(pgid: i32) -> bool {
+    if !exited_unreaped(pgid) {
+        return true;
+    }
+    // SAFETY: signal 0 only checks that the group has a member.
+    if unsafe { libc::kill(-pgid, 0) } != 0 {
+        return false;
+    }
+    live_member_other_than(pgid, pgid)
+}
+
+/// Whether a live (not exited) process other than `leader` is in `pgid`.
+#[cfg(target_os = "linux")]
+fn live_member_other_than(pgid: i32, leader: i32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| *pid != leader)
+        .any(|pid| {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            // `pid (comm) state ppid pgrp ...`; the command may hold `)`.
+            let Some((_, rest)) = stat.rsplit_once(')') else {
+                return false;
+            };
+            let mut fields = rest.split_whitespace();
+            let state = fields.next().unwrap_or("Z");
+            let group = fields.nth(1).and_then(|g| g.parse::<i32>().ok());
+            group == Some(pgid) && !matches!(state, "Z" | "X" | "x")
+        })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn live_member_other_than(_pgid: i32, _leader: i32) -> bool {
+    false
 }
 
 /// Whether `pid` (a child of this process) has exited, without reaping it.
@@ -291,6 +341,41 @@ mod tests {
         assert!(
             !alive(grandchild),
             "grandchild {grandchild} outlived its group"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_group_waits_for_the_whole_group_not_just_its_leader() {
+        // `git commit | tail`: the shell leading the group dies on SIGTERM
+        // at once, while the member is still cleaning up. It must get its
+        // grace instead of a SIGKILL a few milliseconds later.
+        use std::os::unix::process::CommandExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let done = dir.path().join("cleaned");
+        let ready = dir.path().join("ready");
+        let script = format!(
+            "sh -c 'trap \"sleep 0.5; echo clean > {done}; exit 0\" TERM; touch {ready}; \
+             while :; do sleep 0.1; done' & wait",
+            done = done.display(),
+            ready = ready.display(),
+        );
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < until, "member never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop_group(&mut child, Duration::from_secs(5));
+        assert_eq!(
+            std::fs::read_to_string(&done).unwrap_or_default().trim(),
+            "clean",
+            "the member was killed before it finished its SIGTERM cleanup"
         );
     }
 
