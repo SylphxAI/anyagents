@@ -1211,11 +1211,21 @@ impl<H: Harness + 'static> Session<H> {
                 ..ProcessNote::default()
             });
         // A recovery the last kernel owed, or a turn the store holds open
-        // while the process sits idle (it ended, or was lost, with no kernel
-        // to see it), is owed still.
+        // while the process sits idle and served nothing since (it was lost
+        // with no kernel to see it), is owed still. A turn the process
+        // finished while no kernel ran (it served a turn, or usage, past what
+        // the note recorded) is completed now instead, so a routine restart
+        // sends no `[Recovery]` note; its usage is recorded on the next pass.
         let health = harness.health();
-        let idle_with_open_turn =
-            health.turn_state == TurnState::Idle && store.has_open_turn(&self.id).unwrap_or(false);
+        let idle = health.turn_state == TurnState::Idle && health.sign_in_fault.is_none();
+        let finished_detached = !note.pending_recovery
+            && idle
+            && (harness.turns_served() > note.turns_recorded
+                || harness.last_usage() != note.served.clone().unwrap_or_default());
+        let completed = finished_detached && store.note_turn_completed(&self.id).is_ok();
+        let idle_with_open_turn = health.turn_state == TurnState::Idle
+            && !completed
+            && store.has_open_turn(&self.id).unwrap_or(false);
         self.served = note.served;
         self.turns_recorded = note.turns_recorded;
         self.written = note.written;
@@ -2036,12 +2046,17 @@ impl<H: Harness + 'static> Session<H> {
                 self.recovery_blocks_mail = false;
                 self.last_error = None;
                 self.written = self.written.saturating_add(1);
+                // The store counted this recovery: the note kept with the
+                // process says it is no longer owed before anything else, so
+                // a kernel that dies now leaves no second note to send.
+                self.sync_note();
                 false
             }
             Ok(DeliverOutcome::Rejected { reason, .. }) => {
                 self.pending_recovery = false;
                 self.recovery_blocks_mail = false;
                 self.last_error = Some(format!("recovery note rejected by the harness: {reason}"));
+                self.sync_note();
                 self.publish();
                 false
             }

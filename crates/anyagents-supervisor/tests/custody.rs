@@ -115,6 +115,8 @@ struct Left {
     released: Mutex<Vec<AgentId>>,
     retained: Mutex<Vec<(Kept, Option<AgentLock>)>>,
     notes: Mutex<Vec<String>>,
+    /// Each note kept, with how many lines the process had been given then.
+    given_at_note: Mutex<Vec<(serde_json::Value, usize)>>,
 }
 
 struct FakeCustody(Arc<Left>);
@@ -161,8 +163,12 @@ impl Custody<Handle> for FakeCustody {
         }
     }
 
-    fn note(&self, _harness: &Handle, note: &str) {
+    fn note(&self, harness: &Handle, note: &str) {
         self.0.notes.lock().unwrap().push(note.to_string());
+        let given = harness.kept().given().len();
+        if let Ok(value) = serde_json::from_str(note) {
+            self.0.given_at_note.lock().unwrap().push((value, given));
+        }
     }
 
     fn superseded(&self, harness: &Handle) -> bool {
@@ -489,6 +495,70 @@ fn an_owed_recovery_survives_the_kernel_that_owed_it() {
         assert_eq!(fx.launches.load(Ordering::SeqCst), 0);
         drop(supervisor);
     }
+}
+
+/// A turn the process finished while no kernel ran is recorded as completed
+/// by the kernel that takes the process over, with its usage once: a routine
+/// restart sends no `[Recovery]` note.
+#[test]
+fn a_turn_that_ended_while_no_kernel_ran_is_completed_not_recovered() {
+    let fx = Fixture::new();
+    let agent = fx.running("alpha", "claude-code");
+    fx.store.receive(&agent, Incoming::new("working")).unwrap();
+    let first = fx.store.next_undelivered(&agent).unwrap().unwrap();
+    fx.store.note_delivered(&agent, first.seq).unwrap();
+    assert!(fx.store.has_open_turn(&agent).unwrap());
+    // The last kernel wrote the line; the process finished the turn after.
+    let kept = Kept::new();
+    *kept.usage.lock().unwrap() = (
+        TurnUsage {
+            input_tokens: 5,
+            output_tokens: 3,
+            ..TurnUsage::default()
+        },
+        1,
+    );
+    let note = r#"{"served":null,"turns_recorded":0,"written":1,"profile_rotated_ms":0,"completed_turn":false,"pending_recovery":false}"#;
+    fx.leave(&agent, &kept, "claude-code", Some(note));
+    let supervisor = fx.start();
+    assert!(wait_until(|| !fx.store.has_open_turn(&agent).unwrap()));
+    assert!(wait_until(|| fx.store.list_usage(None).unwrap().len() == 1));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !kept.given().iter().any(|id| id.starts_with("recovery_")),
+        "a turn that ended was recovered: {:?}",
+        kept.given()
+    );
+    assert_eq!(fx.store.list_usage(None).unwrap().len(), 1);
+    assert_eq!(fx.launches.load(Ordering::SeqCst), 0);
+    drop(supervisor);
+}
+
+/// The note kept with a process says an owed recovery is no longer owed as
+/// soon as the harness takes the recovery note, before any further mail: a
+/// kernel that dies right after leaves no second note to send.
+#[test]
+fn an_accepted_recovery_note_is_kept_before_more_mail() {
+    let fx = Fixture::new();
+    let agent = fx.running("alpha", "claude-code");
+    fx.store.receive(&agent, Incoming::new("working")).unwrap();
+    let first = fx.store.next_undelivered(&agent).unwrap().unwrap();
+    fx.store.note_delivered(&agent, first.seq).unwrap();
+    fx.store.receive(&agent, Incoming::new("next")).unwrap();
+    let kept = Kept::new();
+    let note = r#"{"served":null,"turns_recorded":0,"written":1,"profile_rotated_ms":0,"completed_turn":false,"pending_recovery":true}"#;
+    fx.leave(&agent, &kept, "claude-code", Some(note));
+    let supervisor = fx.start();
+    assert!(wait_until(|| kept.given().len() >= 2));
+    assert!(kept.given()[0].starts_with("recovery_"), "{:?}", kept.given());
+    let kept_notes = fx.left.given_at_note.lock().unwrap().clone();
+    assert!(
+        kept_notes
+            .iter()
+            .any(|(note, given)| note["pending_recovery"] == false && *given == 1),
+        "the accepted recovery was not kept before more mail: {kept_notes:?}"
+    );
+    drop(supervisor);
 }
 
 /// A kernel whose process another kernel took over stands down: it neither
