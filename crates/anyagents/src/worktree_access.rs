@@ -1169,11 +1169,12 @@ fn trusted_metadata_layout(common: &Path, private: &Path, seat_uid: u32) -> std:
 }
 
 /// Shared Git metadata that everyone may write is never admitted: any local
-/// user could rewrite the store's objects, refs or history, and a default
-/// ACL would hand the same write to every object a seat adds later. The
-/// refusal names the first such path and the owner's repair.
+/// user could rewrite the store's objects, refs, history, hooks or excludes,
+/// and a default ACL would hand the same write to every object a seat adds
+/// later. Admission checks these names first, then every object of the store
+/// during its own walk (see [`revoke_common`]). The refusal names the path
+/// and the owner's repair.
 fn refuse_world_writable(common: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
     for name in [
         "",
         "worktrees",
@@ -1183,68 +1184,80 @@ fn refuse_world_writable(common: &Path) -> std::io::Result<()> {
         "refs",
         "packed-refs",
         "HEAD",
+        "hooks",
+        "info",
     ] {
         let path = if name.is_empty() {
             common.to_path_buf()
         } else {
             common.join(name)
         };
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => continue, // never followed
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
-        };
-        if meta.file_type().is_symlink() {
-            continue; // never followed; the sharing walk refuses it on its own
         }
-        let access = meta.mode() & 0o002 != 0;
-        let default = meta.is_dir() && default_acl_lets_everyone_write(&path)?;
-        if !access && !default {
-            continue;
-        }
-        let shown = if name.is_empty() {
+        let label = if name.is_empty() {
             "the common Git directory"
         } else {
             name
         };
-        let (what, repair) = match (access, default) {
-            (true, false) => (
-                format!("mode {:04o}", meta.mode() & 0o7777),
-                format!("`chmod -R o-w {}`", path.display()),
-            ),
-            (false, _) => (
-                "its default ACL gives every new entry write for everyone (other::w)".to_string(),
-                format!(
-                    "`setfacl -d -m o::rx` on {} and each directory under it",
-                    path.display()
-                ),
-            ),
-            (true, true) => (
-                format!(
-                    "mode {:04o}, and its default ACL gives every new entry write for everyone",
-                    meta.mode() & 0o7777
-                ),
-                format!(
-                    "`chmod -R o-w {}`, then `setfacl -d -m o::rx` on it and each directory \
-                     under it",
-                    path.display()
-                ),
-            ),
-        };
-        return Err(std::io::Error::other(format!(
-            "{shown} ({}) is world-writable ({what}): any local user could rewrite this \
-             repository's Git metadata. Its owner repairs it with {repair}",
-            path.display()
-        )));
+        refuse_world_writable_object(&open_nofollow(&path)?, &path, Some(label))?;
     }
     Ok(())
 }
 
+/// One opened object everyone may write, by mode or by a directory's default
+/// ACL `other` entry, is refused with its path and the owner's repair.
+fn refuse_world_writable_object(
+    file: &std::fs::File,
+    path: &Path,
+    label: Option<&str>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata()?;
+    let access = meta.mode() & 0o002 != 0;
+    let default = meta.is_dir() && default_acl_lets_everyone_write(file)?;
+    if !access && !default {
+        return Ok(());
+    }
+    let chmod = if meta.is_dir() {
+        format!("`chmod -R o-w {}`", path.display())
+    } else {
+        format!("`chmod o-w {}`", path.display())
+    };
+    let (what, repair) = match (access, default) {
+        (true, false) => (format!("mode {:04o}", meta.mode() & 0o7777), chmod),
+        (false, _) => (
+            "its default ACL gives every new entry write for everyone (other::w)".to_string(),
+            format!(
+                "`setfacl -d -m o::rx` on {} and each directory under it",
+                path.display()
+            ),
+        ),
+        (true, true) => (
+            format!(
+                "mode {:04o}, and its default ACL gives every new entry write for everyone",
+                meta.mode() & 0o7777
+            ),
+            format!("{chmod}, then `setfacl -d -m o::rx` on it and each directory under it"),
+        ),
+    };
+    let named = match label {
+        Some(label) => format!("{label} ({})", path.display()),
+        None => path.display().to_string(),
+    };
+    Err(std::io::Error::other(format!(
+        "{named} is world-writable ({what}): any local user could rewrite this repository's \
+         Git metadata. Its owner (root, for objects a seat owns) repairs it with {repair}"
+    )))
+}
+
 #[cfg(target_os = "linux")]
-fn default_acl_lets_everyone_write(path: &Path) -> std::io::Result<bool> {
-    let file = open_nofollow(path)?;
+fn default_acl_lets_everyone_write(file: &std::fs::File) -> std::io::Result<bool> {
     let mut bytes = vec![0u8; 65536];
-    let len = read_xattr(&file, c"system.posix_acl_default", &mut bytes);
+    let len = read_xattr(file, c"system.posix_acl_default", &mut bytes);
     if len < 0 {
         let error = std::io::Error::last_os_error();
         return if no_acl(&error) {
@@ -1263,7 +1276,7 @@ fn default_acl_lets_everyone_write(path: &Path) -> std::io::Result<bool> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn default_acl_lets_everyone_write(_path: &Path) -> std::io::Result<bool> {
+fn default_acl_lets_everyone_write(_file: &std::fs::File) -> std::io::Result<bool> {
     Ok(false)
 }
 
@@ -1995,6 +2008,11 @@ fn revoke_common(
         Err(error) => return Err(error),
     };
     walk_tree(common, false, &|_| {}, &|file, path| {
+        // Admission (the only caller with a regrant) refuses any object of
+        // the store everyone may write; revocation never stops for it.
+        if regrant.is_some() {
+            refuse_world_writable_object(file, path, None)?;
+        }
         revoke_binding(file, path, common, uid, gid, retained, regrant)
     })
 }
@@ -5675,12 +5693,14 @@ mod tests {
         let dir = crate::test_tempdir();
         let common = plain_common(dir.path());
         refuse_world_writable(&common).unwrap();
-        for name in ["objects", "refs", ""] {
+        for name in ["objects", "refs", "hooks", "info", ""] {
             let path = if name.is_empty() {
                 common.clone()
             } else {
                 common.join(name)
             };
+            // Git's template may not provide hooks/ or info/.
+            std::fs::create_dir_all(&path).unwrap();
             let mode = std::fs::metadata(&path).unwrap().mode() & 0o7777;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode | 0o002)).unwrap();
             let error = refuse_world_writable(&common).unwrap_err().to_string();
@@ -5693,6 +5713,44 @@ mod tests {
             }
         }
         refuse_world_writable(&common).unwrap();
+    }
+
+    /// Below the top-level names, admission's own walk of the store refuses
+    /// any object everyone may write (cloud had one world-writable private
+    /// gitdir). Revocation is never stopped by it.
+    #[test]
+    fn admission_refuses_a_world_writable_object_anywhere_in_the_store() {
+        let dir = crate::test_tempdir();
+        let common = plain_common(dir.path());
+        let deep = common.join("worktrees/other-agent");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::set_permissions(&deep, std::fs::Permissions::from_mode(0o777)).unwrap();
+        refuse_world_writable(&common).unwrap();
+        let (uid, gid) = (
+            crate::sandbox::server_uid(),
+            crate::sandbox::server_gid().wrapping_add(100000),
+        );
+        let grant = Grant {
+            common: common.clone(),
+            private: common.join("worktrees/child"),
+            checkout: dir.path().join("child"),
+            uid,
+            gid,
+            active: true,
+            inspection: false,
+            inspection_paths: None,
+            quarantined: false,
+            reason: None,
+        };
+        let error = revoke_common(&common, uid, gid, &[], Some(&grant))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(deep.to_str().unwrap()) && error.contains("is world-writable"),
+            "{error}"
+        );
+        assert!(error.contains("chmod -R o-w"), "{error}");
+        revoke_common(&common, uid, gid, &[], None).unwrap();
     }
 
     /// The review's attack: a seat in the trusted store group writes config
