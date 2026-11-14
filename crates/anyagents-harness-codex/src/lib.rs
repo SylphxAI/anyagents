@@ -68,6 +68,10 @@ use serde_json::{Value, json};
 /// How long a handshake call (`initialize`, `thread/start`, `thread/resume`,
 /// `turn/interrupt`) may take. Delivery never waits for an answer.
 const CALL_WAIT: Duration = Duration::from_secs(60);
+/// The longest a start may take by this adapter's own waits: `initialize`,
+/// `thread/resume`, and `thread/start` when the thread is gone. A host that
+/// bounds the start bounds it no tighter.
+pub const START_BUDGET: Duration = Duration::from_secs(CALL_WAIT.as_secs() * 3);
 
 /// Items asked for per `thread/items/list` page.
 const HISTORY_PAGE: u64 = 50;

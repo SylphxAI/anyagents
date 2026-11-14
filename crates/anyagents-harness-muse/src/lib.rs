@@ -79,6 +79,12 @@ use serde_json::{Value, json};
 const REQUEST_WAIT: Duration = Duration::from_secs(60);
 /// A cold resume can take much longer than a request.
 const RESUME_WAIT: Duration = Duration::from_secs(180);
+/// The longest a start may take by this adapter's own waits: `initialize`,
+/// every `session/resume` attempt a held writer lease allows (six) and their
+/// pauses, a fresh `session/start` when the session is gone, and two pages of
+/// its record. A host that bounds the start bounds it no tighter.
+pub const START_BUDGET: Duration =
+    Duration::from_secs(REQUEST_WAIT.as_secs() * 3 + RESUME_WAIT.as_secs() * 7 + 5);
 
 /// `commandRejected`: a decision Muse records against the command id, with
 /// `data.reason`; the same id answers it again.

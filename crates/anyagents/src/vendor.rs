@@ -167,8 +167,12 @@ impl VendorHarness {
                     launch: serde_json::to_value(&launch).map_err(|error| error.to_string())?,
                 };
                 let lock = request.lock.as_deref().map(|lock| lock.as_fd());
+                let program = anyagents_keeper::Program {
+                    ready: launch.keeper_ready(program.ready),
+                    ..program.clone()
+                };
                 Host::Kept(Box::new(anyagents_keeper::spawn(
-                    program,
+                    &program,
                     &anyagents_keeper::root(&request.data_dir),
                     &spec,
                     lock,
@@ -385,7 +389,28 @@ pub enum AdapterLaunch {
     },
 }
 
+/// What a keeper adds to its adapter's own start: its own start and the
+/// vendor process's spawn.
+const KEEPER_START_SLACK: Duration = Duration::from_secs(30);
+
 impl AdapterLaunch {
+    /// How long this adapter's start may take, as the adapter declares it.
+    fn start_budget(&self) -> Option<Duration> {
+        match self {
+            Self::Muse { .. } => Some(anyagents_harness_muse::START_BUDGET),
+            Self::Codex { .. } => Some(anyagents_harness_codex::START_BUDGET),
+            Self::Spiron { .. } => Some(SPIRON_READY_WAIT),
+            _ => None,
+        }
+    }
+
+    /// How long its keeper may take to say `ready`: never less than `floor`,
+    /// and never less than the adapter's own start budget.
+    fn keeper_ready(&self, floor: Duration) -> Duration {
+        self.start_budget()
+            .map_or(floor, |budget| floor.max(budget + KEEPER_START_SLACK))
+    }
+
     fn environment(&self) -> &[(String, String)] {
         match self {
             Self::Contract { env, .. }
@@ -3575,6 +3600,31 @@ done
         assert_eq!(std::fs::read(&registry).unwrap(), b"not json");
         std::fs::write(&registry, saved).unwrap();
         assert_eq!(std::fs::read_to_string(&pointer).unwrap(), "vendor-1\n");
+    }
+
+    /// A keeper waits for its adapter's start as long as the adapter's own
+    /// waits allow: Muse's initialize and resume retries outlast the default.
+    #[test]
+    fn a_keeper_waits_for_its_adapter_start_budget() {
+        let floor = anyagents_keeper::READY_DEADLINE;
+        let muse = AdapterLaunch::Muse {
+            program: "muse".into(),
+            args: Vec::new(),
+            session: Some("s".into()),
+            env: Vec::new(),
+            work_dir: "/w".into(),
+            config_dir: "/c".into(),
+            scripted: false,
+        };
+        assert!(anyagents_harness_muse::START_BUDGET > floor);
+        assert!(muse.keeper_ready(floor) > anyagents_harness_muse::START_BUDGET);
+        let contract = AdapterLaunch::Contract {
+            program: "anyagents-harness".into(),
+            config: "/c/adapter.json".into(),
+            env: Vec::new(),
+            work_dir: "/w".into(),
+        };
+        assert_eq!(contract.keeper_ready(floor), floor);
     }
 
     /// A cloud harness runs behind the Claude adapter at turn-end delivery

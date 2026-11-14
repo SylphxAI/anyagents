@@ -40,8 +40,9 @@ use crate::{AGENT, Hello, Hosted, LOCK, LOG, RECORD, SOCKET, SPAWNED, Spec};
 /// The descriptor number the process lock has in a keeper.
 const KEEPER_LOCK_FD: i32 = 3;
 
-/// The longest a keeper may take to start its adapter and say `ready`. A
-/// vendor's own handshake is bounded inside this (Spiron's `ready`: 60 s).
+/// The longest a keeper may take to start its adapter and say `ready`, unless
+/// the adapter declares a longer start of its own (Muse's resume retries, for
+/// one): the kernel then waits that long, and a little more.
 pub const READY_DEADLINE: Duration = Duration::from_secs(180);
 /// The longest a keeper may take to answer `hello` (it never waits on the
 /// adapter to answer it).
