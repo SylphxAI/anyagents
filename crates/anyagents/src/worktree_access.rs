@@ -610,7 +610,7 @@ fn store_group_reader(common: &Path) -> std::io::Result<Option<u32>> {
             entries.iter().find(|e| e.0 == 4).map_or(0, |e| e.1 & mask)
         } else {
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ENODATA) {
+            if !no_acl(&error) {
                 return Err(error);
             }
             ((meta.mode() >> 3) & 7) as u16
@@ -731,6 +731,13 @@ fn path_only(file: &std::fs::File) -> bool {
         let _ = file.as_raw_fd();
         false
     }
+}
+
+/// No ACL xattr: none set (`ENODATA`), or a file system without POSIX ACL
+/// support (`EOPNOTSUPP`), where the mode bits are the whole policy.
+#[cfg(target_os = "linux")]
+fn no_acl(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP))
 }
 
 /// Read an extended attribute of the opened inode. `O_PATH` descriptors do not
@@ -862,7 +869,7 @@ fn writable_file_by_untrusted_with(
             }));
         }
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ENODATA) {
+        if !no_acl(&err) {
             return Err(err);
         }
     }
@@ -923,7 +930,7 @@ fn has_access_acl(path: &Path) -> std::io::Result<bool> {
         return Ok(true);
     }
     let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ENODATA) {
+    if no_acl(&error) {
         Ok(false)
     } else {
         Err(error)
@@ -1750,6 +1757,18 @@ fn descriptor_privilege_launcher() -> Option<PathBuf> {
     }
 }
 
+/// Every descriptor operation that changes an object needs a real open
+/// descriptor. On an `O_PATH` binding the kernel answers `EBADF`, which once
+/// surfaced as an endless "Bad file descriptor (os error 9)" revocation
+/// failure; name the object's owner instead.
+#[cfg(unix)]
+fn changeable(file: &std::fs::File) -> std::io::Result<()> {
+    if path_only(file) {
+        return Err(unreadable_foreign(&file.metadata()?));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn descriptor_fchown(
     file: &std::fs::File,
@@ -1757,6 +1776,7 @@ fn descriptor_fchown(
     gid: Option<u32>,
 ) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
+    changeable(file)?;
     if unsafe {
         libc::fchown(
             file.as_raw_fd(),
@@ -1810,6 +1830,7 @@ fn descriptor_fchown(
 #[cfg(unix)]
 fn descriptor_fchmod(file: &std::fs::File, mode: libc::mode_t) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
+    changeable(file)?;
     if unsafe { libc::fchmod(file.as_raw_fd(), mode) } == 0 {
         return Ok(());
     }
@@ -1877,6 +1898,7 @@ fn descriptor_fsetxattr(
     bytes: &[u8],
 ) -> std::io::Result<()> {
     use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+    changeable(file)?;
     if unsafe {
         libc::fsetxattr(
             file.as_raw_fd(),
@@ -1920,11 +1942,12 @@ fn descriptor_fsetxattr(
 #[cfg(target_os = "linux")]
 fn descriptor_fremovexattr(file: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<()> {
     use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+    changeable(file)?;
     if unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) } == 0 {
         return Ok(());
     }
     let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::ENODATA) {
+    if no_acl(&err) {
         return Ok(());
     }
     if matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
@@ -1934,7 +1957,7 @@ fn descriptor_fremovexattr(file: &std::fs::File, name: &std::ffi::CStr) -> std::
         if orig_uid != srv_uid && (meta.is_dir() || (meta.is_file() && meta.nlink() == 1)) {
             descriptor_fchown(file, Some(srv_uid), None)?;
             let res = if unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) } == 0
-                || std::io::Error::last_os_error().raw_os_error() == Some(libc::ENODATA)
+                || no_acl(&std::io::Error::last_os_error())
             {
                 Ok(())
             } else {
@@ -1959,7 +1982,7 @@ fn clear_default_acl(file: &std::fs::File) -> std::io::Result<()> {
             0,
         )
     } >= 0
-        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA)
+        || !no_acl(&std::io::Error::last_os_error())
     {
         return Err(std::io::Error::other(
             "default ACL removal readback differs",
@@ -2177,6 +2200,12 @@ fn walk_tree_policy(
                 .borrow_mut()
                 .push(format!("{}: {error}", path.display()));
             Ok(())
+        } else if error.raw_os_error().is_some() {
+            // A bare errno names no object; the operator needs the path.
+            Err(std::io::Error::new(
+                error.kind(),
+                format!("{}: {error}", path.display()),
+            ))
         } else {
             Err(error)
         }
@@ -2293,63 +2322,9 @@ fn walk_tree_policy(
             before_open(&child_path);
             #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
             let mut child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
-            // Each failed open's errno is captured before any later syscall
-            // (including ignored repair attempts) can overwrite it.
-            #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-            let mut open_error = (child < 0).then(std::io::Error::last_os_error);
-            #[cfg(target_os = "linux")]
-            if open_error
-                .as_ref()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
-                && (kind == libc::S_IFDIR || stat.st_nlink == 1)
-                && descriptor_privilege_launcher().is_some()
-            {
-                let path_fd = unsafe {
-                    libc::openat(
-                        fd,
-                        name.as_ptr(),
-                        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if path_fd >= 0 {
-                    let bound = unsafe { std::fs::File::from_raw_fd(path_fd) };
-                    #[allow(
-                        clippy::unnecessary_cast,
-                        reason = "stat fields differ across Unix targets"
-                    )]
-                    let (stat_dev, stat_ino) = (stat.st_dev as u64, stat.st_ino as u64);
-                    if let Ok(bmeta) = bound.metadata()
-                        && bmeta.dev() == stat_dev
-                        && bmeta.ino() == stat_ino
-                        && (bmeta.is_dir() || (bmeta.is_file() && bmeta.nlink() == 1))
-                    {
-                        let min_mode = ((bmeta.mode() & 0o7777)
-                            | if bmeta.is_dir() { 0o770 } else { 0o660 })
-                            as libc::mode_t;
-                        let _ = descriptor_fchmod(&bound, min_mode);
-                        child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
-                        open_error = (child < 0).then(std::io::Error::last_os_error);
-                        if open_error
-                            .as_ref()
-                            .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
-                        {
-                            let orig_uid = bmeta.uid();
-                            let srv_uid = crate::sandbox::server_uid();
-                            if orig_uid != srv_uid
-                                && descriptor_fchown(&bound, Some(srv_uid), None).is_ok()
-                            {
-                                child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
-                                open_error = (child < 0).then(std::io::Error::last_os_error);
-                                let _ = descriptor_fchown(&bound, Some(orig_uid), None);
-                            }
-                        }
-                    }
-                }
-            }
             if child < 0 {
-                let error = open_error
-                    .take()
-                    .unwrap_or_else(|| std::io::Error::other("open failed"));
+                // Captured before any later syscall can overwrite errno.
+                let error = std::io::Error::last_os_error();
                 // Another principal's unreadable regular file (e.g. a 0600 pack
                 // marker another seat wrote) is bound read-only by inode so the
                 // callback can inspect its ACL. Directories are never bound
@@ -2504,11 +2479,7 @@ fn update_metadata_acl(
         let len = read_xattr(file, name, &mut bytes);
         if len < 0 {
             let err = std::io::Error::last_os_error();
-            return if err.raw_os_error() == Some(libc::ENODATA) {
-                Ok(None)
-            } else {
-                Err(err)
-            };
+            return if no_acl(&err) { Ok(None) } else { Err(err) };
         }
         bytes.truncate(len as usize);
         if bytes.len() < 4
@@ -4616,7 +4587,12 @@ mod tests {
             }
         })
         .unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("os error {}", libc::ELOOP))
+                && message.contains(victim.to_str().unwrap()),
+            "{message}"
+        );
         assert_eq!(std::fs::metadata(outside).unwrap().mode() & 0o777, 0o600);
     }
 
@@ -4734,6 +4710,84 @@ mod tests {
             assert!(seat_owns(&foreign, foreign.uid()));
             assert!(!seat_owns(&foreign, foreign.uid().wrapping_add(1)));
         }
+    }
+
+    /// The deployed revocation loop logged "Bad file descriptor (os error 9)"
+    /// for every retry. Its source: an object the server cannot open is bound
+    /// with `O_PATH`, and the kernel refuses fchmod/fchown/f*xattr on such a
+    /// descriptor with EBADF. The old walk tried exactly that as a "repair"
+    /// and then reported the last errno. No change helper may ever reach the
+    /// kernel with a path-only descriptor; it names the object's owner instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn path_only_bindings_are_never_changed_through_their_descriptor() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pack.keep");
+        std::fs::write(&path, b"").unwrap();
+        let before = std::fs::metadata(&path).unwrap().mode();
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let fd = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let bound = unsafe { std::fs::File::from_raw_fd(fd) };
+        assert!(path_only(&bound));
+        // What the old repair branch received from the kernel.
+        assert_eq!(unsafe { libc::fchmod(bound.as_raw_fd(), 0o600) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        for result in [
+            descriptor_fchmod(&bound, 0o600),
+            descriptor_fchown(&bound, None, None),
+            descriptor_fsetxattr(&bound, c"user.anyagents-test", b"1"),
+            descriptor_fremovexattr(&bound, c"user.anyagents-test"),
+        ] {
+            let error = result.unwrap_err();
+            assert_ne!(error.raw_os_error(), Some(libc::EBADF), "{error}");
+            assert!(
+                error.to_string().contains("unreadable by the server"),
+                "{error}"
+            );
+        }
+        // Reading a path-only binding's ACL still works, through /proc.
+        let mut bytes = [0u8; 64];
+        let len = read_xattr(&bound, c"system.posix_acl_access", &mut bytes);
+        assert!(
+            len >= 0 || no_acl(&std::io::Error::last_os_error()),
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().mode(), before);
+    }
+
+    /// A tree walk that cannot open an object reports the object's own path
+    /// and the real errno, never a later syscall's.
+    #[test]
+    fn walk_failures_name_the_object_and_keep_the_open_errno() {
+        if crate::sandbox::server_uid() == 0 {
+            return; // root opens everything
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let locked = root.join("objects/ab");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let error = walk_tree(&root, false, &|_| {}, &|_, _| Ok(())).unwrap_err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(locked.to_str().unwrap()), "{message}");
+        assert!(message.contains("os error 13"), "{message}");
     }
 
     /// The probe as another uid, under `cargo test`: the test harness stands
