@@ -57,7 +57,11 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
     (27, include_str!("../migrations/028_hot_path_indexes.sql")),
     (28, include_str!("../migrations/029_outcomes.sql")),
     (29, include_str!("../migrations/030_rejected_messages.sql")),
-    (30, include_str!("../migrations/031_turn_errors.sql")),
+    (
+        30,
+        include_str!("../migrations/031_remote_session_tokens.sql"),
+    ),
+    (31, include_str!("../migrations/032_turn_errors.sql")),
 ];
 
 /// Apply pending migrations. Each migration commits on its own, in order.

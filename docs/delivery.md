@@ -78,7 +78,7 @@ way.
 A turn the adapter saw end (`turns_served` moved, or `Accepted {
 turn_finished }`) with a fault on the harness (`sign_in_fault`, not a quota
 wait) is never left holding the mailbox. The supervisor counts it at once in
-`turn_errors` (migration 031) and follows it up:
+`turn_errors` (migration 032) and follows it up:
 
 - **Retry with a note.** The work the turn held comes back as a `[Recovery]`
   note in the agent's own mailbox, from `anyagents`. It names the error,

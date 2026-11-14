@@ -61,6 +61,10 @@ pub use store::{
 pub use store::{
     ErroredTurn, MAX_ERRORED_TURNS, MAX_TRANSIENT_ERRORED_TURNS, SYSTEM_SENDER, TurnErrors,
 };
+pub use store::{
+    REMOTE_SESSION_TOKEN_PREFIX, RemoteSession, RemoteSessionGrant, RemoteSessionToken,
+    is_remote_session_token,
+};
 
 /// The token a client presents as an agent, when it has one. A capability is
 /// written into the agent's own config directory; it is never an argument on a

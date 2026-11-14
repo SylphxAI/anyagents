@@ -414,6 +414,13 @@ pub enum AdapterLaunch {
 const KEEPER_START_SLACK: Duration = Duration::from_secs(30);
 
 impl AdapterLaunch {
+    /// Whether this launch runs the harness off this host: the cloud adapter
+    /// or a remote-sandbox spawn. Such a launch begins a remote session.
+    fn runs_off_host(&self) -> bool {
+        matches!(self, Self::Claude { args, .. }
+            if args.iter().any(|arg| arg == "cloud-harness" || arg == "sandbox-exec"))
+    }
+
     /// How long this adapter's start may take, as the adapter declares it.
     fn start_budget(&self) -> Option<Duration> {
         match self {
@@ -1414,6 +1421,9 @@ fn vendor_launch_inner(
     }
     enforce_host_memory_env(&request.agent.harness, &mut env);
     let planned = plan_adapter(&request, &root, env)?;
+    if planned.launch.runs_off_host() {
+        begin_remote_session(store_opt, &request.agent)?;
+    }
     let vh = VendorHarness::start(planned, &request, host)?;
     vh.sync_session()?;
     Ok(vh)
@@ -2084,6 +2094,22 @@ fn start_claude(
 /// model/tool loop.
 pub(crate) fn is_spiron_harness(harness: &str) -> bool {
     anyagents_harness::normalize_harness_name(harness) == "spiron"
+}
+
+/// A harness that runs off this host starts with a fresh remote session: its
+/// token and callback URL are in its config directory before it starts, and
+/// any earlier session of the agent is revoked.
+fn begin_remote_session(
+    store: Option<&anyagents_core::Store>,
+    agent: &anyagents_core::Agent,
+) -> Result<(), String> {
+    let store = store.ok_or_else(|| {
+        format!(
+            "remote agent `{}` cannot start: the store that issues its session token is unavailable",
+            agent.name
+        )
+    })?;
+    crate::remote::begin_session(store, agent)
 }
 
 pub(crate) fn is_cloud_harness(harness: &str) -> bool {
