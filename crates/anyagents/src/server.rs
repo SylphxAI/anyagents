@@ -12620,6 +12620,7 @@ exec '{}' "$@"
             send(
                 principal,
                 State(state.clone()),
+                axum::http::HeaderMap::new(),
                 Json(SendRequest {
                     to: to.iter().map(|to| to.to_string()).collect(),
                     text: text.to_string(),
