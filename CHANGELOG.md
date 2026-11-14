@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Agents report defects to whoever runs the deployment with `send` to
+  `operator`: a defect in AnyAgents, the harness or the host that an agent
+  cannot fix within its own work. Only the operator reads it, with
+  `anyagents inbox --operator`. Each sender has a small burst and an hourly
+  cap, and a repeated report within an hour is answered as a duplicate.
 - Keep role labels methodology-neutral: roots and labelled children can self-archive
   and release idle processes under the same rules. Preserve legacy effective scopes
   on upgrade, default all new children to private, and retain browser profiles until

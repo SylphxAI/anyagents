@@ -16,8 +16,8 @@ use anyagents_core::{Address, Error, Incoming, Quote};
 
 use crate::agent::open;
 use crate::api::{
-    ConversationResponse, InboxResponse, SendArticle, SendChecklist, SendLocation, SendMedia,
-    SendPoll, SendRequest, SendResponse,
+    ConversationResponse, InboxResponse, OperatorInboxResponse, SendArticle, SendChecklist,
+    SendLocation, SendMedia, SendPoll, SendRequest, SendResponse,
 };
 use crate::client;
 use crate::server;
@@ -148,6 +148,9 @@ fn send_stored(
 ) -> Result<(), Error> {
     let address = Address::parse(to)?;
     let name = match address {
+        Address::Agent(name) if name == "operator" => {
+            return report_stored(data, from.as_deref(), &text, quote.as_ref());
+        }
         Address::Agent(name) => name,
         Address::Group(room) => {
             let store = open(data)?;
@@ -225,6 +228,45 @@ fn send_stored(
     Ok(())
 }
 
+/// The single-user path to the operator's inbox, with the same limits the
+/// server applies.
+fn report_stored(
+    data: &Path,
+    from: Option<&str>,
+    text: &str,
+    quote: Option<&Quote>,
+) -> Result<(), Error> {
+    let store = open(data)?;
+    let (sender, sender_name) = match from.map(str::trim) {
+        None | Some("operator") => ("operator".to_string(), None),
+        Some(named) => {
+            let agent = store.agent_by_name(named.strip_prefix("agent:").unwrap_or(named))?;
+            (format!("agent:{}", agent.id), Some(agent.name))
+        }
+    };
+    let receipt = store.report_to_operator(anyagents_core::OperatorReport {
+        sender,
+        sender_name,
+        body: anyagents_core::quote::compose(text, quote),
+        received_at_ms: None,
+    })?;
+    match receipt {
+        anyagents_core::OperatorReceipt::New(message) => {
+            println!("{}\t{}", message.id, message.seq);
+        }
+        anyagents_core::OperatorReceipt::Duplicate(message) => {
+            println!("{}\t{}\tduplicate", message.id, message.seq);
+        }
+        anyagents_core::OperatorReceipt::Limited { retry_after_ms } => {
+            return Err(Error::Message(format!(
+                "the operator inbox is rate limited for this sender; retry in {}s",
+                (retry_after_ms + 999) / 1000
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn send_telegram(
     data: &Path,
@@ -260,6 +302,9 @@ fn parse_id(raw: &str, what: &'static str) -> Result<i64, Error> {
 }
 
 pub fn inbox(data: &Path, args: InboxArgs) -> Result<(), Error> {
+    if args.operator {
+        return operator_inbox(data, &args);
+    }
     let target = args
         .agent
         .clone()
@@ -364,6 +409,106 @@ pub fn inbox(data: &Path, args: InboxArgs) -> Result<(), Error> {
             }
         } else {
             crate::ui::print_inbox_pretty(&target, &read.messages);
+        }
+        if !args.follow {
+            return Ok(());
+        }
+        std::io::stdout().flush()?;
+        initial = false;
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// `inbox --operator`: what agents reported with `send operator`. The server
+/// answers only the operator's token; with no server to ask, the host operator
+/// reads the store itself, which an agent's seat cannot open.
+fn operator_inbox(data: &Path, args: &InboxArgs) -> Result<(), Error> {
+    let mut since = args.since;
+    let mut initial = true;
+    loop {
+        let limit = if args.all || !initial {
+            None
+        } else {
+            Some(args.limit.unwrap_or(20))
+        };
+        let mut params = Vec::new();
+        if let Some(since) = since {
+            params.push(format!("since={since}"));
+        }
+        if let Some(limit) = limit {
+            params.push(format!("limit={limit}"));
+        }
+        let remote = client::get::<OperatorInboxResponse>(
+            data,
+            &format!("/v1/operator/inbox?{}", params.join("&")),
+        )
+        .map_err(Error::Message)?;
+        let read = match remote {
+            Some(read) => read,
+            None if client::agent_identity().is_some() => {
+                return Err(Error::Message(
+                    "only the operator reads the operator inbox".into(),
+                ));
+            }
+            None => OperatorInboxResponse {
+                messages: open(data)?
+                    .operator_inbox(since, limit)?
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            },
+        };
+        if let Some(last) = read.messages.last() {
+            since = Some(last.seq);
+        }
+        let reporter = |m: &crate::api::OperatorMessageView| match &m.sender_name {
+            Some(name) => format!("agent:{name}"),
+            None => m.sender.clone(),
+        };
+        if args.json {
+            if args.follow {
+                for message in &read.messages {
+                    println!(
+                        "{}",
+                        serde_json::to_string(message)
+                            .map_err(|e| Error::Message(e.to_string()))?
+                    );
+                }
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&read)
+                        .map_err(|e| Error::Message(e.to_string()))?
+                );
+            }
+        } else if args.full || !std::io::stdout().is_terminal() {
+            for m in &read.messages {
+                println!(
+                    "[#{}] {}  IN   {} ({}) -> operator\n{}\n",
+                    m.seq,
+                    crate::ui::format_timestamp_ms(m.received_at_ms),
+                    reporter(m),
+                    m.sender,
+                    m.text
+                );
+            }
+        } else {
+            let rows: Vec<crate::api::MessageView> = read
+                .messages
+                .iter()
+                .map(|m| crate::api::MessageView {
+                    id: m.id.clone(),
+                    seq: m.seq,
+                    text: m.text.clone(),
+                    sender: Some(reporter(m)),
+                    reply_to: None,
+                    source_time_ms: None,
+                    received_at_ms: m.received_at_ms,
+                    ack: "reported".into(),
+                    delivered_at_ms: None,
+                })
+                .collect();
+            crate::ui::print_inbox_pretty("operator", &rows);
         }
         if !args.follow {
             return Ok(());

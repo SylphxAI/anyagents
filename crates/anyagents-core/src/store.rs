@@ -30,6 +30,7 @@ mod harness_leases;
 mod history_ops;
 mod lifecycle;
 mod mcp_ops;
+mod operator_inbox;
 mod outcomes;
 mod registry;
 pub use registry::holds_store_writer;
@@ -46,6 +47,9 @@ pub use credentials::{
 pub use group_policy::{Group, GroupAction, GroupActor};
 pub use harness_leases::HarnessLease;
 pub use lifecycle::{LifecycleKind, LifecycleOp, LifecyclePhase, NewLifecycleOp, SchedulePending};
+pub use operator_inbox::{
+    OPERATOR_BURST, OPERATOR_HOURLY_CAP, OperatorMessage, OperatorReceipt, OperatorReport,
+};
 pub use outcomes::{
     NewOutcome, Outcome, OutcomeCost, OutcomeGroup, OutcomeGroupBy, OutcomeKind, OutcomeReport,
 };

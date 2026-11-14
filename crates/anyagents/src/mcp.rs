@@ -1672,7 +1672,7 @@ fn send_turn_result(response: SendResponse, closing: bool) -> Result<serde_json:
 #[tool_router]
 impl AgentMcp {
     #[tool(
-        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`planner`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`)."
+        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`planner`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`). Use `operator` to report a defect in AnyAgents, the harness, or the host environment that you cannot fix within your own work. Include the exact error and what you tried. Do not work around it silently."
     )]
     async fn send(
         &self,
@@ -8582,6 +8582,13 @@ mod spawn_args_tests {
             );
         }
         let send_tool = tools.iter().find(|t| t.name == "send").unwrap();
+        assert!(
+            send_tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Use `operator` to report a defect in AnyAgents")
+        );
         assert!(
             !send_tool
                 .description

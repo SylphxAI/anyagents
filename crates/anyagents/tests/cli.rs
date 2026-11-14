@@ -548,6 +548,71 @@ fn plain_log_tail_keeps_the_bounded_conversation_route() {
 }
 
 #[test]
+fn send_operator_reaches_the_operator_inbox_and_an_agent_cannot_read_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let create = bin_in(dir.path())
+        .args(["agents", "create", "alpha"])
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let send = || {
+        bin()
+            .arg("--data")
+            .arg(dir.path())
+            .args(["send", "operator", "git push: 403", "--from", "agent:alpha"])
+            .output()
+            .unwrap()
+    };
+    let first = send();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let again = String::from_utf8(send().stdout).unwrap();
+    assert!(again.trim_end().ends_with("duplicate"), "{again}");
+
+    let read = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .args(["inbox", "--operator", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
+    let messages = value["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1, "{value}");
+    assert_eq!(messages[0]["text"], "git push: 403");
+    assert_eq!(messages[0]["sender_name"], "alpha");
+
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let alpha = store.agent_by_name("alpha").unwrap();
+    let as_agent = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .env("ANYAGENTS_AGENT_ID", alpha.id.as_str())
+        .args(["inbox", "--operator"])
+        .output()
+        .unwrap();
+    assert!(!as_agent.status.success());
+    let mixed = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .args(["inbox", "--operator", "alpha"])
+        .output()
+        .unwrap();
+    assert!(!mixed.status.success());
+}
+
+#[test]
 fn create_send_inbox_and_usage() {
     let dir = tempfile::tempdir().unwrap();
     let create = bin_in(dir.path())
