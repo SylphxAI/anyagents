@@ -2,6 +2,7 @@
 //! active native JSONL is read in place and never handed off or rewritten here.
 use crate::{
     Agent, AgentId, HistorySearchQuery, Store,
+    beneath::{Dir, Kind},
     host_cursor::{FileStamp, SourceCursor},
     host_index::{HostIndex, IndexError, IndexHit, IndexMetadata, MemoryScope},
     host_native_metadata::{EventHeader, MetadataReader},
@@ -833,8 +834,16 @@ fn safe_components(walk: &mut Walk, root: &Path, target: &Path) -> io::Result<bo
     }
     Ok(true)
 }
+/// A listed regular file's modification time, never a link's target's.
 fn modified_ms(path: &Path) -> io::Result<i64> {
-    Ok(fs::metadata(path)?
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "an indexed memory file was replaced by something else",
+        ));
+    }
+    Ok(meta
         .modified()?
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(io::Error::other)?
@@ -883,24 +892,45 @@ fn memory_indexable_files(walk: &mut Walk, mem_dir: &Path) -> io::Result<Vec<Pat
 }
 
 /// Regular files under `root`, recording each directory before listing it.
+/// `root` is below the walk's agent root and is reached, listed and
+/// descended through descriptors that never follow a link: the seat owns
+/// these directories and may swap any name for one while the walk runs.
 fn regular_files(walk: &mut Walk, root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
-    let meta = match fs::symlink_metadata(root) {
-        Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+    let relative = root
+        .strip_prefix(&walk.root)
+        .map_err(|_| io::Error::other("index walk outside the agent root"))?
+        .to_owned();
+    let dir = match Dir::open(&walk.root).and_then(|agent| agent.dir(&relative)) {
+        Ok(dir) => dir,
+        // Absent, or a link or a file where a directory belongs: nothing.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+            ) =>
+        {
+            return Ok(vec![]);
+        }
         Err(e) => return Err(e),
     };
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        return Ok(vec![]);
-    }
-    walk.note_dir(root, &meta);
+    files_of(walk, root, &dir, recursive)
+}
+fn files_of(walk: &mut Walk, path: &Path, dir: &Dir, recursive: bool) -> io::Result<Vec<PathBuf>> {
+    walk.note_dir(path, &dir.metadata()?);
     let mut result = Vec::new();
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let kind = entry.file_type()?;
-        if kind.is_file() {
-            result.push(entry.path());
-        } else if recursive && kind.is_dir() {
-            result.extend(regular_files(walk, &entry.path(), true)?);
+    for (name, kind) in dir.entries()? {
+        match kind {
+            Kind::File => result.push(path.join(&name)),
+            Kind::Dir if recursive => match dir.dir(Path::new(&name)) {
+                Ok(child) => result.extend(files_of(walk, &path.join(&name), &child, true)?),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+                    ) => {}
+                Err(e) => return Err(e),
+            },
+            _ => {}
         }
     }
     result.sort();
@@ -922,11 +952,23 @@ fn native_transcripts(walk: &mut Walk, root: &Path) -> io::Result<Vec<PathBuf>> 
             && fs::symlink_metadata(&projects)
                 .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
         {
-            for entry in fs::read_dir(projects)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
+            let relative = projects.strip_prefix(root).unwrap_or(&projects).to_owned();
+            let listed = match Dir::open(root).and_then(|agent| agent.dir(&relative)) {
+                Ok(dir) => dir.entries()?,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+                    ) =>
+                {
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
+            };
+            for (name, kind) in listed {
+                if kind == Kind::Dir {
                     result.extend(
-                        regular_files(walk, &entry.path(), false)?
+                        regular_files(walk, &projects.join(name), false)?
                             .into_iter()
                             .filter(|p| p.extension().is_some_and(|e| e == "jsonl")),
                     );
@@ -2101,6 +2143,50 @@ mod tests {
         fs::write(&path, b"").unwrap();
         refresh_native(&mut index, &Owner::from(&agent), &path).unwrap();
         assert!(documents(&index).is_empty());
+    }
+
+    /// Links a seat plants in `memory/` (a topic, a nested directory) are
+    /// never indexed or read: only the agent's own regular files are.
+    #[test]
+    fn memory_links_a_seat_planted_are_never_indexed() {
+        use std::os::unix::fs::symlink;
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("linker", "spiron"))
+            .unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(outside.join("deeper")).unwrap();
+        fs::write(outside.join("secret.md"), "outsidesecretword\n").unwrap();
+        fs::write(outside.join("deeper/more.md"), "outsidedeeperword\n").unwrap();
+        let memory = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("memory");
+        fs::create_dir_all(memory.join("sub")).unwrap();
+        fs::write(memory.join("own.md"), "ownmemoryword\n").unwrap();
+        symlink(outside.join("secret.md"), memory.join("leak.md")).unwrap();
+        symlink(&outside, memory.join("nested")).unwrap();
+        symlink(outside.join("deeper"), memory.join("sub/deeper")).unwrap();
+        store.sync_agent_memory_index(&agent).unwrap();
+        let ids = [agent.id.to_string()];
+        let hits = |word: &str| {
+            store
+                .search_host_files(
+                    &ids,
+                    MemoryScope::Memory,
+                    &HistorySearchQuery {
+                        query: Some(word.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .len()
+        };
+        assert_eq!(hits("ownmemoryword"), 1);
+        assert_eq!(hits("outsidesecretword"), 0);
+        assert_eq!(hits("outsidedeeperword"), 0);
     }
 
     #[test]

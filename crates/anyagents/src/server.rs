@@ -637,7 +637,7 @@ fn consolidate_idle_agent_memory(
             }
         };
         let agent_root = data_dir.join("agents").join(agent.id.as_str());
-        if !agent_root.join("memory").is_dir() {
+        if !anyagents_core::learned_memory::has_memory_dir(&agent_root) {
             backlog.settle(&agent_id);
             continue;
         }
@@ -5496,7 +5496,14 @@ async fn conversation_route(
                 )
                 .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
                 let _ = state.store.sync_agent_memory_index(&target);
-                let bytes = std::fs::read(&path).unwrap_or_default();
+                // Read back without following a link, as the read route does:
+                // `memory/` is the seat's to write.
+                let bytes = anyagents_core::raw_segment::open_readonly(&path)
+                    .and_then(|mut file| {
+                        let mut bytes = Vec::new();
+                        std::io::Read::read_to_end(&mut file, &mut bytes).map(|_| bytes)
+                    })
+                    .unwrap_or_default();
                 let digest = anyagents_core::learned_memory::sha256(&bytes);
                 let doc_id = format!(
                     "memory:{}:{}",

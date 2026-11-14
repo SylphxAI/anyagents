@@ -4381,8 +4381,8 @@ impl Store {
             return Ok((false, false));
         }
         let agent_root = self.data_dir().join("agents").join(agent.id.as_str());
-        let mem_dir = agent_root.join("memory");
-        if !mem_dir.is_dir() {
+        // The seat writes `memory/`: nothing in it is read through a link.
+        if !crate::learned_memory::has_memory_dir(&agent_root) {
             return Ok((false, false));
         }
         let mut sleep = crate::learned_memory::read_sleep_state(&agent_root);
@@ -4390,15 +4390,9 @@ impl Store {
 
         // Phase 1a: Fast deterministic disk topic check & index sync.
         let updated_topics = crate::learned_memory::list_memory_topics(&agent_root)?;
-        let mem_path = mem_dir.join("MEMORY.md");
-        let mem_exists = mem_path.is_file();
-        let current_mem = std::fs::read_to_string(&mem_path).unwrap_or_default();
-        let mem_mtime_ms = std::fs::metadata(&mem_path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
-            .unwrap_or(0);
+        let index = crate::learned_memory::read_memory_index(&agent_root).unwrap_or(None);
+        let mem_exists = index.is_some();
+        let (current_mem, mem_mtime_ms) = index.unwrap_or_default();
         let any_newer_topic = updated_topics
             .iter()
             .any(|t| t.updated_at_ms > mem_mtime_ms);
