@@ -74,6 +74,49 @@ fn names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
     Ok(out)
 }
 
+// These commands read stdin from an opened inode (never a pipe) and discard
+// stdout. Drain stderr while the child runs, retaining only a bounded prefix;
+// waiting first or stopping at the cap could deadlock a noisy launcher.
+const SEAT_STDERR_LIMIT: u64 = 4096;
+
+fn run_seat_command(command: &mut std::process::Command, stage: &str) -> io::Result<()> {
+    use std::io::Read;
+    let mut child = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| io::Error::new(error.kind(), format!("{stage} spawn failed: {error}")))?;
+    let mut stderr = child.stderr.take().expect("piped seat stderr");
+    let mut prefix = Vec::new();
+    let read_result = (&mut stderr)
+        .take(SEAT_STDERR_LIMIT + 1)
+        .read_to_end(&mut prefix)
+        .and_then(|_| io::copy(&mut stderr, &mut io::sink()).map(|_| ()));
+    // Close even on a read error before waiting, so the child cannot block on
+    // an undrained pipe. Always reap the child, including failed diagnostics.
+    drop(stderr);
+    let status = child
+        .wait()
+        .map_err(|error| io::Error::new(error.kind(), format!("{stage} wait failed: {error}")))?;
+    read_result.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("{stage} stderr read failed ({status}): {error}"),
+        )
+    })?;
+    if status.success() {
+        return Ok(());
+    }
+    let truncated = prefix.len() > SEAT_STDERR_LIMIT as usize;
+    prefix.truncate(SEAT_STDERR_LIMIT as usize);
+    // Debug escaping keeps control characters/newlines out of host log records.
+    let stderr = String::from_utf8_lossy(&prefix);
+    Err(io::Error::other(format!(
+        "{stage} failed ({status}); stderr={stderr:?}{}",
+        if truncated { " [truncated]" } else { "" }
+    )))
+}
+
 fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool) -> io::Result<()> {
     let meta = file.metadata()?;
     if !meta.is_dir() && (!meta.is_file() || meta.nlink() != 1) {
@@ -114,13 +157,15 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool)
     if group_ok && mode_ok {
         return Ok(());
     }
+    let mut repair_error = None;
     // Retain the configured owner's existing ability to repair a shared group,
     // but pass only the opened object, never its replaceable original path.
     if (!super::sandbox::is_isolated_test_env()
         || std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_some())
         && let Some(launcher) = super::sandbox::descriptor_launcher()
     {
-        let result = std::process::Command::new(launcher)
+        let mut command = std::process::Command::new(launcher);
+        command
             .args([
                 "--reuid",
                 &meta.uid().to_string(),
@@ -137,12 +182,10 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool)
                 &gid.to_string(),
                 &format!("{mode:o}"),
             ])
-            .stdin(file.try_clone()?)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-        if result.success() {
-            return Ok(());
+            .stdin(file.try_clone()?);
+        match run_seat_command(&mut command, "seat-inode") {
+            Ok(()) => return Ok(()),
+            Err(error) => repair_error = Some(error),
         }
     }
     // Seat-owned objects with the intended effective grant need no mutation.
@@ -155,7 +198,13 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool)
     {
         return Ok(());
     }
-    Err(io::Error::other("cannot grant the opened seat inode"))
+    Err(match repair_error {
+        Some(error) => io::Error::new(
+            error.kind(),
+            format!("cannot grant the opened seat inode: {error}"),
+        ),
+        None => io::Error::other("cannot grant the opened seat inode"),
+    })
 }
 
 /// O_PATH binds even an unreadable inode before delegating its mode repair.
@@ -324,9 +373,7 @@ fn migrate_open_file(
             "seat-copy",
         ])
         .arg(&temp)
-        .stdin(source.try_clone()?)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdin(source.try_clone()?);
     // Bind working directory directly to the opened parent descriptor via fchdir
     // before privilege drop, avoiding /dev/fd/3 (/proc/self/fd/3) traversal when
     // setresuid sets PR_SET_DUMPABLE=0 (mode 0500 root:root on /proc/self/fd).
@@ -340,11 +387,12 @@ fn migrate_open_file(
     }
     let mut original = source.try_clone()?;
     original.seek(SeekFrom::Start(0))?;
-    if !command.status()?.success() {
-        return Err(io::Error::other(
-            "seat inode copy refused; original retained",
-        ));
-    }
+    run_seat_command(&mut command, "seat-copy").map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("seat inode copy refused; original retained: {error}"),
+        )
+    })?;
     original.seek(SeekFrom::Start(0))?;
     // The new inode belongs to the seat, which may not share a daemon group.
     // Read back under that exact owner rather than widening it for inspection.
@@ -365,9 +413,7 @@ fn migrate_open_file(
             "seat-readback",
         ])
         .arg(&temp)
-        .stdin(source.try_clone()?)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdin(source.try_clone()?);
     unsafe {
         verify.pre_exec(move || {
             if libc::fchdir(fd) != 0 {
@@ -376,11 +422,12 @@ fn migrate_open_file(
             Ok(())
         });
     }
-    if !verify.status()?.success() {
-        return Err(io::Error::other(
-            "seat copy readback differs; original retained",
-        ));
-    }
+    run_seat_command(&mut verify, "seat-readback").map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("seat copy readback differs; original retained: {error}"),
+        )
+    })?;
     let after = source.metadata()?;
     if (
         before.dev(),
@@ -1266,6 +1313,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn seat_command_bounds_and_drains_stderr_and_reports_stage_status() {
+        use std::process::{Command, Stdio};
+        for stage in ["seat-inode", "seat-copy", "seat-readback"] {
+            let error = run_seat_command(
+                Command::new("/bin/sh")
+                    .args(["-c", "printf 'synthetic\\n\\033failure\\377' >&2; exit 43"])
+                    .stdin(Stdio::null()),
+                stage,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(&format!("{stage} failed (exit status: 43)")),
+                "{error}"
+            );
+            assert!(error.contains("synthetic\\n"), "{error}");
+            assert!(!error.contains('\n') && !error.contains('\x1b'), "{error}");
+        }
+        // Exceeds a pipe buffer, so a wait-before-read or cap-without-drain
+        // implementation hangs instead of observing the child's exit status.
+        for code in [0, 44] {
+            let result = run_seat_command(
+                Command::new("/bin/sh")
+                    .args(["-c", &format!("head -c 1048576 /dev/zero >&2; exit {code}")])
+                    .stdin(Stdio::null()),
+                "seat-copy",
+            );
+            if code == 0 {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("exit status: 44"));
+                assert!(error.ends_with(" [truncated]"));
+                assert!(error.len() < 4 * SEAT_STDERR_LIMIT as usize + 100);
+            }
+        }
+    }
+
+    #[test]
+    fn seat_command_reports_spawn_failure_and_signal() {
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        let error = run_seat_command(
+            Command::new(dir.path().join("missing-launcher")).stdin(Stdio::null()),
+            "seat-copy",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("seat-copy spawn failed"));
+        let error = run_seat_command(
+            Command::new("/bin/sh")
+                .args(["-c", "kill -TERM $$"])
+                .stdin(Stdio::null()),
+            "seat-readback",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("seat-readback failed (signal:"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn migrate_open_file_uses_fchdir_without_dev_fd_3_and_unlinks_temp_on_failure() {
@@ -1286,8 +1393,10 @@ if "/dev/fd/3" in joined:
 mode = os.environ.get("FAKE_LAUNCHER_MODE", "ok")
 if mode == "fail_copy_after_touch" and len(cmd) > 3 and cmd[3] == "seat-copy":
     open("./" + cmd[4], "wb").close()
+    print("synthetic copy denied", file=sys.stderr)
     sys.exit(41)
 if mode == "fail_verify" and len(cmd) > 3 and cmd[3] == "seat-readback":
+    print("synthetic readback denied", file=sys.stderr)
     sys.exit(42)
 os.execvp(cmd[0], cmd)
 "#,
@@ -1328,6 +1437,16 @@ os.execvp(cmd[0], cmd)
         )
         .unwrap_err();
         assert!(err.to_string().contains("seat inode copy refused"));
+        assert!(
+            err.to_string()
+                .contains("seat-copy failed (exit status: 41)")
+        );
+        assert!(err.to_string().contains("synthetic copy denied"));
+        assert_eq!(std::fs::read(&shm).unwrap(), vec![0xABu8; 32768]);
+        assert_eq!(
+            std::fs::metadata(&shm).unwrap().ino(),
+            child.metadata().unwrap().ino()
+        );
         let leftovers: Vec<_> = std::fs::read_dir(&cfg)
             .unwrap()
             .flatten()
@@ -1351,6 +1470,16 @@ os.execvp(cmd[0], cmd)
         )
         .unwrap_err();
         assert!(err2.to_string().contains("seat copy readback differs"));
+        assert!(
+            err2.to_string()
+                .contains("seat-readback failed (exit status: 42)")
+        );
+        assert!(err2.to_string().contains("synthetic readback denied"));
+        assert_eq!(std::fs::read(&shm).unwrap(), vec![0xABu8; 32768]);
+        assert_eq!(
+            std::fs::metadata(&shm).unwrap().ino(),
+            child.metadata().unwrap().ino()
+        );
         let leftovers2: Vec<_> = std::fs::read_dir(&cfg)
             .unwrap()
             .flatten()
