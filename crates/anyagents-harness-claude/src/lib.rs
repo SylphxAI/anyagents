@@ -559,6 +559,13 @@ impl Harness for ClaudeHarness {
         }
         {
             let mut state = lock(&self.shared);
+            // A proof the reader committed after `proven` answered: the line
+            // is in, and is never written again.
+            if state.consumed.contains(id) {
+                return Ok(DeliverOutcome::Accepted {
+                    turn_finished: state.finished.contains(id),
+                });
+            }
             if !state.alive {
                 return Err(HarnessError::Dead);
             }
@@ -587,7 +594,6 @@ impl Harness for ClaudeHarness {
             state.phases.insert(id.clone(), phase);
             accept_message(&mut state, id);
             state.in_flight.insert(id.clone());
-            state.consumed.remove(id);
             state.uuid_ids.insert(uuid_for(id), id.clone());
         }
         let line = Self::create_input(message);

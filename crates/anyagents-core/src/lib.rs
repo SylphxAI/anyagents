@@ -59,6 +59,7 @@ pub use store::{
     QuotaBlock, QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState,
     SchedulePending, SessionLease, Turn, TurnOutcome, TurnState,
 };
+pub use store::{ErroredTurn, MAX_ERRORED_TURNS, SYSTEM_SENDER, TurnErrors, is_session_turn_error};
 pub use store::{
     REMOTE_SESSION_TOKEN_PREFIX, RemoteSession, RemoteSessionGrant, RemoteSessionToken,
     is_remote_session_token,

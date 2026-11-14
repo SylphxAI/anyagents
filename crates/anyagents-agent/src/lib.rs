@@ -439,12 +439,15 @@ impl<H: Harness> DeliveryLoop<H> {
             DeliverOutcome::Duplicate | DeliverOutcome::Accepted { .. } => {
                 self.store
                     .note_turn_recovered(&self.agent_id, open.opened_seq)?;
+                // A recovered turn that ended in an error is not completed:
+                // the host closes it with that outcome and counts it.
                 if matches!(
                     outcome,
                     DeliverOutcome::Accepted {
                         turn_finished: true
                     }
-                ) {
+                ) && self.harness.health().sign_in_fault.is_none()
+                {
                     self.store.note_turn_completed(&self.agent_id)?;
                 }
                 self.recovery = None;
@@ -530,6 +533,68 @@ pub fn recovery_outbound(open: &anyagents_core::OpenTurn) -> OutboundMessage {
             ..last.context.clone()
         },
     }
+}
+
+/// The `[Recovery]` note that follows a turn the harness ended with an
+/// error. The host closes that turn with the error as its outcome once this
+/// note, stored in the agent's own mailbox, is there: it starts the next turn
+/// with the work the failed one held, together with any mail that waits.
+/// `strike_limit` is how many errors of the session's own in a row park the
+/// agent, when this error is one; `None` for a systemic error, which never
+/// parks it.
+pub fn errored_turn_note(
+    turn: &anyagents_core::ErroredTurn,
+    error: &str,
+    strike_limit: Option<i64>,
+) -> String {
+    let mut lines = vec![
+        format!(
+            "[Recovery] Your previous turn ended with an error, and AnyAgents closed it: {}",
+            clip_chars(error.trim(), 1_000)
+        ),
+        String::new(),
+    ];
+    match turn.open.as_ref().filter(|open| !open.messages.is_empty()) {
+        Some(open) => {
+            lines.push("The message(s) in that turn:".to_string());
+            for msg in &open.messages {
+                let from = msg.sender.as_deref().unwrap_or("unknown");
+                lines.push(format!("- anyagents-message:{} (from {from}):", msg.id));
+                // Clipped: the whole message stays in the mailbox under its id.
+                for line in clip_chars(&msg.text, 2_000).lines() {
+                    lines.push(format!("  > {line}"));
+                }
+            }
+            if !open.completed_outbounds.is_empty() {
+                lines.push(String::new());
+                lines.push("Outbound messages already sent since that turn began:".to_string());
+                for out in &open.completed_outbounds {
+                    lines.push(format!(
+                        "- send(to={}, id={}): completed (do not resend): {}",
+                        out.destination,
+                        out.id,
+                        clip_chars(&out.body, 300).replace('\n', " ")
+                    ));
+                }
+            }
+        }
+        None => lines.push(
+            "That turn carried no new mailbox message (it was itself a recovery turn).".to_string(),
+        ),
+    }
+    lines.push(String::new());
+    lines.push(match strike_limit {
+        Some(limit) => format!(
+            "This is error {} of {limit} in a row about this session's own content. At {limit}, the agent is paused, its mail is held, and the agent above it (or the operator) is told the error.",
+            turn.streak
+        ),
+        None => "The error came from the provider, the model or the host, not from this session: it was retried after a backoff, and it never pauses the agent.".to_string(),
+    });
+    lines.push(
+        "Check the actual state before repeating anything that may have taken effect, then carry on with the task in smaller steps."
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 fn clip_chars(text: &str, max: usize) -> String {

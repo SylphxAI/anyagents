@@ -385,6 +385,41 @@ fn a_second_kernel_supersedes_the_first_without_ending_the_harness() {
     assert!(!group_alive(pid));
 }
 
+/// A `stop` that arrives while the keeper's event thread reads the adapter's
+/// health waits that moment out, and the adapter ends its harness: gone when
+/// the stop is answered. Taken for a wedged call, the harness group was
+/// signalled without its adapter and left unreaped as the keeper exited.
+#[test]
+fn a_stop_during_a_health_read_ends_the_harness_through_its_adapter() {
+    let fx = Fixture::new();
+    let slow = fx.log.with_file_name("slow-health");
+    let dropped = fx.log.with_file_name("dropped");
+    let mut spec = fx.spec();
+    spec.launch["slow_health"] = json!(slow.display().to_string());
+    spec.launch["dropped"] = json!(dropped.display().to_string());
+    let mut kernel = anyagents_keeper::spawn(&program(&[]), &fx.root, &spec, None).unwrap();
+    let pid = kernel.process_id().unwrap();
+    fx.hold();
+    assert_eq!(
+        kernel.deliver(&message("m1")).unwrap(),
+        DeliverOutcome::InFlight
+    );
+    eventually("the harness reads m1", || fx.read() == ["m1"]);
+    // No call runs now: the next health read is the event thread's, when
+    // the harness answers m1.
+    std::fs::write(&slow, b"").unwrap();
+    fx.release();
+    eventually("the event thread reads health", || {
+        slow.with_extension("reading").exists()
+    });
+    kernel.end().unwrap();
+    assert!(
+        dropped.exists(),
+        "the harness was ended without its adapter"
+    );
+    assert!(!group_alive(pid));
+}
+
 /// A kernel that stops its own wedged keeper takes it over on a fresh
 /// connection; the keeper tells the old link it was superseded. That is the
 /// kernel's own doing, not another server's: it must not stand down.

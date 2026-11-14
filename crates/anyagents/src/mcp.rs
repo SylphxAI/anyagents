@@ -46,14 +46,13 @@ pub enum McpProfile {
     /// Exposes all AnyAgents MCP tools (`send`, `inbox`, `agents`, `groups`, `schedules`,
     /// `conversation`, `code`, `web_search`, `web_fetch`, `memory`, `skills`, `browser`,
     /// `computer`). Default for `anyagents mcp` over `stdio` across all local CLI harnesses
-    /// (`spiron`, `claude-code`, `codex`, `agy`, `opencode`), and for an HTTP caller holding a
-    /// local capability whose agent is bound to a `SandboxConfig` or has built-in tools
-    /// disabled. Never available to a remote session token.
+    /// (`spiron`, `claude-code`, `codex`, `agy`, `opencode`). Never served over HTTP, where
+    /// tools run inside the server process ([`McpProfile::resolve_http`]).
     #[default]
     Full,
-    /// The only profile a remote session token gets, and the default for Streamable HTTP
-    /// `POST /mcp` across all Cloud Agents (`spiron-cloud`, `claude-cloud`, `openai-cloud`,
-    /// `cursor-cloud`). Exposes coordination, `memory` and `skills`: control-plane state that
+    /// The most any Streamable HTTP `POST /mcp` call gets, whatever its credential, and the
+    /// default there: all Cloud Agents (`spiron-cloud`, `claude-cloud`, `openai-cloud`,
+    /// `cursor-cloud`) and remote sandboxes. Exposes coordination, `memory` and `skills`: control-plane state that
     /// belongs to the agent. Every tool that runs on or from the control-plane host (`code`,
     /// `files`, `browser`, `computer`, `device`, `media`, `web_search`, `web_fetch`) is omitted.
     Remote,
@@ -150,41 +149,27 @@ impl McpProfile {
         explicit.unwrap_or(Self::Full)
     }
 
-    /// The profile a remote session token gets: `remote`, or the narrower
-    /// `coordination` when asked for. Nothing a remote session asks for widens
-    /// it.
-    pub fn resolve_remote_session(explicit: Option<&str>) -> Result<Self, String> {
+    /// The profile an MCP call over HTTP gets, whatever credential it
+    /// presents: `remote`, or the narrower `coordination` when asked for.
+    /// Over HTTP the tools run inside the server process, as the server's own
+    /// user, so `full` (files, exec, code, browser, computer, ...) would hand
+    /// the caller the server's identity. It is never served here; `full`
+    /// exists only on stdio, where the tool server runs as the agent itself.
+    pub fn resolve_http(explicit: Option<&str>) -> Result<Self, String> {
         match explicit.map(str::trim).filter(|s| !s.is_empty()) {
             None => Ok(Self::Remote),
             Some(raw) => match Self::from_str_opt(raw) {
                 Some(Self::Remote) => Ok(Self::Remote),
                 Some(Self::Coordination) => Ok(Self::Coordination),
                 Some(Self::Full) => Err(format!(
-                    "MCP profile `{raw}` is not available to a remote session; it gets `remote` or `coordination`"
+                    "MCP profile `{raw}` is not served over HTTP, where tools would run as the server; \
+                     HTTP serves `remote` or `coordination`, and `full` is available only over stdio \
+                     (`anyagents mcp`)"
                 )),
                 None => Err(format!(
-                    "invalid MCP profile `{raw}`; a remote session gets `remote` or `coordination`"
+                    "invalid MCP profile `{raw}`; HTTP serves `remote` or `coordination`"
                 )),
             },
-        }
-    }
-
-    pub fn resolve_http_with_config(
-        explicit: Option<&str>,
-        _harness: &str,
-        config_dir: Option<&Path>,
-    ) -> Result<Self, String> {
-        if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-            return Self::from_str_opt(raw).ok_or_else(|| {
-                format!("invalid MCP profile `{raw}`; expected `full`, `remote`, or `coordination`")
-            });
-        }
-        if anyagents_tools::SandboxConfig::resolve(config_dir).is_some()
-            || config_dir.is_some_and(crate::cloud_harness::disable_builtin_tools_flag)
-        {
-            Ok(Self::Full)
-        } else {
-            Ok(Self::Remote)
         }
     }
 }
@@ -588,6 +573,10 @@ pub(crate) struct Client {
     pub(crate) config: PathBuf,
     /// The capability read at start, used while the file cannot be read.
     pub(crate) capability: String,
+    /// Set for the tool server the HTTP MCP route runs inside the server
+    /// process: every call it makes carries [`HTTP_MCP_HEADER`], so routes
+    /// that would start or read something on the host refuse it.
+    via_http: bool,
     /// What every clone of this client shares: idle connections to the
     /// server and the capability file as last read.
     link: Arc<ServerLink>,
@@ -640,8 +629,15 @@ impl Client {
             socket,
             config,
             capability,
+            via_http: false,
             link: Arc::default(),
         }
+    }
+
+    /// The client of a tool server that answers MCP over HTTP.
+    fn over_http(mut self) -> Self {
+        self.via_http = true;
+        self
     }
 
     /// The capability in the agent's config directory now. The server may
@@ -679,7 +675,15 @@ impl Client {
         capability: &str,
         agent_id: Option<&str>,
     ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
-        let mut request = build_request(method, path, body, Some(capability), None, agent_id)?;
+        let mut request = build_request(
+            method,
+            path,
+            body,
+            Some(capability),
+            None,
+            agent_id,
+            self.via_http,
+        )?;
         loop {
             let (mut sender, reused) = match self.idle_connection().await {
                 Some(sender) => (sender, true),
@@ -3983,7 +3987,16 @@ impl AgentMcp {
                 || t.eq_ignore_ascii_case(&self.agent.name)
                 || t == self.agent.id.as_str()
         });
-        let local_agent_root = self.client.config.parent().map(Path::to_path_buf);
+        // Over HTTP this tool server runs as the server's own user, and the
+        // agent's memory directory is writable by its seat: a planted link
+        // would make an in-process read or write reach a server file. There,
+        // every memory operation goes through the server's routes, which open
+        // files without following links.
+        let local_agent_root = if self.client.via_http {
+            None
+        } else {
+            self.client.config.parent().map(Path::to_path_buf)
+        };
 
         match action.as_str() {
             "list" | "ls" | "index" => {
@@ -4418,9 +4431,48 @@ impl AgentMcp {
     ) -> Self {
         Self {
             agent,
-            client: Client::new(socket, config, capability),
+            client: Client::new(socket, config, capability).over_http(),
             profile,
         }
+    }
+
+    /// One skill file's text. Over stdio this tool server runs as the agent
+    /// and reads what the agent can read. Over HTTP it runs as the server, and
+    /// the skill directories it scans are writable by the agent's seat, so it
+    /// never follows a link the seat could have planted: a linked skill
+    /// directory (a `skills-view` entry) is followed once and only into the
+    /// shared or the agent's own skill root, and every component from there
+    /// is opened without following links.
+    fn read_skill_text(&self, dir: &Path, rel: &Path) -> std::io::Result<String> {
+        if !self.client.via_http {
+            return std::fs::read_to_string(dir.join(rel));
+        }
+        let base = if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
+            let link = std::fs::read_link(dir)?;
+            let target = match dir.parent() {
+                Some(parent) if link.is_relative() => parent.join(link),
+                _ => link,
+            };
+            let mut roots = Vec::new();
+            if let Some(data_dir) = self.client.socket.parent() {
+                roots.push(data_dir.join("skills"));
+            }
+            if let Some(agent_root) = self.client.config.parent() {
+                roots.push(agent_root.join("skills"));
+            }
+            if !roots.iter().any(|root| target.starts_with(root)) {
+                return Err(std::io::Error::other(
+                    "a linked skill directory points outside the skill roots",
+                ));
+            }
+            target
+        } else {
+            dir.to_path_buf()
+        };
+        let mut file = anyagents_core::raw_segment::open_readonly(&base.join(rel))?;
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text)?;
+        Ok(text)
     }
 
     fn collect_skill_directories(&self) -> std::collections::BTreeMap<String, PathBuf> {
@@ -4519,7 +4571,9 @@ impl AgentMcp {
                 let limit = args.limit.unwrap_or(50).max(1);
                 let mut skills = Vec::new();
                 for (slug, dir) in skill_dirs.into_iter().take(limit) {
-                    let md = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
+                    let md = self
+                        .read_skill_text(&dir, Path::new("SKILL.md"))
+                        .unwrap_or_default();
                     let (_, description) =
                         anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &md);
                     skills.push(serde_json::json!({
@@ -4556,8 +4610,8 @@ impl AgentMcp {
                 {
                     return Err(format!("invalid skill file path `{rel_file}`"));
                 }
-                let target = dir.join(rel_path);
-                let content = std::fs::read_to_string(&target)
+                let content = self
+                    .read_skill_text(dir, rel_path)
                     .map_err(|e| format!("cannot read `{name}/{rel_file}`: {e}"))?;
                 let (_, description) =
                     anyagents_core::learned_memory::parse_topic_frontmatter(&name, &content);
@@ -4582,7 +4636,9 @@ impl AgentMcp {
                 let limit = args.limit.unwrap_or(20).max(1);
                 let mut hits = Vec::new();
                 for (slug, dir) in skill_dirs {
-                    let md = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
+                    let md = self
+                        .read_skill_text(&dir, Path::new("SKILL.md"))
+                        .unwrap_or_default();
                     let (_, description) =
                         anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &md);
                     let hay = format!("{slug} {description} {md}").to_ascii_lowercase();
@@ -8294,7 +8350,7 @@ pub(crate) async fn request(
     capability: Option<&str>,
     operator: Option<&str>,
 ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
-    let request = build_request(method, path, body, capability, operator, None)?;
+    let request = build_request(method, path, body, capability, operator, None, false)?;
     let response = connect(socket)
         .await?
         .send_request(request)
@@ -8315,6 +8371,11 @@ pub(crate) async fn request(
 /// presents. The agent id is what a deployment without the boundary uses to
 /// name its one route; with the boundary only the capability decides, and an
 /// operator token alone is accepted beside it.
+/// Marks a call made by the tool server behind the HTTP MCP route. It can only
+/// narrow what a call may do, so a caller that omits it gains nothing: the
+/// tool server that runs as the server's own user always sets it.
+pub(crate) const HTTP_MCP_HEADER: &str = "x-anyagents-via-http-mcp";
+
 fn build_request(
     method: &str,
     path: &str,
@@ -8322,6 +8383,7 @@ fn build_request(
     capability: Option<&str>,
     operator: Option<&str>,
     agent_id: Option<&str>,
+    via_http: bool,
 ) -> Result<hyper::Request<Full<Bytes>>, String> {
     let payload = body.unwrap_or_default();
     let mut builder = hyper::Request::builder()
@@ -8337,6 +8399,9 @@ fn build_request(
     }
     if let Some(id) = agent_id {
         builder = builder.header(crate::auth::AGENT_ID_HEADER, id);
+    }
+    if via_http {
+        builder = builder.header(HTTP_MCP_HEADER, "1");
     }
     builder
         .body(Full::new(Bytes::from(payload)))
@@ -8594,7 +8659,8 @@ mod reconnect_tests {
         let mut sender = super::connect_within(&socket, std::time::Duration::from_secs(20))
             .await
             .unwrap();
-        let request = super::build_request("GET", "/v1/health", None, None, None, None).unwrap();
+        let request =
+            super::build_request("GET", "/v1/health", None, None, None, None, false).unwrap();
         let response = sender.send_request(request).await.unwrap();
         assert_eq!(response.status(), hyper::StatusCode::OK);
         let seen = server.await.unwrap();
@@ -9118,6 +9184,8 @@ mod spawn_args_tests {
             seat_uid: None,
             seat_gid: None,
             schedules: Vec::new(),
+            turn_errors: None,
+            unsettled_outbound: Vec::new(),
         }
     }
 
@@ -10286,7 +10354,7 @@ mod spawn_args_tests {
     }
 
     #[tokio::test]
-    async fn remote_sandbox_backend_executes_files_and_code_and_upgrades_http_mcp_profile() {
+    async fn remote_sandbox_backend_executes_files_and_code_and_never_upgrades_http_mcp_profile() {
         use axum::{
             Router,
             body::Bytes,
@@ -10442,11 +10510,8 @@ mod spawn_args_tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::create_dir_all(&host_workdir).unwrap();
 
-        // Without sandbox.json, HTTP MCP defaults to Remote profile (code disabled).
-        assert_eq!(
-            McpProfile::resolve_http_with_config(None, "claude-cloud", Some(&config_dir)),
-            Ok(McpProfile::Remote)
-        );
+        // HTTP MCP defaults to the Remote profile (code disabled).
+        assert_eq!(McpProfile::resolve_http(None), Ok(McpProfile::Remote));
 
         // Write sandbox.json into agent config_dir.
         std::fs::write(
@@ -10461,11 +10526,10 @@ mod spawn_args_tests {
         )
         .unwrap();
 
-        // With sandbox.json present, HTTP MCP upgrades to Full profile so remote sandbox agents can use `code` and `files`.
-        assert_eq!(
-            McpProfile::resolve_http_with_config(None, "claude-cloud", Some(&config_dir)),
-            Ok(McpProfile::Full)
-        );
+        // A sandbox.json never upgrades HTTP MCP: over HTTP the tools would run
+        // as the server, so `full` is refused there and served only over stdio.
+        assert_eq!(McpProfile::resolve_http(None), Ok(McpProfile::Remote));
+        assert!(McpProfile::resolve_http(Some("full")).is_err());
 
         let mcp = AgentMcp {
             agent: AgentRef {
