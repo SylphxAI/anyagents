@@ -9885,7 +9885,7 @@ esac
         let data = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
         let fake = bin.path().join("fake-chromium");
-        crate::worktree::tests::write_executable(
+        crate::repo::tests::write_executable(
             &fake,
             "#!/bin/sh\ncase \"$1\" in --version) echo 'Chromium 140.0.7339.0'; exit 0;; esac\n\
              env > \"$HOME/env-dump\"\nexit 3\n",

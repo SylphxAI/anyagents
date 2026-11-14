@@ -1,0 +1,368 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SylphxAI/anyagents/blob/main/docs/schemas/spiron-headless-v2.schema.json",
+  "title": "spiron.headless/v2 frame",
+  "description": "One frame of spiron.headless/v2 (docs/adr/0011-spiron-headless-v2.md). A client sends #/$defs/input frames; a server sends #/$defs/output frames. The stdio v1 greeting (#/$defs/greeting) precedes attach on stdio only. Unknown fields are allowed: a client ignores fields it does not know.",
+  "oneOf": [
+    { "$ref": "#/$defs/input" },
+    { "$ref": "#/$defs/output" },
+    { "$ref": "#/$defs/greeting" }
+  ],
+  "$defs": {
+    "protocol": { "type": "string", "pattern": "^spiron\\.headless/v[0-9]+$" },
+    "request_id": { "type": "string", "minLength": 1 },
+    "seq": { "type": "integer", "minimum": 1 },
+    "text": { "type": "string", "minLength": 1 },
+    "identity": { "type": ["string", "null"] },
+
+    "input": {
+      "description": "A frame a client sends.",
+      "oneOf": [
+        { "$ref": "#/$defs/attach" },
+        { "$ref": "#/$defs/prompt" },
+        { "$ref": "#/$defs/steer" },
+        { "$ref": "#/$defs/cancel" },
+        { "$ref": "#/$defs/stop" },
+        { "$ref": "#/$defs/host_tool_result" }
+      ]
+    },
+    "input_common": {
+      "type": "object",
+      "properties": {
+        "session_id": { "type": "string", "description": "When present it must name the server's session, else rejected wrong_session." }
+      }
+    },
+    "attach": {
+      "allOf": [{ "$ref": "#/$defs/input_common" }],
+      "type": "object",
+      "required": ["type", "protocol", "after_seq"],
+      "properties": {
+        "type": { "const": "attach" },
+        "protocol": { "const": "spiron.headless/v2" },
+        "after_seq": {
+          "description": "The last seq the client holds; 0 replays everything the journal holds; null replays nothing.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "request_id": { "$ref": "#/$defs/request_id" }
+      }
+    },
+    "prompt": {
+      "allOf": [{ "$ref": "#/$defs/input_common" }],
+      "type": "object",
+      "required": ["type", "request_id", "text"],
+      "properties": {
+        "type": { "const": "prompt" },
+        "request_id": { "$ref": "#/$defs/request_id" },
+        "text": { "$ref": "#/$defs/text" }
+      }
+    },
+    "steer": {
+      "allOf": [{ "$ref": "#/$defs/input_common" }],
+      "type": "object",
+      "required": ["type", "request_id", "text"],
+      "properties": {
+        "type": { "const": "steer" },
+        "request_id": { "$ref": "#/$defs/request_id" },
+        "text": { "$ref": "#/$defs/text" }
+      }
+    },
+    "cancel": {
+      "allOf": [{ "$ref": "#/$defs/input_common" }],
+      "type": "object",
+      "required": ["type", "request_id"],
+      "properties": {
+        "type": { "const": "cancel" },
+        "request_id": { "$ref": "#/$defs/request_id" }
+      }
+    },
+    "stop": {
+      "allOf": [{ "$ref": "#/$defs/input_common" }],
+      "type": "object",
+      "required": ["type", "request_id"],
+      "properties": {
+        "type": { "const": "stop" },
+        "request_id": { "$ref": "#/$defs/request_id" }
+      }
+    },
+    "host_tool_result": {
+      "allOf": [{ "$ref": "#/$defs/input_common" }],
+      "type": "object",
+      "required": ["type", "call_id", "output", "is_error"],
+      "properties": {
+        "type": { "const": "host_tool_result" },
+        "call_id": { "type": "string", "minLength": 1 },
+        "output": { "description": "Any JSON value; the model sees it as the tool's result." },
+        "is_error": { "type": "boolean" },
+        "request_id": { "$ref": "#/$defs/request_id" }
+      }
+    },
+
+    "greeting": {
+      "description": "The stdio v1 ready. It carries no seq and is not journaled. A v2 client answers it with attach.",
+      "type": "object",
+      "required": ["type", "protocol", "protocols", "session_id"],
+      "properties": {
+        "type": { "const": "ready" },
+        "protocol": { "const": "spiron.headless/v1" },
+        "protocols": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/protocol" },
+          "contains": { "const": "spiron.headless/v2" }
+        },
+        "capabilities": { "type": "array", "items": { "type": "string" } },
+        "session_id": { "type": "string" }
+      },
+      "not": { "required": ["seq"] }
+    },
+
+    "output": {
+      "description": "A frame a server sends on a v2 connection.",
+      "allOf": [{ "$ref": "#/$defs/output_common" }],
+      "oneOf": [
+        { "$ref": "#/$defs/ready" },
+        { "$ref": "#/$defs/accepted" },
+        { "$ref": "#/$defs/steer_ack" },
+        { "$ref": "#/$defs/steer_consumed" },
+        { "$ref": "#/$defs/cancel_ack" },
+        { "$ref": "#/$defs/rejected" },
+        { "$ref": "#/$defs/text_delta" },
+        { "$ref": "#/$defs/journal_event" },
+        { "$ref": "#/$defs/host_tool_call" },
+        { "$ref": "#/$defs/stream_gap" },
+        { "$ref": "#/$defs/protocol_error" },
+        { "$ref": "#/$defs/result" },
+        { "$ref": "#/$defs/stopped" }
+      ]
+    },
+    "output_common": {
+      "type": "object",
+      "required": ["seq", "type", "session_id", "request_id"],
+      "properties": {
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "type": "string" },
+        "session_id": { "type": "string", "minLength": 1 },
+        "request_id": {
+          "description": "The input this frame answers; a turn's frames carry the id of the input that opened it.",
+          "type": ["string", "null"]
+        },
+        "agent_id": { "$ref": "#/$defs/identity" },
+        "agent_name": { "$ref": "#/$defs/identity" },
+        "profile": { "$ref": "#/$defs/identity" }
+      }
+    },
+    "ready": {
+      "type": "object",
+      "required": ["type", "protocol", "protocols", "version", "commit", "model", "context", "host_tools", "replay"],
+      "properties": {
+        "type": { "const": "ready" },
+        "protocol": { "const": "spiron.headless/v2" },
+        "protocols": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/protocol" },
+          "contains": { "const": "spiron.headless/v2" }
+        },
+        "version": { "type": "string", "minLength": 1 },
+        "commit": { "type": ["string", "null"], "pattern": "^[0-9a-f]{7,40}$" },
+        "model": { "type": "string", "minLength": 1 },
+        "context": { "$ref": "#/$defs/context_policy" },
+        "host_tools": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+          "uniqueItems": true
+        },
+        "replay": {
+          "type": "object",
+          "required": ["after_seq", "complete"],
+          "properties": {
+            "after_seq": { "type": ["integer", "null"], "minimum": 0 },
+            "complete": {
+              "description": "False when the journal no longer held every frame after after_seq.",
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "context_policy": {
+      "type": "object",
+      "required": [
+        "window_tokens",
+        "window_source",
+        "reported_window_tokens",
+        "output_reserve_tokens",
+        "request_limit_bytes",
+        "compaction_threshold_bytes"
+      ],
+      "properties": {
+        "window_tokens": { "type": "integer", "minimum": 1 },
+        "window_source": { "enum": ["catalogue", "config", "fallback"] },
+        "reported_window_tokens": { "type": "integer", "minimum": 1 },
+        "output_reserve_tokens": { "type": "integer", "minimum": 0 },
+        "request_limit_bytes": { "type": "integer", "minimum": 1 },
+        "compaction_threshold_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "accepted": {
+      "type": "object",
+      "required": ["type", "mode"],
+      "properties": {
+        "type": { "const": "accepted" },
+        "mode": { "enum": ["turn", "duplicate"] },
+        "request_id": { "$ref": "#/$defs/request_id" }
+      }
+    },
+    "steer_ack": {
+      "type": "object",
+      "required": ["type", "accepted", "turn_id"],
+      "properties": {
+        "type": { "const": "steer_ack" },
+        "accepted": { "const": true },
+        "turn_id": { "$ref": "#/$defs/request_id" },
+        "request_id": { "$ref": "#/$defs/request_id" }
+      }
+    },
+    "steer_consumed": {
+      "type": "object",
+      "required": ["type", "steer_request_id", "turn_id", "duplicate"],
+      "properties": {
+        "type": { "const": "steer_consumed" },
+        "steer_request_id": { "$ref": "#/$defs/request_id" },
+        "turn_id": { "$ref": "#/$defs/request_id" },
+        "duplicate": { "type": "boolean" }
+      }
+    },
+    "cancel_ack": {
+      "type": "object",
+      "required": ["type", "turn_id", "status"],
+      "properties": {
+        "type": { "const": "cancel_ack" },
+        "turn_id": { "$ref": "#/$defs/request_id" },
+        "status": { "const": "cancelling" }
+      }
+    },
+    "rejected": {
+      "type": "object",
+      "required": ["type", "code"],
+      "properties": {
+        "type": { "const": "rejected" },
+        "code": {
+          "enum": [
+            "empty_prompt",
+            "missing_request_id",
+            "no_active_turn",
+            "turn_closed",
+            "turn_not_started",
+            "wrong_session",
+            "unknown_command",
+            "unknown_call",
+            "not_attached",
+            "unsupported_protocol",
+            "already_attached",
+            "turn_open",
+            "stopping"
+          ]
+        },
+        "error": { "type": ["string", "null"] }
+      }
+    },
+    "text_delta": {
+      "type": "object",
+      "required": ["type", "text"],
+      "properties": {
+        "type": { "const": "text_delta" },
+        "text": { "type": "string" }
+      }
+    },
+    "journal_event": {
+      "description": "A session journal event, as Spiron's AgentStreamEvent serializes it.",
+      "type": "object",
+      "required": ["type", "sessionKey", "talentId", "timestamp", "data"],
+      "properties": {
+        "type": { "enum": ["text", "tool_call", "tool_result", "error"] },
+        "sessionKey": { "type": "string" },
+        "talentId": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "data": { "type": "object" }
+      }
+    },
+    "host_tool_call": {
+      "type": "object",
+      "required": ["type", "call_id", "name", "input"],
+      "properties": {
+        "type": { "const": "host_tool_call" },
+        "call_id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+        "input": {}
+      }
+    },
+    "stream_gap": {
+      "type": "object",
+      "required": ["type", "stream", "skipped"],
+      "properties": {
+        "type": { "const": "stream_gap" },
+        "stream": { "enum": ["events", "deltas"] },
+        "skipped": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "protocol_error": {
+      "type": "object",
+      "required": ["type", "code"],
+      "properties": {
+        "type": { "const": "protocol_error" },
+        "code": { "enum": ["invalid_json", "invalid_utf8", "stdin_read_failed"] }
+      }
+    },
+    "usage": {
+      "description": "Summed over every request of the turn. null when no request reported usage; a field the provider did not report is null.",
+      "type": ["object", "null"],
+      "required": ["input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens"],
+      "properties": {
+        "input_tokens": { "type": ["integer", "null"], "minimum": 0 },
+        "output_tokens": { "type": ["integer", "null"], "minimum": 0 },
+        "cached_tokens": { "type": ["integer", "null"], "minimum": 0 },
+        "cache_write_tokens": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "result": {
+      "type": "object",
+      "required": [
+        "type",
+        "status",
+        "is_error",
+        "error",
+        "duplicate",
+        "usage",
+        "cost_micros",
+        "context",
+        "undelivered_steer_ids"
+      ],
+      "properties": {
+        "type": { "const": "result" },
+        "status": { "enum": ["completed", "cancelled", "failed"] },
+        "is_error": { "type": "boolean" },
+        "error": { "type": ["string", "null"] },
+        "duplicate": { "type": "boolean" },
+        "usage": { "$ref": "#/$defs/usage" },
+        "cost_micros": {
+          "description": "Millionths of a US dollar the turn's requests cost, as the gateway reported; null when none reported a cost.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "context": { "type": ["object", "null"] },
+        "undelivered_steer_ids": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/request_id" }
+        },
+        "request_id": { "$ref": "#/$defs/request_id" }
+      }
+    },
+    "stopped": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "stopped" }
+      }
+    }
+  }
+}
