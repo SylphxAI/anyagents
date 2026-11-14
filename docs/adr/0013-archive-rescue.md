@@ -15,7 +15,7 @@ Keeping the checkouts whole protects the work, but nobody reviews it, and it hol
    - every commit that HEAD, a branch, `refs/stash`, a tag, a note or any reflog reaches is on a remote-tracking ref;
    - no tag the pool lacks (every tag, for a clone with its own objects).
 2. **Anything else is saved first.** It goes to `{data}/rescue/{id}/{time}/` (`ANYAGENTS_RESCUE_DIR`):
-   - a `git bundle`. A clone with its own objects is bundled with `--all`, so it restores on its own. A repository that borrows from the pool is bundled down to what the remotes have: HEAD, the branches, the stash, local tags, notes, and its reflog-only commits under `refs/anyagents-rescue/reflog-<n>`. Bundling all its refs would copy the pool's whole history once per checkout, and the pool is never pruned;
+   - a `git bundle`. A clone with its own objects is bundled with `--all`, so it restores on its own. A repository that borrows from the pool carries HEAD, the branches, the stash, local tags, notes, and its reflog-only commits under `refs/anyagents-rescue/reflog-<n>`, down to what the pool's own refs hold. The pool is never pruned, so what it holds stays. Its remote-tracking refs are not trusted for that, since a remote can delete a branch they still point at. Bundling all its refs would copy the pool's whole history once per checkout;
    - a tar of its uncommitted files, without build output;
    - every ref it had, and a `manifest.json` that says how to restore it.
 

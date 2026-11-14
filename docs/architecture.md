@@ -165,8 +165,8 @@ is only when both the clean check and the rescue's own reading find nothing a
 remote lacks: an empty status, and every commit that HEAD, a branch, the stash,
 a tag, a note or a reflog reaches on a remote-tracking ref, with no tag the
 pool lacks. Any other is first saved to `{rescue}/{agent id}/{time}/` (`ANYAGENTS_RESCUE_DIR`). The save holds a `git bundle`,
-`--all` for a clone with its own objects and only what no remote has for one that
-borrows from the pool, with reflog-only commits under `refs/anyagents-rescue/`. It
+`--all` for a clone with its own objects and, for one that borrows from the pool,
+only what the pool's own refs do not hold, with reflog-only commits under `refs/anyagents-rescue/`. It
 also holds a tar of the uncommitted files, every ref the checkout had and a
 `manifest.json`. Files beside checkouts are saved as a tar without build output
 or caches. A checkout that cannot be adopted, read or saved stays in place with
