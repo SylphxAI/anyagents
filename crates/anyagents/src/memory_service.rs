@@ -24,6 +24,7 @@ pub struct MemoryServiceArgs {
     /// Which embedder and reranker run: a JSON file naming a local pinned
     /// model or a remote one bound to a profile (default
     /// `<data>/memory-service/config.json`; without it, the pinned local pair).
+    /// A file named here must exist.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// A pinned local embedder, overriding the configuration (see `pins.rs`).
@@ -51,6 +52,9 @@ enum MemoryServiceCommand {
     },
     /// Print the running service's model pair and embedding progress.
     Status,
+    /// Remove the dense indexes of every vector space but the configured one,
+    /// once that one is built. Nothing else ever removes a space.
+    Prune,
     /// Estimate what building the configured embedder's vector space over
     /// the host index as it stands would read and cost, and whether `serve`
     /// would start it within `max_rebuild_usd`. Calls no model, reads no
@@ -104,17 +108,29 @@ fn config(data: &Path, args: &MemoryServiceArgs) -> Result<Config, anyagents_cor
     }
     config.index_threads = args.index_threads.max(1);
     config.query_threads = args.query_threads.max(1);
-    let path = args
-        .config
-        .clone()
-        .unwrap_or_else(|| ProviderConfig::path(data));
-    config.providers = ProviderConfig::load(&path).map_err(fail)?;
+    // A path the operator named must exist; only the default path may be
+    // absent, and then the pinned local pair runs, which is said.
+    config.providers = match &args.config {
+        Some(path) => ProviderConfig::load_required(path).map_err(fail)?,
+        None => {
+            let path = ProviderConfig::path(data);
+            if !path.exists() {
+                eprintln!(
+                    "memory-service: no {}; the pinned local models run",
+                    path.display()
+                );
+            }
+            ProviderConfig::load(&path).map_err(fail)?
+        }
+    };
     if let Some(name) = &args.embedder {
+        eprintln!("memory-service: --embedder {name} replaces the configured embedder");
         config.providers.embedder = EmbedderConfig::Local {
             model: Some(name.clone()),
         };
     }
     if let Some(name) = &args.reranker {
+        eprintln!("memory-service: --reranker {name} replaces the configured reranker");
         config.providers.reranker = RerankerConfig::Local {
             model: Some(name.clone()),
         };
@@ -162,6 +178,12 @@ pub fn run(data: &Path, args: MemoryServiceArgs) -> Result<(), anyagents_core::E
                 serde_json::to_string_pretty(&reply)
                     .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
             );
+            Ok(())
+        }
+        MemoryServiceCommand::Prune => {
+            for path in anyagents_memory::service::prune(&config).map_err(fail)? {
+                println!("removed {}", path.display());
+            }
             Ok(())
         }
         MemoryServiceCommand::Estimate => {
@@ -229,5 +251,37 @@ pub fn run(data: &Path, args: MemoryServiceArgs) -> Result<(), anyagents_core::E
             println!("{text}");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(config: Option<PathBuf>) -> MemoryServiceArgs {
+        MemoryServiceArgs {
+            command: MemoryServiceCommand::Status,
+            models: None,
+            index_threads: 1,
+            query_threads: 1,
+            config,
+            embedder: None,
+            reranker: None,
+        }
+    }
+
+    /// A configuration the operator named is never silently replaced by the
+    /// local default: a wrong path is an error. Only the default path may be
+    /// absent.
+    #[test]
+    fn a_named_configuration_must_exist() {
+        let dir = crate::test_tempdir();
+        let missing = dir.path().join("typo.json");
+        let error = config(dir.path(), &args(Some(missing.clone())))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("typo.json"), "{error}");
+        let default = config(dir.path(), &args(None)).unwrap();
+        assert_eq!(default.providers, Default::default());
     }
 }

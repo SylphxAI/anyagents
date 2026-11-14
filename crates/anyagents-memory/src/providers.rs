@@ -132,24 +132,36 @@ pub struct ProviderConfig {
     /// for the operator (US$; [`DEFAULT_MAX_REBUILD_USD`] when absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rebuild_usd: Option<f64>,
+    /// The most remote models may cost in one UTC day outside a rebuild:
+    /// query embeddings, rerank, and embedding new history once the space is
+    /// built (US$; [`DEFAULT_MAX_DAILY_USD`] when absent). Persisted, so a
+    /// restart does not reset it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_daily_usd: Option<f64>,
 }
 
 pub const DEFAULT_MAX_REBUILD_USD: f64 = 10.0;
+pub const DEFAULT_MAX_DAILY_USD: f64 = 1.0;
 
 impl ProviderConfig {
     pub fn path(data_dir: &Path) -> PathBuf {
         data_dir.join("memory-service").join("config.json")
     }
-    /// The file at `path`, or the local default when there is none.
+    /// The file at `path`, or the local default when there is none: for
+    /// the default path only, where no file means nothing is configured.
     pub fn load(path: &Path) -> Result<Self, Error> {
         match std::fs::read(path) {
-            Ok(bytes) => {
-                Ok(serde_json::from_slice(&bytes)
-                    .map_err(|e| format!("{}: {e}", path.display()))?)
-            }
+            Ok(_) => Self::load_required(path),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(format!("{}: {e}", path.display()).into()),
         }
+    }
+
+    /// The file at `path`, which must exist: a path the operator named is
+    /// never replaced by the local default.
+    pub fn load_required(path: &Path) -> Result<Self, Error> {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?)
     }
 }
 
@@ -1091,6 +1103,15 @@ pub(crate) mod tests {
             ProviderConfig::load(Path::new("/nonexistent/config.json")).unwrap(),
             ProviderConfig::default()
         );
+        // A path the operator named must exist: a typo is never the local
+        // default.
+        let missing = ProviderConfig::load_required(Path::new("/nonexistent/config.json"));
+        assert!(
+            missing
+                .unwrap_err()
+                .to_string()
+                .contains("/nonexistent/config.json")
+        );
         let config: ProviderConfig = serde_json::from_value(json!({
             "embedder": {"provider": "openai", "profile": "openrouter/default",
                          "model": "qwen/qwen3-embedding-8b", "dimensions": 1024,
@@ -1399,5 +1420,6 @@ pub(crate) mod tests {
             ("openrouter/default", "mongodb/rerank-3")
         );
         assert_eq!(config.max_rebuild_usd, Some(10.0));
+        assert!(config.max_daily_usd.is_some());
     }
 }

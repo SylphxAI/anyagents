@@ -127,6 +127,26 @@ impl HostCatalog {
         )
     }
 
+    /// The host index's generation (`host_generation`), which changes when
+    /// its documents table is created again and rowids start over; `legacy`
+    /// for an index made before generations.
+    pub fn generation(&self) -> rusqlite::Result<String> {
+        match self.conn.query_row(
+            "SELECT generation FROM host_generation WHERE id=1",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(generation) => Ok(generation),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok("legacy".into()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("no such table") =>
+            {
+                Ok("legacy".into())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn max_rowid(&self) -> rusqlite::Result<i64> {
         self.conn.query_row(
             "SELECT COALESCE(MAX(rowid),0) FROM host_documents",
@@ -266,6 +286,11 @@ impl std::ops::AddAssign for Embedded {
 /// longer match its coordinate is skipped (the host index republishes it).
 /// The uncached pieces of the whole batch go through the model together,
 /// sorted by length so a local batch pads little.
+///
+/// When a model request fails partway, every document whose pieces were all
+/// embedded before it is still stored, so vectors already paid for are kept
+/// (identical text is then reused, not bought again); the mark moves only
+/// over the leading run of stored documents, and the error is returned.
 pub fn embed_documents(
     encoder: &mut Embedder,
     dense: &mut DenseIndex,
@@ -325,28 +350,52 @@ pub fn embed_documents(
     stats.prepare_ms = prepare.elapsed().as_millis() as u64;
     let model = std::time::Instant::now();
     let mut vectors: Vec<(f32, Vec<u8>)> = Vec::with_capacity(unique.len());
+    let mut failure = None;
     for batch in unique.chunks(encoder.batch()) {
         let texts: Vec<&str> = batch.iter().map(|(t, _)| t.as_str()).collect();
-        stats.tokens += batch.iter().map(|(_, n)| n).sum::<usize>();
-        for vector in encoder.embed_passages(&texts)? {
-            vectors.push(quantize(&vector));
+        match encoder.embed_passages(&texts) {
+            Ok(embedded) => {
+                stats.tokens += batch.iter().map(|(_, n)| n).sum::<usize>();
+                vectors.extend(embedded.iter().map(|v| quantize(v)));
+            }
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
         }
     }
     stats.model_ms = model.elapsed().as_millis() as u64;
+    let mut complete = vec![true; documents.len()];
     for (d, i, text, _) in &pending {
-        if let Some(Some(pieces)) = planned.get_mut(*d) {
-            let (scale, bytes) = &vectors[slot_of[text]];
-            pieces[*i].scale = *scale;
-            pieces[*i].vector = bytes.clone();
+        match vectors.get(slot_of[text]) {
+            Some((scale, bytes)) => {
+                if let Some(Some(pieces)) = planned.get_mut(*d) {
+                    pieces[*i].scale = *scale;
+                    pieces[*i].vector = bytes.clone();
+                }
+            }
+            None => complete[*d] = false,
         }
     }
-    for (host, plan) in documents.iter().zip(planned) {
+    let mut marking = true;
+    for ((host, plan), complete) in documents.iter().zip(planned).zip(complete) {
+        if !complete {
+            marking = false;
+            stats.documents -= 1;
+            continue;
+        }
+        let mark = [(progress, host.rowid)];
+        let marks: &[(&str, i64)] = if marking { &mark } else { &[] };
         match plan {
-            Some(pieces) => dense.put(&host.document, &pieces, &[(progress, host.rowid)])?,
-            None => dense.set_progress(progress, host.rowid)?,
+            Some(pieces) => dense.put(&host.document, &pieces, marks)?,
+            None if marking => dense.set_progress(progress, host.rowid)?,
+            None => {}
         }
     }
-    Ok(stats)
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(stats),
+    }
 }
 
 #[cfg(test)]

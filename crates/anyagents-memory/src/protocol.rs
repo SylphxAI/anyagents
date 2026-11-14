@@ -76,6 +76,19 @@ pub struct Status {
     /// US$ spent by remote models since the service started.
     #[serde(default)]
     pub spent_usd: f64,
+    /// What background embedding is doing: `running`, `idle`, or why it is
+    /// paused or retrying.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub indexing: String,
+    /// The last error of each background worker that is retrying.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+    /// US$ spent today (UTC) outside a rebuild, and the day's cap: past it,
+    /// rerank and new-history embedding wait for the next day.
+    #[serde(default)]
+    pub today_usd: f64,
+    #[serde(default)]
+    pub max_daily_usd: f64,
 }
 
 /// The estimate a new vector space reports before any of it is embedded.
@@ -113,7 +126,7 @@ struct Envelope<T> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 enum Outcome {
-    Ok { ok: bool, reply: Reply },
+    Ok { ok: bool, reply: Box<Reply> },
     Err { ok: bool, error: String },
 }
 
@@ -143,7 +156,7 @@ pub fn encode_reply(result: &Result<Reply, String>) -> String {
     let outcome = match result {
         Ok(reply) => Outcome::Ok {
             ok: true,
-            reply: reply.clone(),
+            reply: Box::new(reply.clone()),
         },
         Err(error) => Outcome::Err {
             ok: false,
@@ -166,7 +179,7 @@ fn decode_reply(line: &str) -> Result<Reply, String> {
         return Err(format!("memory service answered v{}", envelope.v));
     }
     match envelope.body {
-        Outcome::Ok { ok: true, reply } => Ok(reply),
+        Outcome::Ok { ok: true, reply } => Ok(*reply),
         Outcome::Err { error, .. } => Err(error),
         Outcome::Ok { .. } => Err("memory service reply without a result".into()),
     }
