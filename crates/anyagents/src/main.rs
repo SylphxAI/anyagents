@@ -242,7 +242,7 @@ enum Command {
     },
     /// Send a message, media file, GPS location/venue, or poll to one or more agents, groups, or channels.
     Send {
-        /// Target(s): `agent:<name>`, bare name, comma-separated names (`planner,builder`), `parent`, `children`, `group:<name>`, `all`, or `telegram:chat:<id>[:<topic>]`.
+        /// Target(s): `agent:<name>`, bare name, comma-separated names (`planner,builder`), `parent`, `children`, `group:<name>`, `all`, `operator`, or `telegram:chat:<id>[:<topic>]`.
         to: String,
         /// Message text or caption (optional when sending media, location, or poll).
         #[arg(default_value = "")]
@@ -806,6 +806,10 @@ struct SearchArgs {
 #[derive(Args, Clone, Debug)]
 struct InboxArgs {
     agent: Option<String>,
+    /// Read the operator's inbox: what agents reported with `send operator`.
+    /// Only the operator may.
+    #[arg(long, conflicts_with_all = ["agent", "unread", "sender"])]
+    operator: bool,
     /// Exclusive mailbox sequence cursor.
     #[arg(long)]
     since: Option<i64>,
