@@ -19,10 +19,11 @@
 //!
 //! A clone with an object store of its own is bundled with `--all`, so it
 //! restores on its own. A repository that borrows objects from the read-only
-//! pool (`objects/info/alternates`) is bundled down to what the remotes
-//! already have: its own unpushed commits, which [`crate::repo::adopt`] copied
-//! into it. Bundling all of its refs would copy the pool's whole history once
-//! per checkout.
+//! pool (`objects/info/alternates`) is bundled down to what the pool's own
+//! refs reach: the pool is never pruned, so what it holds stays. Its
+//! remote-tracking refs are not trusted for that, since a remote can delete
+//! a branch they still point at. Bundling all of its refs would copy the
+//! pool's whole history once per checkout.
 //!
 //! Git reads run through [`crate::repo::inspect_command`] as the agent's seat,
 //! and tar runs as the seat too, so configuration an agent wrote into its own
@@ -297,6 +298,20 @@ fn tags(git_dir: &Path, seat: Option<(u32, u32)>) -> Result<Vec<(String, String)
         .collect())
 }
 
+/// The commits and tags the pool's refs hold, except the keep refs adoption
+/// writes for checkouts (one names everything this checkout reaches).
+fn pool_tips(pool: &Path, seat: Option<(u32, u32)>) -> Result<Vec<String>, String> {
+    let cmd = crate::repo::inspect_command(seat, pool, None).map_err(|e| e.to_string())?;
+    let out = stdout(cmd, &["for-each-ref", "--format=%(objectname) %(refname)"])?;
+    Ok(lines(&out)
+        .into_iter()
+        .filter_map(|line| {
+            let (oid, name) = line.split_once(' ')?;
+            (!name.starts_with("refs/anyagents/")).then(|| oid.to_string())
+        })
+        .collect())
+}
+
 /// The pool a repository borrows objects from: the Git directory around the
 /// first `objects/info/alternates` entry.
 fn pool_of(checkout: &Path) -> Option<PathBuf> {
@@ -445,7 +460,9 @@ pub(crate) struct SavedRepo {
     pub(crate) head: Option<String>,
     pub(crate) branch: Option<String>,
     pub(crate) origin: Option<String>,
-    /// It borrowed from a pool: its bundle holds only commits no remote has.
+    /// It borrowed from a pool: its bundle holds only what the pool's refs
+    /// do not reach, and needs the pool (or a repository borrowing from it)
+    /// to restore into.
     pub(crate) borrowed_objects: bool,
     pub(crate) unpushed_commits: u64,
     /// Commits only the stash, notes, tags or reflogs reach.
@@ -547,33 +564,43 @@ fn save_repo(
     // A clone with its own objects carries every ref, so it restores on its
     // own. A repository that borrows from the pool carries what the remotes
     // do not have; the pool and the remote hold the rest.
+    // A clone with its own objects carries every ref, so it restores on its
+    // own. A repository that borrows from the pool carries every commit its
+    // refs, stash, notes and reflogs reach that the pool's own refs do not:
+    // the pool is never pruned, so what it holds stays there. The checkout's
+    // remote-tracking refs prove nothing here; a remote can delete a branch
+    // they still point at.
+    let pool_tips = if state.borrows {
+        pool_of(checkout).and_then(|pool| pool_tips(&pool, seat).ok())
+    } else {
+        None
+    };
     let mut refs: Vec<String> = Vec::new();
-    if !state.borrows {
-        refs.push("--all".into());
-    } else if state.unpushed > 0
-        || state.hidden > 0
-        || state.stash
-        || !state.local_tags.is_empty()
-        || !state.reflog_only.is_empty()
-    {
-        refs.push("--branches".into());
-        if state.head.is_some() {
-            refs.push("HEAD".into());
+    let mut exclude = String::new();
+    match &pool_tips {
+        None => refs.push("--all".into()),
+        Some(tips) => {
+            refs.push("--branches".into());
+            if state.head.is_some() {
+                refs.push("HEAD".into());
+            }
+            if state.stash {
+                refs.push("refs/stash".into());
+            }
+            refs.extend(state.local_tags.iter().cloned());
+            refs.push("--glob=refs/notes/*".into());
+            refs.push(format!("--glob={RESCUE_REFS}/*"));
+            refs.push("--stdin".into());
+            exclude = tips.iter().map(|oid| format!("^{oid}\n")).collect();
         }
-        if state.stash {
-            refs.push("refs/stash".into());
-        }
-        refs.extend(state.local_tags.iter().cloned());
-        refs.push("--glob=refs/notes/*".into());
-        refs.push(format!("--glob={RESCUE_REFS}/*"));
-        refs.extend(["--not".into(), "--remotes".into()]);
     }
     let has_objects = state.head.is_some() || state.stash || !state.local_tags.is_empty();
-    if !refs.is_empty() && has_objects {
+    if has_objects {
         let file = out.join(format!("{slug}.bundle"));
         let mut args: Vec<&OsStrLike> = vec![os("bundle"), os("create"), os("-")];
         args.extend(refs.iter().map(|r| os(r)));
-        match write_to(&file, git_in(checkout, seat)?, &args, None) {
+        let input = (!exclude.is_empty() || pool_tips.is_some()).then_some(exclude.as_bytes());
+        match write_to(&file, git_in(checkout, seat)?, &args, input) {
             Ok(bytes) => {
                 saved.bytes += bytes;
                 // The bundle must name its refs when read back on its own.
@@ -584,8 +611,8 @@ fn save_repo(
                 saved.bundle = Some(format!("{slug}.bundle"));
                 saved.bundle_refs = listed;
             }
-            // Only refs whose commits a remote already has (a lightweight
-            // tag on a pushed commit): `{slug}.refs` names them.
+            // Everything is already in the pool (a lightweight tag on a
+            // commit it holds): `{slug}.refs` names the refs.
             Err(error) if error.contains("empty bundle") => {
                 let _ = std::fs::remove_file(&file);
             }
@@ -961,7 +988,7 @@ impl Reclaim<'_> {
             "rescued_at_ms": anyagents_core::now_ms(),
             "checkouts": repos,
             "loose_tar": loose_tar,
-            "restore": "A clone with its own objects: git clone <name>.bundle <dir>. One that borrowed from a pool: clone its origin, git fetch <name>.bundle if there is one, and check out its head. Then tar -xf <name>.uncommitted.tar -C <dir>. loose.tar holds the files that sat outside any checkout.",
+            "restore": "A clone with its own objects: git clone <name>.bundle <dir>. One that borrowed from a pool: clone with --reference <pool>, git fetch <name>.bundle '+refs/*:refs/rescued/*' if there is one, and check out its head. Then tar -xf <name>.uncommitted.tar -C <dir>. loose.tar holds the files that sat outside any checkout; <name>.refs lists every ref the checkout had.",
         }))
     }
 }
