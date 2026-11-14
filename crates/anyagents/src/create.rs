@@ -562,6 +562,19 @@ fn roll_back_failed_creation(
         );
     }
     if let Err(revocation) = crate::worktree_access::revoke_recorded(data, &agent.id) {
+        // Nothing will ever run this grant again. Keep it and the checkout
+        // for an operator, quarantined so no launch, reap or retry touches it.
+        let reason = format!(
+            "creation of `{}` failed ({error}) and its partial grant could not be revoked: \
+             {revocation}",
+            agent.name
+        );
+        if let Err(mark) = crate::worktree_access::quarantine_recorded(data, &agent.id, &reason) {
+            eprintln!(
+                "warning: cannot quarantine the worktree grant journal of {}: {mark}",
+                agent.id
+            );
+        }
         if let Err(release) = store.release_unadmitted_agent(&agent.id) {
             eprintln!(
                 "warning: failed creation of {} kept its name: {release}",
@@ -569,7 +582,7 @@ fn roll_back_failed_creation(
             );
         }
         eprintln!(
-            "warning: failed creation {} keeps its worktree grant journal for recovery: {revocation}",
+            "warning: failed creation {} keeps its worktree grant journal, quarantined: {reason}",
             agent.id
         );
         return error;
@@ -584,6 +597,13 @@ fn roll_back_failed_creation(
             agent.id
         );
         kept_checkout = Some(checkout);
+    }
+    // A revoked grant whose checkout is gone witnesses nothing more.
+    if let Err(retire) = crate::worktree_access::retire_settled(data, &agent.id) {
+        eprintln!(
+            "warning: worktree grant journal of failed creation {} not removed: {retire}",
+            agent.id
+        );
     }
     if let Err(delete) = store.delete_agent(&agent.id) {
         eprintln!(
@@ -639,7 +659,7 @@ fn remove_made_dirs(made: &MadeDirs, kept_checkout: Option<&Path>, id: &AgentId)
 /// registration is removed. Its branch is deleted only by compare-and-delete
 /// when the tip is unchanged and still reachable from another ref, so no
 /// commit can be lost; otherwise the branch is kept.
-fn remove_provisioned_checkout(checkout: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_provisioned_checkout(checkout: &Path) -> std::io::Result<()> {
     let git = |dir: &Path, args: &[&std::ffi::OsStr]| -> std::io::Result<Option<String>> {
         let out = std::process::Command::new("git")
             .args([

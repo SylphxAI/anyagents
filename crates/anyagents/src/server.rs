@@ -517,6 +517,12 @@ pub(crate) fn reap_archived_agent_locked(
     if std::fs::read(&reaped).is_ok_and(|done| done == generation) {
         return reap_queue::dequeue(data_dir, agent_id);
     }
+    // A quarantined journal waits for an operator, not for time: retrying
+    // cannot help. The startup list names it; the next start re-queues it.
+    if crate::worktree_access::reaping_blocked(data_dir, agent_id) {
+        eprintln!("agent {agent_id}: cleanup waits for its quarantined worktree grant journal");
+        return reap_queue::dequeue(data_dir, agent_id);
+    }
     if !reap_subagent_ephemeral_dirs_in(store, data_dir, agent_id) {
         return reap_queue::note_failure(data_dir, agent_id, now_ms());
     }
@@ -529,6 +535,40 @@ pub(crate) fn reap_archived_agent_locked(
     }
 }
 
+/// A grant journal of an agent that can never run again ends on the first
+/// maintenance pass of each process, once: revoked and removed (a failed
+/// creation's checkout with it), or quarantined with its reason.
+fn settle_grant_journals_once(store: &Store, data_dir: &Path) {
+    static DONE: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    if !DONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(data_dir.to_path_buf())
+    {
+        return;
+    }
+    let owner = |id: &anyagents_core::AgentId| match store.agent(id) {
+        Err(Error::AgentNotFound(_)) => crate::worktree_access::JournalOwner::Deleted,
+        // The startup repair released it: it failed before admission.
+        Ok(agent)
+            if agent.workdir.is_none()
+                && agent.state == "archived"
+                && agent.name == agent.id.as_str() =>
+        {
+            crate::worktree_access::JournalOwner::FailedCreation
+        }
+        Ok(_) | Err(_) => crate::worktree_access::JournalOwner::Live,
+    };
+    if let Err(error) = crate::worktree_access::settle_grant_journals(
+        data_dir,
+        &owner,
+        &crate::create::remove_provisioned_checkout,
+    ) {
+        eprintln!("warning: worktree grant journals not settled: {error}");
+    }
+}
+
 /// The maintenance worker runs this at startup and each minute without waiting
 /// for an agent lock. It visits only archives whose cleanup is owed and due.
 fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
@@ -537,6 +577,7 @@ fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
 
 fn reap_archived_agents_at(store: &Store, data_dir: &Path, health: &HealthBoard, now: i64) {
     reap_queue::backfill(store, data_dir);
+    settle_grant_journals_once(store, data_dir);
     for agent_id in reap_queue::due(data_dir, now) {
         let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent_id) else {
             continue;
@@ -4231,6 +4272,11 @@ fn reap_subagent_ephemeral_dirs_in(
                 }
             }
         }
+    }
+    // A revoked grant whose checkout is gone witnesses nothing more. A
+    // retained checkout keeps its journal for a later cleanup.
+    if complete && let Err(error) = crate::worktree_access::retire_settled(data_dir, agent_id) {
+        eprintln!("agent {agent_id}: worktree grant journal not removed: {error}");
     }
     complete
 }
@@ -9528,6 +9574,41 @@ pub(crate) mod tests {
         unsafe {
             std::env::remove_var("ANYAGENTS_FAKE_MODE");
         }
+    }
+
+    /// A quarantined grant journal waits for an operator, not for time:
+    /// archive cleanup leaves the queue instead of retrying it, and reaps
+    /// nothing of that agent.
+    #[test]
+    fn archive_cleanup_stops_retrying_a_quarantined_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let journal = crate::worktree_access::grant_path(dir.path(), &child.id);
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        std::fs::write(
+            &journal,
+            br#"{"common":"/nonexistent/.git","gid":1,"uid":1,
+                "private":"/nonexistent/.git/worktrees/w","checkout":"/nonexistent/w",
+                "active":false,"quarantined":true,"reason":"injected"}"#,
+        )
+        .unwrap();
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
+        std::fs::create_dir_all(cfg.join("shell-snapshots")).unwrap();
+        reap_archived_agents_at(&store, dir.path(), &HealthBoard::default(), now_ms());
+        assert!(
+            cfg.join("shell-snapshots").exists(),
+            "reaped past quarantine"
+        );
+        assert!(!cfg.join(".anyagents-reaped").exists());
+        assert!(
+            reap_queue::due(dir.path(), i64::MAX).is_empty(),
+            "a quarantined journal stays queued for retries"
+        );
+        assert!(journal.exists());
     }
 
     #[test]
