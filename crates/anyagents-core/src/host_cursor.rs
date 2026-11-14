@@ -67,9 +67,24 @@ pub(crate) struct SourceCursor {
     pub full_verified_ms: i64,
     #[serde(default)]
     pub verification_attempt_ms: i64,
+    /// The frontier reaches the source's last complete record as `stamp`
+    /// described it. A frontier published in bounded batches is incomplete
+    /// until its last batch, so an unchanged stamp never ends its indexing.
+    #[serde(default = "complete_by_default")]
+    pub complete: bool,
+    /// A rebuild from the first record is in progress (its first batch
+    /// dropped the previous documents); completing it records a full
+    /// verification.
+    #[serde(default)]
+    pub rebuilding: bool,
+}
+fn complete_by_default() -> bool {
+    true
 }
 pub(crate) struct JsonlRefresh {
     pub records: Vec<RawCoordinate>,
+    /// Where this scan started.
+    pub start: u64,
     pub end: u64,
     pub next_seq: u64,
     pub boundary_sha256: String,
@@ -77,16 +92,21 @@ pub(crate) struct JsonlRefresh {
     pub boundary_capture_bytes: u64,
     pub suffix_scanned_bytes: u64,
     pub replace: bool,
+    /// No complete record lies beyond `end` in this snapshot.
+    pub reached_end: bool,
 }
 /// Read one stable-length snapshot. Incomplete tail bytes never enter the
 /// committed frontier. Replacement, shrink or a changed 64KiB boundary forces
 /// a full rebuild; older edits are found by periodic full verification.
 /// Every record is hashed and validated from the one buffered pass over it.
-pub(crate) fn scan_jsonl(
+/// It stops after the record crossing `limit` scanned bytes, so one batch
+/// reads a bounded share of a large source.
+pub(crate) fn scan_jsonl_bounded(
     source: &mut RawSource,
     previous: Option<&SourceCursor>,
     force_full: bool,
     tolerate_malformed: bool,
+    limit: u64,
 ) -> io::Result<JsonlRefresh> {
     let stamp = source.stamp().clone();
     let mut start = 0;
@@ -112,6 +132,7 @@ pub(crate) fn scan_jsonl(
     let mut records = Vec::new();
     let mut at = start;
     let mut scanned = 0;
+    let mut reached_end = true;
     while let Some(line) = read_jsonl_line_with_policy(&mut reader, tolerate_malformed)? {
         match line {
             JsonlLine::Complete { length, sha256 } => {
@@ -125,6 +146,10 @@ pub(crate) fn scan_jsonl(
                 at += length;
                 scanned += length;
                 seq += 1;
+                if scanned >= limit {
+                    reached_end = at >= stamp.len;
+                    break;
+                }
             }
             JsonlLine::Partial { length } => scanned += length,
         }
@@ -132,6 +157,7 @@ pub(crate) fn scan_jsonl(
     let (boundary_sha256, boundary_capture_bytes) = boundary_hash(source, at)?;
     Ok(JsonlRefresh {
         records,
+        start,
         end: at,
         next_seq: seq,
         boundary_sha256,
@@ -139,13 +165,14 @@ pub(crate) fn scan_jsonl(
         prefix_verified_bytes: verified,
         suffix_scanned_bytes: scanned,
         replace,
+        reached_end,
     })
 }
 
 /// Two boundary reads per incremental refresh (old and new frontier), never
 /// proportional to prior history. A tail fragment remains outside the frontier.
 pub(crate) const BOUNDARY_BYTES: u64 = 64 * 1024;
-fn boundary_hash(source: &mut RawSource, end: u64) -> io::Result<(String, u64)> {
+pub(crate) fn boundary_hash(source: &mut RawSource, end: u64) -> io::Result<(String, u64)> {
     let length = end.min(BOUNDARY_BYTES);
     let mut reader = source.range(end - length, length);
     let mut hash = Sha256::new();
