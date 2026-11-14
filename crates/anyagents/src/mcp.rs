@@ -3987,7 +3987,16 @@ impl AgentMcp {
                 || t.eq_ignore_ascii_case(&self.agent.name)
                 || t == self.agent.id.as_str()
         });
-        let local_agent_root = self.client.config.parent().map(Path::to_path_buf);
+        // Over HTTP this tool server runs as the server's own user, and the
+        // agent's memory directory is writable by its seat: a planted link
+        // would make an in-process read or write reach a server file. There,
+        // every memory operation goes through the server's routes, which open
+        // files without following links.
+        let local_agent_root = if self.client.via_http {
+            None
+        } else {
+            self.client.config.parent().map(Path::to_path_buf)
+        };
 
         match action.as_str() {
             "list" | "ls" | "index" => {
@@ -4427,6 +4436,45 @@ impl AgentMcp {
         }
     }
 
+    /// One skill file's text. Over stdio this tool server runs as the agent
+    /// and reads what the agent can read. Over HTTP it runs as the server, and
+    /// the skill directories it scans are writable by the agent's seat, so it
+    /// never follows a link the seat could have planted: a linked skill
+    /// directory (a `skills-view` entry) is followed once and only into the
+    /// shared or the agent's own skill root, and every component from there
+    /// is opened without following links.
+    fn read_skill_text(&self, dir: &Path, rel: &Path) -> std::io::Result<String> {
+        if !self.client.via_http {
+            return std::fs::read_to_string(dir.join(rel));
+        }
+        let base = if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
+            let link = std::fs::read_link(dir)?;
+            let target = match dir.parent() {
+                Some(parent) if link.is_relative() => parent.join(link),
+                _ => link,
+            };
+            let mut roots = Vec::new();
+            if let Some(data_dir) = self.client.socket.parent() {
+                roots.push(data_dir.join("skills"));
+            }
+            if let Some(agent_root) = self.client.config.parent() {
+                roots.push(agent_root.join("skills"));
+            }
+            if !roots.iter().any(|root| target.starts_with(root)) {
+                return Err(std::io::Error::other(
+                    "a linked skill directory points outside the skill roots",
+                ));
+            }
+            target
+        } else {
+            dir.to_path_buf()
+        };
+        let mut file = anyagents_core::raw_segment::open_readonly(&base.join(rel))?;
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text)?;
+        Ok(text)
+    }
+
     fn collect_skill_directories(&self) -> std::collections::BTreeMap<String, PathBuf> {
         let mut map = std::collections::BTreeMap::new();
         let mut roots = Vec::new();
@@ -4523,7 +4571,9 @@ impl AgentMcp {
                 let limit = args.limit.unwrap_or(50).max(1);
                 let mut skills = Vec::new();
                 for (slug, dir) in skill_dirs.into_iter().take(limit) {
-                    let md = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
+                    let md = self
+                        .read_skill_text(&dir, Path::new("SKILL.md"))
+                        .unwrap_or_default();
                     let (_, description) =
                         anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &md);
                     skills.push(serde_json::json!({
@@ -4560,8 +4610,8 @@ impl AgentMcp {
                 {
                     return Err(format!("invalid skill file path `{rel_file}`"));
                 }
-                let target = dir.join(rel_path);
-                let content = std::fs::read_to_string(&target)
+                let content = self
+                    .read_skill_text(dir, rel_path)
                     .map_err(|e| format!("cannot read `{name}/{rel_file}`: {e}"))?;
                 let (_, description) =
                     anyagents_core::learned_memory::parse_topic_frontmatter(&name, &content);
@@ -4586,7 +4636,9 @@ impl AgentMcp {
                 let limit = args.limit.unwrap_or(20).max(1);
                 let mut hits = Vec::new();
                 for (slug, dir) in skill_dirs {
-                    let md = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
+                    let md = self
+                        .read_skill_text(&dir, Path::new("SKILL.md"))
+                        .unwrap_or_default();
                     let (_, description) =
                         anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &md);
                     let hay = format!("{slug} {description} {md}").to_ascii_lowercase();
