@@ -39,7 +39,7 @@ anyagents --version
 
 AnyAgents is a **100% vendor-neutral multi-agent orchestrator**. It never implements an LLM loop; instead, each agent composes three independent axes:
 
-1. **Harness (`--harness`) — Who runs the single-agent loop:** Local CLIs (`spiron`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`) and Cloud Harnesses (`spiron-cloud` at `https://spiron.ai`, `claude-cloud`, `openai-cloud`, `cursor-cloud`).
+1. **Harness (`--harness`) — Who runs the single-agent loop:** Local CLIs (`spiron`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`) and Cloud Harnesses (`claude-cloud`, a Claude Managed Agents remote session with no local process; `spiron-cloud` at `https://spiron.ai`, `openai-cloud`, `cursor-cloud`).
 2. **Profile (`--profile`) — Whose credentials or subscription pays:** Peer provider pools (`anthropic`, `openai`, `google-antigravity`, `muse`, `openrouter`, `sylphx`, Coding Plans) live under `<data>/profiles/<provider>/<profile>`. Binding a profile without a target harness mapping **fails closed** instead of silently falling back to an unauthenticated free tier.
 3. **Sandbox (`WorkspaceBackend`) — Where files and commands execute:** Implements the `anyagents_tools::WorkspaceBackend` trait—`LocalWorkspace` (local directory or git worktree by default), `RemoteSandboxWorkspace` (Cloud Sandbox / E2B HTTP APIs), `DockerWorkspace` (`docker://<host>`), or custom embedders.
 

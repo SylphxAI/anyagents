@@ -158,6 +158,67 @@ pub struct AgentView {
     /// is resent automatically; `anyagents outbound` retries or discards one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsettled_outbound: Vec<UnsettledOutboundView>,
+    /// For an agent that runs as a vendor's remote session, with no local
+    /// process (ADR 0010 D7): that session, its state and its spend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteSessionView>,
+}
+
+/// An agent's remote session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteSessionView {
+    /// The adapter that drives it (`claude-managed`).
+    pub adapter: String,
+    /// The vendor's session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// `attached` (a kernel holds its connection), `parked` (the agent
+    /// sleeps), `ended`, or `creating`.
+    pub status: String,
+    /// What the vendor last said: `running`, `idle`, `budget_reached`,
+    /// `terminated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_status: Option<String>,
+    /// The spend cap and what the session cost so far, in US cents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_cents: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_cents: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl From<&anyagents_core::RemoteExecution> for RemoteSessionView {
+    fn from(row: &anyagents_core::RemoteExecution) -> Self {
+        Self {
+            adapter: row.adapter.clone(),
+            session: row.vendor_session.clone(),
+            status: row.status.clone(),
+            vendor_status: row.vendor_status.clone(),
+            budget_cents: row.budget_cents,
+            cost_cents: row.cost_cents,
+            last_error: row.last_error.clone(),
+        }
+    }
+}
+
+impl RemoteSessionView {
+    /// One line for a listing: `remote claude-managed running $0.07/$25.00`.
+    pub fn label(&self) -> String {
+        let dollars = |cents: Option<i64>| {
+            cents.map_or_else(
+                || "-".to_string(),
+                |c| format!("${}.{:02}", c / 100, c % 100),
+            )
+        };
+        format!(
+            "remote {} {} {}/{}",
+            self.adapter,
+            self.vendor_status.as_deref().unwrap_or(&self.status),
+            dollars(self.cost_cents),
+            dollars(self.budget_cents)
+        )
+    }
 }
 
 impl AgentView {

@@ -55,6 +55,9 @@ pub enum HarnessHost {
 enum Host {
     Local(LocalAdapter),
     Kept(Box<RemoteHarness>),
+    /// A vendor's remote session: no local process, one connection held by
+    /// the remote-session executor (ADR 0010 D6).
+    Session(Box<anyagents_remote::Executor>),
 }
 
 /// An agent's harness as the kernel drives it: the adapter, wherever it is
@@ -197,6 +200,25 @@ impl VendorHarness {
         })
     }
 
+    /// An agent's remote session. It has no resume pointer here: the
+    /// executor's own record in the store names its vendor session.
+    pub(crate) fn session(executor: anyagents_remote::Executor) -> Self {
+        let selector = executor.harness().to_string();
+        Self {
+            host: Host::Session(Box::new(executor)),
+            pointer: None,
+            selector,
+        }
+    }
+
+    /// The remote session behind this harness, when it is one.
+    pub(crate) fn remote_session(&self) -> Option<&anyagents_remote::Executor> {
+        match &self.host {
+            Host::Session(executor) => Some(executor),
+            _ => None,
+        }
+    }
+
     /// A keeper a previous kernel left, taken over: the pointer and session
     /// record follow the labels its launch gave it.
     pub(crate) fn kept(remote: RemoteHarness) -> Self {
@@ -217,6 +239,7 @@ impl VendorHarness {
         match &self.host {
             Host::Local(adapter) => adapter,
             Host::Kept(remote) => remote.as_ref(),
+            Host::Session(executor) => executor.as_ref(),
         }
     }
 
@@ -224,6 +247,7 @@ impl VendorHarness {
         match &mut self.host {
             Host::Local(adapter) => adapter,
             Host::Kept(remote) => remote.as_mut(),
+            Host::Session(executor) => executor.as_mut(),
         }
     }
 
@@ -233,19 +257,22 @@ impl VendorHarness {
         is_spiron_harness(&self.selector)
     }
 
-    /// Leave a kept harness running for the next kernel. One hosted here
-    /// ends with this process anyway.
+    /// Leave a kept harness, or a remote session, running for the next
+    /// kernel. One hosted here ends with this process anyway.
     pub(crate) fn detach(self) {
-        if let Host::Kept(remote) = self.host {
-            (*remote).detach();
+        match self.host {
+            Host::Kept(remote) => (*remote).detach(),
+            Host::Session(executor) => (*executor).detach(),
+            Host::Local(_) => {}
         }
     }
 
     /// What this harness answers comes from its adapter: always in this
-    /// process, and from a keeper only while its link is open and answering.
+    /// process (a remote session's executor is here too), and from a keeper
+    /// only while its link is open and answering.
     pub(crate) fn answers_live(&self) -> bool {
         match &self.host {
-            Host::Local(_) => true,
+            Host::Local(_) | Host::Session(_) => true,
             Host::Kept(remote) => remote.answers_live(),
         }
     }
@@ -255,12 +282,17 @@ impl VendorHarness {
         matches!(&self.host, Host::Kept(remote) if remote.superseded())
     }
 
-    /// Keep `note` with a kept harness for the next kernel.
+    /// Keep `note` with a kept harness, or in a remote session's record,
+    /// for the next kernel.
     pub(crate) fn set_note(&self, note: &str) {
-        if let Host::Kept(remote) = &self.host
-            && let Err(error) = remote.set_note(note)
-        {
-            eprintln!("anyagents-keeper: cannot keep the process note: {error}");
+        match &self.host {
+            Host::Kept(remote) => {
+                if let Err(error) = remote.set_note(note) {
+                    eprintln!("anyagents-keeper: cannot keep the process note: {error}");
+                }
+            }
+            Host::Session(executor) => executor.set_note(note),
+            Host::Local(_) => {}
         }
     }
 
@@ -663,6 +695,9 @@ pub(crate) fn declared_delivery(harness: &str) -> anyagents_harness::Delivery {
         "grok" => crate::grok::DELIVERY,
         "spiron" => anyagents_harness_stream::SPIRON,
         "claude-code" => anyagents_harness_claude::DELIVERY,
+        name if crate::remote_exec::is_session_harness(name) => {
+            crate::remote_exec::declared_delivery(name)
+        }
         name if is_cloud_harness(name) => anyagents_harness_claude::CLOUD_DELIVERY,
         _ => anyagents_harness_stream::LINE_PER_TURN,
     }
@@ -874,6 +909,23 @@ fn vendor_launch_authorized(
     store: Option<&anyagents_core::Store>,
     host: &HarnessHost,
 ) -> Result<VendorHarness, String> {
+    // A remote session has no local process to prepare: no host memory, no
+    // seat, no workspace. Its executor connects from this kernel.
+    if crate::remote_exec::is_session_harness(&request.agent.harness) {
+        let store = store.ok_or_else(|| {
+            format!(
+                "remote agent `{}` cannot start: the store that issues its session token is unavailable",
+                request.agent.name
+            )
+        })?;
+        let result = crate::remote_exec::launch(&request, store);
+        if let Err(error) = &result {
+            persist_last_error(&request.config_dir, Some(error), None);
+        } else {
+            persist_last_error(&request.config_dir, None, None);
+        }
+        return result;
+    }
     // The supervisor owns the agent process lock. Allocate the host generation
     // before any vendor can consume its instructions, never from a late marker.
     crate::host_memory::before_launch(&request.data_dir, &request.agent.id).map_err(|error| {
@@ -3774,7 +3826,7 @@ done
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(NewAgent::new("cloudy", "claude-cloud"))
+            .create_agent(NewAgent::new("cloudy", "openai-cloud"))
             .unwrap();
         let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
         std::fs::create_dir_all(&config).unwrap();
@@ -3797,8 +3849,13 @@ done
             planned.launch
         );
         assert_eq!(
-            declared_delivery("claude-cloud"),
+            declared_delivery("openai-cloud"),
             anyagents_harness_claude::CLOUD_DELIVERY
+        );
+        // `claude-cloud` is a remote session, not a cloud harness process.
+        assert_eq!(
+            declared_delivery("claude-cloud"),
+            anyagents_remote::claude_managed::DELIVERY
         );
         assert_eq!(
             anyagents_harness_claude::CLOUD_DELIVERY.level,

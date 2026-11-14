@@ -67,6 +67,21 @@ static SESSION_FILES: Mutex<()> = Mutex::new(());
 struct ConfigFile {
     #[serde(default)]
     server: ServerTable,
+    #[serde(default)]
+    remote: RemoteTable,
+}
+
+/// `[remote]`: agents that run as a vendor's remote session. Unknown keys are
+/// refused for the same reason as in `[server]`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteTable {
+    /// The spend cap, in US dollars, of a metered remote agent that has none
+    /// of its own (`anyagents agents budget`).
+    budget_usd: Option<f64>,
+    /// A Claude Managed Agents environment every session runs in, instead
+    /// of one created per agent.
+    anthropic_environment_id: Option<String>,
 }
 
 /// `[server]`. Unknown keys are refused so a misspelt key fails loudly
@@ -87,6 +102,9 @@ pub struct Settings {
     /// Where the public listener binds, when it is configured.
     pub public_listen: Option<SocketAddr>,
     pub remote_session_ttl: Duration,
+    /// `[remote] budget_usd`, in US cents.
+    pub remote_budget_cents: Option<i64>,
+    pub anthropic_environment_id: Option<String>,
 }
 
 impl Default for Settings {
@@ -95,8 +113,24 @@ impl Default for Settings {
             public_url: None,
             public_listen: None,
             remote_session_ttl: DEFAULT_TTL,
+            remote_budget_cents: None,
+            anthropic_environment_id: None,
         }
     }
+}
+
+/// US dollars as whole cents, refusing anything that is not a positive cap.
+pub fn usd_to_cents(usd: f64) -> Result<i64, String> {
+    if !usd.is_finite() || usd <= 0.0 || usd > 1_000_000.0 {
+        return Err(format!(
+            "a spend cap must be a positive number of US dollars, not {usd}"
+        ));
+    }
+    let cents = (usd * 100.0).round() as i64;
+    if cents < 1 {
+        return Err("a spend cap must be at least one cent".into());
+    }
+    Ok(cents)
 }
 
 impl Settings {
@@ -149,10 +183,22 @@ impl Settings {
                 ttl
             }
         };
+        let remote_budget_cents = file
+            .remote
+            .budget_usd
+            .map(usd_to_cents)
+            .transpose()
+            .map_err(|err| format!("{}: [remote] budget_usd: {err}", origin.display()))?;
         Ok(Self {
             public_url,
             public_listen,
             remote_session_ttl,
+            remote_budget_cents,
+            anthropic_environment_id: file
+                .remote
+                .anthropic_environment_id
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
         })
     }
 
@@ -163,7 +209,7 @@ impl Settings {
             .map(|base| format!("{base}{MCP_PATH}"))
     }
 
-    fn ttl_ms(&self) -> i64 {
+    pub(crate) fn ttl_ms(&self) -> i64 {
         i64::try_from(self.remote_session_ttl.as_millis()).unwrap_or(i64::MAX)
     }
 }
@@ -287,6 +333,14 @@ pub fn rotate_due(store: &Store) -> Result<usize, Error> {
     let mut rotated = 0;
     for session in store.live_remote_sessions(now)? {
         if session.expires_at_ms.saturating_sub(now) >= ttl_ms / 2 {
+            continue;
+        }
+        // A remote session's executor rotates its own token and hands it to
+        // the vendor; a token file would reach no one.
+        if store
+            .agent(&session.agent_id)
+            .is_ok_and(|agent| crate::remote_exec::is_session_harness(&agent.harness))
+        {
             continue;
         }
         let _files = SESSION_FILES.lock().unwrap_or_else(|err| err.into_inner());

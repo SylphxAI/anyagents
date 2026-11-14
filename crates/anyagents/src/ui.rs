@@ -1173,7 +1173,11 @@ pub fn print_agents_table_with_options(
             None => dim("-"),
         };
 
-        let delivery = agent.delivery.label();
+        // A remote session has no local process: say so where its delivery is.
+        let delivery = match &agent.remote {
+            Some(_) => format!("remote · {}", agent.delivery.label()),
+            None => agent.delivery.label(),
+        };
         let delivery_cell = if is_dim { dim(&delivery) } else { delivery };
         let mut row = vec![
             node.display_name,

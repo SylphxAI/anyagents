@@ -31,6 +31,7 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
         AgentsCommand::RevokeRemote { agent, session } => {
             revoke_remote_cmd(data, &agent, session.as_deref())?
         }
+        AgentsCommand::Budget { agent, usd } => budget_cmd(data, &agent, usd)?,
         AgentsCommand::Rename { agent, new_name } => rename_cmd(data, &agent, &new_name)?,
         AgentsCommand::Role { agent, role, clear } => {
             role_cmd(data, &agent, role.as_deref(), clear)?
@@ -854,6 +855,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     let lifecycle_val = agent.lifecycle().to_string();
     let delivery: crate::api::DeliveryView =
         (&crate::vendor::declared_delivery(&agent.harness)).into();
+    let remote = remote_view(&store, &agent.id, &agent.harness);
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -894,6 +896,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
             .map_err(Error::Message)?,
         turn_errors: None,
         unsettled_outbound: Vec::new(),
+        remote,
     })
 }
 
@@ -1011,6 +1014,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let lifecycle_val = agent.lifecycle().to_string();
     let delivery: crate::api::DeliveryView =
         (&crate::vendor::declared_delivery(&agent.harness)).into();
+    let remote = remote_view(&store, &agent.id, &agent.harness);
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -1050,7 +1054,31 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)?,
         turn_errors: None,
         unsettled_outbound: Vec::new(),
+        remote,
     })
+}
+
+/// The agent's remote session, for an agent that runs as one.
+pub(crate) fn remote_view(
+    store: &anyagents_core::Store,
+    agent: &anyagents_core::AgentId,
+    harness: &str,
+) -> Option<crate::api::RemoteSessionView> {
+    if !crate::remote_exec::is_session_harness(harness) {
+        return None;
+    }
+    match store.remote_execution(agent).ok().flatten() {
+        Some(row) => Some((&row).into()),
+        None => Some(crate::api::RemoteSessionView {
+            adapter: crate::remote_exec::adapter_name(harness).to_string(),
+            session: None,
+            status: "none".into(),
+            vendor_status: None,
+            budget_cents: None,
+            cost_cents: None,
+            last_error: None,
+        }),
+    }
 }
 
 /// End an agent's remote sessions: through the server when it runs, else in
@@ -1078,6 +1106,31 @@ fn revoke_remote_cmd(data: &Path, agent: &str, session: Option<&str>) -> Result<
         "{}",
         serde_json::json!({ "agent": rec.name, "session_id": session, "revoked": revoked })
     );
+    Ok(())
+}
+
+/// Set a remote agent's spend cap: through the server when it runs, which
+/// hands it to the live session, else in the agent's record directly.
+fn budget_cmd(data: &Path, agent: &str, usd: f64) -> Result<(), Error> {
+    if client::can_call_server(data) {
+        let body = serde_json::json!({ "usd": usd });
+        let answered = client::call::<serde_json::Value>(
+            data,
+            "POST",
+            &format!("/v1/operator/agents/{agent}/remote-session/budget"),
+            Some(body.to_string().into_bytes()),
+            &client::authority(data),
+        )
+        .map_err(Error::Message)?
+        .ok_or_else(|| Error::Message("the server answered nothing".into()))?;
+        println!("{answered}");
+        return Ok(());
+    }
+    let store = open(data)?;
+    let rec = store.agent_by_name(agent)?;
+    store.record_admin_audit("operator", "agents.remote_budget", &rec.name)?;
+    let answered = crate::remote_exec::set_budget(&store, &rec, usd).map_err(Error::Message)?;
+    println!("{answered}");
     Ok(())
 }
 
@@ -1246,6 +1299,12 @@ fn list_filtered(
             .iter()
             .filter(|a| include_archived || a.state != "archived")
         {
+            // A remote session has no local process: its row says so.
+            let process = if agent.remote.is_some() {
+                "remote"
+            } else {
+                agent.process.as_str()
+            };
             if show_parent {
                 println!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -1255,7 +1314,7 @@ fn list_filtered(
                     agent.harness,
                     agent.model.as_deref().unwrap_or("-"),
                     agent.display_state(),
-                    agent.process,
+                    process,
                     show_optional(agent.oldest_undelivered_age_ms)
                 );
             } else {
@@ -1264,7 +1323,7 @@ fn list_filtered(
                     name: &agent.name,
                     harness: &agent.harness,
                     state: agent.display_state(),
-                    process: &agent.process,
+                    process,
                     delivery: agent.delivery.label(),
                     undelivered: agent.oldest_undelivered_age_ms,
                     quota: agent.quota_reset_at_ms,

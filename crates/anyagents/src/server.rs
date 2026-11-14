@@ -281,7 +281,13 @@ async fn serve(
     } else {
         Vec::new()
     };
-    let custody = crate::keeper::custody(data, &host, refused);
+    // Remote sessions are held by the remote-session executor whatever hosts
+    // the local harnesses: they always outlive this kernel.
+    let custody: Arc<dyn anyagents_supervisor::Custody<VendorHarness>> =
+        Arc::new(crate::remote_exec::SessionCustody::new(
+            Arc::clone(&store),
+            crate::keeper::custody(data, &host, refused),
+        ));
     let kept = matches!(host, HarnessHost::Keeper(_));
     let supervisor = Retaining(
         Some(
@@ -855,6 +861,35 @@ async fn revoke_remote_sessions_route(
     .await
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteBudgetRequest {
+    /// The spend cap, in US dollars.
+    usd: f64,
+}
+
+/// `POST /v1/operator/agents/{name}/remote-session/budget`: the operator or a
+/// root admin sets a remote agent's spend cap. It is kept with the agent and
+/// handed to its live session, which resumes work paused at the old cap.
+async fn remote_budget_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<RemoteBudgetRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "agents.remote_budget", &name)?;
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        crate::remote_exec::set_budget(&state.store, &agent, body.usd)
+            .map(Json)
+            .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))
+    })
+    .await
+}
+
 /// `GET /v1/webhooks/healthz` on `anyagents.sock`: the serving identity
 /// (version, source SHA, binary SHA-256) for the operator and the release
 /// tooling. The public listener answers [`public_healthz`] instead.
@@ -1063,6 +1098,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/v1/operator/agents/{name}/remote-sessions/revoke",
             post(revoke_remote_sessions_route),
+        )
+        .route(
+            "/v1/operator/agents/{name}/remote-session/budget",
+            post(remote_budget_route),
         )
         .route("/v1/whoami", get(whoami))
         .route("/v1/usage", get(usage_report))
@@ -3869,6 +3908,7 @@ fn archived_agent_view_fast(agent: &Agent) -> AgentView {
         schedules: Vec::new(),
         turn_errors: None,
         unsettled_outbound: Vec::new(),
+        remote: None,
     }
 }
 
@@ -4161,6 +4201,7 @@ fn agent_view_preloaded(
             .filter(|held| held.agent_id == agent.id)
             .map(unsettled_view)
             .collect(),
+        remote: crate::agent::remote_view(store, &agent.id, &agent.harness),
     })
 }
 

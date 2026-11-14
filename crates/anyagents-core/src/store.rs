@@ -33,6 +33,7 @@ mod mcp_ops;
 mod operator_inbox;
 mod outcomes;
 mod registry;
+mod remote_executions;
 mod remote_sessions;
 pub use registry::holds_store_writer;
 mod mail_notices;
@@ -57,6 +58,9 @@ pub use operator_inbox::{
 };
 pub use outcomes::{
     NewOutcome, Outcome, OutcomeCost, OutcomeGroup, OutcomeGroupBy, OutcomeKind, OutcomeReport,
+};
+pub use remote_executions::{
+    RemoteExecution, RemoteExecutionPatch, RemoteResume, RemoteTotals, remote_execution_status,
 };
 pub use remote_sessions::{
     REMOTE_SESSION_TOKEN_PREFIX, RemoteSession, RemoteSessionGrant, RemoteSessionToken,
@@ -3184,6 +3188,7 @@ impl Store {
                 "agent_aliases",
                 "agent_capabilities",
                 "remote_session_tokens",
+                "remote_executions",
                 "usage_records",
                 "outcomes",
                 "skill_reads",

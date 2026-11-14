@@ -1,5 +1,10 @@
-//! Outbound Cloud Harness Adapter (`spiron-cloud`, `claude-cloud`,
-//! `openai-cloud`, `cursor-cloud`).
+//! Outbound Cloud Harness Adapter (`spiron-cloud`, `openai-cloud`,
+//! `cursor-cloud`).
+//!
+//! These run a local process per agent and do not work as cloud agents
+//! (ADR 0010 context). Each is deleted when its remote-session adapter lands
+//! (`anyagents-remote`); `claude-cloud` already runs on Claude Managed Agents
+//! there.
 //!
 //! Speaks the `stream-json` wire protocol on stdin/stdout so `ClaudeHarness`
 //! and `anyagents-supervisor` supervise cloud agent runs with full turn
@@ -22,7 +27,7 @@ pub struct CloudHarnessArgs {
     /// the MCP callback URL and credentials.
     #[arg(long)]
     pub config: Option<PathBuf>,
-    /// Cloud harness identifier (`spiron-cloud`, `claude-cloud`, `openai-cloud`, `cursor-cloud`).
+    /// Cloud harness identifier (`spiron-cloud`, `openai-cloud`, `cursor-cloud`).
     #[arg(long)]
     pub harness: Option<String>,
     /// Model identifier to request from the cloud harness.
@@ -252,7 +257,6 @@ pub struct CloudTurnOutcome {
 fn session_filename_for(harness: &str) -> &'static str {
     match normalize_harness_name(harness) {
         "spiron-cloud" => "spiron-cloud-session-id",
-        "claude-cloud" => "claude-cloud-session-id",
         "openai-cloud" => "openai-cloud-session-id",
         "cursor-cloud" => "cursor-cloud-session-id",
         _ => "cloud-session-id",
@@ -377,11 +381,9 @@ fn extract_token_from_json_file(path: &Path) -> Option<String> {
         "/access_token",
         "/accessToken",
         "/OPENAI_API_KEY",
-        "/ANTHROPIC_API_KEY",
         "/CURSOR_API_KEY",
         "/SYLPHX_API_KEY",
         "/tokens/access_token",
-        "/claudeAiOauth/accessToken",
     ] {
         if let Some(s) = val.pointer(pointer).and_then(Value::as_str) {
             let trimmed = s.trim();
@@ -413,14 +415,6 @@ fn resolve_cloud_base_url(config: &Path, harness: &str) -> String {
             .filter(|s| !s.trim().is_empty())
             .or(json_url)
             .unwrap_or_else(|| "https://spiron.ai".to_string())
-            .trim_end_matches('/')
-            .to_string(),
-        "claude-cloud" => std::env::var("ANYAGENTS_ANTHROPIC_API_URL")
-            .ok()
-            .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok())
-            .filter(|s| !s.trim().is_empty())
-            .or(json_url)
-            .unwrap_or_else(|| "https://api.anthropic.com".to_string())
             .trim_end_matches('/')
             .to_string(),
         "openai-cloud" => std::env::var("ANYAGENTS_OPENAI_API_URL")
@@ -465,29 +459,6 @@ fn resolve_cloud_auth_token(config: &Path, harness: &str) -> Option<String> {
                 ".spiron/credentials.json",
                 ".config/sylphx/auth.json",
                 "credentials.json",
-                "auth.json",
-            ] {
-                if let Some(tok) = extract_token_from_json_file(&config.join(rel)) {
-                    return Some(tok);
-                }
-            }
-            None
-        }
-        "claude-cloud" => {
-            for env_key in [
-                "ANYAGENTS_ANTHROPIC_API_KEY",
-                "ANTHROPIC_API_KEY",
-                "CLAUDE_API_KEY",
-            ] {
-                if let Ok(v) = std::env::var(env_key)
-                    && !v.trim().is_empty()
-                {
-                    return Some(v.trim().to_string());
-                }
-            }
-            for rel in [
-                ".credentials.json",
-                ".claude/.credentials.json",
                 "auth.json",
             ] {
                 if let Some(tok) = extract_token_from_json_file(&config.join(rel)) {
@@ -729,37 +700,6 @@ pub fn dispatch_cloud_turn_with_cancel(
             }
             (format!("{base_url}/api/agent-runs"), body)
         }
-        "claude-cloud" => {
-            let mut body = json!({
-                "model": model.unwrap_or("claude-sonnet-4-6"),
-                "max_tokens": 8192,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt_text,
-                    }
-                ],
-                "mcp_servers": [
-                    {
-                        "type": "url",
-                        "name": "anyagents",
-                        "url": mcp_url,
-                        "authorization_token": capability,
-                    }
-                ],
-            });
-            if let Some(sys) = system_prompt {
-                body["system"] = Value::String(sys);
-            }
-            if !disabled_tools.is_empty() {
-                let configs: Vec<Value> = disabled_tools
-                    .iter()
-                    .map(|name| json!({ "name": name, "enabled": false }))
-                    .collect();
-                body["toolset_configs"] = Value::Array(configs);
-            }
-            (format!("{base_url}/v1/messages"), body)
-        }
         "openai-cloud" => {
             let mut body = json!({
                 "model": model.unwrap_or("gpt-5.4"),
@@ -825,14 +765,6 @@ pub fn dispatch_cloud_turn_with_cancel(
         .header("content-type", "application/json");
     if let Some(ref tok) = auth_token {
         req = req.header("authorization", &format!("Bearer {tok}"));
-        if canonical == "claude-cloud" {
-            req = req.header("x-api-key", tok);
-        }
-    }
-    if canonical == "claude-cloud" {
-        req = req
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "mcp-client-2025-04-04");
     }
 
     let mut resp = req
@@ -925,7 +857,6 @@ pub fn cloud_job_status_url(base_url: &str, harness: &str, job_id: &str) -> Stri
     let base = base_url.trim_end_matches('/');
     match normalize_harness_name(harness) {
         "spiron-cloud" => format!("{base}/api/agent-runs/{job_id}"),
-        "claude-cloud" => format!("{base}/v1/messages/{job_id}"),
         "openai-cloud" => format!("{base}/v1/responses/{job_id}"),
         "cursor-cloud" => format!("{base}/v0/agents/{job_id}"),
         _ => format!("{base}/api/agent-runs/{job_id}"),
@@ -940,7 +871,6 @@ pub fn cancel_cloud_turn(
 ) -> Result<(), String> {
     let status_url = cloud_job_status_url(base_url, harness, job_id);
     let cancel_url = format!("{status_url}/cancel");
-    let canonical = normalize_harness_name(harness);
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .http_status_as_error(false)
@@ -951,9 +881,6 @@ pub fn cancel_cloud_turn(
         .header("content-type", "application/json");
     if let Some(tok) = auth_token {
         req = req.header("authorization", &format!("Bearer {tok}"));
-        if canonical == "claude-cloud" {
-            req = req.header("x-api-key", tok);
-        }
     }
     let mut resp = req
         .send_json(json!({ "action": "cancel" }))
@@ -1033,14 +960,6 @@ fn poll_cloud_job_until_done(
         let mut req = agent.get(&status_url);
         if let Some(tok) = auth_token {
             req = req.header("authorization", &format!("Bearer {tok}"));
-            if canonical == "claude-cloud" {
-                req = req.header("x-api-key", tok);
-            }
-        }
-        if canonical == "claude-cloud" {
-            req = req
-                .header("anthropic-version", "2023-06-01")
-                .header("anthropic-beta", "mcp-client-2025-04-04");
         }
         let mut resp = req
             .call()
@@ -1137,11 +1056,6 @@ pub fn parse_sse_cloud_response(
             .unwrap_or(current_event.as_str());
 
         match ev_type {
-            "content_block_delta" => {
-                if let Some(t) = val.pointer("/delta/text").and_then(Value::as_str) {
-                    delta_chunks.push_str(t);
-                }
-            }
             "response.output_text.delta" => {
                 if let Some(t) = val.get("delta").and_then(Value::as_str) {
                     delta_chunks.push_str(t);
@@ -1259,20 +1173,15 @@ fn extract_cloud_reply_text(parsed: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        Router,
-        http::{HeaderMap, StatusCode},
-        routing::post,
-    };
+    use axum::{Router, http::StatusCode, routing::post};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
-    async fn cloud_harness_dispatches_spiron_claude_openai_and_cursor_turns_with_mcp_capability() {
+    async fn cloud_harness_dispatches_spiron_openai_and_cursor_turns_with_mcp_capability() {
         #[derive(Default)]
         struct RecordedCalls {
             spiron: Mutex<Vec<Value>>,
-            claude: Mutex<Vec<(String, Value)>>,
             openai: Mutex<Vec<Value>>,
             cursor: Mutex<Vec<Value>>,
         }
@@ -1293,31 +1202,6 @@ mod tests {
                                     "session_id": "spiron-sess-99",
                                     "result": "spiron cloud turn ok",
                                     "usage": { "input_tokens": 11, "output_tokens": 22 }
-                                })),
-                            )
-                        }
-                    }
-                }),
-            )
-            .route(
-                "/v1/messages",
-                post({
-                    let rec = Arc::clone(&recorded);
-                    move |headers: HeaderMap, axum::Json(payload): axum::Json<Value>| {
-                        let rec = Arc::clone(&rec);
-                        async move {
-                            let beta = headers
-                                .get("anthropic-beta")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("")
-                                .to_string();
-                            rec.claude.lock().unwrap().push((beta, payload));
-                            (
-                                StatusCode::OK,
-                                axum::Json(json!({
-                                    "id": "msg_claude_77",
-                                    "content": [{ "type": "text", "text": "claude cloud turn ok" }],
-                                    "usage": { "input_tokens": 15, "output_tokens": 25 }
                                 })),
                             )
                         }
@@ -1441,47 +1325,6 @@ mod tests {
             );
         }
 
-        // 2. claude-cloud
-        let cfg_clone = cfg.clone();
-        let claude_out = tokio::task::spawn_blocking(move || {
-            dispatch_cloud_turn(
-                &cfg_clone,
-                "claude-cloud",
-                Some("claude-sonnet-4-6"),
-                None,
-                "ping claude",
-            )
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(claude_out.session_id, "msg_claude_77");
-        assert_eq!(claude_out.reply_text, "claude cloud turn ok");
-        {
-            let calls = recorded.claude.lock().unwrap();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].0, "mcp-client-2025-04-04");
-            assert_eq!(
-                calls[0].1["mcp_servers"][0]["url"],
-                "https://mcp.example.test/mcp?profile=remote"
-            );
-            assert_eq!(
-                calls[0].1["mcp_servers"][0]["authorization_token"],
-                remote.as_str()
-            );
-            let sys = calls[0].1["system"].as_str().unwrap();
-            assert!(sys.contains("<learned_memory>"), "{sys}");
-            assert!(sys.contains("<available_skills>"), "{sys}");
-            assert!(sys.contains("prove-it"), "{sys}");
-            assert_eq!(
-                calls[0].1["toolset_configs"],
-                json!([
-                    {"name": "bash", "enabled": false},
-                    {"name": "write", "enabled": false}
-                ])
-            );
-        }
-
         // 3. openai-cloud
         let cfg_clone = cfg.clone();
         let openai_out = tokio::task::spawn_blocking(move || {
@@ -1564,27 +1407,6 @@ mod tests {
         let cancel_recorded = Arc::new(Mutex::new(Vec::<String>::new()));
 
         let app = Router::new()
-            // 1. Anthropic SSE stream on `/v1/messages`
-            .route(
-                "/v1/messages",
-                post(|| async move {
-                    let sse = concat!(
-                        "event: message_start\n",
-                        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_sse_101\",\"usage\":{\"input_tokens\":14}}}\n\n",
-                        "event: content_block_delta\n",
-                        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}\n\n",
-                        "event: content_block_delta\n",
-                        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"SSE World\"}}\n\n",
-                        "event: message_delta\n",
-                        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":28}}\n\n"
-                    );
-                    (
-                        StatusCode::OK,
-                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                        sse,
-                    )
-                }),
-            )
             // 2. OpenAI SSE stream on `/v1/responses`
             .route(
                 "/v1/responses",
@@ -1723,18 +1545,6 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-
-        // 1. Verify Anthropic SSE streaming
-        let cfg_clone = cfg.clone();
-        let claude_sse = tokio::task::spawn_blocking(move || {
-            dispatch_cloud_turn(&cfg_clone, "claude-cloud", None, None, "sse test").unwrap()
-        })
-        .await
-        .unwrap();
-        assert_eq!(claude_sse.session_id, "msg_sse_101");
-        assert_eq!(claude_sse.reply_text, "Hello SSE World");
-        assert_eq!(claude_sse.input_tokens, 14);
-        assert_eq!(claude_sse.output_tokens, 28);
 
         // 2. Verify OpenAI Responses SSE streaming
         let cfg_clone = cfg.clone();
@@ -1934,7 +1744,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path();
         std::fs::write(cfg.join("mcp-capability"), "cap-local\n").unwrap();
-        let err = dispatch_cloud_turn(cfg, "claude-cloud", None, None, "hi").unwrap_err();
+        let err = dispatch_cloud_turn(cfg, "openai-cloud", None, None, "hi").unwrap_err();
         assert!(err.contains("remote session token"), "{err}");
 
         std::fs::write(
@@ -1945,7 +1755,7 @@ mod tests {
         if std::env::var_os("ANYAGENTS_PUBLIC_MCP_URL").is_none() {
             let err = resolve_public_mcp_url(cfg).unwrap_err();
             assert!(err.contains("public_url"), "{err}");
-            let err = dispatch_cloud_turn(cfg, "claude-cloud", None, None, "hi").unwrap_err();
+            let err = dispatch_cloud_turn(cfg, "openai-cloud", None, None, "hi").unwrap_err();
             assert!(err.contains("public_url"), "{err}");
         }
 

@@ -33,6 +33,7 @@ mod opencode_config;
 mod operator;
 mod outbound;
 mod remote;
+mod remote_exec;
 mod reply;
 mod sandbox;
 mod sandbox_exec;
@@ -646,7 +647,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Run the outbound cloud harness adapter (`spiron-cloud`, `claude-cloud`, `openai-cloud`, `cursor-cloud`) speaking `stream-json`.
+    /// Run the outbound cloud harness adapter (`spiron-cloud`, `openai-cloud`, `cursor-cloud`) speaking `stream-json`.
     #[command(name = "cloud-harness")]
     CloudHarness(cloud_harness::CloudHarnessArgs),
     /// Run a local CLI harness inside a remote sandbox (`POST /v1/sandboxes/{id}/exec`) speaking `stream-json`.
@@ -945,6 +946,13 @@ enum AgentsCommand {
     GrantAdmin { agent: String },
     /// Revoke administrative authority immediately (operator only).
     RevokeAdmin { agent: String },
+    /// Set a remote agent's spend cap, in US dollars. A session paused at its old cap resumes once the new one is above what it cost (operator or root admin).
+    Budget {
+        /// Agent name or `agt_...` ID.
+        agent: String,
+        /// The cap, in US dollars.
+        usd: f64,
+    },
     /// End an agent's remote (cloud) sessions now: every token of each stops authenticating on its next call (operator or root admin).
     RevokeRemote {
         /// Agent name or `agt_...` ID.
@@ -1830,6 +1838,17 @@ fn inspect_cmd(data: &Path, agent: Option<String>, limit: usize, json: bool) -> 
                 .as_deref()
                 .map_or_else(String::new, |peer| format!("   Peer: {peer}"))
         );
+        if let Some(remote) = &view.remote {
+            println!(
+                "Executor: {}   Session: {}   Record: {}",
+                remote.label(),
+                remote.session.as_deref().unwrap_or("-"),
+                remote.status
+            );
+            if let Some(error) = &remote.last_error {
+                println!("Remote error: {error}");
+            }
+        }
         for schedule in &view.schedules {
             println!("  {} {}: {}", schedule.kind, schedule.spec, schedule.prompt);
         }
@@ -3050,8 +3069,11 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             .as_ref()
             .and_then(|id| create::bound_profile_name(&anyagents_core::agent_config_dir(data, id)))
             .unwrap_or_else(|| "default".to_string());
+        let executor = a.remote.as_ref().map_or_else(String::new, |remote| {
+            format!("\texecutor={}", remote.label())
+        });
         println!(
-            "  {}\t{}\tharness={}\tprofile={prof}\tstate={}\tprocess={}\tdelivery={}",
+            "  {}\t{}\tharness={}\tprofile={prof}\tstate={}\tprocess={}\tdelivery={}{executor}",
             a.name,
             a.id,
             a.harness,

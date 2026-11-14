@@ -13,6 +13,7 @@ members = [
     "crates/anyagents-harness-spiron",
     "crates/anyagents-agent",
     "crates/anyagents-keeper",
+    "crates/anyagents-remote",
     "crates/anyagents-supervisor",
     "crates/anyagents-installer",
     "crates/anyagents-toolchain",

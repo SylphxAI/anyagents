@@ -87,6 +87,7 @@ dependencies = [
  "anyagents-installer",
  "anyagents-invariants",
  "anyagents-keeper",
+ "anyagents-remote",
  "anyagents-supervisor",
  "anyagents-toolchain",
  "anyagents-tools",
@@ -303,6 +304,27 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "anyagents-remote"
+version = "0.1.8"
+dependencies = [
+ "anyagents-agent",
+ "anyagents-core",
+ "anyagents-harness",
+ "anyagents-keeper",
+ "anyagents-supervisor",
+ "axum",
+ "bytes",
+ "chrono",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

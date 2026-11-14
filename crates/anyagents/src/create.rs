@@ -2257,7 +2257,7 @@ pub(crate) fn seed_harness_credentials(
     }
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
     let static_rel_paths: &[&str] = match normalize_harness_name(&agent.harness) {
-        "claude-code" | "claude-cloud" => &[".credentials.json", ".claude/.credentials.json"],
+        "claude-code" => &[".credentials.json", ".claude/.credentials.json"],
         "codex" | "openai-cloud" if provider == "openai" => &[
             "auth.json",
             ".codex/auth.json",
@@ -2649,7 +2649,6 @@ pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
         "dsh" => Some("dsh-session-id"),
         "grok" => Some("grok-session-id"),
         "spiron-cloud" => Some("spiron-cloud-session-id"),
-        "claude-cloud" => Some("claude-cloud-session-id"),
         "openai-cloud" => Some("openai-cloud-session-id"),
         "cursor-cloud" => Some("cursor-cloud-session-id"),
         selector if crate::vendor::is_spiron_harness(selector) => Some("spiron-session-id"),
@@ -2760,7 +2759,6 @@ pub(crate) fn compute_live_session_continuity(
         "grok",
         "spiron",
         "spiron-cloud",
-        "claude-cloud",
         "openai-cloud",
         "cursor-cloud",
     ] {

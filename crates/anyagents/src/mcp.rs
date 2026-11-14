@@ -9186,6 +9186,7 @@ mod spawn_args_tests {
             schedules: Vec::new(),
             turn_errors: None,
             unsettled_outbound: Vec::new(),
+            remote: None,
         }
     }
 

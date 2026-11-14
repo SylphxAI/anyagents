@@ -64,6 +64,9 @@ pub use store::{
     REMOTE_SESSION_TOKEN_PREFIX, RemoteSession, RemoteSessionGrant, RemoteSessionToken,
     is_remote_session_token,
 };
+pub use store::{
+    RemoteExecution, RemoteExecutionPatch, RemoteResume, RemoteTotals, remote_execution_status,
+};
 
 /// The token a client presents as an agent, when it has one. A capability is
 /// written into the agent's own config directory; it is never an argument on a
