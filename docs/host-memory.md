@@ -20,8 +20,8 @@ and rerank models run is chosen through AnyAgents profiles
 ([providers](#embedding-and-rerank-providers)); with nothing configured, the
 default for an open-source install, both are pinned local ONNX models and no
 request leaves the host. The model work runs in a separate process,
-`anyagents memory-service`; without it the server ranks lexically and says so
-in each response.
+`anyagents memory-service`; without it the server ranks lexically and reports
+`retrieval.mode` `lexical`.
 
 ## Native history coverage
 
@@ -212,8 +212,11 @@ candidate failing any check is dropped. Lexical and dense hits are fused by
 reciprocal rank (k = 60); a document found by both keeps its lexical window.
 The fused list is merged with mailbox results, and its first 20 turns are
 reordered by the cross-encoder. A relevance search's response carries
-`retrieval.stages` (`lexical`, `dense`, `rerank`) and, for a stage that did
-not run, `retrieval.degraded` with the reason. Search waits at most 3 s for
+`retrieval.mode` and `retrieval.stages` (`lexical`, `dense`, `rerank`). The
+mode is `lexical` when no service runs on the data directory (nothing
+configured, the default), and nothing is reported degraded; it is `hybrid`
+when one does, and a stage the service could not run is then listed in
+`retrieval.degraded` with the reason. Search waits at most 3 s for
 the service and rerank 8 s; past that the server answers without the stage
 and says so. Reads in time order, range reads and neighbor expansion rank
 nothing and do not call the service.
@@ -232,7 +235,16 @@ embedded once. Vectors are L2-normalised and stored as per-vector int8.
 
 The background embedder takes new documents first and then the backlog newest
 first; both marks commit with each document, so a restart resumes where it
-stopped. It runs `--index-threads` workers (default 1) at nice 19 (`--nice`),
+stopped. Marks are named by the host index's generation (a new one each time
+its documents table is created and rowids start over) and by the worker count:
+a restart with another `--index-threads`, or a rebuilt host index, starts new
+marks and walks the catalog again, paying only for documents not already
+embedded at the same digest. A worker whose step fails (a model, the network,
+a database) keeps running and retries after 30 s, doubling to 10 minutes;
+`status.errors` and `status.indexing` name the error until a step succeeds,
+and a rebuild reports `retrying: …`. When a model request fails partway
+through a batch, the documents already embedded are stored, so their vectors
+are not bought twice, and their spend counts either way. It runs `--index-threads` workers (default 1) at nice 19 (`--nice`),
 each a single-threaded session over its own stripe of documents with its own
 marks, so the CPU it may take is exactly that many cores and only when no
 normal-priority work wants them. Query embedding and reranking run on their
@@ -304,9 +316,23 @@ the space is building, everything it embeds counts toward the rebuild, history
 published meanwhile included, and all embedding stops (`stopped: …`) when the
 spend the provider reports reaches the cap. Once every worker has embedded its
 backlog the space is recorded as built: from then on new history is embedded
-as it comes, a restart with another `--index-threads` is not a rebuild, and
-other spaces' files are deleted at the next sweep. Changing the reranker, or
-only `query_prefix`, rebuilds nothing.
+as it comes, and a restart with another `--index-threads` is not a rebuild.
+Other spaces' files stay until the operator runs `anyagents memory-service
+prune`, which removes them only once the configured space is built; nothing
+removes a space on its own, so a wrong `--config` or a local override never
+costs a paid index. A `--config` file must exist; only the default path may be
+absent, and then the service says it runs the pinned local pair.
+`--embedder`/`--reranker` replace the configured models and say so. Changing
+the reranker, or only `query_prefix`, rebuilds nothing.
+
+Spend outside a rebuild (query embeddings, rerank, and embedding new history
+once the space is built) is capped per UTC day by `max_daily_usd` (US$1 by
+default) and kept in `<data>/memory-service/spend.db`, so a restart does not
+reset it. Once the day's spend reaches the cap, rerank answers with the reason
+(search keeps BM25 and dense and lists `rerank:` in `retrieval.degraded`) and
+new history waits for the next UTC day; query embeddings, a fraction of a cent
+each, go on and are counted. `status` reports `today_usd` and
+`max_daily_usd`.
 
 `anyagents memory-service estimate` makes the same estimate for the configured
 embedder over the host index as it stands, without calling a model, reading a
@@ -345,7 +371,8 @@ The desk runs `qwen/qwen3-embedding-8b` and `mongodb/rerank-3` through the
     "usd_per_million_tokens": 0.05,
     "passage_chars": 1000
   },
-  "max_rebuild_usd": 10
+  "max_rebuild_usd": 10,
+  "max_daily_usd": 3
 }
 ```
 
@@ -364,15 +391,21 @@ The desk runs `qwen/qwen3-embedding-8b` and `mongodb/rerank-3` through the
   none. It shapes queries only and is not part of the vector space.
 - `passage_chars`: as measured; it also bounds one search's rerank to about
   20,000 characters.
+- `max_rebuild_usd`: the owner's cap on one rebuild. `max_daily_usd`: room for
+  a few thousand reranked searches (each at most about US$0.001) and a day of
+  new history (tens of millions of tokens at US$0.01 per million).
 
 The first start with this file builds the qwen3 space over everything the host
-index holds. After the host index covers every agent's native history, that is
-an estimated 275 to 570 million tokens: about US$3 to 6 at list price, inside
-the US$10 cap. Measured throughput was about 5,300 tokens a second per
-worker, so four workers (`--index-threads 4`) take roughly 4 to 8 hours; the
-dense index takes about 1.8 KB per 1024-dimension piece, roughly 2 to 4 GB.
-Each search then costs one query embedding and one rerank of at most 20
-passages, at most about US$0.001.
+index holds. A review on 2026-11-14 sampled the live host index at about 1.5
+to 2 billion tokens once every agent's native history is indexed: about US$15
+to 22 at list price, above the US$10 cap. With this file `serve` therefore
+waits (`waiting: estimated US$… exceeds max_rebuild_usd US$10.00`) and
+embeds nothing until the operator, having run `estimate`, raises
+`max_rebuild_usd`. At the measured 5,300 tokens a second per worker, four
+workers (`--index-threads 4`) take roughly 20 to 26 hours, and the dense index
+takes about 1.8 KB per 1024-dimension piece, roughly 10 to 13 GB. Each search
+then costs one query embedding and one rerank of at most 20 passages, at most
+about US$0.001.
 
 To build it:
 
@@ -383,8 +416,10 @@ To build it:
    is built is embedded as new history, outside the cap.
 2. Write the configuration above.
 3. `anyagents --data <data> memory-service estimate`: the documents, tokens
-   and US$ the rebuild will read and spend, and `"state": "running"`; it
-   exits non-zero if `serve` would wait.
+   and US$ the rebuild will read and spend, and the state `serve` would start
+   in; it exits non-zero while `serve` would wait. Run it more than once (each
+   reads another random sample), and raise `max_rebuild_usd` only after
+   deciding on the figure.
 4. `anyagents --data <data> memory-service serve --index-threads 4`, as the
    same user and groups as `anyagents serve`, so it can read every source the
    server indexed.
@@ -392,9 +427,20 @@ To build it:
    (`running`, then `done`), `rebuild.spent_usd` and the pending documents.
    A `conversation` search then reports `retrieval.stages`
    `["lexical", "dense", "rerank"]`.
+6. After a change of embedding model, once `status` says `done`,
+   `anyagents --data <data> memory-service prune` removes the old space's
+   index. A first build has nothing to remove.
 
 Stopping the service returns search to BM25 and says so in
-`retrieval.degraded`; the dense index stays for a later start. Without the
+`retrieval.degraded`; the dense index stays for a later start.
+
+Rolling the server back past this change: an older server cannot read the
+host index this one writes (Spiron journal rows are documents addressed as
+`<database>/<table>/<rowid>`, which an older server fails to read back), so its
+searches over Spiron history can fail. Stop it and delete
+`<data>/host-history-index-v1.db` with its `-wal` and `-shm`; the index is a
+rebuildable projection, and the older server builds it again. It ignores the
+dense indexes and `spend.db`. Without the
 file the service runs the pinned local pair, which is another space and builds
 its own index on local CPU at no cost.
 

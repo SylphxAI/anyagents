@@ -29,7 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after its estimated tokens and cost are reported, and only within
   `max_rebuild_usd`; while it builds, all embedding stops when the spend the
   provider reports reaches the cap. `anyagents memory-service estimate`
-  previews the rebuild without calling a model. Every OpenRouter request
+  previews the rebuild without calling a model. Spend outside a rebuild
+  (query embeddings, rerank, new history) is capped per UTC day by
+  `max_daily_usd` and persisted; past it rerank and new-history embedding
+  wait for the next day. Background workers retry failures with backoff and
+  report them in `status`; marks follow the host index's generation and the
+  worker count. No space is deleted automatically: `memory-service prune`
+  removes other spaces once the configured one is built, and a `--config`
+  that does not exist is an error. Every OpenRouter request
   carries `provider.data_collection = "deny"`, and a remote reranker reads at
   most `passage_chars` (1,000) characters of each passage. The desk's choice,
   `qwen/qwen3-embedding-8b` with `mongodb/rerank-3` through
@@ -39,7 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hybrid retrieval: BM25 fused with dense candidates from a local multilingual
   embedder and reranked by a local cross-encoder, run by the new
   `anyagents memory-service` process. Every result cites its raw bytes; without
-  the service the server ranks lexically and reports it in `retrieval`.
+  the service the server ranks lexically and reports `retrieval.mode`
+  `lexical`, with nothing marked degraded.
 - Security: the server no longer opens host files with its own access on an
   agent's behalf (ADR 0010 D3). A `send` with a local media path uploads it
   only when the sending agent can read it itself: a seat agent's file is
