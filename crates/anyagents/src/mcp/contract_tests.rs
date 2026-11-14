@@ -53,43 +53,46 @@ async fn a_command_with_its_own_timeout_stretches_the_call_and_one_without_inher
     if !limits_from_file() {
         return;
     }
+    // Limits leave a slow CI runner seconds to start the sandbox before the
+    // snippet's first call; each case still needs more than the default.
     let dir = tempfile::tempdir().unwrap();
     let mcp = agent_with_limits(
         dir.path(),
-        json!({"code_timeout_ms": 1000, "code_max_timeout_ms": 8000}),
+        json!({"code_timeout_ms": 4000, "code_max_timeout_ms": 15000}),
     );
 
-    // The call's default is 1s; the command asks for 4s and the call
+    // The call's default is 4s; the command asks for 8s and the call
     // stays open for it.
     let stretched = run(
         &mcp,
-        "const r = await workspace.exec({cmd: 'sleep 1.5; echo stretched', timeout_ms: 4000}); return r.stdout;",
+        "const r = await workspace.exec({cmd: 'sleep 4.5; echo stretched', timeout_ms: 8000}); return r.stdout;",
         None,
     )
     .await
     .unwrap();
     assert_eq!(stretched["result"], "stretched\n", "{stretched}");
 
-    // The call has 6s; a command naming no timeout gets what is left of
-    // it, not the 1s default.
+    // The call has 12s; a command naming no timeout gets what is left of
+    // it, not the 4s default.
     let inherited = run(
         &mcp,
-        "const r = await workspace.exec({cmd: 'sleep 1.5; echo inherited'}); return r.stdout;",
-        Some(6000),
+        "const r = await workspace.exec({cmd: 'sleep 4.5; echo inherited'}); return r.stdout;",
+        Some(12_000),
     )
     .await
     .unwrap();
     assert_eq!(inherited["result"], "inherited\n", "{inherited}");
 
-    // A command that outlives the time it was given names both ways out.
-    let timed_out = run(&mcp, "return await workspace.exec('sleep 5');", Some(2500))
+    // A command that outlives the time it was given names both ways out,
+    // before the call itself runs out.
+    let timed_out = run(&mcp, "return await workspace.exec('sleep 20');", Some(7000))
         .await
         .unwrap_err();
     assert!(
         timed_out.contains("workspace.exec timed out"),
         "{timed_out}"
     );
-    assert!(timed_out.contains("up to 8000"), "{timed_out}");
+    assert!(timed_out.contains("up to 15000"), "{timed_out}");
     assert!(timed_out.contains("background: true"), "{timed_out}");
 }
 
@@ -133,7 +136,7 @@ async fn long_commands_run_as_jobs_that_later_calls_await() {
     let dir = tempfile::tempdir().unwrap();
     let mcp = agent_with_limits(
         dir.path(),
-        json!({"code_timeout_ms": 1000, "code_max_timeout_ms": 8000}),
+        json!({"code_timeout_ms": 4000, "code_max_timeout_ms": 15000}),
     );
     let started = run(
         &mcp,
@@ -152,7 +155,7 @@ async fn long_commands_run_as_jobs_that_later_calls_await() {
             .is_dir()
     );
 
-    // A later call awaits it; the wait stretches the 1s call.
+    // A later call awaits it; the wait stretches the 4s call.
     let done = run(
         &mcp,
         &format!("return await workspace.job({{id: '{id}', wait_ms: 5000}});"),

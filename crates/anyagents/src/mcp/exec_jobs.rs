@@ -442,7 +442,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(JOBS_DIR);
         let marker = dir.path().join("leaked");
-        let cmd = format!("(sleep 1; echo leaked > '{}') & sleep 30", marker.display());
+        let cmd = format!("(sleep 3; echo leaked > '{}') & sleep 30", marker.display());
         let started = start(&root, &cmd, dir.path(), None).unwrap();
         let id = started["job_id"].as_str().unwrap().to_string();
         let begun = Instant::now();
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(running["status"], "running", "{running}");
         let killed = kill(&root, &id).unwrap();
         assert_eq!(killed["status"], "killed", "{killed}");
-        std::thread::sleep(Duration::from_millis(1_500));
+        std::thread::sleep(Duration::from_millis(3_500));
         assert!(
             !marker.exists(),
             "a background process of the job outlived the kill"
