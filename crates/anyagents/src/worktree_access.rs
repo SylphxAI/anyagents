@@ -3664,12 +3664,17 @@ fn verify_within(
             ),
         )
     };
-    let out = match output_within(command, timeout) {
-        Ok(Some(out)) => out,
-        Ok(None) => {
+    let kill = |group: libc::pid_t| kill_group(group, launch);
+    let out = match output_within(command, timeout, &kill) {
+        Ok(Ok(out)) => out,
+        Ok(Err(group)) => {
             return Err(seat(format!(
-                "the admission probe did not finish within {} s; its processes were killed",
-                timeout.as_secs()
+                "the admission probe did not finish within {} s; {}",
+                timeout.as_secs(),
+                match group {
+                    None => "its processes were killed".to_string(),
+                    Some(group) => format!("its process group {group} could not be killed"),
+                }
             )));
         }
         Err(error) if exec_failure(&error) => return Err(unexecutable(error.to_string())),
@@ -3693,12 +3698,15 @@ fn verify_within(
 }
 
 /// Run `command` in its own process group and collect its output, or kill
-/// the whole group once `timeout` passes (`None`). A stopped or stalled
-/// process and everything it started go with it.
+/// the whole group with `kill` once `timeout` passes: `Err(None)` when the
+/// group was killed, `Err(Some(group))` when it could not be. A stopped or
+/// stalled process and everything it started go with it; a group that cannot
+/// be killed is left behind rather than waited for.
 fn output_within(
     mut command: std::process::Command,
     timeout: std::time::Duration,
-) -> std::io::Result<Option<std::process::Output>> {
+    kill: &dyn Fn(libc::pid_t) -> bool,
+) -> std::io::Result<Result<std::process::Output, Option<libc::pid_t>>> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     command
@@ -3729,26 +3737,62 @@ fn output_within(
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
     );
     let (sender, receiver) = std::sync::mpsc::channel();
-    let waiter = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let _ = sender.send(child.wait());
     });
-    let status = match receiver.recv_timeout(timeout) {
-        Ok(status) => Some(status?),
+    match receiver.recv_timeout(timeout) {
+        Ok(status) => Ok(Ok(std::process::Output {
+            status: status?,
+            stdout: stdout.join().unwrap_or_default(),
+            stderr: stderr.join().unwrap_or_default(),
+        })),
         Err(_) => {
             // The child is not reaped yet, so its pid still names its group.
-            unsafe { libc::kill(-group, libc::SIGKILL) };
-            let _ = receiver.recv();
-            None
+            let killed = kill(group)
+                && receiver
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .is_ok();
+            Ok(Err((!killed).then_some(group)))
         }
+    }
+}
+
+/// SIGKILL a probe's process group. The server signals it itself when it
+/// may (as root, or as the seat's own uid); a seat process the server may
+/// not signal is killed as the seat, through the seat launcher, the way
+/// harness children are.
+fn kill_group(group: libc::pid_t, launch: Option<&str>) -> bool {
+    if unsafe { libc::kill(-group, libc::SIGKILL) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        && launch.is_some_and(|spec| kill_group_as_seat(group, spec))
+}
+
+/// SIGKILL a process group as the seat, through the seat launcher.
+fn kill_group_as_seat(group: libc::pid_t, launch: &str) -> bool {
+    let parts: Vec<_> = launch.split('\t').collect();
+    let [launcher, uid, gid, _] = parts[..] else {
+        return false;
     };
-    let _ = waiter.join();
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
-    Ok(status.map(|status| std::process::Output {
-        status,
-        stdout,
-        stderr,
-    }))
+    std::process::Command::new(launcher)
+        .args([
+            "--reuid",
+            uid,
+            "--regid",
+            gid,
+            "--clear-groups",
+            "--no-new-privs",
+            "--",
+        ])
+        .args(["/bin/kill", "-KILL", "--", &format!("-{group}")])
+        .env_clear()
+        .current_dir("/")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// An `exec` refusal of the program itself, as opposed to the identity
@@ -6312,6 +6356,27 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("did not finish within 1 s"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    /// A seat's probe the server may not signal is killed as the seat: the
+    /// launcher runs `/bin/kill` on the whole group. The stand-in launcher
+    /// here runs the command after `--` as the caller.
+    #[test]
+    fn a_probe_group_is_killed_through_the_seat_launcher() {
+        let dir = crate::test_tempdir();
+        let launcher = dir.path().join("launcher");
+        crate::worktree::tests::write_executable(
+            &launcher,
+            "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+        );
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & exec sleep 30"]);
+        let spec = format!("{}\t1\t1\t1", launcher.display());
+        let started = std::time::Instant::now();
+        let kill = |group: libc::pid_t| kill_group_as_seat(group, &spec);
+        let outcome = output_within(command, std::time::Duration::from_secs(1), &kill).unwrap();
+        assert!(matches!(outcome, Err(None)), "{outcome:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(20));
     }
 

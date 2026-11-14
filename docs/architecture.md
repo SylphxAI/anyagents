@@ -286,7 +286,9 @@ only external program, so a host image that wraps, removes or kills `find`, `sh`
 execute the server binary, with every ancestor directory traversable; a seat
 that cannot is refused with a message that names the binary. A seat's probe
 runs in its own process group and is killed with everything it started after
-300 seconds, so a seat that stops or stalls it cannot hold a creation. A probe
+300 seconds (as the seat, through the seat launcher's `/bin/kill`, when the
+server may not signal it), so a seat that stops or stalls it cannot hold a
+creation. A probe
 as the server's own uid and gid runs in the server process. New worktrees are
 shared with that seat's group.
 On Linux, additive POSIX ACLs grant writes only to shared `objects/`, `refs/`,
