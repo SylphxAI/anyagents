@@ -664,7 +664,8 @@ impl Client {
         loop {
             let (mut sender, reused) = match self.idle_connection().await {
                 Some(sender) => (sender, true),
-                None => (connect(&self.socket).await?, false),
+                // A tool call made while the server restarts waits for it.
+                None => (connect_within(&self.socket, RECONNECT_WITHIN).await?, false),
             };
             let response = match sender.try_send_request(request).await {
                 Ok(response) => response,
@@ -8312,12 +8313,43 @@ fn build_request(
         .map_err(|err| err.to_string())
 }
 
-/// A new HTTP/1 connection to the server's socket. Its driver runs as a task
-/// until the server closes it or the last sender is dropped.
+/// How long a tool server's call waits for the server's socket to come back.
+/// The harness outlives a server restart or upgrade (its keeper holds it),
+/// and for that moment nothing listens: the socket is missing or refuses.
+/// Only the connection is tried again; no request is ever sent twice. A
+/// one-shot command does not wait: an operator's read falls back to the
+/// store at once.
+const RECONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(90);
+/// How often a missing or refusing socket is tried again.
+const RECONNECT_PROBE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A new HTTP/1 connection to the server's socket, or an error at once when
+/// nothing listens. Its driver runs as a task until the server closes it or
+/// the last sender is dropped.
 async fn connect(socket: &Path) -> Result<http1::SendRequest<Full<Bytes>>, String> {
-    let stream = tokio::net::UnixStream::connect(socket)
-        .await
-        .map_err(|err| format!("cannot reach the server: {err}"))?;
+    connect_within(socket, std::time::Duration::ZERO).await
+}
+
+/// [`connect`], waiting up to `within` while nothing listens on `socket`.
+async fn connect_within(
+    socket: &Path,
+    within: std::time::Duration,
+) -> Result<http1::SendRequest<Full<Bytes>>, String> {
+    let deadline = tokio::time::Instant::now() + within;
+    let stream = loop {
+        match tokio::net::UnixStream::connect(socket).await {
+            Ok(stream) => break stream,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(RECONNECT_PROBE).await;
+            }
+            Err(err) => return Err(format!("cannot reach the server: {err}")),
+        }
+    };
     let (sender, connection) = http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|err| err.to_string())?;
@@ -8354,6 +8386,62 @@ fn parse_sequence_range(range: Option<&str>) -> Result<(Option<i64>, Option<i64>
         return Err("sequence range start must not exceed end".into());
     }
     Ok((Some(start), Some(end)))
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    /// A tool call made while the server restarts waits for its socket to
+    /// come back, and its request is sent once, on the new server.
+    #[tokio::test]
+    async fn a_call_made_while_the_server_restarts_reaches_the_next_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let listening = socket.clone();
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            let listener = tokio::net::UnixListener::bind(&listening).unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !String::from_utf8_lossy(&seen).contains("\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                seen.extend_from_slice(&buf[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            // A second request on another connection would block here.
+            drop(listener);
+            seen
+        });
+        let mut sender = super::connect_within(&socket, std::time::Duration::from_secs(20))
+            .await
+            .unwrap();
+        let request = super::build_request("GET", "/v1/health", None, None, None, None).unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        let seen = server.await.unwrap();
+        let seen = String::from_utf8_lossy(&seen);
+        assert!(
+            seen.starts_with("GET ") && seen.contains("/v1/health"),
+            "{seen}"
+        );
+    }
+
+    /// Past the wait, a server that is still gone is an error, as before.
+    #[tokio::test]
+    async fn a_server_still_gone_after_the_wait_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let started = std::time::Instant::now();
+        let error = super::connect_within(&socket, std::time::Duration::from_millis(600))
+            .await
+            .expect_err("a missing server was reached");
+        assert!(error.starts_with("cannot reach the server"), "{error}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(600));
+    }
 }
 
 #[cfg(test)]
@@ -9366,7 +9454,8 @@ mod spawn_args_tests {
             gateway: None,
         })
         .unwrap();
-        let server = tokio::spawn(async move {
+        let (served, server) = tokio::sync::oneshot::channel::<()>();
+        let later = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
             loop {
@@ -9382,6 +9471,30 @@ mod spawn_args_tests {
             );
             stream.write_all(header.as_bytes()).await.unwrap();
             stream.write_all(&body).await.unwrap();
+            drop(stream);
+            let _ = served.send(());
+            // The server stays up, as a real one does: what it does not
+            // serve here (memory reads) is answered `404`, and the tools fall
+            // back to the agent's own files.
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    match stream.read_u8().await {
+                        Ok(byte) => request.push(byte),
+                        Err(_) => break,
+                    }
+                }
+                let body = br#"{"error":"not served here"}"#;
+                let head = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
         });
 
         let mcp = AgentMcp {
@@ -9435,6 +9548,7 @@ mod spawn_args_tests {
         assert_eq!(code_res["logs"], json!(["parallel calls done 2"]));
         assert!(workdir.join("computed.txt").is_file());
         server.await.unwrap();
+        let _serving = &later;
 
         // 2. Verify capability sandbox blocks `process`, `process.env`, `require`, `child_process`, `fs`, `fetch`, and Function constructor escapes.
         let sandbox_probe = mcp
@@ -9618,6 +9732,7 @@ mod spawn_args_tests {
         assert_eq!(evo_res["result"]["execExit"], 0);
         assert_eq!(evo_res["result"]["execStdout"], "hello-exec");
         assert_eq!(evo_res["result"]["hasWebHelpers"], true);
+        later.abort();
     }
 
     #[tokio::test]
