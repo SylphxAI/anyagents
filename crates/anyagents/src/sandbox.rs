@@ -863,28 +863,28 @@ fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     crate::seat_tree::share(dir, uid, gid)
 }
 
-/// Prepare per-agent disposable build and temporary directories on the scratch
-/// tier and grant read/write ownership to the agent's OS seat.
+/// Prepare the agent's storage root on the scratch tier (its build and
+/// temporary directories) and grant read/write ownership to its OS seat.
 pub(crate) fn prepare_scratch_dirs_for_seat(
     scratch_root: &Path,
     agent_id: &anyagents_core::AgentId,
     uid: u32,
     gid: u32,
 ) -> std::io::Result<()> {
+    let root = anyagents_core::agent_scratch_root(scratch_root, agent_id);
     let build_root = anyagents_core::agent_scratch_build_dir(scratch_root, agent_id);
     let tmp_root = anyagents_core::agent_scratch_tmp_dir(scratch_root, agent_id);
     for dir in [
+        root.clone(),
         build_root.clone(),
         build_root.join("cargo"),
         build_root.join("gradle"),
         build_root.join("derived-data"),
-        tmp_root.clone(),
+        tmp_root,
     ] {
         ensure_seat_dir_as_owner(&dir, uid, gid, 0o2770)?;
     }
-    give_tree(&build_root, uid, gid)?;
-    give_tree(&tmp_root, uid, gid)?;
-    Ok(())
+    give_tree(&root, uid, gid)
 }
 
 /// Start one admitted agent command, or say what admission is missing.

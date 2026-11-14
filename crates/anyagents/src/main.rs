@@ -34,6 +34,7 @@ mod operator;
 mod outbound;
 mod remote;
 mod reply;
+mod rescue;
 mod sandbox;
 mod sandbox_exec;
 mod schedule;

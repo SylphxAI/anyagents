@@ -2,9 +2,10 @@
 //! - Tier 1 (`ANYAGENTS_STATE_DIR`): control-plane SQLite, capabilities, agent configs
 //! - Tier 2 (`ANYAGENTS_WORKSPACES_DIR` + `ANYAGENTS_GIT_POOL_DIR`): linked worktrees
 //!   backed by a shared bare Git object pool (`--reference-if-able` / `worktree add`)
-//! - Tier 3 (`ANYAGENTS_SCRATCH_DIR`): per-agent compile & temp trees
-//!   (`<scratch>/builds/<id>/{cargo,gradle,derived-data}`, `<scratch>/tmp/<id>`)
+//! - Tier 3 (`ANYAGENTS_SCRATCH_DIR`): each agent's storage root
+//!   (`<scratch>/agents/<id>/build/{cargo,gradle,derived-data}`, `<scratch>/agents/<id>/tmp`)
 //!   reaped synchronously on `archive`.
+//! - Archive saves a dirty checkout to `<state>/rescue/<id>/` before deleting it.
 
 mod support;
 
@@ -336,11 +337,8 @@ exec "{scripted_bin}" "$@"
     assert_eq!(common1, std::fs::canonicalize(&pool_bare).unwrap());
 
     // Wait for fake wrapper to run and write env-receipt.json in Tier 3 scratch
-    let receipt_path = tier3_scratch
-        .join("builds")
-        .join(&worker1_id)
-        .join("cargo")
-        .join("env-receipt.json");
+    let root1 = tier3_scratch.join("agents").join(&worker1_id);
+    let receipt_path = root1.join("build").join("cargo").join("env-receipt.json");
     let wait_receipt = Instant::now() + Duration::from_secs(10);
     while !receipt_path.is_file() {
         assert!(
@@ -355,20 +353,11 @@ exec "{scripted_bin}" "$@"
         serde_json::from_str(&std::fs::read_to_string(&receipt_path).unwrap()).unwrap();
     assert_eq!(
         receipt["CARGO_TARGET_DIR"].as_str().unwrap(),
-        tier3_scratch
-            .join("builds")
-            .join(&worker1_id)
-            .join("cargo")
-            .display()
-            .to_string()
+        root1.join("build").join("cargo").display().to_string()
     );
     assert_eq!(
         receipt["TMPDIR"].as_str().unwrap(),
-        tier3_scratch
-            .join("tmp")
-            .join(&worker1_id)
-            .display()
-            .to_string()
+        root1.join("tmp").display().to_string()
     );
     assert_eq!(
         receipt["SCCACHE_DIR"].as_str().unwrap(),
@@ -412,11 +401,8 @@ exec "{scripted_bin}" "$@"
         .expect("worker2 id")
         .to_string();
     let wt2 = tier2_workspaces.join(&worker2_id);
-    let receipt2 = tier3_scratch
-        .join("builds")
-        .join(&worker2_id)
-        .join("cargo")
-        .join("env-receipt.json");
+    let root2 = tier3_scratch.join("agents").join(&worker2_id);
+    let receipt2 = root2.join("build").join("cargo").join("env-receipt.json");
     let wait_r2 = Instant::now() + Duration::from_secs(10);
     while !receipt2.is_file() {
         assert!(Instant::now() < wait_r2, "worker-dirty did not run");
@@ -441,12 +427,8 @@ exec "{scripted_bin}" "$@"
         "archive worker-clean failed: {arch1}"
     );
     assert!(
-        !tier3_scratch.join("builds").join(&worker1_id).exists(),
-        "archive must immediately reap <scratch>/builds/<id>"
-    );
-    assert!(
-        !tier3_scratch.join("tmp").join(&worker1_id).exists(),
-        "archive must immediately reap <scratch>/tmp/<id>"
+        !root1.exists(),
+        "archive must immediately reap <scratch>/agents/<id>"
     );
     assert!(
         !wt1.exists(),
@@ -457,7 +439,8 @@ exec "{scripted_bin}" "$@"
         "Tier 1 state and Tier 2 bare pool must remain completely intact"
     );
 
-    // Archive worker-dirty -> Tier 3 builds/tmp MUST be wiped immediately while dirty Tier 2 source stays safe!
+    // Archive worker-dirty -> Tier 3 root MUST be wiped immediately, and the dirty
+    // Tier 2 source is saved to the rescue area before its checkout is deleted.
     let arch2 = support::call_raw(
         &socket,
         "POST",
@@ -470,16 +453,29 @@ exec "{scripted_bin}" "$@"
         "archive worker-dirty failed: {arch2}"
     );
     assert!(
-        !tier3_scratch.join("builds").join(&worker2_id).exists(),
-        "archive must immediately reap <scratch>/builds/<id> even when source worktree is dirty"
+        !root2.exists(),
+        "archive must immediately reap <scratch>/agents/<id> even when source worktree is dirty"
     );
-    assert!(
-        !tier3_scratch.join("tmp").join(&worker2_id).exists(),
-        "archive must immediately reap <scratch>/tmp/<id> even when source worktree is dirty"
-    );
+    let rescues = tier1_state.join("rescue").join(&worker2_id);
+    let rescued = std::fs::read_dir(&rescues)
+        .unwrap_or_else(|e| panic!("no rescue at {}: {e}", rescues.display()))
+        .map(|entry| entry.unwrap().path())
+        .next()
+        .expect("one rescue");
+    let tar = Command::new("tar")
+        .arg("-xOf")
+        .arg(rescued.join("work.uncommitted.tar"))
+        .arg("README.md")
+        .output()
+        .unwrap();
     assert_eq!(
-        std::fs::read_to_string(wt2.join("README.md")).unwrap(),
+        String::from_utf8_lossy(&tar.stdout),
         "# Unpushed work in progress\n",
         "dirty uncommitted source in Tier 2 worktree must never be lost"
     );
+    // HEAD is pushed, so its commit and the tar restore it: no bundle.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(rescued.join("manifest.json")).unwrap()).unwrap();
+    assert!(manifest["checkouts"][0]["head"].is_string(), "{manifest:#}");
+    assert!(!wt2.exists(), "a rescued checkout is deleted");
 }

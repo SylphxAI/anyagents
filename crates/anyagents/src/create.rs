@@ -12965,13 +12965,27 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             "clean unmodified worktree should be reaped without recreating empty work/ dir"
         );
 
-        //    - Dirty L1's worktree with an uncommitted file -> reaping L1 MUST preserve `l1_wt`!
+        //    - Dirty L1's worktree with an uncommitted file -> reaping L1 saves it to
+        //      the rescue area before the checkout goes: never lost.
         std::fs::write(l1_wt.join("uncommitted.txt"), "work in progress\n").unwrap();
         crate::server::reap_subagent_ephemeral_dirs(data, &l1.id);
-        assert!(
-            l1_wt.join("uncommitted.txt").is_file(),
-            "dirty worktree must NEVER be deleted on archive"
+        let rescued = std::fs::read_dir(anyagents_core::rescue_dir(data).join(l1.id.as_str()))
+            .expect("dirty worktree was rescued")
+            .map(|entry| entry.unwrap().path())
+            .next()
+            .unwrap();
+        let saved = std::process::Command::new("tar")
+            .arg("-xOf")
+            .arg(rescued.join("work.uncommitted.tar"))
+            .arg("uncommitted.txt")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&saved.stdout),
+            "work in progress\n",
+            "dirty worktree must NEVER be lost on archive"
         );
+        assert!(!l1_wt.exists());
     }
 
     #[test]

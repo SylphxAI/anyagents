@@ -154,14 +154,23 @@ the pause is delivered after recovery. Rate-limit responses without a stated
 retry time use exponential cooldowns from 60 to 300 seconds. Permission and
 payload errors remain distinct and never masquerade as completed checks.
 
-### Archived sub-agent cleanup
+### Archived agent cleanup
 
 An explicit archive creates a fresh `.anyagents-archived` generation in the
-agent's config directory. Successful ephemeral cleanup copies that generation
-to `.anyagents-reaped`; retained dirty, unpushed, external or shared worktrees do
-not cause cleanup to repeat. A wake clears both markers before the agent resumes.
-Missing or empty legacy archive generations are repaired under the lifecycle
-lock, and unsuccessful cleanup stays pending for a later pass.
+agent's config directory. Cleanup removes the agent's scratch storage root at
+once, for root agents and sub-agents alike. For a sub-agent it also removes
+harness caches and reclaims its managed work directory checkout by checkout
+([ADR 0012](adr/0012-agent-storage-roots.md)): a clean, pushed checkout is
+deleted; one with unpushed commits or uncommitted files is first saved to
+`{rescue}/{agent id}/{time}/` as a `git bundle` and a tar of the uncommitted
+files; loose files are saved as a tar; a checkout whose state cannot be read
+stays in place and the operator inbox is told. External and shared worktrees are
+never touched. Successful cleanup writes the generation and the cleanup revision
+to `.anyagents-reaped`; an archive an earlier revision finished is revisited
+when its storage is still on disk. A wake clears both markers before the agent
+resumes. Missing or empty legacy archive generations are repaired under the
+lifecycle lock, and unsuccessful cleanup stays pending for a later pass. One
+maintenance pass spends at most 20 seconds on cleanups and leaves the rest due.
 
 Both server modes run archive cleanup in their existing independent maintenance
 worker, immediately at startup and then every 60 seconds. Mail reconciliation
@@ -559,6 +568,20 @@ ORDER BY id;
 ## Storage
 
 One embedded SQLite database in WAL mode under the data directory holds every resource, the mailboxes and the usage records. A message is `received` when its insert has committed. Schema changes are versioned migrations applied at server start.
+
+### Storage tiers and agent roots
+
+With no tier configured, everything lives under the data directory. A deployment can split it ([ADR 0012](adr/0012-agent-storage-roots.md)):
+
+| Setting | Holds | Lifecycle |
+| --- | --- | --- |
+| `ANYAGENTS_STATE_DIR` | `state.db`, capabilities, agent config | kept |
+| `ANYAGENTS_WORKSPACES_DIR` | managed work directories, `{workspaces}/{id}` | rescued and removed on archive |
+| `ANYAGENTS_SCRATCH_DIR` | each agent's root, `{scratch}/agents/{id}/{build,tmp}` | build output under `ANYAGENTS_SCRATCH_BUILD_BUDGET` (300 GiB); removed on archive |
+| `ANYAGENTS_GIT_POOL_DIR` | the shared bare object pool | kept |
+| `ANYAGENTS_RESCUE_DIR` | work saved from archived checkouts, default `{data}/rescue` | kept |
+
+The harness gets `CARGO_TARGET_DIR`, `GRADLE_USER_HOME`, `DERIVED_DATA_PATH` and `TMPDIR` inside its root, and `ANYAGENTS_AGENT_BUILD_DIR` naming its `build/` for host build wrappers. The budget check runs every ten minutes and logs every eviction; `ANYAGENTS_SCRATCH_BUILD_BUDGET_DRY_RUN=1` logs the plan without removing anything.
 
 ### Locks and their order
 
