@@ -4,7 +4,7 @@ Status: proposed. Date: 2026-11-14. Amends [0006](0006-runtime-state-and-lifecyc
 
 ## Context
 
-Archive cleanup deleted only checkouts that were clean and fully pushed. It kept every other checkout of an archived agent in place, with no end date. On the desk on 2026-11-14 that was 77 archived agents' work directories, 31.8 GiB under `{data}/agents/*/work`. There were also 67 under `{workspaces}`, and the agents behind them will never run again.
+Archive cleanup deleted only checkouts that were clean and fully pushed. It kept every other checkout of an archived agent in place, with no end date. On the desk on 2026-11-14 that was 77 archived agents' work directories, 31.8 GiB under `{data}/agents/*/work`. There were also 72 under `{workspaces}`, and the agents behind them will never run again.
 
 Keeping the checkouts whole protects the work, but nobody reviews it, and it holds the disk forever. Deleting it would lose what no remote has: unpushed branches, the stash, local tags, notes, commits only a reflog reaches, and uncommitted files.
 
