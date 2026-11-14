@@ -703,14 +703,17 @@ fn lock_config(path: PathBuf) -> std::io::Result<ConfigLock> {
     Ok(ConfigLock { _file: file, path })
 }
 
-/// Caller holds the journal lock. Relocate the server's own plain config into
-/// the dedicated directory (or finish an interrupted relocation), then give
-/// `readers` read access to it. A config another principal owns is left in
-/// place: only the server's own objects can witness a relocation.
+/// Caller holds the journal lock. Relocate the store's plain config (the
+/// server's or the store owner's; [`open_common_config`] refuses anyone
+/// else's) into the dedicated directory, or finish an interrupted
+/// relocation, then give `readers` read access to it. Admission checked
+/// first that this server may relocate it ([`relocatable`]).
 fn manage_config(common: &Path, readers: &[u32]) -> std::io::Result<()> {
     let relocated = relocate_config(common, &|| Ok(()))?;
     if !matches!(open_common_config(common)?, CommonConfig::Managed { .. }) {
-        return Ok(()); // not the server's to relocate
+        return Err(std::io::Error::other(
+            "the Git config is not managed after its relocation",
+        ));
     }
     let _lock = match relocated {
         Some(lock) => lock,
@@ -762,12 +765,28 @@ fn relocate_config(
         CommonConfig::Plain(file) | CommonConfig::Linked(file) => file,
     };
     let meta = source.metadata()?;
+    if let Some(refusal) = relocation_refusal(meta.uid(), crate::sandbox::server_uid(), unsafe {
+        libc::geteuid()
+    }) {
+        return Err(std::io::Error::other(refusal));
+    }
     let path = common.join(CONFIG_DIRECTORY);
     let created = match std::fs::DirBuilder::new().mode(0o700).create(&path) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(error) => return Err(error),
     };
+    // A relocation that fails before the move leaves no directory of its
+    // own behind (one holding the config stays: it is the interrupted state).
+    struct Made<'a>(Option<&'a Path>);
+    impl Drop for Made<'_> {
+        fn drop(&mut self) {
+            if let Some(path) = self.0 {
+                let _ = std::fs::remove_dir(path);
+            }
+        }
+    }
+    let mut made = Made(created.then_some(path.as_path()));
     let directory = managed_directory(common, &owners)?;
     let same = |file: &std::fs::File| {
         file.metadata()
@@ -856,8 +875,42 @@ fn relocate_config(
     }
     std::os::unix::fs::symlink(Path::new(CONFIG_DIRECTORY).join("config"), &stage)?;
     std::fs::rename(&stage, common.join("config"))?;
+    made.0 = None;
     open_nofollow(common)?.sync_all()?;
     Ok(Some(target_lock))
+}
+
+/// Why this server cannot relocate a config `owner` owns, if it cannot: the
+/// dedicated directory goes to the config's owner, and only root may give a
+/// directory to another user.
+fn relocation_refusal(owner: u32, server: u32, euid: u32) -> Option<String> {
+    (owner != server && euid != 0).then(|| {
+        format!(
+            "the store's Git config belongs to uid {owner}, not the server (uid {server}), and \
+             only a server running as root can relocate another user's config; have root give \
+             the config to the server's user, or run the server as root"
+        )
+    })
+}
+
+/// Admission's check, before any journal or grant, that a seat's admission
+/// will be able to relocate the store's config (see [`relocation_refusal`]).
+fn relocatable(common: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let file = match open_common_config(common) {
+        Ok(CommonConfig::Managed { .. }) => return Ok(()),
+        Ok(CommonConfig::Plain(file) | CommonConfig::Linked(file)) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    match relocation_refusal(
+        file.metadata()?.uid(),
+        crate::sandbox::server_uid(),
+        unsafe { libc::geteuid() },
+    ) {
+        Some(refusal) => Err(std::io::Error::other(refusal)),
+        None => Ok(()),
+    }
 }
 
 /// The common directory's owning group, when it may list and traverse the
@@ -2583,6 +2636,11 @@ fn share_known_locked(
     secure_private_config(common, private).map_err(|e| refusal(private, e))?;
     validate_config_files(private, common)?;
     trusted_metadata_layout(common, private, uid).map_err(|e| refusal(common, e))?;
+    // A seat's admission relocates the config: refuse now, not after the
+    // journal is active, when this server cannot.
+    if !(uid == crate::sandbox::server_uid() && gid == crate::sandbox::server_gid()) {
+        relocatable(common).map_err(|e| refusal(common, e))?;
+    }
     // A journal awaiting recovery is never overwritten by a new grant.
     match std::fs::read(journal) {
         Ok(bytes) => {
@@ -6790,6 +6848,19 @@ mod tests {
         )
         .unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    }
+
+    /// Relocation hands the managed directory to the config's owner, which
+    /// only root may do for another user: such a store is refused up front.
+    #[test]
+    fn only_root_relocates_another_users_config() {
+        let refusal = relocation_refusal(1000, 1001, 1001).unwrap();
+        assert!(
+            refusal.contains("uid 1000") && refusal.contains("root"),
+            "{refusal}"
+        );
+        assert!(relocation_refusal(1001, 1001, 1001).is_none());
+        assert!(relocation_refusal(1000, 0, 0).is_none());
     }
 
     /// The review's attack on the settle pass: after a failed creation, a
