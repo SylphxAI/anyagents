@@ -593,7 +593,9 @@ fn mail_the_vendor_refuses_backs_off_and_honours_retry_after() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(offers > 50, "offered {offers} times");
+    // However often the mail is offered while it waits (a slow runner
+    // offers less), the vendor is asked once.
+    assert!(offers >= 5, "offered {offers} times");
     assert_eq!(
         vendor.sent("user.message").len(),
         1,
