@@ -490,7 +490,7 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(anyagents_core::NewAgent::new("cloud", "claude-cloud"))
+            .create_agent(anyagents_core::NewAgent::new("cloud", "openai-cloud"))
             .unwrap();
         let err = begin_session(&store, &agent).unwrap_err();
         assert!(err.contains("public_url"), "{err}");
@@ -510,7 +510,7 @@ mod tests {
         .unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(anyagents_core::NewAgent::new("cloud", "claude-cloud"))
+            .create_agent(anyagents_core::NewAgent::new("cloud", "openai-cloud"))
             .unwrap();
         let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -530,7 +530,7 @@ mod tests {
         .unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
-            .create_agent(anyagents_core::NewAgent::new("cloud", "claude-cloud"))
+            .create_agent(anyagents_core::NewAgent::new("cloud", "openai-cloud"))
             .unwrap();
         begin_session(&store, &agent).unwrap();
         let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
@@ -593,5 +593,23 @@ mod tests {
                 .session_id,
             grant.session_id
         );
+    }
+
+    #[test]
+    fn a_remote_session_agents_token_is_rotated_by_its_executor_not_into_a_file() {
+        let dir = crate::test_tempdir();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("managed", "claude-cloud"))
+            .unwrap();
+        store.begin_remote_session(&agent.id, 60_000).unwrap();
+        assert_eq!(rotate_due(&store).unwrap(), 0);
+        let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        assert!(!config.join(TOKEN_FILE).exists());
     }
 }
