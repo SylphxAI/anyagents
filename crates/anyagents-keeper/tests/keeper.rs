@@ -387,6 +387,24 @@ fn a_second_kernel_supersedes_the_first_without_ending_the_harness() {
     assert!(!group_alive(pid));
 }
 
+/// A kernel that stops its own wedged keeper takes it over on a fresh
+/// connection; the keeper tells the old link it was superseded. That is the
+/// kernel's own doing, not another server's: it must not stand down.
+#[test]
+fn a_kernel_that_stops_its_own_keeper_afresh_is_not_superseded() {
+    let fx = Fixture::new();
+    let mut kernel = fx.spawn();
+    kernel.set_call_deadline(Duration::from_millis(300));
+    assert!(kernel.deliver(&message("wedge")).is_err());
+    let dir = kernel.dir().to_path_buf();
+    Harness::stop(&mut kernel);
+    assert!(!dir.exists(), "the wedged keeper was not stopped");
+    assert!(
+        !kernel.superseded(),
+        "the kernel took its own fresh connection for another server"
+    );
+}
+
 /// Why attach refused to take over (or clear) the keeper there.
 #[cfg(target_os = "linux")]
 fn refused_attach(root: &std::path::Path) -> String {

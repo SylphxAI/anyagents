@@ -851,7 +851,15 @@ impl Link {
                     }) => self.fire(),
                     Ok(Reply::Event {
                         event: Event::Superseded,
-                    }) => lock(&self.state).superseded = true,
+                    }) => {
+                        // A kernel that ends the link itself took the keeper
+                        // over on a fresh connection to stop it: that is not
+                        // another server.
+                        let mut state = lock(&self.state);
+                        if !state.ending {
+                            state.superseded = true;
+                        }
+                    }
                     _ => {}
                 }
                 continue;
