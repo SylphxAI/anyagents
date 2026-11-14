@@ -3699,62 +3699,149 @@ fn verify_within(
 
 /// Run `command` in its own process group and collect its output, or kill
 /// the whole group with `kill` once `timeout` passes: `Err(None)` when the
-/// group was killed, `Err(Some(group))` when it could not be. A stopped or
-/// stalled process and everything it started go with it; a group that cannot
-/// be killed is left behind rather than waited for.
+/// group was killed, `Err(Some(group))` when it could not be. The child is
+/// never reaped before the kill, so its pid still names its group. Output is
+/// read until the same deadline and no longer: another process of the seat
+/// can hold the pipes open (through `/proc/<pid>/fd`), so after the child
+/// exits its output is read for at most a short grace, then the pipes are
+/// closed.
 fn output_within(
     mut command: std::process::Command,
     timeout: std::time::Duration,
     kill: &dyn Fn(libc::pid_t) -> bool,
 ) -> std::io::Result<Result<std::process::Output, Option<libc::pid_t>>> {
     use std::io::Read;
+    use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(2);
     command
         .process_group(0)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = command.spawn()?;
     let group = child.id() as libc::pid_t;
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
-            }
-            bytes
-        })
-    };
-    let stdout = drain(
+    let deadline = std::time::Instant::now() + timeout;
+    let mut pipes: Vec<Option<std::fs::File>> = vec![
         child
             .stdout
             .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let stderr = drain(
+            .map(|p| std::fs::File::from(std::os::fd::OwnedFd::from(p))),
         child
             .stderr
             .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = sender.send(child.wait());
-    });
-    match receiver.recv_timeout(timeout) {
-        Ok(status) => Ok(Ok(std::process::Output {
-            status: status?,
-            stdout: stdout.join().unwrap_or_default(),
-            stderr: stderr.join().unwrap_or_default(),
-        })),
-        Err(_) => {
-            // The child is not reaped yet, so its pid still names its group.
-            let killed = kill(group)
-                && receiver
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .is_ok();
-            Ok(Err((!killed).then_some(group)))
+            .map(|p| std::fs::File::from(std::os::fd::OwnedFd::from(p))),
+    ];
+    for pipe in pipes.iter().flatten() {
+        let fd = pipe.as_raw_fd();
+        unsafe {
+            libc::fcntl(
+                fd,
+                libc::F_SETFL,
+                libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+            )
+        };
+    }
+    let mut output = [Vec::new(), Vec::new()];
+    let mut exited_at = None;
+    loop {
+        if exited_at.is_none() && exited_unreaped(group)? {
+            exited_at = Some(std::time::Instant::now());
+        }
+        let now = std::time::Instant::now();
+        let until = exited_at.map_or(deadline, |at| deadline.min(at + GRACE));
+        if pipes.iter().all(Option::is_none) && exited_at.is_some() || now >= until {
+            break;
+        }
+        let mut polled: Vec<libc::pollfd> = pipes
+            .iter()
+            .flatten()
+            .map(|pipe| libc::pollfd {
+                fd: pipe.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // Until the child exits, wake regularly to notice it.
+        let wait = if exited_at.is_some() {
+            until - now
+        } else {
+            (until - now).min(std::time::Duration::from_millis(50))
+        };
+        unsafe {
+            libc::poll(
+                polled.as_mut_ptr(),
+                polled.len() as libc::nfds_t,
+                wait.as_millis().clamp(1, i32::MAX as u128) as libc::c_int,
+            )
+        };
+        for (slot, buffer) in pipes.iter_mut().zip(output.iter_mut()) {
+            let Some(pipe) = slot else { continue };
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => {
+                        *slot = None;
+                        break;
+                    }
+                    Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break, // WouldBlock: nothing more for now
+                }
+            }
         }
     }
+    drop(pipes);
+    if exited_at.is_none() {
+        let killed = kill(group) && {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if exited_unreaped(group).unwrap_or(true) {
+                    break true;
+                }
+                if std::time::Instant::now() >= until {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        if killed {
+            let _ = child.wait();
+        } else {
+            // Reaped whenever it ends; never waited for here.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        return Ok(Err((!killed).then_some(group)));
+    }
+    let status = child.wait()?;
+    let [stdout, stderr] = output;
+    Ok(Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }))
+}
+
+/// Whether the child `pid` has exited, without reaping it.
+fn exited_unreaped(pid: libc::pid_t) -> std::io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    #[cfg(target_os = "linux")]
+    let reported = unsafe { info.si_pid() };
+    #[cfg(not(target_os = "linux"))]
+    let reported = info.si_pid;
+    Ok(reported != 0)
 }
 
 /// SIGKILL a probe's process group. The server signals it itself when it
@@ -6676,6 +6763,33 @@ mod tests {
             error.to_string().contains("writable by no one else"),
             "{error}"
         );
+    }
+
+    /// Another process of the seat may hold the probe's output pipe open
+    /// after the probe exits (here a child in a session of its own, which
+    /// the group kill does not reach): the reads end at a deadline.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_output_reads_end_at_a_deadline() {
+        let dir = crate::test_tempdir();
+        let launcher = dir.path().join("launcher");
+        crate::worktree::tests::write_executable(
+            &launcher,
+            "#!/bin/sh\n/usr/bin/setsid -f /bin/sleep 30\nexit 0\n",
+        );
+        let uid = crate::sandbox::server_uid().wrapping_add(1);
+        let gid = crate::sandbox::server_gid();
+        let spec = format!("{}\t{uid}\t{gid}\t{gid}", launcher.display());
+        let started = std::time::Instant::now();
+        verify_within(
+            dir.path(),
+            uid,
+            gid,
+            Some(&spec),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
     }
 
     /// The review's attack on the settle pass: after a failed creation, a
