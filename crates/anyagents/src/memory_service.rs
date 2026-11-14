@@ -51,6 +51,12 @@ enum MemoryServiceCommand {
     },
     /// Print the running service's model pair and embedding progress.
     Status,
+    /// Estimate what building the configured embedder's vector space over
+    /// the host index as it stands would read and cost, and whether `serve`
+    /// would start it within `max_rebuild_usd`. Calls no model, reads no
+    /// profile key and writes nothing; exits non-zero when `serve` would
+    /// wait.
+    Estimate,
     /// Build an evaluation sample from a data directory's `state.db`, read-only:
     /// the agents' mailboxes and the queries their history implies.
     EvalSample {
@@ -156,6 +162,18 @@ pub fn run(data: &Path, args: MemoryServiceArgs) -> Result<(), anyagents_core::E
                 serde_json::to_string_pretty(&reply)
                     .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
             );
+            Ok(())
+        }
+        MemoryServiceCommand::Estimate => {
+            let estimate = anyagents_memory::service::estimate_configured(&config).map_err(fail)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&estimate)
+                    .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+            );
+            if estimate.rebuild.state.starts_with("waiting") {
+                return Err(anyagents_core::Error::Message(estimate.rebuild.state));
+            }
             Ok(())
         }
         MemoryServiceCommand::EvalSample {

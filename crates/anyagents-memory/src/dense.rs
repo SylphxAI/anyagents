@@ -117,6 +117,23 @@ impl DenseIndex {
         Ok(Self { conn })
     }
 
+    /// An existing index, read-only, if it holds the vector space `space`;
+    /// `None` when it was built in another. Nothing is created or emptied.
+    pub fn open_read_only(path: &Path, space: &str, dims: usize) -> rusqlite::Result<Option<Self>> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let current: Option<String> = conn
+            .query_row("SELECT v FROM meta WHERE k='model'", [], |r| r.get(0))
+            .optional()?;
+        Ok(
+            (current.as_deref() == Some(format!("{space}:{dims}").as_str()))
+                .then_some(Self { conn }),
+        )
+    }
+
     /// The raw digest a document was embedded at, if it was.
     pub fn embedded_sha(&self, document_id: &str) -> rusqlite::Result<Option<String>> {
         self.conn
@@ -184,6 +201,17 @@ impl DenseIndex {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Add `delta` to a counter in one statement: workers on their own
+    /// connections never lose each other's additions.
+    pub fn add_progress(&self, key: &str, delta: i64) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "INSERT INTO progress VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET v=v+excluded.v
+             RETURNING v",
+            params![key, delta],
+            |r| r.get(0),
+        )
     }
 
     /// Every progress mark whose key starts with `prefix`.
