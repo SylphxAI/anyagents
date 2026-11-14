@@ -742,6 +742,7 @@ pub fn read_conversation(
         store.conversation_all(options.with.as_deref(), options.since, limit)?
     };
     Ok(ConversationResponse {
+        retrieval: None,
         agent: canonical
             .as_ref()
             .map_or(target, |a| a.name.as_str())

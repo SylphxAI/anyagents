@@ -2585,6 +2585,7 @@ impl AgentMcp {
                         .get(&conv_path, None)
                         .await
                         .unwrap_or(ConversationResponse {
+                            retrieval: None,
                             agent_id: view.id.clone(),
                             agent: view.name.clone(),
                             turns: Vec::new(),
@@ -2795,6 +2796,7 @@ impl AgentMcp {
                         .get(&conv_path, None)
                         .await
                         .unwrap_or(ConversationResponse {
+                            retrieval: None,
                             agent_id: view.id.clone(),
                             agent: view.name.clone(),
                             turns: Vec::new(),
