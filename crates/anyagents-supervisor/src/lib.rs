@@ -278,6 +278,13 @@ pub trait Custody<H>: Send + Sync {
     fn superseded(&self, _harness: &H) -> bool {
         false
     }
+    /// What `harness` answers now comes from its adapter: one in this
+    /// process always does; a kept one only while its keeper's link is open
+    /// and answering (a closed or wedged link answers with what it last
+    /// knew). Asked after the answers it vouches for.
+    fn answers_live(&self, _harness: &H) -> bool {
+        true
+    }
 }
 
 /// A process a previous kernel left, taken over.
@@ -1262,21 +1269,22 @@ impl<H: Harness + 'static> Session<H> {
         // finished while no kernel ran (it served a turn, or usage, past what
         // the note recorded) is completed now instead, so a routine restart
         // sends no `[Recovery]` note; its usage is recorded on the next pass.
-        // Only live answers say a turn finished: a process (or keeper) that
-        // is gone, before or after they are read, reads as idle with nothing
-        // new, and is owed its recovery.
+        // Only live answers say a turn finished: a served turn the adapter
+        // itself answered (its keeper's link open), or usage that grew while
+        // the process lives. A keeper that is gone, before or after they are
+        // read, reads as idle with nothing new, and is owed its recovery.
         let harness = delivery.harness();
         let health = harness.health();
         let turns = harness.turns_served();
         let usage = harness.last_usage();
+        let answered = self.inner.custody.answers_live(harness);
         let live = health.process_alive && harness.health().process_alive;
         let idle = health.turn_state == TurnState::Idle && health.sign_in_fault.is_none();
         let finished_detached = !replaced
             && !note.pending_recovery
-            && live
             && idle
-            && (turns > note.turns_recorded
-                || usage_advanced(&usage, &note.served.clone().unwrap_or_default()));
+            && ((answered && turns > note.turns_recorded)
+                || (live && usage_advanced(&usage, &note.served.clone().unwrap_or_default())));
         let store = delivery.store();
         let completed = finished_detached && store.note_turn_completed(&self.id).is_ok();
         let idle_with_open_turn = health.turn_state == TurnState::Idle
@@ -1801,6 +1809,11 @@ impl<H: Harness + 'static> Session<H> {
                 false
             }
             Err(anyagents_agent::Error::HarnessDown) => {
+                // The process went while mail was offered: a turn its adapter
+                // saw end before then is completed, not recovered.
+                if let Some(health) = self.harness_health() {
+                    self.record_usage_with(&health);
+                }
                 if !self.wait_backoff() {
                     return false;
                 }
@@ -1919,13 +1932,18 @@ impl<H: Harness + 'static> Session<H> {
         let served = delivery.harness().last_usage();
         let before = self.served.clone().unwrap_or_default();
         let turns_served = delivery.harness().turns_served();
-        // Served totals only grow: a lower or equal reading is no news. And
-        // only a live process says its turn ended: one that is gone (or a
-        // keeper that no longer answers) reads idle with its last totals,
-        // which proves nothing; its turn is recovered by the next process.
+        // A turn the adapter saw end did end, even if its process exited
+        // since: a served turn counts whenever the adapter itself answered
+        // (it is in this process, or its keeper's link is open). Usage alone
+        // says a turn ended only while the process lives: one that is gone
+        // (or a keeper that no longer answers) reads idle with its last
+        // totals, which proves nothing; its turn is recovered by the next
+        // process. Served totals only grow: a lower or equal reading is no
+        // news.
+        let served_turn = turns_served > self.turns_recorded
+            && self.inner.custody.answers_live(delivery.harness());
         let advanced = usage_advanced(&served, &before);
-        let completed = (turns_served > self.turns_recorded || advanced)
-            && health.process_alive
+        let completed = (served_turn || (advanced && health.process_alive))
             && health.turn_state == TurnState::Idle
             && health.sign_in_fault.is_none();
         // Persist completion before publishing progress or resetting the usage

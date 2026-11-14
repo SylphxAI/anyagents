@@ -147,6 +147,10 @@ impl Custody<VendorHarness> for KeeperCustody {
     fn superseded(&self, harness: &VendorHarness) -> bool {
         harness.superseded()
     }
+
+    fn answers_live(&self, harness: &VendorHarness) -> bool {
+        harness.answers_live()
+    }
 }
 
 /// The custody `serve` gives its supervisor for `host`. `refused` names the

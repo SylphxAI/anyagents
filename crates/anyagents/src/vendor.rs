@@ -241,6 +241,15 @@ impl VendorHarness {
         }
     }
 
+    /// What this harness answers comes from its adapter: always in this
+    /// process, and from a keeper only while its link is open and answering.
+    pub(crate) fn answers_live(&self) -> bool {
+        match &self.host {
+            Host::Local(_) => true,
+            Host::Kept(remote) => remote.answers_live(),
+        }
+    }
+
     /// Another kernel took this harness's keeper over.
     pub(crate) fn superseded(&self) -> bool {
         matches!(&self.host, Host::Kept(remote) if remote.superseded())

@@ -1333,6 +1333,13 @@ impl RemoteHarness {
         lock(&self.link.state).closed
     }
 
+    /// What this harness answered came from its keeper: the link is open and
+    /// answering. A closed or wedged link answers with what it last knew.
+    pub fn answers_live(&self) -> bool {
+        let state = lock(&self.link.state);
+        !state.closed && !state.wedged
+    }
+
     /// Another kernel owns the keeper now: this one must stand down for the
     /// agent, and neither stop the keeper nor start another harness.
     pub fn superseded(&self) -> bool {

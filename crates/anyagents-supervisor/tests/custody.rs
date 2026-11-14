@@ -26,6 +26,8 @@ struct Kept {
     usage: Arc<Mutex<(TurnUsage, u32)>>,
     /// Another kernel took the process over.
     superseded: Arc<AtomicBool>,
+    /// The keeper died: its link answers nothing, only what it last knew.
+    keeper_gone: Arc<AtomicBool>,
 }
 
 impl Kept {
@@ -35,7 +37,14 @@ impl Kept {
             ended: Arc::new(AtomicBool::new(false)),
             usage: Arc::new(Mutex::new((TurnUsage::default(), 0))),
             superseded: Arc::new(AtomicBool::new(false)),
+            keeper_gone: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The keeper dies, and its vendor process with it.
+    fn keeper_dies(&self) {
+        self.fake.lock().unwrap().kill();
+        self.keeper_gone.store(true, Ordering::SeqCst);
     }
 
     fn written(&self) -> Vec<String> {
@@ -81,11 +90,13 @@ impl Harness for Handle {
         Ok(())
     }
 
-    /// A process that is gone reads idle, as a keeper's link that closed
-    /// does.
+    /// A process whose keeper is gone reads dead and idle, as a keeper's
+    /// link that closed does; a vendor process that exited under a live
+    /// keeper reads as its adapter saw it.
     fn health(&self) -> HarnessHealth {
         let mut health = self.kept().fake.lock().unwrap().health();
-        if !health.process_alive {
+        if self.kept().keeper_gone.load(Ordering::SeqCst) {
+            health.process_alive = false;
             health.turn_state = TurnState::Idle;
         }
         health
@@ -192,6 +203,10 @@ impl Custody<Handle> for FakeCustody {
 
     fn superseded(&self, harness: &Handle) -> bool {
         harness.kept().superseded.load(Ordering::SeqCst)
+    }
+
+    fn answers_live(&self, harness: &Handle) -> bool {
+        !harness.kept().keeper_gone.load(Ordering::SeqCst)
     }
 }
 
@@ -662,7 +677,7 @@ fn a_process_found_dead_is_recovered_not_completed() {
     let first = fx.store.next_undelivered(&agent).unwrap().unwrap();
     fx.store.note_delivered(&agent, first.seq).unwrap();
     let kept = Kept::new();
-    kept.fake.lock().unwrap().kill();
+    kept.keeper_dies();
     let note = r#"{"served":{"input_tokens":5,"output_tokens":3,"cache_read_tokens":0,"cache_write_tokens":0,"reported_cost_micros":null},"turns_recorded":1,"written":1,"profile_rotated_ms":0,"completed_turn":true,"pending_recovery":false}"#;
     fx.leave(&agent, &kept, "claude-code", Some(note));
     let supervisor = fx.start();
@@ -728,7 +743,7 @@ fn a_process_that_dies_mid_turn_with_cost_bearing_usage_is_recovered() {
             .is_some_and(|live| live.process_alive)
     }));
     // Its keeper dies; mail wakes the worker.
-    kept.fake.lock().unwrap().kill();
+    kept.keeper_dies();
     fx.store.receive(&agent, Incoming::new("more")).unwrap();
     let mut now = 1_699_000_000_000;
     assert!(
@@ -749,6 +764,107 @@ fn a_process_that_dies_mid_turn_with_cost_bearing_usage_is_recovered() {
         "the turn the dead process held was completed, not recovered: {:?}",
         fx.launched.lock().unwrap().first().map(Kept::given)
     );
+    drop(supervisor);
+}
+
+/// A process taken over with the mail it was given in its open turn.
+fn in_turn(fx: &Fixture, agent: &AgentId) -> Kept {
+    fx.store.receive(agent, Incoming::new("working")).unwrap();
+    let first = fx.store.next_undelivered(agent).unwrap().unwrap();
+    fx.store.note_delivered(agent, first.seq).unwrap();
+    let kept = Kept::new();
+    kept.fake
+        .lock()
+        .unwrap()
+        .deliver(&OutboundMessage {
+            id: first.id.as_str().to_string(),
+            seq: first.seq,
+            text: first.text.clone(),
+            sender: None,
+            reply_to: None,
+            source_time_ms: None,
+            context: Default::default(),
+        })
+        .unwrap();
+    let note = r#"{"served":null,"turns_recorded":0,"written":1,"profile_rotated_ms":0,"completed_turn":false,"pending_recovery":false}"#;
+    fx.leave(agent, &kept, "claude-code", Some(note));
+    kept
+}
+
+/// The replacement launched after `kept` died, once the clock lets it start:
+/// whether the first line it was given is a `[Recovery]` note.
+fn replacement_recovers(fx: &Fixture) -> Option<bool> {
+    let mut now = 1_699_000_000_000;
+    let started = wait_until(|| {
+        now += 60_000;
+        fx.clock.set_ms(now);
+        fx.launched
+            .lock()
+            .unwrap()
+            .first()
+            .is_some_and(|replacement| !replacement.given().is_empty())
+    });
+    started.then(|| {
+        fx.launched.lock().unwrap()[0]
+            .given()
+            .first()
+            .is_some_and(|id| id.starts_with("recovery_"))
+    })
+}
+
+/// An adapter that saw its turn end, and whose vendor process then exited,
+/// answered that the turn ended: it is completed, and the replacement gets
+/// no `[Recovery]` note.
+#[test]
+fn a_turn_served_before_its_process_exited_gets_no_recovery() {
+    let fx = Fixture::new();
+    let agent = fx.running("alpha", "claude-code");
+    let kept = in_turn(&fx, &agent);
+    let supervisor = fx.start();
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent)
+            .is_some_and(|live| live.process_alive)
+    }));
+    {
+        // The turn ends and the vendor exits before any pass sees it idle.
+        let mut fake = kept.fake.lock().unwrap();
+        fake.complete_turn();
+        kept.usage.lock().unwrap().1 = 1;
+        fake.kill();
+    }
+    fx.store.receive(&agent, Incoming::new("more")).unwrap();
+    assert_eq!(
+        replacement_recovers(&fx),
+        Some(false),
+        "a turn the adapter saw end was recovered: {:?}",
+        fx.launched.lock().unwrap().first().map(Kept::given)
+    );
+    drop(supervisor);
+}
+
+/// A served turn read from a keeper that is gone is what it last knew, not
+/// an answer: the turn is recovered, never completed.
+#[test]
+fn a_turn_count_from_a_keeper_that_is_gone_is_no_completion() {
+    let fx = Fixture::new();
+    let agent = fx.running("alpha", "claude-code");
+    let kept = in_turn(&fx, &agent);
+    let supervisor = fx.start();
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent)
+            .is_some_and(|live| live.process_alive)
+    }));
+    {
+        let mut fake = kept.fake.lock().unwrap();
+        fake.complete_turn();
+        kept.usage.lock().unwrap().1 = 1;
+        fake.kill();
+        kept.keeper_gone.store(true, Ordering::SeqCst);
+    }
+    fx.store.receive(&agent, Incoming::new("more")).unwrap();
+    assert_eq!(replacement_recovers(&fx), Some(true));
     drop(supervisor);
 }
 
