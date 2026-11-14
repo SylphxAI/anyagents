@@ -2065,9 +2065,12 @@ fn update_harnesses_cmd(data: &Path, target: Option<&str>) -> Result<(), anyagen
         Some(t) => {
             let normalized = anyagents_harness::normalize_harness_name(t);
             if catalog.get(normalized).is_none() {
-                return Err(anyagents_core::Error::Message(format!(
-                    "unknown harness `{t}`"
-                )));
+                return Err(anyagents_core::Error::Message(
+                    crate::install::unknown_harness_message(
+                        t,
+                        catalog.harnesses().iter().map(|entry| entry.id.as_str()),
+                    ),
+                ));
             }
             vec![normalized.to_string()]
         }
