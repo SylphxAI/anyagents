@@ -15,11 +15,10 @@ use std::time::Duration;
 pub use anyagents_agent::recovery_outbound;
 use anyagents_agent::{DeliveryLoop, RunOutcome};
 use anyagents_core::{
-    Agent, AgentId, BillingMode, NewUsage, Store, Wake, agent_config_dir, agent_work_dir, utc_day,
+    Agent, AgentId, AgentLock, BillingMode, NewUsage, Store, Wake, agent_config_dir,
+    agent_work_dir, utc_day,
 };
-use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessHealth, SteerSupport, TurnState, TurnUsage,
-};
+use anyagents_harness::{DeliverOutcome, Delivery, Harness, HarnessHealth, TurnState, TurnUsage};
 
 /// Maximum drain window (ms) to let an active turn finish naturally after a
 /// harness or model switch is requested. While draining, new mailbox
@@ -244,9 +243,130 @@ pub struct LaunchRequest {
     pub config_dir: PathBuf,
     pub work_dir: PathBuf,
     pub extra_env: Vec<(String, String)>,
+    /// A copy of the agent's process lock for a process host that outlives
+    /// this kernel (a keeper) to hold for the life of the process. `None`
+    /// when processes are hosted in the kernel.
+    pub lock: Option<Arc<AgentLock>>,
 }
 
 pub type Launch<H> = Arc<dyn Fn(LaunchRequest) -> Result<H, String> + Send + Sync>;
+
+/// Who holds harness processes, and whether they outlive this kernel.
+///
+/// With keepers (`docs/adr/0007-process-architecture.md`) a harness process
+/// and the adapter that speaks to it live in their own process. A kernel that
+/// stops leaves them running ([`Supervisor::retain_processes`]); the next one
+/// takes each over ([`Custody::attach`]) and resumes delivery from the
+/// mailbox cursor, with the adapter's memory of what it was given intact.
+pub trait Custody<H>: Send + Sync {
+    /// Launched processes outlive this kernel: a launch hands the host a copy
+    /// of the agent's process lock, and a stop may leave them running.
+    fn outlives_kernel(&self) -> bool;
+    /// Agents whose processes a previous kernel left running.
+    fn retained(&self) -> Vec<AgentId>;
+    /// Take over the process a previous kernel left for `agent`.
+    fn attach(&self, agent: &AgentId) -> Result<Option<Attached<H>>, String>;
+    /// End the process a previous kernel left for `agent` without taking it
+    /// over: the agent is no longer running.
+    fn release(&self, agent: &AgentId);
+    /// Leave `harness` running for the next kernel.
+    fn retain(&self, harness: H);
+    /// Keep `note` with the process for the next kernel that attaches.
+    fn note(&self, harness: &H, note: &str);
+    /// Another kernel took the process over: this one must stand down for
+    /// the agent, neither ending the process nor starting another.
+    fn superseded(&self, _harness: &H) -> bool {
+        false
+    }
+    /// What `harness` answers now comes from its adapter: one in this
+    /// process always does; a kept one only while its keeper's link is open
+    /// and answering (a closed or wedged link answers with what it last
+    /// knew). Asked after the answers it vouches for.
+    fn answers_live(&self, _harness: &H) -> bool {
+        true
+    }
+}
+
+/// A process a previous kernel left, taken over.
+pub struct Attached<H> {
+    pub harness: H,
+    /// The copy of the agent's process lock the host held.
+    pub lock: AgentLock,
+    /// What the process was launched for, which the agent's configuration
+    /// may no longer name: a difference is a switch, made at its boundary.
+    pub harness_name: String,
+    pub model: Option<String>,
+    pub started_at_ms: Option<i64>,
+    /// What the last kernel kept with the process ([`Custody::note`]).
+    pub note: Option<String>,
+    /// Older processes of the same agent left beside it (a kernel that died
+    /// in the middle of a replacement): retired once what they proved is
+    /// committed.
+    pub older: Vec<H>,
+}
+
+/// Harness processes hosted in the kernel: they end with it.
+pub struct InProcess;
+
+impl<H> Custody<H> for InProcess {
+    fn outlives_kernel(&self) -> bool {
+        false
+    }
+
+    fn retained(&self) -> Vec<AgentId> {
+        Vec::new()
+    }
+
+    fn attach(&self, _agent: &AgentId) -> Result<Option<Attached<H>>, String> {
+        Ok(None)
+    }
+
+    fn release(&self, _agent: &AgentId) {}
+
+    fn retain(&self, harness: H) {
+        drop(harness);
+    }
+
+    fn note(&self, _harness: &H, _note: &str) {}
+}
+
+/// What a launch answers when the kernel stops while the harness is still
+/// starting: the process holding it (a keeper) goes on starting, holding a
+/// copy of the agent's lock, for the next kernel. The worker leaves the lock
+/// locked: unlocking any copy would unlock the keeper's.
+pub const LAUNCH_ABANDONED: &str =
+    "the kernel is stopping; the harness's start goes on for the next kernel";
+
+/// What a kernel keeps with a process for the kernel that takes it over:
+/// the usage it already recorded from it, so none is recorded twice, the
+/// operator profile marker it was launched under, and a `[Recovery]` note it
+/// still owes the process's agent.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct ProcessNote {
+    served: Option<TurnUsage>,
+    turns_recorded: u32,
+    written: u32,
+    profile_rotated_ms: i64,
+    completed_turn: bool,
+    #[serde(default)]
+    pending_recovery: bool,
+}
+
+/// Whether served totals grew past `before`, field by field: a token count
+/// above its last reading, or a cost above the last one (a positive cost
+/// where there was none). Equal totals are no news, whatever they carry.
+fn usage_advanced(served: &TurnUsage, before: &TurnUsage) -> bool {
+    let cost = match (served.reported_cost_micros, before.reported_cost_micros) {
+        (Some(now), Some(then)) => now > then,
+        (Some(now), None) => now > 0,
+        _ => false,
+    };
+    served.input_tokens > before.input_tokens
+        || served.output_tokens > before.output_tokens
+        || served.cache_read_tokens > before.cache_read_tokens
+        || served.cache_write_tokens > before.cache_write_tokens
+        || cost
+}
 
 /// How soon a worker looks again after it handed lines over, or while a turn
 /// is open, after it last did work or was woken. One store read, so `flush`
@@ -268,8 +388,9 @@ const IDLE_SAFETY_NET_MS: i64 = 60_000;
 pub struct LiveState {
     pub process_alive: bool,
     pub turn_state: TurnState,
-    pub delivery_mode: DeliveryMode,
-    pub steer_support: SteerSupport,
+    /// What the agent's harness process guarantees for mail, as it announced
+    /// itself. `None` while no process has been started.
+    pub delivery: Option<Delivery>,
     pub quota_reset_at_ms: Option<i64>,
     pub restart_at_ms: Option<i64>,
     pub pid: Option<u32>,
@@ -292,44 +413,6 @@ impl HealthBoard {
 
     pub fn get(&self, id: &AgentId) -> Option<LiveState> {
         lock(&self.inner).get(id).cloned()
-    }
-}
-
-/// Catalog delivery when no process is up. It matches what each adapter reports
-/// while it runs.
-///
-/// Steer: Codex takes its `turn/start` while a turn is open and steers into it;
-/// Claude Code writes a new user message into the running stream-json child
-/// (acknowledged by its replay echo); OpenCode takes a prompt with `delivery: "steer"`,
-/// and its own session inbox decides whether that joins the running turn or
-/// starts the next one. Muse's app-server takes `ifBusy: "steer"` on
-/// `turn/start`.
-///
-/// Followup: the contract double (`ANYAGENTS_HARNESS_BIN`) reads one line per
-/// turn and answers with a `result`, so a line written mid-turn waits for that
-/// turn to end. AGY's stream input also starts a turn per line; its hook helpers
-/// have no wired, confirmed consumption acknowledgement.
-pub fn declared(harness: &str) -> (DeliveryMode, SteerSupport) {
-    match anyagents_harness::normalize_harness_name(harness) {
-        "codex" | "claude-code" | "opencode" | "muse" | "agy" | "omp" | "dsh" | "grok"
-        | "spiron" => (DeliveryMode::Steer, SteerSupport::Yes),
-        _ => (DeliveryMode::Followup, SteerSupport::Unproven),
-    }
-}
-
-pub fn mode_name(mode: DeliveryMode) -> &'static str {
-    match mode {
-        DeliveryMode::Steer => "steer",
-        DeliveryMode::Followup => "followup",
-        DeliveryMode::Queue => "queue",
-    }
-}
-
-pub fn steer_name(steer: SteerSupport) -> &'static str {
-    match steer {
-        SteerSupport::Yes => "yes",
-        SteerSupport::No => "no",
-        SteerSupport::Unproven => "unproven",
     }
 }
 
@@ -379,9 +462,13 @@ struct Inner<H> {
     store: Arc<Store>,
     clock: Arc<dyn Clock>,
     launch: Launch<H>,
+    custody: Arc<dyn Custody<H>>,
     extra_env: Vec<(String, String)>,
     board: HealthBoard,
     stop: AtomicBool,
+    /// Set by [`Supervisor::retain_processes`]: stopping workers leave their
+    /// processes to the next kernel instead of ending them.
+    retain: AtomicBool,
     workers: Mutex<HashMap<AgentId, Slot>>,
     #[cfg(test)]
     idle_release_hook: Option<IdleReleaseHook>,
@@ -403,19 +490,35 @@ struct WakeListener {
 }
 
 impl<H: Harness + 'static> Supervisor<H> {
+    /// Start with harness processes hosted in this kernel.
     pub fn start(
         store: Arc<Store>,
         clock: Arc<dyn Clock>,
         launch: Launch<H>,
         extra_env: Vec<(String, String)>,
     ) -> Result<Self, String> {
+        Self::start_with_custody(store, clock, launch, extra_env, Arc::new(InProcess))
+    }
+
+    /// Start with `custody` holding harness processes. Processes a previous
+    /// kernel left are taken over by the workers of running agents and ended
+    /// for every other agent.
+    pub fn start_with_custody(
+        store: Arc<Store>,
+        clock: Arc<dyn Clock>,
+        launch: Launch<H>,
+        extra_env: Vec<(String, String)>,
+        custody: Arc<dyn Custody<H>>,
+    ) -> Result<Self, String> {
         let inner = Arc::new(Inner {
             store: Arc::clone(&store),
             clock,
             launch,
+            custody,
             extra_env,
             board: HealthBoard::default(),
             stop: AtomicBool::new(false),
+            retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
             #[cfg(test)]
             idle_release_hook: None,
@@ -441,6 +544,14 @@ impl<H: Harness + 'static> Supervisor<H> {
 
     pub fn board(&self) -> HealthBoard {
         self.inner.board.clone()
+    }
+
+    /// Stop, leaving every harness process to the next kernel when the
+    /// custody lets processes outlive this one. A worker in the middle of a
+    /// call finishes it first; nothing is ended.
+    pub fn retain_processes(self) {
+        self.inner.retain.store(true, Ordering::SeqCst);
+        drop(self);
     }
 }
 
@@ -551,14 +662,27 @@ fn listen_wake<H: Harness>(socket: UnixDatagram, inner: Arc<Inner<H>>) {
 }
 
 fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
+    // A process a previous kernel left is taken over by its running agent's
+    // worker, which releases it to idle through the same checks as any live
+    // process (its turn, its commands still running). Every other one is
+    // ended: its agent no longer runs.
+    let retained: std::collections::HashSet<AgentId> =
+        inner.custody.retained().into_iter().collect();
     if let Ok(agents) = inner.store.list_live_agents() {
+        let mut running = std::collections::HashSet::new();
         for agent in agents {
             if agent.state == "running" {
-                if inner.store.complete_idle_agent(&agent.id).unwrap_or(false) {
+                running.insert(agent.id.clone());
+                if !retained.contains(&agent.id)
+                    && inner.store.complete_idle_agent(&agent.id).unwrap_or(false)
+                {
                     continue;
                 }
                 ensure(&inner, agent.id);
             }
+        }
+        for id in retained.difference(&running) {
+            inner.custody.release(id);
         }
     }
     while let Ok(wake) = events.recv() {
@@ -635,15 +759,13 @@ fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {
             None
         }
     };
-    if let Ok(agent) = inner.store.agent(id) {
-        let (mode, steer) = declared(&agent.harness);
+    if inner.store.agent(id).is_ok() {
         inner.board.publish(
             id,
             LiveState {
                 process_alive: false,
                 turn_state: TurnState::Idle,
-                delivery_mode: mode,
-                steer_support: steer,
+                delivery: None,
                 quota_reset_at_ms: None,
                 restart_at_ms: None,
                 pid: None,
@@ -824,8 +946,11 @@ struct Session<H: Harness> {
     turns_recorded: u32,
     /// Set when a fresh harness process starts (`boot` or `replace_process`)
     /// so an open turn interrupted by the previous process's exit is resumed
-    /// with a `[Recovery]` prompt if no new mailbox message wakes it first.
+    /// with a `[Recovery]` note, ahead of any new mail.
     pending_recovery: bool,
+    /// The recovery note is not yet written to the vendor: new mail, which is
+    /// younger than the interrupted turn's, waits behind it.
+    recovery_blocks_mail: bool,
     /// Set once at least one turn has completed during this session, enabling
     /// automatic scale-to-zero (`idle`) for any agent after a completed turn.
     completed_turn_in_session: bool,
@@ -851,6 +976,15 @@ struct Session<H: Harness> {
     /// Those commands cannot be watched (no pidfd): review them on the
     /// backoff timer instead.
     review_children: bool,
+    /// A copy of the process lock for each process host this worker starts,
+    /// when hosts outlive the kernel.
+    host_lock: Option<Arc<AgentLock>>,
+    /// The process came from a previous kernel, with whether a `[Recovery]`
+    /// note is owed: one that kernel owed, or a turn left open in the store
+    /// while the process sits idle.
+    adopted: Option<bool>,
+    /// The note last kept with the process.
+    kept_note: Option<ProcessNote>,
 }
 
 impl<H: Harness + 'static> Session<H> {
@@ -878,6 +1012,7 @@ impl<H: Harness + 'static> Session<H> {
             written: 0,
             turns_recorded: 0,
             pending_recovery: false,
+            recovery_blocks_mail: false,
             completed_turn_in_session: false,
             quota_started_at: None,
             pending_switch_started_at: None,
@@ -890,6 +1025,9 @@ impl<H: Harness + 'static> Session<H> {
             process_scan_logged: false,
             exit_watch: None,
             review_children: false,
+            host_lock: None,
+            adopted: None,
+            kept_note: None,
         }
     }
 
@@ -905,7 +1043,7 @@ impl<H: Harness + 'static> Session<H> {
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 self.record_usage();
-                self.delivery = None;
+                self.end_delivery();
                 self.publish();
                 return false;
             }
@@ -915,9 +1053,16 @@ impl<H: Harness + 'static> Session<H> {
                         delivery.harness().watch_activity(Arc::clone(&self.notify));
                         self.exit_watch = None;
                         self.restart_at = None;
-                        // Unknown until recover_once reads durable state successfully.
-                        self.pending_recovery = true;
+                        // A fresh process may follow an interrupted turn:
+                        // unknown until recover_once reads durable state. A
+                        // process taken over from a previous kernel never
+                        // stopped: its turn goes on, and it is owed a
+                        // recovery note only as decided when it was adopted.
+                        self.pending_recovery = self.adopted.take().unwrap_or(true);
+                        self.recovery_blocks_mail = false;
+                        self.kept_note = None;
                         self.delivery = Some(*delivery);
+                        self.sync_note();
                     }
                     Boot::Busy => {
                         self.delivery = None;
@@ -945,6 +1090,15 @@ impl<H: Harness + 'static> Session<H> {
             let Some(health) = self.harness_health() else {
                 continue;
             };
+            if self
+                .delivery
+                .as_ref()
+                .is_some_and(|delivery| self.inner.custody.superseded(delivery.harness()))
+            {
+                self.stand_down();
+                return false;
+            }
+            self.sync_note();
             // A changed configuration supersedes the old process's fault,
             // quota hold or restart delay before any further dispatch.
             if self.try_apply_pending_switch(&health) {
@@ -954,9 +1108,10 @@ impl<H: Harness + 'static> Session<H> {
                 continue;
             }
             if !health.process_alive {
+                self.commit_proven();
                 self.record_usage_with(&health);
                 if !self.wait_backoff() {
-                    self.delivery = None;
+                    self.end_delivery();
                     self.restart_at = None;
                     self.publish();
                     return false;
@@ -965,12 +1120,185 @@ impl<H: Harness + 'static> Session<H> {
                 continue;
             }
             if self.deliver_once() {
-                self.delivery = None;
+                self.stop_delivery();
                 self.restart_at = None;
                 self.publish();
                 return true;
             }
         }
+    }
+
+    /// The worker stops: its process ends with it, or, while the kernel
+    /// stops with [`Supervisor::retain_processes`], is left to the next one.
+    fn end_delivery(&mut self) {
+        if !self.inner.retain.load(Ordering::SeqCst) {
+            self.stop_delivery();
+            return;
+        }
+        let host_lock = self.host_lock.take();
+        if let Some(delivery) = self.delivery.take() {
+            // The host keeps holding the agent's lock after this process.
+            if let Some(lock) = &host_lock {
+                lock.retain();
+            }
+            self.inner.custody.retain(delivery.into_harness());
+        }
+    }
+
+    /// End the process and release the agent's lock.
+    fn stop_delivery(&mut self) {
+        self.delivery = None;
+        self.host_lock = None;
+    }
+
+    /// Another kernel took the process over. Let go of it without ending it,
+    /// and without releasing the lock it and that kernel hold, and stop: no
+    /// second process is started beside it.
+    fn stand_down(&mut self) {
+        let host_lock = self.host_lock.take();
+        if let Some(delivery) = self.delivery.take() {
+            if let Some(lock) = &host_lock {
+                lock.retain();
+            }
+            self.inner.custody.retain(delivery.into_harness());
+        }
+        self.restart_at = None;
+        self.last_error = Some("another server took this agent's harness over".into());
+        self.publish();
+    }
+
+    /// Keep this worker's accounting of the process with it, for a kernel
+    /// that takes the process over after this one, whenever it changed.
+    fn sync_note(&mut self) {
+        if !self.inner.custody.outlives_kernel() {
+            return;
+        }
+        let Some(delivery) = self.delivery.as_ref() else {
+            return;
+        };
+        let note = ProcessNote {
+            served: self.served.clone(),
+            turns_recorded: self.turns_recorded,
+            written: self.written,
+            profile_rotated_ms: self.process_profile_rotated_ms,
+            completed_turn: self.completed_turn_in_session,
+            pending_recovery: self.pending_recovery,
+        };
+        if self.kept_note.as_ref() == Some(&note) {
+            return;
+        }
+        if let Ok(text) = serde_json::to_string(&note) {
+            self.inner.custody.note(delivery.harness(), &text);
+            self.kept_note = Some(note);
+        }
+    }
+
+    /// Take over a process a previous kernel left, under the agent lock copy
+    /// its host held, with that kernel's accounting of it.
+    fn adopt(&mut self, store: Store, attached: Attached<H>) -> Boot<H> {
+        let Attached {
+            harness,
+            lock,
+            harness_name,
+            model,
+            started_at_ms,
+            note,
+            older,
+        } = attached;
+        let fresh = match store.agent(&self.id) {
+            Ok(fresh) if fresh.state == "running" => fresh,
+            Ok(_) | Err(anyagents_core::Error::AgentNotFound(_)) => {
+                // The processes end before their lock is released: never the
+                // other way round, which would leave one running unlocked.
+                drop(harness);
+                drop(older);
+                drop(lock);
+                return Boot::Stopped;
+            }
+            Err(_) => {
+                // Not this kernel's to end on a read failure: leave them.
+                lock.retain();
+                self.inner.custody.retain(harness);
+                for other in older {
+                    self.inner.custody.retain(other);
+                }
+                return Boot::Retry;
+            }
+        };
+        let host_lock = match lock.share() {
+            Ok(copy) => Arc::new(copy),
+            Err(_) => {
+                lock.retain();
+                self.inner.custody.retain(harness);
+                for other in older {
+                    self.inner.custody.retain(other);
+                }
+                return Boot::Retry;
+            }
+        };
+        self.paths = AgentPaths::from_store(&self.inner.store, &fresh);
+        self.configured = Some(fresh.clone());
+        // The process serves what it was launched for; a configuration
+        // changed while no kernel ran is a switch at its next boundary.
+        self.agent = Agent {
+            harness: harness_name,
+            model,
+            ..fresh
+        };
+        let note: ProcessNote = note
+            .as_deref()
+            .and_then(|text| serde_json::from_str(text).ok())
+            .unwrap_or_else(|| ProcessNote {
+                profile_rotated_ms: self.marker_ms(PROFILE_ROTATED).unwrap_or(0),
+                ..ProcessNote::default()
+            });
+        let mut delivery = DeliveryLoop::adopted(store, lock, self.id.clone(), harness);
+        // An older process an interrupted replacement left is retired first,
+        // as a replacement retires one: what it proved is committed. Its
+        // turn was interrupted, and the newest process never saw that mail:
+        // a recovery is owed, as after any replacement.
+        let replaced = !older.is_empty();
+        for other in older {
+            if let Err(err) = delivery.retire_other(other) {
+                self.last_error = Some(format!("commit proven mail: {err}"));
+            }
+        }
+        // A recovery the last kernel owed, or a turn the store holds open
+        // while the process sits idle and served nothing since (it was lost
+        // with no kernel to see it), is owed still. A turn the process
+        // finished while no kernel ran (it served a turn, or usage, past what
+        // the note recorded) is completed now instead, so a routine restart
+        // sends no `[Recovery]` note; its usage is recorded on the next pass.
+        // Only live answers say a turn finished: a served turn the adapter
+        // itself answered (its keeper's link open), or usage that grew while
+        // the process lives. A keeper that is gone, before or after they are
+        // read, reads as idle with nothing new, and is owed its recovery.
+        let harness = delivery.harness();
+        let health = harness.health();
+        let turns = harness.turns_served();
+        let usage = harness.last_usage();
+        let answered = self.inner.custody.answers_live(harness);
+        let live = health.process_alive && harness.health().process_alive;
+        let idle = health.turn_state == TurnState::Idle && health.sign_in_fault.is_none();
+        let finished_detached = !replaced
+            && !note.pending_recovery
+            && idle
+            && ((answered && turns > note.turns_recorded)
+                || (live && usage_advanced(&usage, &note.served.clone().unwrap_or_default())));
+        let store = delivery.store();
+        let completed = finished_detached && store.note_turn_completed(&self.id).is_ok();
+        let idle_with_open_turn = health.turn_state == TurnState::Idle
+            && !completed
+            && store.has_open_turn(&self.id).unwrap_or(false);
+        self.served = note.served;
+        self.turns_recorded = note.turns_recorded;
+        self.written = note.written;
+        self.process_profile_rotated_ms = note.profile_rotated_ms;
+        self.completed_turn_in_session = note.completed_turn;
+        self.process_started_at = Some(started_at_ms.unwrap_or_else(|| self.inner.clock.now_ms()));
+        self.host_lock = Some(host_lock);
+        self.adopted = Some(replaced || note.pending_recovery || idle_with_open_turn);
+        Boot::Ready(Box::new(delivery))
     }
 
     fn boot(&mut self) -> Boot<H> {
@@ -981,6 +1309,13 @@ impl<H: Harness + 'static> Session<H> {
             Ok(store) => store,
             Err(_) => return Boot::Retry,
         };
+        // A process a previous kernel left holds the agent's lock: take it
+        // over instead of starting another.
+        match self.inner.custody.attach(&self.id) {
+            Ok(Some(attached)) => return self.adopt(store, attached),
+            Ok(None) => {}
+            Err(_) => return Boot::Retry,
+        }
         // Acquire the per-agent process lock BEFORE launching the child or
         // creating workspace/scratch directories so concurrent archive/delete
         // reaping under this lock cannot race an in-flight spawn.
@@ -988,6 +1323,14 @@ impl<H: Harness + 'static> Session<H> {
             Ok(lock) => lock,
             Err(anyagents_core::Error::AgentBusy) => return Boot::Busy,
             Err(_) => return Boot::Retry,
+        };
+        self.host_lock = if self.inner.custody.outlives_kernel() {
+            match lock.share() {
+                Ok(copy) => Some(Arc::new(copy)),
+                Err(_) => return Boot::Retry,
+            }
+        } else {
+            None
         };
         match store.agent(&self.id) {
             Ok(fresh) if fresh.state != "running" => return Boot::Stopped,
@@ -1000,6 +1343,11 @@ impl<H: Harness + 'static> Session<H> {
         }
         let harness = match self.launch_harness() {
             Ok(harness) => harness,
+            Err(error) if error == LAUNCH_ABANDONED => {
+                // The keeper still starting holds this lock on: never unlock.
+                lock.retain();
+                return Boot::Stopped;
+            }
             Err(_) if self.stop.load(Ordering::SeqCst) => return Boot::Stopped,
             Err(_) => return Boot::Retry,
         };
@@ -1038,6 +1386,7 @@ impl<H: Harness + 'static> Session<H> {
             config_dir: self.paths.config_dir.clone(),
             work_dir: self.paths.work_dir.clone(),
             extra_env: self.inner.extra_env.clone(),
+            lock: self.host_lock.clone(),
         });
         match &res {
             Ok(_) => {
@@ -1053,7 +1402,9 @@ impl<H: Harness + 'static> Session<H> {
                 }
             }
             Err(err) => {
-                self.last_error = Some(err.clone());
+                if err != LAUNCH_ABANDONED {
+                    self.last_error = Some(err.clone());
+                }
                 self.agent = serving;
             }
         }
@@ -1068,6 +1419,7 @@ impl<H: Harness + 'static> Session<H> {
     /// Publish the state this worker sleeps in, then wait for `deadline` or a
     /// wake. `true` when a wake ended the wait.
     fn sleep(&mut self, deadline: Option<i64>) -> bool {
+        self.sync_note();
         self.publish();
         self.inner.clock.wait(deadline, &self.woken)
     }
@@ -1108,8 +1460,7 @@ impl<H: Harness + 'static> Session<H> {
                     } else {
                         TurnState::Idle
                     },
-                    delivery_mode: health.delivery_mode,
-                    steer_support: health.steer_support,
+                    delivery: Some(health.delivery),
                     quota_reset_at_ms: health.quota_reset_at_ms,
                     restart_at_ms: if health.process_alive {
                         None
@@ -1138,22 +1489,18 @@ impl<H: Harness + 'static> Session<H> {
                         .or_else(|| self.last_error.clone()),
                 }
             }
-            None => {
-                let (mode, steer) = declared(&self.agent.harness);
-                LiveState {
-                    process_alive: false,
-                    turn_state: TurnState::Idle,
-                    delivery_mode: mode,
-                    steer_support: steer,
-                    quota_reset_at_ms: None,
-                    restart_at_ms: self.restart_at,
-                    pid: None,
-                    live_harness: None,
-                    live_model: None,
-                    process_started_at_ms: None,
-                    last_error: self.last_error.clone(),
-                }
-            }
+            None => LiveState {
+                process_alive: false,
+                turn_state: TurnState::Idle,
+                delivery: None,
+                quota_reset_at_ms: None,
+                restart_at_ms: self.restart_at,
+                pid: None,
+                live_harness: None,
+                live_model: None,
+                process_started_at_ms: None,
+                last_error: self.last_error.clone(),
+            },
         };
         self.inner.board.publish(&self.id, state);
     }
@@ -1225,9 +1572,28 @@ impl<H: Harness + 'static> Session<H> {
             self.restart_at = None;
             return false;
         }
+        self.commit_proven();
         // Flush any usage the exited process finished serving before swapping it.
         if !self.record_usage() {
             return false;
+        }
+        // A replacement on the same harness resumes the same vendor session,
+        // so the old process is stopped and read to the end first: what it
+        // proved in its last moments is committed, its transcript or journal
+        // is no longer written while the new one reads it, and it releases
+        // the session for the new one to take. A launch that then fails
+        // leaves a dead process, which the dead-process backoff replaces. A
+        // switch to another harness starts another session: the old process
+        // keeps serving until the new one is up.
+        let running = self.agent.harness.clone();
+        let same_session = self
+            .configured()
+            .is_none_or(|configured| configured.harness == running);
+        if same_session && let Some(delivery) = self.delivery.as_mut() {
+            if let Err(err) = delivery.retire_harness() {
+                self.last_error = Some(format!("commit proven mail: {err}"));
+            }
+            self.publish();
         }
         match self.launch_harness() {
             Ok(mut harness) => {
@@ -1235,13 +1601,18 @@ impl<H: Harness + 'static> Session<H> {
                 // A quota wait belonged to the process that is gone.
                 harness.clear_quota();
                 if let Some(delivery) = self.delivery.as_mut() {
+                    if !same_session && let Err(err) = delivery.retire_harness() {
+                        self.last_error = Some(format!("commit proven mail: {err}"));
+                    }
                     self.pending_recovery = true;
+                    self.recovery_blocks_mail = false;
                     delivery.replace_harness(harness);
                 }
                 self.exit_watch = None;
                 self.served = None;
                 self.turns_recorded = 0;
                 self.restart_at = None;
+                self.sync_note();
                 true
             }
             Err(_) => {
@@ -1273,8 +1644,40 @@ impl<H: Harness + 'static> Session<H> {
             // A new process makes this pass's snapshot stale: start over.
             return (rotated_after_start || config_switched) && self.replace_process();
         }
+        self.commit_proven();
         self.sleep(Some(reset_at));
         true
+    }
+
+    /// Commit what the harness already proved it took, before anything that
+    /// skips the delivery pass: a quota wait, a switch drain, or replacing
+    /// the process, alive or dead. A proof outlives the process that gave it
+    /// but not the adapter that holds it, so an uncommitted one would hand
+    /// the message to the next process again. Nothing is written.
+    fn commit_proven(&mut self) {
+        let Some(delivery) = self.delivery.as_mut() else {
+            return;
+        };
+        match delivery.commit_proven() {
+            Ok(committed) => {
+                self.written = self
+                    .written
+                    .saturating_add(committed.clamp(0, u64::from(u32::MAX)) as u32);
+            }
+            Err(err) => self.last_error = Some(format!("commit proven mail: {err}")),
+        }
+    }
+
+    /// The last message the harness refused for good in this pass, as the
+    /// agent's error, so a parked message is seen.
+    fn take_rejection_note(&mut self) -> Option<String> {
+        let delivery = self.delivery.as_mut()?;
+        delivery.take_rejections().pop().map(|rejection| {
+            format!(
+                "message {} (seq {}) rejected by the harness: {}",
+                rejection.message_id, rejection.seq, rejection.reason
+            )
+        })
     }
 
     /// One pass over the mailbox. Every line is handed to the harness's own
@@ -1289,6 +1692,8 @@ impl<H: Harness + 'static> Session<H> {
             // replacement process instead of steering them into the old turn,
             // and cut over at the turn boundary (a harness transition wakes
             // this worker) or at the drain deadline.
+            // What the old process proves while it drains is committed now.
+            self.commit_proven();
             let deadline = switch_started_at.saturating_add(PENDING_SWITCH_DRAIN_MS);
             let now = self.inner.clock.now_ms();
             // Never busy-loop on a wait whose deadline is already past.
@@ -1300,17 +1705,17 @@ impl<H: Harness + 'static> Session<H> {
             self.sleep(Some(wait_until));
             return false;
         }
-        if self.pending_recovery
-            && self
-                .delivery
-                .as_ref()
-                .is_some_and(|d| d.harness().has_unconfirmed_hold())
-        {
+        // An interrupted turn's messages are older than any mail behind
+        // them: its recovery note goes first, and new mail follows it only
+        // once it is written.
+        if self.pending_recovery {
             if self.recover_once() {
                 return false;
             }
-            if !self.pending_recovery {
-                self.wake_unless_more();
+            if self.pending_recovery && self.recovery_blocks_mail {
+                if let Some(health) = self.harness_health() {
+                    self.idle_wait(&health);
+                }
                 return false;
             }
         }
@@ -1320,16 +1725,20 @@ impl<H: Harness + 'static> Session<H> {
             };
             delivery.run_once()
         };
+        let rejected = self.take_rejection_note();
         match outcome {
-            Ok(RunOutcome::Quota { .. }) => false,
+            Ok(RunOutcome::Quota { .. }) => {
+                if rejected.is_some() {
+                    self.last_error = rejected;
+                    self.publish();
+                }
+                false
+            }
             Ok(RunOutcome::Delivered { delivered }) => {
                 // The turn this opens may start new commands: the next idle
                 // point looks at the process tree again.
                 self.exit_watch = None;
-                // New mailbox messages just woke the session directly; any open
-                // turn from before a process restart is now superseded by them.
-                self.pending_recovery = false;
-                self.last_error = None;
+                self.last_error = rejected;
                 self.written = self
                     .written
                     .saturating_add(delivered.clamp(0, u64::from(u32::MAX)) as u32);
@@ -1342,6 +1751,10 @@ impl<H: Harness + 'static> Session<H> {
                 // No message was accepted on this pass (the mailbox may still
                 // contain deferred mail). Record whatever the vendor reported.
                 self.attempt = 0;
+                if rejected.is_some() {
+                    self.last_error = rejected;
+                    self.publish();
+                }
                 let Some(mut health) = self.harness_health() else {
                     return false;
                 };
@@ -1354,10 +1767,10 @@ impl<H: Harness + 'static> Session<H> {
                     return false;
                 }
                 if !health.process_alive
-                    && self.delivery.as_ref().is_some_and(|d| {
-                        d.store().has_open_turn(&self.id).unwrap_or(false)
-                            || d.harness().has_unconfirmed_hold()
-                    })
+                    && self
+                        .delivery
+                        .as_ref()
+                        .is_some_and(|d| d.store().has_open_turn(&self.id).unwrap_or(false))
                 {
                     if !self.wait_backoff() {
                         return false;
@@ -1396,6 +1809,11 @@ impl<H: Harness + 'static> Session<H> {
                 false
             }
             Err(anyagents_agent::Error::HarnessDown) => {
+                // The process went while mail was offered: a turn its adapter
+                // saw end before then is completed, not recovered.
+                if let Some(health) = self.harness_health() {
+                    self.record_usage_with(&health);
+                }
                 if !self.wait_backoff() {
                     return false;
                 }
@@ -1514,7 +1932,18 @@ impl<H: Harness + 'static> Session<H> {
         let served = delivery.harness().last_usage();
         let before = self.served.clone().unwrap_or_default();
         let turns_served = delivery.harness().turns_served();
-        let completed = (turns_served > self.turns_recorded || served != before)
+        // A turn the adapter saw end did end, even if its process exited
+        // since: a served turn counts whenever the adapter itself answered
+        // (it is in this process, or its keeper's link is open). Usage alone
+        // says a turn ended only while the process lives: one that is gone
+        // (or a keeper that no longer answers) reads idle with its last
+        // totals, which proves nothing; its turn is recovered by the next
+        // process. Served totals only grow: a lower or equal reading is no
+        // news.
+        let served_turn = turns_served > self.turns_recorded
+            && self.inner.custody.answers_live(delivery.harness());
+        let advanced = usage_advanced(&served, &before);
+        let completed = (served_turn || (advanced && health.process_alive))
             && health.turn_state == TurnState::Idle
             && health.sign_in_fault.is_none();
         // Persist completion before publishing progress or resetting the usage
@@ -1527,7 +1956,8 @@ impl<H: Harness + 'static> Session<H> {
             self.last_error = Some(format!("persist turn completion: {err}"));
             return false;
         }
-        if served != before {
+        let served_changed = advanced;
+        if served_changed {
             let turns = turns_served
                 .saturating_sub(self.turns_recorded)
                 .max(self.written.max(1));
@@ -1553,6 +1983,9 @@ impl<H: Harness + 'static> Session<H> {
             self.completed_turn_in_session = true;
             self.consecutive_turn_errors = 0;
             self.last_error = None;
+        }
+        if completed || served_changed {
+            self.sync_note();
         }
         true
     }
@@ -1605,7 +2038,7 @@ impl<H: Harness + 'static> Session<H> {
             return false;
         }
         self.stop.store(true, Ordering::SeqCst);
-        self.delivery = None;
+        self.stop_delivery();
         self.restart_at = None;
         reap_ephemeral_dirs(&self.paths.config_dir, &self.paths.managed_work);
         self.publish();
@@ -1652,9 +2085,6 @@ impl<H: Harness + 'static> Session<H> {
     fn recoverable_mid_turn_fault(&self, health: &HarnessHealth) -> Option<String> {
         let delivery = self.delivery.as_ref()?;
         let fault = health.sign_in_fault.clone()?;
-        if delivery.harness().has_unconfirmed_idle_hold() {
-            return Some(fault);
-        }
         if health.turn_state != TurnState::Idle
             || !delivery.store().has_open_turn(&self.id).unwrap_or(false)
         {
@@ -1669,22 +2099,6 @@ impl<H: Harness + 'static> Session<H> {
                 self.pending_recovery = false;
                 return false;
             };
-            let has_hold = delivery.harness().has_unconfirmed_hold();
-            if has_hold {
-                let held_ids = delivery.harness().peek_unconfirmed_request_ids();
-                if !held_ids.is_empty()
-                    && let Err(err) = delivery
-                        .store()
-                        .promote_messages_to_open_turn(&self.id, &held_ids)
-                {
-                    self.last_error = Some(format!("read open turn for recovery: {err}"));
-                    return false;
-                }
-            } else if !matches!(delivery.store().next_undelivered(&self.id), Ok(None)) {
-                // Idle also covers deferred or passive mail. Recovery must not
-                // overtake any queued message, and a failed read is not emptiness.
-                return false;
-            }
             let open = match delivery.store().open_turn(&self.id) {
                 Ok(open) => open,
                 Err(err) => {
@@ -1692,23 +2106,10 @@ impl<H: Harness + 'static> Session<H> {
                     return false;
                 }
             };
-            let reconciled = if has_hold {
-                match delivery.harness_mut().reconcile_unconfirmed_for_recovery() {
-                    Ok(rec) => Ok(rec),
-                    Err(anyagents_harness::HarnessError::Dead) => {
-                        Err(anyagents_agent::Error::HarnessDown)
-                    }
-                    Err(anyagents_harness::HarnessError::Failed(reason)) => {
-                        Err(anyagents_agent::Error::HarnessFailed(reason))
-                    }
-                }
-            } else {
-                Ok(None)
-            };
-            match (reconciled, open) {
-                (Err(err), _) => Err(err),
-                (Ok(_), None) => {
+            match open {
+                None => {
                     self.pending_recovery = false;
+                    self.recovery_blocks_mail = false;
                     if self
                         .last_error
                         .as_deref()
@@ -1716,30 +2117,41 @@ impl<H: Harness + 'static> Session<H> {
                     {
                         self.last_error = None;
                     }
-                    if has_hold {
-                        self.last_error = None;
-                    }
                     return false;
                 }
-                (Ok(rec), Some(open)) => {
-                    delivery.recover_open_turn_with_reconciliation(&open, rec.as_ref())
-                }
+                Some(open) => delivery.recover_open_turn(&open),
             }
         };
         match outcome {
-            Ok(DeliverOutcome::Accepted { .. }) => {
+            Ok(DeliverOutcome::Accepted { .. } | DeliverOutcome::Duplicate) => {
                 self.pending_recovery = false;
+                self.recovery_blocks_mail = false;
                 self.last_error = None;
                 self.written = self.written.saturating_add(1);
+                // The store counted this recovery: the note kept with the
+                // process says it is no longer owed before anything else, so
+                // a kernel that dies now leaves no second note to send.
+                self.sync_note();
                 false
             }
-            // The delivery loop answers a recovery note only as taken or not.
-            Ok(
-                DeliverOutcome::Deferred
-                | DeliverOutcome::InFlight
-                | DeliverOutcome::Duplicate
-                | DeliverOutcome::Quota { .. },
-            ) => false,
+            Ok(DeliverOutcome::Rejected { reason, .. }) => {
+                self.pending_recovery = false;
+                self.recovery_blocks_mail = false;
+                self.last_error = Some(format!("recovery note rejected by the harness: {reason}"));
+                self.sync_note();
+                self.publish();
+                false
+            }
+            // Written and not yet proved: mail may follow it.
+            Ok(DeliverOutcome::InFlight) => {
+                self.recovery_blocks_mail = false;
+                false
+            }
+            // Not written: mail waits behind it.
+            Ok(DeliverOutcome::Deferred | DeliverOutcome::Quota { .. }) => {
+                self.recovery_blocks_mail = true;
+                false
+            }
             Err(anyagents_agent::Error::HarnessDown) => {
                 if !self.wait_backoff() {
                     return true;
@@ -2276,36 +2688,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn declared_catalog_matches_native_steer_adapters() {
-        for harness in [
-            "codex",
-            "claude-code",
-            "opencode",
-            "muse",
-            "agy",
-            "omp",
-            "dsh",
-            "grok",
-            "spiron",
-            "sylphx",
-            "sylphx-agent",
-            "sylphx_agent",
-            "sylphx/default",
-        ] {
-            assert_eq!(
-                super::declared(harness),
-                (super::DeliveryMode::Steer, super::SteerSupport::Yes),
-                "{harness}"
-            );
-        }
-        assert_eq!(
-            super::declared("contract"),
-            (super::DeliveryMode::Followup, super::SteerSupport::Unproven)
-        );
-    }
-
     use super::*;
+    use anyagents_harness::DeliveryMode;
 
     #[test]
     fn legacy_admin_files_do_not_disable_spiron_supervision() {
@@ -2430,9 +2814,11 @@ mod tests {
                     DeliveryMode::Steer,
                 )))
             }),
+            custody: Arc::new(InProcess),
             extra_env: Vec::new(),
             board: HealthBoard::default(),
             stop: AtomicBool::new(false),
+            retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
             idle_release_hook: Some(Arc::new(move |_| {
                 at_idle_tx.send(()).unwrap();
@@ -2669,9 +3055,11 @@ mod tests {
             store: Arc::clone(&store),
             clock: Arc::clone(&clock) as Arc<dyn Clock>,
             launch: Arc::new(|_| Err("no launch".into())),
+            custody: Arc::new(InProcess),
             extra_env: Vec::new(),
             board: HealthBoard::default(),
             stop: AtomicBool::new(false),
+            retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
             idle_release_hook: None,
         });
@@ -2734,7 +3122,7 @@ mod tests {
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
-    use anyagents_harness::{FakeHarness, HarnessError, OutboundMessage};
+    use anyagents_harness::{DeliveryMode, FakeHarness, HarnessError, OutboundMessage};
     use rusqlite::Connection;
 
     struct UsageHarness {
@@ -2785,9 +3173,11 @@ mod persistence_tests {
             store: Arc::clone(&store),
             clock: Arc::new(SystemClock::new()),
             launch: Arc::new(move |_| Ok(make_harness())),
+            custody: Arc::new(InProcess),
             extra_env: Vec::new(),
             board: HealthBoard::default(),
             stop: AtomicBool::new(false),
+            retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
             idle_release_hook: None,
         });
@@ -3123,9 +3513,11 @@ mod persistence_tests {
                 launches_counter.fetch_add(1, Ordering::SeqCst);
                 Err("unexpected launch".into())
             }),
+            custody: Arc::new(InProcess),
             extra_env: Vec::new(),
             board: HealthBoard::default(),
             stop: AtomicBool::new(false),
+            retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
             idle_release_hook: None,
         });
@@ -3141,5 +3533,160 @@ mod persistence_tests {
         assert!(matches!(session.boot(), Boot::Stopped));
         assert_eq!(launches.load(Ordering::SeqCst), 0);
         assert!(!session.paths.work_dir.exists());
+    }
+}
+
+#[cfg(test)]
+mod custody_tests {
+    use super::*;
+
+    /// Equal totals are no news, whatever cost they carry; any total above
+    /// its last reading is.
+    #[test]
+    fn usage_advances_only_when_a_total_grows() {
+        let usage = |tokens: u64, cost: Option<i64>| TurnUsage {
+            input_tokens: tokens,
+            output_tokens: tokens,
+            reported_cost_micros: cost,
+            ..TurnUsage::default()
+        };
+        assert!(!usage_advanced(&usage(5, Some(7)), &usage(5, Some(7))));
+        assert!(!usage_advanced(&usage(5, None), &usage(5, Some(7))));
+        assert!(!usage_advanced(&usage(4, Some(6)), &usage(5, Some(7))));
+        assert!(!usage_advanced(&usage(5, Some(0)), &usage(5, None)));
+        assert!(usage_advanced(&usage(5, Some(8)), &usage(5, Some(7))));
+        assert!(usage_advanced(&usage(5, Some(1)), &usage(5, None)));
+        assert!(usage_advanced(&usage(6, Some(7)), &usage(5, Some(7))));
+        assert_eq!(
+            usage(4, Some(6))
+                .difference(usage(5, Some(7)))
+                .reported_cost_micros,
+            Some(0)
+        );
+    }
+    use anyagents_core::NewAgent;
+    use anyagents_harness::{HarnessError, OutboundMessage};
+
+    /// A process whose end looks at the agent lock: whether it was still held
+    /// when the process ended.
+    struct Probe {
+        lock_path: PathBuf,
+        held_when_ended: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            use std::os::fd::AsRawFd as _;
+            let file = fs::File::open(&self.lock_path).unwrap();
+            // SAFETY: flock on a descriptor this probe owns; dropping it
+            // releases what it took.
+            let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 };
+            *lock(&self.held_when_ended) = Some(!free);
+        }
+    }
+
+    impl Harness for Probe {
+        fn deliver(&mut self, _message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+            Ok(DeliverOutcome::Deferred)
+        }
+        fn background(&mut self) -> Result<(), HarnessError> {
+            Ok(())
+        }
+        fn resume(&mut self, _session: &str) -> Result<(), HarnessError> {
+            Ok(())
+        }
+        fn cancel(&mut self) -> Result<(), HarnessError> {
+            Ok(())
+        }
+        fn health(&self) -> HarnessHealth {
+            HarnessHealth {
+                process_alive: true,
+                turn_state: TurnState::Idle,
+                delivery: anyagents_harness::Delivery {
+                    level: anyagents_harness::DeliveryLevel::TurnEnd,
+                    idempotent: false,
+                    proof: "a probe proves nothing".into(),
+                    peer: None,
+                },
+                quota_reset_at_ms: None,
+                sign_in_fault: None,
+            }
+        }
+    }
+
+    struct OneLeft(Mutex<Option<Attached<Probe>>>);
+
+    impl Custody<Probe> for OneLeft {
+        fn outlives_kernel(&self) -> bool {
+            true
+        }
+        fn retained(&self) -> Vec<AgentId> {
+            Vec::new()
+        }
+        fn attach(&self, _agent: &AgentId) -> Result<Option<Attached<Probe>>, String> {
+            Ok(lock(&self.0).take())
+        }
+        fn release(&self, _agent: &AgentId) {}
+        fn retain(&self, harness: Probe) {
+            std::mem::forget(harness);
+        }
+        fn note(&self, _harness: &Probe, _note: &str) {}
+    }
+
+    /// A process left for an agent that stopped running meanwhile is ended
+    /// before the agent lock it was taken over with is released: never left
+    /// running without its lock, even for a moment.
+    #[test]
+    fn a_process_taken_over_for_a_stopped_agent_ends_before_its_lock_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("alpha", "claude-code"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "paused").unwrap();
+        let taken = store.try_lock_agent(&agent.id).unwrap();
+        let keeper_copy = taken.share().unwrap();
+        taken.retain();
+        drop(taken);
+        let adopted = AgentLock::adopt(
+            std::os::fd::AsFd::as_fd(&keeper_copy)
+                .try_clone_to_owned()
+                .unwrap(),
+        );
+        // The keeper is gone: only the adopted copy holds the lock now.
+        drop(keeper_copy);
+        let held_when_ended = Arc::new(Mutex::new(None));
+        let probe = Probe {
+            lock_path: anyagents_core::agent_lock_path(store.data_dir(), &agent.id),
+            held_when_ended: Arc::clone(&held_when_ended),
+        };
+        let inner = Arc::new(Inner::<Probe> {
+            store: Arc::clone(&store),
+            clock: Arc::new(SystemClock::new()),
+            launch: Arc::new(|_| Err("no launch".into())),
+            custody: Arc::new(OneLeft(Mutex::new(Some(Attached {
+                harness: probe,
+                lock: adopted,
+                harness_name: "claude-code".into(),
+                model: None,
+                started_at_ms: None,
+                note: None,
+                older: Vec::new(),
+            })))),
+            extra_env: Vec::new(),
+            board: HealthBoard::default(),
+            stop: AtomicBool::new(false),
+            retain: AtomicBool::new(false),
+            workers: Mutex::new(HashMap::new()),
+            idle_release_hook: None,
+        });
+        let mut session = Session::new(inner, agent.clone(), Arc::new(|| {}), Signals::detached());
+        assert!(matches!(session.boot(), Boot::Stopped));
+        assert_eq!(
+            *lock(&held_when_ended),
+            Some(true),
+            "the lock was released before the process ended"
+        );
+        store.try_lock_agent(&agent.id).unwrap();
     }
 }

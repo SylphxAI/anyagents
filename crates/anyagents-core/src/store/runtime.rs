@@ -1,5 +1,5 @@
-//! Explicit, persisted runtime state machines: the agent runtime, turns, steer
-//! custody, session leases and quota blocks.
+//! Explicit, persisted runtime state machines: the agent runtime, turns,
+//! session leases and quota blocks.
 //!
 //! Every transition is a compare-and-set against the state the caller observed
 //! and is checked against its transition table before anything is written. A
@@ -116,7 +116,6 @@ text_enum!(
         Transient => "transient",
         Fatal => "fatal",
         StorageRetry => "storage_retry",
-        SteerReconcile => "steer_reconcile",
         RecoveryExhausted => "recovery_exhausted",
         Legacy => "legacy",
     }
@@ -195,43 +194,6 @@ pub enum RecoveryOffer {
     /// The limit was reached: the turn stays interrupted and the runtime is
     /// faulted with `recovery_exhausted` in the same transaction.
     Exhausted(Turn),
-}
-
-text_enum!(
-    SteerState, "steer" {
-        Held => "held",
-        Acked => "acked",
-        Unconsumed => "unconsumed",
-        Consumed => "consumed",
-        Reconciling => "reconciling",
-        Archived => "archived",
-    }
-);
-
-/// Where a steer hold can go. `None` is "committed": the row is removed.
-pub fn steer_allows(from: SteerState, to: Option<SteerState>) -> bool {
-    use SteerState::*;
-    matches!(
-        (from, to),
-        (Held, Some(Acked))
-            | (Acked, None)
-            | (Acked, Some(Unconsumed | Consumed))
-            | (Held | Acked, Some(Reconciling))
-            | (Reconciling, Some(Unconsumed | Consumed) | None)
-            | (Unconsumed, Some(Held))
-            | (Consumed, None)
-    )
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SteerHold {
-    pub agent_id: AgentId,
-    pub message_id: String,
-    pub generation: i64,
-    pub turn_id: Option<String>,
-    pub state: SteerState,
-    pub redelivered: bool,
-    pub updated_at_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -467,37 +429,6 @@ fn release_blocker(tx: &Transaction<'_>, agent_id: &AgentId) -> Result<Option<St
         )
         .optional()?;
     Ok(busy_child.map(|child| format!("child {child} is active")))
-}
-
-fn steer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SteerHold> {
-    Ok(SteerHold {
-        agent_id: agent_id_at(row, 0)?,
-        message_id: row.get(1)?,
-        generation: row.get(2)?,
-        turn_id: row.get(3)?,
-        state: parse(4, row.get(4)?)?,
-        redelivered: row.get::<_, i64>(5)? != 0,
-        updated_at_ms: row.get(6)?,
-    })
-}
-
-const STEER_COLS: &str =
-    "agent_id, message_id, generation, turn_id, state, redelivered, updated_at_ms";
-
-fn steer_of(
-    conn: &Connection,
-    agent_id: &AgentId,
-    message_id: &str,
-) -> Result<Option<SteerHold>, Error> {
-    Ok(conn
-        .query_row(
-            &format!(
-                "SELECT {STEER_COLS} FROM steer_holds WHERE agent_id = ?1 AND message_id = ?2"
-            ),
-            params![agent_id.as_str(), message_id],
-            steer_from_row,
-        )
-        .optional()?)
 }
 
 fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionLease> {
@@ -746,103 +677,6 @@ impl Store {
             mirror_turn_recovery(tx, agent_id)?;
             turn_by_id(tx, agent_id, &next)
         })
-    }
-
-    /// Persist a steer hold before any input bytes are written. A row that is
-    /// `unconsumed` and not yet redelivered is held again (its one redelivery).
-    pub fn hold_steer(
-        &self,
-        agent_id: &AgentId,
-        message_id: &str,
-        generation: i64,
-        turn_id: Option<&str>,
-    ) -> Result<SteerHold, Error> {
-        self.runtime_write(|tx| {
-            agent_exists(tx, agent_id)?;
-            match steer_of(tx, agent_id, message_id)? {
-                None => {
-                    tx.execute(
-                        "INSERT INTO steer_holds (agent_id, message_id, generation, turn_id, state, updated_at_ms)
-                         VALUES (?1, ?2, ?3, ?4, 'held', ?5)",
-                        params![agent_id.as_str(), message_id, generation, turn_id, now_ms()],
-                    )?;
-                }
-                Some(hold) if hold.state == SteerState::Unconsumed && !hold.redelivered => {
-                    tx.execute(
-                        "UPDATE steer_holds SET state = 'held', redelivered = 1, generation = ?3,
-                             turn_id = ?4, updated_at_ms = ?5
-                         WHERE agent_id = ?1 AND message_id = ?2",
-                        params![agent_id.as_str(), message_id, generation, turn_id, now_ms()],
-                    )?;
-                }
-                Some(hold) => return Err(refused("steer", hold.state, SteerState::Held)),
-            }
-            steer_of(tx, agent_id, message_id)?
-                .ok_or_else(|| Error::Message(format!("steer hold {message_id} vanished")))
-        })
-    }
-
-    /// Move a steer hold from `from` to `to`; `None` commits it (removes the row).
-    /// Entering `unconsumed` rewinds the delivery cursor to just before that
-    /// message in the same commit, so it is offered again exactly once.
-    pub fn transition_steer(
-        &self,
-        agent_id: &AgentId,
-        message_id: &str,
-        from: SteerState,
-        to: Option<SteerState>,
-    ) -> Result<Option<SteerHold>, Error> {
-        self.runtime_write(|tx| {
-            let hold = steer_of(tx, agent_id, message_id)?
-                .ok_or_else(|| Error::Message(format!("no steer hold for {message_id}")))?;
-            if hold.state != from {
-                return Err(conflict("steer", from, hold.state));
-            }
-            let target = to.map_or("committed", SteerState::as_str);
-            if !steer_allows(from, to) || to == Some(SteerState::Held) {
-                return Err(refused("steer", from, target));
-            }
-            let Some(to) = to else {
-                tx.execute(
-                    "DELETE FROM steer_holds WHERE agent_id = ?1 AND message_id = ?2",
-                    params![agent_id.as_str(), message_id],
-                )?;
-                return Ok(None);
-            };
-            if to == SteerState::Unconsumed {
-                if hold.redelivered {
-                    return Err(refused("steer", "redelivered", SteerState::Unconsumed));
-                }
-                rewind_before(tx, agent_id, message_id)?;
-            }
-            tx.execute(
-                "UPDATE steer_holds SET state = ?3, updated_at_ms = ?4 WHERE agent_id = ?1 AND message_id = ?2",
-                params![agent_id.as_str(), message_id, to.as_str(), now_ms()],
-            )?;
-            steer_of(tx, agent_id, message_id)
-        })
-    }
-
-    /// Archive every non-archived hold from generations up to `generation`
-    /// (reset retires a generation; its holds never block a later start).
-    pub fn retire_steer_holds(&self, agent_id: &AgentId, generation: i64) -> Result<usize, Error> {
-        self.runtime_write(|tx| {
-            Ok(tx.execute(
-                "UPDATE steer_holds SET state = 'archived', updated_at_ms = ?3
-                 WHERE agent_id = ?1 AND generation <= ?2 AND state != 'archived'",
-                params![agent_id.as_str(), generation, now_ms()],
-            )?)
-        })
-    }
-
-    /// Every steer hold for the agent, archived included, in message order.
-    pub fn steer_holds(&self, agent_id: &AgentId) -> Result<Vec<SteerHold>, Error> {
-        let conn = self.read_conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {STEER_COLS} FROM steer_holds WHERE agent_id = ?1 ORDER BY message_id"
-        ))?;
-        let rows = stmt.query_map([agent_id.as_str()], steer_from_row)?;
-        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Acquire the vendor-session lease for `generation`. Refused while any
@@ -1121,28 +955,6 @@ fn close_turn(
     tx.execute(
         "UPDATE turns SET state = 'closed', outcome = ?3, closed_at_ms = ?4 WHERE agent_id = ?1 AND turn_id = ?2",
         params![agent_id.as_str(), turn_id, outcome.as_str(), now_ms()],
-    )?;
-    Ok(())
-}
-
-fn rewind_before(tx: &Transaction<'_>, agent_id: &AgentId, message_id: &str) -> Result<(), Error> {
-    let seq: i64 = tx
-        .query_row(
-            "SELECT seq FROM messages WHERE agent_id = ?1 AND id = ?2",
-            params![agent_id.as_str(), message_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .ok_or_else(|| {
-            Error::Message(format!("steer message {message_id} is not in the mailbox"))
-        })?;
-    tx.execute(
-        "UPDATE mailbox_cursors SET delivered_seq = MIN(delivered_seq, ?2) WHERE agent_id = ?1",
-        params![agent_id.as_str(), seq - 1],
-    )?;
-    tx.execute(
-        "UPDATE messages SET delivered_at_ms = NULL WHERE agent_id = ?1 AND seq = ?2",
-        params![agent_id.as_str(), seq],
     )?;
     Ok(())
 }

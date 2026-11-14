@@ -1,3 +1,5 @@
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -83,7 +85,7 @@ fn a_message_in_another_process_wakes_the_supervisor() {
         .unwrap();
     let wake = events.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(matches!(wake, Wake::Mail { .. }));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -149,7 +151,7 @@ fn one_process_restarts_after_a_kill_and_refuses_a_second() {
             live.process_alive && live.pid.is_some_and(|next| next != pid) && argv_count(&log) >= 2
         })
     }));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -187,7 +189,63 @@ fn a_running_agent_receives_mail_without_a_manual_deliver() {
         "{}",
         std::fs::read_to_string(&log).unwrap_or_default()
     );
-    drop(supervisor);
+    support::stop(supervisor);
+}
+
+#[test]
+fn a_message_proved_before_the_process_died_is_committed_and_never_handed_over_again() {
+    let dir = short_dir();
+    let log = dir.path().join("vendor.log");
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let agent = store
+        .create_agent(NewAgent::new("alpha", "claude-code"))
+        .unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    store
+        .set_agent_running(&agent.id, &work.display().to_string())
+        .unwrap();
+    let start = 1_699_000_000_000;
+    let clock = ManualClock::new(start);
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+        scripted("prove_exit", log.clone()),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent.id)
+            .is_some_and(|live| live.process_alive)
+    }));
+    store
+        .receive(&agent.id, Incoming::new("proved-then-died"))
+        .unwrap();
+    // The vendor proves the line and exits at once. The proof is committed
+    // while the clock is still: before the restart backoff, and before a new
+    // process could be handed the line again.
+    assert!(wait_until(
+        || store.delivered_cursor(&agent.id).unwrap() == 1
+    ));
+    // The next process is handed the interrupted turn's recovery note, which
+    // is offered only once the mailbox holds nothing for it.
+    let mut ticks = 0;
+    assert!(wait_until(|| {
+        ticks += 1;
+        clock.set_ms(start + ticks * 1_000);
+        log_contains(&log, "[Recovery]")
+    }));
+    support::stop(supervisor);
+    let written = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        written
+            .lines()
+            .filter(|line| line.contains("proved-then-died") && !line.contains("[Recovery]"))
+            .count(),
+        1,
+        "{written}"
+    );
 }
 
 #[test]
@@ -232,7 +290,7 @@ fn quota_pauses_until_the_reset_time() {
         "{}",
         std::fs::read_to_string(&log).unwrap_or_default()
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -332,7 +390,7 @@ fn finished_turns_sum_by_agent_and_day() {
     assert_eq!(beta_input, 11);
     assert!(rows.iter().any(|row| row.day == utc_day(later)));
     assert_ne!(utc_day(later), first_day);
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// Three lines arrive while the child holds its turn open. Tool-boundary hook
@@ -402,7 +460,7 @@ fn three_lines_sent_while_a_turn_is_open_are_all_taken_and_none_twice() {
             .iter()
             .all(|message| message.ack == anyagents_core::Ack::Delivered)
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// A line already taken is not written again after the server restarts, and a
@@ -441,7 +499,8 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
     // Do not kill the child until it has read the first accepted pipe write.
     assert!(wait_until(|| log_contains(&log, "user:1:")));
     // The process dies with the turn still open. The supervisor starts a new
-    // one after its backoff, and the next two lines go to it in order.
+    // one after its backoff: the interrupted turn's recovery note goes first,
+    // then the next two lines, in order.
     let pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
     let killed = std::process::Command::new("kill")
         .args(["-KILL", &pid.to_string()])
@@ -470,9 +529,17 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
         std::fs::read_to_string(&log).unwrap_or_default()
     );
     let text = std::fs::read_to_string(&log).unwrap_or_default();
+    // The recovery note names the interrupted message; it is no input of its
+    // own. Count the lines that carry each message as input.
+    let inputs: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with('{') && !line.contains("[Recovery]"))
+        .collect();
     for message in &inbox {
         assert_eq!(
-            text.matches(&format!("anyagents-message:{}", message.id))
+            inputs
+                .iter()
+                .filter(|line| line.contains(&format!("anyagents-message:{}", message.id)))
                 .count(),
             1,
             "{} was written once across the restart: {text}",
@@ -480,7 +547,17 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
         );
         assert_eq!(message.ack, anyagents_core::Ack::Delivered);
     }
-    drop(supervisor);
+    let note = text
+        .find("[Recovery]")
+        .expect("the interrupted turn's recovery note");
+    let two = text
+        .find(&format!("anyagents-message:{}", inbox[1].id))
+        .expect("the second line");
+    assert!(
+        note < two,
+        "the recovery note goes ahead of later mail: {text}"
+    );
+    support::stop(supervisor);
 }
 
 #[test]
@@ -575,7 +652,12 @@ fn backpressure_parks_until_the_input_activity_notification() {
         })
     };
     let supervisor = Supervisor::start(Arc::clone(&store), clock, launch, vec![]).unwrap();
+    let deadline = Instant::now() + WAIT_CEILING;
     loop {
+        assert!(
+            Instant::now() < deadline,
+            "backpressure never reached a clock wait"
+        );
         if rx
             .recv_timeout(Duration::from_secs(3))
             .expect("backpressure must reach clock wait")
@@ -590,7 +672,7 @@ fn backpressure_parks_until_the_input_activity_notification() {
     assert!(wait_until(
         || store.delivered_cursor(&agent.id).unwrap() == 1
     ));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -666,7 +748,7 @@ fn an_interrupted_turn_with_no_new_messages_receives_a_recovery_note_on_restart(
         text.contains("completed (do not resend): part 1 report already delivered"),
         "{text}"
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -767,7 +849,7 @@ fn a_finished_turn_does_not_receive_a_recovery_note_on_restart() {
         "finished turn must not receive recovery note:\n{}",
         std::fs::read_to_string(&log).unwrap_or_default()
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -828,8 +910,13 @@ fn assert_finished_agent_scales_to_zero(is_root: bool, role: Option<&str>) {
         clock.set_ms(due + i64::from(stepped) * 1_000);
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Completing the turn automatically scales the sub-agent to `idle` and releases its process.
+    // Completing the turn automatically scales the sub-agent to `idle` and
+    // releases its process. The turn's proof can be its last event, so the
+    // idle review runs on the supervisor's timer: let time pass.
+    let mut ticks = 0;
     assert!(wait_until(|| {
+        ticks += 1;
+        clock.set_ms(due + 50_000 + ticks * 250);
         other.agent(&sub.id).unwrap().state == "idle"
             && supervisor
                 .live(&sub.id)
@@ -847,10 +934,13 @@ fn assert_finished_agent_scales_to_zero(is_root: bool, role: Option<&str>) {
         clock.set_ms(due + 100_000 + i64::from(stepped2) * 1_000);
         std::thread::sleep(Duration::from_millis(50));
     }
+    let mut ticks = 0;
     assert!(wait_until(|| {
+        ticks += 1;
+        clock.set_ms(due + 150_000 + ticks * 250);
         other.agent(&sub.id).unwrap().state == "idle"
     }));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -895,7 +985,7 @@ fn a_model_or_harness_change_automatically_switches_running_process_at_next_idle
                 && live.live_model.as_deref() == Some("opus")
         })
     }));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -971,7 +1061,7 @@ fn a_model_or_harness_change_drains_and_cuts_over_even_when_turn_never_ends_and_
                 && live.live_model.as_deref() == Some("opus")
         }) && log_contains(&log, "queued-for-new-model")
     }));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 // Observe the worker reaching its blocking wait, not an arbitrary sleep:
@@ -1014,16 +1104,27 @@ fn profile_rotation_keeps_mail_flowing_and_preserves_an_in_turn_child() {
     let release = dir.path().join("finish-turn");
     let log = dir.path().join("vendor.log");
     let program = dir.path().join("controlled-claude");
-    // The real ClaudeHarness owns this process. Each turn consumes one release
-    // token before reporting completion, so the replacement's queued turn stays
-    // observable even when the runtime promptly releases completed idle agents.
+    // The real ClaudeHarness owns this process. Like Claude Code, it reads
+    // every line as it arrives and proves it entered the conversation with
+    // the replay echo: a line that arrives while a turn runs joins that
+    // turn. A turn reports completion only once it claims a release token,
+    // so the replacement's queued turn stays observable even when the
+    // runtime promptly releases completed idle agents.
     std::fs::write(&program, r#"#!/bin/sh
+turn="$RELEASE_TURN.$$.open"
 while IFS= read -r line; do
     printf '%s:%s\n' "$$" "$line" >> "$PROBE_LOG"
-    while [ ! -f "$RELEASE_TURN" ]; do sleep 0.01; done
-    rm "$RELEASE_TURN"
-    printf '%s\n' '{"type":"result","subtype":"success","session_id":"rotation-test","usage":{"input_tokens":1,"output_tokens":1}}'
+    printf '%s\n' "$line" | sed 's/^{/{"isReplay":true,/'
+    if [ ! -f "$turn" ]; then
+        : > "$turn"
+        (
+            while ! mv "$RELEASE_TURN" "$turn.released" 2>/dev/null; do sleep 0.01; done
+            rm -f "$turn"
+            printf '%s\n' '{"type":"result","subtype":"success","session_id":"rotation-test","usage":{"input_tokens":1,"output_tokens":1}}'
+        ) &
+    fi
 done
+wait
 "#).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     let clock = ManualClock::new(1_700_000_000_000);
@@ -1060,7 +1161,9 @@ done
         &dir.path().join("vendor.log"),
         "initial-long-turn"
     )));
+    let until = Instant::now() + WAIT_CEILING;
     loop {
+        assert!(Instant::now() < until, "the worker never waited 250 ms");
         let (now, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
         if deadline == Some(now + 250) {
             break;
@@ -1086,7 +1189,9 @@ done
     for elapsed in [15_001, 30_001] {
         let now = 1_700_000_000_000 + elapsed;
         clock.set_ms(now);
+        let until = Instant::now() + WAIT_CEILING;
         loop {
+            assert!(Instant::now() < until, "the worker never waited at {now}");
             let (observed, _) = rx.recv_timeout(WAIT_CEILING).unwrap();
             if observed == now {
                 break;
@@ -1108,12 +1213,7 @@ done
                 .success()
         );
     }
-    // The same child works through the steered mail before it is replaced.
-    std::fs::write(dir.path().join("finish-turn"), "done\n").unwrap();
-    assert!(wait_until(|| log_contains(
-        &log_path,
-        "steered-during-rotation"
-    )));
+    // The same child took the steered mail into its running turn.
     let log = std::fs::read_to_string(&log_path).unwrap();
     assert!(
         log.lines()
@@ -1121,8 +1221,8 @@ done
             .unwrap()
             .starts_with(&format!("{first_pid}:"))
     );
-    // When that work ends the child is idle and the rotation takes effect.
-    std::fs::write(dir.path().join("finish-turn"), "finish-steered-turn\n").unwrap();
+    // When that turn ends the child is idle and the rotation takes effect.
+    std::fs::write(dir.path().join("finish-turn"), "done\n").unwrap();
     assert!(wait_until(|| store.open_turn(&agent.id).unwrap().is_none()
         && supervisor
             .live(&agent.id)
@@ -1151,7 +1251,7 @@ done
     }
     std::fs::write(dir.path().join("finish-turn"), "finish-last-turn\n").unwrap();
     assert!(wait_until(|| store.open_turn(&agent.id).unwrap().is_none()));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 #[test]
@@ -1209,7 +1309,12 @@ fn profile_rotation_cannot_replace_an_in_turn_harness_via_quota_recovery() {
     });
     assert!(wait_until(|| old.lock().unwrap().health_reads > reads + 1));
     clock.set_ms(clock.now_ms() + 30_001);
+    let until = Instant::now() + WAIT_CEILING;
     loop {
+        assert!(
+            Instant::now() < until,
+            "the worker never waited at the clock's time"
+        );
         let (now, _) = rx.recv_timeout(WAIT_CEILING).unwrap();
         if now == clock.now_ms() {
             break;
@@ -1225,7 +1330,7 @@ fn profile_rotation_cannot_replace_an_in_turn_harness_via_quota_recovery() {
         agent_id: agent.id.clone(),
     });
     assert!(wait_until(|| probes.lock().unwrap().len() == 2));
-    drop(supervisor);
+    support::stop(supervisor);
 }
 
 /// A controllable adapter keeps replacement and delivery as separate observable
@@ -1241,6 +1346,7 @@ struct SwitchProbe {
     offers: usize,
     given: Vec<String>,
     health_reads: usize,
+    stopped: bool,
 }
 
 impl Default for SwitchProbe {
@@ -1249,8 +1355,12 @@ impl Default for SwitchProbe {
             health: anyagents_harness::HarnessHealth {
                 process_alive: true,
                 turn_state: anyagents_harness::TurnState::Idle,
-                delivery_mode: DeliveryMode::Steer,
-                steer_support: anyagents_harness::SteerSupport::Yes,
+                delivery: anyagents_harness::Delivery {
+                    level: anyagents_harness::DeliveryLevel::MidTurn,
+                    idempotent: false,
+                    proof: std::borrow::Cow::Borrowed("scripted double"),
+                    peer: None,
+                },
                 quota_reset_at_ms: None,
                 sign_in_fault: None,
             },
@@ -1259,6 +1369,7 @@ impl Default for SwitchProbe {
             offers: 0,
             given: Vec::new(),
             health_reads: 0,
+            stopped: false,
         }
     }
 }
@@ -1284,6 +1395,11 @@ impl anyagents_harness::Harness for SwitchHarness {
     fn resume(&mut self, _: &str) -> Result<(), anyagents_harness::HarnessError> {
         panic!("a switch must not resume the retiring harness session")
     }
+    fn stop(&mut self) {
+        let mut probe = self.probe.lock().unwrap();
+        probe.stopped = true;
+        probe.health.process_alive = false;
+    }
     fn cancel(&mut self) -> Result<(), anyagents_harness::HarnessError> {
         Ok(())
     }
@@ -1295,7 +1411,10 @@ impl anyagents_harness::Harness for SwitchHarness {
 }
 
 #[test]
-fn a_replacement_that_fails_to_launch_leaves_the_old_process_serving_mail() {
+/// A switch to another harness starts another session, so the old process
+/// keeps serving until the new one is up: a launch that fails leaves it
+/// serving mail.
+fn a_switch_to_another_harness_that_fails_to_launch_leaves_the_old_process_serving_mail() {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1326,7 +1445,10 @@ fn a_replacement_that_fails_to_launch_leaves_the_old_process_serving_mail() {
                 if !launch_works.load(Ordering::SeqCst) {
                     return Err("launch refused".to_string());
                 }
-                launched_models.lock().unwrap().push(request.agent.model);
+                launched_models
+                    .lock()
+                    .unwrap()
+                    .push(Some(request.agent.harness));
                 let probe = Arc::new(Mutex::new(SwitchProbe::default()));
                 probes.lock().unwrap().push(Arc::clone(&probe));
                 Ok(SwitchHarness { probe })
@@ -1354,7 +1476,7 @@ fn a_replacement_that_fails_to_launch_leaves_the_old_process_serving_mail() {
         assert!(wait_until(|| old.lock().unwrap().health_reads > reads + 1));
     };
     let start = clock.now_ms();
-    store.set_agent_model(&agent.id, "new-model").unwrap();
+    store.set_agent_harness(&agent.id, "codex").unwrap();
     settle();
     // The drain ends and the replacement fails to launch.
     clock.set_ms(start + 15_001);
@@ -1386,8 +1508,76 @@ fn a_replacement_that_fails_to_launch_leaves_the_old_process_serving_mail() {
     assert!(wait_until(|| probes.lock().unwrap().len() == 2));
     assert_eq!(
         launched_models.lock().unwrap().last().unwrap().as_deref(),
-        Some("new-model")
+        Some("codex")
     );
+}
+
+/// A model switch resumes the same vendor session: the old process is
+/// stopped and read to the end before the new one launches, so the two never
+/// share the session. A launch that fails leaves a dead process, which the
+/// dead-process backoff replaces.
+#[test]
+fn a_model_switch_stops_the_old_process_before_the_new_one_launches() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = short_dir();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let mut spec = NewAgent::new("switch-target", "sylphx");
+    spec.model = Some("old-model".into());
+    let agent = store.create_agent(spec).unwrap();
+    store
+        .set_agent_running(&agent.id, &dir.path().join("work").display().to_string())
+        .unwrap();
+    let probes = Arc::new(Mutex::new(Vec::<Arc<Mutex<SwitchProbe>>>::new()));
+    let launch_works = Arc::new(AtomicBool::new(true));
+    let old_stopped_at_launch = Arc::new(Mutex::new(Vec::new()));
+    let clock = ManualClock::new(1_700_000_000_000);
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock.clone()),
+        {
+            let probes = Arc::clone(&probes);
+            let launch_works = Arc::clone(&launch_works);
+            let seen = Arc::clone(&old_stopped_at_launch);
+            Arc::new(move |_: LaunchRequest| {
+                let previous = probes.lock().unwrap().last().cloned();
+                if let Some(previous) = previous {
+                    seen.lock().unwrap().push(previous.lock().unwrap().stopped);
+                }
+                if !launch_works.load(Ordering::SeqCst) {
+                    return Err("launch refused".to_string());
+                }
+                let probe = Arc::new(Mutex::new(SwitchProbe::default()));
+                probes.lock().unwrap().push(Arc::clone(&probe));
+                Ok(SwitchHarness { probe })
+            })
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| supervisor.live(&agent.id).is_some()));
+    launch_works.store(false, Ordering::SeqCst);
+    store.set_agent_model(&agent.id, "new-model").unwrap();
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    // The first launch fails after the old process was stopped.
+    assert!(wait_until(|| !old_stopped_at_launch
+        .lock()
+        .unwrap()
+        .is_empty()));
+    assert!(old_stopped_at_launch.lock().unwrap()[0]);
+    assert!(probes.lock().unwrap()[0].lock().unwrap().stopped);
+    // The dead process is replaced after its backoff.
+    launch_works.store(true, Ordering::SeqCst);
+    let mut ticks = 0;
+    assert!(wait_until(|| {
+        ticks += 1;
+        clock.set_ms(1_700_000_000_000 + ticks * 1_000);
+        probes.lock().unwrap().len() == 2
+    }));
+    support::stop(supervisor);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1586,7 +1776,7 @@ fn a_dead_process_switches_without_waiting_for_restart_backoff() {
 }
 
 #[test]
-fn deferred_pending_mail_precedes_interrupted_turn_recovery() {
+fn interrupted_turn_recovery_goes_ahead_of_pending_mail() {
     use std::sync::{Mutex, atomic::AtomicBool, mpsc};
 
     struct DispatchClock {
@@ -1630,8 +1820,8 @@ fn deferred_pending_mail_precedes_interrupted_turn_recovery() {
         .unwrap();
     let pending = store.next_undelivered(&agent.id).unwrap().unwrap();
 
-    // Real mail is deferred, but recovery would be accepted immediately. This
-    // makes an invalid recovery offer observable without racing an input gate.
+    // Real mail is deferred, but recovery is accepted immediately, so the
+    // order of the two offers is observable without racing an input gate.
     let probe = Arc::new(Mutex::new(SwitchProbe {
         accept_recovery: true,
         ..SwitchProbe::default()
@@ -1656,21 +1846,20 @@ fn deferred_pending_mail_precedes_interrupted_turn_recovery() {
         Vec::new(),
     )
     .unwrap();
+    // The interrupted turn's messages are older than the pending mail: its
+    // recovery note goes first, even while the vendor defers that mail.
     let deadline = Instant::now() + WAIT_CEILING;
-    loop {
-        let (offers, given) = rx
+    let recovery = loop {
+        let (_, given) = rx
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .expect("dispatch must park");
-        if offers > 0 {
-            assert!(
-                given.is_empty(),
-                "recovery must not overtake deferred mail: {given:?}"
-            );
-            break;
+        if !given.is_empty() {
+            assert_eq!(given.len(), 1, "only the recovery note is taken: {given:?}");
+            assert!(given[0].starts_with("recovery_"), "{given:?}");
+            break given[0].clone();
         }
-    }
+    };
     assert_eq!(store.delivered_cursor(&agent.id).unwrap(), interrupted.seq);
-    assert_eq!(store.open_turn(&agent.id).unwrap(), Some(open));
     assert_eq!(
         store.next_undelivered(&agent.id).unwrap().unwrap().id,
         pending.id
@@ -1685,15 +1874,16 @@ fn deferred_pending_mail_precedes_interrupted_turn_recovery() {
         let (_, given) = rx
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .expect("delivery must park");
-        if !given.is_empty() {
-            assert_eq!(given, vec![pending.id.to_string()]);
+        if given.len() > 1 {
+            assert_eq!(given, vec![recovery.clone(), pending.id.to_string()]);
             break;
         }
     }
     assert_eq!(store.delivered_cursor(&agent.id).unwrap(), pending.seq);
     assert!(store.next_undelivered(&agent.id).unwrap().is_none());
     assert!(store.open_turn(&agent.id).unwrap().is_none());
-    drop(supervisor);
+    let _ = open;
+    support::stop(supervisor);
 }
 
 /// A real Claude Code adapter whose `health` reads are counted: every
@@ -1709,6 +1899,12 @@ impl anyagents_harness::Harness for CountedClaude {
         message: &anyagents_harness::OutboundMessage,
     ) -> Result<anyagents_harness::DeliverOutcome, anyagents_harness::HarnessError> {
         self.inner.deliver(message)
+    }
+    fn proven(&self, message_id: &str) -> Option<anyagents_harness::Proof> {
+        self.inner.proven(message_id)
+    }
+    fn stop(&mut self) {
+        self.inner.stop();
     }
     fn background(&mut self) -> Result<(), anyagents_harness::HarnessError> {
         self.inner.background()
@@ -1765,6 +1961,7 @@ fn a_streaming_turn_costs_a_bounded_number_of_supervisor_passes() {
         format!(
             r#"#!/bin/sh
 while IFS= read -r line; do
+    printf '%s\n' "$line" | sed 's/^{{/{{"isReplay":true,/'
     i=0
     while [ "$i" -lt {LINES} ]; do
         printf '%s\n' "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"chunk $i\"}}]}}}}"
@@ -1824,5 +2021,5 @@ done
         passes <= 60,
         "a {LINES}-line turn took {passes} harness health reads"
     );
-    drop(supervisor);
+    support::stop(supervisor);
 }

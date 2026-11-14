@@ -1064,12 +1064,14 @@ fn download_inbound_media(
     channel_id: &anyagents_core::ChannelId,
     media: &[MediaAttachment],
 ) -> Vec<String> {
-    let media_dir = data_dir.join("media");
+    let media_dir = data_dir.join(anyagents_harness::media::MEDIA_DIR);
     let _ = std::fs::create_dir_all(&media_dir);
+    // An agent's seat reads a file it was told about by name; none lists the
+    // files every chat received.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&media_dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(&media_dir, std::fs::Permissions::from_mode(0o711));
     }
     let mut notes = Vec::new();
     for att in media {
@@ -1145,11 +1147,7 @@ fn download_inbound_media(
             }
         }
         if dest.is_file() {
-            notes.push(format!(
-                "[Local media ({}) file: {}]",
-                att.kind,
-                dest.display()
-            ));
+            notes.push(anyagents_harness::media::local_media_line(&att.kind, &dest));
         }
     }
     notes
@@ -1173,6 +1171,13 @@ fn persist_media(
             .create_new(true)
             .write(true)
             .open(&staging)?;
+        // Readable by the seat of every agent the message reaches, whatever
+        // the server's umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        }
         let copied = std::io::copy(reader, &mut file)?;
         if expected.is_some_and(|size| size < 0 || copied != size as u64) {
             return Err(std::io::Error::new(
@@ -4434,6 +4439,13 @@ pub(crate) mod tests {
         assert!(!path.exists());
         persist_media(&mut &b"complete"[..], &path, Some(8)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"complete");
+        // Every agent the message reaches reads it from its own seat.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o644);
+        }
         assert!(persist_media(&mut Broken, &path, None).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"complete");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);

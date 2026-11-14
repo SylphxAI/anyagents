@@ -1,16 +1,112 @@
-//! Scripted stand-in for the OMP child. The field names are unverified.
+//! The OMP adapter against the scripted `omp --mode rpc` the delivery
+//! conformance suite uses (`tests/invariants/fakes/proto_omp.py`): what the
+//! suite does not hold every harness to.
+#![cfg(unix)]
 
-use std::path::Path;
-use std::thread;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use anyagents_harness::{
-    Context, DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport,
-};
+use anyagents_harness::{Context, DeliverOutcome, Harness, OutboundMessage, Proof, TurnUsage};
 use anyagents_harness_omp::OmpHarness;
+use anyagents_harness_stream::StreamSpec;
 use tempfile::TempDir;
 
-fn msg(id: &str) -> OutboundMessage {
+const VENDOR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/invariants/fakes/vendor.py"
+);
+const PATIENCE: Duration = Duration::from_secs(30);
+
+/// One scripted OMP: its state directory. Every vendor runs the same
+/// program, written once before any test starts a process: a script written
+/// while another thread forks can be held open for writing by that fork and
+/// fail to start (`ETXTBSY`).
+struct Vendor {
+    dir: TempDir,
+}
+
+fn program() -> &'static Path {
+    static PROGRAM: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    let (_, program) = PROGRAM.get_or_init(|| {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new().unwrap();
+        let program = dir.path().join("omp");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nexec /usr/bin/python3 -u '{VENDOR}' --fixture \"$OMP_FIXTURE\" --protocol omp \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (dir, program)
+    });
+    program
+}
+
+impl Vendor {
+    fn new() -> Self {
+        program();
+        Self {
+            dir: TempDir::new().unwrap(),
+        }
+    }
+
+    /// The adapter as the server starts it: the catalog entry's arguments,
+    /// in the agent's working directory.
+    fn start(&self, session: Option<&str>) -> OmpHarness {
+        let mut spec = StreamSpec::for_program("omp");
+        spec.args.push("--no-extensions".to_string());
+        let fixture = self.dir.path().display().to_string();
+        OmpHarness::start_with_spec(
+            spec,
+            program(),
+            session,
+            &[("OMP_FIXTURE", fixture.as_str())],
+            Some(self.dir.path()),
+        )
+        .expect("omp starts")
+    }
+
+    /// Ask the vendor to act and wait until it has.
+    fn command(&self, name: &str) {
+        let path = self.dir.path().join(name);
+        std::fs::write(&path, "").unwrap();
+        until(&format!("the vendor acts on {name}"), || !path.exists());
+    }
+
+    /// The id of every input that reached the vendor.
+    fn wire(&self) -> Vec<String> {
+        read_ids(&self.dir.path().join("wire.jsonl"))
+    }
+
+    /// The id of every input its model saw.
+    fn journal(&self) -> Vec<String> {
+        read_ids(&self.dir.path().join("journal.jsonl"))
+    }
+}
+
+fn read_ids(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            row["id"].as_str().unwrap().to_string()
+        })
+        .collect()
+}
+
+fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + PATIENCE;
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn message(id: &str) -> OutboundMessage {
     OutboundMessage {
         id: id.to_string(),
         seq: 1,
@@ -22,89 +118,206 @@ fn msg(id: &str) -> OutboundMessage {
     }
 }
 
-fn start(dir: &TempDir, mode: &str, session: Option<&str>) -> OmpHarness {
-    let log = dir.path().join("log");
-    OmpHarness::start(
-        env!("CARGO_BIN_EXE_fake_omp"),
-        session,
-        &[
-            ("ANYAGENTS_FAKE_MODE", mode),
-            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
-        ],
-    )
-    .expect("start")
+/// Offer `id` until the vendor proves it consumed it.
+fn deliver(harness: &mut OmpHarness, id: &str) -> DeliverOutcome {
+    let mut outcome = DeliverOutcome::Deferred;
+    until(&format!("{id} is proved"), || {
+        outcome = harness.deliver(&message(id)).unwrap();
+        matches!(
+            outcome,
+            DeliverOutcome::Accepted { .. } | DeliverOutcome::Duplicate
+        )
+    });
+    outcome
 }
 
-fn read_log(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
+/// Offer `id` until it is written into the running turn.
+fn steer(harness: &mut OmpHarness, id: &str) {
+    until(&format!("{id} is written"), || {
+        harness.deliver(&message(id)).unwrap() == DeliverOutcome::InFlight
+    });
 }
 
-fn wait_log(path: &Path, needle: &str) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if read_log(path).contains(needle) {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    false
-}
-
-#[test]
-fn a_done_event_records_usage_and_a_second_deliver_is_not_written() {
-    let dir = TempDir::new().unwrap();
-    let mut harness = start(&dir, "finish", None);
-    harness.deliver(&msg("m1")).unwrap();
-    assert!(harness.wait_finished("m1", Duration::from_secs(5)));
-    let usage = harness.usage_for("m1").expect("usage");
-    assert_eq!(usage.input_tokens, 11);
-    assert_eq!(usage.output_tokens, 7);
-    assert_eq!(harness.health().delivery_mode, DeliveryMode::Followup);
-    assert_eq!(harness.health().steer_support, SteerSupport::Unproven);
-    harness.deliver(&msg("m1")).unwrap();
-    assert_eq!(harness.written_ids(), vec!["m1".to_string()]);
+/// Offer `id` until it is written, and wait until OMP read it, so a `step`
+/// commanded next takes it.
+fn steer_read(harness: &mut OmpHarness, vendor: &Vendor, id: &str) {
+    steer(harness, id);
+    until(&format!("OMP read {id}"), || {
+        vendor.wire().iter().any(|seen| seen == id)
+    });
 }
 
 #[test]
-fn a_second_message_during_a_turn_waits() {
-    let dir = TempDir::new().unwrap();
-    let mut harness = start(&dir, "hold", None);
-    harness.deliver(&msg("m1")).unwrap();
-    assert!(matches!(
-        harness.deliver(&msg("m2")).unwrap(),
+fn omp_runs_in_rpc_mode_and_names_its_protocol_and_session() {
+    let vendor = Vendor::new();
+    let mut harness = vendor.start(None);
+    until("the peer is known", || {
+        harness.health().delivery.peer.is_some()
+    });
+    let health = harness.health();
+    assert!(health.process_alive, "a launch without --mode rpc exits");
+    assert_eq!(health.delivery.peer.as_deref(), Some("omp rpc/1"));
+    assert_eq!(health.sign_in_fault, None, "steering mode all was taken");
+    // OMP writes a new session only with its first reply, and refuses to
+    // resume one it never wrote: it is named once it is on disk.
+    deliver(&mut harness, "m1");
+    assert_eq!(harness.session_id(), None);
+    vendor.command("finish");
+    until("the session is on disk", || harness.session_id().is_some());
+    assert_eq!(harness.session_id().as_deref(), Some("omp-session-1"));
+}
+
+#[test]
+fn a_run_that_died_before_its_first_reply_leaves_nothing_to_resume_or_recognise() {
+    let vendor = Vendor::new();
+    let mut first = vendor.start(None);
+    assert_eq!(
+        deliver(&mut first, "m1"),
         DeliverOutcome::Accepted {
             turn_finished: false
         }
-    ));
-    assert_eq!(harness.turns_started(), 1);
-}
-
-#[test]
-fn a_rate_limit_is_a_wait_and_not_a_write() {
-    let dir = TempDir::new().unwrap();
-    let harness = start(&dir, "quota", None);
-    assert_eq!(
-        harness.wait_quota(Duration::from_secs(5)),
-        Some(1_700_000_000_000)
     );
-    assert!(harness.written_ids().is_empty());
+    vendor.command("crash");
+    until("the child is gone", || !first.health().process_alive);
+    // Proved, so the host commits it; but no session reached the disk.
+    assert_eq!(
+        first.proven("m1"),
+        Some(Proof::Taken {
+            turn_finished: false
+        })
+    );
+    assert_eq!(first.session_id(), None, "OMP would refuse to resume it");
+    // A host that lost the commit hands m1 to a fresh session: the vendor's
+    // own record shows it never arrived, and nothing it began was kept.
+    let mut second = vendor.start(first.session_id().as_deref());
+    assert_eq!(
+        deliver(&mut second, "m1"),
+        DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    assert_eq!(vendor.wire(), ["m1", "m1"]);
 }
 
 #[test]
-fn an_echoed_id_is_not_written_again() {
-    let dir = TempDir::new().unwrap();
-    let mut harness = start(&dir, "echo", None);
-    assert!(harness.wait_seen("echoed", Duration::from_secs(5)));
-    harness.deliver(&msg("echoed")).unwrap();
-    assert!(harness.written_ids().is_empty());
+fn a_session_omp_never_wrote_cannot_be_resumed() {
+    let vendor = Vendor::new();
+    let harness = vendor.start(Some("omp-session-9"));
+    until("the child is gone", || !harness.health().process_alive);
+    let exit = harness.exit_diagnostic().expect("an exit diagnostic");
+    assert!(
+        exit.contains("Session \"omp-session-9\" not found"),
+        "{exit}"
+    );
 }
 
 #[test]
-fn the_message_id_is_the_first_line() {
-    let dir = TempDir::new().unwrap();
-    let mut harness = start(&dir, "hold", Some("sess-1"));
-    harness.deliver(&msg("m1")).unwrap();
-    let log = dir.path().join("log");
-    assert!(wait_log(&log, "anyagents-message:m1"));
-    assert!(read_log(&log).contains("argv:--session sess-1"));
+fn a_crash_after_a_step_leaves_a_session_that_holds_what_it_took() {
+    let vendor = Vendor::new();
+    let mut first = vendor.start(None);
+    deliver(&mut first, "m1");
+    steer_read(&mut first, &vendor, "m2");
+    steer_read(&mut first, &vendor, "m3");
+    // The step after a tool batch takes m2 and dies before m3: the tool
+    // call's reply put the session on disk.
+    vendor.command("step-1");
+    until("the child is gone", || !first.health().process_alive);
+    first.stop();
+    assert_eq!(
+        first.proven("m2"),
+        Some(Proof::Taken {
+            turn_finished: false
+        })
+    );
+    assert_eq!(first.proven("m3"), None);
+    let session = first.session_id().expect("the session is on disk");
+    let mut second = vendor.start(Some(&session));
+    for id in ["m1", "m2"] {
+        assert_eq!(deliver(&mut second, id), DeliverOutcome::Duplicate, "{id}");
+    }
+    assert_eq!(
+        deliver(&mut second, "m3"),
+        DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    assert_eq!(vendor.journal(), ["m1", "m2", "m3"]);
+}
+
+#[test]
+fn a_finished_run_counts_one_turn_and_reports_its_usage() {
+    let vendor = Vendor::new();
+    let mut harness = vendor.start(None);
+    assert_eq!(
+        deliver(&mut harness, "m1"),
+        DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    vendor.command("finish");
+    until("the turn ends", || harness.turns_served() == 1);
+    assert_eq!(
+        harness.deliver(&message("m1")).unwrap(),
+        DeliverOutcome::Accepted {
+            turn_finished: true
+        }
+    );
+    assert_eq!(
+        harness.served_usage(),
+        TurnUsage {
+            input_tokens: 3,
+            output_tokens: 2,
+            cache_read_tokens: 1,
+            cache_write_tokens: 0,
+            reported_cost_micros: Some(5),
+        }
+    );
+    assert_eq!(vendor.wire(), ["m1"], "written once");
+}
+
+#[test]
+fn a_resumed_session_recognises_what_an_earlier_process_put_into_it() {
+    let vendor = Vendor::new();
+    let mut first = vendor.start(None);
+    deliver(&mut first, "m1");
+    steer_read(&mut first, &vendor, "m2");
+    vendor.command("step");
+    deliver(&mut first, "m2");
+    vendor.command("finish");
+    let session = first.session_id().unwrap();
+    drop(first);
+    let mut second = vendor.start(Some(&session));
+    for id in ["m1", "m2"] {
+        assert_eq!(deliver(&mut second, id), DeliverOutcome::Duplicate, "{id}");
+    }
+    assert_eq!(
+        deliver(&mut second, "m3"),
+        DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    assert_eq!(second.session_id(), Some(session));
+    assert_eq!(vendor.wire(), ["m1", "m2", "m3"]);
+    assert_eq!(vendor.journal(), ["m1", "m2", "m3"]);
+}
+
+#[test]
+fn a_dead_child_keeps_its_proofs_and_reports_its_exit() {
+    let vendor = Vendor::new();
+    let mut harness = vendor.start(None);
+    deliver(&mut harness, "m1");
+    vendor.command("crash");
+    until("the child is gone", || !harness.health().process_alive);
+    assert_eq!(
+        harness.deliver(&message("m1")).unwrap(),
+        DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    assert_eq!(
+        harness.deliver(&message("m2")),
+        Err(anyagents_harness::HarnessError::Dead)
+    );
+    let exit = harness.exit_diagnostic().expect("an exit diagnostic");
+    assert!(exit.starts_with("omp "), "{exit}");
 }
