@@ -12,6 +12,20 @@ with readiness only, `{"ok":true}` and `Cache-Control: no-store`. The exact
 version and binary digest tell a scanner which advisories apply, so they stay
 on the socket.
 
+## Listeners
+
+| Listener | Bound by | Serves | Credentials |
+| --- | --- | --- | --- |
+| `anyagents.sock` | always | the whole local API | operator token, local capabilities, remote session tokens on MCP |
+| local TCP | `ANYAGENTS_WEBHOOK_LISTEN`; default `0.0.0.0:8788`, or `127.0.0.1:8788` once `public_listen` is set | readiness, Telegram webhooks, MCP (`/v1/webhooks/mcp`, `/v1/mcp`, `/mcp`) | local capabilities and remote session tokens |
+| public TCP | `public_listen` under `[server]` in `<data>/anyagents.toml` | `/`, `/healthz`, `/v1/webhooks/healthz`, `/v1/webhooks/telegram/{channel}`, `/v1/webhooks/mcp`; every other path is 404 | remote session tokens on MCP; a channel's secret token on its Telegram webhook |
+
+The listener a request arrives on decides what it may present. No source
+address and no `X-Forwarded-*` or `Forwarded` header widens it. The bound
+address is written to `<data>/public.addr` (and `anyagents status --json`
+`public_addr`). A configuration file that cannot be read fails closed: no
+public listener, and the local TCP listener defaults to loopback.
+
 | Field | Meaning |
 | --- | --- |
 | `ok` | `true`, preserving the existing readiness response. |

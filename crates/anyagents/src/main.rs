@@ -2666,6 +2666,10 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let public_addr = std::fs::read_to_string(data.join("public.addr"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let boundary = sandbox::boundary_of(data).ok();
     let has_operator_token = operator::operator_token(data).is_some();
 
@@ -2710,6 +2714,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             "server": if server_up { "running" } else { "stopped" },
             "socket": sock.display().to_string(),
             "webhook_addr": webhook_addr,
+            "public_addr": public_addr,
             "operator_token_present": has_operator_token,
             "boundary": boundary,
             "harnesses": harness_rows,

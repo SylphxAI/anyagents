@@ -14,7 +14,14 @@
 //!   expires. The long-lived local mailbox capability never leaves this host.
 //! * A remote session token only ever gets the `remote` MCP profile
 //!   ([`crate::mcp::McpProfile::resolve_remote_session`]).
+//! * `public_listen` in the same table binds the public listener: its own port,
+//!   serving readiness, Telegram webhooks and MCP for remote session tokens
+//!   only. Every local credential stays on the socket and the loopback API
+//!   (ADR 0010 D2). The separation is by listener, never by source address.
+//! * An agent that runs off this host creates children, and moves agents, only
+//!   onto harnesses that also run off it ([`may_place_on`]).
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -58,6 +65,7 @@ struct ConfigFile {
 #[serde(deny_unknown_fields)]
 struct ServerTable {
     public_url: Option<String>,
+    public_listen: Option<String>,
     remote_session_ttl_secs: Option<u64>,
 }
 
@@ -66,6 +74,8 @@ struct ServerTable {
 pub struct Settings {
     /// The normalized public origin (and optional base path), no trailing `/`.
     pub public_url: Option<String>,
+    /// Where the public listener binds, when it is configured.
+    pub public_listen: Option<SocketAddr>,
     pub remote_session_ttl: Duration,
 }
 
@@ -73,6 +83,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             public_url: None,
+            public_listen: None,
             remote_session_ttl: DEFAULT_TTL,
         }
     }
@@ -100,6 +111,19 @@ impl Settings {
             .map(normalize_public_url)
             .transpose()
             .map_err(|err| format!("{}: [server] public_url {err}", origin.display()))?;
+        let public_listen = file
+            .server
+            .public_listen
+            .as_deref()
+            .map(|raw| {
+                raw.trim().parse::<SocketAddr>().map_err(|_| {
+                    format!(
+                        "{}: [server] public_listen `{raw}` must be an `address:port` such as `0.0.0.0:8789`",
+                        origin.display()
+                    )
+                })
+            })
+            .transpose()?;
         let remote_session_ttl = match file.server.remote_session_ttl_secs {
             None => DEFAULT_TTL,
             Some(secs) => {
@@ -117,6 +141,7 @@ impl Settings {
         };
         Ok(Self {
             public_url,
+            public_listen,
             remote_session_ttl,
         })
     }
@@ -176,6 +201,35 @@ pub fn normalize_public_url(raw: &str) -> Result<String, String> {
         _ => return Err(format!("`{trimmed}` must start with `https://`")),
     }
     Ok(format!("{}://{rest}", scheme.to_ascii_lowercase()))
+}
+
+/// Whether this agent's harness runs off this host: a cloud harness, or a
+/// harness spawned into a remote sandbox. These are the agents that hold
+/// remote session tokens.
+pub fn runs_off_host(agent: &Agent, config_dir: &Path) -> bool {
+    crate::vendor::is_cloud_harness(&agent.harness)
+        || anyagents_tools::SandboxConfig::resolve(Some(config_dir))
+            .is_some_and(|sandbox| sandbox.remote_spawn)
+}
+
+/// Whether an agent that runs off this host may place an agent on `harness`:
+/// only a cloud harness, which runs off this host too. A host harness would
+/// let a remote session (prompt-injected, or holding a leaked token) start
+/// code on the control-plane host through a child. Refusing is explicit; a
+/// silent switch to a cloud harness would pick a vendor and spend on the
+/// caller's behalf. Every other caller may place any harness.
+pub fn may_place_on(store: &Store, caller: &AgentId, harness: &str) -> Result<(), String> {
+    let caller = store.agent(caller).map_err(|err| err.to_string())?;
+    let config = anyagents_core::agent_config_dir(store.data_dir(), &caller.id);
+    if !runs_off_host(&caller, &config) || crate::vendor::is_cloud_harness(harness) {
+        return Ok(());
+    }
+    Err(format!(
+        "`{}` runs off this host, so the agents it creates or moves must run off it too: \
+         `{harness}` would run on the control-plane host; use a cloud harness \
+         (`claude-cloud`, `openai-cloud`, `cursor-cloud`, `spiron-cloud`)",
+        caller.name
+    ))
 }
 
 /// Why a remote agent cannot be created or started here, when it cannot.
@@ -329,7 +383,7 @@ mod tests {
 
         std::fs::write(
             dir.path().join(CONFIG_FILE),
-            "[server]\npublic_url = \"https://Agents.Example.com/base/\"\nremote_session_ttl_secs = 1800\n",
+            "[server]\npublic_url = \"https://Agents.Example.com/base/\"\npublic_listen = \"0.0.0.0:8789\"\nremote_session_ttl_secs = 1800\n",
         )
         .unwrap();
         let settings = Settings::load(dir.path()).unwrap();
@@ -338,6 +392,11 @@ mod tests {
             Some("https://Agents.Example.com/base")
         );
         assert_eq!(settings.remote_session_ttl, Duration::from_secs(1800));
+        assert_eq!(
+            settings.public_listen,
+            Some("0.0.0.0:8789".parse().unwrap())
+        );
+        assert_eq!(Settings::default().public_listen, None);
         assert_eq!(
             settings.mcp_url().as_deref(),
             Some("https://Agents.Example.com/base/v1/webhooks/mcp")
@@ -376,6 +435,10 @@ mod tests {
             assert!(err.contains("remote_session_ttl_secs"), "{err}");
         }
         assert!(parse("[server]\npublic-url = \"https://a.example.com\"\n").is_err());
+        for bad in ["8789", "agents.example.com:8789", "0.0.0.0", ""] {
+            let err = parse(&format!("[server]\npublic_listen = \"{bad}\"\n")).unwrap_err();
+            assert!(err.contains("public_listen"), "{bad}: {err}");
+        }
     }
 
     #[test]

@@ -46,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are no longer in it. The public listener's `/`, `/healthz` and
   `/v1/webhooks/healthz` return `{"ok":true}`; the serving identity stays on
   `anyagents.sock`.
+- A separate public listener (`public_listen` under `[server]`) serves only
+  readiness, Telegram webhooks and MCP for remote session tokens, and 404 for
+  everything else; once it is configured, the local TCP listener defaults to
+  loopback. Without `public_listen` nothing changes. An agent that runs off
+  this host (a cloud harness or a remote-spawn sandbox) can create or move
+  agents only onto cloud harnesses, and its remote session token stops
+  authenticating once its harness moves back onto the host.
 
 ## 0.1.3
 
