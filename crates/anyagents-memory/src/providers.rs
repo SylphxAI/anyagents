@@ -144,6 +144,33 @@ pub const DEFAULT_MAX_REBUILD_USD: f64 = 10.0;
 pub const DEFAULT_MAX_DAILY_USD: f64 = 1.0;
 
 impl ProviderConfig {
+    /// Every remote model has a configured price, so its spend is always
+    /// counted against `max_rebuild_usd` and `max_daily_usd`: the price
+    /// covers any answer that reports no `usage.cost`. A remote model
+    /// without one would count as free, and neither cap could hold.
+    pub fn require_prices(&self) -> Result<(), Error> {
+        if let EmbedderConfig::OpenAi(remote) = &self.embedder
+            && remote.usd_per_million_tokens.is_none()
+        {
+            return Err(format!(
+                "embedder {} ({}) has no usd_per_million_tokens; its spend could not be held to max_rebuild_usd or max_daily_usd",
+                remote.model, remote.profile
+            )
+            .into());
+        }
+        if let RerankerConfig::Rerank(remote) = &self.reranker
+            && remote.usd_per_million_tokens.is_none()
+            && remote.usd_per_search.is_none()
+        {
+            return Err(format!(
+                "reranker {} ({}) has neither usd_per_million_tokens nor usd_per_search; its spend could not be held to max_daily_usd",
+                remote.model, remote.profile
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     pub fn path(data_dir: &Path) -> PathBuf {
         data_dir.join("memory-service").join("config.json")
     }
@@ -477,6 +504,17 @@ fn is_cjk(c: char) -> bool {
         | 0xf900..=0xfaff | 0xff00..=0xffef | 0x20000..=0x2ffff)
 }
 
+/// `text` up to its `budget`-th approximate token.
+pub fn cut_to_tokens(text: &str, budget: usize) -> &str {
+    if budget == 0 {
+        return "";
+    }
+    match approximate_tokens(text).get(budget - 1) {
+        Some(&(_, end)) => &text[..end],
+        None => text,
+    }
+}
+
 /// Approximate token boundaries for a model whose tokenizer is not local:
 /// each CJK character, each punctuation mark, and each run of up to four
 /// letters or digits is one token. It decides where pieces are cut and
@@ -655,6 +693,7 @@ impl RemoteModel {
                 format!("{}{passage}", self.config.passage_prefix)
             })
             .collect();
+        let query: String = query.chars().take(cut).collect();
         let body = json!({
             "model": self.config.model,
             "query": format!("{}{query}", self.config.query_prefix),
@@ -692,7 +731,7 @@ impl RemoteModel {
                     .iter()
                     .map(|p| approximate_tokens(p).len() as u64)
                     .sum::<u64>()
-                    + approximate_tokens(query).len() as u64
+                    + approximate_tokens(&query).len() as u64
             });
         let searches = answer
             .pointer("/usage/search_units")
@@ -877,13 +916,18 @@ impl Embedder {
         }
     }
 
+    /// Embed queries, each read with the model's query prefix. A local
+    /// model's tokenizer cuts a long query to the model's budget; a remote
+    /// query is cut to the same piece budget a passage gets, so one search
+    /// never sends (or pays for) more.
     pub fn embed_queries(&mut self, queries: &[&str]) -> Result<Vec<Vec<f32>>, Error> {
+        let budget = self.budget();
         match self {
             Self::Local(encoder) => encoder.embed_queries(queries),
             Self::Remote { model, .. } => {
                 let texts: Vec<String> = queries
                     .iter()
-                    .map(|q| format!("{}{q}", model.config.query_prefix))
+                    .map(|q| format!("{}{}", model.config.query_prefix, cut_to_tokens(q, budget)))
                     .collect();
                 let extra = model.config.query_body.clone();
                 model.embed(&texts, &extra)
@@ -1421,5 +1465,58 @@ pub(crate) mod tests {
         );
         assert_eq!(config.max_rebuild_usd, Some(10.0));
         assert!(config.max_daily_usd.is_some());
+    }
+
+    /// A remote query is cut to the piece budget a passage gets, and a
+    /// remote rerank query to the passage length: one search never sends or
+    /// pays for more, however long the text it was given.
+    #[test]
+    fn remote_queries_are_cut_to_the_piece_budget() {
+        assert_eq!(cut_to_tokens("abcdefgh ij", 2), "abcdefgh");
+        assert_eq!(cut_to_tokens("粵語問題", 3), "粵語問");
+        assert_eq!(cut_to_tokens("short", 10), "short");
+        assert_eq!(cut_to_tokens("short", 0), "");
+        let (url, seen) = serve(|path, body| {
+            if path == "/v1/rerank" {
+                return (
+                    200,
+                    json!({"results": [{"index": 0, "relevance_score": 1.0}]}),
+                );
+            }
+            let n = body["input"].as_array().unwrap().len();
+            let data: Vec<Value> = (0..n)
+                .map(|i| json!({"index": i, "embedding": [1.0, 0.0]}))
+                .collect();
+            (200, json!({"data": data}))
+        });
+        let remote = Remote {
+            profile: "openrouter/default".into(),
+            model: "m".into(),
+            dimensions: Some(2),
+            piece_tokens: Some(116),
+            query_prefix: "Q: ".into(),
+            ..Remote::default()
+        };
+        let mut embedder = Embedder::remote(
+            remote.clone(),
+            Endpoint::for_test(&format!("{url}/v1"), "k"),
+        )
+        .unwrap();
+        let long = "word ".repeat(5_000);
+        embedder.embed_queries(&[long.as_str()]).unwrap();
+        let mut reranker = Reranker::Remote(Box::new(RemoteModel::new(
+            remote,
+            Endpoint::for_test(&format!("{url}/v1"), "k"),
+        )));
+        reranker.score(&long, &["passage"]).unwrap();
+        let requests = seen.lock().unwrap();
+        let query = requests[0].2["input"][0].as_str().unwrap();
+        let query = query.strip_prefix("Q: ").unwrap();
+        assert_eq!(approximate_tokens(query).len(), 100, "116 less 16 reserved");
+        let rerank_query = requests[1].2["query"].as_str().unwrap();
+        assert_eq!(
+            rerank_query.strip_prefix("Q: ").unwrap().chars().count(),
+            REMOTE_RERANK_CHARS
+        );
     }
 }

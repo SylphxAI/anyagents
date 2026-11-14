@@ -54,12 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider reports reaches the cap. `anyagents memory-service estimate`
   previews the rebuild without calling a model. Spend outside a rebuild
   (query embeddings, rerank, new history) is capped per UTC day by
-  `max_daily_usd` and persisted; past it rerank and new-history embedding
+  `max_daily_usd` and persisted; past it query embedding, rerank and new-history embedding
   wait for the next day. Background workers retry failures with backoff and
   report them in `status`; marks follow the host index's generation and the
   worker count. No space is deleted automatically: `memory-service prune`
   removes other spaces once the configured one is built, and a `--config`
-  that does not exist is an error. Every OpenRouter request
+  that does not exist is an error. A remote model must have a configured
+  price, so its spend is always counted, and a remote query is cut to the
+  piece budget. Every OpenRouter request
   carries `provider.data_collection = "deny"`, and a remote reranker reads at
   most `passage_chars` (1,000) characters of each passage. The desk's choice,
   `qwen/qwen3-embedding-8b` with `mongodb/rerank-3` through

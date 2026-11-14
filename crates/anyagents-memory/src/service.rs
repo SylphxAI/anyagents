@@ -620,11 +620,17 @@ impl Shared {
                 until_ms,
                 limit,
             } => {
-                // A query is always embedded, its spend counted against the
-                // day: past the daily cap search keeps its dense stage and
-                // only loses rerank.
+                // Past the daily cap a remote query is not embedded: the
+                // server answers from BM25 and says why dense did not run.
                 let vector = {
                     let mut embedder = self.embedder.lock().map_err(|_| "embedder poisoned")?;
+                    if embedder.is_remote() {
+                        let today = self.ledger.today()?;
+                        let cap = self.config.max_daily_usd();
+                        if today >= cap {
+                            return Err(daily_cap_reached(today, cap).into());
+                        }
+                    }
                     let before = embedder.usage().usd;
                     let embedded = embedder.embed_queries(&[query.as_str()]);
                     self.ledger.charge(embedder.usage().usd - before)?;
@@ -709,6 +715,7 @@ pub fn serve(config: Config) -> Result<(), Error> {
 /// Serve on a socket already bound, and embed in the background unless
 /// `no_index`.
 pub fn run(listener: UnixListener, config: Config) -> Result<(), Error> {
+    config.providers.require_prices()?;
     let environment = local_runtime(&config)?;
     let local = environment.map(|environment| Local {
         environment,
@@ -1796,11 +1803,11 @@ mod tests {
         assert_eq!(last["input"].as_array().unwrap().len(), 36, "only the rest");
     }
 
-    /// The day's cap on spend outside rebuilds is persisted, holds rerank and
-    /// new-history embedding once reached, and leaves search with its dense
-    /// stage. The next UTC day starts at zero.
+    /// The day's cap on spend outside rebuilds is persisted and, once
+    /// reached, holds query embedding, rerank and new-history embedding: no
+    /// remote request is made until the next UTC day, which starts at zero.
     #[test]
-    fn the_daily_cap_holds_rerank_and_new_history_but_not_dense_search() {
+    fn the_daily_cap_holds_queries_rerank_and_new_history() {
         let dir = crate::test_tempdir();
         let host_path = host_with(dir.path(), 12);
         openrouter_profile(dir.path());
@@ -1858,21 +1865,54 @@ mod tests {
         );
         assert_eq!(status.pending_documents, 2);
         assert_eq!((status.today_usd, status.max_daily_usd), (1.0, 1.0));
-        let (hits, _) = client
+        // The server answers these from BM25 and lists why in degraded.
+        let query = client
             .search("deploys", &["agt".to_owned()], None, None, None, 5)
-            .unwrap();
-        assert!(!hits.is_empty(), "dense search still answers");
+            .unwrap_err();
+        assert!(query.contains("max_daily_usd"), "{query}");
         let refused = client
             .rerank("deploys", &["a".into(), "b".into()])
             .unwrap_err();
         assert!(refused.contains("max_daily_usd"), "{refused}");
-        let requests = seen.lock().unwrap();
-        for (path, _, body) in &requests[before..] {
-            assert_eq!(path, "/v1/embeddings", "no rerank past the cap");
-            assert_eq!(body["input"], json!(["Q: deploys"]), "only the query");
+        assert_eq!(seen.lock().unwrap().len(), before, "no remote request");
+        assert_eq!(status_of(&client).today_usd, 1.0);
+    }
+
+    /// A remote model with no configured price would count as free, so
+    /// neither cap could hold: the service refuses to start with one.
+    #[test]
+    fn a_remote_model_without_a_price_is_refused_at_start() {
+        let dir = crate::test_tempdir();
+        openrouter_profile(dir.path());
+        let (url, seen) = stub_models(0.0, &[]);
+        let unpriced = |config: ProviderConfig| {
+            let mut service = Config::new(dir.path());
+            service.providers = config;
+            let socket = dir.path().join("unpriced.sock");
+            let _ = std::fs::remove_file(&socket);
+            run(UnixListener::bind(&socket).unwrap(), service)
+                .unwrap_err()
+                .to_string()
+        };
+        let error = unpriced(desk_pair(&url, None, 10.0));
+        assert!(error.contains("usd_per_million_tokens"), "{error}");
+        let mut config = desk_pair(&url, Some(0.01), 10.0);
+        if let crate::providers::RerankerConfig::Rerank(reranker) = &mut config.reranker {
+            reranker.usd_per_million_tokens = None;
         }
-        drop(requests);
-        assert!(status_of(&client).today_usd > 1.0, "the query is counted");
+        let error = unpriced(config.clone());
+        assert!(error.contains("usd_per_search"), "{error}");
+        // Either price makes a reranker countable.
+        if let crate::providers::RerankerConfig::Rerank(reranker) = &mut config.reranker {
+            reranker.usd_per_search = Some(0.002);
+        }
+        assert!(config.require_prices().is_ok());
+        assert!(desk_pair(&url, Some(0.01), 10.0).require_prices().is_ok());
+        assert!(
+            ProviderConfig::default().require_prices().is_ok(),
+            "local is free"
+        );
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     /// Nothing removes a vector space on its own; `prune` does, and only
