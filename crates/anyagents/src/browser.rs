@@ -105,10 +105,13 @@ struct StoredRefs {
     pub elements: Vec<InteractiveRef>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct BrowserProfileSummary {
     pub profile: String,
     pub status: String,
+    /// Inspection failed for this profile, without invalidating its siblings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5073,53 +5076,150 @@ fn resolve_request_key_specs(req: &BrowserRequest) -> Result<Vec<KeySpec>, Error
     Ok(out)
 }
 
+fn profile_entry_metadata(
+    root: &std::fs::File,
+    c_name: &std::ffi::CStr,
+) -> std::io::Result<Option<libc::stat>> {
+    use std::os::fd::AsRawFd as _;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: root is an open directory, c_name is NUL-terminated,
+    // and stat points to storage for the metadata written on success.
+    if unsafe {
+        libc::fstatat(
+            root.as_raw_fd(),
+            c_name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        // Unlink after readdir is harmless; other metadata failures are not.
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    // SAFETY: fstatat succeeded and initialized stat.
+    Ok(Some(unsafe { stat.assume_init() }))
+}
+
 pub fn list_profiles(data: &Path) -> Result<Vec<BrowserProfileSummary>, Error> {
-    let root = profiles_root(data);
+    use std::os::fd::IntoRawFd as _;
+
+    let data_dir = std::fs::File::open(data)?;
+    let root = owned_child_dir(&data_dir, "browser-profiles".as_ref(), 0o755, false)?;
     let mut names = std::collections::BTreeSet::new();
     names.insert("default".to_string());
-    if let Ok(entries) = std::fs::read_dir(&root) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str()
-                && matches!(server_profile_dir(data, name, false), Ok(Some(_)))
+    if let Some(root) = root {
+        // Bind enumeration to the verified directory on both Linux and macOS.
+        struct Directory(*mut libc::DIR);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                // SAFETY: fdopendir transferred ownership of this stream to us.
+                unsafe { libc::closedir(self.0) };
+            }
+        }
+        // Clone atomically with close-on-exec, so concurrent child spawns
+        // cannot inherit the directory descriptor before fdopendir owns it.
+        let fd = root.try_clone()?.into_raw_fd();
+        // SAFETY: fd is an open directory descriptor. On success the stream owns it.
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: fdopendir failed, so fd remains ours.
+            unsafe { libc::close(fd) };
+            return Err(error.into());
+        }
+        let directory = Directory(stream);
+        loop {
+            // SAFETY: the platform returns this thread's errno storage.
+            unsafe {
+                #[cfg(target_os = "linux")]
+                {
+                    *libc::__errno_location() = 0;
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    *libc::__error() = 0;
+                }
+            }
+            // SAFETY: directory owns a live stream, used only by this thread.
+            let entry = unsafe { libc::readdir(directory.0) };
+            if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(0) {
+                    return Err(error.into());
+                }
+                break;
+            }
+            // SAFETY: readdir supplied a NUL-terminated name valid until the next call.
+            let c_name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if matches!(c_name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            let Ok(name) = c_name.to_str() else { continue };
+            let Some(stat) = profile_entry_metadata(&root, c_name)? else {
+                continue;
+            };
+            if stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+                && stat.st_uid == crate::sandbox::server_uid()
             {
+                // Metadata, rather than opening the child, includes owned
+                // directories with denied access in the per-profile results.
                 names.insert(name.to_string());
             }
         }
     }
     let mut out = Vec::new();
     for name in names {
-        let fp = ensure_fingerprint(data, &name)?;
-        if let Some(rt) = load_runtime(data, &name)? {
-            let pages = list_page_targets(rt.cdp_port).unwrap_or_default();
-            let current = pages.first();
-            out.push(BrowserProfileSummary {
+        // Preserve damaged records and browser state for recovery rather than
+        // silently regenerating an identity or failing the whole inventory.
+        out.push(
+            summarize_profile(data, &name).unwrap_or_else(|error| BrowserProfileSummary {
                 profile: name,
-                status: "running".to_string(),
-                pid: Some(rt.pid),
-                cdp_port: Some(rt.cdp_port),
-                display_mode: Some(rt.display_mode),
-                current_url: current.map(|p| p.url.clone()),
-                current_title: current.map(|p| p.title.clone()),
-                last_used_at_ms: Some(rt.last_used_at_ms),
-                webgl_renderer: fp.webgl_renderer,
-                user_agent: fp.user_agent,
-            });
-        } else {
-            out.push(BrowserProfileSummary {
-                profile: name,
-                status: "stopped".to_string(),
-                pid: None,
-                cdp_port: None,
-                display_mode: None,
-                current_url: None,
-                current_title: None,
-                last_used_at_ms: None,
-                webgl_renderer: fp.webgl_renderer,
-                user_agent: fp.user_agent,
-            });
-        }
+                status: "error".into(),
+                error: Some(error.to_string()),
+                ..Default::default()
+            }),
+        );
     }
     Ok(out)
+}
+
+fn summarize_profile(data: &Path, name: &str) -> Result<BrowserProfileSummary, Error> {
+    let fp = ensure_fingerprint(data, name)?;
+    if let Some(rt) = load_runtime(data, name)? {
+        let pages = list_page_targets(rt.cdp_port).unwrap_or_default();
+        let current = pages.first();
+        Ok(BrowserProfileSummary {
+            profile: name.to_string(),
+            error: None,
+            status: "running".to_string(),
+            pid: Some(rt.pid),
+            cdp_port: Some(rt.cdp_port),
+            display_mode: Some(rt.display_mode),
+            current_url: current.map(|p| p.url.clone()),
+            current_title: current.map(|p| p.title.clone()),
+            last_used_at_ms: Some(rt.last_used_at_ms),
+            webgl_renderer: fp.webgl_renderer,
+            user_agent: fp.user_agent,
+        })
+    } else {
+        Ok(BrowserProfileSummary {
+            profile: name.to_string(),
+            error: None,
+            status: "stopped".to_string(),
+            pid: None,
+            cdp_port: None,
+            display_mode: None,
+            current_url: None,
+            current_title: None,
+            last_used_at_ms: None,
+            webgl_renderer: fp.webgl_renderer,
+            user_agent: fp.user_agent,
+        })
+    }
 }
 
 /// Run one browser request. `files` is whose access opens any host file the
@@ -6875,6 +6975,200 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn profiles_isolate_damaged_records_and_preserve_user_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let healthy = ensure_fingerprint(dir.path(), "healthy").unwrap();
+        let healthy_path = profile_dir(dir.path(), "healthy").join("fingerprint.json");
+        let healthy_bytes = std::fs::read(&healthy_path).unwrap();
+        for (name, file, bytes) in [
+            ("default", "fingerprint.json", b"".as_slice()),
+            ("bad-json", "fingerprint.json", b"{corrupt".as_slice()),
+            ("bad-schema", "fingerprint.json", b"{}".as_slice()),
+            ("bad-runtime", "runtime.json", b"{corrupt".as_slice()),
+        ] {
+            let profile = server_profile_dir(dir.path(), name, true).unwrap().unwrap();
+            if file == "runtime.json" {
+                ensure_fingerprint(dir.path(), name).unwrap();
+            }
+            std::fs::write(profile.join(file), bytes).unwrap();
+            std::fs::create_dir_all(profile.join("user-data")).unwrap();
+            std::fs::write(profile.join("user-data/Cookies"), b"retained-session").unwrap();
+        }
+        // A directory is an unreadable JSON file on every test host, even root.
+        let unreadable = server_profile_dir(dir.path(), "unreadable", true)
+            .unwrap()
+            .unwrap();
+        std::fs::create_dir(unreadable.join("fingerprint.json")).unwrap();
+        std::fs::write(unreadable.join("fingerprint.json/recovery"), b"keep").unwrap();
+
+        for action in ["profiles", "list"] {
+            let result = execute(
+                dir.path(),
+                "default",
+                BrowserRequest {
+                    action: action.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let profiles = result["profiles"].as_array().unwrap();
+            assert_eq!(profiles.len(), 6);
+            let good = profiles.iter().find(|p| p["profile"] == "healthy").unwrap();
+            assert_eq!(good["status"], "stopped");
+            assert!(good.get("error").is_none());
+            assert_eq!(good["user_agent"], healthy.user_agent);
+            assert_eq!(good["webgl_renderer"], healthy.webgl_renderer);
+            for (name, file, bytes) in [
+                ("default", "fingerprint.json", b"".as_slice()),
+                ("bad-json", "fingerprint.json", b"{corrupt".as_slice()),
+                ("bad-schema", "fingerprint.json", b"{}".as_slice()),
+                ("bad-runtime", "runtime.json", b"{corrupt".as_slice()),
+            ] {
+                let failed = profiles.iter().find(|p| p["profile"] == name).unwrap();
+                assert_eq!(failed["status"], "error");
+                assert!(failed["error"].as_str().unwrap().contains(file));
+                let profile = profile_dir(dir.path(), name);
+                assert_eq!(std::fs::read(profile.join(file)).unwrap(), bytes);
+                assert_eq!(
+                    std::fs::read(profile.join("user-data/Cookies")).unwrap(),
+                    b"retained-session"
+                );
+            }
+            let failed = profiles
+                .iter()
+                .find(|p| p["profile"] == "unreadable")
+                .unwrap();
+            assert_eq!(failed["status"], "error");
+            assert!(failed["error"].as_str().unwrap().contains("cannot read"));
+            assert_eq!(
+                std::fs::read(unreadable.join("fingerprint.json/recovery")).unwrap(),
+                b"keep"
+            );
+            assert_eq!(std::fs::read(&healthy_path).unwrap(), healthy_bytes);
+        }
+    }
+
+    #[test]
+    fn profile_entry_metadata_skips_vanished_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::File::open(dir.path()).unwrap();
+        let path = dir.path().join("vanished");
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            profile_entry_metadata(&root, c"vanished")
+                .unwrap()
+                .is_some()
+        );
+        // Model unlink after readdir supplied a name but before fstatat.
+        std::fs::remove_dir(&path).unwrap();
+        assert!(
+            profile_entry_metadata(&root, c"vanished")
+                .unwrap()
+                .is_none()
+        );
+        std::fs::create_dir(dir.path().join("healthy")).unwrap();
+        assert!(profile_entry_metadata(&root, c"healthy").unwrap().is_some());
+        let not_directory = std::fs::File::create(dir.path().join("file")).unwrap();
+        assert!(profile_entry_metadata(&not_directory, c"child").is_err());
+    }
+
+    #[test]
+    fn profiles_fail_closed_on_invalid_containers() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let request = || BrowserRequest {
+            action: "profiles".into(),
+            ..Default::default()
+        };
+        assert!(execute(&dir.path().join("missing"), "default", request()).is_err());
+        // An absent browser-profiles is the one valid empty-container case.
+        let result = execute(dir.path(), "default", request()).unwrap();
+        assert_eq!(result["profiles"].as_array().unwrap().len(), 1);
+        let root = profiles_root(dir.path());
+        let saved = dir.path().join("saved-profiles");
+        std::fs::rename(&root, &saved).unwrap();
+        std::fs::write(&root, b"not a directory").unwrap();
+        assert!(execute(dir.path(), "default", request()).is_err());
+        assert_eq!(std::fs::read(&root).unwrap(), b"not a directory");
+        std::fs::remove_file(&root).unwrap();
+        symlink(&saved, &root).unwrap();
+        assert!(execute(dir.path(), "default", request()).is_err());
+        std::fs::remove_file(&root).unwrap();
+        std::fs::rename(&saved, &root).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o0)).unwrap();
+            let denied = execute(dir.path(), "default", request());
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(denied.is_err());
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o0)).unwrap();
+            let denied = execute(dir.path(), "default", request());
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(denied.is_err());
+        }
+    }
+
+    #[test]
+    fn profiles_include_owned_permission_denied_entries() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: geteuid has no preconditions. Root bypasses DAC permissions;
+        // the directory-as-file fixture above covers I/O failure on root hosts.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        ensure_fingerprint(dir.path(), "healthy").unwrap();
+        ensure_fingerprint(dir.path(), "denied-file").unwrap();
+        ensure_fingerprint(dir.path(), "denied-directory").unwrap();
+        let file = profile_dir(dir.path(), "denied-file").join("fingerprint.json");
+        let bytes = std::fs::read(&file).unwrap();
+        let denied_dir = profile_dir(dir.path(), "denied-directory");
+        let directory_bytes = std::fs::read(denied_dir.join("fingerprint.json")).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o0)).unwrap();
+        std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0o0)).unwrap();
+        for action in ["profiles", "list"] {
+            let result = execute(
+                dir.path(),
+                "default",
+                BrowserRequest {
+                    action: action.into(),
+                    ..Default::default()
+                },
+            );
+            // Restore modes before any assertion can panic and leave temp state.
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let result = result.unwrap();
+            let profiles = result["profiles"].as_array().unwrap();
+            assert_eq!(profiles.len(), 4);
+            for name in ["denied-file", "denied-directory"] {
+                let failed = profiles.iter().find(|p| p["profile"] == name).unwrap();
+                assert_eq!(failed["status"], "error");
+                assert!(
+                    failed["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Permission denied")
+                );
+            }
+            assert_eq!(std::fs::read(&file).unwrap(), bytes);
+            assert_eq!(
+                std::fs::read(denied_dir.join("fingerprint.json")).unwrap(),
+                directory_bytes
+            );
+            assert_eq!(
+                profiles.iter().find(|p| p["profile"] == "healthy").unwrap()["status"],
+                "stopped"
+            );
+            if action == "profiles" {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o0)).unwrap();
+                std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0o0))
+                    .unwrap();
+            }
+        }
     }
 
     #[test]
