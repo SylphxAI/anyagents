@@ -1278,7 +1278,11 @@ fn profile_rotation_cannot_replace_an_in_turn_harness_via_quota_recovery() {
             let probes = Arc::clone(&probes);
             Arc::new(move |_: LaunchRequest| {
                 let probe = Arc::new(Mutex::new(SwitchProbe::default()));
-                probes.lock().unwrap().push(Arc::clone(&probe));
+                let mut guard = probes.lock().unwrap();
+                if guard.len() == 1 {
+                    probe.lock().unwrap().health.process_alive = false;
+                }
+                guard.push(Arc::clone(&probe));
                 Ok(SwitchHarness { probe })
             })
         },
@@ -1341,6 +1345,7 @@ struct SwitchProbe {
     offers: usize,
     given: Vec<String>,
     health_reads: usize,
+    clear_quota_calls: usize,
     stopped: bool,
 }
 
@@ -1364,6 +1369,7 @@ impl Default for SwitchProbe {
             offers: 0,
             given: Vec::new(),
             health_reads: 0,
+            clear_quota_calls: 0,
             stopped: false,
         }
     }
@@ -1397,6 +1403,11 @@ impl anyagents_harness::Harness for SwitchHarness {
     }
     fn cancel(&mut self) -> Result<(), anyagents_harness::HarnessError> {
         Ok(())
+    }
+    fn clear_quota(&mut self) {
+        let mut probe = self.probe.lock().unwrap();
+        probe.clear_quota_calls += 1;
+        probe.health.quota_reset_at_ms = None;
     }
     fn health(&self) -> anyagents_harness::HarnessHealth {
         let mut probe = self.probe.lock().unwrap();
@@ -2015,6 +2026,302 @@ done
     assert!(
         passes <= 60,
         "a {LINES}-line turn took {passes} harness health reads"
+    );
+    support::stop(supervisor);
+}
+
+#[test]
+fn instructions_rotation_recycles_when_idle_and_waits_for_in_turn_boundary() {
+    use anyagents_harness::TurnState;
+    use std::sync::Mutex;
+
+    let dir = short_dir();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let agent = store
+        .create_agent(NewAgent::new("spiron-boundary", "spiron"))
+        .unwrap();
+    store
+        .set_agent_running(&agent.id, &dir.path().display().to_string())
+        .unwrap();
+    let clock = ManualClock::new(1_700_000_000_000);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probes = Arc::new(Mutex::new(Vec::<Arc<Mutex<SwitchProbe>>>::new()));
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(ObservedClock {
+            clock: clock.clone(),
+            waits: tx,
+        }),
+        {
+            let probes = Arc::clone(&probes);
+            Arc::new(move |_: LaunchRequest| {
+                let probe = Arc::new(Mutex::new(SwitchProbe::default()));
+                let mut guard = probes.lock().unwrap();
+                if guard.len() == 2 {
+                    probe.lock().unwrap().accept = true;
+                }
+                guard.push(Arc::clone(&probe));
+                Ok(SwitchHarness { probe })
+            })
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| probes.lock().unwrap().len() == 1));
+    let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+    std::fs::create_dir_all(&config).unwrap();
+
+    // 1. Quiescent (Idle) process recycles immediately when instructions rotate.
+    std::fs::write(
+        config.join(".anyagents-instructions-rotated-ms"),
+        format!("{}\n", clock.now_ms() + 1),
+    )
+    .unwrap();
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    assert!(wait_until(|| probes.lock().unwrap().len() == 2));
+
+    // 2. Active InTurn process is preserved without kill/replay across drain deadlines.
+    let second = Arc::clone(&probes.lock().unwrap()[1]);
+    {
+        let mut p = second.lock().unwrap();
+        p.health.turn_state = TurnState::InTurn;
+    }
+    std::fs::write(
+        config.join(".anyagents-instructions-rotated-ms"),
+        format!("{}\n", clock.now_ms() + 2),
+    )
+    .unwrap();
+    let reads = second.lock().unwrap().health_reads;
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    assert!(wait_until(|| second.lock().unwrap().health_reads > reads));
+    clock.set_ms(clock.now_ms() + 30_001);
+    let until = Instant::now() + WAIT_CEILING;
+    loop {
+        assert!(Instant::now() < until);
+        let (observed, _) = rx.recv_timeout(WAIT_CEILING).unwrap();
+        if observed == clock.now_ms() {
+            break;
+        }
+    }
+    assert_eq!(probes.lock().unwrap().len(), 2);
+
+    // 3. Finishing the active turn recycles onto the 3rd process before next dispatch.
+    let anyagents_core::ReceiveOutcome::New(queued) = store
+        .receive(&agent.id, Incoming::new("after-boundary-turn"))
+        .unwrap()
+    else {
+        panic!("expected new message");
+    };
+    let queued_id = queued.id.to_string();
+    {
+        let mut p = second.lock().unwrap();
+        p.health.turn_state = TurnState::Idle;
+    }
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    assert!(wait_until(|| probes.lock().unwrap().len() == 3));
+    let third = Arc::clone(&probes.lock().unwrap()[2]);
+    assert!(second.lock().unwrap().stopped);
+    assert!(wait_until(|| third
+        .lock()
+        .unwrap()
+        .given
+        .contains(&queued_id)));
+    assert!(!second.lock().unwrap().given.contains(&queued_id));
+
+    support::stop(supervisor);
+}
+
+#[test]
+fn instructions_rotation_does_not_bypass_active_quota_hold() {
+    use std::sync::Mutex;
+
+    let dir = short_dir();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let agent = store
+        .create_agent(NewAgent::new("spiron-quota", "spiron"))
+        .unwrap();
+    store
+        .set_agent_running(&agent.id, &dir.path().display().to_string())
+        .unwrap();
+    let clock = ManualClock::new(1_700_000_000_000);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probes = Arc::new(Mutex::new(Vec::<Arc<Mutex<SwitchProbe>>>::new()));
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(ObservedClock {
+            clock: clock.clone(),
+            waits: tx,
+        }),
+        {
+            let probes = Arc::clone(&probes);
+            Arc::new(move |_: LaunchRequest| {
+                let probe = Arc::new(Mutex::new(SwitchProbe::default()));
+                let mut guard = probes.lock().unwrap();
+                if guard.len() == 2 {
+                    probe.lock().unwrap().accept = true;
+                }
+                guard.push(Arc::clone(&probe));
+                Ok(SwitchHarness { probe })
+            })
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| probes.lock().unwrap().len() == 1));
+    let reset_at = clock.now_ms() + 60_000;
+    {
+        let first = Arc::clone(&probes.lock().unwrap()[0]);
+        first.lock().unwrap().health.quota_reset_at_ms = Some(reset_at);
+    }
+    let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join(".anyagents-instructions-rotated-ms"),
+        format!("{}\n", clock.now_ms() + 1),
+    )
+    .unwrap();
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    let until = Instant::now() + WAIT_CEILING;
+    loop {
+        assert!(Instant::now() < until);
+        let (_, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
+        if deadline == Some(reset_at) {
+            break;
+        }
+    }
+    assert_eq!(
+        probes.lock().unwrap().len(),
+        1,
+        "instructions rotation alone must preserve active quota hold"
+    );
+
+    clock.set_ms(reset_at);
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    assert!(wait_until(|| probes.lock().unwrap().len() == 2));
+    assert_eq!(
+        probes.lock().unwrap()[1].lock().unwrap().clear_quota_calls,
+        0,
+        "instruction-only reload after quota expiry must not call harness.clear_quota()"
+    );
+    support::stop(supervisor);
+}
+
+#[test]
+fn instructions_rotation_preserves_restart_backoff_and_does_not_clear_quota() {
+    use std::sync::Mutex;
+
+    let dir = short_dir();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let agent = store
+        .create_agent(NewAgent::new("spiron-backoff", "spiron"))
+        .unwrap();
+    store
+        .set_agent_running(&agent.id, &dir.path().display().to_string())
+        .unwrap();
+    let clock = ManualClock::new(1_700_000_000_000);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probes = Arc::new(Mutex::new(Vec::<Arc<Mutex<SwitchProbe>>>::new()));
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(ObservedClock {
+            clock: clock.clone(),
+            waits: tx,
+        }),
+        {
+            let probes = Arc::clone(&probes);
+            Arc::new(move |_: LaunchRequest| {
+                let probe = Arc::new(Mutex::new(SwitchProbe::default()));
+                let mut guard = probes.lock().unwrap();
+                if guard.len() == 1 {
+                    probe.lock().unwrap().health.process_alive = false;
+                }
+                guard.push(Arc::clone(&probe));
+                Ok(SwitchHarness { probe })
+            })
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| probes.lock().unwrap().len() == 1));
+    {
+        let first = Arc::clone(&probes.lock().unwrap()[0]);
+        first.lock().unwrap().health.process_alive = false;
+    }
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent.id)
+            .is_some_and(|live| !live.process_alive && live.restart_at_ms.is_some())
+    }));
+    let first_restart_at = supervisor.live(&agent.id).unwrap().restart_at_ms.unwrap();
+    let first_delay = first_restart_at - clock.now_ms();
+    assert!(first_delay >= 200, "delay={first_delay}");
+
+    // Write instructions rotation while dead child is in restart backoff.
+    let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join(".anyagents-instructions-rotated-ms"),
+        format!("{}\n", clock.now_ms() + 1),
+    )
+    .unwrap();
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    clock.set_ms(clock.now_ms() + first_delay / 2);
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    let until = Instant::now() + WAIT_CEILING;
+    loop {
+        assert!(Instant::now() < until);
+        let (observed, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
+        if observed == clock.now_ms() && deadline == Some(first_restart_at) {
+            break;
+        }
+    }
+    assert_eq!(
+        probes.lock().unwrap().len(),
+        1,
+        "instructions rotation must not bypass dead-process restart backoff"
+    );
+
+    // Advance to the full backoff deadline: replacement swaps cleanly without clear_quota().
+    clock.set_ms(first_restart_at);
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    assert!(wait_until(|| probes.lock().unwrap().len() == 2));
+    let second = Arc::clone(&probes.lock().unwrap()[1]);
+    assert_eq!(
+        second.lock().unwrap().clear_quota_calls,
+        0,
+        "instruction-only reload must not clear quota on new harness"
+    );
+
+    // Because the replacement died before serving, backoff continues from attempt=2.
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent.id)
+            .is_some_and(|live| !live.process_alive && live.restart_at_ms.is_some())
+    }));
+    let second_restart_at = supervisor.live(&agent.id).unwrap().restart_at_ms.unwrap();
+    let second_delay = second_restart_at - first_restart_at;
+    assert!(
+        second_delay > first_delay,
+        "backoff must not reset across instruction-only reload (first={first_delay}, second={second_delay})"
     );
     support::stop(supervisor);
 }
