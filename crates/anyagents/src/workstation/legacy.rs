@@ -287,7 +287,7 @@ fn signal(p: &Process, sig: i32) -> Result<()> {
     if current.start != p.start {
         return Ok(());
     }
-    if current.group != p.group || current.cmd != p.cmd {
+    if current.group != p.group {
         return Err(invalid("legacy process ownership changed before signaling"));
     }
     // SAFETY: descriptor pins this process; null siginfo and flags zero.
@@ -307,6 +307,36 @@ fn signal(p: &Process, sig: i32) -> Result<()> {
         }
     }
     Ok(())
+}
+// SIGSTOP delivery is asynchronous: confirm the stop before sweeping children,
+// otherwise a launcher already inside fork could publish a child after the scan.
+fn freeze(p: &Process) -> Result<()> {
+    signal(p, libc::SIGSTOP)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let stat = match std::fs::read_to_string(format!("/proc/{}/stat", p.pid)) {
+            Ok(stat) => stat,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let (alive, _, group, start) = parse_stat(&stat)?;
+        if !alive || start != p.start {
+            return Ok(());
+        }
+        if group != p.group {
+            return Err(invalid("legacy process group changed while freezing"));
+        }
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, tail)| tail.split_whitespace().next());
+        if matches!(state, Some("T" | "t")) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(invalid("legacy process did not stop"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 fn stop_members(all: Vec<Process>, dir: &Path, asked: bool) -> Result<()> {
     if let Some(browser) = browser_member(&all, dir)
@@ -331,18 +361,47 @@ fn stop_members(all: Vec<Process>, dir: &Path, asked: bool) -> Result<()> {
     {
         std::thread::sleep(Duration::from_millis(100));
     }
-    for p in &all {
-        signal(p, libc::SIGTERM)?;
+    let group = all[0].group;
+    let mut known = all;
+    // A known survivor pins this PGID. Freeze launchers before discovering
+    // children spawned after the browser exited (e.g. xvfb-run cleanup).
+    for _ in 0..8 {
+        if !known.iter().any(|p| {
+            process(p.pid)
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.start == p.start && c.group == group)
+        }) {
+            break;
+        }
+        for p in &known {
+            freeze(p)?;
+        }
+        let mut added = false;
+        for p in members(group)? {
+            if !known.iter().any(|k| k.pid == p.pid && k.start == p.start) {
+                known.push(p);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
     }
-    for p in &all {
+    for p in &known {
+        signal(p, libc::SIGTERM)?;
+        signal(p, libc::SIGCONT)?;
+    }
+    for p in &known {
         if !wait_gone(p, Duration::from_secs(5))? {
             signal(p, libc::SIGKILL)?;
+            signal(p, libc::SIGCONT)?;
         }
         if !wait_gone(p, Duration::from_secs(5))? {
             return Err(invalid("legacy group did not exit"));
         }
     }
-    if !members(all[0].group)?.is_empty() {
+    if !members(group)?.is_empty() {
         return Err(invalid("legacy group changed during retirement"));
     }
     Ok(())
