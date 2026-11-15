@@ -110,13 +110,19 @@ fn configured_owner_catalog_is_authoritative_for_create_discovery_and_updates() 
             .unwrap()
     };
     let workspace = workspace.to_str().unwrap();
-    // A no-role agent remains possible, even before the catalog exists.
+    // Omitting --role automatically defaults to the built-in `general` role without any disk file.
     let created = run(&["agents", "create", "plain", "--workdir", workspace]);
     assert!(
         created.status.success(),
         "{}",
         String::from_utf8_lossy(&created.stderr)
     );
+    {
+        let store = Store::open(data.join("state.db")).unwrap();
+        let plain = store.agent_by_name("plain").unwrap();
+        assert_eq!(plain.role.as_deref(), Some("general"));
+        assert_eq!(plain.scope(), "public");
+    }
     for state in ["missing", "empty", "populated"] {
         if state == "empty" {
             std::fs::create_dir_all(owner.join(".agents/agents")).unwrap();
@@ -849,7 +855,8 @@ fn create_registers_mcp_only_in_the_agent_config() {
     let store = Store::open(dir.path().join("state.db")).unwrap();
     let agent = store.agent_by_name("alpha").unwrap();
     assert_eq!(agent.state, "running");
-    assert_eq!(agent.instructions.as_deref(), Some("be brief"));
+    assert_eq!(agent.role.as_deref(), Some("general"));
+    let alpha_instructions = agent.instructions.clone().unwrap();
     assert_eq!(agent.model.as_deref(), Some("sonnet"));
     assert_eq!(
         agent.workdir.as_deref(),
@@ -919,6 +926,15 @@ fn create_registers_mcp_only_in_the_agent_config() {
     assert!(toml.contains("[mcp_servers.anyagents]"), "{toml}");
     assert_eq!(std::fs::read(&claude_sentinel).unwrap(), b"sentinel-claude");
     assert_eq!(std::fs::read(&codex_sentinel).unwrap(), b"sentinel-codex");
+
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let beta = store.agent_by_name("beta").unwrap();
+    let default_body = beta.instructions.as_deref().unwrap();
+    assert!(
+        default_body.starts_with("You are a cohesive end-to-end execution worker."),
+        "{default_body}"
+    );
+    assert_eq!(alpha_instructions, format!("{default_body}\n\nbe brief"));
 }
 
 #[test]
@@ -1103,4 +1119,104 @@ fn add_telegram_copies_the_token_and_lists_no_secret() {
     assert!(stdout.contains("telegram"), "{stdout}");
     assert!(stdout.contains("alpha"), "{stdout}");
     assert!(!stdout.contains("123456"), "{stdout}");
+}
+
+#[test]
+fn cli_create_defaults_omitted_and_empty_role_to_builtin_general_and_allows_disk_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let workspace = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let ws_str = workspace.to_str().unwrap();
+    let run = |args: &[&str]| {
+        bin_in(&data)
+            .env("HOME", &home)
+            .env_remove("ANYAGENTS_OWNER_WORKDIR")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    for (name, extra_args) in [
+        ("omitted-role", &[][..]),
+        ("empty-role", &["--role", ""][..]),
+        ("explicit-general", &["--role", "general"][..]),
+    ] {
+        let mut args = vec!["agents", "create", name, "--workdir", ws_str];
+        args.extend_from_slice(extra_args);
+        let out = run(&args);
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Sub-agent with omitted role gets built-in `general` with `private` scope.
+    let sub = run(&[
+        "agents",
+        "create",
+        "sub-omitted",
+        "--parent",
+        "omitted-role",
+        "--workdir",
+        ws_str,
+    ]);
+    assert!(
+        sub.status.success(),
+        "sub-omitted: {}",
+        String::from_utf8_lossy(&sub.stderr)
+    );
+
+    {
+        let store = Store::open(data.join("state.db")).unwrap();
+        let omitted = store.agent_by_name("omitted-role").unwrap();
+        let default_body = omitted.instructions.as_deref().unwrap();
+        assert!(
+            default_body.starts_with("You are a cohesive end-to-end execution worker."),
+            "{default_body}"
+        );
+        for name in ["omitted-role", "empty-role", "explicit-general"] {
+            let agent = store.agent_by_name(name).unwrap();
+            assert_eq!(agent.role.as_deref(), Some("general"), "{name}");
+            assert_eq!(agent.scope(), "public", "{name}");
+            assert_eq!(agent.instructions.as_deref(), Some(default_body), "{name}");
+        }
+        let sub_agent = store.agent_by_name("sub-omitted").unwrap();
+        assert_eq!(sub_agent.role.as_deref(), Some("general"));
+        assert_eq!(sub_agent.scope(), "private");
+        assert_eq!(sub_agent.instructions.as_deref(), Some(default_body));
+    }
+
+    // Workspace .agents/agents/general.md overrides the built-in template (even root scope).
+    std::fs::create_dir_all(workspace.join(".agents/agents")).unwrap();
+    std::fs::write(
+        workspace.join(".agents/agents/general.md"),
+        "---\nname: general\ndescription: Workspace General Override\nscope: private\n---\nWorkspace general override body.\n",
+    )
+    .unwrap();
+    let overridden = run(&["agents", "create", "disk-general", "--workdir", ws_str]);
+    assert!(
+        overridden.status.success(),
+        "{}",
+        String::from_utf8_lossy(&overridden.stderr)
+    );
+    let store = Store::open(data.join("state.db")).unwrap();
+    let agent = store.agent_by_name("disk-general").unwrap();
+    assert_eq!(agent.role.as_deref(), Some("general"));
+    assert_eq!(agent.scope(), "private");
+    assert_eq!(
+        agent.description.as_deref(),
+        Some("Workspace General Override")
+    );
+    assert!(
+        agent
+            .instructions
+            .as_deref()
+            .is_some_and(|text| text.contains("Workspace general override body.")),
+        "{:?}",
+        agent.instructions
+    );
 }
