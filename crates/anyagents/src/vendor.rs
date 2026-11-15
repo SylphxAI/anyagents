@@ -2202,8 +2202,11 @@ fn start_spiron(
         "--agent-name".to_string(),
         agent.name.to_string(),
     ];
-    if let Some(model) = agent.model.map(str::trim).filter(|model| !model.is_empty()) {
-        let normalized = crate::spiron::strip_coding_plan_prefix(model);
+    if let Some(normalized) = agent
+        .model
+        .map(crate::spiron::normalize_model)
+        .filter(|model| !model.is_empty())
+    {
         args.extend(["--model".to_string(), normalized.to_string()]);
     }
     let mut environment = env.to_vec();
