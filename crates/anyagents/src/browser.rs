@@ -5077,14 +5077,83 @@ fn resolve_request_key_specs(req: &BrowserRequest) -> Result<Vec<KeySpec>, Error
 }
 
 pub fn list_profiles(data: &Path) -> Result<Vec<BrowserProfileSummary>, Error> {
-    let root = profiles_root(data);
+    use std::os::fd::AsRawFd as _;
+
+    let data_dir = std::fs::File::open(data)?;
+    let root = owned_child_dir(&data_dir, "browser-profiles".as_ref(), 0o755, false)?;
     let mut names = std::collections::BTreeSet::new();
     names.insert("default".to_string());
-    if let Ok(entries) = std::fs::read_dir(&root) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str()
-                && matches!(server_profile_dir(data, name, false), Ok(Some(_)))
+    if let Some(root) = root {
+        // Bind enumeration to the verified directory on both Linux and macOS.
+        struct Directory(*mut libc::DIR);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                // SAFETY: fdopendir transferred ownership of this stream to us.
+                unsafe { libc::closedir(self.0) };
+            }
+        }
+        // SAFETY: root owns a valid descriptor; dup returns a new owned descriptor.
+        let fd = unsafe { libc::dup(root.as_raw_fd()) };
+        if fd == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: fd is an open directory descriptor. On success the stream owns it.
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: fdopendir failed, so fd remains ours.
+            unsafe { libc::close(fd) };
+            return Err(error.into());
+        }
+        let directory = Directory(stream);
+        loop {
+            // SAFETY: the platform returns this thread's errno storage.
+            unsafe {
+                #[cfg(target_os = "linux")]
+                {
+                    *libc::__errno_location() = 0;
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    *libc::__error() = 0;
+                }
+            }
+            // SAFETY: directory owns a live stream, used only by this thread.
+            let entry = unsafe { libc::readdir(directory.0) };
+            if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(0) {
+                    return Err(error.into());
+                }
+                break;
+            }
+            // SAFETY: readdir supplied a NUL-terminated name valid until the next call.
+            let c_name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if matches!(c_name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            let Ok(name) = c_name.to_str() else { continue };
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: root is an open directory, c_name is NUL-terminated,
+            // and stat points to storage for the metadata written on success.
+            if unsafe {
+                libc::fstatat(
+                    root.as_raw_fd(),
+                    c_name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
             {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // SAFETY: fstatat succeeded and initialized stat.
+            let stat = unsafe { stat.assume_init() };
+            if stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+                && stat.st_uid == crate::sandbox::server_uid()
+            {
+                // Metadata, rather than opening the child, includes owned
+                // directories with denied access in the per-profile results.
                 names.insert(name.to_string());
             }
         }
@@ -6966,6 +7035,101 @@ mod tests {
                 b"keep"
             );
             assert_eq!(std::fs::read(&healthy_path).unwrap(), healthy_bytes);
+        }
+    }
+
+    #[test]
+    fn profiles_fail_closed_on_invalid_containers() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let request = || BrowserRequest {
+            action: "profiles".into(),
+            ..Default::default()
+        };
+        assert!(execute(&dir.path().join("missing"), "default", request()).is_err());
+        // An absent browser-profiles is the one valid empty-container case.
+        let result = execute(dir.path(), "default", request()).unwrap();
+        assert_eq!(result["profiles"].as_array().unwrap().len(), 1);
+        let root = profiles_root(dir.path());
+        let saved = dir.path().join("saved-profiles");
+        std::fs::rename(&root, &saved).unwrap();
+        std::fs::write(&root, b"not a directory").unwrap();
+        assert!(execute(dir.path(), "default", request()).is_err());
+        assert_eq!(std::fs::read(&root).unwrap(), b"not a directory");
+        std::fs::remove_file(&root).unwrap();
+        symlink(&saved, &root).unwrap();
+        assert!(execute(dir.path(), "default", request()).is_err());
+        std::fs::remove_file(&root).unwrap();
+        std::fs::rename(&saved, &root).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0)).unwrap();
+            let denied = execute(dir.path(), "default", request());
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(denied.is_err());
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0)).unwrap();
+            let denied = execute(dir.path(), "default", request());
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(denied.is_err());
+        }
+    }
+
+    #[test]
+    fn profiles_include_owned_permission_denied_entries() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: geteuid has no preconditions. Root bypasses DAC permissions;
+        // the directory-as-file fixture above covers I/O failure on root hosts.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        ensure_fingerprint(dir.path(), "healthy").unwrap();
+        ensure_fingerprint(dir.path(), "denied-file").unwrap();
+        ensure_fingerprint(dir.path(), "denied-directory").unwrap();
+        let file = profile_dir(dir.path(), "denied-file").join("fingerprint.json");
+        let bytes = std::fs::read(&file).unwrap();
+        let denied_dir = profile_dir(dir.path(), "denied-directory");
+        let directory_bytes = std::fs::read(denied_dir.join("fingerprint.json")).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0)).unwrap();
+        for action in ["profiles", "list"] {
+            let result = execute(
+                dir.path(),
+                "default",
+                BrowserRequest {
+                    action: action.into(),
+                    ..Default::default()
+                },
+            );
+            // Restore modes before any assertion can panic and leave temp state.
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let result = result.unwrap();
+            let profiles = result["profiles"].as_array().unwrap();
+            assert_eq!(profiles.len(), 4);
+            for name in ["denied-file", "denied-directory"] {
+                let failed = profiles.iter().find(|p| p["profile"] == name).unwrap();
+                assert_eq!(failed["status"], "error");
+                assert!(
+                    failed["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Permission denied")
+                );
+            }
+            assert_eq!(std::fs::read(&file).unwrap(), bytes);
+            assert_eq!(
+                std::fs::read(denied_dir.join("fingerprint.json")).unwrap(),
+                directory_bytes
+            );
+            assert_eq!(
+                profiles.iter().find(|p| p["profile"] == "healthy").unwrap()["status"],
+                "stopped"
+            );
+            if action == "profiles" {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0)).unwrap();
+                std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0)).unwrap();
+            }
         }
     }
 
