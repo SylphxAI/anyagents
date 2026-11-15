@@ -534,7 +534,7 @@ mod stdio_frame_cap_tests {
             spilled,
             format!(
                 "line \"one\"\n\n{}\n{big}",
-                r#"{"data":"AAAA","mimeType":"image/png","type":"image"}"#
+                r#"{"type":"image","data":"AAAA","mimeType":"image/png"}"#
             )
         );
 
