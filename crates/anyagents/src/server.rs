@@ -5115,6 +5115,15 @@ async fn pause_agent_route(
             .store
             .lock_agent_lifecycle(&found.id)
             .map_err(ApiError::from_store)?;
+        // Read again under the lock: an archive may have completed meanwhile,
+        // and a pause must not bring an archived agent back as paused.
+        let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
+        if found.state == "archived" {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("agent {} is archived; wake it to resume", found.name),
+            ));
+        }
         let agent = state
             .store
             .set_agent_state(&found.id, "paused")
@@ -14911,6 +14920,57 @@ exec '{}' "$@"
         .unwrap();
         assert_eq!(r.totals.input_tokens, 600);
         assert_eq!(r.buckets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn pause_agent_route_waits_on_lifecycle_and_rejects_archived() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let live = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("pause-live", "opencode"))
+            .unwrap();
+        let Json(paused) = pause_agent_route(
+            Principal::Operator,
+            State(state.clone()),
+            AxumPath(live.name.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(paused.state, "paused");
+
+        let archived = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("pause-archived", "opencode"))
+            .unwrap();
+        let held = state.store.lock_agent_lifecycle(&archived.id).unwrap();
+        let route_state = state.clone();
+        let route_name = archived.name.clone();
+        let pending = tokio::spawn(async move {
+            pause_agent_route(
+                Principal::Operator,
+                State(route_state),
+                AxumPath(route_name),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            !pending.is_finished(),
+            "pause ran while lifecycle lock was held"
+        );
+        state
+            .store
+            .set_agent_state(&archived.id, "archived")
+            .unwrap();
+        drop(held);
+        let err = pending.await.unwrap().unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(
+            state.store.agent(&archived.id).unwrap().state,
+            "archived",
+            "pause overwrote archived state"
+        );
     }
 }
 

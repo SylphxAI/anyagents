@@ -199,35 +199,42 @@ mod tests {
             .collect();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         std::thread::scope(|scope| {
-            for value in &values {
-                let marker = &marker;
-                scope.spawn(move || {
-                    for _ in 0..200 {
-                        atomic_write_in_existing_dir(marker, value, 0o664).unwrap();
-                    }
-                });
-            }
             let mut readers = Vec::new();
             for _ in 0..4 {
                 let (marker, stop, values) = (&marker, stop.clone(), &values);
                 readers.push(scope.spawn(move || {
                     let mut reads = 0_u64;
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // One more read after the writers finish, so every reader
+                    // also checks the final committed value.
+                    loop {
+                        let done = stop.load(std::sync::atomic::Ordering::Acquire);
                         let seen = fs::read(marker).unwrap();
                         assert!(
                             seen == b"1000000000000\n" || values.contains(&seen),
                             "reader saw {seen:?}"
                         );
                         reads += 1;
+                        if done {
+                            return reads;
+                        }
                     }
-                    reads
                 }));
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            while fs::read_dir(dir.path()).unwrap().count() > 1 {
-                std::thread::yield_now();
+            let writers: Vec<_> = values
+                .iter()
+                .map(|value| {
+                    let marker = &marker;
+                    scope.spawn(move || {
+                        for _ in 0..200 {
+                            atomic_write_in_existing_dir(marker, value, 0o664).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().unwrap();
             }
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            stop.store(true, std::sync::atomic::Ordering::Release);
             for reader in readers {
                 assert!(reader.join().unwrap() > 0);
             }
