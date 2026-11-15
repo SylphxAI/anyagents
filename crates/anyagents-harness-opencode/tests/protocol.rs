@@ -1105,6 +1105,14 @@ fn a_mid_turn_sse_reconnect_keeps_queued_steers_in_flight() {
 }
 
 #[test]
+fn repeated_mid_turn_sse_reconnects_keep_queued_steers_in_flight() {
+    for attempt in 1..=50 {
+        eprintln!("mid-turn reconnect attempt {attempt}/50");
+        a_mid_turn_sse_reconnect_keeps_queued_steers_in_flight();
+    }
+}
+
+#[test]
 fn unconsumed_steers_settled_at_idle_redeliver_in_fifo_ahead_of_fresh_mail() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "settle-fifo");
