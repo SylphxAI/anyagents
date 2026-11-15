@@ -12272,8 +12272,8 @@ exec '{}' "$@"
         );
     }
 
-    #[tokio::test]
-    async fn create_agent_route_defaults_omitted_and_empty_role_to_builtin_general() {
+    #[test]
+    fn create_agent_route_defaults_omitted_and_empty_role_to_builtin_general() {
         let _env = env_lock();
         let prev_home = std::env::var_os("HOME");
         let prev_owner = std::env::var_os("ANYAGENTS_OWNER_WORKDIR");
@@ -12287,75 +12287,77 @@ exec '{}' "$@"
             std::env::set_var("HOME", &home);
             std::env::remove_var("ANYAGENTS_OWNER_WORKDIR");
         }
-        let state = archetype_validation_state(dir.path());
-        for (name, extra) in [
-            ("http-omitted", serde_json::json!({})),
-            ("http-empty", serde_json::json!({ "role": "" })),
-            ("http-general", serde_json::json!({ "role": "general" })),
-        ] {
-            let mut body = serde_json::json!({
-                "name": name,
-                "workdir": work,
-            });
-            if let Some(obj) = extra.as_object() {
-                for (k, v) in obj {
-                    body[k] = v.clone();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let state = archetype_validation_state(dir.path());
+            for (name, extra) in [
+                ("http-omitted", serde_json::json!({})),
+                ("http-empty", serde_json::json!({ "role": "" })),
+                ("http-general", serde_json::json!({ "role": "general" })),
+            ] {
+                let mut body = serde_json::json!({
+                    "name": name,
+                    "workdir": work,
+                });
+                if let Some(obj) = extra.as_object() {
+                    for (k, v) in obj {
+                        body[k] = v.clone();
+                    }
                 }
+                let (status, Json(agent)) = create_agent_route(
+                    Principal::Operator,
+                    State(state.clone()),
+                    axum::http::HeaderMap::new(),
+                    Json(serde_json::from_value(body).unwrap()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {}: {}", e.status, e.message));
+                assert_eq!(status, StatusCode::CREATED, "{name}");
+                assert_eq!(agent.role.as_deref(), Some("general"), "{name}");
+                assert_eq!(agent.scope, "private", "{name}");
+                assert!(
+                    agent
+                        .instructions
+                        .as_deref()
+                        .is_some_and(|text| !text.trim().is_empty()),
+                    "{name}"
+                );
             }
-            let (status, Json(agent)) = create_agent_route(
+
+            // Workspace .agents/agents/general.md overrides the built-in template.
+            std::fs::create_dir_all(work.join(".agents/agents")).unwrap();
+            std::fs::write(
+                work.join(".agents/agents/general.md"),
+                "---\nname: general\ndescription: HTTP General Override\nscope: public\n---\nHTTP general override body.\n",
+            )
+            .unwrap();
+            let (status, Json(overridden)) = create_agent_route(
                 Principal::Operator,
                 State(state.clone()),
                 axum::http::HeaderMap::new(),
-                Json(serde_json::from_value(body).unwrap()),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "http-overridden",
+                        "workdir": work,
+                    }))
+                    .unwrap(),
+                ),
             )
             .await
-            .unwrap_or_else(|e| panic!("{name}: {}: {}", e.status, e.message));
-            assert_eq!(status, StatusCode::CREATED, "{name}");
-            assert_eq!(agent.role.as_deref(), Some("general"), "{name}");
-            assert_eq!(agent.scope, "private", "{name}");
+            .unwrap_or_else(|e| panic!("override: {}: {}", e.status, e.message));
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(overridden.role.as_deref(), Some("general"));
+            assert_eq!(overridden.scope, "public");
+            assert_eq!(
+                overridden.description.as_deref(),
+                Some("HTTP General Override")
+            );
             assert!(
-                agent
+                overridden
                     .instructions
                     .as_deref()
-                    .is_some_and(|text| !text.trim().is_empty()),
-                "{name}"
+                    .is_some_and(|text| text.contains("HTTP general override body."))
             );
-        }
-
-        // Workspace .agents/agents/general.md overrides the built-in template.
-        std::fs::create_dir_all(work.join(".agents/agents")).unwrap();
-        std::fs::write(
-            work.join(".agents/agents/general.md"),
-            "---\nname: general\ndescription: HTTP General Override\nscope: public\n---\nHTTP general override body.\n",
-        )
-        .unwrap();
-        let (status, Json(overridden)) = create_agent_route(
-            Principal::Operator,
-            State(state.clone()),
-            axum::http::HeaderMap::new(),
-            Json(
-                serde_json::from_value(serde_json::json!({
-                    "name": "http-overridden",
-                    "workdir": work,
-                }))
-                .unwrap(),
-            ),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("override: {}: {}", e.status, e.message));
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(overridden.role.as_deref(), Some("general"));
-        assert_eq!(overridden.scope, "public");
-        assert_eq!(
-            overridden.description.as_deref(),
-            Some("HTTP General Override")
-        );
-        assert!(
-            overridden
-                .instructions
-                .as_deref()
-                .is_some_and(|text| text.contains("HTTP general override body."))
-        );
+        });
 
         unsafe {
             match prev_home {

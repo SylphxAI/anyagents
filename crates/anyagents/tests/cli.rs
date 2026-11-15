@@ -1138,12 +1138,12 @@ fn cli_create_defaults_omitted_and_empty_role_to_builtin_general_and_allows_disk
     };
 
     for (name, extra_args) in [
-        ("omitted-role", vec![]),
-        ("empty-role", vec!["--role", ""]),
-        ("explicit-general", vec!["--role", "general"]),
+        ("omitted-role", &[][..]),
+        ("empty-role", &["--role", ""][..]),
+        ("explicit-general", &["--role", "general"][..]),
     ] {
         let mut args = vec!["agents", "create", name, "--workdir", ws_str];
-        args.extend(extra_args);
+        args.extend_from_slice(extra_args);
         let out = run(&args);
         assert!(
             out.status.success(),
