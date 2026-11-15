@@ -4296,10 +4296,13 @@ Connection: close
         timer_schedule(&store, &owner.id, "at", "due", Some(now - 1));
         let mut timer = Timer::local();
         timer.stop.store(true, Ordering::SeqCst);
-        assert_eq!(timer.step(&store, &health, 0, now).fired, 0);
+        let stopped = timer.step(&store, &health, 0, now);
+        assert_eq!(stopped.fired, 0);
         assert!(store.inbox(&owner.id, None).unwrap().is_empty());
+        // The entry is still due: the next step, at the retry deadline, fires it.
+        assert_eq!(stopped.deadline, now + RETRY_MS);
         timer.stop.store(false, Ordering::SeqCst);
-        assert_eq!(timer.step(&store, &health, 0, now).fired, 1);
+        assert_eq!(timer.step(&store, &health, 0, stopped.deadline).fired, 1);
     }
 
     #[test]
