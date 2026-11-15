@@ -302,8 +302,9 @@ struct State {
     /// The one Antigravity steer under way, and once the language server
     /// settled it, whether it queued the message.
     agy_steer: Option<AgySteer>,
-    /// The Antigravity turn (its `turns_started`) whose cascade refused a
-    /// steer: it is given no more, and the next input waits for its end.
+    /// The Antigravity turn (its `turns_started`) whose cascade, held open
+    /// past it with an empty mailbox, refused a steer: the next input opens
+    /// a turn on stdin. A refusal while a turn runs is asked again instead.
     agy_refused_turn: Option<usize>,
     /// Messages a cascade's durable mailbox holds that the cascade has not
     /// shown taking: the language server queued them for this process, or a
@@ -845,6 +846,7 @@ impl StreamHarness {
                         child_pid: state.child.as_ref().map(Child::id),
                         cached_port: state.http_port,
                         planner_config: state.planner_config.clone(),
+                        running: agy_known_running(&state),
                         generation: state.generation,
                     });
                 } else {
@@ -2840,7 +2842,6 @@ const AGY_STEER_PROBE_GAP: Duration = Duration::from_millis(400);
 /// `Some(Some(d))` for `d`.
 ///
 /// - A steer under way: its settling wakes the host.
-/// - A turn whose cascade refused a steer takes no more: its end does.
 /// - A steer goes through the language server, while the turn it joins was
 ///   started on stdin, and nothing orders the two. A known cascade that has
 ///   not shown the turn's first step may still be idle; a steer sent now
@@ -2859,7 +2860,7 @@ const AGY_STEER_PROBE_GAP: Duration = Duration::from_millis(400);
 /// is steered at once: the message joins the mail and starts the invocation
 /// that takes all of it, in order.
 fn agy_input_gate(state: &State) -> Option<Option<Duration>> {
-    if agy_steer_running(state) || (agy_held(state) && !state.open.is_empty()) {
+    if agy_steer_running(state) {
         return Some(None);
     }
     if let Some(idle) = state.idle_since
@@ -2914,7 +2915,7 @@ fn agy_note_opener_taken(state: &mut State) {
     }
 }
 
-/// The running turn's cascade refused a steer.
+/// The cascade held open past the last turn refused a steer.
 fn agy_held(state: &State) -> bool {
     state.agy_refused_turn == Some(state.turns_started)
 }
@@ -2973,7 +2974,25 @@ struct AgySteerJob {
     child_pid: Option<u32>,
     cached_port: Option<u16>,
     planner_config: Option<Value>,
+    /// The cascade is known to run this process's turn: no probe is asked.
+    running: bool,
     generation: u64,
+}
+
+/// The cascade runs a turn of this process: the turn showed a step, and the
+/// cascade has not been seen idle since. A steer goes straight to
+/// `SendUserCascadeMessage`, which the running cascade takes at its next
+/// step; one that went idle meanwhile refuses it for want of a planner
+/// config, and the next steer waits out the turn's close and asks for its
+/// run status.
+fn agy_known_running(state: &State) -> bool {
+    !state.open.is_empty()
+        && state.turn_user_inputs > 0
+        && state.idle_since.is_none()
+        && state
+            .session_id
+            .as_deref()
+            .is_some_and(|sid| !sid.is_empty())
 }
 
 /// Run `job` off the delivery path; its message is in flight until the steer
@@ -3036,7 +3055,8 @@ const AGY_REFUSALS: [&str; 3] = [
 ];
 
 /// One steer: ask the language server whether the cascade runs (and for its
-/// planner config when it does not), then `SendUserCascadeMessage` with
+/// planner config when it does not), unless a step of the running turn
+/// already showed it ([`agy_known_running`]), then `SendUserCascadeMessage` with
 /// `NEXT_INVOCATION`, which queues the message in the cascade's durable
 /// mailbox and answers `{}`. The answer is waited for without a timeout. A
 /// probe that fails, or a refusal, returns the message; an answer that
@@ -3056,12 +3076,22 @@ fn agy_steer_attempt(
         child_pid,
         cached_port,
         mut planner_config,
+        running: known_running,
         generation,
     } = job;
     let Some(port) = agy_port(shared, &rpc, cached_port, child_pid, generation) else {
         return agy_back_off(shared, wake, generation);
     };
-    let Ok((resolved_sid, running)) = agy_rpc_is_running(port, &rpc.csrf_token, &session_id) else {
+    // Unprobed, the steer carries no planner config: a cascade that went
+    // idle meanwhile refuses it rather than starting an invocation whose
+    // turn a late `result` would close.
+    let probed = if known_running {
+        planner_config = None;
+        Ok((session_id.clone(), true))
+    } else {
+        agy_rpc_is_running(port, &rpc.csrf_token, &session_id)
+    };
+    let Ok((resolved_sid, running)) = probed else {
         agy_forget_port(shared, &rpc, generation);
         return agy_back_off(shared, wake, generation);
     };
@@ -3216,15 +3246,17 @@ fn agy_steer_attempt(
             nudge_after(shared, wake, generation, AGY_TURN_CLOSE_GRACE);
             AgySteered::Returned
         }
-        // The cascade refused it while no turn of this process runs and its
-        // mailbox holds mail: no turn's end will reopen the way, so it is
-        // asked again after a pause.
-        Err(AgyRpcError::Refused(_)) if state.open.is_empty() && !state.agy_queued.is_empty() => {
+        // The cascade refused it while a turn of this process runs (a step
+        // under way at the boundary it reached), or while its mailbox holds
+        // mail no turn's end will take: the refusal queued nothing, so it is
+        // asked again after a pause and the running turn takes it at a later
+        // step.
+        Err(AgyRpcError::Refused(_)) if !state.open.is_empty() || !state.agy_queued.is_empty() => {
             drop(state);
             agy_back_off(shared, wake, generation)
         }
-        // The cascade refused it: the turn takes no more steers, and the
-        // message waits for its end.
+        // A cascade held open past its turn refused it, and nothing waits in
+        // its mailbox: the message opens the next turn on stdin.
         Err(AgyRpcError::Refused(_)) => {
             state.agy_refused_turn = Some(state.turns_started);
             AgySteered::Returned

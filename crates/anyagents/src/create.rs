@@ -204,7 +204,15 @@ fn create_with_seat(
     // A harness is installed only if an adapter can start it.
     install::adapter(&normalized_harness)?;
     let mut new = NewAgent::new(request.name, normalized_harness.clone());
-    new.role = request.role;
+    new.role = Some(
+        request
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_AGENT_ROLE)
+            .to_string(),
+    );
     new.model = request
         .model
         .map(|m| m.trim().to_string())
@@ -1020,7 +1028,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
             .collect::<Vec<_>>()
             .join(", ");
         doc.push_str(&format!(
-            "- Available sub-agent roles (`role` in `agents`/`spawn`): {formatted_roles} (see `spawn` tool `role` schema for details).\n"
+            "- Available sub-agent roles (`role` in `agents`/`spawn`; defaults to `{DEFAULT_AGENT_ROLE}`): {formatted_roles} (see `spawn` tool `role` schema for details).\n"
         ));
     }
 
@@ -9120,6 +9128,35 @@ pub(crate) fn save_subagent_defaults(
     write_required_file(&path, format!("{text}\n").as_bytes(), 0o644)
 }
 
+/// Default built-in role assigned when `role` is omitted or empty in `spawn` / `create`.
+pub(crate) const DEFAULT_AGENT_ROLE: &str = "general";
+
+/// Standing execution instructions for the built-in `general` default role.
+pub(crate) const BUILTIN_GENERAL_ROLE_BODY: &str = "\
+You are a cohesive end-to-end execution worker. Own the assigned outcome from first inspection through live verification rather than stopping at partial steps or delegating your core deliverable sideways.\n\n\
+Work from primary evidence: read the relevant files, state, and runtime behavior before changing anything, implement the simplest complete solution, and verify the result against real execution before reporting back.\n\n\
+Split work into sub-agents only along genuine causal or independent-scope boundaries when parallel execution or distinct specialization is warranted. Keep changes minimal, clean, and honest about every verified outcome and any remaining gaps.";
+
+fn builtin_role_template(slug: &str) -> Result<Option<ArchetypeTemplate>, Error> {
+    if slug == DEFAULT_AGENT_ROLE {
+        let raw = format!(
+            "---\nname: general\nrole: general\nscope: private\ndescription: Default general-purpose end-to-end execution worker\n---\n{BUILTIN_GENERAL_ROLE_BODY}\n"
+        );
+        let mut tpl = parse_archetype_markdown(&raw)?;
+        if tpl
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| valid_template_stem(r))
+            .is_none()
+        {
+            tpl.role = Some(DEFAULT_AGENT_ROLE.to_string());
+        }
+        return Ok(Some(tpl));
+    }
+    Ok(None)
+}
+
 /// Parsed archetype template loaded from `<archetype>.md` or `<archetype>/agent.md`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ArchetypeTemplate {
@@ -9382,11 +9419,11 @@ pub(crate) fn archetype_search_roots(
     archetype_search_roots_with_ancestors(explicit_workdir, &ancestors, data_dir)
 }
 
-pub(crate) fn discover_available_archetype_slugs_with_ancestors(
+fn discover_disk_archetype_slugs_with_ancestors(
     explicit_workdir: Option<&Path>,
     ancestor_workdirs: &[PathBuf],
     data_dir: &Path,
-) -> Vec<String> {
+) -> std::collections::BTreeSet<String> {
     let mut slugs = std::collections::BTreeSet::new();
     for (base, rel_root) in
         archetype_search_roots_with_ancestors(explicit_workdir, ancestor_workdirs, data_dir)
@@ -9419,7 +9456,21 @@ pub(crate) fn discover_available_archetype_slugs_with_ancestors(
             }
         }
     }
-    slugs.into_iter().collect()
+    slugs
+}
+
+pub(crate) fn discover_available_archetype_slugs_with_ancestors(
+    explicit_workdir: Option<&Path>,
+    ancestor_workdirs: &[PathBuf],
+    data_dir: &Path,
+) -> Vec<String> {
+    let mut disk =
+        discover_disk_archetype_slugs_with_ancestors(explicit_workdir, ancestor_workdirs, data_dir);
+    disk.remove(DEFAULT_AGENT_ROLE);
+    let mut slugs = Vec::with_capacity(disk.len() + 1);
+    slugs.push(DEFAULT_AGENT_ROLE.to_string());
+    slugs.extend(disk);
+    slugs
 }
 
 pub(crate) fn discover_available_archetype_slugs(
@@ -9471,12 +9522,33 @@ pub(crate) fn resolve_archetype_template(
     resolve_archetype_template_with_ancestors(archetype, explicit_workdir, &ancestors, data_dir)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArchetypeSource {
+    Disk,
+    Builtin,
+}
+
 pub(crate) fn resolve_archetype_template_with_ancestors(
     archetype: &str,
     explicit_workdir: Option<&Path>,
     ancestor_workdirs: &[PathBuf],
     data_dir: &Path,
 ) -> Result<Option<ArchetypeTemplate>, Error> {
+    Ok(resolve_archetype_template_with_source(
+        archetype,
+        explicit_workdir,
+        ancestor_workdirs,
+        data_dir,
+    )?
+    .map(|(tpl, _)| tpl))
+}
+
+fn resolve_archetype_template_with_source(
+    archetype: &str,
+    explicit_workdir: Option<&Path>,
+    ancestor_workdirs: &[PathBuf],
+    data_dir: &Path,
+) -> Result<Option<(ArchetypeTemplate, ArchetypeSource)>, Error> {
     let slug = archetype.trim();
     if !valid_template_stem(slug) {
         return Err(Error::Message(format!(
@@ -9505,11 +9577,11 @@ pub(crate) fn resolve_archetype_template_with_ancestors(
                 {
                     tpl.role = Some(slug.to_string());
                 }
-                return Ok(Some(tpl));
+                return Ok(Some((tpl, ArchetypeSource::Disk)));
             }
         }
     }
-    Ok(None)
+    Ok(builtin_role_template(slug)?.map(|tpl| (tpl, ArchetypeSource::Builtin)))
 }
 
 /// Read a template under a trusted search root `base` while refusing any symlink
@@ -9712,95 +9784,103 @@ pub(crate) fn apply_archetype_defaults(
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
     let ancestor_wds = ancestor_archetype_workdirs(store, data_dir, parent)?;
-    let resolved = if let Some(role) = body
+    let role = body
         .role
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-    {
-        let slugified = role.to_ascii_lowercase().replace(' ', "-");
-        if !valid_template_stem(role) && !valid_template_stem(&slugified) {
-            resolve_archetype_template_with_ancestors(
+        .unwrap_or(DEFAULT_AGENT_ROLE);
+    let slugified = role.to_ascii_lowercase().replace(' ', "-");
+    let resolved = if !valid_template_stem(role) && !valid_template_stem(&slugified) {
+        resolve_archetype_template_with_source(
+            role,
+            explicit_wd.as_deref(),
+            &ancestor_wds,
+            data_dir,
+        )?;
+        None
+    } else {
+        let direct = if valid_template_stem(role) {
+            resolve_archetype_template_with_source(
                 role,
                 explicit_wd.as_deref(),
                 &ancestor_wds,
                 data_dir,
-            )?;
-            None
+            )?
+            .map(|(tpl, src)| (role.to_string(), tpl, src))
         } else {
-            let direct = if valid_template_stem(role) {
-                resolve_archetype_template_with_ancestors(
-                    role,
+            None
+        };
+        let matched = if direct.is_some() {
+            direct
+        } else if valid_template_stem(&slugified) {
+            resolve_archetype_template_with_source(
+                &slugified,
+                explicit_wd.as_deref(),
+                &ancestor_wds,
+                data_dir,
+            )?
+            .map(|(tpl, src)| (slugified, tpl, src))
+        } else {
+            None
+        };
+        if matched.is_some() {
+            matched
+        } else {
+            let disk_slugs = discover_disk_archetype_slugs_with_ancestors(
+                explicit_wd.as_deref(),
+                &ancestor_wds,
+                data_dir,
+            );
+            if !disk_slugs.is_empty()
+                || has_configured_archetype_roots_with_ancestors(
                     explicit_wd.as_deref(),
                     &ancestor_wds,
                     data_dir,
-                )?
-                .map(|tpl| (role.to_string(), tpl))
-            } else {
-                None
-            };
-            let matched = if direct.is_some() {
-                direct
-            } else if valid_template_stem(&slugified) {
-                resolve_archetype_template_with_ancestors(
-                    &slugified,
-                    explicit_wd.as_deref(),
-                    &ancestor_wds,
-                    data_dir,
-                )?
-                .map(|tpl| (slugified, tpl))
-            } else {
-                None
-            };
-            if matched.is_some() {
-                matched
-            } else {
+                )
+            {
                 let available = discover_available_archetype_slugs_with_ancestors(
                     explicit_wd.as_deref(),
                     &ancestor_wds,
                     data_dir,
                 );
-                if !available.is_empty()
-                    || has_configured_archetype_roots_with_ancestors(
-                        explicit_wd.as_deref(),
-                        &ancestor_wds,
-                        data_dir,
-                    )
-                {
-                    let suffix = if available.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" (available: {})", available.join(", "))
-                    };
-                    return Err(Error::Message(format!(
-                        "unknown archetype template {role:?}{suffix}"
-                    )));
-                }
-                None
+                let suffix = if available.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (available: {})", available.join(", "))
+                };
+                return Err(Error::Message(format!(
+                    "unknown archetype template {role:?}{suffix}"
+                )));
             }
+            None
         }
-    } else {
-        None
     };
-    let Some((resolved_slug, tpl)) = resolved else {
+    let Some((resolved_slug, tpl, source)) = resolved else {
         return Ok(());
     };
 
-    if body
+    let caller_description = body
         .description
         .as_deref()
         .map(str::trim)
-        .is_none_or(str::is_empty)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    if caller_description.is_none()
         && let Some(desc) = tpl.description
     {
         body.description = Some(desc);
     }
+    // Disk templates apply their declared `scope` unconditionally; built-in
+    // `general` defaults sub-agents (`parent.is_some()`) to `private` while
+    // letting root agents keep their default `public` scope unless overridden.
     if body
         .scope
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
         && body.public.is_none()
+        && (source == ArchetypeSource::Disk || parent.is_some())
         && let Some(scope) = tpl.scope
     {
         body.scope = Some(scope);
@@ -9850,13 +9930,15 @@ pub(crate) fn apply_archetype_defaults(
         .unwrap_or(&resolved_slug)
         .to_string();
     body.role = Some(canonical_role);
+    let effective_caller_instructions = body
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or(caller_description);
     if !tpl.body.is_empty() {
-        body.instructions = match body
-            .instructions
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        body.instructions = match effective_caller_instructions {
             Some(existing) => Some(format!("{}\n\n{}", tpl.body, existing)),
             None => Some(tpl.body),
         };
@@ -9891,8 +9973,12 @@ pub(crate) fn normalize_or_validate_agent_role(
             .filter(|r| valid_template_stem(r))
             .unwrap_or(slugified));
     }
-    let available = discover_available_archetype_slugs(agent_workdir, parent_workdir, data_dir);
-    if !available.is_empty() || configured_owner_archetype_workdir().is_some() {
+    let parent_ancestors: Vec<PathBuf> =
+        parent_workdir.map(Path::to_path_buf).into_iter().collect();
+    let disk_slugs =
+        discover_disk_archetype_slugs_with_ancestors(agent_workdir, &parent_ancestors, data_dir);
+    if !disk_slugs.is_empty() || configured_owner_archetype_workdir().is_some() {
+        let available = discover_available_archetype_slugs(agent_workdir, parent_workdir, data_dir);
         return Err(Error::Message(format!(
             "unknown role template {role:?} (available: {})",
             available.join(", ")
@@ -12753,10 +12839,205 @@ mod archetype_tests {
         let prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
         assert!(
             prompt.contains(
-                "- Available sub-agent roles (`role` in `agents`/`spawn`): `assistant`, `code-reviewer`, `director`, `engineer` (see `spawn` tool `role` schema for details)."
+                "- Available sub-agent roles (`role` in `agents`/`spawn`; defaults to `general`): `general`, `assistant`, `code-reviewer`, `director`, `engineer` (see `spawn` tool `role` schema for details)."
             ),
             "{prompt}"
         );
+    }
+
+    #[test]
+    fn builtin_general_role_resolves_private_without_disk_file_and_respects_disk_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // No .agents/agents/general.md exists anywhere on disk.
+        let tpl = resolve_archetype_template("general", Some(&ws), None, &data)
+            .unwrap()
+            .expect("built-in general role must resolve without disk file");
+        assert_eq!(tpl.role.as_deref(), Some("general"));
+        assert_eq!(tpl.scope.as_deref(), Some("private"));
+        assert!(tpl.description.as_deref().is_some_and(|d| !d.is_empty()));
+        assert!(!tpl.body.is_empty());
+        assert_eq!(
+            discover_available_archetype_slugs(Some(&ws), None, &data),
+            vec!["general".to_string()]
+        );
+
+        // Root agent (`parent: None`): built-in `general` assigns role without forcing private scope.
+        for role_val in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::json!("general"),
+        ] {
+            let mut req: crate::api::CreateAgentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": "default-root",
+                    "role": role_val,
+                    "workdir": ws,
+                }))
+                .unwrap();
+            apply_archetype_defaults(None, &data, None, &mut req).unwrap();
+            assert_eq!(req.role.as_deref(), Some("general"));
+            assert!(req.scope.is_none());
+            assert_eq!(req.instructions.as_deref(), Some(BUILTIN_GENERAL_ROLE_BODY));
+        }
+
+        // Explicit scope override on root is preserved.
+        let mut private_root_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "private-root",
+                "scope": "private",
+                "workdir": ws,
+            }))
+            .unwrap();
+        apply_archetype_defaults(None, &data, None, &mut private_root_req).unwrap();
+        assert_eq!(private_root_req.role.as_deref(), Some("general"));
+        assert_eq!(private_root_req.scope.as_deref(), Some("private"));
+
+        // Direct `create()` also defaults omitted/empty role to `general`.
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        for (name, role) in [
+            ("direct-none", None),
+            ("direct-empty", Some("".to_string())),
+        ] {
+            let agent = create(
+                &store,
+                &data,
+                CreateRequest {
+                    name: name.to_string(),
+                    role,
+                    harness: "agy".to_string(),
+                    model: None,
+                    profile: None,
+                    repo: None,
+                    branch: None,
+                    base: None,
+                    workdir: Some(ws.clone()),
+                    workdir_default: None,
+                    description: None,
+                    instructions: None,
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(agent.role.as_deref(), Some("general"));
+            assert_eq!(agent.scope(), "public");
+        }
+
+        // Sub-agent (`parent: Some`): built-in `general` defaults scope to `private` unless overridden.
+        let parent_agent = store.agent_by_name("direct-none").unwrap();
+        let mut sub_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "default-subagent",
+                "workdir": ws,
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data, Some(&parent_agent), &mut sub_req).unwrap();
+        assert_eq!(sub_req.role.as_deref(), Some("general"));
+        assert_eq!(sub_req.scope.as_deref(), Some("private"));
+
+        let mut public_sub_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "public-subagent",
+                "scope": "public",
+                "workdir": ws,
+            }))
+            .unwrap();
+        apply_archetype_defaults(
+            Some(&store),
+            &data,
+            Some(&parent_agent),
+            &mut public_sub_req,
+        )
+        .unwrap();
+        assert_eq!(public_sub_req.role.as_deref(), Some("general"));
+        assert_eq!(public_sub_req.scope.as_deref(), Some("public"));
+
+        // Explicit `public: true` / `public: false` without `scope` on a sub-agent stays intact.
+        for public_flag in [true, false] {
+            let mut bool_sub_req: crate::api::CreateAgentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": format!("bool-subagent-{public_flag}"),
+                    "public": public_flag,
+                    "workdir": ws,
+                }))
+                .unwrap();
+            apply_archetype_defaults(Some(&store), &data, Some(&parent_agent), &mut bool_sub_req)
+                .unwrap();
+            assert_eq!(bool_sub_req.role.as_deref(), Some("general"));
+            assert!(bool_sub_req.scope.is_none());
+            assert_eq!(bool_sub_req.public, Some(public_flag));
+        }
+
+        // Caller `description` is preserved into `instructions` when `instructions` is omitted.
+        let mut legacy_sub_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "legacy-subagent",
+                "description": "Legacy subagent brief",
+                "workdir": ws,
+            }))
+            .unwrap();
+        apply_archetype_defaults(
+            Some(&store),
+            &data,
+            Some(&parent_agent),
+            &mut legacy_sub_req,
+        )
+        .unwrap();
+        assert_eq!(legacy_sub_req.role.as_deref(), Some("general"));
+        assert_eq!(
+            legacy_sub_req.description.as_deref(),
+            Some("Legacy subagent brief")
+        );
+        assert_eq!(
+            legacy_sub_req.instructions.as_deref(),
+            Some(format!("{BUILTIN_GENERAL_ROLE_BODY}\n\nLegacy subagent brief").as_str())
+        );
+
+        // `.agents/agents/general.md` on disk overrides the built-in template.
+        std::fs::create_dir_all(ws.join(".agents/agents")).unwrap();
+        std::fs::write(
+            ws.join(".agents/agents/general.md"),
+            "---\nname: general\nscope: siblings\ndescription: Workspace general override\n---\nWorkspace general body.",
+        )
+        .unwrap();
+        let overridden = resolve_archetype_template("general", Some(&ws), None, &data)
+            .unwrap()
+            .unwrap();
+        assert_eq!(overridden.scope.as_deref(), Some("siblings"));
+        assert_eq!(
+            overridden.description.as_deref(),
+            Some("Workspace general override")
+        );
+        assert_eq!(overridden.body, "Workspace general body.");
+
+        let mut override_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "overridden-worker",
+                "workdir": ws,
+            }))
+            .unwrap();
+        apply_archetype_defaults(None, &data, None, &mut override_req).unwrap();
+        assert_eq!(override_req.role.as_deref(), Some("general"));
+        assert_eq!(override_req.scope.as_deref(), Some("siblings"));
+        assert_eq!(
+            override_req.instructions.as_deref(),
+            Some("Workspace general body.")
+        );
+
+        // Removing disk override reverts cleanly to built-in general.
+        std::fs::remove_file(ws.join(".agents/agents/general.md")).unwrap();
+        let reverted = resolve_archetype_template("general", Some(&ws), None, &data)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reverted.scope.as_deref(), Some("private"));
     }
 
     #[test]

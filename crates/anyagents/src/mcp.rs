@@ -1080,7 +1080,7 @@ struct AgentsArgs {
     /// New agent name when `action = "rename"`.
     #[serde(default, alias = "to")]
     new_name: Option<String>,
-    /// Optional agent role template name (`.agents/agents/<role>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action` is `"spawn"`, `"create"`, `"describe"`, or `"role"`.
+    /// Agent role template name (`"general"` first by default — built-in end-to-end execution role; or any `.agents/agents/<role>.md` template, e.g. `"general"`, `"planner"`, `"builder"`, `"tester"`) when `action` is `"spawn"`, `"create"`, `"describe"`, or `"role"`.
     #[serde(
         default,
         alias = "archetype",
@@ -1185,7 +1185,7 @@ struct SpawnArgs {
         alias = "target"
     )]
     name: Option<String>,
-    /// Optional agent role template name (`.agents/agents/<role>.md`, e.g. `"planner"`, `"builder"`, `"tester"`).
+    /// Agent role template name (`"general"` first by default — built-in end-to-end execution role; or any `.agents/agents/<role>.md` template, e.g. `"general"`, `"planner"`, `"builder"`, `"tester"`).
     #[serde(
         default,
         alias = "archetype",
@@ -1251,7 +1251,7 @@ struct DescribeArgs {
     /// Detailed private standing instructions (`instructions`, Layer 2 — injected only into the agent's own private system prompt).
     #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
-    /// Optional agent role template name (`.agents/agents/<role>.md`).
+    /// Agent role template name (`"general"` first by default — built-in end-to-end execution role; or any `.agents/agents/<role>.md` template).
     #[serde(
         default,
         alias = "archetype",
@@ -1303,7 +1303,7 @@ struct SubagentsArgs {
     /// Optional case-insensitive multi-token search query for `list`.
     #[serde(default, alias = "search", alias = "filter", alias = "q")]
     query: Option<String>,
-    /// Optional agent role template name (`.agents/agents/<role>.md`, e.g. `"planner"`, `"builder"`, `"tester"`) when `action = "spawn"`.
+    /// Agent role template name (`"general"` first by default — built-in end-to-end execution role; or any `.agents/agents/<role>.md` template, e.g. `"general"`, `"planner"`, `"builder"`, `"tester"`) when `action = "spawn"`.
     #[serde(
         default,
         alias = "archetype",
@@ -2054,7 +2054,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`role`, `name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git repository; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed checkouts while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); use `verdict` (`name`, `verdict`: `accepted` | `rework` | `rejected` | `abandoned`, `reason`) to judge a descendant's work, and `outcomes` (like `usage`) for successes and cost per success; or use `create`, `rename`, `role`, `harness`, `models`."
+        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`role` defaulting to `\"general\"`, `name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git repository; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed checkouts while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); use `verdict` (`name`, `verdict`: `accepted` | `rework` | `rejected` | `abandoned`, `reason`) to judge a descendant's work, and `outcomes` (like `usage`) for successes and cost per success; or use `create`, `rename`, `role`, `harness`, `models`."
     )]
     async fn agents(
         &self,
@@ -3626,7 +3626,8 @@ pub fn tool_definitions_with_roles(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let append_note = format!(" Available `.agents/agents/*.md` roles: {role_catalog}.");
+    let append_note =
+        format!(" Available roles (`general` is the built-in default): {role_catalog}.");
     for tool in &mut tools {
         let has_role_arg = tool
             .input_schema
@@ -3637,7 +3638,7 @@ pub fn tool_definitions_with_roles(
             continue;
         }
         let mut desc = tool.description.as_deref().unwrap_or_default().to_string();
-        if !desc.contains("Available `.agents/agents/*.md` roles:") {
+        if !desc.contains("Available roles (") {
             desc.push_str(&append_note);
             tool.description = Some(desc.into());
         }
@@ -9474,7 +9475,7 @@ mod spawn_args_tests {
             let desc = tool.description.as_deref().unwrap_or_default();
             assert!(
                 desc.contains(
-                    "Available `.agents/agents/*.md` roles: `builder` (Isolated builder specialist)."
+                    "Available roles (`general` is the built-in default): `general` (Default general-purpose end-to-end execution worker), `builder` (Isolated builder specialist)."
                 ),
                 "{name}: {desc}"
             );
@@ -9492,13 +9493,34 @@ mod spawn_args_tests {
                 .description
                 .as_deref()
                 .unwrap_or_default()
-                .contains("Available `.agents/agents/*.md` roles:")
+                .contains("Available roles (")
         );
-        let without_templates =
+        let empty_dir_tools =
             tool_definitions_with_roles(McpProfile::Full, None, Some(&dir.path().join("empty")));
+        let empty_agents_desc = empty_dir_tools
+            .iter()
+            .find(|t| t.name == "agents")
+            .and_then(|t| t.description.as_deref())
+            .unwrap_or_default();
+        assert!(
+            empty_agents_desc.contains(
+                "Available roles (`general` is the built-in default): `general` (Default general-purpose end-to-end execution worker)."
+            ),
+            "{empty_agents_desc}"
+        );
+        let without_data_dir = tool_definitions_with_roles(McpProfile::Full, None, None);
         assert_eq!(
-            serde_json::to_value(&without_templates).unwrap(),
+            serde_json::to_value(&without_data_dir).unwrap(),
             serde_json::to_value(tool_definitions(McpProfile::Full)).unwrap()
+        );
+        let agents_schema = serde_json::to_value(schemars::schema_for!(AgentsArgs)).unwrap();
+        let role_doc = agents_schema["properties"]["role"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(role_doc.contains("`\"general\"`"), "{role_doc}");
+        assert!(
+            role_doc.find("general").unwrap() < role_doc.find("planner").unwrap(),
+            "{role_doc}"
         );
     }
 

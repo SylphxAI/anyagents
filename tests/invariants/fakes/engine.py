@@ -211,6 +211,10 @@ class Protocol:
     def consumed(self, taken):
         """The running turn consumed `taken`, a list of (input, fresh)."""
 
+    def unproven(self, count):
+        """The model takes `count` pending inputs; no proof of them leaves."""
+        self.engine.step(count, kind="lost" if self.stores_after_proof else "steer")
+
     def finish(self):
         """End the running turn the way this vendor does."""
         self.engine.end_turn()
@@ -234,7 +238,7 @@ def drive(engine, protocol):
             # lost, not as input the session kept.
             for path in sorted(root.glob("unproven-*")):
                 count = int(path.name.split("-", 1)[1])
-                taken = engine.step(count, kind="lost" if protocol.stores_after_proof else "steer")
+                protocol.unproven(count)
                 path.unlink()
                 os._exit(1)
             if (root / "crash").exists():
