@@ -860,6 +860,511 @@ fn a_returned_agy_steer_defers_later_mail_and_clears_probed_planner_config() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn closed_turn_stdout_result_races_do_not_resurrect_turn_user_inputs() {
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
+    let config = tempfile::tempdir().unwrap();
+    let dir = config.path().to_path_buf();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let running = Arc::new(AtomicBool::new(true));
+    let hold_probe = Arc::new(AtomicBool::new(false));
+    let probe_waiting = Arc::new(AtomicBool::new(false));
+    let hold_send = Arc::new(AtomicBool::new(false));
+    let send_waiting = Arc::new(AtomicBool::new(false));
+    let steered: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let running_srv = Arc::clone(&running);
+    let hold_probe_srv = Arc::clone(&hold_probe);
+    let probe_waiting_srv = Arc::clone(&probe_waiting);
+    let hold_send_srv = Arc::clone(&hold_send);
+    let send_waiting_srv = Arc::clone(&send_waiting);
+    let steered_srv = Arc::clone(&steered);
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut data = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&data[..pos]);
+                    let content_len = head
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= pos + 4 + content_len {
+                        break;
+                    }
+                }
+            }
+            let req = String::from_utf8_lossy(&data);
+            let (head, body) = req.split_once("\r\n\r\n").unwrap_or(("", ""));
+            let first_line = head.lines().next().unwrap_or("");
+            let resp_body = if first_line.contains("GetAllCascadeTrajectories") {
+                if hold_probe_srv.load(Ordering::SeqCst) {
+                    probe_waiting_srv.store(true, Ordering::SeqCst);
+                    while hold_probe_srv.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                let status = if running_srv.load(Ordering::SeqCst) {
+                    "CASCADE_RUN_STATUS_RUNNING"
+                } else {
+                    "CASCADE_RUN_STATUS_IDLE"
+                };
+                json!({
+                    "trajectorySummaries": {
+                        "sess-agy-race": { "status": status }
+                    }
+                })
+                .to_string()
+            } else if first_line.contains("SendUserCascadeMessage") {
+                let val: serde_json::Value = serde_json::from_str(body).unwrap();
+                steered_srv.lock().unwrap().push(val);
+                if hold_send_srv.load(Ordering::SeqCst) {
+                    send_waiting_srv.store(true, Ordering::SeqCst);
+                    while hold_send_srv.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                "{}".to_string()
+            } else {
+                "{}".to_string()
+            };
+            let resp = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let spec = StreamSpec::for_program("agy");
+    let mut harness = super::StreamHarness::launch_with_agy_rpc(
+        super::Launch {
+            spec: spec.clone(),
+            program: "/usr/bin/python3".into(),
+            args: vec![
+                "-u".into(),
+                "-c".into(),
+                "import json, sys\nfor step in range(4):\n    sys.stdin.readline()\n    print(json.dumps({\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"sess-agy-race\",\"step_index\":step,\"state\":\"DONE\",\"step_type\":\"user_input\"}}), flush=True)\n    if step < 3:\n        sys.stdin.readline()\n        print(json.dumps({\"event\":\"result\",\"session_id\":\"sess-agy-race\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}), flush=True)\nsys.stdin.read()\n".into(),
+            ],
+            environment: vec![],
+            work_dir: Some(dir.clone()),
+            session_id: None,
+            mode: anyagents_harness::DeliveryMode::Steer,
+            delivery: crate::LINE_INTO_TURN,
+        },
+        Some(super::AgyRpcConfig {
+            config_dir: dir,
+            csrf_token: "test-csrf-123".into(),
+            port_override: Some(port),
+        }),
+    )
+    .unwrap();
+
+    let msg = |id: &str| {
+        let m = agy_message(id);
+        let line = super::message_line(&spec, &m);
+        (m, line)
+    };
+
+    // Open turn 1 on stdin (m1).
+    let (m1, line1) = msg("m1");
+    assert_eq!(
+        harness.deliver(&m1, &line1).unwrap(),
+        anyagents_harness::DeliverOutcome::InFlight
+    );
+    assert!(harness.wait_pred(Duration::from_secs(3), |s| s.turn_user_inputs > 0));
+
+    // Race 1a (running == true): pause inside agy_rpc_is_running while stdout
+    // closes turn 1. The post-probe lock must return AgySteered::Returned
+    // without resurrecting turn_user_inputs = 1 or calling SendUserCascadeMessage.
+    super::lock(&harness.shared).session_id = None;
+    hold_probe.store(true, Ordering::SeqCst);
+    running.store(true, Ordering::SeqCst);
+    let (m2, line2) = msg("m2");
+    assert_eq!(
+        harness.deliver(&m2, &line2).unwrap(),
+        anyagents_harness::DeliverOutcome::InFlight
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !probe_waiting.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(probe_waiting.load(Ordering::SeqCst));
+    super::write_stdin(&harness.stdin, &json!({"close": 1})).unwrap();
+    assert!(harness.wait_finished("m1", Duration::from_secs(3)));
+    probe_waiting.store(false, Ordering::SeqCst);
+    hold_probe.store(false, Ordering::SeqCst);
+
+    assert!(harness.wait_pred(Duration::from_secs(3), |s| {
+        s.agy_steer
+            .as_ref()
+            .is_some_and(|st| st.id == "m2" && st.outcome == Some(super::AgySteered::Returned))
+    }));
+    {
+        let s = super::lock(&harness.shared);
+        assert!(s.open.is_empty());
+        assert_eq!(s.turn_user_inputs, 0);
+        assert!(s.last_steer_probe.is_none());
+    }
+    assert!(steered.lock().unwrap().is_empty());
+
+    // m2 opens turn 2 on stdin rather than steering.
+    assert_eq!(
+        harness.deliver(&m2, &line2).unwrap(),
+        anyagents_harness::DeliverOutcome::InFlight
+    );
+    assert!(harness.wait_pred(Duration::from_secs(3), |s| s.turn_user_inputs > 0));
+    assert_eq!(harness.written_ids(), ["m1", "m2"]);
+
+    // Race 1a (running == false): pause inside agy_rpc_is_running while stdout
+    // closes turn 2. Must return AgySteered::Returned without 400ms agy_back_off.
+    super::lock(&harness.shared).session_id = None;
+    hold_probe.store(true, Ordering::SeqCst);
+    running.store(false, Ordering::SeqCst);
+    let (m3, line3) = msg("m3");
+    assert_eq!(
+        harness.deliver(&m3, &line3).unwrap(),
+        anyagents_harness::DeliverOutcome::InFlight
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !probe_waiting.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(probe_waiting.load(Ordering::SeqCst));
+    super::write_stdin(&harness.stdin, &json!({"close": 2})).unwrap();
+    assert!(harness.wait_finished("m2", Duration::from_secs(3)));
+    probe_waiting.store(false, Ordering::SeqCst);
+    hold_probe.store(false, Ordering::SeqCst);
+
+    assert!(harness.wait_pred(Duration::from_secs(3), |s| {
+        s.agy_steer
+            .as_ref()
+            .is_some_and(|st| st.id == "m3" && st.outcome == Some(super::AgySteered::Returned))
+    }));
+    {
+        let s = super::lock(&harness.shared);
+        assert!(s.open.is_empty());
+        assert_eq!(s.turn_user_inputs, 0);
+        assert!(s.last_steer_probe.is_none());
+    }
+
+    // m3 opens turn 3 on stdin.
+    running.store(true, Ordering::SeqCst);
+    assert_eq!(
+        harness.deliver(&m3, &line3).unwrap(),
+        anyagents_harness::DeliverOutcome::InFlight
+    );
+    assert!(harness.wait_pred(Duration::from_secs(3), |s| s.turn_user_inputs > 0));
+    assert_eq!(harness.written_ids(), ["m1", "m2", "m3"]);
+
+    // Race 1b (post-send slow 200 OK): hold SendUserCascadeMessage(m4) while
+    // the cascade takes m4 and emits stdout result closing turn 3. When 200 OK
+    // arrives afterward, turn_user_inputs must remain 0 so m5 opens turn 4 on stdin.
+    hold_send.store(true, Ordering::SeqCst);
+    let (m4, line4) = msg("m4");
+    assert_eq!(
+        harness.deliver(&m4, &line4).unwrap(),
+        anyagents_harness::DeliverOutcome::InFlight
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !send_waiting.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(send_waiting.load(Ordering::SeqCst));
+    take_in_transcript(config.path(), "sess-agy-race", "m4");
+    super::write_stdin(&harness.stdin, &json!({"close": 3})).unwrap();
+    assert!(harness.wait_finished("m3", Duration::from_secs(3)));
+    assert!(harness.wait_finished("m4", Duration::from_secs(3)));
+    send_waiting.store(false, Ordering::SeqCst);
+    hold_send.store(false, Ordering::SeqCst);
+
+    assert!(harness.wait_pred(Duration::from_secs(3), |s| {
+        s.agy_steer
+            .as_ref()
+            .is_some_and(|st| st.id == "m4" && st.outcome == Some(super::AgySteered::Queued))
+    }));
+    {
+        let s = super::lock(&harness.shared);
+        assert!(s.open.is_empty());
+        assert_eq!(s.turn_user_inputs, 0);
+    }
+    assert_eq!(
+        harness.proven("m4"),
+        Some(anyagents_harness::Proof::Taken {
+            turn_finished: true
+        })
+    );
+
+    let (m5, line5) = msg("m5");
+    assert_eq!(
+        harness.deliver(&m5, &line5).unwrap(),
+        anyagents_harness::DeliverOutcome::InFlight
+    );
+    assert!(harness.wait_pred(Duration::from_secs(3), |s| s.turn_user_inputs > 0));
+    assert_eq!(steered.lock().unwrap().len(), 1);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn held_open_agy_cascade_settles_taken_steers_before_closing_turn() {
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    // Part A: agy_steer_attempt (!running && had_open) settles taken steers
+    // before finish_open.
+    let config_a = tempfile::tempdir().unwrap();
+    let dir_a = config_a.path().to_path_buf();
+    let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port_a = listener_a.local_addr().unwrap().port();
+    let running_a = Arc::new(AtomicBool::new(true));
+    let running_a_srv = Arc::clone(&running_a);
+    thread::spawn(move || {
+        for stream in listener_a.incoming().flatten() {
+            let mut stream = stream;
+            let mut data = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&data[..pos]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if data.len() >= pos + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let req = String::from_utf8_lossy(&data);
+            let body = if req.contains("GetAllCascadeTrajectories") {
+                let status = if running_a_srv.load(Ordering::SeqCst) {
+                    "CASCADE_RUN_STATUS_RUNNING"
+                } else {
+                    "CASCADE_RUN_STATUS_IDLE"
+                };
+                json!({"trajectorySummaries": {"sess-held-a": {"status": status}}}).to_string()
+            } else if req.contains("GetCascadeTrajectoryGeneratorMetadata") {
+                json!({"generatorMetadata": [{"plannerConfig": {"planModel": 42}}]}).to_string()
+            } else {
+                "{}".to_string()
+            };
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+
+    let spec = StreamSpec::for_program("agy");
+    let mut harness_a = super::StreamHarness::launch_with_agy_rpc(
+        super::Launch {
+            spec: spec.clone(),
+            program: "/usr/bin/python3".into(),
+            args: vec![
+                "-u".into(),
+                "-c".into(),
+                "import json, sys\nsys.stdin.readline()\nprint(json.dumps({\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"sess-held-a\",\"step_type\":\"user_input\"}}), flush=True)\nsys.stdin.read()\n".into(),
+            ],
+            environment: vec![],
+            work_dir: Some(dir_a.clone()),
+            session_id: None,
+            mode: anyagents_harness::DeliveryMode::Steer,
+            delivery: crate::LINE_INTO_TURN,
+        },
+        Some(super::AgyRpcConfig {
+            config_dir: dir_a,
+            csrf_token: "csrf-a".into(),
+            port_override: Some(port_a),
+        }),
+    )
+    .unwrap();
+
+    let m1 = agy_message("m1");
+    let l1 = super::message_line(&spec, &m1);
+    assert_eq!(
+        harness_a.deliver(&m1, &l1).unwrap(),
+        anyagents_harness::DeliverOutcome::InFlight
+    );
+    assert!(harness_a.wait_pred(Duration::from_secs(3), |s| s.turn_user_inputs > 0));
+
+    let m2 = agy_message("m2");
+    let l2 = super::message_line(&spec, &m2);
+    assert_eq!(
+        settled(&mut harness_a, &m2, &l2),
+        anyagents_harness::DeliverOutcome::InFlight
+    );
+    // The cascade takes m2 and goes IDLE without emitting a stdout step or result.
+    take_in_transcript(config_a.path(), "sess-held-a", "m2");
+    running_a.store(false, Ordering::SeqCst);
+
+    let m3 = agy_message("m3");
+    let l3 = super::message_line(&spec, &m3);
+    // Pre-expire AGY_TURN_CLOSE_GRACE on idle_since so m3 probes IDLE rather
+    // than taking known_running and proceeds directly to the held-open close.
+    super::lock(&harness_a.shared).idle_since = Some(Instant::now() - Duration::from_millis(250));
+    assert_eq!(
+        settled(&mut harness_a, &m3, &l3),
+        anyagents_harness::DeliverOutcome::InFlight
+    );
+    assert!(harness_a.wait_finished("m1", Duration::from_secs(3)));
+    assert!(harness_a.wait_finished("m2", Duration::from_secs(3)));
+    assert_eq!(
+        harness_a.proven("m2"),
+        Some(anyagents_harness::Proof::Taken {
+            turn_finished: true
+        })
+    );
+
+    // Part B: watch_agy_cascade (!running after AGY_TURN_CLOSE_GRACE) settles
+    // taken steers before finish_open.
+    let config_b = tempfile::tempdir().unwrap();
+    let dir_b = config_b.path().to_path_buf();
+    let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port_b = listener_b.local_addr().unwrap().port();
+    let running_b = Arc::new(AtomicBool::new(true));
+    let idle_polls = Arc::new(AtomicUsize::new(0));
+    let running_b_srv = Arc::clone(&running_b);
+    let idle_polls_srv = Arc::clone(&idle_polls);
+    let transcript_dir_b = config_b.path().to_path_buf();
+    thread::spawn(move || {
+        for stream in listener_b.incoming().flatten() {
+            let mut stream = stream;
+            let mut data = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&data[..pos]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if data.len() >= pos + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let req = String::from_utf8_lossy(&data);
+            let body = if req.contains("GetAllCascadeTrajectories") {
+                let status = if running_b_srv.load(Ordering::SeqCst) {
+                    "CASCADE_RUN_STATUS_RUNNING"
+                } else {
+                    if idle_polls_srv.fetch_add(1, Ordering::SeqCst) + 1 >= 2 {
+                        take_in_transcript(&transcript_dir_b, "sess-held-b", "w2");
+                    }
+                    "CASCADE_RUN_STATUS_IDLE"
+                };
+                json!({"trajectorySummaries": {"sess-held-b": {"status": status}}}).to_string()
+            } else {
+                "{}".to_string()
+            };
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+
+    let mut harness_b = super::StreamHarness::launch_with_agy_rpc(
+        super::Launch {
+            spec: spec.clone(),
+            program: "/usr/bin/python3".into(),
+            args: vec![
+                "-u".into(),
+                "-c".into(),
+                "import json, sys\nsys.stdin.readline()\nprint(json.dumps({\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"sess-held-b\",\"step_type\":\"user_input\"}}), flush=True)\nsys.stdin.read()\n".into(),
+            ],
+            environment: vec![],
+            work_dir: Some(dir_b.clone()),
+            session_id: None,
+            mode: anyagents_harness::DeliveryMode::Steer,
+            delivery: crate::LINE_INTO_TURN,
+        },
+        Some(super::AgyRpcConfig {
+            config_dir: dir_b,
+            csrf_token: "csrf-b".into(),
+            port_override: Some(port_b),
+        }),
+    )
+    .unwrap();
+
+    let w1 = agy_message("w1");
+    let wl1 = super::message_line(&spec, &w1);
+    assert_eq!(
+        harness_b.deliver(&w1, &wl1).unwrap(),
+        anyagents_harness::DeliverOutcome::InFlight
+    );
+    assert!(harness_b.wait_pred(Duration::from_secs(3), |s| s.turn_user_inputs > 0));
+
+    let w2 = agy_message("w2");
+    let wl2 = super::message_line(&spec, &w2);
+    assert_eq!(
+        settled(&mut harness_b, &w2, &wl2),
+        anyagents_harness::DeliverOutcome::InFlight
+    );
+    running_b.store(false, Ordering::SeqCst);
+
+    assert!(harness_b.wait_pred(Duration::from_secs(10), |s| s.open.is_empty()));
+    assert!(harness_b.wait_finished("w1", Duration::ZERO));
+    assert!(harness_b.wait_finished("w2", Duration::ZERO));
+    assert_eq!(
+        harness_b.proven("w2"),
+        Some(anyagents_harness::Proof::Taken {
+            turn_finished: true
+        })
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn agy_completed_turn_with_stale_historical_quota_or_tool_error_still_finishes() {
     use std::time::Duration;
     let spec = StreamSpec::for_program("agy");

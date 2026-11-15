@@ -3125,6 +3125,11 @@ fn agy_steer_attempt(
             session_id = resolved_sid;
             state.session_id = Some(session_id.clone());
         }
+        // The turn ended while it was asked: the message opens the next one
+        // on stdin, unless the mailbox holds mail it must follow.
+        if state.open.is_empty() && state.turn_user_inputs == 0 && state.agy_queued.is_empty() {
+            return AgySteered::Returned;
+        }
         if running {
             state.idle_since = None;
             state.last_steer_probe = None;
@@ -3161,6 +3166,9 @@ fn agy_steer_attempt(
         if state.generation == generation && planner_config.is_some() {
             state.planner_config = planner_config.clone();
         }
+    }
+    if !running {
+        agy_settle(shared, wake, &rpc, generation);
     }
     {
         let mut state = lock(shared);
@@ -3237,8 +3245,10 @@ fn agy_steer_attempt(
         return AgySteered::Returned;
     }
     if let Some((held, taken)) = held {
-        state.idle_since = None;
-        state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
+        if !state.open.is_empty() {
+            state.idle_since = None;
+            state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
+        }
         state.written.push(id.clone());
         if taken {
             state.agy_taken.insert(id);
@@ -3795,6 +3805,9 @@ fn watch_agy_cascade(
         else {
             continue;
         };
+        if !running {
+            agy_settle(&shared, &wake, &rpc, generation);
+        }
         let mut state = lock(&shared);
         if state.generation != generation || !state.alive || state.open.is_empty() {
             continue;
