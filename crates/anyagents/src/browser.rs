@@ -2156,6 +2156,33 @@ pub struct CaptchaDetection {
     pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// The page the detection ran on; `None` when the page was unreadable.
+    #[serde(skip)]
+    pub page: Option<ChallengePage>,
+}
+
+/// A page's address and whether it holds a solved challenge response token.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ChallengePage {
+    pub url: String,
+    #[serde(default)]
+    pub solved_token: bool,
+}
+
+/// Positive proof that the challenge seen on `initial` was solved: a solved
+/// response token appeared, or the page navigated to another web address and
+/// shows no challenge. A challenge that merely disappears on the same address
+/// (an idle reset or unmount) proves nothing, and neither does an unreadable
+/// page; those sessions end through Done or expiry.
+fn challenge_solved(initial: &ChallengePage, now: &CaptchaDetection) -> bool {
+    let Some(page) = now.page.as_ref() else {
+        return false;
+    };
+    let address = |url: &str| url.split_once('#').map_or(url, |(a, _)| a).to_string();
+    (page.solved_token && !initial.solved_token)
+        || (!now.detected
+            && (page.url.starts_with("https://") || page.url.starts_with("http://"))
+            && address(&page.url) != address(&initial.url))
 }
 
 /// Original page metrics are kept with the target, not whichever tab is active at release.
@@ -2201,6 +2228,9 @@ pub struct BrowserTakeoverState {
     pub initial_captcha_detected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_captcha_kind: Option<String>,
+    /// The challenge page at takeover start; solve proof is measured against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_challenge_page: Option<ChallengePage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_viewport: Option<TakeoverViewport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2795,9 +2825,15 @@ const DETECT_CAPTCHA_JS: &str = r#"((visible, MIN) => {
   return { detected: false };
 })"#;
 
-/// The page expression that runs [`DETECT_CAPTCHA_JS`].
+/// Response fields challenge widgets fill in the host page once solved.
+const CHALLENGE_TOKEN_SELECTOR: &str = r#"[name^="g-recaptcha-response"], [name="h-captcha-response"], [name="cf-turnstile-response"]"#;
+
+/// The page expression that runs [`DETECT_CAPTCHA_JS`] and reports the page
+/// address and whether a challenge response token is filled.
 fn detect_captcha_expression() -> String {
-    format!("{DETECT_CAPTCHA_JS}({CAPTCHA_VISIBLE_JS}, {CAPTCHA_MIN_SIDE_PX})")
+    format!(
+        "(() => {{ const d = {DETECT_CAPTCHA_JS}({CAPTCHA_VISIBLE_JS}, {CAPTCHA_MIN_SIDE_PX}); d.url = location.href; d.solved_token = Array.from(document.querySelectorAll('{CHALLENGE_TOKEN_SELECTOR}')).some(e => typeof e.value === 'string' && e.value.trim() !== ''); return d; }})()"
+    )
 }
 
 /// The challenge a child frame's URL names, as `(kind, summary)`.
@@ -2908,7 +2944,14 @@ fn frame_owner_shown_in(session: &mut CdpSession, frame_id: &str) -> Option<bool
 }
 
 fn detect_captcha(cdp: &mut CdpSession) -> CaptchaDetection {
-    if let Ok(val) = eval_js(cdp, &detect_captcha_expression())
+    let val = eval_js(cdp, &detect_captcha_expression()).ok();
+    let page = val.as_ref().and_then(|v| {
+        Some(ChallengePage {
+            url: v.get("url")?.as_str()?.to_string(),
+            solved_token: v.get("solved_token").and_then(|t| t.as_bool()) == Some(true),
+        })
+    });
+    if let Some(val) = val
         && val.get("detected").and_then(|v| v.as_bool()) == Some(true)
     {
         return CaptchaDetection {
@@ -2918,6 +2961,7 @@ fn detect_captcha(cdp: &mut CdpSession) -> CaptchaDetection {
                 .get("summary")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            page,
         };
     }
     let frames = discover_child_frames(cdp);
@@ -2929,10 +2973,14 @@ fn detect_captcha(cdp: &mut CdpSession) -> CaptchaDetection {
                 detected: true,
                 kind: Some(kind.to_string()),
                 summary: Some(summary.to_string()),
+                page,
             };
         }
     }
-    CaptchaDetection::default()
+    CaptchaDetection {
+        page,
+        ..Default::default()
+    }
 }
 
 fn notify_agent_takeover_completed(
@@ -4255,6 +4303,10 @@ fn start_or_reuse_takeover_session(
         tunnel_pid,
         initial_captcha_detected: initial_captcha.detected,
         initial_captcha_kind: initial_captcha.kind.clone(),
+        initial_challenge_page: initial_captcha
+            .page
+            .clone()
+            .filter(|_| initial_captcha.detected),
         original_viewport: None,
         viewport_heartbeat_ms: None,
     };
@@ -4347,7 +4399,7 @@ fn wait_for_takeover_completion(
     wait_ms: u64,
 ) -> Result<(Option<BrowserTakeoverState>, CaptchaDetection), Error> {
     let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms.clamp(100, 600_000));
-    let mut consecutive_cleared = 0u32;
+    let mut consecutive_solved = 0u32;
     loop {
         let now = now_ms();
         reap_expired_takeover(data, profile, now)?;
@@ -4371,10 +4423,10 @@ fn wait_for_takeover_completion(
         if cur.completed || cur.holder != "human" {
             return Ok((st, cap));
         }
-        if cur.initial_captcha_detected {
-            if !cap.detected {
-                consecutive_cleared += 1;
-                if consecutive_cleared >= 2 {
+        if let Some(initial) = cur.initial_challenge_page.as_ref() {
+            if challenge_solved(initial, &cap) {
+                consecutive_solved += 1;
+                if consecutive_solved >= 2 {
                     complete_takeover_session(
                         data,
                         profile,
@@ -4383,7 +4435,7 @@ fn wait_for_takeover_completion(
                     return Ok((load_takeover_state(data, profile)?, cap));
                 }
             } else {
-                consecutive_cleared = 0;
+                consecutive_solved = 0;
             }
         }
         if std::time::Instant::now() >= deadline {
@@ -8137,6 +8189,110 @@ mod tests {
         );
     }
 
+    fn challenge_at(url: &str, detected: bool, solved_token: bool) -> CaptchaDetection {
+        CaptchaDetection {
+            detected,
+            page: Some(ChallengePage {
+                url: url.into(),
+                solved_token,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn challenge_disappearing_on_the_same_page_is_not_solve_proof() {
+        let initial = ChallengePage {
+            url: "https://example.test/login?step=verify".into(),
+            solved_token: false,
+        };
+        // The widget unmounts or resets on the same address, with no token.
+        for url in [
+            "https://example.test/login?step=verify",
+            "https://example.test/login?step=verify#reset",
+            "about:blank",
+            "chrome-error://chromewebdata/",
+            "",
+        ] {
+            assert!(
+                !challenge_solved(&initial, &challenge_at(url, false, false)),
+                "{url}"
+            );
+        }
+        // An unreadable page proves nothing.
+        assert!(!challenge_solved(&initial, &CaptchaDetection::default()));
+        // A token already present at start is not a new solve.
+        let stale = ChallengePage {
+            solved_token: true,
+            ..initial.clone()
+        };
+        assert!(!challenge_solved(
+            &stale,
+            &challenge_at(&stale.url, false, true)
+        ));
+        // Another page that still shows a challenge is not solved.
+        assert!(!challenge_solved(
+            &initial,
+            &challenge_at("https://example.test/verify/next", true, false)
+        ));
+    }
+
+    #[test]
+    fn challenge_solve_proof_is_a_new_token_or_a_navigation() {
+        let initial = ChallengePage {
+            url: "https://example.test/login?step=verify".into(),
+            solved_token: false,
+        };
+        // A filled response token, even while the solved widget stays shown.
+        assert!(challenge_solved(
+            &initial,
+            &challenge_at(&initial.url, true, true)
+        ));
+        assert!(challenge_solved(
+            &initial,
+            &challenge_at(&initial.url, false, true)
+        ));
+        // Navigation to another web address that shows no challenge.
+        assert!(challenge_solved(
+            &initial,
+            &challenge_at("https://example.test/account", false, false)
+        ));
+        assert!(challenge_solved(
+            &initial,
+            &challenge_at("https://example.test/login?step=done", false, false)
+        ));
+    }
+
+    #[test]
+    fn takeover_watcher_does_not_close_without_solve_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = "challenge-reset";
+        let cap = challenge_at("https://example.test/verify", true, false);
+        start_or_reuse_takeover_session(
+            dir.path(),
+            profile,
+            None,
+            None,
+            Some(60_000),
+            Some(false),
+            &cap,
+        )
+        .unwrap();
+        // No readable page reports a challenge any more; that is not proof.
+        let (st, cap) = wait_for_takeover_completion(dir.path(), profile, 1_500).unwrap();
+        assert!(!cap.detected);
+        let st = st.unwrap();
+        assert!(!st.completed && st.holder == "human", "{st:?}");
+        // Done — Hand Back still completes the session.
+        assert_eq!(
+            complete_takeover_session(dir.path(), profile, None).unwrap()["completed"],
+            true
+        );
+        let (st, _) = wait_for_takeover_completion(dir.path(), profile, 100).unwrap();
+        assert!(st.unwrap().completed);
+        cleanup_takeover_session(dir.path(), profile).unwrap();
+    }
+
     #[test]
     fn completion_notification_failure_is_visible_and_retry_is_deduplicated() {
         let fixture = ScriptedBrowser::new(cdp_ok_response);
@@ -9822,6 +9978,10 @@ esac
             let mut cdp = CdpSession::connect(rt.cdp_port, &ws)?;
             let cap = CaptchaDetection {
                 detected: path == "captcha",
+                page: Some(ChallengePage {
+                    url: format!("http://127.0.0.1:{port}/"),
+                    solved_token: false,
+                }),
                 ..Default::default()
             };
             let st = start_or_reuse_takeover_session(
@@ -9878,6 +10038,13 @@ esac
                     assert_eq!(done["released_takeover"], true);
                 }
                 "captcha" => {
+                    // No challenge on the same page is not proof; a token is.
+                    let (open, _) = wait_for_takeover_completion(dir.path(), profile, 1_500)?;
+                    assert!(!open.unwrap().completed);
+                    eval_js(
+                        &mut cdp,
+                        "(() => { const t = document.createElement('textarea'); t.name = 'h-captcha-response'; t.style.display = 'none'; t.value = 'solved'; document.body.appendChild(t); return true; })()",
+                    )?;
                     let (done, cap) = wait_for_takeover_completion(dir.path(), profile, 2_000)?;
                     assert!(!cap.detected);
                     assert!(done.unwrap().completed);
