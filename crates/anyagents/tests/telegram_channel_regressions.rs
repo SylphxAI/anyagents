@@ -49,6 +49,13 @@ fn fake(status: u16, response: Value) -> (String, std::thread::JoinHandle<Value>
 
 // None consumes the complete request, then loses the acknowledgement.
 fn fake_wire(response: Option<String>) -> (String, std::thread::JoinHandle<Value>) {
+    fake_wire_at(response, None)
+}
+
+fn fake_wire_at(
+    response: Option<String>,
+    expected_method: Option<&'static str>,
+) -> (String, std::thread::JoinHandle<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
     let task = std::thread::spawn(move || {
@@ -63,6 +70,18 @@ fn fake_wire(response: Option<String>) -> (String, std::thread::JoinHandle<Value
             bytes.push(byte[0]);
             if bytes.ends_with(b"\r\n\r\n") {
                 let header = String::from_utf8(bytes.clone()).unwrap();
+                if let Some(method) = expected_method {
+                    assert_eq!(
+                        header.lines().next().unwrap(),
+                        format!("POST /bot777:synthetic-token/{method} HTTP/1.1")
+                    );
+                    assert!(header.lines().any(|line| {
+                        line.split_once(':').is_some_and(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-type")
+                                && value.trim().split(';').next() == Some("application/json")
+                        })
+                    }));
+                }
                 let length: usize = header
                     .lines()
                     .find_map(|line| {
@@ -501,6 +520,97 @@ fn offline_invalid_identity_and_updates_never_echo_provider_data() {
                 .state,
             before
         );
+    }
+    unsafe {
+        std::env::remove_var("ANYAGENTS_TELEGRAM_API");
+    }
+}
+
+/// Exercise the production credential, request-construction and HTTP adapter
+/// path. Exact expected bodies are independent of the Markdown helper, and the
+/// listener rejects a plain-text fallback or an additional request.
+#[test]
+fn offline_rich_line_breaks_reach_send_and_edit_transport() {
+    let _lock = telegram::tests::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let store = setup(dir.path());
+    for (input, expected) in [
+        (
+            "Status\r\n• one\r\n• two\r\n\r\nNext",
+            "Status  \n• one  \n• two\n\nNext",
+        ),
+        (
+            "## List\n- one\n- two\n\n> first\n> second",
+            "## List\n- one  \n- two\n\n> first  \n> second",
+        ),
+        (
+            "Code\n```sh\necho $HOME <file> & next\n```\nPrice $5\nnext",
+            "Code\n```sh\necho $HOME <file> & next\n```\nPrice \\$5  \nnext",
+        ),
+        (
+            "Table\n| a | b |\n| --- | --- |\n| 1 | 2 |\nAfter\nnext",
+            "Table\n| a | b |\n| --- | --- |\n| 1 | 2 |\nAfter  \nnext",
+        ),
+        (
+            "Use `$ONE\n$TWO`\nUnmatched ` $5\nnext",
+            "Use `$ONE\n$TWO`  \nUnmatched ` \\$5  \nnext",
+        ),
+        (
+            "Breaks\nexisting  \nbackslash\\\nnext\\\\\nlast",
+            "Breaks  \nexisting  \nbackslash\\\nnext\\\\  \nlast",
+        ),
+    ] {
+        for method in ["sendRichMessage", "editMessageText"] {
+            let body = json!({"ok":true,"result":{"message_id":71}}).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let (address, task) = fake_wire_at(Some(response), Some(method));
+            // Every transport destination is the newly bound loopback listener.
+            unsafe {
+                std::env::set_var("ANYAGENTS_TELEGRAM_API", address);
+            }
+            let expected_body = if method == "sendRichMessage" {
+                assert_eq!(
+                    telegram::post_text(
+                        &store,
+                        dir.path(),
+                        "ada",
+                        None,
+                        -1007,
+                        input,
+                        Some(55),
+                        Some(3)
+                    )
+                    .unwrap(),
+                    71
+                );
+                json!({
+                    "chat_id":-1007,
+                    "rich_message":{"markdown":expected},
+                    "reply_parameters":{"message_id":55},
+                    "reply_to_message_id":55,
+                    "message_thread_id":3
+                })
+            } else {
+                telegram::edit_message(
+                    &store,
+                    dir.path(),
+                    "ada",
+                    None,
+                    telegram::ChatMessage {
+                        chat_id: -1007,
+                        message_id: 71,
+                        thread: Some(3),
+                    },
+                    input,
+                )
+                .unwrap();
+                json!({"chat_id":-1007,"message_id":71,"rich_message":{"markdown":expected}})
+            };
+            assert_eq!(task.join().unwrap(), expected_body, "{method}: {input:?}");
+        }
     }
     unsafe {
         std::env::remove_var("ANYAGENTS_TELEGRAM_API");
