@@ -1305,7 +1305,19 @@ impl FenceTracker {
 }
 
 fn fence_marker(line: &str) -> Option<(u8, usize, &str)> {
-    let trimmed = line.trim_start();
+    let mut trimmed = line;
+    loop {
+        let content = trimmed.trim_start_matches(' ');
+        if trimmed.len() - content.len() > 3 {
+            return None;
+        }
+        trimmed = content;
+        if let Some(quote) = trimmed.strip_prefix('>') {
+            trimmed = quote.strip_prefix(' ').unwrap_or(quote);
+        } else {
+            break;
+        }
+    }
     let ch = *trimmed.as_bytes().first()?;
     if ch != b'`' && ch != b'~' {
         return None;
@@ -1320,6 +1332,60 @@ fn is_blank_markdown_line(line: &str) -> bool {
         .is_empty()
 }
 
+/// Byte ranges of matched inline code spans. Unmatched backticks are prose.
+/// Paragraph and fenced-block boundaries prevent an opener from consuming a
+/// later, unrelated block. Backslashes only escape ticks outside code spans.
+fn inline_code_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    fn scan(text: &str, base: usize, spans: &mut Vec<std::ops::Range<usize>>) {
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] != b'`' {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i] == b'`' {
+                i += 1;
+            }
+            let width = i - start;
+            let mut j = i;
+            while j < bytes.len() {
+                if bytes[j] != b'`' {
+                    j += 1;
+                    continue;
+                }
+                let close = j;
+                while j < bytes.len() && bytes[j] == b'`' {
+                    j += 1;
+                }
+                if j - close == width {
+                    spans.push(base + start..base + j);
+                    i = j;
+                    break;
+                }
+            }
+        }
+    }
+    let mut spans = Vec::new();
+    let mut fence = FenceTracker::default();
+    let mut start = 0;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if fence.advance(line.trim_end_matches(['\r', '\n'])) || is_blank_markdown_line(line) {
+            scan(&text[start..offset], start, &mut spans);
+            start = offset + line.len();
+        }
+        offset += line.len();
+    }
+    scan(&text[start..], start, &mut spans);
+    spans
+}
+
 /// Turns each single `\n` between two content lines into a CommonMark hard
 /// break (`  \n`), so `sendRichMessage` keeps the line breaks the author wrote
 /// instead of folding them into one paragraph. CRLF is normalized to LF. Blank
@@ -1330,7 +1396,10 @@ pub fn preserve_rich_markdown_line_breaks(text: &str) -> String {
     if !text.contains('\n') {
         return text.to_string();
     }
-    let lines: Vec<&str> = text
+    let normalized = text.replace("\r\n", "\n");
+    let spans = inline_code_spans(&normalized);
+    let mut offset = 0;
+    let lines: Vec<&str> = normalized
         .split('\n')
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
         .collect();
@@ -1343,6 +1412,8 @@ pub fn preserve_rich_markdown_line_breaks(text: &str) -> String {
             out.push('\n');
         }
         out.push_str(line);
+        let newline = offset + line.len();
+        offset = newline + 1;
         if fence.advance(line) {
             prev_blank = false;
             in_indented_code = false;
@@ -1366,7 +1437,8 @@ pub fn preserve_rich_markdown_line_breaks(text: &str) -> String {
             || in_indented_code
             || is_blank_markdown_line(next)
             || line.ends_with("  ")
-            || line.ends_with('\\')
+            || line.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 1
+            || spans.iter().any(|span| span.contains(&newline))
             || is_markdown_table_row(trimmed)
             || is_markdown_table_row(next.trim())
             || fence_marker(next).is_some()
@@ -1394,54 +1466,35 @@ pub fn escape_rich_markdown_dollars(text: &str) -> String {
     }
     let mut out = String::with_capacity(text.len() + 8);
     let mut fence = FenceTracker::default();
+    let spans = inline_code_spans(text);
+    let mut offset = 0;
     for (line_idx, line) in text.split('\n').enumerate() {
         if line_idx > 0 {
             out.push('\n');
         }
+        let base = offset;
+        offset += line.len() + 1;
         if fence.advance(line) {
             out.push_str(line);
             continue;
         }
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
-        let mut inline_ticks: usize = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            if c == '`' {
-                let mut count = 0;
-                while i + count < chars.len() && chars[i + count] == '`' {
-                    count += 1;
-                }
-                for _ in 0..count {
-                    out.push('`');
-                }
-                if inline_ticks == 0 {
-                    inline_ticks = count;
-                } else if count == inline_ticks {
-                    inline_ticks = 0;
-                }
-                i += count;
-                continue;
-            }
-            if inline_ticks > 0 {
+        let mut chars = line.char_indices().peekable();
+        while let Some((idx, c)) = chars.next() {
+            if spans.iter().any(|span| span.contains(&(base + idx))) {
                 out.push(c);
-                i += 1;
                 continue;
             }
-            if c == '\\' && i + 1 < chars.len() {
-                out.push('\\');
-                out.push(chars[i + 1]);
-                i += 2;
+            if c == '\\' {
+                out.push(c);
+                if let Some((_, escaped)) = chars.next() {
+                    out.push(escaped);
+                }
                 continue;
             }
             if c == '$' {
                 out.push('\\');
-                out.push('$');
-                i += 1;
-                continue;
             }
             out.push(c);
-            i += 1;
         }
     }
     out
@@ -3299,6 +3352,48 @@ mod membership_tests {
         assert_eq!(
             preserve_rich_markdown_line_breaks(input),
             "Results\n| a | b |\n| --- | --- |\n| 1 | 2 |\nTotal  \nshown"
+        );
+    }
+
+    #[test]
+    fn inline_code_and_backslash_boundaries_keep_their_meaning() {
+        for (input, expected) in [
+            ("Use `one\ntwo`\nnext", "Use `one\ntwo`  \nnext"),
+            ("Use ``one `\ntwo``\nnext", "Use ``one `\ntwo``  \nnext"),
+            ("unmatched ` tick\nnext", "unmatched ` tick  \nnext"),
+            ("escaped \\` tick\nnext", "escaped \\` tick  \nnext"),
+            ("two\\\\\nnext", "two\\\\  \nnext"),
+        ] {
+            assert_eq!(preserve_rich_markdown_line_breaks(input), expected);
+        }
+        let input = "Use `$ONE\n$TWO`\nPay $5 with unmatched ` $6";
+        let expected = "Use `$ONE\n$TWO`  \nPay \\$5 with unmatched ` \\$6";
+        assert_eq!(
+            send_message(100, input, None, None).body["rich_message"]["markdown"],
+            expected
+        );
+        assert_eq!(
+            edit_message_text(100, 42, input).body["rich_message"]["markdown"],
+            expected
+        );
+    }
+
+    #[test]
+    fn quoted_fences_and_indented_fence_text_do_not_leak_state() {
+        let input = "> ```sh\n> echo $HOME\n> next\n> ```\nafter\nmore";
+        assert_eq!(
+            rich_markdown(input),
+            "> ```sh\n> echo $HOME\n> next\n> ```\nafter  \nmore"
+        );
+        let input = "    ```\n    code\n\nafter\nmore";
+        assert_eq!(
+            preserve_rich_markdown_line_breaks(input),
+            "    ```\n    code\n\nafter  \nmore"
+        );
+        // A shorter or different fence cannot close the block.
+        assert_eq!(
+            rich_markdown("````\n$x\n```\n$y\n~~~~\n$z\n````\n$a"),
+            "````\n$x\n```\n$y\n~~~~\n$z\n````\n\\$a"
         );
     }
 
