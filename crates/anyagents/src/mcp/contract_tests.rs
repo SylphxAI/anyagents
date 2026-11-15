@@ -457,6 +457,7 @@ fn send_reads_null_placeholders_as_absent() {
     let args: SendArgs = serde_json::from_value(json!({
         "action": "send",
         "article": "null",
+        "bot": "null",
         "checklist": "null",
         "emoji": "null",
         "idempotency_key": "null",
@@ -474,7 +475,7 @@ fn send_reads_null_placeholders_as_absent() {
     assert!(args.article.is_none() && args.media.is_none() && args.poll.is_none());
     assert!(args.location.is_none() && args.checklist.is_none());
     assert!(args.reply_to.is_none() && args.target.is_none() && args.quote.is_none());
-    assert!(args.idempotency_key.is_none());
+    assert!(args.idempotency_key.is_none() && args.bot.is_none());
     assert!(args.options.is_empty());
     assert_eq!(args.to, vec!["agent:planner".to_string()]);
     // `emoji: ""` clears a reaction; only the placeholder words are absent.
@@ -505,6 +506,25 @@ fn send_reads_null_placeholders_as_absent() {
     assert_eq!(vote.options, vec!["None", "nil", "Null", "NULL"]);
     assert_eq!(vote.quote.as_deref(), Some("None"));
     assert!(vote.reply_to.is_none());
+}
+
+#[test]
+fn interact_reads_a_null_bot_as_absent_and_keeps_a_named_one() {
+    let unnamed: InteractArgs = serde_json::from_value(json!({
+        "action": "react",
+        "target": "telegram:chat:-1007:91",
+        "emoji": "👍",
+        "bot": "null",
+    }))
+    .unwrap();
+    assert!(unnamed.bot.is_none());
+    let named: InteractArgs = serde_json::from_value(json!({
+        "action": "react",
+        "target": "telegram:chat:-1007:91",
+        "bot": "@ada_promo_bot",
+    }))
+    .unwrap();
+    assert_eq!(named.bot.as_deref(), Some("@ada_promo_bot"));
 }
 
 #[test]

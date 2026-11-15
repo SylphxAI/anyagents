@@ -2751,6 +2751,7 @@ fn interact_cmd(
         emoji,
         options,
         text,
+        bot: None,
     };
     let payload =
         serde_json::to_vec(&body).map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
