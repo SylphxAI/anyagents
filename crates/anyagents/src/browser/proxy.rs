@@ -236,7 +236,6 @@ mod tests {
         ignore = "needs a Chromium the toolchain resolves"
     )]
     fn direct_fallback_reaches_the_page_when_the_proxy_is_down() {
-        use std::io::{Read, Write};
         let Some(chromium) = super::super::tests::fixture_chromium() else {
             return;
         };
@@ -246,17 +245,8 @@ mod tests {
             .unwrap();
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = server.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for mut stream in server.incoming().flatten() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let body = "<html><body>reached-directly</body></html>";
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            }
+        super::super::tests::serve_pages(server, |_| {
+            "<html><body>reached-directly</body></html>".to_string()
         });
         let proxy = format!("socks5://{closed},direct://");
         validate(&proxy).unwrap();

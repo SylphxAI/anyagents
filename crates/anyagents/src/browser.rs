@@ -2691,10 +2691,14 @@ const CAPTCHA_VISIBLE_JS: &str = r#"(el, min, box) => {
     if (!frame) break;
     const fr = frame.getBoundingClientRect();
     const fs = frame.ownerDocument.defaultView.getComputedStyle(frame);
-    const ox = fr.left + frame.clientLeft + parseFloat(fs.paddingLeft);
-    const oy = fr.top + frame.clientTop + parseFloat(fs.paddingTop);
-    left += ox; right += ox; top += oy; bottom += oy;
-    clipTo(ox, oy, ox + view.innerWidth, oy + view.innerHeight);
+    // A transformed frame scales everything inside it.
+    const sx = frame.offsetWidth ? fr.width / frame.offsetWidth : 0;
+    const sy = frame.offsetHeight ? fr.height / frame.offsetHeight : 0;
+    const ox = fr.left + (frame.clientLeft + parseFloat(fs.paddingLeft)) * sx;
+    const oy = fr.top + (frame.clientTop + parseFloat(fs.paddingTop)) * sy;
+    left = ox + left * sx; right = ox + right * sx;
+    top = oy + top * sy; bottom = oy + bottom * sy;
+    clipTo(ox, oy, ox + view.innerWidth * sx, oy + view.innerHeight * sy);
     start = frame;
   }
   return right - left >= min && bottom - top >= min;
@@ -8735,9 +8739,21 @@ esac
     fn spawn_html_server(bind_ip: &str, html: String) -> u16 {
         let listener = TcpListener::bind(format!("{bind_ip}:0")).expect("bind local test server");
         let port = listener.local_addr().unwrap().port();
+        serve_pages(listener, move |_| html.clone());
+        port
+    }
+
+    /// Serves `page(path)` for every request, one thread per connection. A
+    /// connection that sends nothing (a browser's speculative preconnect)
+    /// times out instead of starving the others.
+    pub(super) fn serve_pages(
+        listener: TcpListener,
+        page: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) {
+        let page = std::sync::Arc::new(page);
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let html = html.clone();
+                let page = page.clone();
                 std::thread::spawn(move || {
                     let mut stream = stream;
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
@@ -8752,6 +8768,11 @@ esac
                             break;
                         }
                     }
+                    if req_buf.is_empty() {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&req_buf);
+                    let html = page(request.split_whitespace().nth(1).unwrap_or("/"));
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         html.len(),
@@ -8763,7 +8784,6 @@ esac
                 });
             }
         });
-        port
     }
 
     #[test]
@@ -10952,7 +10972,6 @@ esac
     )]
     fn captcha_frame_owner_fallback_requires_a_rendered_challenge() {
         use super::*;
-        use std::io::{Read, Write};
         use std::time::Instant;
         let Some(chromium) = fixture_chromium() else {
             return;
@@ -10991,31 +11010,24 @@ esac
             ("/inner-hidden".into(), zero(widget("/turnstile", 300, 65))),
             ("/same-visible".into(), frame("/inner-visible")),
             ("/same-hidden".into(), zero(frame("/inner-visible"))),
+            (
+                "/same-scaled".into(),
+                r#"<iframe src="/inner-visible" width="400" height="200" style="border:0;transform:scale(0)"></iframe>"#.into(),
+            ),
             ("/cross-visible".into(), frame(&format!("{login}/inner-visible"))),
             ("/cross-hidden-inner".into(), frame(&format!("{login}/inner-hidden"))),
             ("/cross-hidden-outer".into(), zero(frame(&format!("{login}/inner-visible")))),
         ]
         .into_iter()
         .collect();
-        std::thread::spawn(move || {
-            for mut stream in server.incoming().flatten() {
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]);
-                let path = request.split_whitespace().nth(1).unwrap_or("/");
-                let body = format!(
-                    "<!doctype html><html><body style=\"margin:0\">{}</body></html>",
-                    pages
-                        .get(path)
-                        .map(String::as_str)
-                        .unwrap_or("<p>widget</p>")
-                );
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            }
+        serve_pages(server, move |path| {
+            format!(
+                "<!doctype html><html><body style=\"margin:0\">{}</body></html>",
+                pages
+                    .get(path)
+                    .map(String::as_str)
+                    .unwrap_or("<p>widget</p>")
+            )
         });
 
         let debug_port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -11070,6 +11082,7 @@ esac
             ("/shadow-hidden", None),
             ("/shadow-visible", Some("cloudflare_turnstile")),
             ("/same-hidden", None),
+            ("/same-scaled", None),
             ("/same-visible", Some("cloudflare_turnstile")),
             ("/cross-hidden-inner", None),
             ("/cross-hidden-outer", None),
