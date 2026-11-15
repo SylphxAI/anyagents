@@ -1,4 +1,7 @@
 //! Regression coverage through production Store APIs and the SQLite driver.
+use super::memory_index::{
+    FTS_DELETE_AGENT_ROWS, FTS_DELETE_CHUNK, fts_chunk_lookup, fts_exact_phrase,
+};
 use super::*;
 
 fn setup() -> (tempfile::TempDir, Store, Agent) {
@@ -13,9 +16,13 @@ fn assert_fault(error: Error, needle: &str) {
     assert!(error.to_string().contains(needle), "{error:?}");
 }
 
+/// The store's search index connection (`memory_index.rs`).
+fn ix(store: &Store) -> std::sync::MutexGuard<'_, Connection> {
+    store.shared.memory_index.writer()
+}
+
 fn reject_chunks(store: &Store) {
-    store
-        .conn()
+    ix(store)
         .execute_batch(
             "CREATE TRIGGER reject_chunk BEFORE INSERT ON rag_chunks BEGIN
          SELECT RAISE(ABORT, 'fixture-rag-write'); END;",
@@ -24,15 +31,15 @@ fn reject_chunks(store: &Store) {
 }
 
 fn count(store: &Store, table: &str) -> i64 {
-    store
-        .conn()
-        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-        .unwrap()
+    let sql = format!("SELECT count(*) FROM {table}");
+    if table.starts_with("rag_chunks") || table.starts_with("index_") {
+        return ix(store).query_row(&sql, [], |r| r.get(0)).unwrap();
+    }
+    store.conn().query_row(&sql, [], |r| r.get(0)).unwrap()
 }
 
 fn assert_fts(store: &Store, term: &str) {
-    let n: i64 = store
-        .conn()
+    let n: i64 = ix(store)
         .query_row(
             "SELECT count(*) FROM rag_chunks_fts WHERE rag_chunks_fts MATCH ?1",
             [term],
@@ -56,29 +63,116 @@ fn current_schema_reopens_while_another_connection_holds_the_writer_lock() {
 }
 
 #[test]
-fn only_pre_23_schemas_probe_and_backfill_fts_on_open() {
-    for baseline in [22, 23] {
-        let dir = crate::test_tempdir();
-        let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);",
-        ).unwrap();
-        for (version, sql) in migrate::MIGRATIONS.iter().filter(|(v, _)| *v <= baseline) {
-            conn.execute_batch(sql).unwrap();
-            conn.execute("INSERT INTO schema_migrations VALUES (?1, 0)", [version])
-                .unwrap();
+fn upgrading_moves_search_out_of_state_keeping_tool_summaries_and_outbound_order() {
+    let dir = crate::test_tempdir();
+    let path = dir.path().join("state.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);",
+    )
+    .unwrap();
+    for (version, sql) in migrate::MIGRATIONS
+        .iter()
+        .filter(|(v, _)| *v < migrate::MEMORY_INDEX_SPLIT)
+    {
+        conn.execute_batch(sql).unwrap();
+        conn.execute("INSERT INTO schema_migrations VALUES (?1, 0)", [version])
+            .unwrap();
+    }
+    // A pre-split store: mailbox rows, their chunks in state, an outbound
+    // turn whose mailbox position only its chunk held, and a standalone
+    // tool summary that only the chunk tables hold.
+    let old = AgentId::generate();
+    let inbound = MessageId::generate();
+    let fixture = "INSERT INTO agents (id, name, harness, state, created_at_ms)
+             VALUES ('agt_old', 'veteran', 'test', 'idle', 0);
+         INSERT INTO messages (id, agent_id, seq, body, received_at_ms)
+             VALUES ('msg_old1', 'agt_old', 1, 'legacyinboundneedle', 1);
+         INSERT INTO outbound_messages (id, agent_id, destination, body, sent_at_ms)
+             VALUES ('out_old1', 'agt_old', 'peer', 'legacyoutboundneedle', 2);
+         INSERT INTO rag_chunks (chunk_id, agent_id, agent_name, direction, sender, destination,
+                 timestamp_ms, content_hash, text, kind, tool_name, seq, text_format)
+             VALUES ('msg_old1', 'agt_old', 'veteran', 'in', 'peer', 'agent:veteran', 1, 'h',
+                     'legacy prefix', 'message', '', 1, 1),
+                    ('out_old1', 'agt_old', 'veteran', 'out', 'agent:veteran', 'peer', 2, 'h',
+                     'legacyoutboundneedle', 'message', '', 7, 2),
+                    ('tool_old1', 'agt_old', 'veteran', 'out', 'agent:veteran', 'tool:bash', 3,
+                     'h', '[tool:bash] legacytoolneedle', 'tool', 'bash', 1, 2);";
+    conn.execute_batch(
+        &fixture
+            .replace("agt_old", old.as_str())
+            .replace("msg_old1", inbound.as_str()),
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = Store::open(&path).unwrap();
+    for table in ["rag_chunks", "rag_chunks_fts"] {
+        let present: bool = store
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!present, "{table} left in state");
+    }
+    assert_eq!(
+        store.memory_index_path(),
+        dir.path().join("memory-index.db")
+    );
+    // The mailbox is re-projected in full (the legacy prefix is gone), the
+    // tool summary is kept, and the outbound turn keeps its position.
+    assert_eq!(count(&store, "rag_chunks"), 3);
+    for term in [
+        "legacyinboundneedle",
+        "legacyoutboundneedle",
+        "legacytoolneedle",
+    ] {
+        assert_fts(&store, term);
+    }
+    let seq: i64 = store
+        .conn()
+        .query_row(
+            "SELECT seq FROM outbound_messages WHERE id = 'out_old1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(seq, 7);
+}
+
+#[test]
+fn a_damaged_or_deleted_index_is_rebuilt_from_state() {
+    let (dir, store, agent) = setup();
+    store
+        .receive(&agent.id, Incoming::new("rebuildinboundneedle"))
+        .unwrap();
+    store
+        .record_outbound(&agent.id, "peer", None, "rebuildoutboundneedle")
+        .unwrap();
+    let index = store.memory_index_path().to_path_buf();
+    drop(store);
+    for damage in ["garbage", "deleted", "old-layout"] {
+        match damage {
+            "garbage" => {
+                for suffix in ["-wal", "-shm"] {
+                    let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+                }
+                std::fs::write(&index, b"not an index").unwrap();
+            }
+            "deleted" => std::fs::remove_file(&index).unwrap(),
+            _ => {
+                let conn = Connection::open(&index).unwrap();
+                conn.execute("UPDATE index_meta SET value = 0 WHERE key = 'layout'", [])
+                    .unwrap();
+            }
         }
-        conn.execute_batch(
-            "INSERT INTO rag_chunks(chunk_id,agent_id,agent_name,direction,sender,destination,timestamp_ms,content_hash,text)
-             VALUES ('legacy','agent','worker','in','peer','worker',0,'legacy','legacyftsneedle');",
-        ).unwrap();
-        drop(conn);
-        let store = Store::open(&path).unwrap();
-        assert_eq!(count(&store, "rag_chunks_fts"), i64::from(baseline < 23));
-        if baseline < 23 {
-            assert_fts(&store, "legacyftsneedle");
-        }
+        let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+        assert_eq!(count(&store, "rag_chunks"), 2, "{damage}");
+        assert_fts(&store, "rebuildinboundneedle");
+        assert_fts(&store, "rebuildoutboundneedle");
     }
 }
 
@@ -112,136 +206,37 @@ fn group_column_upgrade_is_idempotent_and_unexpected_ddl_failure_is_visible() {
 }
 
 #[test]
-fn legacy_backfill_repairs_partial_duplicate_orphan_and_stale_fts_generations() {
-    for fault in ["partial", "duplicate", "orphan", "stale"] {
-        let (_dir, store, agent) = setup();
-        store
-            .receive(&agent.id, Incoming::new("ftsneedlefirst"))
-            .unwrap();
-        store
-            .receive(&agent.id, Incoming::new("ftsneedlesecond"))
-            .unwrap();
-        let conn = store.conn();
-        match fault {
-            "partial" => {
-                conn.execute(
-                    "DELETE FROM rag_chunks_fts WHERE text='ftsneedlesecond'",
-                    [],
-                )
-                .unwrap();
-            }
-            "duplicate" => {
-                conn.execute("INSERT INTO rag_chunks_fts SELECT * FROM rag_chunks_fts WHERE text='ftsneedlefirst'", []).unwrap();
-            }
-            "orphan" => {
-                conn.execute(
-                    "UPDATE rag_chunks_fts SET chunk_id='orphan' WHERE text='ftsneedlesecond'",
-                    [],
-                )
-                .unwrap();
-            }
-            "stale" => {
-                conn.execute(
-                    "UPDATE rag_chunks_fts SET text='stale' WHERE text='ftsneedlesecond'",
-                    [],
-                )
-                .unwrap();
-            }
-            _ => unreachable!(),
-        }
-        drop(conn);
-        ensure_lexical_fts_backfilled(&mut store.conn()).unwrap();
-        assert_eq!(count(&store, "rag_chunks_fts"), 2, "{fault}");
-        assert_fts(&store, "ftsneedlefirst");
-        assert_fts(&store, "ftsneedlesecond");
-    }
-}
-
-#[test]
-fn failed_legacy_fts_backfill_rolls_back_and_retries_the_generation() {
-    let (dir, store, agent) = setup();
-    store
-        .receive(&agent.id, Incoming::new("ftsneedlefirst"))
-        .unwrap();
-    store
-        .receive(&agent.id, Incoming::new("ftsneedlesecond"))
-        .unwrap();
-    // A real SQL constraint injects a later insert failure after one good row.
-    store.conn().execute_batch(
-        "DROP TABLE rag_chunks_fts;
-         CREATE TABLE rag_chunks_fts(chunk_id,agent_name,sender,destination,kind,tool_name,text,
-             search_tokens,CONSTRAINT fixture_fts_write CHECK(text != 'ftsneedlesecond'));
-         INSERT INTO rag_chunks_fts SELECT chunk_id,agent_name,sender,destination,kind,tool_name,text,text
-             FROM rag_chunks WHERE text='ftsneedlefirst';",
-    ).unwrap();
-    assert_fault(
-        ensure_lexical_fts_backfilled(&mut store.conn()).unwrap_err(),
-        "fixture_fts_write",
-    );
-    drop(store);
-    let path = dir.path().join("custom-mailbox.sqlite");
-    let conn = Connection::open(&path).unwrap();
-    assert_eq!(
-        conn.query_row("SELECT count(*) FROM rag_chunks_fts", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
-    conn.execute_batch(
-        "DROP TABLE rag_chunks_fts;
-         CREATE VIRTUAL TABLE rag_chunks_fts USING fts5(chunk_id,agent_name,sender,destination,
-             kind,tool_name,text,search_tokens,tokenize='unicode61');",
-    )
-    .unwrap();
-    drop(conn);
-    let store = Store::open(&path).unwrap();
-    ensure_lexical_fts_backfilled(&mut store.conn()).unwrap();
-    assert_fts(&store, "ftsneedlefirst");
-    assert_fts(&store, "ftsneedlesecond");
-}
-
-#[test]
-fn incoming_outgoing_and_tool_index_failures_refuse_receipts_and_roll_back() {
+fn index_failures_never_refuse_mail_and_the_next_sync_projects_it() {
     let (dir, store, agent) = setup();
     store.set_agent_state(&agent.id, "idle").unwrap();
     reject_chunks(&store);
     let mut incoming = Incoming::new("inboundneedle");
     incoming.source_key = Some("retry-one".into());
-    assert_fault(
-        store.receive(&agent.id, incoming.clone()).unwrap_err(),
-        "fixture-rag-write",
-    );
-    assert_fault(
-        store
-            .record_outbound(&agent.id, "peer", None, "outboundneedle")
-            .unwrap_err(),
-        "fixture-rag-write",
-    );
+    // Mail and sends are state; the index is derived and cannot refuse them.
+    let ReceiveOutcome::New(message) = store.receive(&agent.id, incoming.clone()).unwrap() else {
+        panic!("first accepted receipt");
+    };
+    assert_eq!(message.seq, 1);
+    assert_eq!(store.agent(&agent.id).unwrap().state, "running");
+    store
+        .record_outbound(&agent.id, "peer", None, "outboundneedle")
+        .unwrap();
+    assert_eq!(count(&store, "outbound_messages"), 1);
+    assert_eq!(count(&store, "rag_chunks"), 0);
+    // A standalone summary has no other home, so its failure is reported.
     assert_fault(
         store
             .record_tool_event(&agent.id, "browser", "toolneedle")
             .unwrap_err(),
         "fixture-rag-write",
     );
-    assert!(store.inbox(&agent.id, None).unwrap().is_empty());
-    assert_eq!(store.agent(&agent.id).unwrap().state, "idle");
-    assert_eq!(count(&store, "outbound_messages"), 0);
-    assert_eq!(count(&store, "rag_chunks"), 0);
-    store
-        .conn()
+    ix(&store)
         .execute_batch("DROP TRIGGER reject_chunk")
         .unwrap();
-    let ReceiveOutcome::New(message) = store.receive(&agent.id, incoming.clone()).unwrap() else {
-        panic!("first accepted receipt");
-    };
-    assert_eq!(message.seq, 1);
     assert!(matches!(
         store.receive(&agent.id, incoming).unwrap(),
         ReceiveOutcome::Duplicate(_)
     ));
-    store
-        .record_outbound(&agent.id, "peer", None, "outboundneedle")
-        .unwrap();
     store
         .record_tool_event(&agent.id, "browser", "toolneedle")
         .unwrap();
@@ -251,58 +246,6 @@ fn incoming_outgoing_and_tool_index_failures_refuse_receipts_and_roll_back() {
     for term in ["inboundneedle", "outboundneedle", "toolneedle"] {
         assert_fts(&store, term);
     }
-}
-
-#[test]
-fn authorized_upgrade_reads_only_legacy_chunks_without_indexing_hidden_bodies() {
-    let (dir, store, own) = setup();
-    let hidden = store.create_agent(NewAgent::new("hidden", "test")).unwrap();
-    store
-        .receive(&own.id, Incoming::new("legacyinboundneedle"))
-        .unwrap();
-    store
-        .record_outbound(&own.id, "peer", None, "legacyoutboundneedle")
-        .unwrap();
-    store.receive(&own.id, Incoming::new("x")).unwrap();
-    store
-        .receive(&hidden.id, Incoming::new("hiddenlegacyneedle"))
-        .unwrap();
-    store
-        .conn()
-        // Ingress maintains chunk membership transactionally. Only legacy text
-        // needs repair; searching must not enumerate the entire raw mailbox.
-        .execute_batch(
-            "UPDATE rag_chunks SET text='legacy prefix',text_format=1; DELETE FROM rag_chunks_fts;",
-        )
-        .unwrap();
-    drop(store);
-    let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
-    for term in [
-        "legacyinboundneedle",
-        "legacyoutboundneedle",
-        "hiddenlegacyneedle",
-    ] {
-        let result = store
-            .search_history(&HistorySearchQuery {
-                query: Some(term.into()),
-                visible_agent_ids: Some(vec![own.id.to_string()]),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(result.len(), usize::from(term != "hiddenlegacyneedle"));
-    }
-    assert_eq!(count(&store, "rag_chunks"), 3);
-    let hidden_format: i64 = store
-        .conn()
-        .query_row(
-            "SELECT text_format FROM rag_chunks WHERE agent_id=?1",
-            [hidden.id.as_str()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(hidden_format, 1);
-    assert_fts(&store, "legacyinboundneedle");
-    assert_fts(&store, "legacyoutboundneedle");
 }
 
 #[test]
@@ -366,10 +309,17 @@ fn schedule_claim_and_wake_retry_in_state(state: &str) {
     assert!(!deliver(&store, &agent.id, 100).unwrap());
     store.set_agent_state(&agent.id, state).unwrap();
     assert!(!deliver(&store, &agent.id, 99).unwrap());
-    reject_chunks(&store);
+    // A failing mailbox write rolls the claim back with it.
+    store
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_mail BEFORE INSERT ON messages BEGIN
+             SELECT RAISE(ABORT, 'fixture-mail-write'); END;",
+        )
+        .unwrap();
     assert_fault(
         deliver(&store, &agent.id, 100).unwrap_err(),
-        "fixture-rag-write",
+        "fixture-mail-write",
     );
     let pending = store.list_schedules(Some(&agent.id), true).unwrap();
     assert_eq!(pending.len(), 1);
@@ -379,7 +329,7 @@ fn schedule_claim_and_wake_retry_in_state(state: &str) {
     assert_eq!(store.agent(&agent.id).unwrap().state, state);
     store
         .conn()
-        .execute_batch("DROP TRIGGER reject_chunk")
+        .execute_batch("DROP TRIGGER reject_mail")
         .unwrap();
     assert!(deliver(&store, &agent.id, 100).unwrap());
     assert!(!deliver(&store, &agent.id, 100).unwrap());
@@ -406,23 +356,10 @@ fn schedule_claim_and_wake_retry_in_state(state: &str) {
 #[test]
 fn outbound_effect_history_replays_once_and_refuses_changed_payloads() {
     let (dir, store, agent) = setup();
-    reject_chunks(&store);
-    assert_fault(
-        store
-            .record_outbound_once("effect-1", &agent.id, "peer", None, "settlementneedle")
-            .unwrap_err(),
-        "fixture-rag-write",
-    );
-    assert_eq!(count(&store, "outbound_messages"), 0);
-    store
-        .conn()
-        .execute_batch("DROP TRIGGER reject_chunk")
-        .unwrap();
     let id = store
         .record_outbound_once("effect-1", &agent.id, "peer", None, "settlementneedle")
         .unwrap();
-    let sequence: i64 = store
-        .conn()
+    let sequence: i64 = ix(&store)
         .query_row("SELECT seq FROM rag_chunks WHERE chunk_id=?1", [&id], |r| {
             r.get(0)
         })
@@ -462,8 +399,7 @@ fn outbound_effect_history_replays_once_and_refuses_changed_payloads() {
     );
     assert_eq!(count(&store, "outbound_messages"), 1);
     assert_eq!(count(&store, "rag_chunks_fts"), 2);
-    let replay_sequence: i64 = store
-        .conn()
+    let replay_sequence: i64 = ix(&store)
         .query_row("SELECT seq FROM rag_chunks WHERE chunk_id=?1", [&id], |r| {
             r.get(0)
         })
@@ -528,70 +464,6 @@ fn concurrent_schedule_claims_publish_exactly_one_searchable_wake() {
     assert_eq!(results.into_iter().filter(|claimed| *claimed).count(), 1);
     assert_eq!(store.inbox(&agent.id, None).unwrap().len(), 1);
     assert_fts(&store, "concurrenttimerneedle");
-}
-
-#[test]
-fn fts_rebuild_propagates_chunk_decode_errors_without_committing_partial_rows() {
-    let (dir, store, agent) = setup();
-    store
-        .receive(&agent.id, Incoming::new("decodeneedle"))
-        .unwrap();
-    store
-        .conn()
-        .execute("UPDATE rag_chunks SET sender=X'FF'", [])
-        .unwrap();
-    drop(store);
-    let path = dir.path().join("custom-mailbox.sqlite");
-    let store = Store::open(&path).unwrap();
-    let error = ensure_lexical_fts_backfilled(&mut store.conn()).unwrap_err();
-    assert!(
-        matches!(error, Error::Db(rusqlite::Error::InvalidColumnType(..))),
-        "{error:?}"
-    );
-    let conn = Connection::open(&path).unwrap();
-    assert_eq!(
-        conn.query_row("SELECT count(*) FROM rag_chunks_fts", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
-    conn.execute("UPDATE rag_chunks SET sender='unknown'", [])
-        .unwrap();
-    drop(conn);
-    assert_fts(&Store::open(path).unwrap(), "decodeneedle");
-}
-
-#[test]
-fn late_fts_insert_failure_rolls_back_already_inserted_mail_and_chunk() {
-    let (_dir, store, agent) = setup();
-    store
-        .conn()
-        .execute_batch(
-            "DROP TABLE rag_chunks_fts;
-         CREATE TABLE rag_chunks_fts(chunk_id,agent_name,sender,destination,kind,tool_name,text,
-            search_tokens,CONSTRAINT fixture_fts_write CHECK(text != 'lateindexneedle'));",
-        )
-        .unwrap();
-    assert_fault(
-        store
-            .receive(&agent.id, Incoming::new("lateindexneedle"))
-            .unwrap_err(),
-        "fixture_fts_write",
-    );
-    assert!(store.inbox(&agent.id, None).unwrap().is_empty());
-    assert_eq!(count(&store, "rag_chunks"), 0);
-    store
-        .conn()
-        .execute_batch(
-            "DROP TABLE rag_chunks_fts;
-         CREATE VIRTUAL TABLE rag_chunks_fts USING fts5(chunk_id,agent_name,sender,destination,
-             kind,tool_name,text,search_tokens,tokenize='unicode61');",
-        )
-        .unwrap();
-    store
-        .receive(&agent.id, Incoming::new("lateindexneedle"))
-        .unwrap();
-    assert_fts(&store, "lateindexneedle");
 }
 
 #[test]
@@ -762,4 +634,614 @@ fn deleted_immutable_sender_refuses_receive_before_wake_mail_or_index_mutation()
         store.inbox(&recipient.id, None).unwrap().len(),
         before.len() + 1
     );
+}
+
+#[test]
+fn a_deleted_messages_identities_and_aliases_are_found_by_index() {
+    // Deleting an agent deletes its messages, and each message cascades to
+    // the rows naming it. Without an index on the child key every deleted
+    // message scanned these tables with the writer held.
+    let (_dir, store, _agent) = setup();
+    let conn = store.conn();
+    for (table, column) in [
+        ("message_identities", "identity_id"),
+        ("message_identities", "target_id"),
+        ("message_origin_aliases", "identity_id"),
+        ("message_source_aliases", "identity_id"),
+    ] {
+        let mut plan = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM {table} WHERE {column} = ?1"
+            ))
+            .unwrap();
+        let details: Vec<String> = plan
+            .query_map([rusqlite::types::Null], |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.starts_with("SEARCH") && d.contains("INDEX")),
+            "{table}.{column}: {details:?}"
+        );
+    }
+}
+
+/// Search rows filed under `name`, found through the index.
+fn fts_rows_named(store: &Store, name: &str) -> i64 {
+    ix(store)
+        .query_row(
+            "SELECT count(*) FROM rag_chunks_fts WHERE agent_name MATCH ?1 AND agent_name = ?2",
+            params![fts_exact_phrase(name), name],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn deleting_or_renaming_an_agent_changes_only_its_own_search_rows() {
+    let (_dir, store, kept) = setup();
+    let leaving = store
+        .create_agent(NewAgent::new("leaving", "test"))
+        .unwrap();
+    let renamed = store
+        .create_agent(NewAgent::new("before-rename", "test"))
+        .unwrap();
+    for (agent, text) in [
+        (&kept, "keptneedle"),
+        (&leaving, "leavingneedle"),
+        (&renamed, "renamedneedle"),
+    ] {
+        store.receive(&agent.id, Incoming::new(text)).unwrap();
+    }
+    assert_eq!(fts_rows_named(&store, "leaving"), 1);
+
+    store.delete_agent(&leaving.id).unwrap();
+    assert_eq!(fts_rows_named(&store, "leaving"), 0);
+    assert_fts(&store, "keptneedle");
+    assert_eq!(count(&store, "rag_chunks_fts"), count(&store, "rag_chunks"));
+
+    store.rename_agent(&renamed.id, "after-rename").unwrap();
+    assert_eq!(fts_rows_named(&store, "before-rename"), 0);
+    assert_eq!(fts_rows_named(&store, "after-rename"), 1);
+    assert_eq!(fts_rows_named(&store, "worker"), 1);
+    assert_fts(&store, "renamedneedle");
+}
+
+/// Pages a statement reads on a connection without mmap: every page access
+/// goes through the pager and counts (hit or miss), so the number does not
+/// depend on what is cached or on timing.
+fn pages_read(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> (i64, i64) {
+    fn accesses(conn: &Connection) -> i64 {
+        let mut total = 0;
+        for op in [
+            rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT,
+            rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+        ] {
+            let (mut current, mut highwater) = (0, 0);
+            // SAFETY: the handle is this live connection's; the call only
+            // reads its counters.
+            unsafe {
+                rusqlite::ffi::sqlite3_db_status(
+                    conn.handle(),
+                    op,
+                    &mut current,
+                    &mut highwater,
+                    0,
+                );
+            }
+            total += i64::from(current);
+        }
+        total
+    }
+    let before = accesses(conn);
+    let rows: i64 = conn.query_row(sql, params, |r| r.get(0)).unwrap();
+    (rows, accesses(conn) - before)
+}
+
+/// A store shaped like the fleet's: `fleet_rows` chunks of one large agent,
+/// every id starting with the `msg` token, plus one small agent.
+fn fleet_store(fleet_rows: usize) -> (tempfile::TempDir, Store, Agent, Connection) {
+    let (dir, store, small) = setup();
+    for i in 0..20 {
+        store
+            .receive(&small.id, Incoming::new(format!("smallneedle {i}")))
+            .unwrap();
+    }
+    {
+        let conn = ix(&store);
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..fleet_rows {
+            let id = format!("msg_01m7{:022}", i * 7919);
+            let text = format!("fleet history line {i} about the build and its review");
+            tx.execute(
+                "INSERT INTO rag_chunks (chunk_id, agent_id, agent_name, direction, sender,
+                     destination, timestamp_ms, content_hash, text, kind, tool_name, seq)
+                 VALUES (?1, 'agt_fleet', 'fleet', 'in', 'agent:x', 'agent:fleet', ?2, 'h', ?3,
+                     'message', '', ?2)",
+                params![id, i as i64, text],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO rag_chunks_fts (chunk_id, agent_name, sender, destination, kind,
+                     tool_name, text, search_tokens)
+                 VALUES (?1, 'fleet', 'agent:x', 'agent:fleet', 'message', '', ?2, ?2)",
+                params![id, text],
+            )
+            .unwrap();
+        }
+        // One merged segment, so page counts compare across fleet sizes
+        // without depending on how many segments the inserts left.
+        tx.execute(
+            "INSERT INTO rag_chunks_fts(rag_chunks_fts) VALUES('optimize')",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    let reader = Connection::open(store.memory_index_path()).unwrap();
+    reader.pragma_update(None, "mmap_size", 0).unwrap();
+    (dir, store, small, reader)
+}
+
+/// The rows a maintenance statement touches, read instead of written.
+fn as_count(statement: &str) -> String {
+    let count = statement.replacen(
+        "DELETE FROM rag_chunks_fts",
+        "SELECT count(*) FROM rag_chunks_fts",
+        1,
+    );
+    assert_ne!(count, statement, "{statement}");
+    count
+}
+
+/// Pages each maintenance lookup reads on a fleet of `fleet` rows: the
+/// unique-token chunk lookup, one agent's rows, and the name scan the
+/// latter replaced.
+fn maintenance_pages(fleet: usize) -> [i64; 3] {
+    let (_dir, _store, small, reader) = fleet_store(fleet);
+    let id = format!("msg_01m7{:022}", (fleet / 2) * 7919);
+    let lookup = fts_chunk_lookup(&id).unwrap();
+    let (found, token) = pages_read(&reader, &as_count(FTS_DELETE_CHUNK), &[&id, &lookup]);
+    assert_eq!(found, 1);
+    let (own, agent) = pages_read(
+        &reader,
+        &as_count(FTS_DELETE_AGENT_ROWS),
+        &[&"worker", &fts_exact_phrase("worker"), &small.id.as_str()],
+    );
+    assert_eq!(own, 20);
+    let (_, scan) = pages_read(
+        &reader,
+        "SELECT count(*) FROM rag_chunks_fts WHERE agent_name = ?1",
+        &[&"worker"],
+    );
+    [token, agent, scan]
+}
+
+#[test]
+fn search_index_maintenance_cost_does_not_grow_with_the_fleet() {
+    // Report #4/#5: a failed spawn's rollback scanned the whole index with
+    // the writer held. Cost is counted in pages read, so it does not depend
+    // on caching or timing. On a fleet eight times larger, a name scan reads
+    // about eight times the pages; what maintenance reads grows only with the
+    // B-tree's depth.
+    let small = maintenance_pages(2_000);
+    let large = maintenance_pages(16_000);
+    eprintln!("pages [lookup, agent rows, scan] at 2k rows {small:?}, at 16k rows {large:?}");
+    let [token_s, agent_s, scan_s] = small;
+    let [token_l, agent_l, scan_l] = large;
+    assert!(scan_l > scan_s * 6, "scan control: {scan_s} -> {scan_l}");
+    assert!(
+        token_l * 2 < token_s * 3,
+        "chunk lookup grew: {token_s} -> {token_l}"
+    );
+    assert!(
+        agent_l < agent_s * 2,
+        "agent rows grew: {agent_s} -> {agent_l}"
+    );
+    assert!(
+        agent_l * 5 < scan_l,
+        "agent rows {agent_l} against a scan of {scan_l}"
+    );
+}
+
+#[test]
+fn deleting_renaming_and_rolling_back_keep_the_index_exact_on_a_fleet() {
+    let fleet = 3_000;
+    let (_dir, store, small, _reader) = fleet_store(fleet);
+    let failed = store
+        .create_agent(NewAgent::new("failed-spawn", "test"))
+        .unwrap();
+    store.delete_agent(&failed.id).unwrap();
+    store.rename_agent(&small.id, "renamed-small").unwrap();
+    assert_eq!(fts_rows_named(&store, "renamed-small"), 20);
+    assert_eq!(fts_rows_named(&store, "worker"), 0);
+    assert_eq!(fts_rows_named(&store, "fleet"), fleet as i64);
+    store.delete_agent(&small.id).unwrap();
+    assert_eq!(fts_rows_named(&store, "renamed-small"), 0);
+    assert_eq!(fts_rows_named(&store, "fleet"), fleet as i64);
+    assert_eq!(count(&store, "rag_chunks_fts"), count(&store, "rag_chunks"));
+}
+
+#[test]
+fn reindexing_a_chunk_replaces_only_its_own_search_row() {
+    let (_dir, store, _small, _reader) = fleet_store(50);
+    let id = format!("msg_01m7{:022}", 7 * 7919);
+    let longer = format!("{id}_part");
+    {
+        let conn = ix(&store);
+        conn.execute(
+            "INSERT INTO rag_chunks_fts (chunk_id, agent_name, sender, destination, kind,
+                 tool_name, text, search_tokens)
+             VALUES (?1, 'fleet', 'agent:x', 'agent:fleet', 'message', '', 'part', 'part')",
+            [&longer],
+        )
+        .unwrap();
+        memory_index::remove_chunk(&conn, &id).unwrap();
+        let gone: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM rag_chunks_fts WHERE chunk_id MATCH ?2 AND chunk_id = ?1",
+                params![id, fts_chunk_lookup(&id).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, 0);
+        let left: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM rag_chunks_fts WHERE chunk_id MATCH ?2 AND chunk_id = ?1",
+                params![longer, fts_chunk_lookup(&longer).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 1, "a chunk whose id extends this one keeps its row");
+    }
+    assert_eq!(fts_chunk_lookup("msg_01ABC"), Some("\"01ABC\"".to_string()));
+    assert_eq!(fts_chunk_lookup("___"), None);
+}
+
+#[test]
+fn a_standalone_redaction_scrubs_the_index_before_its_audit_and_a_retry_completes_it() {
+    use crate::redaction::{Actor, Request};
+    let (_dir, store, agent) = setup();
+    let tool = store
+        .record_tool_event(&agent.id, "bash", "tool secretcanary")
+        .unwrap();
+    store.set_agent_state(&agent.id, "archived").unwrap();
+    let request = Request {
+        message_id: Some(tool.clone()),
+        seq: None,
+        span: None,
+        reason: "remove".into(),
+    };
+    // The audit fails after the index committed: the secret is already gone
+    // from the index, and nothing in state claims the redaction.
+    store
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_audit BEFORE INSERT ON conversation_redactions BEGIN
+             SELECT RAISE(ABORT, 'fixture-audit-write'); END;",
+        )
+        .unwrap();
+    assert_fault(
+        store
+            .redact_conversation(Actor::Operator, &agent.id, &request)
+            .unwrap_err(),
+        "fixture-audit-write",
+    );
+    let canary = |store: &Store| -> i64 {
+        ix(store)
+            .query_row(
+                "SELECT count(*) FROM rag_chunks WHERE text LIKE '%secretcanary%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(canary(&store), 0);
+    assert_eq!(count(&store, "conversation_redactions"), 0);
+    store
+        .conn()
+        .execute_batch("DROP TRIGGER reject_audit")
+        .unwrap();
+    let assert_refusal = |error: Error, needle: &str| {
+        assert!(matches!(&error, Error::Message(_)), "{error:?}");
+        assert!(error.to_string().contains(needle), "{error:?}");
+    };
+    // Recovery is a write, not an unguarded receipt replay.
+    store.set_agent_state(&agent.id, "running").unwrap();
+    assert_refusal(
+        store
+            .redact_conversation(Actor::Operator, &agent.id, &request)
+            .unwrap_err(),
+        "quiescent target",
+    );
+    store.set_agent_state(&agent.id, "archived").unwrap();
+    let process = store.try_lock_agent(&agent.id).unwrap();
+    assert!(matches!(
+        store.redact_conversation(Actor::Operator, &agent.id, &request),
+        Err(Error::AgentBusy)
+    ));
+    drop(process);
+    let mut different = request.clone();
+    different.span = Some(crate::redaction::Span {
+        unit: crate::redaction::SpanUnit::Bytes,
+        start: 0,
+        end: 1,
+    });
+    assert_refusal(
+        store
+            .redact_conversation(Actor::Operator, &agent.id, &different)
+            .unwrap_err(),
+        "staged redaction selector differs",
+    );
+    // A receipt cannot authorize recovery over a changed body.
+    ix(&store)
+        .execute(
+            "UPDATE rag_chunks SET text = 'changed' WHERE chunk_id = ?1",
+            [&tool],
+        )
+        .unwrap();
+    assert_refusal(
+        store
+            .redact_conversation(Actor::Operator, &agent.id, &request)
+            .unwrap_err(),
+        "staged receipt does not verify",
+    );
+    ix(&store)
+        .execute(
+            "UPDATE rag_chunks SET text = '[redacted]' WHERE chunk_id = ?1",
+            [&tool],
+        )
+        .unwrap();
+    assert_eq!(count(&store, "conversation_redactions"), 0);
+    let pending: i64 = ix(&store)
+        .query_row("SELECT count(*) FROM index_redactions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(pending, 1, "refused retries retain recovery intent");
+    // The retry completes the staged audit instead of refusing a changed
+    // target, and the replay after it returns the same receipt.
+    let receipt = store
+        .redact_conversation(Actor::Operator, &agent.id, &request)
+        .unwrap();
+    assert!(receipt.full_scrub, "{:?}", receipt.unscrubbed);
+    let persisted: String = store
+        .conn()
+        .query_row(
+            "SELECT receipt FROM conversation_redactions WHERE id = ?1",
+            [&receipt.audit_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<crate::redaction::Receipt>(&persisted).unwrap(),
+        receipt
+    );
+    assert_eq!(count(&store, "conversation_redactions"), 1);
+    let staged: i64 = ix(&store)
+        .query_row("SELECT count(*) FROM index_redactions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(staged, 0);
+    assert_eq!(
+        store
+            .redact_conversation(Actor::Operator, &agent.id, &request)
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(canary(&store), 0);
+    let fts: i64 = ix(&store)
+        .query_row(
+            "SELECT count(*) FROM rag_chunks_fts WHERE rag_chunks_fts MATCH 'secretcanary'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fts, 0);
+}
+
+#[test]
+fn deleting_the_newest_agent_keeps_the_index_and_projects_reused_rowids_even_when_interrupted() {
+    let (_dir, store, keeper) = setup();
+    store
+        .receive(&keeper.id, Incoming::new("keeperneedle"))
+        .unwrap();
+    let top = store.create_agent(NewAgent::new("newest", "test")).unwrap();
+    store
+        .receive(&top.id, Incoming::new("newestneedle"))
+        .unwrap();
+    store
+        .record_tool_event(&top.id, "bash", "newesttoolneedle")
+        .unwrap();
+    // A rebuild would re-project this row and lose the marker.
+    let mark_rows = |store: &Store| -> i64 {
+        ix(store)
+            .query_row("SELECT count(*) FROM rag_chunks WHERE seq = -77", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    ix(&store)
+        .execute(
+            "UPDATE rag_chunks SET seq = -77 WHERE agent_id = ?1",
+            [keeper.id.as_str()],
+        )
+        .unwrap();
+    let marks_before: Vec<(String, i64)> = ix(&store)
+        .prepare("SELECT key, value FROM index_meta WHERE key LIKE '%rowid'")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let tool_row: (String, String, String, i64, String) = ix(&store)
+        .query_row(
+            "SELECT chunk_id, agent_id, agent_name, timestamp_ms, text FROM rag_chunks
+             WHERE agent_id = ?1 AND kind = 'tool'",
+            [top.id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    store.invalidate_index(&[], &[top.id.as_str()]).unwrap();
+    let pending: (Option<i64>, Option<i64>) = ix(&store)
+        .query_row(
+            "SELECT cap_messages, cap_outbound FROM index_pending WHERE kind = 'agent'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    store.delete_agent(&top.id).unwrap();
+    assert_eq!(mark_rows(&store), 1, "a delete never rebuilds");
+
+    // Put the index back as a writer stopped between the state commit and
+    // the index's own cleanup leaves it.
+    {
+        let conn = ix(&store);
+        conn.execute(
+            "INSERT INTO index_pending (kind, id, cap_messages, cap_outbound) VALUES ('agent', ?1, ?2, ?3)",
+            params![top.id.as_str(), pending.0, pending.1],
+        )
+        .unwrap();
+        for (key, value) in &marks_before {
+            conn.execute(
+                "UPDATE index_meta SET value = ?2 WHERE key = ?1",
+                params![key, value],
+            )
+            .unwrap();
+        }
+        memory_index::upsert_chunk(
+            &conn,
+            &memory_index::Chunk {
+                id: &tool_row.0,
+                agent_id: &tool_row.1,
+                agent_name: &tool_row.2,
+                direction: "out",
+                sender: "agent:newest",
+                destination: "tool:bash",
+                timestamp_ms: tool_row.3,
+                text: &tool_row.4,
+                kind: Some("tool"),
+                tool: Some("bash"),
+                seq: 1,
+            },
+        )
+        .unwrap();
+    }
+    // The next message reuses the deleted agent's highest rowid.
+    store
+        .receive(&keeper.id, Incoming::new("reusedrowidneedle"))
+        .unwrap();
+    store.sync_memory_index().unwrap();
+    assert_eq!(
+        mark_rows(&store),
+        1,
+        "no rebuild after the interrupted delete"
+    );
+    assert_fts(&store, "reusedrowidneedle");
+    let left: i64 = ix(&store)
+        .query_row(
+            "SELECT count(*) FROM rag_chunks WHERE agent_id = ?1",
+            [top.id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0, "the deleted agent's summary is not an orphan");
+    assert_eq!(count(&store, "index_pending"), 0);
+}
+
+#[test]
+fn a_forced_rebuild_keeps_pending_changes_and_drops_orphaned_summaries() {
+    let (_dir, store, agent) = setup();
+    store
+        .record_tool_event(&agent.id, "bash", "livetoolneedle")
+        .unwrap();
+    let state = store.read_conn();
+    let conn = ix(&store);
+    memory_index::upsert_chunk(
+        &conn,
+        &memory_index::Chunk {
+            id: "tool_orphan",
+            agent_id: "agt_gone",
+            agent_name: "gone",
+            direction: "out",
+            sender: "agent:gone",
+            destination: "tool:bash",
+            timestamp_ms: 1,
+            text: "[tool:bash] orphantoolneedle",
+            kind: Some("tool"),
+            tool: Some("bash"),
+            seq: 1,
+        },
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO index_pending (kind, id, cap_messages, cap_outbound) VALUES ('agent', 'agt_gone', 3, 4)",
+        [],
+    )
+    .unwrap();
+    memory_index::reset(&conn, Some(&state), true).unwrap();
+    let texts: Vec<String> = conn
+        .prepare("SELECT text FROM rag_chunks")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(texts, ["[tool:bash] livetoolneedle"]);
+    let pending: (i64, i64) = conn
+        .query_row(
+            "SELECT cap_messages, cap_outbound FROM index_pending WHERE id = 'agt_gone'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(pending, (3, 4));
+}
+
+#[test]
+fn duplicate_mail_never_waits_on_the_index_and_merged_bodies_are_repaired() {
+    let (dir, store, agent) = setup();
+    let mut keyed = Incoming::new("duplicateneedle");
+    keyed.source_key = Some("retry-key".into());
+    store.receive(&agent.id, keyed.clone()).unwrap();
+    // Another process holds the index: a retried delivery is answered from
+    // state at once and is never failed by the index.
+    let blocker = Connection::open(store.memory_index_path()).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        store.receive(&agent.id, keyed).unwrap(),
+        ReceiveOutcome::Duplicate(_)
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+
+    // A channel message whose stored body changed after it was projected
+    // (a merge a stopped writer did not re-project) is repaired on open.
+    let mut channel = Incoming::new("channelmergedneedle full body");
+    channel.origin = Some(crate::Origin {
+        chat_id: Some(-100),
+        thread_id: None,
+        message_id: Some(42),
+    });
+    let ReceiveOutcome::New(message) = store.receive(&agent.id, channel).unwrap() else {
+        panic!("a new message");
+    };
+    ix(&store)
+        .execute(
+            "UPDATE rag_chunks SET text = 'stale', content_hash = 'stale' WHERE chunk_id = ?1",
+            [message.id.as_str()],
+        )
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+    store.sync_memory_index().unwrap();
+    let text: String = ix(&store)
+        .query_row(
+            "SELECT text FROM rag_chunks WHERE chunk_id = ?1",
+            [message.id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(text.contains("channelmergedneedle"), "{text}");
 }

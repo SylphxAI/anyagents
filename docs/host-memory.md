@@ -87,10 +87,23 @@ catalog AnyAgents rebuilds deterministically from them on every write (the
 `memory` tool's `consolidate` action rebuilds it on demand). An agent writes
 topics with the `memory` tool. While an agent is idle, the server's sleep
 consolidation pass reviews its recent mailbox with a model, may add, update or
-delete topics, and rebuilds `MEMORY.md`; its watermarks are in
+merge topics, and rebuilds `MEMORY.md`; its watermarks are in
 `memory/.sleep-state.json`, a dotfile that is never indexed. Hybrid retrieval
 leaves that pass as it is. It is to be rebuilt inside the agent's own harness
 and session; until that exists, the server-side pass stays.
+
+The pass destroys nothing. It only reads raw history. Before it replaces a
+topic, the topic's current bytes are copied to
+`history/archive/memory/<topic>.<ms>.md`; a topic it merges away moves there
+instead of being deleted. The archive is searchable history (`scope:
+transcripts`), never pinned into a prompt. Every topic it writes ends with a
+`## Sources (raw history)` section citing the mailbox turns it was distilled
+from, one line each: `raw_id` (the message id), `raw_sha256` (SHA-256 of the
+body's exact bytes), byte `offset` and `length`, mailbox `seq` and
+`direction`. Earlier citations are kept across rewrites (the newest 64). The
+model names its source turns; a plan that names none is cited to the whole
+window it read. An agent's own `memory` tool writes and deletes are not this
+pass, and do what they say.
 
 
 ## Files and session boundaries
@@ -142,6 +155,23 @@ self and descendants only. `all`, `*`, names and immutable IDs never widen that
 boundary. Authorization applies before file access and result limits.
 
 Lexical search uses full mailbox bodies and bounded host-file FTS windows.
+The mailbox search index (`rag_chunks`, `rag_chunks_fts`) is not in
+`state.db`: it lives in `memory-index.db` beside it (`<file>.memory-index.db`
+for a state file with another name), a projection of `messages` and
+`outbound_messages` written in its own transactions, so projecting, rebuilding,
+renaming or redacting index rows never holds the state writer. New rows are
+projected after their commit (a writer that finds the index busy leaves them
+to the next search) and every search first projects what is missing. A change
+to a projected row records a pending entry in the index before the state
+write and re-projects from what state committed after it, so an interruption is
+repaired by the next sync. A missing, damaged or older-layout file is
+recreated and refilled from state, more than one search's share in the
+background. Standalone tool summaries have no mailbox row and are kept in the
+index as recorded, across a rebuild of the layout. Opening a pre-split
+database copies those summaries into the index and moves each outbound turn's
+mailbox position onto its row (migration 34) before state's search tables are
+dropped; the space they held is reused by SQLite and returned to the file
+system only by a `VACUUM` of `state.db`, run while no process has it open.
 The host SQLite index stores metadata, cursors, call correlation and a
 contentless FTS index; authoritative host-file payloads stay in filesystem
 sources. Archive retrieval also reads the historical pre-upgrade directory
@@ -328,11 +358,18 @@ the reranker, or only `query_prefix`, rebuilds nothing.
 Spend outside a rebuild (query embeddings, rerank, and embedding new history
 once the space is built) is capped per UTC day by `max_daily_usd` (US$1 by
 default) and kept in `<data>/memory-service/spend.db`, so a restart does not
-reset it. Once the day's spend reaches the cap, rerank answers with the reason
-(search keeps BM25 and dense and lists `rerank:` in `retrieval.degraded`) and
-new history waits for the next UTC day; query embeddings, a fraction of a cent
-each, go on and are counted. `status` reports `today_usd` and
+reset it. Once the day's spend reaches the cap, the service makes no remote
+request until the next UTC day: it refuses query embedding and rerank with the
+reason, so search answers from BM25 and lists `dense:` and `rerank:` in
+`retrieval.degraded`, and new history waits. `status` reports `today_usd` and
 `max_daily_usd`.
+
+A cap holds only if every request is counted. A remote model therefore needs a
+configured price (`usd_per_million_tokens`, or `usd_per_search` for a
+reranker), used whenever an answer reports no `usage.cost`; `serve` refuses to
+start with a remote model that has none. A remote query is cut to the same
+piece budget as a passage, and a remote rerank query to `passage_chars`, so a
+long query never sends or costs more than a passage.
 
 `anyagents memory-service estimate` makes the same estimate for the configured
 embedder over the host index as it stands, without calling a model, reading a
@@ -432,17 +469,25 @@ To build it:
    index. A first build has nothing to remove.
 
 Stopping the service returns search to BM25 and says so in
-`retrieval.degraded`; the dense index stays for a later start.
+`retrieval.degraded`; the dense index stays for a later start. Without the
+file the service runs the pinned local pair, which is another space and builds
+its own index on local CPU at no cost.
 
 Rolling the server back past this change: an older server cannot read the
 host index this one writes (Spiron journal rows are documents addressed as
 `<database>/<table>/<rowid>`, which an older server fails to read back), so its
 searches over Spiron history can fail. Stop it and delete
 `<data>/host-history-index-v1.db` with its `-wal` and `-shm`; the index is a
-rebuildable projection, and the older server builds it again. It ignores the
-dense indexes and `spend.db`. Without the
-file the service runs the pinned local pair, which is another space and builds
-its own index on local CPU at no cost.
+rebuildable projection. It ignores the dense indexes and `spend.db`.
+
+The older server rebuilds the index lazily: the first search that reaches an
+agent's history indexes all of it inside that agent's lifecycle lock, so mail
+to that agent waits until it is done. On the desk on 2026-11-14 that was about
+39 agents with indexed history, about 6 GB raw, and the larger agents take
+several minutes each. Either accept that wait, or warm the index before taking
+traffic: start the older server with those agents paused, run one search per
+agent (`anyagents --data <data> search <word> --agent <name> --scope
+transcripts`), then resume them.
 
 ## Retrieval quality on real history
 

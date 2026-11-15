@@ -188,6 +188,69 @@ fn a_replay_rebuilds_the_open_turn_and_its_proofs_and_nothing_is_written_twice()
 }
 
 #[test]
+fn a_replayed_steer_ack_marks_its_turn_in_flight_before_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let peer = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let attach: Value = serde_json::from_str(&line).unwrap();
+        let attach_id = attach["request_id"].as_str().unwrap().to_string();
+        let mut out = stream;
+        let ready = json!({"type": "ready", "protocol": "spiron.headless/v2", "version": "0.1.0",
+            "commit": "0123456789abcdef", "model": "sylphx/m", "context": {"window_tokens": 1000, "window_source": "catalogue"}});
+        for chunk in [
+            frame(
+                1,
+                "m2",
+                json!({"type": "steer_ack", "accepted": true, "turn_id": "m1"}),
+            ),
+            frame(2, &attach_id, ready),
+        ] {
+            out.write_all(chunk.as_bytes()).unwrap();
+        }
+        let mut rest = Vec::new();
+        line.clear();
+        while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+            rest.push(serde_json::from_str::<Value>(&line).unwrap());
+            line.clear();
+        }
+        rest
+    });
+
+    let mut harness = StreamHarness::connect(Connect {
+        spec: spec(),
+        program: "spiron".into(),
+        socket: path,
+        pid: Some(4242),
+        after_seq: Some(0),
+        session_id: Some("s-1".into()),
+        environment: Vec::new(),
+        delivery: SPIRON,
+    })
+    .unwrap();
+    harness.wait_ready(Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        harness
+            .deliver(&message("m1"), &json!({"type": "prompt"}))
+            .unwrap(),
+        DeliverOutcome::InFlight
+    );
+    assert_eq!(
+        harness
+            .deliver(&message("m2"), &json!({"type": "steer"}))
+            .unwrap(),
+        DeliverOutcome::InFlight
+    );
+    assert!(harness.written_ids().is_empty());
+    harness.stop();
+    assert!(peer.join().unwrap().is_empty());
+}
+
+#[test]
 fn a_replayed_quota_holds_nothing_and_a_live_one_does() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.sock");
@@ -285,4 +348,52 @@ fn a_refused_attach_fails_the_wait() {
         "{error}"
     );
     peer.join().unwrap();
+}
+
+#[test]
+fn an_old_or_unnamed_ready_cannot_complete_a_v2_attach() {
+    for protocol in [Some("spiron.headless/v1"), None] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let attach: Value = serde_json::from_str(&line).unwrap();
+            // Even naming both old capabilities cannot admit the old protocol.
+            let ready = json!({"type":"ready", "protocol":protocol,
+                "capabilities":["steer_consumed","idempotent_input"]});
+            stream
+                .write_all(frame(1, attach["request_id"].as_str().unwrap(), ready).as_bytes())
+                .unwrap();
+            line.clear();
+            assert_eq!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "no input after refusal"
+            );
+        });
+        let mut harness = StreamHarness::connect(Connect {
+            spec: spec(),
+            program: "spiron".into(),
+            socket: path,
+            pid: None,
+            after_seq: None,
+            session_id: None,
+            environment: Vec::new(),
+            delivery: SPIRON,
+        })
+        .unwrap();
+        let error = harness.wait_ready(Duration::from_secs(10)).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported_protocol"),
+            "{error}"
+        );
+        assert!(!harness.input_ready());
+        assert!(harness.written_ids().is_empty());
+        harness.stop();
+        peer.join().unwrap();
+    }
 }

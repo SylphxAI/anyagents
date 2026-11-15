@@ -399,7 +399,7 @@ pub enum AdapterLaunch {
         env: Vec<(String, String)>,
         work_dir: PathBuf,
         /// A cloud harness behind the Claude adapter: mail waits for the turn
-        /// to end (`docs/delivery.md`).
+        /// to end unless its `acp/v1` peer declares more (`docs/delivery.md`).
         #[serde(default)]
         cloud: bool,
     },
@@ -515,8 +515,7 @@ impl AdapterLaunch {
 
     /// Launch a Spiron that speaks `spiron.headless/v2` as a process of its
     /// own that outlives this server (`spiron_native`). `None` when this is
-    /// no Spiron launch, or the binary speaks v1 only: it then starts as
-    /// before.
+    /// not a Spiron launch.
     fn start_listening(
         &self,
         at: crate::spiron_native::Launching<'_>,
@@ -534,10 +533,6 @@ impl AdapterLaunch {
         else {
             return None;
         };
-        // A binary whose help does not name `--listen` speaks v1 only.
-        if !anyagents_harness_spiron::listens(program) {
-            return None;
-        }
         let (launch, applied) = match spiron_launch(
             program,
             config_dir,
@@ -555,7 +550,6 @@ impl AdapterLaunch {
         };
         match crate::spiron_native::launch(launch, applied, at, SPIRON_READY_WAIT) {
             Ok(harness) => Some(Ok(LocalAdapter::Spiron(Box::new(harness)))),
-            Err(anyagents_harness_spiron::ListenError::NotV2) => None,
             Err(anyagents_harness_spiron::ListenError::Failed(error)) => Some(Err(error)),
         }
     }
@@ -884,6 +878,44 @@ impl anyagents_harness::Harness for ContractHarness {
     }
 }
 
+/// The tool caches a harness writes into, by the environment key that names
+/// them, and the name of the private cache a seat gets in their place.
+const WRITTEN_TOOL_CACHES: &[(&str, &str)] = &[
+    ("BUN_INSTALL_CACHE_DIR", "bun"),
+    ("UV_CACHE_DIR", "uv"),
+    ("PIP_CACHE_DIR", "pip"),
+    ("NPM_CONFIG_CACHE", "npm"),
+    ("SCCACHE_DIR", "sccache"),
+];
+
+/// What a harness gets for one tool setting the server's environment names.
+///
+/// A seated harness (`seat` is its launch spec) runs as another uid, and a
+/// tool cache it cannot write breaks the tool outright: the desk's shared
+/// `/scratch/bun-cache` is `kyle:root 2755`, so `bun install` in a seat ended
+/// with `bun is unable to write files to tempdir: EACCES` (bun stages each
+/// download in the cache directory). Such a seat gets its own cache under its
+/// scratch build root instead; a cache it can write is shared as before, and
+/// every other setting passes unchanged.
+fn tool_env_value(key: &str, value: String, seat: Option<&str>, build_root: &Path) -> String {
+    let Some(seat) = seat else {
+        return value;
+    };
+    let Some((_, name)) = WRITTEN_TOOL_CACHES.iter().find(|(k, _)| *k == key) else {
+        return value;
+    };
+    let writable = crate::sandbox::seat_principal(seat)
+        .is_some_and(|principal| crate::sandbox::seat_can_write_dir(Path::new(&value), &principal));
+    if writable {
+        return value;
+    }
+    build_root
+        .join(crate::sandbox::SEAT_CACHE_DIR)
+        .join(name)
+        .display()
+        .to_string()
+}
+
 pub fn child_env() -> Vec<(String, String)> {
     let mut env = Vec::new();
     for key in ["ANYAGENTS_FAKE_MODE", "ANYAGENTS_FAKE_LOG"] {
@@ -1184,8 +1216,6 @@ fn vendor_launch_inner(
     authority: Option<&anyagents_core::Store>,
     host: &HarnessHost,
 ) -> Result<VendorHarness, String> {
-    crate::worktree_access::ensure_launchable(&request.data_dir, &request.agent.id)
-        .map_err(|error| error.to_string())?;
     // Strip any untrusted launch or authority variables from caller/stored env.
     let mut env: Vec<(String, String)> = std::mem::take(&mut request.extra_env)
         .into_iter()
@@ -1362,7 +1392,7 @@ fn vendor_launch_inner(
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
         let _ = crate::install::record(&root, &request.agent.harness);
         if let Some(store) = store_opt {
-            crate::create::reconcile_agent_runtime_config(
+            crate::create::reconcile_agent_runtime_config_for_launch(
                 store,
                 &request.data_dir,
                 &request.agent,
@@ -1418,7 +1448,6 @@ fn vendor_launch_inner(
         });
         if let Some((_, uid, gid, _)) = effective_seat.as_ref() {
             let (uid, gid) = (*uid, *gid);
-            crate::sandbox::share_config_with_seat_uid(&request.config_dir, uid, gid);
             let managed_work = anyagents_core::agent_work_dir(&request.data_dir, &request.agent.id);
             if request.work_dir == managed_work && !managed_work.exists() {
                 let _ = crate::sandbox::ensure_seat_dir_as_owner(&managed_work, uid, gid, 0o2770);
@@ -1427,15 +1456,15 @@ fn vendor_launch_inner(
                 && managed_work.is_dir()
                 && !managed_work.join(".git").exists()
             {
-                let _ = crate::sandbox::share_worktree_with_seat(
-                    &managed_work,
-                    uid,
-                    gid,
-                    &crate::worktree_access::grant_path(&request.data_dir, &request.agent.id),
-                );
+                let _ = crate::sandbox::share_worktree_with_seat(&managed_work, gid);
             }
         }
         crate::create::ensure_seat_op_config(&request.config_dir, seat_launch);
+        // Op setup can create private config entries; admit the completed tree.
+        if let Some((_, uid, gid, _)) = effective_seat.as_ref() {
+            crate::sandbox::share_config_with_seat_uid_checked(&request.config_dir, *uid, *gid)
+                .map_err(|err| err.to_string())?;
+        }
         env.push(("HOME".to_string(), request.config_dir.display().to_string()));
         env.push(("USER".to_string(), seat_user.clone()));
         env.push(("LOGNAME".to_string(), seat_user.clone()));
@@ -1494,6 +1523,9 @@ fn vendor_launch_inner(
             "DERIVED_DATA_PATH".to_string(),
             derived_data.display().to_string(),
         ));
+        // A seated harness runs as another uid. A shared cache the server's
+        // environment names is passed on only when that uid can write it.
+        let seat = seat_spec.as_ref().map(|(_, spec)| spec.as_str());
         for key in [
             "RUSTUP_HOME",
             "CARGO_HOME",
@@ -1513,7 +1545,11 @@ fn vendor_launch_inner(
                 .or_else(|| std::env::var_os(key))
                 .filter(|v| !v.is_empty())
             {
-                env.push((key.to_string(), value.to_string_lossy().into_owned()));
+                let value = value.to_string_lossy().into_owned();
+                env.push((
+                    key.to_string(),
+                    tool_env_value(key, value, seat, &build_root),
+                ));
             }
         }
     }
@@ -2127,7 +2163,7 @@ pub(crate) fn ensure_agy_steering_settings(
 }
 
 /// The deny reason the guard gives the model for a native tool.
-const AGY_GUARD_DENY: &str = "Native built-in tools are disabled under AnyAgents. Invoke AnyAgents MCP tools via call_mcp_tool with ServerName=\"anyagents\" (read schemas in ~/.gemini/antigravity-cli/mcp/anyagents/*.json if needed): e.g. ToolName=\"code\" with Arguments={\"code\":\"return await workspace.read({ path: \\\"...\\\" });\"} for workspace/web/anyagents operations, ToolName=\"send\" with Arguments={\"to\":[\"parent\"],\"text\":\"...\"} to reply, ToolName=\"agents\", ToolName=\"schedules\", or ToolName=\"skills\". read_file stays for an image, PDF or audio file in the workspace or the AnyAgents media directory, and for media this CLI offloaded from a tool result ([Resource offloaded to file://...]).";
+const AGY_GUARD_DENY: &str = "Native built-in tools are disabled under AnyAgents. Invoke AnyAgents MCP tools via call_mcp_tool with ServerName=\"anyagents\" (read schemas in ~/.gemini/antigravity-cli/mcp/anyagents/*.json if needed): e.g. ToolName=\"code\" with Arguments={\"code\":\"return await workspace.read({ path: \\\"...\\\" });\"} for workspace/web/anyagents operations, ToolName=\"send\" with Arguments={\"to\":[\"parent\"],\"text\":\"...\"} to reply, ToolName=\"agents\", ToolName=\"schedules\", or ToolName=\"skills\". read_file stays for an image, PDF or audio file in the workspace or the AnyAgents media directory, for media this CLI offloaded from a tool result ([Resource offloaded to file://...]), and for an oversize AnyAgents response spilled to anyagents-mcp-stdio-frame-*.txt in the temp dir.";
 
 /// The `PreToolUse` command that holds AGY's native tools: every one is
 /// denied, except `read_file` of an MCP tool schema under
@@ -2135,7 +2171,9 @@ const AGY_GUARD_DENY: &str = "Native built-in tools are disabled under AnyAgents
 /// of a media file (an image, a PDF or audio, told by its bytes) whose real
 /// path is in one of `roots` (the workspace and `<data>/media`) or is media
 /// AGY itself offloaded under `~/.gemini/antigravity-cli/brain/
-/// */.system_generated/steps/`.
+/// */.system_generated/steps/`, and `read_file` of a response the tool
+/// server spilled past the stdio frame cap: a `0600` file of this user named
+/// `anyagents-mcp-stdio-frame-<pid>-<seq>.txt` directly in the temp dir.
 ///
 /// AGY gives its model an MCP image only when its bytes fit the tool output
 /// limit (10,240 bytes by default, `tool_config.mcp.max_output_bytes`); a
@@ -2151,7 +2189,7 @@ fn agy_tool_guard_command(roots: &[&Path]) -> String {
     let roots = serde_json::to_string(&roots).unwrap_or_else(|_| "[]".to_string());
     let deny = serde_json::to_string(AGY_GUARD_DENY).unwrap_or_default();
     let program = format!(
-        r#"import json,os,sys
+        r#"import json,os,re,stat,sys,tempfile
 deny={deny}
 home=os.path.expanduser("~/.gemini/antigravity-cli")
 roots=[os.path.realpath(r) for r in {roots}]
@@ -2172,7 +2210,9 @@ try:
   steps=os.path.realpath(os.path.join(home,"brain"))
   schema=under(rp,mcp) and rp.endswith(".json")
   offloaded=under(rp,steps) and "/.system_generated/steps/" in rp
-  if rp and os.path.isfile(rp) and (schema or (media(rp) and (offloaded or any(under(rp,r) for r in roots)))):
+  st=os.stat(rp) if rp and os.path.isfile(rp) else None
+  spilled=st is not None and os.path.dirname(rp)==os.path.realpath(tempfile.gettempdir()) and re.fullmatch(r"anyagents-mcp-stdio-frame-[0-9]+-[0-9]+\.txt",os.path.basename(rp)) is not None and st.st_uid==os.getuid() and stat.S_IMODE(st.st_mode)==0o600
+  if rp and os.path.isfile(rp) and (schema or spilled or (media(rp) and (offloaded or any(under(rp,r) for r in roots)))):
    print(json.dumps({{"decision":"allow","permissionOverrides":["read_file(*)","read_file","view_file"]}}));sys.exit(0)
 except Exception:
  pass
@@ -2252,9 +2292,13 @@ fn start_spiron(
     env: &[(String, String)],
 ) -> Result<SpironHarness, String> {
     let (launch, applied) = spiron_launch(program, config_dir, work_dir, agent, session, env)?;
+    let socket = config_dir.join("spiron.sock");
+    let log = config_dir.join("spiron.log");
     // Its `ready` says whether every input may be steered at once; nothing
     // is offered before it, so mail starts on the right rules.
-    let harness = SpironHarness::start(launch, SPIRON_READY_WAIT).map_err(|err| err.to_string())?;
+    let harness =
+        SpironHarness::launch_listening(launch, &socket, &log, SPIRON_READY_WAIT, |_pid| Ok(()))
+            .map_err(|anyagents_harness_spiron::ListenError::Failed(error)| error)?;
     harness.recognise_applied(applied);
     Ok(harness)
 }
@@ -2289,8 +2333,11 @@ fn spiron_launch(
         "--agent-name".to_string(),
         agent.name.to_string(),
     ];
-    if let Some(model) = agent.model.map(str::trim).filter(|model| !model.is_empty()) {
-        let normalized = crate::spiron::strip_coding_plan_prefix(model);
+    if let Some(normalized) = agent
+        .model
+        .map(crate::spiron::normalize_model)
+        .filter(|model| !model.is_empty())
+    {
         args.extend(["--model".to_string(), normalized.to_string()]);
     }
     let mut environment = env.to_vec();
@@ -2869,6 +2916,82 @@ fn session_from_file(config_dir: &Path, file_name: &str) -> Result<Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Report #16: a seat inherited the desk's `kyle:root 2755` bun cache and
+    /// every `bun install` failed. A seat keeps a shared cache it can write and
+    /// gets a private one otherwise; settings that are not written caches, and
+    /// unseated harnesses, are unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn a_seat_never_inherits_a_tool_cache_it_cannot_write() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("bun-cache");
+        std::fs::create_dir(&shared).unwrap();
+        let meta = std::fs::metadata(&shared).unwrap();
+        let (uid, gid) = (meta.uid().wrapping_add(7919), meta.gid().wrapping_add(7919));
+        let seat = format!(
+            "/usr/local/bin/anyagents-setpriv\t{uid}\t{gid}\t{gid},{}",
+            meta.gid()
+        );
+        let build_root = dir.path().join("builds").join("agt_x");
+        let shared_text = shared.display().to_string();
+        let private = build_root.join("cache").join("bun").display().to_string();
+
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o2755)).unwrap();
+        assert_eq!(
+            tool_env_value(
+                "BUN_INSTALL_CACHE_DIR",
+                shared_text.clone(),
+                Some(&seat),
+                &build_root
+            ),
+            private
+        );
+        assert_eq!(
+            tool_env_value(
+                "BUN_INSTALL_CACHE_DIR",
+                shared_text.clone(),
+                None,
+                &build_root
+            ),
+            shared_text
+        );
+        assert_eq!(
+            tool_env_value("CARGO_HOME", shared_text.clone(), Some(&seat), &build_root),
+            shared_text
+        );
+        // A group-writable shared cache stays shared for a seat in that group.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o2775)).unwrap();
+        assert_eq!(
+            tool_env_value(
+                "BUN_INSTALL_CACHE_DIR",
+                shared_text.clone(),
+                Some(&seat),
+                &build_root
+            ),
+            shared_text
+        );
+        // A cache that does not exist yet, or an unreadable seat spec, is private.
+        assert_eq!(
+            tool_env_value(
+                "UV_CACHE_DIR",
+                dir.path().join("absent").display().to_string(),
+                Some(&seat),
+                &build_root
+            ),
+            build_root.join("cache").join("uv").display().to_string()
+        );
+        assert_eq!(
+            tool_env_value(
+                "BUN_INSTALL_CACHE_DIR",
+                shared_text,
+                Some("garbled"),
+                &build_root
+            ),
+            private
+        );
+    }
 
     #[test]
     fn claude_native_memory_preserves_operator_choice() {
@@ -3818,20 +3941,63 @@ done
         let config = root.join("config");
         std::fs::create_dir_all(&config).unwrap();
         let first = host_session::new_session(&root, "spiron").unwrap();
-        let harness = SpironHarness::start(
+        let script = dir.path().join("spiron-v2-session-probe");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/python3
+import json, os, socket, sys
+args = sys.argv[1:]
+sock_path = args[args.index("--listen") + 1]
+session = args[args.index("--session") + 1]
+try:
+    os.unlink(sock_path)
+except FileNotFoundError:
+    pass
+srv = socket.socket(socket.AF_UNIX)
+srv.bind(sock_path)
+srv.listen(4)
+while True:
+    conn, _ = srv.accept()
+    reader = conn.makefile("r")
+    first = reader.readline()
+    if first:
+        break
+    reader.close()
+    conn.close()
+attach = json.loads(first)
+conn.sendall((json.dumps({
+    "type": "ready",
+    "request_id": attach["request_id"],
+    "protocol": "spiron.headless/v2",
+    "session_id": session,
+    "seq": 1,
+}) + "\n").encode())
+for raw in reader:
+    msg = json.loads(raw)
+    if msg.get("type") == "stop":
+        conn.sendall((json.dumps({"type": "stopped", "request_id": msg["request_id"], "seq": 2}) + "\n").encode())
+        break
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let harness = SpironHarness::launch_listening(
             SpironLaunch {
-                program: "/bin/sh".into(),
-                args: vec![
-                    "-c".into(),
-                    r#"echo '{"type":"ready","protocol":"spiron.headless/v1"}'; exec sleep 30"#
-                        .into(),
-                ],
+                program: script,
+                args: vec![],
                 environment: vec![],
                 work_dir: config.clone(),
                 session: Some("vendor-1".into()),
                 state_dir: config.clone(),
             },
+            &config.join("spiron.sock"),
+            &config.join("spiron.log"),
             Duration::from_secs(10),
+            |_pid| Ok(()),
         )
         .unwrap();
         let pointer = config.join("spiron-session-id");
@@ -3886,8 +4052,8 @@ done
     }
 
     /// A cloud harness runs behind the Claude adapter at turn-end delivery
-    /// (`docs/delivery.md`). The launch the kernel hands its keeper says so,
-    /// and keeps saying so across the wire.
+    /// until its peer declares more (`docs/delivery.md`). The launch the
+    /// kernel hands its keeper says so, and keeps saying so across the wire.
     #[test]
     fn a_cloud_harness_launch_keeps_turn_end_delivery_across_its_keeper() {
         use anyagents_core::{NewAgent, Store};
@@ -4294,6 +4460,16 @@ done
     /// The guard's answer for one native tool call, as AGY runs the hook:
     /// the call on stdin, `HOME` the agent's config directory.
     fn agy_guard(cmd: &str, home: &Path, tool: &str, path: &Path) -> serde_json::Value {
+        agy_guard_in(cmd, home, &std::env::temp_dir(), tool, path)
+    }
+
+    fn agy_guard_in(
+        cmd: &str,
+        home: &Path,
+        tmp: &Path,
+        tool: &str,
+        path: &Path,
+    ) -> serde_json::Value {
         use std::io::Write as _;
         let payload = serde_json::json!({
             "toolCall": { "name": tool, "args": { "Path": path.display().to_string() } }
@@ -4302,6 +4478,7 @@ done
             .arg("-c")
             .arg(cmd)
             .env("HOME", home)
+            .env("TMPDIR", tmp)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -4315,6 +4492,56 @@ done
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success());
         serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    /// A response the tool server spilled past the stdio frame cap is read
+    /// with native `read_file`: only a `0600` file of this user, named as the
+    /// spill is named, directly in the temp dir, and not through a symlink
+    /// to anything else.
+    #[cfg(unix)]
+    #[test]
+    fn agy_native_read_opens_only_a_spilled_stdio_frame() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_tempdir();
+        let config_dir = dir.path().join("config");
+        let work_dir = dir.path().join("work");
+        let media_dir = dir.path().join(anyagents_harness::media::MEDIA_DIR);
+        let tmp = dir.path().join("tmp");
+        let nested = tmp.join("nested");
+        for path in [&config_dir, &work_dir, &media_dir, &nested] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        ensure_agy_steering_settings(&config_dir, &work_dir, &media_dir).unwrap();
+        let hooks: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(config_dir.join(".gemini/config/hooks.json")).unwrap(),
+        )
+        .unwrap();
+        let cmd = hooks["anyagents-native-tool-guard"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        let write = |path: &Path, mode: u32| {
+            std::fs::write(path, "result text").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let spilled = tmp.join("anyagents-mcp-stdio-frame-12-3.txt");
+        write(&spilled, 0o600);
+        let decide = |path: &Path| agy_guard_in(cmd, &config_dir, &tmp, "read_file", path);
+        assert_eq!(decide(&spilled)["decision"], "allow");
+
+        let loose = tmp.join("anyagents-mcp-stdio-frame-12-4.txt");
+        write(&loose, 0o644);
+        let deep = nested.join("anyagents-mcp-stdio-frame-12-5.txt");
+        write(&deep, 0o600);
+        let other = tmp.join("notes.txt");
+        write(&other, 0o600);
+        let secret = work_dir.join("secret.txt");
+        write(&secret, 0o600);
+        let link = tmp.join("anyagents-mcp-stdio-frame-12-6.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let traversal = nested.join("../../work/secret.txt");
+        for path in [&loose, &deep, &other, &link, &traversal] {
+            assert_eq!(decide(path)["decision"], "deny", "{}", path.display());
+        }
     }
 
     /// AGY gives its model an MCP image only up to 10,240 bytes and offloads

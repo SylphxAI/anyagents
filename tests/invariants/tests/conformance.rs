@@ -15,7 +15,7 @@ mod spiron {
     use anyagents_harness_spiron::{SpironHarness, SpironLaunch};
 
     fn launch(fixture: &Fixture, session: Option<&str>) -> SpironHarness {
-        SpironHarness::start(
+        SpironHarness::launch_listening(
             SpironLaunch {
                 program: fixture.program().to_path_buf(),
                 args: Vec::new(),
@@ -24,12 +24,16 @@ mod spiron {
                 session: session.map(str::to_string),
                 state_dir: fixture.dir().to_path_buf(),
             },
+            &fixture.dir().join("spiron.sock"),
+            &fixture.dir().join("spiron.log"),
             READY,
+            |_pid| Ok(()),
         )
         .expect("spiron starts")
     }
 
-    /// A peer whose `ready` names `steer_consumed` and `idempotent_input`.
+    /// A peer whose `ready` names `steer_consumed` and `idempotent_input`
+    /// over `spiron.headless/v2`.
     pub struct Spiron;
 
     impl Subject for Spiron {
@@ -46,25 +50,6 @@ mod spiron {
 
     mod capable {
         anyagents_invariants::conformance_suite!(super::Spiron);
-    }
-
-    /// A peer from before those capabilities.
-    pub struct OlderSpiron;
-
-    impl Subject for OlderSpiron {
-        type Harness = SpironHarness;
-        const HARNESS: &'static str = "spiron";
-        const PROTOCOL: &'static str = "spiron-v0";
-        fn launch(fixture: &Fixture, session: Option<&str>) -> SpironHarness {
-            launch(fixture, session)
-        }
-        fn session(harness: &SpironHarness) -> Option<String> {
-            harness.session_id()
-        }
-    }
-
-    mod older {
-        anyagents_invariants::conformance_suite!(super::OlderSpiron);
     }
 
     use anyagents_invariants::conformance::{World, ids};

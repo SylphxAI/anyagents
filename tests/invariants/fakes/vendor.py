@@ -43,7 +43,6 @@ from engine import Engine, drive
 # `PROTOCOLS` map from protocol name to its front end.
 FAMILIES = {
     "spiron": "proto_spiron",
-    "spiron-v0": "proto_spiron",
     "codex": "proto_codex",
     "claude": "proto_claude",
     "muse": "proto_muse",
@@ -52,6 +51,8 @@ FAMILIES = {
     "grok": "proto_grok",
     "omp": "proto_omp",
     "agy": "proto_agy",
+    "acp": "proto_acp",
+    "acp-turn-end": "proto_acp",
 }
 
 

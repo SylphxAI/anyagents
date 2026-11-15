@@ -316,11 +316,16 @@ async fn configured_owner_catalog_controls_mcp_discovery_after_removal() {
         for tool in role_tools {
             let description = tool.description.as_deref().unwrap_or_default();
             assert!(!description.contains("`retired`"), "{state}: {description}");
-            assert_eq!(
-                description.contains("`worker`"),
-                state == "populated",
-                "{state}: {description}"
-            );
+            assert!(description.contains("`general`"), "{state}: {description}");
+            if state == "populated" {
+                assert!(description.contains("`worker`"), "{state}: {description}");
+                assert!(
+                    description.find("`general`").unwrap() < description.find("`worker`").unwrap(),
+                    "{state}: {description}"
+                );
+            } else {
+                assert!(!description.contains("`worker`"), "{state}: {description}");
+            }
         }
     }
 }
@@ -1166,6 +1171,22 @@ async fn mcp_tools_use_the_server_socket() {
     );
     assert_eq!(woken.state, "running");
 
+    let baseline_worker: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({
+                "action": "spawn",
+                "name": "baseline-general"
+            }),
+        )
+        .await,
+    );
+    let default_body = baseline_worker["instructions"].as_str().unwrap();
+    assert!(
+        default_body.starts_with("You are a cohesive end-to-end execution worker."),
+        "{default_body}"
+    );
     for route in ["agents", "subagents"] {
         let worker: serde_json::Value = ok_json(
             call(
@@ -1180,8 +1201,13 @@ async fn mcp_tools_use_the_server_socket() {
             )
             .await,
         );
+        assert_eq!(worker["role"], "general");
+        assert_eq!(worker["scope"], "private");
         assert_eq!(worker["description"], "Public role");
-        assert_eq!(worker["instructions"], "Private instructions");
+        assert_eq!(
+            worker["instructions"],
+            format!("{default_body}\n\nPrivate instructions")
+        );
     }
     let legacy_worker: serde_json::Value = ok_json(
         call(
@@ -1195,8 +1221,13 @@ async fn mcp_tools_use_the_server_socket() {
         )
         .await,
     );
+    assert_eq!(legacy_worker["role"], "general");
+    assert_eq!(legacy_worker["scope"], "private");
     assert_eq!(legacy_worker["description"], "Legacy instructions");
-    assert_eq!(legacy_worker["instructions"], "Legacy instructions");
+    assert_eq!(
+        legacy_worker["instructions"],
+        format!("{default_body}\n\nLegacy instructions")
+    );
 
     alpha.cancel().await.unwrap();
     beta.cancel().await.unwrap();
@@ -1685,12 +1716,12 @@ async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_sn
                 const listed = await workspace.list("src");
                 const execOut = await workspace.exec({ cmd: "printf 'exec-ok'" });
 
-                // 3. Semantic Accessibility Snapshot & STALE_REF guard on tools.computer
-                const snap = await tools.computer.snapshot();
-                const windows = await tools.computer.list_windows();
+                // 3. Semantic Accessibility Snapshot & STALE_REF guard on host tools.computer
+                const snap = await tools.computer.snapshot({ display: ":0" });
+                const windows = await tools.computer.list_windows({ display: ":0" });
                 let staleCaught = false;
                 try {
-                    await tools.computer.click("@e1");
+                    await tools.computer.click({ ref: "@e1", display: ":0" });
                 } catch (err: any) {
                     staleCaught = String(err).includes("STALE_REF") && String(err).includes("stale_ref");
                 }
@@ -2037,4 +2068,139 @@ async fn code_limits_come_from_the_server_environment() {
     );
     alpha.cancel().await.unwrap();
     drop(server);
+}
+
+#[tokio::test]
+async fn mcp_spawn_and_create_default_to_general_and_schema_lists_general_first() {
+    let dir = support::physical_tempdir();
+    let owner = dir.path().join("owner");
+    std::fs::create_dir_all(owner.join(".agents/agents")).unwrap();
+    // Alphabetically earlier roles on disk must still appear after built-in `general`.
+    std::fs::write(
+        owner.join(".agents/agents/assistant.md"),
+        "---\nname: assistant\ndescription: Assistant role\n---\nAssistant body.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        owner.join(".agents/agents/counsel.md"),
+        "---\nname: counsel\ndescription: Counsel role\n---\nCounsel body.\n",
+    )
+    .unwrap();
+
+    let created_alpha = bin()
+        .env("PATH", machine_path(dir.path()))
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "create", "alpha"])
+        .output()
+        .unwrap();
+    assert!(
+        created_alpha.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created_alpha.stderr)
+    );
+    let _server = start_server(dir.path());
+    let alpha = connect_with_owner(dir.path(), "alpha", Some(&owner)).await;
+
+    let tools = alpha.list_all_tools().await.unwrap();
+    let agents_tool = tools.iter().find(|t| t.name == "agents").unwrap();
+    let tool_desc = agents_tool.description.as_deref().unwrap_or_default();
+    assert!(
+        tool_desc.contains("Available roles (`general` is the built-in default): `general`"),
+        "{tool_desc}"
+    );
+    let catalog_start = tool_desc.find("Available roles (").unwrap();
+    let catalog = &tool_desc[catalog_start..];
+    let general_pos = catalog
+        .find("`general`")
+        .unwrap_or_else(|| panic!("{catalog}"));
+    let assistant_pos = catalog
+        .find("`assistant`")
+        .unwrap_or_else(|| panic!("{catalog}"));
+    let counsel_pos = catalog
+        .find("`counsel`")
+        .unwrap_or_else(|| panic!("{catalog}"));
+    assert!(
+        general_pos < assistant_pos && general_pos < counsel_pos,
+        "{catalog}"
+    );
+
+    // Omitted, empty, and explicit `general` all resolve to built-in `general` with `private` scope.
+    let mut expected_default_body: Option<String> = None;
+    for (tool_name, payload) in [
+        (
+            "agents",
+            serde_json::json!({"action": "spawn", "name": "spawn-omitted"}),
+        ),
+        (
+            "agents",
+            serde_json::json!({"action": "spawn", "name": "spawn-empty", "role": ""}),
+        ),
+        (
+            "agents",
+            serde_json::json!({"action": "spawn", "name": "spawn-explicit", "role": "general"}),
+        ),
+        (
+            "spawn",
+            serde_json::json!({"name": "legacy-spawn-empty", "role": ""}),
+        ),
+    ] {
+        let created: serde_json::Value = ok_json(call(&alpha, tool_name, payload).await);
+        assert_eq!(created["role"], "general", "{created:?}");
+        assert_eq!(created["scope"], "private", "{created:?}");
+        let instructions = created["instructions"].as_str().unwrap();
+        if let Some(expected) = &expected_default_body {
+            assert_eq!(instructions, expected, "{created:?}");
+        } else {
+            assert!(
+                instructions.starts_with("You are a cohesive end-to-end execution worker."),
+                "{instructions}"
+            );
+            expected_default_body = Some(instructions.to_string());
+        }
+    }
+
+    // Explicit `public: true` / `public: false` without `scope` is respected on MCP spawn.
+    for (public_flag, expected_scope) in [(true, "public"), (false, "private")] {
+        let flagged: serde_json::Value = ok_json(
+            call(
+                &alpha,
+                "agents",
+                serde_json::json!({
+                    "action": "spawn",
+                    "name": format!("spawn-public-{public_flag}"),
+                    "public": public_flag
+                }),
+            )
+            .await,
+        );
+        assert_eq!(flagged["role"], "general", "{flagged:?}");
+        assert_eq!(flagged["scope"], expected_scope, "{flagged:?}");
+    }
+
+    // Adding `.agents/agents/general.md` overrides the built-in `general` template.
+    std::fs::write(
+        owner.join(".agents/agents/general.md"),
+        "---\nname: general\ndescription: Owner General Override\nscope: public\n---\nOwner general override body.\n",
+    )
+    .unwrap();
+    let overridden: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({"action": "spawn", "name": "spawn-overridden", "workdir": &owner}),
+        )
+        .await,
+    );
+    assert_eq!(overridden["role"], "general");
+    assert_eq!(overridden["scope"], "public");
+    assert_eq!(overridden["description"], "Owner General Override");
+    assert!(
+        overridden["instructions"]
+            .as_str()
+            .is_some_and(|text| text.contains("Owner general override body.")),
+        "{overridden:?}"
+    );
+
+    alpha.cancel().await.unwrap();
 }

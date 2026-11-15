@@ -583,6 +583,7 @@ pub fn describe_cmd(
 pub fn spawn(
     data: &Path,
     name: Option<String>,
+    role: Option<String>,
     harness: Option<String>,
     model: Option<String>,
     profile: Option<String>,
@@ -615,6 +616,7 @@ pub fn spawn(
     };
     let body = serde_json::json!({
         "name": resolved_name,
+        "role": role,
         "harness": harness.unwrap_or_default(),
         "model": model,
         "profile": profile,
@@ -828,7 +830,6 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         }
     }
     if state == "running" {
-        crate::worktree_access::restore_recorded(data, &found.id)?;
         server::clear_explicitly_archived(data, &found.id);
     }
     let agent = store.set_agent_state(&found.id, state)?;
@@ -854,6 +855,8 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     let lifecycle_val = agent.lifecycle().to_string();
     let delivery: crate::api::DeliveryView =
         (&crate::vendor::declared_delivery(&agent.harness)).into();
+    let effective_instructions =
+        crate::create::effective_agent_instructions(Some(&store), data, &agent);
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -886,7 +889,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: "-".to_string(),
         description: public_desc,
-        instructions: agent.instructions,
+        instructions: effective_instructions,
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
@@ -1011,6 +1014,8 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let lifecycle_val = agent.lifecycle().to_string();
     let delivery: crate::api::DeliveryView =
         (&crate::vendor::declared_delivery(&agent.harness)).into();
+    let effective_instructions =
+        crate::create::effective_agent_instructions(Some(&store), data, &agent);
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -1043,7 +1048,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: "-".to_string(),
         description: public_desc,
-        instructions: agent.instructions,
+        instructions: effective_instructions,
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),

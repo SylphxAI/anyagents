@@ -43,10 +43,13 @@ pub fn write_spiron_config(
     Ok(())
 }
 
-/// Strip external Coding Plan provider prefixes (`kimi-code-plan/`,
-/// `glm-code-plan/`, `qwen-token-plan/`, `minimax-code-plan/`) so Spiron sends
-/// the bare provider model ID to the Coding Plan endpoint.
-pub fn strip_coding_plan_prefix(model: &str) -> &str {
+/// Convert an AnyAgents model selector to the model ID Spiron sends upstream.
+/// Remove the gateway namespace and external Coding Plan routing prefixes,
+/// retaining the provider model ID and any effort suffix. Use this for both
+/// config.toml and --model so CLI precedence cannot change routing.
+pub fn normalize_model(model: &str) -> &str {
+    let model = model.trim();
+    let model = model.strip_prefix("sylphx/").unwrap_or(model);
     [
         "kimi-code-plan/",
         "glm-code-plan/",
@@ -58,8 +61,9 @@ pub fn strip_coding_plan_prefix(model: &str) -> &str {
     .unwrap_or(model)
 }
 
-fn coding_plan_provider_for_model(model: Option<&str>) -> Option<&'static str> {
+pub(crate) fn coding_plan_provider_for_model(model: Option<&str>) -> Option<&'static str> {
     let m = model?.trim();
+    let m = m.strip_prefix("sylphx/").unwrap_or(m);
     [
         "kimi-code-plan",
         "glm-code-plan",
@@ -69,7 +73,8 @@ fn coding_plan_provider_for_model(model: Option<&str>) -> Option<&'static str> {
     .into_iter()
     .find(|&provider| {
         m.strip_prefix(provider)
-            .is_some_and(|rest| rest.starts_with('/'))
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|id| !id.trim().is_empty())
     })
 }
 
@@ -99,7 +104,7 @@ fn write_spiron_config_toml(config_dir: &Path, model: Option<&str>) -> Result<()
                             | "plan_mode"
                             | "compaction_threshold"
                     )
-                    || (k == "model" && model.map(str::trim).is_none_or(str::is_empty))
+                    || (k == "model" && model.map(normalize_model).is_none_or(str::is_empty))
                 {
                     preserved_lines.push(trimmed.to_string());
                 }
@@ -121,8 +126,7 @@ fn write_spiron_config_toml(config_dir: &Path, model: Option<&str>) -> Result<()
     {
         out.push_str(&format!("sylphx_ai_url = {escaped}\n"));
     }
-    if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
-        let normalized = strip_coding_plan_prefix(m.strip_prefix("sylphx/").unwrap_or(m));
+    if let Some(normalized) = model.map(normalize_model).filter(|s| !s.is_empty()) {
         let escaped =
             serde_json::to_string(normalized).map_err(|e| Error::Message(e.to_string()))?;
         out.push_str(&format!("model = {escaped}\n"));
@@ -135,7 +139,8 @@ fn write_spiron_config_toml(config_dir: &Path, model: Option<&str>) -> Result<()
 fn model_provider_prefix(model: Option<&str>) -> Option<&str> {
     let m = model?.trim();
     let (prefix, rest) = m.split_once('/')?;
-    (!prefix.is_empty() && !rest.is_empty()).then_some(prefix)
+    (!prefix.is_empty() && !rest.trim().is_empty() && !normalize_model(m).is_empty())
+        .then_some(prefix)
 }
 
 fn discover_seat_gateway_url_for_model(config_dir: &Path, model: Option<&str>) -> Option<String> {
@@ -363,6 +368,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_normalized_model_preserves_existing_config() {
+        for input in [
+            "sylphx/",
+            "kimi-code-plan/",
+            "   ",
+            " sylphx/kimi-code-plan/ ",
+        ] {
+            assert_eq!(normalize_model(input), "");
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("config.toml");
+            assert_eq!(coding_plan_provider_for_model(Some(input)), None);
+            std::fs::write(
+                &config,
+                "model = \"existing/model\"\nsylphx_ai_url = \"https://existing.example/v1\"\n",
+            )
+            .unwrap();
+            let auth = br#"{"access_token":"existing-token"}"#;
+            std::fs::write(dir.path().join("auth.json"), auth).unwrap();
+            std::fs::write(dir.path().join("opencode.json"), br#"{"provider":{"kimi-code-plan":{"options":{"baseURL":"https://other.example/v1"}}}}"#).unwrap();
+            std::fs::create_dir_all(dir.path().join(".config/opencode")).unwrap();
+            std::fs::write(
+                dir.path().join(".config/opencode/kimi-code-plan.key"),
+                "other-token",
+            )
+            .unwrap();
+            write_spiron_config(dir.path(), Some(input), Path::new("anyagents"), &[]).unwrap();
+            assert_eq!(std::fs::read(dir.path().join("auth.json")).unwrap(), auth);
+            let text = std::fs::read_to_string(config).unwrap();
+            assert!(text.contains("https://existing.example/v1"), "{text}");
+            assert!(!text.contains("https://other.example/v1"), "{text}");
+            assert!(text.contains("model = \"existing/model\""), "{text}");
+            assert!(!text.contains("model = \"\""), "{text}");
+        }
+        assert_eq!(
+            coding_plan_provider_for_model(Some(" sylphx/kimi-code-plan/model#max ")),
+            Some("kimi-code-plan")
+        );
+    }
+
+    #[test]
+    fn config_and_cli_share_model_normalization() {
+        for (selector, expected) in [
+            ("sylphx/openai/gpt-6.1-sol#high", "openai/gpt-6.1-sol#high"),
+            ("openai/gpt-6.1-sol#high", "openai/gpt-6.1-sol#high"),
+            ("kimi-code-plan/k3.1-pro#max", "k3.1-pro#max"),
+            ("glm-code-plan/glm-5#high", "glm-5#high"),
+            ("qwen-token-plan/qwen3-coder", "qwen3-coder"),
+            ("minimax-code-plan/MiniMax-M3", "MiniMax-M3"),
+            ("sylphx/kimi-code-plan/k3.1-pro#max", "k3.1-pro#max"),
+            ("custom/provider/model#high", "custom/provider/model#high"),
+            ("model", "model"),
+        ] {
+            assert_eq!(normalize_model(selector), expected);
+            let temp = tempfile::tempdir().unwrap();
+            write_spiron_config_toml(temp.path(), Some(selector)).unwrap();
+            let raw = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+            assert!(
+                raw.contains(&format!("model = {expected:?}")),
+                "{selector}: {raw}"
+            );
+        }
+    }
+
+    #[test]
     fn ensure_spiron_seat_auth_prefers_project_key_over_org_wide_credentials_and_heals_stale_auth()
     {
         let temp = tempfile::tempdir().unwrap();
@@ -438,7 +507,7 @@ mod tests {
 
         write_spiron_config(
             cfg,
-            Some("kimi-code-plan/k3.1-pro#max"),
+            Some("sylphx/kimi-code-plan/k3.1-pro#max"),
             Path::new("/usr/bin/anyagents"),
             &["mcp".to_string()],
         )
@@ -449,6 +518,11 @@ mod tests {
         let auth_kimi: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(cfg.join("auth.json")).unwrap()).unwrap();
         assert_eq!(auth_kimi["access_token"], "sk_kimi_222");
+        for mirror in [".spiron/auth.json", ".config/sylphx/auth.json"] {
+            let mirrored: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(cfg.join(mirror)).unwrap()).unwrap();
+            assert_eq!(mirrored, auth_kimi);
+        }
     }
     #[test]
     fn write_spiron_config_resolves_vendor_neutral_provider_gateway_and_key() {

@@ -140,8 +140,6 @@ pub(crate) struct Launching<'a> {
 
 /// Launch a v2 Spiron that listens on `<config dir>/spiron.sock` and
 /// outlives this server, attach, and record the launch.
-/// [`ListenError::NotV2`]: the binary speaks v1 only, and is launched as
-/// before.
 pub(crate) fn launch(
     spiron: SpironLaunch,
     applied: Vec<String>,
@@ -151,12 +149,11 @@ pub(crate) fn launch(
     // The agent's config directory: the server and the agent's seat reach it.
     let socket = spiron.state_dir.join("spiron.sock");
     if socket.as_os_str().len() > SOCKET_PATH_MAX {
-        eprintln!(
-            "anyagents-spiron: {} is too long for a Unix socket; {} runs over stdio",
-            socket.display(),
-            at.agent
-        );
-        return Err(ListenError::NotV2);
+        return Err(ListenError::Failed(format!(
+            "Unix socket path for {} exceeds {SOCKET_PATH_MAX} bytes: {}",
+            at.agent,
+            socket.display()
+        )));
     }
     let seat = spiron
         .environment

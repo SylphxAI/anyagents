@@ -22,11 +22,6 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      takeover:
-        description: Run the real Chromium takeover interaction acceptance
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -101,7 +96,7 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_release_admission.py' -v
       - name: Deploy build policy
         run: python3 -m unittest discover -s tests -p 'test_deploy_build.py' -v
-      - name: Browser fixture tests
+      - name: npm package tests
         run: npm test
       - name: Build harness helper binaries
         run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
@@ -110,34 +105,21 @@ jobs:
           # The browser jail's acceptance fails, never skips, without Landlock.
           ANYAGENTS_REQUIRE_LANDLOCK_TEST: '1'
         run: cargo test --workspace --locked
-      - name: Takeover interaction acceptance
-        if: github.event_name == 'workflow_dispatch' && inputs.takeover && github.event.repository.visibility == 'public'
-        env:
-          TAKEOVER_EVIDENCE_DIR: ${{ runner.temp }}/takeover-evidence
-          ANYAGENTS_CHROMIUM_BIN: /usr/bin/google-chrome
+      # A real desktop session: headless Wayland (sway), the VNC server behind
+      # takeover (wayvnc) and the runner's Chrome, driven through the browser
+      # and computer tools. It also proves an existing profile opens with its
+      # cookies and local storage.
+      - name: Desktop packages
         run: |
-          set -euo pipefail
-          node --version
-          "$ANYAGENTS_CHROMIUM_BIN" --version
-          cargo test -p anyagents --bin anyagents --locked \
-            browser::tests::mobile_takeover_ui_acceptance -- --ignored --exact --nocapture
-          cargo test -p anyagents --bin anyagents --locked \
-            browser::tests::takeover_clipboard_ui_acceptance -- --ignored --exact --nocapture
-          cargo test -p anyagents --bin anyagents --locked \
-            browser::tests::takeover_focus_finds_cross_origin_input -- --ignored --exact --nocapture
-          cargo test -p anyagents --bin anyagents --locked \
-            releases_held_press -- --ignored --nocapture
-          cargo test -p anyagents --bin anyagents --locked \
-            browser::tests::takeover_cancel_survives_earlier_stopped_pointerdown -- --ignored --exact --nocapture
-      - name: Takeover acceptance evidence
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.takeover && github.event.repository.visibility == 'public'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: takeover-evidence
-          path: ${{ runner.temp }}/takeover-evidence
-          if-no-files-found: error
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends sway wayvnc fonts-dejavu-core
+      - name: Desktop session (headful)
+        env:
+          ANYAGENTS_DESKTOP_HEADFUL: '1'
+          ANYAGENTS_CHROMIUM_BIN: /usr/bin/google-chrome
+        run: cargo test -p anyagents --bin anyagents --locked workstation::headful_tests -- --nocapture
 
-      # Same public Linux sudo lane as the cross-UID worktree acceptance.
+      # Same public Linux sudo lane as the cross-seat repository acceptance.
       # This is required: missing privilege, identity change or setpriv fails.
       - name: Host memory managed-UID admission
         run: |
@@ -157,13 +139,25 @@ jobs:
             cat "$RUNNER_TEMP/host-memory-seat-receipt.json"
           fi
 
-      - name: Cross-seat worktree writes
+      - name: Privileged config ACL acceptance
+        run: |
+          set -euo pipefail
+          cargo test -p anyagents --bin anyagents --locked --no-run --message-format=json > "$RUNNER_TEMP/config-acl-build.json"
+          test_binary=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/config-acl-build.json")
+          test_name=seat_tree::privileged_config_tests::privileged_config_acl_cross_uid
+          # A missing module/test must not become a successful zero-test run.
+          "$test_binary" --ignored --exact "$test_name" --list | grep -Fx "$test_name: test"
+          sudo env LC_ALL=C ANYAGENTS_REQUIRE_CONFIG_ACL_TEST=1 ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST=1 /usr/bin/setpriv --bounding-set=-dac_override,-dac_read_search -- "$test_binary" --ignored --exact "$test_name" --nocapture 2>&1 | tee "$RUNNER_TEMP/config-acl-test.log"
+          grep -Fx 'CONFIG_ACL_PRIVILEGED_ACCEPTANCE_EXECUTED' "$RUNNER_TEMP/config-acl-test.log"
+
+      - name: Cross-seat repositories
         run: |
           set -euo pipefail
           cargo test -p anyagents --bin anyagents --locked --no-run --message-format=json > "$RUNNER_TEMP/worktree-test-build.json"
           test_binary=$(python3 -c 'import json,sys; artifacts=[a for line in open(sys.argv[1]) if (a:=json.loads(line)).get("reason")=="compiler-artifact" and a.get("target",{}).get("name")=="anyagents" and a.get("profile",{}).get("test") and a.get("executable")]; assert len(artifacts)==1; print(artifacts[0]["executable"])' "$RUNNER_TEMP/worktree-test-build.json")
-          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact create::tests::privileged_cross_uid_spawn_can_create_commit_and_status --nocapture
-          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact worktree::tests::privileged_pool_seat_workflow_receipt --nocapture
+          # Two seat uids, each committing and pushing in its own repository
+          # over one pool, neither able to read the other's Git directory.
+          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact repo::tests::privileged_seats_own_their_repositories --nocapture
           # A file the server opens for a seat is opened by that seat.
           sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact seat_tree::tests::privileged_seat_open_refuses_what_the_seat_cannot_read --nocapture
 
@@ -186,8 +180,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Browser fixture cleanup
-        run: node --test tests/browser-process-group.test.mjs
       - name: Build harness helper binaries
         run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
       - name: Test

@@ -136,7 +136,7 @@ fn seat_file_program() -> io::Result<(PathBuf, Vec<&'static str>)> {
 #[cfg(test)]
 fn seat_file_program() -> io::Result<(PathBuf, Vec<&'static str>)> {
     Ok((
-        crate::worktree_access::seat_executable_test_harness()?,
+        crate::repo::seat_executable_test_harness()?,
         vec![
             "--exact",
             "seat_tree::tests::seat_file_worker",
@@ -187,8 +187,10 @@ fn seat_file_command(
 ///
 /// - `inode <mode> [<gid>]`: give standard input's inode group `gid`, then
 ///   octal `mode`.
-/// - `op-dir`: mode 0700 on standard input's directory, then 0600 on its
-///   `config` when that is a regular file.
+/// - `op-dir`: strip access/default ACLs, mode 0700 on standard input's
+///   directory and 0600 on each single-link regular file; reject other entries.
+/// - `config-acl <seat> <daemon> <mode> <inherit>`: install exact principal
+///   ACLs on the input inode, with a default ACL when `inherit` is `1`.
 /// - `copy <name>`: create `./<name>` (0660, never over an existing name),
 ///   copy standard input into it and fsync it.
 /// - `readback <name>`: succeed only when `./<name>` holds exactly the bytes
@@ -205,7 +207,7 @@ pub(crate) fn seat_file_main(args: &[OsString]) -> std::process::ExitCode {
         eprintln!(
             "usage: anyagents internal seat-file inode <mode> [<gid>] | op-dir | \
              copy <name> | readback <name> | unlink <name> | open <path> | create <path> | \
-             kill <pid>"
+             kill <pid> | config-acl <seat> <daemon> <mode> <inherit>"
         );
         std::process::ExitCode::from(2)
     };
@@ -221,6 +223,21 @@ pub(crate) fn seat_file_main(args: &[OsString]) -> std::process::ExitCode {
         (Some("inode"), [mode, gid]) => {
             match (parse_mode(mode), gid.to_str().and_then(|g| g.parse().ok())) {
                 (Some(mode), Some(gid)) => set_inode(input, Some(gid), mode),
+                _ => return usage(),
+            }
+        }
+        (Some("config-acl"), [uid, daemon, mode, inherit]) => {
+            match (
+                uid.to_str().and_then(|v| v.parse().ok()),
+                daemon.to_str().and_then(|v| v.parse().ok()),
+                parse_mode(mode),
+                inherit.to_str(),
+            ) {
+                (Some(uid), Some(daemon), Some(mode), Some(inherit @ ("0" | "1"))) =>
+                {
+                    #[allow(clippy::unnecessary_cast, reason = "mode_t differs across platforms")]
+                    config_acl(input, uid, daemon, mode as u32, inherit == "1")
+                }
                 _ => return usage(),
             }
         }
@@ -313,25 +330,49 @@ fn set_inode(fd: BorrowedFd<'_>, gid: Option<libc::gid_t>, mode: libc::mode_t) -
     }
 }
 
+/// chmod alone leaves a default ACL behind: future private files would inherit
+/// named readers. Remove both ACLs through the pinned descriptor first.
+#[cfg(target_os = "linux")]
+fn clear_private_acl(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let path =
+        CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(io::Error::other)?;
+    for name in [c"system.posix_acl_default", c"system.posix_acl_access"] {
+        if unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) } != 0 {
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::ENOTSUP)) {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn clear_private_acl(_fd: BorrowedFd<'_>) -> io::Result<()> {
+    Ok(())
+}
+
 fn tighten_op_dir(dir: BorrowedFd<'_>) -> io::Result<()> {
+    use std::os::fd::AsFd as _;
+    clear_private_acl(dir)?;
     set_inode(dir, None, 0o700)?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let found = unsafe {
-        libc::fstatat(
-            dir.as_raw_fd(),
-            c"config".as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } == 0;
-    if !found || unsafe { stat.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return Ok(());
+    // Owner helpers receive O_PATH descriptors for initially inaccessible dirs.
+    #[cfg(target_os = "linux")]
+    let directory = File::open(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
+    #[cfg(not(target_os = "linux"))]
+    let directory = File::from(dir.try_clone_to_owned()?);
+    for name in names(&directory)? {
+        let file = open_child(&directory, &name, false)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(io::Error::other(
+                "private config requires single-link regular files",
+            ));
+        }
+        clear_private_acl(file.as_fd())?;
+        set_inode(file.as_fd(), None, 0o600)?;
     }
-    if unsafe { libc::fchmodat(dir.as_raw_fd(), c"config".as_ptr(), 0o600, 0) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    Ok(())
 }
 
 fn copy_into(source: BorrowedFd<'_>, name: &OsStr) -> io::Result<()> {
@@ -390,6 +431,9 @@ pub(crate) fn open_regular_file(path: &Path, create: bool) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut options = std::fs::OpenOptions::new();
     if create {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
         options.write(true).create(true).truncate(true).mode(0o644);
     } else {
         options.read(true);
@@ -687,6 +731,148 @@ fn open_as_seat_within(
     }
 }
 
+/// Install a Linux POSIX ACL on the bound inode, not its replaceable pathname.
+/// Named users are retained even when equal to today's owner: inherited files
+/// may be created by either principal. No unrelated group or other gets access.
+#[cfg(target_os = "linux")]
+fn config_acl(
+    fd: BorrowedFd<'_>,
+    uid: u32,
+    daemon: u32,
+    mode: u32,
+    inherit: bool,
+) -> io::Result<()> {
+    let file = File::from(fd.try_clone_to_owned()?);
+    let meta = file.metadata()?;
+    if !meta.is_dir() && (!meta.is_file() || meta.nlink() != 1) {
+        return Err(io::Error::other(
+            "config ACL requires a directory or single-link file",
+        ));
+    }
+    let seat = ((mode >> 3) & 7) as u16;
+    let owner = ((mode >> 6) & 7) as u16;
+    let mut users = std::collections::BTreeMap::new();
+    users.insert(uid, seat);
+    // A capability is read-only for the seat; its daemon owner already has
+    // write authority and a named writer must not widen the ACL mask.
+    users.insert(daemon, if seat & 2 != 0 { owner } else { seat });
+    let mut bytes = 2u32.to_le_bytes().to_vec();
+    let mut entry = |tag: u16, perm: u16, id: u32| {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&perm.to_le_bytes());
+        bytes.extend_from_slice(&id.to_le_bytes());
+    };
+    entry(1, owner, u32::MAX);
+    for (id, perm) in users {
+        entry(2, perm, id);
+    }
+    entry(4, seat, u32::MAX);
+    entry(16, seat, u32::MAX);
+    entry(32, 0, u32::MAX);
+    // setxattr through procfs also handles O_PATH; the open descriptor pins
+    // the object across rename/symlink swaps, and the type was checked above.
+    let path =
+        CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(io::Error::other)?;
+    for name in [c"system.posix_acl_access", c"system.posix_acl_default"]
+        .into_iter()
+        .take(if inherit { 2 } else { 1 })
+    {
+        // An admitted non-owner may already have the exact grant. Avoid an
+        // unnecessary owner-helper launch (or EPERM) for an idempotent repair.
+        let mut existing = vec![0u8; bytes.len()];
+        let length = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                existing.as_mut_ptr().cast(),
+                existing.len(),
+            )
+        };
+        if length == bytes.len() as isize && existing == bytes {
+            continue;
+        }
+        if unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut actual = vec![0u8; bytes.len()];
+        let length = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                actual.as_mut_ptr().cast(),
+                actual.len(),
+            )
+        };
+        if length < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if length as usize != bytes.len() || actual != bytes {
+            return Err(io::Error::other("config ACL read-back mismatch"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn config_acl(
+    _fd: BorrowedFd<'_>,
+    _uid: u32,
+    _daemon: u32,
+    _mode: u32,
+    _inherit: bool,
+) -> io::Result<()> {
+    Ok(())
+}
+
+fn grant_config_acl(file: &File, uid: u32, gid: u32, mode: u32) -> io::Result<()> {
+    use std::os::fd::AsFd as _;
+    let daemon = super::sandbox::server_uid();
+    let meta = file.metadata()?;
+    let inherit = meta.is_dir();
+    match config_acl(file.as_fd(), uid, daemon, mode, inherit) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if super::sandbox::is_isolated_test_env()
+                && std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_none()
+            {
+                return Err(error);
+            }
+            let Some(launcher) = super::sandbox::descriptor_launcher() else {
+                return Err(error);
+            };
+            let mut command = seat_file_command(
+                &launcher,
+                meta.uid(),
+                meta.gid(),
+                &format!("{},{gid}", meta.gid()),
+            )?;
+            command
+                .args([
+                    "config-acl",
+                    &uid.to_string(),
+                    &daemon.to_string(),
+                    &format!("{mode:o}"),
+                    if inherit { "1" } else { "0" },
+                ])
+                .stdin(file.try_clone()?);
+            run_seat_command(&mut command, "seat-config-acl")
+        }
+    }
+}
+
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "mode_t is u16 on macOS and u32 on Linux"
+)]
 fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool) -> io::Result<()> {
     let meta = file.metadata()?;
     if !meta.is_dir() && (!meta.is_file() || meta.nlink() != 1) {
@@ -719,13 +905,21 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool)
         reason = "MetadataExt::mode is u32 while libc::mode_t is u16 on macOS"
     )]
     if meta.gid() == gid && (meta.mode() as libc::mode_t & 0o7777) == mode {
-        return Ok(());
+        return if daemon_access {
+            grant_config_acl(file, uid, gid, mode as u32)
+        } else {
+            Ok(())
+        };
     }
     let fd = file.as_raw_fd();
     let group_ok = meta.gid() == gid || unsafe { libc::fchown(fd, u32::MAX, gid) } == 0;
     let mode_ok = unsafe { libc::fchmod(fd, mode) } == 0;
     if group_ok && mode_ok {
-        return Ok(());
+        return if daemon_access {
+            grant_config_acl(file, uid, gid, mode as u32)
+        } else {
+            Ok(())
+        };
     }
     let mut repair_error = None;
     // Retain the configured owner's existing ability to repair a shared group,
@@ -744,7 +938,13 @@ fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool)
             .args(["inode", &format!("{mode:o}"), &gid.to_string()])
             .stdin(file.try_clone()?);
         match run_seat_command(&mut command, "seat-inode") {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                return if daemon_access {
+                    grant_config_acl(file, uid, gid, mode as u32)
+                } else {
+                    Ok(())
+                };
+            }
             Err(error) => repair_error = Some(error),
         }
     }
@@ -1017,6 +1217,7 @@ fn migrate_open_file(
 struct ShareAccess {
     daemon_access: bool,
     runtime_tree: bool,
+    brain_tree: bool,
 }
 
 pub(super) fn share(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
@@ -1058,15 +1259,20 @@ pub(super) fn share_config(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
             {
                 return Err(io::Error::last_os_error());
             }
+            let stat = unsafe { stat.assume_init() };
+            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                return Err(io::Error::other("config root must be a directory"));
+            }
             inaccessible_child(
                 &parent,
                 name,
                 uid,
                 gid,
-                &unsafe { stat.assume_init() },
+                &stat,
                 ShareAccess {
                     daemon_access: true,
                     runtime_tree: false,
+                    brain_tree: false,
                 },
             )?
             .ok_or_else(|| io::Error::other("config root repair did not grant daemon access"))?
@@ -1081,127 +1287,59 @@ pub(super) fn share_config(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
         ShareAccess {
             daemon_access: true,
             runtime_tree: false,
+            brain_tree: false,
         },
         &mut |_, _| {},
     )
 }
 
-fn tighten_private_inode(
-    file: &File,
-    meta: &std::fs::Metadata,
-    uid: u32,
-    gid: u32,
-    mode: libc::mode_t,
-) -> io::Result<()> {
-    if meta.uid() != uid {
-        return Ok(());
-    }
-    #[allow(
-        clippy::unnecessary_cast,
-        reason = "MetadataExt::mode is u32 while libc::mode_t is u16 on macOS"
-    )]
-    if (meta.mode() as libc::mode_t & 0o7777) == mode {
-        return Ok(());
-    }
-    if unsafe { libc::fchmod(file.as_raw_fd(), mode) } == 0 {
-        return Ok(());
-    }
-    if (!super::sandbox::is_isolated_test_env()
-        || std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_some())
-        && let Some(launcher) = super::sandbox::descriptor_launcher()
-    {
-        let status = seat_file_command(
-            &launcher,
-            meta.uid(),
-            meta.gid(),
-            &format!("{},{gid}", meta.gid()),
-        )?
-        .args(["inode", &format!("{mode:o}")])
-        .stdin(file.try_clone()?)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-        if status.success() {
-            return Ok(());
-        }
-    }
-    Ok(())
-}
-
-fn tighten_private_op_dir(parent: &File, name: &OsStr, uid: u32, gid: u32) -> io::Result<()> {
-    match open_child(parent, name, true) {
-        Ok(op_dir) => {
-            let meta = op_dir.metadata()?;
-            if !meta.is_dir() {
-                return Ok(());
-            }
-            for child_name in names(&op_dir).unwrap_or_default() {
-                if let Ok(child) = open_child(&op_dir, &child_name, false)
-                    && let Ok(cmeta) = child.metadata()
-                    && cmeta.is_file()
-                    && cmeta.nlink() == 1
-                {
-                    let _ = tighten_private_inode(&child, &cmeta, uid, gid, 0o600);
-                } else {
-                    #[cfg(target_os = "linux")]
-                    if let Ok(c_child) = CString::new(child_name.as_bytes()) {
-                        let fd = unsafe {
-                            libc::openat(
-                                op_dir.as_raw_fd(),
-                                c_child.as_ptr(),
-                                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                            )
-                        };
-                        if fd >= 0 {
-                            let bound = unsafe { File::from_raw_fd(fd) };
-                            if let Ok(cmeta) = bound.metadata()
-                                && cmeta.is_file()
-                                && cmeta.nlink() == 1
-                            {
-                                let _ = tighten_private_inode(&bound, &cmeta, uid, gid, 0o600);
-                            }
-                        }
-                    }
-                }
-            }
-            let _ = tighten_private_inode(&op_dir, &meta, uid, gid, 0o700);
-        }
+fn tighten_private_op_dir(directory: &File, name: &OsStr, uid: u32, gid: u32) -> io::Result<()> {
+    use std::os::fd::AsFd as _;
+    let op_dir = match open_child(directory, name, true) {
+        Ok(file) => file,
         #[cfg(target_os = "linux")]
-        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-            let c_name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
             let fd = unsafe {
                 libc::openat(
-                    parent.as_raw_fd(),
-                    c_name.as_ptr(),
-                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };
-            if fd >= 0 {
-                let bound = unsafe { File::from_raw_fd(fd) };
-                if let Ok(meta) = bound.metadata()
-                    && meta.is_dir()
-                    && meta.uid() == uid
-                    && (!super::sandbox::is_isolated_test_env()
-                        || std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_some())
-                    && let Some(launcher) = super::sandbox::descriptor_launcher()
-                {
-                    let _ = seat_file_command(
-                        &launcher,
-                        meta.uid(),
-                        meta.gid(),
-                        &format!("{},{gid}", meta.gid()),
-                    )?
-                    .arg("op-dir")
-                    .stdin(bound.try_clone()?)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-                }
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
             }
+            unsafe { File::from_raw_fd(fd) }
         }
-        Err(_) => {}
+        Err(error) => return Err(error),
+    };
+    let meta = op_dir.metadata()?;
+    // A foreign owner's private directory must never be changed by this grant.
+    if meta.uid() != uid && meta.uid() != super::sandbox::server_uid() {
+        return Err(io::Error::other("private config has an unrelated owner"));
     }
-    Ok(())
+    match tighten_op_dir(op_dir.as_fd()) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if super::sandbox::is_isolated_test_env()
+                && std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_none()
+            {
+                return Err(error);
+            }
+            let Some(launcher) = super::sandbox::descriptor_launcher() else {
+                return Err(error);
+            };
+            let mut command = seat_file_command(
+                &launcher,
+                meta.uid(),
+                meta.gid(),
+                &format!("{},{gid}", meta.gid()),
+            )?;
+            command.arg("op-dir").stdin(op_dir);
+            run_seat_command(&mut command, "seat-private-config")
+        }
+    }
 }
 
 fn share_open(
@@ -1243,6 +1381,8 @@ fn share_open(
             continue;
         }
         if !access.runtime_tree
+            && !(access.daemon_access
+                && (text == "brain" || (access.brain_tree && text == ".system_generated")))
             && (matches!(
                 text.as_ref(),
                 ".ssh"
@@ -1253,8 +1393,6 @@ fn share_open(
                     | ".next"
                     | "target"
                     | ".git"
-                    | "data-home"
-                    | "state-home"
                     | ".cargo"
                     | ".rustup"
                     | "brain"
@@ -1273,7 +1411,7 @@ fn share_open(
             && text == "op"
             && (path.ends_with(".config") || path.ends_with("config-home"))
         {
-            let _ = tighten_private_op_dir(&directory, &name, uid, gid);
+            tighten_private_op_dir(&directory, &name, uid, gid)?;
             continue;
         }
         let c_name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
@@ -1297,7 +1435,12 @@ fn share_open(
         // Runtime scratch/cache trees need the same admitted seat grant after
         // an execution-identity handoff. Do not mutate a foreign owner's tree.
         let access = ShareAccess {
-            runtime_tree: access.runtime_tree || matches!(text.as_ref(), "cache-home" | "tmp"),
+            runtime_tree: access.runtime_tree
+                || matches!(
+                    text.as_ref(),
+                    "cache-home" | "tmp" | "data-home" | "state-home"
+                ),
+            brain_tree: access.brain_tree || (access.daemon_access && text == "brain"),
             ..access
         };
         if access.runtime_tree && stat.st_uid != super::sandbox::server_uid() && stat.st_uid != uid
@@ -1643,6 +1786,69 @@ mod tests {
         assert_eq!(std::fs::metadata(&op_cfg).unwrap().mode() & 0o777, 0o600);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_acl_inherits_explicit_principals_into_runtime_output() {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        fn acl(path: &Path, name: &std::ffi::CStr) -> Vec<u8> {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let mut bytes = vec![0u8; 256];
+            let size = unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            assert!(size > 0, "ACL read failed: {}", io::Error::last_os_error());
+            bytes.truncate(size as usize);
+            bytes
+        }
+        fn named(bytes: &[u8], uid: u32) -> Option<u16> {
+            bytes[4..].as_chunks::<8>().0.iter().find_map(|entry| {
+                let tag = u16::from_le_bytes(entry[..2].try_into().unwrap());
+                let id = u32::from_le_bytes(entry[4..].try_into().unwrap());
+                (tag == 2 && id == uid).then(|| u16::from_le_bytes(entry[2..4].try_into().unwrap()))
+            })
+        }
+        let temp = crate::test_tempdir();
+        let config = temp.path().join("config");
+        let brain = config.join(".gemini/antigravity-cli/brain/task");
+        std::fs::create_dir_all(&brain).unwrap();
+        let executable = config.join(".local/opt/node/bin/node");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"#!/bin/sh").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let daemon = crate::sandbox::server_uid();
+        let seat = if daemon == 12345 { 12346 } else { 12345 };
+        share_config(&config, seat, crate::sandbox::server_gid()).unwrap();
+        assert_eq!(
+            named(&acl(&executable, c"system.posix_acl_access"), daemon),
+            Some(7)
+        );
+        assert_eq!(
+            named(&acl(&executable, c"system.posix_acl_access"), seat),
+            Some(7)
+        );
+        assert_eq!(
+            named(&acl(&brain, c"system.posix_acl_default"), daemon),
+            Some(7)
+        );
+        let output = brain.join("output.txt");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o666)
+            .open(&output)
+            .unwrap();
+        let inherited = acl(&output, c"system.posix_acl_access");
+        assert_eq!(named(&inherited, daemon), Some(7));
+        assert_eq!(named(&inherited, seat), Some(7));
+        assert_eq!(std::fs::metadata(&output).unwrap().mode() & 0o777, 0o660);
+        assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o007, 0);
+    }
+
     #[test]
     fn config_sharing_never_changes_symlink_targets_or_hardlinked_private_files() {
         use std::os::unix::fs::PermissionsExt;
@@ -1690,6 +1896,7 @@ mod tests {
             ShareAccess {
                 daemon_access: true,
                 runtime_tree: false,
+                brain_tree: false,
             },
             &mut |parent, name| {
                 if name == "nested" {
@@ -1915,7 +2122,7 @@ mode=ok
 if [ -f "$here/mode" ]; then read -r mode < "$here/mode"; fi
 op=
 for arg do
-  case $arg in copy|readback|unlink|inode|op-dir) op=$arg ;; esac
+  case $arg in copy|readback|unlink|inode|op-dir|config-acl) op=$arg ;; esac
   name=$arg
 done
 if [ "$mode" = fail_copy_after_touch ] && [ "$op" = copy ]; then
@@ -2191,7 +2398,7 @@ exec "$@"
     #[cfg(target_os = "linux")]
     fn recording_launcher(dir: &Path) -> PathBuf {
         let launcher = dir.join("recording-launcher.sh");
-        crate::worktree::tests::write_executable(
+        crate::repo::tests::write_executable(
             &launcher,
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0%/*}/launcher-args\"\n\
              while [ \"$#\" -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n",
@@ -2252,6 +2459,18 @@ exec "$@"
         let out = temp.path().join("out.png");
         open(&out, true).unwrap().write_all(b"written").unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"written");
+        let screenshot = temp.path().join("sessions/screenshots/shot.png");
+        assert!(!screenshot.parent().unwrap().exists());
+        open(&screenshot, true)
+            .unwrap()
+            .write_all(b"screenshot")
+            .unwrap();
+        let mut content = Vec::new();
+        open(&screenshot, false)
+            .unwrap()
+            .read_to_end(&mut content)
+            .unwrap();
+        assert_eq!(content, b"screenshot");
         assert!(open(&temp.path().join("link"), true).is_err());
         assert_eq!(std::fs::read(&secret).unwrap(), b"operator-secret");
     }
@@ -2263,7 +2482,7 @@ exec "$@"
     fn a_seat_that_hands_back_nothing_opens_nothing() {
         let temp = crate::test_tempdir();
         let launcher = temp.path().join("silent.sh");
-        crate::worktree::tests::write_executable(&launcher, "#!/bin/sh\nexit 0\n");
+        crate::repo::tests::write_executable(&launcher, "#!/bin/sh\nexit 0\n");
         let file = temp.path().join("f");
         std::fs::write(&file, b"x").unwrap();
         let error = open_as_seat(&launcher, 42001, 42002, "42002", &file, false)
@@ -2271,7 +2490,7 @@ exec "$@"
             .to_string();
         assert!(error.contains("without one opened file"), "{error}");
         let launcher = temp.path().join("denying.sh");
-        crate::worktree::tests::write_executable(&launcher, "#!/bin/sh\necho denied >&2\nexit 3\n");
+        crate::repo::tests::write_executable(&launcher, "#!/bin/sh\necho denied >&2\nexit 3\n");
         let error = open_as_seat(&launcher, 42001, 42002, "42002", &file, false)
             .unwrap_err()
             .to_string();
@@ -2289,7 +2508,7 @@ exec "$@"
     fn a_stopped_seat_helper_never_pins_the_caller() {
         let temp = crate::test_tempdir();
         let launcher = temp.path().join("stopping.sh");
-        crate::worktree::tests::write_executable(&launcher, "#!/bin/sh\nkill -STOP $$\nexit 0\n");
+        crate::repo::tests::write_executable(&launcher, "#!/bin/sh\nkill -STOP $$\nexit 0\n");
         let file = temp.path().join("f");
         std::fs::write(&file, b"x").unwrap();
         let started = std::time::Instant::now();
@@ -2330,7 +2549,7 @@ exec "$@"
     fn a_held_stderr_and_a_full_reaper_never_pin_the_caller() {
         let temp = crate::test_tempdir();
         let launcher = temp.path().join("holding.sh");
-        crate::worktree::tests::write_executable(
+        crate::repo::tests::write_executable(
             &launcher,
             "#!/bin/sh\n/bin/sleep 30 </dev/null >/dev/null &\necho denied >&2\nexit 3\n",
         );
@@ -2510,3 +2729,7 @@ exec "$@"
         );
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "seat_config_acl_tests.rs"]
+mod privileged_config_tests;

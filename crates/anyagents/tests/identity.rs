@@ -1405,6 +1405,8 @@ fn agent_group_cli_mutations_refuse_offline_database_fallback() {
             ])
             .env("ANYAGENTS_AGENT_ID", agent.id.as_str())
             .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+            // No server ever runs here: the restart wait is not under test.
+            .env("ANYAGENTS_RECONNECT_WAIT_MS", "200")
             .output()
             .unwrap();
         assert!(!output.status.success(), "unexpected {action} success");

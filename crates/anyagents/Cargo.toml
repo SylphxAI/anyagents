@@ -32,7 +32,7 @@ clap = { version = "4", features = ["derive"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 futures = "0.3"
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
 libc = "0.2"
 rmcp = { version = "3.5", features = [
     "client",
@@ -54,6 +54,17 @@ ureq = { version = "3", features = ["json"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 roxmltree = "0.21"
 
+# Desktop sessions (headless Wayland) exist on Linux only; other hosts answer
+# session calls with a typed `UNSUPPORTED` error.
+#
+# Pinned by git revision (agent-workstation 0.2.0, merged to main as #9)
+# until 0.2.0 is published; then this becomes `agent-workstation = "0.2"`.
+[target.'cfg(target_os = "linux")'.dependencies]
+agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "b740702cca87d2282ae827f4dc03694ae241d76e" }
+async-trait = "0.1"
+tower = { version = "0.5", features = ["util"] }
+url = "2"
+
 [dev-dependencies]
 anyagents-agent = { path = "../anyagents-agent" }
 anyagents-core = { path = "../anyagents-core" }
@@ -65,7 +76,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 rmcp = { version = "3.5", features = ["client", "transport-child-process"] }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 
 # A scripted `opencode` for the server test: it speaks the CLI's own `serve`
 # and `api` surface. It is not part of the released binary.

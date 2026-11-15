@@ -21,15 +21,21 @@
 //! afresh. While the mailbox holds mail, new mail joins it rather than
 //! opening a turn on stdin that could run first.
 //!
-//! The level is `turn-end`: that the running turn takes its mailbox at its
-//! next step is inferred from the vendor, not yet proven against it. A
-//! resumed cascade's transcript is read before its process starts, so a
-//! message an earlier process applied is answered as a duplicate
-//! (idempotent). A refusal is not a fault: the message goes back to the
-//! mailbox. The request runs off the delivery path and waits for its answer
-//! without a timeout; an answer that never came is settled from the
-//! cascade's mailbox and transcript, never by sending again blindly. Without
-//! the language server a line written mid-turn waits for the turn to end.
+//! The level is `next-step`: the running cascade takes every message its
+//! mailbox holds, in send order, at its next step boundary, and each is
+//! committed only on the cascade's own record of taking it. While a step of
+//! the running turn has shown the cascade running, a steer goes straight to
+//! `SendUserCascadeMessage`, one request after another in mailbox order,
+//! with no run-status probe before each. A resumed cascade's transcript is
+//! read before its process starts, so a message an earlier process applied
+//! is answered as a duplicate (idempotent). A refusal is not a fault and
+//! queues nothing: while a turn runs, the message is sent again after a
+//! short pause and lands at a later step; only a cascade held open past its
+//! turn that refuses gets the next message on stdin. The request runs off
+//! the delivery path and waits for its answer without a timeout; an answer
+//! that never came is settled from the cascade's mailbox and transcript,
+//! never by sending again blindly. Without the language server a line
+//! written mid-turn waits for the turn to end.
 
 use std::path::{Path, PathBuf};
 
@@ -45,7 +51,7 @@ use anyagents_harness_stream::{
 /// What this adapter guarantees for mail that reaches a busy agent
 /// (`docs/delivery.md`).
 pub const DELIVERY: Delivery = Delivery {
-    level: DeliveryLevel::TurnEnd,
+    level: DeliveryLevel::NextStep,
     idempotent: true,
     proof: std::borrow::Cow::Borrowed(
         "the cascade took it: a USER_INPUT transcript row or messages/read.json",

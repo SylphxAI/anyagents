@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- The browser and session computer tools now run on one desktop per profile
+  from the open-source `agent-workstation` crate: a headless Wayland desktop
+  (sway) with one headful browser, web operations over loopback DevTools,
+  full-desktop screenshots and input, and a noVNC takeover of the whole desktop.
+  The previous Xvfb/CDP browser, its injected fingerprint scripts and its
+  screencast takeover page are removed. Existing profiles under
+  `browser-profiles/` open with their logins; browsers left running by the
+  previous version are stopped once and their bookkeeping files removed.
+  Linux hosts need `sway`, `wayvnc` and a Chromium-family browser
+  (`ANYAGENTS_CHROMIUM_BIN`, optional `ANYAGENTS_BROWSER_SEED_FLAG`).
+- **macOS and Windows hosts:** `tools.browser` (and `tools.computer` requests
+  for the session desktop) now return a typed `UNSUPPORTED` error naming
+  `ANYAGENTS_WORKSTATION_URL`, the setting remote routing to a Linux workstation
+  will use; this release does not route yet. Host desktop control
+  (`tools.computer` with `platform`, the default on these hosts) is unchanged.
+- `tools.computer` without `platform`, `display` or `wayland_display` drives the
+  agent's session desktop on Linux; host desktops are selected explicitly.
+- Browser refs are snapshot outlines with `@eN` refs; the response no longer
+  lists per-element geometry. `headless`, `ttl_ms` and `tunnel` are gone, and the
+  CLI drops `--headless` and `--repeat`; `--script`, `--full-page` and
+  `--hold-ms` remain. `anyagents browser` needs a running server.
+- `ANYAGENTS_TAKEOVER_URL` is no longer read; the takeover page is published
+  through a `cloudflared` quick tunnel when installed
+  (`ANYAGENTS_TAKEOVER_TUNNEL=0` disables it), otherwise on loopback. Public
+  listeners also route takeover pages through `/v1/webhooks/takeover/{key}`.
+
+- Git: every repository-backed agent has a repository of its own (ADR 0010
+  D5). Its config, refs, index and hooks are its alone; it borrows objects
+  read-only from a pool through `objects/info/alternates`, so a checkout
+  costs a checkout and two agents on one repository cannot see each other's
+  branches or config. The pool is a bare repository per remote under
+  `ANYAGENTS_GIT_POOL_DIR`, now `<data>/git-pool` by default, so `repo:`
+  works with no checkout provider configured. Only the server fetches into
+  it, and it is never pruned. A checkout provider remains optional; a
+  linked worktree it makes is converted in place into an own repository and
+  its store becomes the pool, which must then never prune
+  (`gc.pruneExpire=never`, `gc.cruftPacks=true`, else conversion is
+  refused); a keep ref in the store holds what each converted repository
+  borrows until it is reaped. Archive removes a checkout only when the
+  remote's own answer (`ls-remote`) covers every commit, tag and note it
+  has and it has no stash. Removed: worktrees of a shared bare pool, the
+  POSIX ACL grants on its `objects/`, `refs/`, `logs/` and `packed-refs`,
+  the `anyagents-config/` config symlink, per-checkout `--worktree` config,
+  the grant journals in `<data>/worktree-grants/` with their quarantine and
+  recovery, and `ANYAGENTS_TRUSTED_METADATA_GIDS`. Existing linked
+  worktrees keep working as they are; archive cleanup converts one in place
+  (same status, HEAD, index, sparse patterns and hooks, unpushed and
+  reflog-only objects copied) before judging it. For `repo: "inherit"` and local sources, the
+  remote is asked from outside the source repository.
 - `conversation` searches every harness's native history: Spiron's
   `sessions.sqlite3`, OpenCode's `opencode.db` (tool parts included), Claude
   Code subagents, Codex rollouts, AGY, Muse, OMP and Grok sessions, read
@@ -31,12 +82,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider reports reaches the cap. `anyagents memory-service estimate`
   previews the rebuild without calling a model. Spend outside a rebuild
   (query embeddings, rerank, new history) is capped per UTC day by
-  `max_daily_usd` and persisted; past it rerank and new-history embedding
+  `max_daily_usd` and persisted; past it query embedding, rerank and new-history embedding
   wait for the next day. Background workers retry failures with backoff and
   report them in `status`; marks follow the host index's generation and the
   worker count. No space is deleted automatically: `memory-service prune`
   removes other spaces once the configured one is built, and a `--config`
-  that does not exist is an error. Every OpenRouter request
+  that does not exist is an error. A remote model must have a configured
+  price, so its spend is always counted, and a remote query is cut to the
+  piece budget. Every OpenRouter request
   carries `provider.data_collection = "deny"`, and a remote reranker reads at
   most `passage_chars` (1,000) characters of each passage. The desk's choice,
   `qwen/qwen3-embedding-8b` with `mongodb/rerank-3` through
