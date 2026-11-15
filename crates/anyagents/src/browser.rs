@@ -7063,11 +7063,11 @@ mod tests {
         std::fs::rename(&saved, &root).unwrap();
         // SAFETY: geteuid has no preconditions.
         if unsafe { libc::geteuid() } != 0 {
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o0)).unwrap();
             let denied = execute(dir.path(), "default", request());
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
             assert!(denied.is_err());
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o0)).unwrap();
             let denied = execute(dir.path(), "default", request());
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             assert!(denied.is_err());
@@ -7090,8 +7090,8 @@ mod tests {
         let bytes = std::fs::read(&file).unwrap();
         let denied_dir = profile_dir(dir.path(), "denied-directory");
         let directory_bytes = std::fs::read(denied_dir.join("fingerprint.json")).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0)).unwrap();
-        std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o0)).unwrap();
+        std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0o0)).unwrap();
         for action in ["profiles", "list"] {
             let result = execute(
                 dir.path(),
@@ -7127,8 +7127,9 @@ mod tests {
                 "stopped"
             );
             if action == "profiles" {
-                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0)).unwrap();
-                std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0)).unwrap();
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o0)).unwrap();
+                std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0o0))
+                    .unwrap();
             }
         }
     }
