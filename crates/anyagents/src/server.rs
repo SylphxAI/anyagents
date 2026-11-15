@@ -5612,8 +5612,6 @@ async fn delete_agent_route(
         }
 
         reap_subagent_ephemeral_dirs_in(&state.store, data_dir, &found.id);
-        #[cfg(target_os = "linux")]
-        crate::workstation::session::stop_agent_blocking(data_dir, &found.name);
         remove_agent_identity_files(data_dir, &found, &agent_dir, seat_ids);
         let deleted = state
             .store
@@ -5648,7 +5646,8 @@ fn remove_agent_identity_files(
     agent_dir: &Path,
     seat_ids: Option<(u32, u32, u32)>,
 ) {
-    let _ = crate::browser::stop_profile(data_dir, &agent.name);
+    #[cfg(target_os = "linux")]
+    crate::workstation::session::stop_agent_blocking(data_dir, &agent.name);
     remove_path_with_seat(
         &data_dir.join("browser-profiles").join(&agent.name),
         seat_ids,
@@ -15935,8 +15934,6 @@ exec '{}' "$@"
             StatusCode::NOT_FOUND
         );
     }
-    use std::io::{Read, Write};
-    use std::sync::MutexGuard;
 
     #[tokio::test]
     async fn pause_agent_route_waits_on_lifecycle_and_rejects_archived() {
