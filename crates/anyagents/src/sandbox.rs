@@ -474,21 +474,25 @@ fn ensure_agent_root_traversable(_config_dir: &Path) -> std::io::Result<()> {
 /// Give one agent's config directory to its explicitly admitted principal.
 /// Workdirs have separate fail-closed sharing before admission.
 pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
-    if let Err(err) = ensure_agent_root_traversable(config_dir) {
-        eprintln!(
-            "seat: cannot restore traverse permissions on parent of {}: {err}",
-            config_dir.display()
-        );
+    if let Err(error) = share_config_with_seat_uid_checked(config_dir, uid, gid) {
+        eprintln!("seat: {error}");
     }
-    let (eff_uid, eff_gid) = match existing_config_seat(config_dir) {
-        Some((_, existing_uid, existing_gid, _)) => (existing_uid, existing_gid),
-        None => (uid, gid),
-    };
-    if config_dir.is_dir()
-        && let Err(err) = crate::seat_tree::share_config(config_dir, eff_uid, eff_gid)
-    {
-        eprintln!("seat: cannot share {}: {err}", config_dir.display());
-    }
+}
+
+/// Admit the explicit principal before launching or waking a harness.
+pub fn share_config_with_seat_uid_checked(
+    config_dir: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<(), Error> {
+    prepare_config_with_seat_uid(config_dir, uid, gid)?;
+    share_config_overlays(config_dir, uid, gid).map_err(|error| Error::WorkdirPermission {
+        path: config_dir.display().to_string(),
+        message: format!("cannot share harness overlays: {error}"),
+    })
+}
+
+fn share_config_overlays(config_dir: &Path, eff_uid: u32, eff_gid: u32) -> std::io::Result<()> {
     // Learned facts and agent-authored skills are the only writable host
     // authority outside config/work. Session pins, raw history and migration
     // receipts remain owned by the daemon. Never follow an overlay symlink.
@@ -496,44 +500,42 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
         let path = config_dir.with_file_name(name);
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
-                eprintln!(
-                    "seat: refusing non-directory host overlay {}",
+                return Err(std::io::Error::other(format!(
+                    "refusing non-directory host overlay {}",
                     path.display()
-                );
-                continue;
+                )));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if ensure_seat_dir_as_owner(&path, eff_uid, eff_gid, 0o2770).is_err() {
-                    continue;
-                }
+                ensure_seat_dir_as_owner(&path, eff_uid, eff_gid, 0o2770)?;
             }
-            Err(_) => continue,
+            Err(error) => return Err(error),
             _ => (),
         }
-        if let Err(error) = give_tree(&path, eff_uid, eff_gid) {
-            eprintln!("seat: cannot share {}: {error}", path.display());
-        }
+        give_tree(&path, eff_uid, eff_gid)?;
     }
     // Sessions holds the harness session database and must stay admitted
     // to the seat principal (0o2770 + seat group) exactly like config, or
     // seat-side resume fails with Permission denied (os error 13).
     // Transcripts remain host-private under daemon ownership.
     let sessions_dir = config_dir.with_file_name("sessions");
-    let _ = std::fs::create_dir_all(&sessions_dir);
-    if sessions_dir.is_dir()
-        && let Err(err) = crate::seat_tree::share_config(&sessions_dir, eff_uid, eff_gid)
-    {
-        eprintln!("seat: cannot share {}: {err}", sessions_dir.display());
-    }
+    ensure_seat_dir_as_owner(&sessions_dir, eff_uid, eff_gid, 0o2770)?;
+    crate::seat_tree::share_config(&sessions_dir, eff_uid, eff_gid)?;
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
         use std::os::unix::fs::PermissionsExt as _;
         let transcripts_dir = config_dir.with_file_name("transcripts");
-        if transcripts_dir.is_dir() {
-            let _ =
-                std::fs::set_permissions(&transcripts_dir, std::fs::Permissions::from_mode(0o700));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(&transcripts_dir)
+        {
+            Ok(dir) => dir.set_permissions(std::fs::Permissions::from_mode(0o700))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
         }
     }
+    Ok(())
 }
 
 pub(crate) fn ensure_seat_dir_as_owner(
