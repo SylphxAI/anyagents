@@ -105,10 +105,13 @@ struct StoredRefs {
     pub elements: Vec<InteractiveRef>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct BrowserProfileSummary {
     pub profile: String,
     pub status: String,
+    /// Inspection failed for this profile, without invalidating its siblings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5088,38 +5091,53 @@ pub fn list_profiles(data: &Path) -> Result<Vec<BrowserProfileSummary>, Error> {
     }
     let mut out = Vec::new();
     for name in names {
-        let fp = ensure_fingerprint(data, &name)?;
-        if let Some(rt) = load_runtime(data, &name)? {
-            let pages = list_page_targets(rt.cdp_port).unwrap_or_default();
-            let current = pages.first();
-            out.push(BrowserProfileSummary {
+        // Preserve damaged records and browser state for recovery rather than
+        // silently regenerating an identity or failing the whole inventory.
+        out.push(
+            summarize_profile(data, &name).unwrap_or_else(|error| BrowserProfileSummary {
                 profile: name,
-                status: "running".to_string(),
-                pid: Some(rt.pid),
-                cdp_port: Some(rt.cdp_port),
-                display_mode: Some(rt.display_mode),
-                current_url: current.map(|p| p.url.clone()),
-                current_title: current.map(|p| p.title.clone()),
-                last_used_at_ms: Some(rt.last_used_at_ms),
-                webgl_renderer: fp.webgl_renderer,
-                user_agent: fp.user_agent,
-            });
-        } else {
-            out.push(BrowserProfileSummary {
-                profile: name,
-                status: "stopped".to_string(),
-                pid: None,
-                cdp_port: None,
-                display_mode: None,
-                current_url: None,
-                current_title: None,
-                last_used_at_ms: None,
-                webgl_renderer: fp.webgl_renderer,
-                user_agent: fp.user_agent,
-            });
-        }
+                status: "error".into(),
+                error: Some(error.to_string()),
+                ..Default::default()
+            }),
+        );
     }
     Ok(out)
+}
+
+fn summarize_profile(data: &Path, name: &str) -> Result<BrowserProfileSummary, Error> {
+    let fp = ensure_fingerprint(data, name)?;
+    if let Some(rt) = load_runtime(data, name)? {
+        let pages = list_page_targets(rt.cdp_port).unwrap_or_default();
+        let current = pages.first();
+        Ok(BrowserProfileSummary {
+            profile: name.to_string(),
+            error: None,
+            status: "running".to_string(),
+            pid: Some(rt.pid),
+            cdp_port: Some(rt.cdp_port),
+            display_mode: Some(rt.display_mode),
+            current_url: current.map(|p| p.url.clone()),
+            current_title: current.map(|p| p.title.clone()),
+            last_used_at_ms: Some(rt.last_used_at_ms),
+            webgl_renderer: fp.webgl_renderer,
+            user_agent: fp.user_agent,
+        })
+    } else {
+        Ok(BrowserProfileSummary {
+            profile: name.to_string(),
+            error: None,
+            status: "stopped".to_string(),
+            pid: None,
+            cdp_port: None,
+            display_mode: None,
+            current_url: None,
+            current_title: None,
+            last_used_at_ms: None,
+            webgl_renderer: fp.webgl_renderer,
+            user_agent: fp.user_agent,
+        })
+    }
 }
 
 /// Run one browser request. `files` is whose access opens any host file the
@@ -6875,6 +6893,80 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn profiles_isolate_damaged_records_and_preserve_user_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let healthy = ensure_fingerprint(dir.path(), "healthy").unwrap();
+        let healthy_path = profile_dir(dir.path(), "healthy").join("fingerprint.json");
+        let healthy_bytes = std::fs::read(&healthy_path).unwrap();
+        for (name, file, bytes) in [
+            ("default", "fingerprint.json", b"".as_slice()),
+            ("bad-json", "fingerprint.json", b"{corrupt".as_slice()),
+            ("bad-schema", "fingerprint.json", b"{}".as_slice()),
+            ("bad-runtime", "runtime.json", b"{corrupt".as_slice()),
+        ] {
+            let profile = server_profile_dir(dir.path(), name, true).unwrap().unwrap();
+            if file == "runtime.json" {
+                ensure_fingerprint(dir.path(), name).unwrap();
+            }
+            std::fs::write(profile.join(file), bytes).unwrap();
+            std::fs::create_dir_all(profile.join("user-data")).unwrap();
+            std::fs::write(profile.join("user-data/Cookies"), b"retained-session").unwrap();
+        }
+        // A directory is an unreadable JSON file on every test host, even root.
+        let unreadable = server_profile_dir(dir.path(), "unreadable", true)
+            .unwrap()
+            .unwrap();
+        std::fs::create_dir(unreadable.join("fingerprint.json")).unwrap();
+        std::fs::write(unreadable.join("fingerprint.json/recovery"), b"keep").unwrap();
+
+        for action in ["profiles", "list"] {
+            let result = execute(
+                dir.path(),
+                "default",
+                BrowserRequest {
+                    action: action.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let profiles = result["profiles"].as_array().unwrap();
+            assert_eq!(profiles.len(), 6);
+            let good = profiles.iter().find(|p| p["profile"] == "healthy").unwrap();
+            assert_eq!(good["status"], "stopped");
+            assert!(good.get("error").is_none());
+            assert_eq!(good["user_agent"], healthy.user_agent);
+            assert_eq!(good["webgl_renderer"], healthy.webgl_renderer);
+            for (name, file, bytes) in [
+                ("default", "fingerprint.json", b"".as_slice()),
+                ("bad-json", "fingerprint.json", b"{corrupt".as_slice()),
+                ("bad-schema", "fingerprint.json", b"{}".as_slice()),
+                ("bad-runtime", "runtime.json", b"{corrupt".as_slice()),
+            ] {
+                let failed = profiles.iter().find(|p| p["profile"] == name).unwrap();
+                assert_eq!(failed["status"], "error");
+                assert!(failed["error"].as_str().unwrap().contains(file));
+                let profile = profile_dir(dir.path(), name);
+                assert_eq!(std::fs::read(profile.join(file)).unwrap(), bytes);
+                assert_eq!(
+                    std::fs::read(profile.join("user-data/Cookies")).unwrap(),
+                    b"retained-session"
+                );
+            }
+            let failed = profiles
+                .iter()
+                .find(|p| p["profile"] == "unreadable")
+                .unwrap();
+            assert_eq!(failed["status"], "error");
+            assert!(failed["error"].as_str().unwrap().contains("cannot read"));
+            assert_eq!(
+                std::fs::read(unreadable.join("fingerprint.json/recovery")).unwrap(),
+                b"keep"
+            );
+            assert_eq!(std::fs::read(&healthy_path).unwrap(), healthy_bytes);
+        }
     }
 
     #[test]
