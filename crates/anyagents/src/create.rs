@@ -15398,6 +15398,56 @@ Connection: close
     }
 
     #[test]
+    fn spiron_muse_profile_preserves_gateway_auth_and_normalizes_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let model = "sylphx/openai/gpt-6.1-sol#high";
+        let mut spec = NewAgent::new("spiron-profile", "spiron");
+        spec.model = Some(model.into());
+        let agent = store.create_agent(spec).unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        let profile = data.join("profiles/sylphx/muse-default");
+        std::fs::create_dir_all(&profile).unwrap();
+        let selector = br#"{"gateway_base_url":"https://gateway.example/v1"}"#;
+        let auth = br#"{"access_token":"test-profile-token"}"#;
+        std::fs::write(profile.join("spiron-agent.json"), selector).unwrap();
+        std::fs::write(profile.join("auth.json"), auth).unwrap();
+        ensure_profile_compatible_and_mapped(
+            data,
+            "sylphx",
+            "muse-default",
+            "spiron",
+            Some(model),
+            Some(&cfg),
+        )
+        .unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "sylphx/muse-default\n").unwrap();
+        seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+        crate::spiron::write_spiron_config(
+            &cfg,
+            Some(model),
+            Path::new("/usr/bin/anyagents"),
+            &["mcp".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(cfg.join("spiron-agent.json")).unwrap(),
+            selector
+        );
+        let seeded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cfg.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(seeded["access_token"], "test-profile-token");
+        let config = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+        assert!(config.contains("https://gateway.example/v1"), "{config}");
+        assert!(
+            config.contains("model = \"openai/gpt-6.1-sol#high\""),
+            "{config}"
+        );
+    }
+
+    #[test]
     fn spiron_profile_switch_removes_stale_seat_selector_and_refreshes_gateway_url() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path();

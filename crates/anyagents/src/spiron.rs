@@ -43,10 +43,12 @@ pub fn write_spiron_config(
     Ok(())
 }
 
-/// Strip external Coding Plan provider prefixes (`kimi-code-plan/`,
-/// `glm-code-plan/`, `qwen-token-plan/`, `minimax-code-plan/`) so Spiron sends
-/// the bare provider model ID to the Coding Plan endpoint.
-pub fn strip_coding_plan_prefix(model: &str) -> &str {
+/// Convert an AnyAgents model selector to the model ID Spiron sends upstream.
+/// Remove the gateway namespace and external Coding Plan routing prefixes,
+/// retaining the provider model ID and any effort suffix. Use this for both
+/// config.toml and --model so CLI precedence cannot change routing.
+pub fn normalize_model(model: &str) -> &str {
+    let model = model.strip_prefix("sylphx/").unwrap_or(model);
     [
         "kimi-code-plan/",
         "glm-code-plan/",
@@ -122,7 +124,7 @@ fn write_spiron_config_toml(config_dir: &Path, model: Option<&str>) -> Result<()
         out.push_str(&format!("sylphx_ai_url = {escaped}\n"));
     }
     if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
-        let normalized = strip_coding_plan_prefix(m.strip_prefix("sylphx/").unwrap_or(m));
+        let normalized = normalize_model(m);
         let escaped =
             serde_json::to_string(normalized).map_err(|e| Error::Message(e.to_string()))?;
         out.push_str(&format!("model = {escaped}\n"));
@@ -361,6 +363,30 @@ fn mirror_spiron_auth_paths(config_dir: &Path, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_and_cli_share_model_normalization() {
+        for (selector, expected) in [
+            ("sylphx/openai/gpt-6.1-sol#high", "openai/gpt-6.1-sol#high"),
+            ("openai/gpt-6.1-sol#high", "openai/gpt-6.1-sol#high"),
+            ("kimi-code-plan/k3.1-pro#max", "k3.1-pro#max"),
+            ("glm-code-plan/glm-5#high", "glm-5#high"),
+            ("qwen-token-plan/qwen3-coder", "qwen3-coder"),
+            ("minimax-code-plan/MiniMax-M3", "MiniMax-M3"),
+            ("sylphx/kimi-code-plan/k3.1-pro#max", "k3.1-pro#max"),
+            ("custom/provider/model#high", "custom/provider/model#high"),
+            ("model", "model"),
+        ] {
+            assert_eq!(normalize_model(selector), expected);
+            let temp = tempfile::tempdir().unwrap();
+            write_spiron_config_toml(temp.path(), Some(selector)).unwrap();
+            let raw = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+            assert!(
+                raw.contains(&format!("model = {expected:?}")),
+                "{selector}: {raw}"
+            );
+        }
+    }
 
     #[test]
     fn ensure_spiron_seat_auth_prefers_project_key_over_org_wide_credentials_and_heals_stale_auth()

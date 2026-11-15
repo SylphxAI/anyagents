@@ -105,12 +105,20 @@ for line in sys.stdin:
         ("ANYAGENTS_SPIRON_BIN", probe.as_os_str()),
         ("ANYAGENTS_FAKE_MODE", std::ffi::OsStr::new("1")),
     ]);
-    for harness_name in [
-        "spiron",
-        "sylphx",
-        "sylphx-agent",
-        "sylphx_agent",
-        "sylphx/default",
+    for (harness_name, model, expected_model) in [
+        (
+            "spiron",
+            "sylphx/openai/gpt-6.1-sol#high",
+            "openai/gpt-6.1-sol#high",
+        ),
+        ("sylphx", "kimi-code-plan/k3.1-pro#max", "k3.1-pro#max"),
+        ("sylphx-agent", "glm-code-plan/glm-5#high", "glm-5#high"),
+        ("sylphx_agent", "qwen-token-plan/qwen3-coder", "qwen3-coder"),
+        (
+            "sylphx/default",
+            "minimax-code-plan/MiniMax-M3",
+            "MiniMax-M3",
+        ),
     ] {
         let data = temp.path().join(harness_name.replace('/', "-"));
         std::fs::create_dir_all(&data).unwrap();
@@ -124,7 +132,7 @@ for line in sys.stdin:
         std::fs::create_dir_all(&real_work).unwrap();
         std::os::unix::fs::symlink(&real_work, &work).unwrap();
         let mut spec = NewAgent::new("protocol-probe", harness_name);
-        spec.model = Some("sylphx/openai/gpt-6.1-sol#xhigh".into());
+        spec.model = Some(model.into());
         spec.workdir = Some(work.display().to_string());
         spec.instructions = Some("preserve this identity".into());
         let agent = store.create_agent(spec).unwrap();
@@ -160,6 +168,8 @@ for line in sys.stdin:
             &["mcp".into(), "--agent".into(), agent.id.to_string()],
         )
         .unwrap();
+        let config_toml = std::fs::read_to_string(config.join("config.toml")).unwrap();
+        assert!(config_toml.contains(&format!("model = {expected_model:?}")));
         let retained = [
             "sylphx-window.json",
             "sylphx-goal.json",
@@ -295,7 +305,7 @@ for line in sys.stdin:
                 .map(|v| v.as_str().unwrap())
                 .collect();
             for (flag, expected) in [
-                ("--model", agent.model.clone().unwrap()),
+                ("--model", expected_model.into()),
                 ("--session", "legacy-session".into()),
                 (
                     "--mcp-config",
