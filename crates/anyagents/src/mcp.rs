@@ -541,7 +541,10 @@ mod stdio_frame_cap_tests {
         assert!(summary.contains("0600"), "summary names the spill mode");
         let summary: serde_json::Value = serde_json::from_str(&summary).unwrap();
         let spill_path = PathBuf::from(summary["artifact"]["path"].as_str().unwrap());
-        assert_eq!(spill_path.parent(), Some(dir.path()));
+        assert_eq!(
+            spill_path.parent(),
+            Some(std::fs::canonicalize(dir.path()).unwrap().as_path())
+        );
         let spilled = std::fs::read(&spill_path).unwrap();
         assert_eq!(spilled, frame, "spilled file must be byte-identical");
         #[cfg(unix)]
