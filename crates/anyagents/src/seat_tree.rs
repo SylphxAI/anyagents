@@ -231,7 +231,9 @@ pub(crate) fn seat_file_main(args: &[OsString]) -> std::process::ExitCode {
                 parse_mode(mode),
                 inherit.to_str(),
             ) {
-                (Some(uid), Some(daemon), Some(mode), Some(inherit @ ("0" | "1"))) => {
+                (Some(uid), Some(daemon), Some(mode), Some(inherit @ ("0" | "1"))) =>
+                {
+                    #[allow(clippy::unnecessary_cast, reason = "mode_t differs across platforms")]
                     config_acl(input, uid, daemon, mode as u32, inherit == "1")
                 }
                 _ => return usage(),
@@ -1830,7 +1832,7 @@ mod tests {
             bytes
         }
         fn named(bytes: &[u8], uid: u32) -> Option<u16> {
-            bytes[4..].chunks_exact(8).find_map(|entry| {
+            bytes[4..].as_chunks::<8>().0.iter().find_map(|entry| {
                 let tag = u16::from_le_bytes(entry[..2].try_into().unwrap());
                 let id = u32::from_le_bytes(entry[4..].try_into().unwrap());
                 (tag == 2 && id == uid).then(|| u16::from_le_bytes(entry[2..4].try_into().unwrap()))
