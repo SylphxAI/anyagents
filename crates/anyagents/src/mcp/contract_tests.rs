@@ -509,6 +509,25 @@ fn send_reads_null_placeholders_as_absent() {
 }
 
 #[test]
+fn interact_reads_a_null_bot_as_absent_and_keeps_a_named_one() {
+    let unnamed: InteractArgs = serde_json::from_value(json!({
+        "action": "react",
+        "target": "telegram:chat:-1007:91",
+        "emoji": "👍",
+        "bot": "null",
+    }))
+    .unwrap();
+    assert!(unnamed.bot.is_none());
+    let named: InteractArgs = serde_json::from_value(json!({
+        "action": "react",
+        "target": "telegram:chat:-1007:91",
+        "bot": "@ada_promo_bot",
+    }))
+    .unwrap();
+    assert_eq!(named.bot.as_deref(), Some("@ada_promo_bot"));
+}
+
+#[test]
 fn relation_words_read_alike_in_any_case() {
     assert_eq!(relation_word("Parent"), Some("parent"));
     assert_eq!(relation_word(" agent:parent "), Some("parent"));

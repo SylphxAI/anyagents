@@ -214,6 +214,9 @@ pub struct UnsettledOutboundView {
     pub key: String,
     pub agent_id: String,
     pub destination: String,
+    /// The sender's own channel bot the send named, when it named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since_ms: Option<i64>,
     /// The error that left the outcome unknown, when one was recorded.

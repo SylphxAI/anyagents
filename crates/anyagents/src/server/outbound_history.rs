@@ -1789,6 +1789,73 @@ mod tests {
         );
     }
 
+    /// An unconfirmed post a two-bot agent made through a named bot is held
+    /// with that bot, keeps it across a restart, and its retry posts through
+    /// that bot again.
+    #[test]
+    fn a_held_post_retries_through_the_bot_it_named() {
+        let (_dir, store, sender) = fixture();
+        for (identity, secret) in [
+            ("ada_desk_bot", "channels/desk"),
+            ("ada_promo_bot", "channels/promo"),
+        ] {
+            let channel = store
+                .create_channel(anyagents_core::NewChannel {
+                    kind: "telegram".into(),
+                    identity: Some(identity.into()),
+                    config: "{}".into(),
+                    credential_ref: Some(secret.into()),
+                })
+                .unwrap();
+            store.attach_channel(&channel.id, &sender).unwrap();
+        }
+        assert!(
+            deliver(
+                &store,
+                &sender,
+                "telegram:chat:-1007",
+                Some("@ada_promo_bot"),
+                None,
+                "launch post",
+                Some("promo-call"),
+                false,
+                || Err(telegram_refusal(0, "timeout")),
+            )
+            .is_err()
+        );
+        // A restart reads the obligation back from disk.
+        forget(&store);
+        reconcile(&store).unwrap();
+        let held = unsettled(&store);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].bot.as_deref(), Some("@ada_promo_bot"));
+        assert_eq!(
+            super::super::unsettled_view(&held[0]).bot.as_deref(),
+            Some("@ada_promo_bot")
+        );
+        let receipt = retry(&store, "promo-call", |held| {
+            let actor = super::super::Actor::Agent("sender".into());
+            let body = super::super::held_send(held, &actor);
+            assert_eq!(body.bot.as_deref(), Some("@ada_promo_bot"));
+            assert_eq!(body.to, ["telegram:chat:-1007"]);
+            let call = crate::telegram::outbound_call(
+                &store,
+                "sender",
+                body.bot.as_deref(),
+                -1007,
+                &body.text,
+                None,
+                None,
+            )
+            .map_err(ApiError::from_store)?;
+            assert_eq!(call.credential_ref, "channels/promo");
+            Ok(delivery())
+        })
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(receipt.len(), 1);
+        assert!(unsettled(&store).is_empty());
+    }
+
     /// The operator retries a held obligation through a new send; it is
     /// closed with that send's receipt only when the send succeeds.
     #[test]
