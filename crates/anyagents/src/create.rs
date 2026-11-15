@@ -2866,6 +2866,28 @@ pub(crate) fn resolved_agent_seat_info(
     Some((user, uid, gid, None))
 }
 
+// Seat preparation owns the config mode and ACL mask. Never replay a mode
+// captured before preparation over the permissions it established.
+fn prepare_runtime_config_dir(config: &Path, seat: Option<(u32, u32)>) -> Result<(), Error> {
+    create_private_config_dir(config)?;
+    if let Some((uid, gid)) = seat {
+        crate::sandbox::prepare_config_with_seat_uid(config, uid, gid)?;
+    } else {
+        #[cfg(unix)]
+        repair_unseated_config_mode(config, own_mode(config)?.unwrap_or(0o0700))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn repair_unseated_config_mode(config: &Path, base_mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let group_exec = if (base_mode & 0o0060) != 0 { 0o0010 } else { 0 };
+    let other_exec = if (base_mode & 0o0006) != 0 { 0o0001 } else { 0 };
+    let safe_mode = (base_mode | 0o0700 | group_exec | other_exec) & 0o7777;
+    std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode))
+}
+
 /// Canonical, idempotent runtime reconciliation for an agent: resolves the
 /// authoritative parent from `state.db`, seeds credentials and model catalogs,
 /// ensures the mailbox capability, computes cross-harness continuity from
@@ -2885,20 +2907,10 @@ pub(crate) fn reconcile_agent_runtime_config(
             .ok()
             .map(|m| m.permissions().mode() & 0o7777)
     };
-    create_private_config_dir(config)?;
-    if let Some((_, uid, gid, _)) = resolved_agent_seat_info(store, agent) {
-        crate::sandbox::prepare_config_with_seat_uid(config, uid, gid)?;
-    }
-    #[cfg(unix)]
-    if let Some(base_mode) = pre_existing_mode {
-        use std::os::unix::fs::PermissionsExt as _;
-        let group_exec = if (base_mode & 0o0060) != 0 { 0o0010 } else { 0 };
-        let other_exec = if (base_mode & 0o0006) != 0 { 0o0001 } else { 0 };
-        let safe_mode = (base_mode | 0o0700 | group_exec | other_exec) & 0o7777;
-        if safe_mode != base_mode {
-            let _ = std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode));
-        }
-    }
+    prepare_runtime_config_dir(
+        config,
+        resolved_agent_seat_info(store, agent).map(|(_, uid, gid, _)| (uid, gid)),
+    )?;
     let parent_name = agent
         .parent_id
         .as_ref()
@@ -3036,7 +3048,7 @@ pub(crate) fn reconcile_agent_runtime_config(
         if let Some(ref spec) = spec_opt {
             ensure_seat_op_config(config, spec);
         }
-        crate::sandbox::share_config_with_seat_uid(config, uid, gid);
+        crate::sandbox::share_config_with_seat_uid_checked(config, uid, gid)?;
         // Workdir admission belongs to create, not config-only reconciliation:
         // an archived agent may already have had its managed workdir reaped.
         if agent.harness == "muse"
@@ -3063,12 +3075,7 @@ pub(crate) fn reconcile_agent_runtime_config(
     } else {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            let base_mode = pre_existing_mode.unwrap_or(0o0700);
-            let group_exec = if (base_mode & 0o0060) != 0 { 0o0010 } else { 0 };
-            let other_exec = if (base_mode & 0o0006) != 0 { 0o0001 } else { 0 };
-            let safe_mode = (base_mode | 0o0700 | group_exec | other_exec) & 0o7777;
-            let _ = std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode));
+            repair_unseated_config_mode(config, pre_existing_mode.unwrap_or(0o0700))?;
         }
     }
     verify_harness_runtime_config(config, &agent.harness, agent.model.as_deref())?;
@@ -3871,7 +3878,7 @@ fn propagate_credentials(
         }
         if let Some(s) = store_opt.as_ref() {
             if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
-                crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
+                crate::sandbox::share_config_with_seat_uid_checked(&cfg, uid, gid)?;
             }
             if change == CredentialChange::Replaced {
                 poke_agent_wake_socket(data, &agent_rec.id);
@@ -10568,6 +10575,49 @@ mod tests {
         std::fs::write(target.join("late.txt"), "kept").unwrap();
         remove_made_dirs(&made.into_inner(), None, &AgentId::generate());
         assert!(target.join("late.txt").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_config_preparation_preserves_seat_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_tempdir();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        for old_mode in [0o0600, 0o0700, 0o2770] {
+            let config = dir.path().join(format!("seat-{old_mode:o}/config"));
+            create_private_config_dir(&config).unwrap();
+            std::fs::write(config.join("credential"), "retained").unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(old_mode)).unwrap();
+            prepare_runtime_config_dir(&config, Some((uid, gid))).unwrap();
+            assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o7777, 0o2770);
+            assert_eq!(
+                std::fs::read_to_string(config.join("credential")).unwrap(),
+                "retained"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_config_preparation_repairs_unseated_modes_and_propagates_failures() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_tempdir();
+        for (old_mode, expected) in [(0o0600, 0o0700), (0o0660, 0o0770), (0o2770, 0o2770)] {
+            let config = dir.path().join(format!("unseated-{old_mode:o}/config"));
+            create_private_config_dir(&config).unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(old_mode)).unwrap();
+            prepare_runtime_config_dir(&config, None).unwrap();
+            assert_eq!(
+                std::fs::metadata(&config).unwrap().mode() & 0o7777,
+                expected
+            );
+        }
+        let blocked = dir.path().join("file");
+        std::fs::write(&blocked, "retained").unwrap();
+        assert!(prepare_runtime_config_dir(&blocked, None).is_err());
+        assert!(repair_unseated_config_mode(&dir.path().join("missing"), 0o0600).is_err());
+        assert_eq!(std::fs::read_to_string(blocked).unwrap(), "retained");
     }
 
     #[cfg(unix)]
