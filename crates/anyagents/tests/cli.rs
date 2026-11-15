@@ -121,7 +121,7 @@ fn configured_owner_catalog_is_authoritative_for_create_discovery_and_updates() 
         let store = Store::open(data.join("state.db")).unwrap();
         let plain = store.agent_by_name("plain").unwrap();
         assert_eq!(plain.role.as_deref(), Some("general"));
-        assert_eq!(plain.scope(), "private");
+        assert_eq!(plain.scope(), "public");
     }
     for state in ["missing", "empty", "populated"] {
         if state == "empty" {
@@ -1152,12 +1152,28 @@ fn cli_create_defaults_omitted_and_empty_role_to_builtin_general_and_allows_disk
         );
     }
 
+    // Sub-agent with omitted role gets built-in `general` with `private` scope.
+    let sub = run(&[
+        "agents",
+        "create",
+        "sub-omitted",
+        "--parent",
+        "omitted-role",
+        "--workdir",
+        ws_str,
+    ]);
+    assert!(
+        sub.status.success(),
+        "sub-omitted: {}",
+        String::from_utf8_lossy(&sub.stderr)
+    );
+
     {
         let store = Store::open(data.join("state.db")).unwrap();
         for name in ["omitted-role", "empty-role", "explicit-general"] {
             let agent = store.agent_by_name(name).unwrap();
             assert_eq!(agent.role.as_deref(), Some("general"), "{name}");
-            assert_eq!(agent.scope(), "private", "{name}");
+            assert_eq!(agent.scope(), "public", "{name}");
             assert!(
                 agent
                     .instructions
@@ -1166,13 +1182,16 @@ fn cli_create_defaults_omitted_and_empty_role_to_builtin_general_and_allows_disk
                 "{name}: missing built-in general instructions"
             );
         }
+        let sub_agent = store.agent_by_name("sub-omitted").unwrap();
+        assert_eq!(sub_agent.role.as_deref(), Some("general"));
+        assert_eq!(sub_agent.scope(), "private");
     }
 
-    // Workspace .agents/agents/general.md overrides the built-in template.
+    // Workspace .agents/agents/general.md overrides the built-in template (even root scope).
     std::fs::create_dir_all(workspace.join(".agents/agents")).unwrap();
     std::fs::write(
         workspace.join(".agents/agents/general.md"),
-        "---\nname: general\ndescription: Workspace General Override\nscope: public\n---\nWorkspace general override body.\n",
+        "---\nname: general\ndescription: Workspace General Override\nscope: private\n---\nWorkspace general override body.\n",
     )
     .unwrap();
     let overridden = run(&["agents", "create", "disk-general", "--workdir", ws_str]);
@@ -1184,7 +1203,7 @@ fn cli_create_defaults_omitted_and_empty_role_to_builtin_general_and_allows_disk
     let store = Store::open(data.join("state.db")).unwrap();
     let agent = store.agent_by_name("disk-general").unwrap();
     assert_eq!(agent.role.as_deref(), Some("general"));
-    assert_eq!(agent.scope(), "public");
+    assert_eq!(agent.scope(), "private");
     assert_eq!(
         agent.description.as_deref(),
         Some("Workspace General Override")

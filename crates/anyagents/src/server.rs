@@ -12313,7 +12313,7 @@ exec '{}' "$@"
                 .unwrap_or_else(|e| panic!("{name}: {}: {}", e.status, e.message));
                 assert_eq!(status, StatusCode::CREATED, "{name}");
                 assert_eq!(agent.role.as_deref(), Some("general"), "{name}");
-                assert_eq!(agent.scope, "private", "{name}");
+                assert_eq!(agent.scope, "public", "{name}");
                 assert!(
                     agent
                         .instructions
@@ -12323,11 +12323,31 @@ exec '{}' "$@"
                 );
             }
 
-            // Workspace .agents/agents/general.md overrides the built-in template.
+            // Sub-agent with omitted role gets built-in `general` with `private` scope.
+            let (sub_status, Json(sub)) = create_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "http-subagent",
+                        "parent": "http-omitted",
+                        "workdir": work,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("subagent: {}: {}", e.status, e.message));
+            assert_eq!(sub_status, StatusCode::CREATED);
+            assert_eq!(sub.role.as_deref(), Some("general"));
+            assert_eq!(sub.scope, "private");
+
+            // Workspace .agents/agents/general.md overrides the built-in template even for root.
             std::fs::create_dir_all(work.join(".agents/agents")).unwrap();
             std::fs::write(
                 work.join(".agents/agents/general.md"),
-                "---\nname: general\ndescription: HTTP General Override\nscope: public\n---\nHTTP general override body.\n",
+                "---\nname: general\ndescription: HTTP General Override\nscope: private\n---\nHTTP general override body.\n",
             )
             .unwrap();
             let (status, Json(overridden)) = create_agent_route(
@@ -12346,7 +12366,7 @@ exec '{}' "$@"
             .unwrap_or_else(|e| panic!("override: {}: {}", e.status, e.message));
             assert_eq!(status, StatusCode::CREATED);
             assert_eq!(overridden.role.as_deref(), Some("general"));
-            assert_eq!(overridden.scope, "public");
+            assert_eq!(overridden.scope, "private");
             assert_eq!(
                 overridden.description.as_deref(),
                 Some("HTTP General Override")
