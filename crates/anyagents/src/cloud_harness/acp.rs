@@ -792,6 +792,7 @@ impl<H: Write, P: Write> Client<H, P> {
             // The running turn's state refused it: the host offers it again,
             // and what waits behind it goes back too so mailbox FIFO holds.
             "turn_open" | "turn_closed" | "no_active_turn" | "turn_not_started" => {
+                let Some(item) = item else { return Ok(()) };
                 if code == "turn_open" && self.turn.is_none() {
                     self.turn = Some(String::new());
                     self.duplicate_turn = false;
@@ -801,7 +802,6 @@ impl<H: Write, P: Write> Client<H, P> {
                 }
                 self.opening = false;
                 self.delivering = None;
-                let Some(item) = item else { return Ok(()) };
                 self.cancelled_batch.push(item);
                 self.cancelled_batch.extend(self.waiting.drain(..));
                 if !self.defer_cancel {
@@ -1577,6 +1577,113 @@ mod tests {
         let odd = json!({"type": "rejected", "seq": null, "session_id": SESSION, "lease_epoch": 1,
             "request_id": "1.9", "code": "something_new", "error": null});
         assert!(rig.client.on_peer(&odd.to_string()).is_err());
+    }
+
+    #[test]
+    fn rejected_interrupt_does_not_clobber_in_flight_deliver_fence() {
+        // Case 1: opening `deliver` (`m1`) is in flight when an `interrupt` is
+        // rejected with `no_active_turn`. Neither `opening` nor `waiting` is
+        // disturbed, so `m2` and `m3` stay fenced behind `m1` in FIFO order.
+        let mut rig = live();
+        rig.client.on_host(&user("m1")).unwrap();
+        let sent_m1 = rig.peer.take();
+        assert_eq!(sent_m1.len(), 1);
+        assert_eq!(sent_m1[0]["mode"], "turn");
+        let req_m1 = sent_m1[0]["request_id"].as_str().unwrap().to_string();
+
+        rig.client
+            .on_host(r#"{"type":"control_request","request":{"subtype":"interrupt"}}"#)
+            .unwrap();
+        let sent_int = rig.peer.take();
+        assert_eq!(sent_int.len(), 1);
+        assert_eq!(sent_int[0]["type"], "interrupt");
+        let req_int = sent_int[0]["request_id"].as_str().unwrap().to_string();
+
+        rig.client.on_host(&user("m2")).unwrap();
+        assert!(rig.peer.take().is_empty(), "m2 waits behind opening m1");
+
+        let rejected_int = json!({
+            "type": "rejected",
+            "seq": null,
+            "session_id": SESSION,
+            "lease_epoch": 1,
+            "request_id": req_int,
+            "code": "no_active_turn",
+            "error": null,
+        });
+        rig.client.on_peer(&rejected_int.to_string()).unwrap();
+        assert!(rig.host.take().is_empty());
+        assert!(rig.client.opening, "opening fence remains intact");
+
+        rig.client.on_host(&user("m3")).unwrap();
+        assert!(rig.peer.take().is_empty(), "m3 must not race m1 or m2");
+
+        rig.client
+            .on_peer(&frame(
+                2,
+                1,
+                Some(&req_m1),
+                json!({"type": "accepted", "turn_id": "t1", "mode": "turn"}),
+            ))
+            .unwrap();
+        assert_eq!(echoed(&rig.host.take()), ["u-m1"]);
+        let sent_m2 = rig.peer.take();
+        assert_eq!(sent_m2.len(), 1);
+        assert_eq!(sent_m2[0]["mode"], "steer");
+        assert_eq!(sent_m2[0]["items"][0]["id"], "m2");
+        let req_m2 = sent_m2[0]["request_id"].as_str().unwrap().to_string();
+
+        // Case 2: steer `deliver` (`m2`) is in flight when an `interrupt` is
+        // rejected with `no_active_turn`. `delivering` stays intact so a fresh
+        // `m4` cannot overtake `m2` or `m3`.
+        rig.client
+            .on_host(r#"{"type":"control_request","request":{"subtype":"interrupt"}}"#)
+            .unwrap();
+        let sent_int2 = rig.peer.take();
+        let req_int2 = sent_int2[0]["request_id"].as_str().unwrap().to_string();
+        let rejected_int2 = json!({
+            "type": "rejected",
+            "seq": null,
+            "session_id": SESSION,
+            "lease_epoch": 1,
+            "request_id": req_int2,
+            "code": "no_active_turn",
+            "error": null,
+        });
+        rig.client.on_peer(&rejected_int2.to_string()).unwrap();
+        assert_eq!(
+            rig.client.delivering.as_ref().map(|(req, _)| req.as_str()),
+            Some(req_m2.as_str())
+        );
+
+        rig.client.on_host(&user("m4")).unwrap();
+        assert!(rig.peer.take().is_empty(), "m4 waits behind m2 and m3");
+
+        rig.client
+            .on_peer(&frame(
+                3,
+                1,
+                Some(&req_m2),
+                json!({"type": "steer_ack", "turn_id": "t1", "item_ids": ["m2"]}),
+            ))
+            .unwrap();
+        let sent_m3 = rig.peer.take();
+        assert_eq!(sent_m3.len(), 1);
+        assert_eq!(sent_m3[0]["mode"], "steer");
+        assert_eq!(sent_m3[0]["items"][0]["id"], "m3");
+        let req_m3 = sent_m3[0]["request_id"].as_str().unwrap().to_string();
+        rig.client
+            .on_peer(&frame(
+                4,
+                1,
+                Some(&req_m3),
+                json!({"type": "steer_ack", "turn_id": "t1", "item_ids": ["m3"]}),
+            ))
+            .unwrap();
+        let sent_m4 = rig.peer.take();
+        assert_eq!(sent_m4.len(), 1);
+        assert_eq!(sent_m4[0]["mode"], "steer");
+        assert_eq!(sent_m4[0]["items"][0]["id"], "m4");
     }
 
     #[test]

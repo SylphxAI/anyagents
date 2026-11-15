@@ -229,6 +229,9 @@ struct State {
     admissions: u64,
     /// A thread is waiting for the open turn to end.
     watching: bool,
+    /// Active `settle_unproven` passes fencing mailbox delivery until all
+    /// unproven prompts settle atomically.
+    settling: usize,
     turns_completed: u32,
     /// `turns_completed` when the session's totals were last read.
     usage_read_at: Option<u32>,
@@ -753,15 +756,23 @@ fn follow_events(vendor: &Arc<Vendor>, launch: u64) {
             }
         };
         let ended = events::subscribe(&service, &password, |event| {
-            let connected = on_event(vendor, launch, &event);
+            let connected = on_event(vendor, launch, &event, connected_before);
             if connected && connected_before {
                 // Events during the gap are gone: the conversation settles
                 // every line still unproven, off this thread so the stream
                 // keeps being read.
                 let settler = Arc::clone(vendor);
-                let _ = thread::Builder::new()
+                if thread::Builder::new()
                     .name("anyagents-opencode-settle".into())
-                    .spawn(move || settle_unproven(&settler));
+                    .spawn(move || settle_unproven(&settler, false))
+                    .is_err()
+                {
+                    let mut state = vendor.lock();
+                    state.settling = state.settling.saturating_sub(1);
+                    state.epoch += 1;
+                    drop(state);
+                    vendor.changed.notify_all();
+                }
             }
             connected_before |= connected;
         });
@@ -793,7 +804,7 @@ fn follow_events(vendor: &Arc<Vendor>, launch: u64) {
 
 /// Record one event of the service started as `launch`. Answers whether it
 /// was `server.connected`.
-fn on_event(vendor: &Vendor, launch: u64, event: &Value) -> bool {
+fn on_event(vendor: &Vendor, launch: u64, event: &Value, connected_before: bool) -> bool {
     let kind = event.get("type").and_then(Value::as_str);
     let data = event.get("data");
     let field = |key: &str| data.and_then(|data| data.get(key)).and_then(Value::as_str);
@@ -803,7 +814,12 @@ fn on_event(vendor: &Vendor, launch: u64, event: &Value) -> bool {
     }
     let connected = kind == Some("server.connected");
     match kind {
-        Some("server.connected") => state.events_connected = true,
+        Some("server.connected") => {
+            state.events_connected = true;
+            if connected_before {
+                state.settling += 1;
+            }
+        }
         Some(kind @ ("session.inbox.delivered" | "session.inbox.cancelled")) => {
             let Some(inbox) = field("inboxID") else {
                 return false;
@@ -833,7 +849,10 @@ fn downgrade_unconsumed_admitted(state: &mut State) {
     let mut downgraded = Vec::new();
     for (id, prompt) in &mut state.prompts {
         let vid = vendor_message_id(id);
-        if matches!(prompt, Prompt::Admitted) && !state.consumed.contains(&vid) {
+        if matches!(prompt, Prompt::Admitted)
+            && !state.consumed.contains(&vid)
+            && !state.cancelled.contains(&vid)
+        {
             *prompt = Prompt::Unknown;
             downgraded.push(id.clone());
         }
@@ -845,24 +864,43 @@ fn downgrade_unconsumed_admitted(state: &mut State) {
     }
 }
 
-fn settle_unproven(vendor: &Vendor) {
-    let (session, unproven) = {
-        let state = vendor.lock();
+fn settle_unproven(vendor: &Vendor, known_idle: bool) {
+    let (session, admitted, unproven) = {
+        let mut state = vendor.lock();
         let Some(session) = state.session.clone() else {
+            state.settling = state.settling.saturating_sub(1);
+            state.epoch += 1;
+            drop(state);
+            vendor.changed.notify_all();
             return;
         };
-        let unproven: Vec<(String, String)> = state
+        let unproven: Vec<(String, String, bool)> = state
             .prompts
             .iter()
             .filter(|(_, prompt)| {
                 matches!(prompt, Prompt::Sending | Prompt::Admitted | Prompt::Unknown)
             })
-            .map(|(id, _)| (id.clone(), vendor_message_id(id)))
-            .filter(|(_, vid)| !state.consumed.contains(vid))
+            .map(|(id, prompt)| {
+                (
+                    id.clone(),
+                    vendor_message_id(id),
+                    matches!(prompt, Prompt::Admitted),
+                )
+            })
+            .filter(|(_, vid, _)| !state.consumed.contains(vid) && !state.cancelled.contains(vid))
             .collect();
-        (session, unproven)
+        if unproven.is_empty() {
+            state.settling = state.settling.saturating_sub(1);
+            state.epoch += 1;
+            drop(state);
+            vendor.changed.notify_all();
+            return;
+        }
+        (session, state.admissions, unproven)
     };
-    for (msg_id, id) in unproven {
+    let mut found_ids = Vec::new();
+    let mut missing_admitted = Vec::new();
+    for (msg_id, id, was_admitted) in unproven {
         match vendor.call(
             "GET",
             &format!("/api/session/{session}/message/{id}"),
@@ -870,29 +908,48 @@ fn settle_unproven(vendor: &Vendor) {
             Some(CALL_TIMEOUT),
         ) {
             Ok(found) if found.pointer("/data/id").and_then(Value::as_str) == Some(id.as_str()) => {
-                let mut state = vendor.lock();
-                state.cancelled.remove(&id);
-                state.consumed.insert(id);
-                state.epoch += 1;
-                drop(state);
-                vendor.changed.notify_all();
+                found_ids.push(id);
             }
-            Err(err) if err.status == Some(404) => {
-                let mut state = vendor.lock();
-                if state.session.as_deref() == Some(session.as_str())
-                    && !state.consumed.contains(&id)
-                    && matches!(state.prompts.get(&msg_id), Some(Prompt::Admitted))
-                {
-                    state.prompts.insert(msg_id.clone(), Prompt::Unknown);
-                    state.history.retain(|prior| prior.id != msg_id);
-                    state.epoch += 1;
-                    drop(state);
-                    vendor.changed.notify_all();
-                }
+            Err(err) if err.status == Some(404) && was_admitted => {
+                missing_admitted.push((msg_id, id));
             }
             _ => {}
         }
     }
+    let session_idle = if known_idle || missing_admitted.is_empty() {
+        known_idle
+    } else {
+        matches!(
+            vendor.call("GET", "/api/session/active", None, Some(CALL_TIMEOUT)),
+            Ok(active) if active.get("data").and_then(|data| data.get(&session)).is_none()
+        )
+    };
+    let mut state = vendor.lock();
+    for id in found_ids {
+        state.cancelled.remove(&id);
+        state.consumed.insert(id);
+    }
+    if session_idle
+        && state.session.as_deref() == Some(session.as_str())
+        && state.admissions == admitted
+    {
+        if known_idle {
+            downgrade_unconsumed_admitted(&mut state);
+        } else {
+            for (msg_id, id) in missing_admitted {
+                if !state.consumed.contains(&id)
+                    && matches!(state.prompts.get(&msg_id), Some(Prompt::Admitted))
+                {
+                    state.prompts.insert(msg_id.clone(), Prompt::Unknown);
+                    state.history.retain(|prior| prior.id != msg_id);
+                }
+            }
+        }
+    }
+    state.settling = state.settling.saturating_sub(1);
+    state.epoch += 1;
+    drop(state);
+    vendor.changed.notify_all();
 }
 
 impl Vendor {
@@ -1364,7 +1421,7 @@ impl Vendor {
             .pointer("/time/created")
             .and_then(Value::as_i64)
             .is_some_and(|created| created < sent_at);
-        if existed
+        if (existed || replay)
             && !self.lock().consumed.contains(&id)
             && self
                 .call(
@@ -1373,7 +1430,9 @@ impl Vendor {
                     None,
                     None,
                 )
-                .is_ok()
+                .is_ok_and(|found| {
+                    found.pointer("/data/id").and_then(Value::as_str) == Some(id.as_str())
+                })
             && !self.lock().consumed.contains(&id)
         {
             if replay {
@@ -1514,11 +1573,15 @@ fn watch_turn(vendor: &Arc<Vendor>) {
             continue;
         }
         let has_unproven = state.prompts.iter().any(|(id, prompt)| {
-            matches!(prompt, Prompt::Admitted) && !state.consumed.contains(&vendor_message_id(id))
+            let vid = vendor_message_id(id);
+            matches!(prompt, Prompt::Admitted)
+                && !state.consumed.contains(&vid)
+                && !state.cancelled.contains(&vid)
         });
         if has_unproven {
+            state.settling += 1;
             drop(state);
-            settle_unproven(vendor);
+            settle_unproven(vendor, true);
             state = vendor.lock();
             if !state.alive || state.closing {
                 state.watching = false;
@@ -1602,8 +1665,9 @@ impl Harness for OpenCodeHarness {
             Some(Prompt::Unknown) => true,
             _ => false,
         };
-        // One prompt call at a time keeps the inbox in mailbox order.
-        if state.sending.is_some() {
+        // One prompt call at a time — and none while unproven admissions are
+        // settling — keeps the inbox in mailbox order.
+        if state.settling > 0 || state.sending.is_some() {
             return Ok(DeliverOutcome::Deferred);
         }
         state.sending = Some(message.id.clone());

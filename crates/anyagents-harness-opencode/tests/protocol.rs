@@ -1044,6 +1044,109 @@ fn an_unconsumed_admitted_line_left_behind_at_idle_is_replayed_and_accepted() {
 }
 
 #[test]
+fn a_same_ms_replay_already_consumed_is_accepted() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "replay-same-ms");
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    assert_eq!(
+        harness.proven("m1"),
+        Some(Proof::Taken {
+            turn_finished: false
+        })
+    );
+}
+
+#[test]
+fn a_mid_turn_sse_reconnect_keeps_queued_steers_in_flight() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "reconnect-midturn");
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    assert_eq!(harness.deliver(&msg("m2")), Ok(DeliverOutcome::InFlight));
+    eventually(&harness, "m2 probed across SSE reconnect", |h| {
+        let log = log_of(&dir);
+        h.seen("m2")
+            && log.contains("api:GET /api/session/ses_fake/message/msg_m2")
+            && log.matches("api:GET /api/session/active").count() >= 2
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match harness.deliver(&msg("m3")).unwrap() {
+            DeliverOutcome::Deferred => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "settling did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            DeliverOutcome::InFlight | DeliverOutcome::Accepted { .. } => break,
+            other => panic!("unexpected m3 outcome: {other:?}"),
+        }
+    }
+    assert_eq!(settle(&mut harness, &msg("m3")).unwrap(), accepted());
+    assert_eq!(settle(&mut harness, &msg("m2")).unwrap(), accepted());
+    assert_eq!(log_of(&dir).matches("\"id\":\"msg_m2\"").count(), 1);
+}
+
+#[test]
+fn unconsumed_steers_settled_at_idle_redeliver_in_fifo_ahead_of_fresh_mail() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "settle-fifo");
+    assert_eq!(harness.deliver(&msg("m1")), Ok(DeliverOutcome::InFlight));
+    eventually(&harness, "m1 admitted", |h| h.seen("m1"));
+    assert_eq!(harness.deliver(&msg("m2")), Ok(DeliverOutcome::InFlight));
+    eventually(&harness, "m2 admitted", |h| h.seen("m2"));
+
+    std::fs::write(dir.path().join("turn-ended"), "1").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !dir.path().join("in-settle").exists() {
+        assert!(std::time::Instant::now() < deadline, "settle did not start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // While `settle_unproven` probes HTTP, admitted lines stay in flight and
+    // fresh mail behind them defers instead of overtaking.
+    assert_eq!(harness.deliver(&msg("m1")), Ok(DeliverOutcome::InFlight));
+    assert_eq!(harness.deliver(&msg("m2")), Ok(DeliverOutcome::InFlight));
+    assert_eq!(harness.deliver(&msg("m3")), Ok(DeliverOutcome::Deferred));
+
+    let mailbox = [msg("m1"), msg("m2"), msg("m3")];
+    let mut cursor = 0;
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while cursor < mailbox.len() {
+        assert!(
+            std::time::Instant::now() < drain_deadline,
+            "mailbox did not drain"
+        );
+        for (idx, item) in mailbox.iter().enumerate().skip(cursor) {
+            match harness.deliver(item).unwrap() {
+                DeliverOutcome::Accepted { .. } if idx == cursor => cursor += 1,
+                DeliverOutcome::Accepted { .. } | DeliverOutcome::InFlight => {}
+                DeliverOutcome::Deferred => break,
+                other => panic!("unexpected outcome for {}: {other:?}", item.id),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let posted: Vec<String> = log_of(&dir)
+        .lines()
+        .filter_map(|line| line.strip_prefix("api:POST /api/session/ses_fake/prompt "))
+        .filter_map(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .filter_map(|v| {
+            v.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(
+        posted,
+        vec!["msg_m1", "msg_m2", "msg_m1", "msg_m2", "msg_m3"],
+        "{}",
+        log_of(&dir)
+    );
+}
+
+#[test]
 fn a_refused_event_stream_fails_the_start() {
     let dir = TempDir::new().unwrap();
     let log = dir.path().join("log");

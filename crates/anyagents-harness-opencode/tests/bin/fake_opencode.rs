@@ -196,9 +196,38 @@ fn api(args: &[String], endpoint: &str) {
             print!("{{\"data\":[{{\"id\":\"ses_fake\"}}]}}");
         }
         ("GET", "/api/session/active") => {
-            print!("{{\"data\":{{}}}}");
+            let dir = env::var("ANYAGENTS_FAKE_STATE").unwrap_or_default();
+            if mode == "reconnect-midturn"
+                && !std::path::Path::new(&format!("{dir}/finish-turn")).exists()
+            {
+                print!(
+                    "{}",
+                    serde_json::json!({"data": {"ses_fake": {"type": "running"}}})
+                );
+            } else {
+                print!("{{\"data\":{{}}}}");
+            }
         }
         ("POST", p) if p.starts_with("/api/experimental/session/") && p.ends_with("/wait") => {
+            let dir = env::var("ANYAGENTS_FAKE_STATE").unwrap_or_default();
+            if mode == "reconnect-midturn" {
+                let address = endpoint.trim_start_matches("http://");
+                while !std::path::Path::new(&format!("{dir}/finish-turn")).exists()
+                    && std::net::TcpStream::connect(address).is_ok()
+                {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                return;
+            }
+            if mode == "settle-fifo" {
+                let address = endpoint.trim_start_matches("http://");
+                while !std::path::Path::new(&format!("{dir}/turn-ended")).exists()
+                    && std::net::TcpStream::connect(address).is_ok()
+                {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                return;
+            }
             // A turn that never ends answers only when the service stops.
             if matches!(
                 mode.as_str(),
@@ -220,16 +249,20 @@ fn api(args: &[String], endpoint: &str) {
                 .next()
                 .unwrap_or_default();
             let id = p.rsplit('/').next().unwrap_or_default();
+            let dir = env::var("ANYAGENTS_FAKE_STATE").unwrap_or_default();
             // `applied`, or an input the service consumed: the conversation holds it.
-            let replay_consumed = mode == "replay-consumed" && {
-                let dir = env::var("ANYAGENTS_FAKE_STATE").unwrap_or_default();
-                std::path::Path::new(&format!("{dir}/failed-once")).exists()
-            };
+            let replay_consumed = matches!(mode.as_str(), "replay-consumed" | "replay-same-ms")
+                && std::path::Path::new(&format!("{dir}/failed-once")).exists();
             if mode == "applied" || replay_consumed || was_delivered(endpoint, session, id) {
                 print!(
                     "{{\"data\":{{\"id\":\"{id}\",\"type\":\"user\",\"text\":\"\",\"time\":{{\"created\":1}}}}}}"
                 );
                 return;
+            }
+            if mode == "settle-fifo" {
+                let _ = std::fs::write(format!("{dir}/in-settle"), "1");
+                thread::sleep(Duration::from_millis(120));
+                let _ = std::fs::write(format!("{dir}/settled"), "1");
             }
             fail(
                 404,
@@ -345,7 +378,7 @@ fn api(args: &[String], endpoint: &str) {
             // or an outcome does not say whether the line was admitted.
             if matches!(
                 mode.as_str(),
-                "prompt-503-once" | "prompt-502-once" | "replay-consumed"
+                "prompt-503-once" | "prompt-502-once" | "replay-consumed" | "replay-same-ms"
             ) {
                 let marker = format!("{dir}/failed-once");
                 if !std::path::Path::new(&marker).exists() {
@@ -408,7 +441,24 @@ fn api(args: &[String], endpoint: &str) {
                 } else {
                     announce(endpoint, session, prompt_id);
                 }
-            } else if !matches!(mode.as_str(), "undelivered" | "applied" | "replay-consumed") {
+            } else if mode == "reconnect-midturn" {
+                if prompt_id == "msg_m1" {
+                    announce(endpoint, session, prompt_id);
+                } else if prompt_id == "msg_m2" {
+                    notify_service(endpoint, "/fake/drop-sse");
+                } else {
+                    let _ = std::fs::write(format!("{dir}/finish-turn"), "1");
+                    announce(endpoint, session, "msg_m2");
+                    announce(endpoint, session, prompt_id);
+                }
+            } else if mode == "settle-fifo" {
+                if std::path::Path::new(&format!("{dir}/settled")).exists() {
+                    announce(endpoint, session, prompt_id);
+                }
+            } else if !matches!(
+                mode.as_str(),
+                "undelivered" | "applied" | "replay-consumed" | "replay-same-ms"
+            ) {
                 announce(endpoint, session, prompt_id);
             }
             let request: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
@@ -440,6 +490,8 @@ fn api(args: &[String], endpoint: &str) {
             // service answers with the record it already holds.
             let created = if matches!(mode.as_str(), "applied" | "parked" | "replay-consumed") {
                 1
+            } else if mode == "replay-same-ms" {
+                now_ms() + 60_000
             } else {
                 now_ms()
             };
@@ -656,6 +708,13 @@ fn events(listener: std::net::TcpListener) {
                         .unwrap()
                         .0
                         .retain_mut(|stream| stream.write_all(frame.as_bytes()).is_ok());
+                    let _ = connection.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+                }
+                (Some("POST"), Some("/fake/drop-sse")) => {
+                    let mut state = state.lock().unwrap();
+                    for stream in state.0.drain(..) {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    }
                     let _ = connection.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
                 }
                 (Some("POST"), Some(path)) if path.starts_with("/fake/missed/") => {
