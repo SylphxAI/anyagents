@@ -359,6 +359,10 @@ async fn serve(
     let listener = api_listener;
     let poller = crate::telegram::Poller::start(Arc::clone(&store), data.to_path_buf())
         .map_err(Error::Message)?;
+    // Set once a stop is requested: every listener (the socket and both TCP
+    // listeners) stops taking connections at once, calls running on any of
+    // them drain together, and every background loop ends at once.
+    let (stopping, _) = tokio::sync::watch::channel(false);
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
         quota_rotation::start(Arc::clone(&store));
@@ -367,11 +371,16 @@ async fn serve(
         let reaper_root = data.to_path_buf();
         let reaper_store = Arc::clone(&store);
         let reaper_health = state.health.clone();
+        let mut reaper_stop = stopping.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             let mut tick_count = 0u64;
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    biased;
+                    _ = reaper_stop.wait_for(|stop| *stop) => break,
+                    _ = interval.tick() => {}
+                }
                 tick_count = tick_count.wrapping_add(1);
                 let run_verify = tick_count.is_multiple_of(15);
                 let first_pass = tick_count == 1;
@@ -422,11 +431,18 @@ async fn serve(
         });
         let updater_root = data.to_path_buf();
         let updater_store = Arc::clone(&store);
+        let mut updater_stop = stopping.subscribe();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(6 * 3600),
+            );
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    biased;
+                    _ = updater_stop.wait_for(|stop| *stop) => break,
+                    _ = interval.tick() => {}
+                }
                 let root = updater_root.clone();
                 let store_for_update = Arc::clone(&updater_store);
                 let _ = tokio::task::spawn_blocking(move || {
@@ -471,12 +487,12 @@ async fn serve(
                 .await;
             }
         });
-        start_schedule_loops(Arc::clone(&store), state.health.clone());
+        crate::schedule::start_loops(
+            Arc::clone(&store),
+            state.health.clone(),
+            stopping.subscribe(),
+        );
     }
-    // Set once a stop is requested: every listener (the socket and both TCP
-    // listeners) stops taking connections at once, and calls running on any
-    // of them drain together.
-    let (stopping, _) = tokio::sync::watch::channel(false);
     // `public_listen` decides whether the local TCP listener is also the
     // public one. A configuration file that cannot be read fails closed: no
     // public listener, and the local listener defaults to loopback.
@@ -633,6 +649,12 @@ async fn serve(
                     left = &mut settling => break left,
                 }
             };
+            if kept {
+                // Nothing left to wait for once the mutations are done: the
+                // answers, the Telegram release and the joins after it get a
+                // few seconds, then the process exits whatever still runs.
+                exit_after(STOP_AFTER_DRAIN_WITHIN);
+            }
             if left > 0 {
                 eprintln!(
                     "anyagents: {left} mutating call(s) still running after {}s end with \
@@ -701,8 +723,16 @@ const RESPONSE_FLUSH_WITHIN: std::time::Duration = std::time::Duration::from_sec
 /// their keepers for the next server, exactly as after a crash, and its store
 /// writes are transactions, so a write cut short is not half made.
 pub(crate) const STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(
-    MUTATION_DRAIN_WITHIN.as_secs() + RESPONSE_FLUSH_WITHIN.as_secs() + 13,
+    MUTATION_DRAIN_WITHIN.as_secs() + STOP_AFTER_DRAIN_WITHIN.as_secs(),
 );
+
+/// Once the mutations are done (or their wait is over), the longest a server
+/// whose harnesses live in keepers takes to exit: the answers are written out
+/// ([`RESPONSE_FLUSH_WITHIN`]), the Telegram release and the joins after it
+/// finish, and the runtime abandons its blocking work. Background loops (the
+/// schedule timers and their external probes among them) already ended at the
+/// stop.
+const STOP_AFTER_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// The wait for Telegram to hand back every bot's long poll at shutdown. It
 /// runs beside the drain. A bot not released in time is polled again by the
@@ -956,16 +986,6 @@ pub(crate) fn clear_explicitly_archived(data_dir: &Path, agent_id: &anyagents_co
     let _ = std::fs::remove_file(cfg.join(".anyagents-reaped"));
     let _ = std::fs::remove_file(cfg.join(".anyagents-archived"));
     reap_queue::dequeue(data_dir, agent_id);
-}
-
-/// Local timers and network watches run on separate timers, so an in-flight
-/// external request cannot hold a local tick. Each sleeps until its next due
-/// time or a schedule change.
-fn start_schedule_loops(
-    store: Arc<Store>,
-    health: HealthBoard,
-) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
-    crate::schedule::start_loops(store, health)
 }
 
 /// How this server authenticates. A machine started without an operator token
@@ -8949,7 +8969,9 @@ pub(crate) mod tests {
         let store = Store::open(temp.path().join("state.db")).unwrap();
         for (harness, mode, steer) in [
             ("spiron", "steer", "yes"),
-            ("grok", "steer", "unproven"),
+            ("grok", "steer", "yes"),
+            ("opencode", "steer", "yes"),
+            ("dsh", "steer", "yes"),
             ("spiron-cloud", "followup", "no"),
         ] {
             let agent = store
@@ -8966,6 +8988,14 @@ pub(crate) mod tests {
                 "{harness}"
             );
         }
+        let mid_turn = crate::api::DeliveryView::from(&anyagents_harness_stream::LINE_INTO_TURN);
+        assert_eq!(
+            (
+                mid_turn.legacy_mode().as_str(),
+                mid_turn.legacy_steer().as_str()
+            ),
+            ("steer", "unproven")
+        );
     }
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
@@ -11237,7 +11267,9 @@ pub(crate) mod tests {
         }
         let release = Release(Some(release));
         runtime.block_on(async {
-            let (local, network) = start_schedule_loops(Arc::clone(&store), HealthBoard::default());
+            let (stop, stopping) = tokio::sync::watch::channel(false);
+            let (local, network) =
+                crate::schedule::start_loops(Arc::clone(&store), HealthBoard::default(), stopping);
             let deadline = Instant::now() + Duration::from_secs(8);
             loop {
                 match received.try_recv() {
@@ -11320,8 +11352,15 @@ pub(crate) mod tests {
             assert_eq!(active[0].id, watch.id);
             assert_eq!(active[0].last_observed, watch.last_observed);
             // All five admissions are proven before releasing the external response.
-            local.abort();
-            network.abort();
+            // A stop ends both timers at once, though the external probe is
+            // still waiting for its answer.
+            stop.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                local.await.unwrap();
+                network.await.unwrap();
+            })
+            .await
+            .expect("a stop ends both schedule timers while a probe is in flight");
         });
         drop(release);
         peer.join().unwrap();

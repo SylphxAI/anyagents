@@ -16,6 +16,8 @@ use anyagents_harness::normalize_harness_name;
 use clap::Args;
 use serde_json::{Value, json};
 
+mod acp;
+
 #[derive(Args, Clone, Debug)]
 pub struct CloudHarnessArgs {
     /// Agent configuration directory containing the server-issued remote session token,
@@ -76,12 +78,10 @@ pub fn try_parse_from_raw_argv(argv: &[String]) -> Option<CloudHarnessArgs> {
 }
 
 pub fn run(args: CloudHarnessArgs) -> Result<(), Error> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    run_with_io(args, BufReader::new(stdin.lock()), stdout)
+    run_with_io(args, BufReader::new(std::io::stdin()), std::io::stdout())
 }
 
-pub fn run_with_io<R: BufRead, W: Write + Send + 'static>(
+pub fn run_with_io<R: BufRead + Send + 'static, W: Write + Send + 'static>(
     args: CloudHarnessArgs,
     reader: R,
     writer: W,
@@ -96,12 +96,30 @@ pub fn run_with_io<R: BufRead, W: Write + Send + 'static>(
         .unwrap_or_else(|| "spiron-cloud".to_string());
     let harness = normalize_harness_name(&raw_harness).to_string();
     let model = args.model.filter(|m| !m.trim().is_empty());
+    let resume = args
+        .resume
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| read_persisted_session_id(&config, &harness));
 
-    let session_id = Arc::new(Mutex::new(
-        args.resume
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| read_persisted_session_id(&config, &harness)),
-    ));
+    // A peer that speaks `acp/v1` runs the session itself (`acp`).
+    if let Some(peer) =
+        acp::config(read_cloud_json(&config).as_ref(), &harness).map_err(Error::Message)?
+    {
+        let instructions = build_cloud_system_prompt(&config);
+        return acp::serve(
+            &peer,
+            &config,
+            &harness,
+            resume,
+            model,
+            instructions,
+            reader,
+            writer,
+        )
+        .map_err(Error::Message);
+    }
+
+    let session_id = Arc::new(Mutex::new(resume));
     let writer = Arc::new(Mutex::new(writer));
 
     type ActiveTurn = (

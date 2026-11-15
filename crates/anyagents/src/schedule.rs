@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -985,18 +986,25 @@ pub fn schedules_changed(data_dir: &Path) {
 /// the turn-ownership guard), one for network-backed watches, so an in-flight
 /// external request cannot delay a local tick. Both step at once at startup,
 /// then each sleeps until its earliest due time or a schedule change.
+///
+/// Both end once `stopping` turns true (or its sender is gone): a sleep ends at
+/// once, and a step in progress stops before its next entry, so a pass of
+/// external probes cannot outlive a server stop by more than the one probe in
+/// flight, which the stopping runtime abandons.
 pub fn start_loops(
     store: Arc<Store>,
     health: HealthBoard,
+    stopping: tokio::sync::watch::Receiver<bool>,
 ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
     let feed = change_feed(store.data_dir());
     let local = spawn_timer(
         Arc::clone(&store),
         health.clone(),
         feed.subscribe(),
+        stopping.clone(),
         Timer::local(),
     );
-    let external = spawn_timer(store, health, feed.subscribe(), Timer::external());
+    let external = spawn_timer(store, health, feed.subscribe(), stopping, Timer::external());
     (local, external)
 }
 
@@ -1004,8 +1012,10 @@ fn spawn_timer(
     store: Arc<Store>,
     health: HealthBoard,
     mut changes: tokio::sync::watch::Receiver<u64>,
+    mut stopping: tokio::sync::watch::Receiver<bool>,
     timer: Timer,
 ) -> tokio::task::JoinHandle<()> {
+    let stop = Arc::clone(&timer.stop);
     let timer = Arc::new(Mutex::new(timer));
     tokio::spawn(async move {
         loop {
@@ -1016,20 +1026,26 @@ fn spawn_timer(
                 timer
                     .step(&st, &hb, generation, anyagents_core::now_ms())
                     .deadline
-            })
-            .await;
-            let deadline = step.unwrap_or_else(|err| {
-                eprintln!("Schedule pass failed: {err}");
-                anyagents_core::now_ms().saturating_add(RETRY_MS)
             });
+            let deadline = tokio::select! {
+                biased;
+                _ = stopping.wait_for(|stop| *stop) => break,
+                step = step => step.unwrap_or_else(|err| {
+                    eprintln!("Schedule pass failed: {err}");
+                    anyagents_core::now_ms().saturating_add(RETRY_MS)
+                }),
+            };
             let wait = deadline
                 .saturating_sub(anyagents_core::now_ms())
                 .clamp(0, SAFETY_NET_MS);
             tokio::select! {
+                biased;
+                _ = stopping.wait_for(|stop| *stop) => break,
                 () = tokio::time::sleep(Duration::from_millis(wait as u64)) => {}
                 Ok(()) = changes.changed() => {}
             }
         }
+        stop.store(true, Ordering::SeqCst);
     })
 }
 
@@ -1041,6 +1057,8 @@ struct Timer {
     guard: Option<TurnGuard>,
     restored: bool,
     deadline: i64,
+    /// Set when the server stops: a step in progress evaluates no further entry.
+    stop: Arc<AtomicBool>,
 }
 
 impl Timer {
@@ -1050,6 +1068,7 @@ impl Timer {
             guard: Some(TurnGuard::default()),
             restored: false,
             deadline: i64::MIN,
+            stop: Arc::default(),
         }
     }
 
@@ -1059,6 +1078,7 @@ impl Timer {
             guard: None,
             restored: true,
             deadline: i64::MIN,
+            stop: Arc::default(),
         }
     }
 
@@ -1087,7 +1107,7 @@ impl Timer {
         }
         if self.plan.due(now) {
             step.worked = true;
-            let pass = self.plan.pass(store, health, now);
+            let pass = self.plan.pass(store, health, now, &self.stop);
             step.fired = pass.fired;
             if pass.wrote {
                 self.plan.reload(store, generation, now);
@@ -1747,7 +1767,13 @@ impl Plan {
     }
 
     /// Evaluate every entry whose check time has come.
-    fn pass(&mut self, store: &Store, health: &HealthBoard, now: i64) -> PassOutcome {
+    fn pass(
+        &mut self,
+        store: &Store,
+        health: &HealthBoard,
+        now: i64,
+        stop: &AtomicBool,
+    ) -> PassOutcome {
         if self.external {
             github::begin_cycle(
                 self.entries
@@ -1765,6 +1791,9 @@ impl Plan {
         }
         let mut outcome = PassOutcome::default();
         for i in order {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
             let step = evaluate_entry(store, health, &mut self.entries[i], now);
             outcome.fired += usize::from(step.fired);
             outcome.wrote |= step.wrote;
@@ -4298,6 +4327,27 @@ Connection: close
     }
 
     #[test]
+    fn stopped_timer_evaluates_no_further_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("stopped-owner", "codex"))
+            .unwrap();
+        let now = anyagents_core::now_ms();
+        timer_schedule(&store, &owner.id, "at", "due", Some(now - 1));
+        let mut timer = Timer::local();
+        timer.stop.store(true, Ordering::SeqCst);
+        let stopped = timer.step(&store, &health, 0, now);
+        assert_eq!(stopped.fired, 0);
+        assert!(store.inbox(&owner.id, None).unwrap().is_empty());
+        // The entry is still due: the next step, at the retry deadline, fires it.
+        assert_eq!(stopped.deadline, now + RETRY_MS);
+        timer.stop.store(false, Ordering::SeqCst);
+        assert_eq!(timer.step(&store, &health, 0, stopped.deadline).fired, 1);
+    }
+
+    #[test]
     fn idle_timer_touches_the_store_only_at_its_deadlines() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -4469,7 +4519,8 @@ Connection: close
         );
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let (local, external) = start_loops(Arc::clone(&store), health.clone());
+            let (_stopping, stopped) = tokio::sync::watch::channel(false);
+            let (local, external) = start_loops(Arc::clone(&store), health.clone(), stopped);
             // The startup step fires what is already due.
             let started = std::time::Instant::now();
             while store.inbox(&first.id, None).unwrap().is_empty() {

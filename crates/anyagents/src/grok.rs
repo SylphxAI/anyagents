@@ -8,15 +8,30 @@
 //! it as a turn; a busy one appends it to its `pending_inputs` queue and
 //! promotes it into the running turn at the next safe gap.
 //!
-//! Delivery is `mid-turn` (`docs/delivery.md`). A message is accepted once
-//! Grok shows it admitted: its marker line in an `x.ai/queue/changed` report
-//! (the running prompt or a pending entry), in a `user_message_chunk` or an
-//! `x.ai/session/interjection`, or the answer to its request. Grok names none
-//! of these by an id AnyAgents sends, so the marker line is the link, and it
-//! deduplicates nothing, so nothing is ever written to Grok twice.
+//! Delivery is `next-step` (`docs/delivery.md`). Grok shows a prompt in two
+//! stages, and the adapter tells them apart:
 //!
-//! An error answer to a prompt Grok already showed admitted ends that turn:
-//! the message was taken. An error answer before Grok showed it admitted is
+//! - admitted: its marker line in a pending entry of an `x.ai/queue/changed`
+//!   report. The prompt sits in `pending_inputs`; nothing is committed, and
+//!   the next prompt may be written behind it;
+//! - consumed: its marker line in the running turn's input, which Grok shows
+//!   as the report's `runningText` (a prompt that opened the turn) or
+//!   `runningCombinedTexts` (one the turn's next step promoted into it), as a
+//!   `user_message_chunk` (the interjection the model is given) or an
+//!   `x.ai/session/interjection`, or the answer to its request (the turn that
+//!   held it ended). This is the proof the message is committed on.
+//!
+//! Grok names none of these by an id AnyAgents sends, so the marker line is
+//! the link. A prompt Grok admitted and its turn never consumed (the process
+//! died first) is offered again to the next process: Grok keeps
+//! `pending_inputs` in the process, and a turn that ends with input pending
+//! runs it as the next turn rather than dropping it. Grok deduplicates
+//! nothing, so the adapter is not idempotent, and nothing is ever written to
+//! one Grok process twice.
+//!
+//! An error answer to a prompt Grok already showed admitted ends the turn it
+//! was queued on or running in: the message was taken. An error answer before
+//! Grok showed it admitted is
 //! parked as rejected and its sender told; it is never written again. For a
 //! request the JSON-RPC layer could not take (`-32700`, `-32600`, `-32601`,
 //! `-32602`) that is certain: Grok never ran it, and it would refuse the same
@@ -55,10 +70,11 @@ fn rpc_wait() -> Duration {
 /// What this adapter guarantees for mail that reaches a busy agent
 /// (`docs/delivery.md`).
 pub const DELIVERY: Delivery = Delivery {
-    level: DeliveryLevel::MidTurn,
+    level: DeliveryLevel::NextStep,
     idempotent: false,
     proof: std::borrow::Cow::Borrowed(
-        "marker in x.ai/queue/changed or user_message_chunk; session/prompt answer",
+        "marker in the running turn's input (x.ai/queue/changed running texts, \
+         user_message_chunk); session/prompt answer",
     ),
     peer: None,
 };
@@ -85,9 +101,8 @@ struct State {
     prompts: HashMap<String, Prompt>,
     /// The mailbox id behind each `session/prompt` request.
     requests: HashMap<i64, String>,
-    /// Answers that arrived before their request was recorded: the error
-    /// object, or `None` for a result.
-    early: HashMap<i64, Option<Value>>,
+    /// Answers that arrived before their request was recorded.
+    early: HashMap<i64, EarlyAnswer>,
     /// Written, and Grok has shown nothing about it yet.
     unconfirmed: HashSet<String>,
     /// Written and not yet answered.
@@ -100,21 +115,29 @@ struct State {
     turns_served: u32,
 }
 
+/// An answer that arrived before its `session/prompt` id was recorded.
+struct EarlyAnswer {
+    stop_reason: Option<String>,
+    error: Option<Value>,
+}
+
 /// One `session/prompt` this process wrote.
 struct Prompt {
     /// `None` while the line is on its way.
     request: Option<i64>,
     /// Grok showed it queued or in its turn.
     admitted: bool,
+    /// Grok showed it in the running turn's input: its turn consumed it.
+    consumed: bool,
     /// Grok answered its request after admitting it: the turn that took it
     /// ended, with a result or an error.
     answered: bool,
 }
 
 impl Prompt {
-    /// What Grok proved about it, or `None` while Grok has shown nothing.
+    /// What Grok proved about it: `None` until its turn consumed it.
     fn proof(&self) -> Option<Proof> {
-        (self.admitted || self.answered).then_some(Proof::Taken {
+        (self.consumed || self.answered).then_some(Proof::Taken {
             turn_finished: self.answered,
         })
     }
@@ -289,6 +312,7 @@ impl Harness for GrokHarness {
                 Prompt {
                     request: None,
                     admitted: false,
+                    consumed: false,
                     answered: false,
                 },
             );
@@ -310,10 +334,22 @@ impl Harness for GrokHarness {
                 if let Some(prompt) = st.prompts.get_mut(id) {
                     prompt.request = Some(request);
                 }
-                if let Some(error) = st.early.remove(&request) {
-                    answer(&mut st, id, request, error);
+                if let Some(early) = st.early.remove(&request) {
+                    answer(
+                        &mut st,
+                        id,
+                        request,
+                        early.stop_reason.as_deref(),
+                        early.error,
+                    );
                 }
-                Ok(known_outcome(&st, id).unwrap_or(DeliverOutcome::InFlight))
+                Ok(if let Some(outcome) = known_outcome(&st, id) {
+                    outcome
+                } else if st.prompts.contains_key(id) {
+                    DeliverOutcome::InFlight
+                } else {
+                    DeliverOutcome::Deferred
+                })
             }
             // The line was not written: Grok has nothing to apply. The
             // process is judged by its output, which ends at EOF.
@@ -566,19 +602,43 @@ fn on_notification(state: &mut State, value: &Value) -> NotificationEffect {
     match method {
         "$rpc/response" => {
             if let Some(request) = params.get("id").and_then(Value::as_i64) {
+                let stop_reason = params
+                    .pointer("/result/stopReason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 let error = params
                     .get("error")
                     .filter(|error| !error.is_null())
                     .cloned();
                 match state.requests.get(&request).cloned() {
-                    Some(id) => answer(state, &id, request, error),
+                    Some(id) => answer(state, &id, request, stop_reason.as_deref(), error),
                     None => {
-                        state.early.insert(request, error);
+                        state
+                            .early
+                            .insert(request, EarlyAnswer { stop_reason, error });
                     }
                 }
             }
         }
-        "x.ai/queue/changed" | "x.ai/session/interjection" => admit_named(state, params),
+        "x.ai/queue/changed" => {
+            // Every entry, running or pending, is admitted; only the running
+            // turn's input is consumed.
+            admit_named(state, &params.to_string(), false);
+            let running: Vec<&str> = params
+                .get("runningText")
+                .into_iter()
+                .chain(
+                    params
+                        .get("runningCombinedTexts")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten(),
+                )
+                .filter_map(Value::as_str)
+                .collect();
+            admit_named(state, &running.join("\n"), true);
+        }
+        "x.ai/session/interjection" => admit_named(state, &params.to_string(), true),
         "session/update" => {
             if params
                 .pointer("/update/sessionUpdate")
@@ -591,16 +651,22 @@ fn on_notification(state: &mut State, value: &Value) -> NotificationEffect {
                     ..NotificationEffect::default()
                 };
             }
-            admit_named(state, params);
+            admit_named(state, &params.to_string(), true);
         }
         _ => {}
     }
     NotificationEffect::default()
 }
 
-/// Grok answered `request`, which carried `id`: `error` is its error object,
-/// `None` for a result.
-fn answer(state: &mut State, id: &str, request: i64, error: Option<Value>) {
+/// Grok answered `request`, which carried `id`: `stop_reason` is its result's
+/// `stopReason`, `error` its error object.
+fn answer(
+    state: &mut State,
+    id: &str,
+    request: i64,
+    stop_reason: Option<&str>,
+    error: Option<Value>,
+) {
     // A request is answered once.
     state.requests.remove(&request);
     let Some(prompt) = state.prompts.get_mut(id) else {
@@ -609,20 +675,19 @@ fn answer(state: &mut State, id: &str, request: i64, error: Option<Value>) {
     if prompt.request != Some(request) || prompt.answered {
         return;
     }
-    let rejected = match error {
-        Some(error) if !prompt.admitted => Some(rejection(&error)),
-        // A result, or an error that ended a turn Grok had taken it into.
-        _ => None,
-    };
-    match rejected {
-        Some(reason) => {
-            state.prompts.remove(id);
-            state.rejected.insert(id.to_string(), reason);
-        }
-        None => {
-            prompt.answered = true;
-            state.serving = true;
-        }
+    if !prompt.consumed
+        && (stop_reason == Some("cancelled") || (prompt.admitted && error.is_some()))
+    {
+        // Cancelled or failed while still queued: Grok never took it into a
+        // step, so it returns to the mailbox to be offered again in order.
+        state.prompts.remove(id);
+    } else if let Some(error) = error.filter(|_| !prompt.admitted) {
+        let reason = rejection(&error);
+        state.prompts.remove(id);
+        state.rejected.insert(id.to_string(), reason);
+    } else {
+        prompt.answered = true;
+        state.serving = true;
     }
     state.unconfirmed.remove(id);
     state.unanswered = state.unanswered.saturating_sub(1);
@@ -663,24 +728,16 @@ fn rejection(error: &Value) -> String {
     }
 }
 
-/// Grok showed a queue or a turn: every unconfirmed message whose marker line
-/// it carries is admitted.
-fn admit_named(state: &mut State, params: &Value) {
-    if state.unconfirmed.is_empty() {
-        return;
-    }
-    let text = params.to_string();
-    let named: Vec<String> = state
-        .unconfirmed
-        .iter()
-        .filter(|id| names_marker(&text, id))
-        .cloned()
-        .collect();
-    for id in named {
-        state.unconfirmed.remove(&id);
-        if let Some(prompt) = state.prompts.get_mut(&id) {
-            prompt.admitted = true;
+/// Grok showed `text`, a queue or the running turn's input: every message
+/// whose marker line it carries is admitted, and consumed when `consumed`.
+fn admit_named(state: &mut State, text: &str, consumed: bool) {
+    for (id, prompt) in state.prompts.iter_mut() {
+        if (prompt.consumed || (!consumed && prompt.admitted)) || !names_marker(text, id) {
+            continue;
         }
+        prompt.admitted = true;
+        prompt.consumed |= consumed;
+        state.unconfirmed.remove(id);
     }
 }
 
@@ -797,6 +854,7 @@ mod tests {
             Prompt {
                 request: Some(request),
                 admitted: false,
+                consumed: false,
                 answered: false,
             },
         );
@@ -823,25 +881,69 @@ mod tests {
     }
 
     #[test]
-    fn a_queue_report_admits_only_the_prompts_it_names() {
+    fn a_queue_report_admits_pending_entries_and_proves_only_the_running_input() {
         let mut state = State::default();
         written(&mut state, "m1", 1);
         written(&mut state, "m2", 2);
+        written(&mut state, "m3", 3);
+        // m1 runs; m2 waits in `pending_inputs`: admitted, not consumed.
+        on_notification(
+            &mut state,
+            &json!({"method": "x.ai/queue/changed", "params": {
+                "entries": [{"id": "q-2", "text": "anyagents-message:m2\nhello"}],
+                "runningText": "anyagents-message:m1\nhi",
+                "runningCombinedTexts": ["anyagents-message:m1\nhi"]
+            }}),
+        );
+        let taken = Some(Proof::Taken {
+            turn_finished: false,
+        });
+        assert_eq!(state.proven("m1"), taken);
+        assert_eq!(state.proven("m2"), None);
+        assert_eq!(state.proven("m3"), None);
+        assert!(state.prompts["m2"].admitted);
+        assert_eq!(
+            state.unconfirmed.iter().collect::<Vec<_>>(),
+            [&"m3".to_string()]
+        );
+        // The next step promotes m2 into the running turn.
+        on_notification(
+            &mut state,
+            &json!({"method": "x.ai/queue/changed", "params": {
+                "entries": [],
+                "runningText": "anyagents-message:m1\nhi",
+                "runningCombinedTexts": ["anyagents-message:m1\nhi", "anyagents-message:m2\nhello"]
+            }}),
+        );
+        assert_eq!(state.proven("m2"), taken);
+        // So does the interjection the model is given.
+        on_notification(
+            &mut state,
+            &json!({"method": "session/update", "params": {"update": {
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text":
+                    "The user sent a message while you were working:\n<user_query>\nanyagents-message:m3\nyo\n</user_query>"}
+            }}}),
+        );
+        assert_eq!(state.proven("m3"), taken);
+        assert!(state.unconfirmed.is_empty());
+    }
+
+    #[test]
+    fn a_prompt_admitted_and_never_consumed_proves_nothing() {
+        let mut state = State::default();
+        written(&mut state, "m1", 1);
         on_notification(
             &mut state,
             &json!({"method": "x.ai/queue/changed", "params": {
                 "entries": [{"id": "q-1", "text": "anyagents-message:m1\nhello"}],
-                "runningText": null
+                "runningText": null,
+                "runningCombinedTexts": []
             }}),
         );
-        assert_eq!(
-            state.proven("m1"),
-            Some(Proof::Taken {
-                turn_finished: false
-            })
-        );
-        assert_eq!(state.proven("m2"), None);
-        assert_eq!(state.unconfirmed.len(), 1);
+        // Admitted: the next message may be written, this one is not committed.
+        assert!(state.unconfirmed.is_empty());
+        assert_eq!(known_outcome(&state, "m1"), None);
     }
 
     #[test]
@@ -915,14 +1017,67 @@ mod tests {
         assert!(state.early.contains_key(&7));
         on_notification(&mut state, &answered(8, None));
         written(&mut state, "m1", 7);
-        let error = state.early.remove(&7).unwrap();
-        answer(&mut state, "m1", 7, error);
+        let early = state.early.remove(&7).unwrap();
+        answer(
+            &mut state,
+            "m1",
+            7,
+            early.stop_reason.as_deref(),
+            early.error,
+        );
         assert_eq!(
             known_outcome(&state, "m1"),
             Some(DeliverOutcome::Accepted {
                 turn_finished: true
             })
         );
+    }
+
+    #[test]
+    fn cancelled_or_errored_unconsumed_prompts_return_to_the_mailbox() {
+        let mut state = State::default();
+        written(&mut state, "running", 1);
+        written(&mut state, "queued_cancel", 2);
+        written(&mut state, "queued_error", 3);
+        on_notification(
+            &mut state,
+            &json!({"method": "x.ai/queue/changed", "params": {
+                "entries": [
+                    {"id": "q-2", "text": "anyagents-message:queued_cancel\nhi"},
+                    {"id": "q-3", "text": "anyagents-message:queued_error\nyo"}
+                ],
+                "runningText": "anyagents-message:running\nopen",
+                "runningCombinedTexts": ["anyagents-message:running\nopen"]
+            }}),
+        );
+        let cancel_reply = |id: i64| {
+            json!({"method": "$rpc/response", "params": {
+                "id": id,
+                "result": {"stopReason": "cancelled"},
+                "error": Value::Null,
+            }})
+        };
+        on_notification(&mut state, &cancel_reply(1));
+        on_notification(&mut state, &cancel_reply(2));
+        on_notification(&mut state, &answered(3, Some((-32603, "Turn aborted"))));
+
+        // The consumed opening prompt settled as taken; the two queued prompts
+        // were never consumed, so neither is marked taken or rejected.
+        assert_eq!(
+            known_outcome(&state, "running"),
+            Some(DeliverOutcome::Accepted {
+                turn_finished: true
+            })
+        );
+        for unconsumed in ["queued_cancel", "queued_error"] {
+            assert_eq!(known_outcome(&state, unconsumed), None, "{unconsumed}");
+            assert_eq!(state.proven(unconsumed), None, "{unconsumed}");
+            assert!(!state.prompts.contains_key(unconsumed), "{unconsumed}");
+            assert!(!state.rejected.contains_key(unconsumed), "{unconsumed}");
+        }
+        assert!(state.unconfirmed.is_empty());
+        assert_eq!(state.unanswered, 0);
+        assert_eq!(state.turns_served, 1);
     }
 
     #[test]
@@ -1056,6 +1211,28 @@ mod process {
     #[test]
     fn an_unclassified_error_before_admission_is_parked_not_resent_nor_restarted() {
         a_prompt_answered_with("internal-error", "may or may not have applied it");
+    }
+
+    #[test]
+    fn cancelling_a_turn_with_queued_steers_redelivers_them_in_order() {
+        let mut world = World::<Grok>::new();
+        let first = world.prompt();
+        let queued = world.receive(2);
+        // Wait until Grok admitted both steers into its queue without stepping.
+        world.pump_until("both steers queued", |w| w.fixture.wire().len() >= 3);
+        assert_eq!(world.cursor(), first.seq);
+        world.delivery.harness_mut().cancel().unwrap();
+        // After cancel answers stopReason = cancelled, the unconsumed steers
+        // return to the mailbox and run in FIFO order.
+        world.drain(queued[1].seq);
+        assert_eq!(
+            ids(&world.fixture.journal()),
+            vec![
+                first.id.to_string(),
+                queued[0].id.to_string(),
+                queued[1].id.to_string()
+            ]
+        );
     }
 
     /// A Grok that admits `m1` and prints nothing more until it is stopped.
