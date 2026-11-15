@@ -162,13 +162,13 @@ fn decode(text: &str) -> Option<Vec<u8>> {
 }
 
 #[test]
-fn the_language_server_names_the_peer_and_its_level_is_turn_end() {
+fn the_language_server_names_the_peer_and_its_level_is_next_step() {
     let mut world = World::<Agy>::new();
     let first = world.prompt();
     let second = world.receive(1).remove(0);
     commit_queued(&mut world, &second);
     let delivery = world.delivery_level();
-    assert_eq!(delivery.level, DeliveryLevel::TurnEnd);
+    assert_eq!(delivery.level, DeliveryLevel::NextStep);
     assert!(delivery.idempotent);
     assert_eq!(delivery.peer.as_deref(), Some("agy 1.5.8"));
     world.drain(second.seq);
@@ -210,8 +210,10 @@ fn an_unanswered_steer_the_mailbox_lacks_is_sent_again() {
     assert_prompt_then(&world, first.id.as_str(), second.id.as_str());
 }
 
-/// A run-status probe the language server cannot answer is asked again
-/// later: no fault, no restart.
+/// A steer into a turn whose step showed the cascade running asks no
+/// run-status probe first, and a probe the language server cannot answer
+/// (the turn's own status poll) is asked again later: no fault, no restart,
+/// no steer lost or sent twice.
 #[test]
 fn a_failed_probe_costs_no_restart() {
     let mut world = World::<Agy>::new();
@@ -219,35 +221,98 @@ fn a_failed_probe_costs_no_restart() {
     arm(&world.fixture, "fail-probe");
     let second = world.receive(1).remove(0);
     commit_queued(&mut world, &second);
-    assert!(!world.fixture.dir().join("fail-probe").exists());
+    world.pump_until("the turn's status poll asked", |w| {
+        !w.fixture.dir().join("fail-probe").exists()
+    });
+    let third = world.receive(1).remove(0);
+    commit_queued(&mut world, &third);
+    world.drain(third.seq);
     assert_eq!(sends(&world.fixture, second.id.as_str()), 1);
-    world.drain(second.seq);
-    assert_prompt_then(&world, first.id.as_str(), second.id.as_str());
+    assert_eq!(sends(&world.fixture, third.id.as_str()), 1);
+    let journal = world.fixture.journal();
+    assert_eq!(
+        ids(&journal),
+        [
+            first.id.to_string(),
+            second.id.to_string(),
+            third.id.to_string()
+        ],
+        "{journal:?}"
+    );
+    assert_eq!(world.fixture.launches(), 1, "restarted");
 }
 
-/// A cascade that refused a steer is not asked again within its turn; the
-/// message opens the next turn.
+/// A cascade that refuses a steer at a step boundary (a step under way)
+/// queued nothing: the message is sent again after a pause and the running
+/// turn takes it at its next step, not at its end. Nothing is applied twice.
 #[test]
-fn a_refused_steer_waits_for_the_turn_to_end() {
+fn a_refused_steer_is_sent_again_into_the_running_turn() {
     let mut world = World::<Agy>::new();
     let first = world.prompt();
     world.fixture.command("refuse");
     let second = world.receive(1).remove(0);
-    world.pump_until("the steer reaches the vendor", |w| {
-        w.fixture.wire().contains(&second.id.to_string())
+    world.pump_until("the refused steer is sent again", |w| {
+        sends(&w.fixture, second.id.as_str()) == 2
     });
-    world.pump_for(Duration::from_millis(800));
-    assert_eq!(sends(&world.fixture, second.id.as_str()), 1);
-    assert_eq!(world.cursor(), first.seq);
-    world.fixture.command("finish");
-    world.pump_until("the message opens the next turn", |w| {
-        w.cursor() == second.seq
-    });
-    assert_eq!(sends(&world.fixture, second.id.as_str()), 1);
-    world.drain(second.seq);
+    commit_queued(&mut world, &second);
+    assert!(world.fixture.in_turn(), "waited for the turn to end");
+    // A later message is not held behind the refusal either.
+    let third = world.receive(1).remove(0);
+    commit_queued(&mut world, &third);
+    assert!(world.fixture.in_turn(), "waited for the turn to end");
+    world.drain(third.seq);
+    assert_eq!(sends(&world.fixture, second.id.as_str()), 2);
+    assert_eq!(sends(&world.fixture, third.id.as_str()), 1);
     let journal = world.fixture.journal();
-    assert_eq!(journal[1].kind, "prompt", "{journal:?}");
-    assert_prompt_then(&world, first.id.as_str(), second.id.as_str());
+    assert_eq!(
+        ids(&journal),
+        [
+            first.id.to_string(),
+            second.id.to_string(),
+            third.id.to_string()
+        ],
+        "{journal:?}"
+    );
+    assert!(
+        journal[1..]
+            .iter()
+            .all(|seen| seen.kind == "steer" && seen.turn == journal[0].turn),
+        "not taken by the running turn: {journal:?}"
+    );
+    assert_eq!(world.fixture.launches(), 1, "restarted");
+}
+
+/// Mail that reaches a busy agent is queued in the running cascade's
+/// mailbox one message after another, every one before the turn's next
+/// step, and that step takes them all, in order, each sent once.
+#[test]
+fn mail_for_a_running_turn_is_all_queued_before_its_next_step() {
+    let mut world = World::<Agy>::new();
+    let first = world.prompt();
+    let three = world.receive(3);
+    let wanted: Vec<String> = three.iter().map(|m| m.id.to_string()).collect();
+    world.pump_until("the mailbox holds all three", |w| {
+        let held = queued(&w.fixture);
+        wanted.iter().all(|id| held.contains(id))
+    });
+    assert_eq!(world.cursor(), first.seq, "committed before the step");
+    assert!(world.fixture.in_turn());
+    let last = three.last().unwrap().seq;
+    world.fixture.command("step");
+    world.pump_until("the step commits all three", |w| w.cursor() == last);
+    world.drain(last);
+    for id in &wanted {
+        assert_eq!(sends(&world.fixture, id), 1, "{id} sent again");
+    }
+    let journal = world.fixture.journal();
+    let steered: Vec<String> = journal[1..].iter().map(|seen| seen.id.clone()).collect();
+    assert_eq!(steered, wanted, "{journal:?}");
+    assert!(
+        journal[1..]
+            .iter()
+            .all(|seen| seen.turn == journal[0].turn && seen.step == journal[1].step),
+        "not one step of the running turn: {journal:?}"
+    );
 }
 
 /// A steer whose answer takes longer than any request timeout the adapter
