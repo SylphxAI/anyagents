@@ -4586,7 +4586,14 @@ async fn create_agent_route(
             state.store.data_dir(),
             CreateRequest {
                 name: body.name,
-                role: body.role,
+                role: Some(
+                    body.role
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(create::DEFAULT_AGENT_ROLE)
+                        .to_string(),
+                ),
                 harness,
                 model,
                 profile,
@@ -12627,6 +12634,182 @@ exec '{}' "$@"
             !agents_dir.exists() || std::fs::read_dir(agents_dir).unwrap().next().is_none(),
             "a rejected template must not leave a SYSTEM_PROMPT.md or agent directory"
         );
+    }
+
+    #[test]
+    fn create_agent_route_defaults_omitted_and_empty_role_to_builtin_general() {
+        let _env = env_lock();
+        let prev_home = std::env::var_os("HOME");
+        let prev_owner = std::env::var_os("ANYAGENTS_OWNER_WORKDIR");
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("ANYAGENTS_OWNER_WORKDIR");
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let state = archetype_validation_state(dir.path());
+            for (name, extra) in [
+                ("http-omitted", serde_json::json!({})),
+                ("http-empty", serde_json::json!({ "role": "" })),
+                ("http-general", serde_json::json!({ "role": "general" })),
+            ] {
+                let mut body = serde_json::json!({
+                    "name": name,
+                    "workdir": work,
+                });
+                if let Some(obj) = extra.as_object() {
+                    for (k, v) in obj {
+                        body[k] = v.clone();
+                    }
+                }
+                let (status, Json(agent)) = create_agent_route(
+                    Principal::Operator,
+                    State(state.clone()),
+                    axum::http::HeaderMap::new(),
+                    Json(serde_json::from_value(body).unwrap()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {}: {}", e.status, e.message));
+                assert_eq!(status, StatusCode::CREATED, "{name}");
+                assert_eq!(agent.role.as_deref(), Some("general"), "{name}");
+                assert_eq!(agent.scope, "public", "{name}");
+                assert_eq!(
+                    agent.instructions.as_deref(),
+                    Some(create::BUILTIN_GENERAL_ROLE_BODY),
+                    "{name}"
+                );
+            }
+
+            // Sub-agent with omitted role gets built-in `general` with `private` scope.
+            let (sub_status, Json(sub)) = create_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "http-subagent",
+                        "parent": "http-omitted",
+                        "workdir": work,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("subagent: {}: {}", e.status, e.message));
+            assert_eq!(sub_status, StatusCode::CREATED);
+            assert_eq!(sub.role.as_deref(), Some("general"));
+            assert_eq!(sub.scope, "private");
+            assert_eq!(
+                sub.instructions.as_deref(),
+                Some(create::BUILTIN_GENERAL_ROLE_BODY)
+            );
+
+            // Explicit `public: true` / `public: false` without `scope` on a sub-agent.
+            for (public_flag, expected_scope) in [(true, "public"), (false, "private")] {
+                let (flag_status, Json(flagged)) = create_agent_route(
+                    Principal::Operator,
+                    State(state.clone()),
+                    axum::http::HeaderMap::new(),
+                    Json(
+                        serde_json::from_value(serde_json::json!({
+                            "name": format!("http-sub-public-{public_flag}"),
+                            "parent": "http-omitted",
+                            "public": public_flag,
+                            "workdir": work,
+                        }))
+                        .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("public={public_flag}: {}: {}", e.status, e.message));
+                assert_eq!(flag_status, StatusCode::CREATED);
+                assert_eq!(flagged.role.as_deref(), Some("general"));
+                assert_eq!(flagged.scope, expected_scope);
+            }
+
+            // Caller `description` without `instructions` composes with built-in `general`.
+            let (legacy_status, Json(legacy_sub)) = create_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "http-sub-legacy-desc",
+                        "parent": "http-omitted",
+                        "description": "Legacy HTTP brief",
+                        "workdir": work,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("legacy: {}: {}", e.status, e.message));
+            assert_eq!(legacy_status, StatusCode::CREATED);
+            assert_eq!(legacy_sub.role.as_deref(), Some("general"));
+            assert_eq!(legacy_sub.scope, "private");
+            assert_eq!(
+                legacy_sub.description.as_deref(),
+                Some("Legacy HTTP brief")
+            );
+            assert_eq!(
+                legacy_sub.instructions.as_deref(),
+                Some(
+                    format!("{}\n\nLegacy HTTP brief", create::BUILTIN_GENERAL_ROLE_BODY)
+                        .as_str()
+                )
+            );
+
+            // Workspace .agents/agents/general.md overrides the built-in template even for root.
+            std::fs::create_dir_all(work.join(".agents/agents")).unwrap();
+            std::fs::write(
+                work.join(".agents/agents/general.md"),
+                "---\nname: general\ndescription: HTTP General Override\nscope: private\n---\nHTTP general override body.\n",
+            )
+            .unwrap();
+            let (status, Json(overridden)) = create_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "http-overridden",
+                        "workdir": work,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("override: {}: {}", e.status, e.message));
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(overridden.role.as_deref(), Some("general"));
+            assert_eq!(overridden.scope, "private");
+            assert_eq!(
+                overridden.description.as_deref(),
+                Some("HTTP General Override")
+            );
+            assert!(
+                overridden
+                    .instructions
+                    .as_deref()
+                    .is_some_and(|text| text.contains("HTTP general override body."))
+            );
+        });
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_owner {
+                Some(v) => std::env::set_var("ANYAGENTS_OWNER_WORKDIR", v),
+                None => std::env::remove_var("ANYAGENTS_OWNER_WORKDIR"),
+            }
+        }
     }
 
     #[cfg(unix)]

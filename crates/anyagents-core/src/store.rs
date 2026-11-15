@@ -1636,13 +1636,12 @@ impl Store {
                 params![current.name, agent_id.as_str(), now_ms()],
             )?;
             tx.execute("DELETE FROM agent_aliases WHERE alias = ?1", [clean])?;
+            // The search rows first: they are found under the names
+            // `rag_chunks` still gives them.
+            let _ = rewrite_agent_fts_rows(tx, agent_id, Some(clean));
             let _ = tx.execute(
                 "UPDATE rag_chunks SET agent_name = ?2 WHERE agent_id = ?1",
                 params![agent_id.as_str(), clean],
-            );
-            let _ = tx.execute(
-                "UPDATE rag_chunks_fts SET agent_name = ?2 WHERE agent_name = ?1",
-                params![current.name, clean],
             );
             Ok((agent_by_id(tx, agent_id)?, true))
         })?;
@@ -3170,6 +3169,12 @@ impl Store {
         let deleted = self.write_tx(|tx| {
             let agent = agent_by_id(tx, id)?;
             credentials::delete_bindings_for_deleted_agent(tx, id, actor)?;
+            // The agent's own search rows, found through its chunks before
+            // they go, never by a name filter: FTS5 answers `agent_name = ?`
+            // only by reading every row of every agent, and this transaction
+            // holds the writer meanwhile. A failed creation, which has no
+            // chunks, used to stall every write of the server for minutes.
+            rewrite_agent_fts_rows(tx, id, None)?;
             for table in [
                 "agent_runtime",
                 "turns",
@@ -3202,10 +3207,6 @@ impl Store {
                     [id.as_str()],
                 )?;
             }
-            let _ = tx.execute(
-                "DELETE FROM rag_chunks_fts WHERE agent_name = ?1",
-                [agent.name.as_str()],
-            );
             tx.execute("DELETE FROM agents WHERE id = ?1", [id.as_str()])?;
             Ok(agent)
         })?;
@@ -3778,10 +3779,7 @@ impl Store {
                 for chunk in chunks {
                     after = chunk.id.clone();
                     if clean_rag_text(&chunk.text).chars().count() < 2 {
-                        tx.execute(
-                            "DELETE FROM rag_chunks_fts WHERE chunk_id MATCH ?1",
-                            [format!("\"{}\"", chunk.id.replace('"', "\"\""))],
-                        )?;
+                        delete_fts_chunk(tx, &chunk.id)?;
                         tx.execute(
                             "DELETE FROM rag_chunks WHERE chunk_id=?1 AND agent_id=?2",
                             params![chunk.id, chunk.owner],
@@ -6806,6 +6804,138 @@ fn ensure_lexical_fts_backfilled(conn: &mut Connection) -> Result<(), Error> {
     Ok(())
 }
 
+/// The search index (`rag_chunks_fts`, FTS5) answers only `rowid` and
+/// `MATCH` constraints from its index: a plain `column = ?` filter reads every
+/// row of the fleet's index (about a million rows, most of the store) with the
+/// Store writer held. Every statement that maintains it below finds its rows
+/// through `MATCH` and keeps the result exact with `=`.
+///
+/// One chunk's row, through the chunk id's own token (see
+/// [`fts_chunk_lookup`]). `?1` the chunk id, `?2` its lookup phrase.
+pub(crate) const FTS_DELETE_CHUNK: &str =
+    "DELETE FROM rag_chunks_fts WHERE chunk_id MATCH ?2 AND chunk_id = ?1";
+
+/// One agent's rows filed under one name: `MATCH` on the name, `=` for the
+/// exact name, and only chunks `rag_chunks` gives the agent. `?1` the name,
+/// `?2` its phrase, `?3` the agent id.
+pub(crate) const FTS_DELETE_AGENT_ROWS: &str = "DELETE FROM rag_chunks_fts \
+     WHERE agent_name MATCH ?2 AND agent_name = ?1 \
+       AND chunk_id IN (SELECT chunk_id FROM rag_chunks WHERE agent_id = ?3)";
+
+/// [`FTS_DELETE_AGENT_ROWS`]' rows renamed to `?4`.
+pub(crate) const FTS_RENAME_AGENT_ROWS: &str = "UPDATE rag_chunks_fts SET agent_name = ?4 \
+     WHERE agent_name MATCH ?2 AND agent_name = ?1 \
+       AND chunk_id IN (SELECT chunk_id FROM rag_chunks WHERE agent_id = ?3)";
+
+/// One chunk's row renamed to `?3`, found as in [`FTS_DELETE_CHUNK`].
+pub(crate) const FTS_RENAME_CHUNK: &str =
+    "UPDATE rag_chunks_fts SET agent_name = ?3 WHERE chunk_id MATCH ?2 AND chunk_id = ?1";
+
+/// `value` as one FTS5 phrase: quoted, with any quote doubled.
+pub(crate) fn fts_exact_phrase(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// The tokens the index's `unicode61` tokenizer makes of `value`: runs of
+/// letters and digits (everything else separates).
+fn fts_tokens(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+}
+
+/// The phrase that finds one chunk's row: its id's longest token, the unique
+/// part. The whole id (`msg_<id>`, `out_<hash>`) starts with a token most of
+/// the index shares, and a phrase with it reads that token's doclist: about
+/// 40 ms on the fleet's store against 0.07 ms for the unique token alone.
+/// `None` for an id without a token, which only a full scan can find.
+pub(crate) fn fts_chunk_lookup(chunk_id: &str) -> Option<String> {
+    fts_tokens(chunk_id)
+        .max_by_key(|token| token.len())
+        .map(fts_exact_phrase)
+}
+
+/// Remove one chunk's search row (and any duplicate of it).
+fn delete_fts_chunk(conn: &Connection, chunk_id: &str) -> Result<usize, Error> {
+    Ok(match fts_chunk_lookup(chunk_id) {
+        Some(lookup) => conn.execute(FTS_DELETE_CHUNK, params![chunk_id, lookup])?,
+        None => conn.execute("DELETE FROM rag_chunks_fts WHERE chunk_id = ?1", [chunk_id])?,
+    })
+}
+
+/// The names an agent's chunks are filed under (normally one; more after a
+/// rename that left rows behind).
+fn agent_chunk_names(conn: &Connection, agent_id: &AgentId) -> Result<Vec<String>, Error> {
+    let mut stmt =
+        conn.prepare_cached("SELECT DISTINCT agent_name FROM rag_chunks WHERE agent_id = ?1")?;
+    let names = stmt
+        .query_map([agent_id.as_str()], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(names)
+}
+
+/// The chunk ids an agent owns under one name.
+fn agent_chunk_ids_named(
+    conn: &Connection,
+    agent_id: &AgentId,
+    name: &str,
+) -> Result<Vec<String>, Error> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT chunk_id FROM rag_chunks WHERE agent_id = ?1 AND agent_name = ?2",
+    )?;
+    let ids = stmt
+        .query_map(params![agent_id.as_str(), name], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// Remove an agent's search rows, or (`rename_to`) refile them under a new
+/// name. Work is proportional to the agent's own rows: one indexed statement
+/// per name its chunks are filed under, chunk by chunk only for a name that
+/// has no token to match. An agent without chunks (a failed creation) costs
+/// one index probe.
+fn rewrite_agent_fts_rows(
+    conn: &Connection,
+    agent_id: &AgentId,
+    rename_to: Option<&str>,
+) -> Result<usize, Error> {
+    let mut changed = 0;
+    for name in agent_chunk_names(conn, agent_id)? {
+        if rename_to == Some(name.as_str()) {
+            continue;
+        }
+        if fts_tokens(&name).next().is_some() {
+            let phrase = fts_exact_phrase(&name);
+            changed += match rename_to {
+                None => conn.execute(
+                    FTS_DELETE_AGENT_ROWS,
+                    params![name, phrase, agent_id.as_str()],
+                )?,
+                Some(new) => conn.execute(
+                    FTS_RENAME_AGENT_ROWS,
+                    params![name, phrase, agent_id.as_str(), new],
+                )?,
+            };
+            continue;
+        }
+        for chunk_id in agent_chunk_ids_named(conn, agent_id, &name)? {
+            changed += match (rename_to, fts_chunk_lookup(&chunk_id)) {
+                (None, _) => delete_fts_chunk(conn, &chunk_id)?,
+                (Some(new), Some(lookup)) => {
+                    conn.execute(FTS_RENAME_CHUNK, params![chunk_id, lookup, new])?
+                }
+                (Some(new), None) => conn.execute(
+                    "UPDATE rag_chunks_fts SET agent_name = ?2 WHERE chunk_id = ?1",
+                    params![chunk_id, new],
+                )?,
+            };
+        }
+    }
+    Ok(changed)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn index_rag_chunk(
     conn: &Connection,
@@ -6855,10 +6985,7 @@ fn index_rag_chunk(
             params![chunk_id],
         )?;
     }
-    conn.execute(
-        "DELETE FROM rag_chunks_fts WHERE chunk_id MATCH ?1",
-        params![format!("\"{}\"", chunk_id.replace('"', ""))],
-    )?;
+    delete_fts_chunk(conn, chunk_id)?;
     conn.execute(
         "INSERT INTO rag_chunks_fts (
             chunk_id, agent_name, sender, destination, kind, tool_name, text, search_tokens
