@@ -33,6 +33,10 @@
 //!
 //! `ANYAGENTS_FAKE_DELAY_MS` holds every prompt's answer back that long.
 //!
+//! The service serves its event stream (`GET /api/event`): every prompt it
+//! admits is announced there as taken (`session.inbox.delivered`) before the
+//! prompt is answered, except in `undelivered`, where none ever is.
+//!
 //! `POST /api/experimental/session/{id}/wait` answers at once (the turn is
 //! over) except in `hold`, `inbox` and `interrupt-failed`, where the turn never
 //! ends: it answers only when the service stops, as the real one does.
@@ -152,13 +156,7 @@ fn serve(args: &[String]) {
         }
         exit(1);
     });
-    std::thread::spawn(move || {
-        for connection in listener.incoming() {
-            if connection.is_err() {
-                break;
-            }
-        }
-    });
+    std::thread::spawn(move || events(listener));
     println!("server listening on http://127.0.0.1:{port}");
     println!("server password scripted-password");
     let _ = std::io::stdout().flush();
@@ -213,9 +211,14 @@ fn api(args: &[String], endpoint: &str) {
             // 204: the session is idle, and the CLI prints nothing.
         }
         ("GET", p) if p.starts_with("/api/session/ses_") && p.contains("/message/") => {
-            // `applied`: the session took the line into its conversation.
-            if mode == "applied" {
-                let id = p.rsplit('/').next().unwrap_or_default();
+            let session = p
+                .trim_start_matches("/api/session/")
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            let id = p.rsplit('/').next().unwrap_or_default();
+            // `applied`, or an input the service consumed: the conversation holds it.
+            if mode == "applied" || was_delivered(endpoint, session, id) {
                 print!(
                     "{{\"data\":{{\"id\":\"{id}\",\"type\":\"user\",\"text\":\"\",\"time\":{{\"created\":1}}}}}}"
                 );
@@ -367,6 +370,30 @@ fn api(args: &[String], endpoint: &str) {
                     let _ = std::fs::write(&first_marker, "1");
                 }
             }
+            // The session takes it at once and says so before the answer, as
+            // the real one announces an input its idle session opens a turn
+            // with; `undelivered` never takes it.
+            let request: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let prompt_id = request["id"].as_str().unwrap_or("msg_minted");
+            let session = p
+                .trim_start_matches("/api/session/")
+                .trim_end_matches("/prompt");
+            if mode == "cancel-once" {
+                let marker = format!("{dir}/cancelled-once");
+                if !std::path::Path::new(&marker).exists() {
+                    let _ = std::fs::write(&marker, "1");
+                    notify_service(endpoint, &format!("/fake/cancelled/{session}/{prompt_id}"));
+                } else {
+                    announce(endpoint, session, prompt_id);
+                }
+            } else if mode == "reconnect-settle" {
+                // Drop the event stream while consuming the input, so its
+                // event is missed and the reconnect must settle from the
+                // conversation.
+                notify_service(endpoint, &format!("/fake/missed/{session}/{prompt_id}"));
+            } else if !matches!(mode.as_str(), "undelivered" | "applied") {
+                announce(endpoint, session, prompt_id);
+            }
             let request: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
             let steered = request["delivery"] == "steer";
             let text = request["text"].as_str().unwrap_or_default().to_string();
@@ -509,6 +536,152 @@ fn api(args: &[String], endpoint: &str) {
             print!("{{}}");
         }
     }
+}
+
+/// The service's event stream, `GET /api/event`: `server.connected`, then a
+/// `session.inbox.delivered` for each input the session takes. A one-shot
+/// `api` process announces the input it admitted with `POST
+/// /fake/delivered/<session>/<id>`, since it is not the service itself.
+fn events(listener: std::net::TcpListener) {
+    use std::collections::HashSet;
+    use std::io::{BufRead, BufReader};
+    let mode = env::var("ANYAGENTS_FAKE_MODE").unwrap_or_default();
+    let state = std::sync::Arc::new(std::sync::Mutex::new((
+        Vec::<std::net::TcpStream>::new(),
+        HashSet::<(String, String)>::new(),
+    )));
+    for connection in listener.incoming() {
+        let Ok(mut connection) = connection else {
+            break;
+        };
+        let state = std::sync::Arc::clone(&state);
+        let mode = mode.clone();
+        thread::spawn(move || {
+            let Ok(clone) = connection.try_clone() else {
+                return;
+            };
+            let mut request = BufReader::new(clone);
+            let mut line = String::new();
+            if request.read_line(&mut line).is_err() {
+                return;
+            }
+            let mut header = String::new();
+            while request.read_line(&mut header).is_ok_and(|read| read > 2) {
+                header.clear();
+            }
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("GET"), Some("/api/event")) if mode == "event-403" => {
+                    let _ = connection
+                        .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n");
+                }
+                (Some("GET"), Some("/api/event")) => {
+                    let mut state = state.lock().unwrap();
+                    if connection
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: {\"type\":\"server.connected\",\"data\":{}}\n\n",
+                        )
+                        .is_ok()
+                    {
+                        state.0.push(connection);
+                    }
+                }
+                (Some("POST"), Some(path)) if path.starts_with("/fake/delivered/") => {
+                    let mut parts = path.trim_start_matches("/fake/delivered/").split('/');
+                    let session = parts.next().unwrap_or_default().to_string();
+                    let id = parts.next().unwrap_or_default().to_string();
+                    let event = serde_json::json!({
+                        "type": "session.inbox.delivered",
+                        "data": {"sessionID": &session, "inboxID": &id},
+                    });
+                    let frame = format!("data: {event}\n\n");
+                    let mut state = state.lock().unwrap();
+                    state.1.insert((session, id));
+                    state
+                        .0
+                        .retain_mut(|stream| stream.write_all(frame.as_bytes()).is_ok());
+                    let _ = connection.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+                }
+                (Some("POST"), Some(path)) if path.starts_with("/fake/cancelled/") => {
+                    let mut parts = path.trim_start_matches("/fake/cancelled/").split('/');
+                    let event = serde_json::json!({
+                        "type": "session.inbox.cancelled",
+                        "data": {"sessionID": parts.next(), "inboxID": parts.next()},
+                    });
+                    let frame = format!("data: {event}\n\n");
+                    state
+                        .lock()
+                        .unwrap()
+                        .0
+                        .retain_mut(|stream| stream.write_all(frame.as_bytes()).is_ok());
+                    let _ = connection.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+                }
+                (Some("POST"), Some(path)) if path.starts_with("/fake/missed/") => {
+                    let mut parts = path.trim_start_matches("/fake/missed/").split('/');
+                    let session = parts.next().unwrap_or_default().to_string();
+                    let id = parts.next().unwrap_or_default().to_string();
+                    let mut state = state.lock().unwrap();
+                    for stream in state.0.drain(..) {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    }
+                    state.1.insert((session, id));
+                    let _ = connection.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+                }
+                (Some("GET"), Some(path)) if path.starts_with("/fake/delivered/") => {
+                    let mut parts = path.trim_start_matches("/fake/delivered/").split('/');
+                    let key = (
+                        parts.next().unwrap_or_default().to_string(),
+                        parts.next().unwrap_or_default().to_string(),
+                    );
+                    let found = state.lock().unwrap().1.contains(&key);
+                    let status = if found {
+                        b"HTTP/1.1 204 No Content\r\n\r\n".as_slice()
+                    } else {
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".as_slice()
+                    };
+                    let _ = connection.write_all(status);
+                }
+                _ => {
+                    let _ = connection
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n");
+                }
+            }
+        });
+    }
+}
+
+/// Tell the service's event stream that its session took input `id`.
+fn announce(endpoint: &str, session: &str, id: &str) {
+    notify_service(endpoint, &format!("/fake/delivered/{session}/{id}"));
+}
+
+fn notify_service(endpoint: &str, path: &str) {
+    use std::io::Read as _;
+    let address = endpoint.trim_start_matches("http://");
+    let Ok(mut connection) = std::net::TcpStream::connect(address) else {
+        return;
+    };
+    let _ = write!(
+        connection,
+        "POST {path} HTTP/1.1\r\nhost: {address}\r\n\r\n"
+    );
+    let mut answer = [0u8; 64];
+    let _ = connection.read(&mut answer);
+}
+
+fn was_delivered(endpoint: &str, session: &str, id: &str) -> bool {
+    use std::io::Read as _;
+    let address = endpoint.trim_start_matches("http://");
+    let Ok(mut connection) = std::net::TcpStream::connect(address) else {
+        return false;
+    };
+    let _ = write!(
+        connection,
+        "GET /fake/delivered/{session}/{id} HTTP/1.1\r\nhost: {address}\r\n\r\n"
+    );
+    let mut answer = [0u8; 64];
+    let n = connection.read(&mut answer).unwrap_or(0);
+    std::str::from_utf8(&answer[..n]).is_ok_and(|head| head.starts_with("HTTP/1.1 204"))
 }
 
 /// Answer the way `opencode api` reports a non-2xx answer: the error's body on

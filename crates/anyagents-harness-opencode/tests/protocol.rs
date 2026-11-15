@@ -92,7 +92,7 @@ fn eventually(harness: &OpenCodeHarness, what: &str, done: impl Fn(&OpenCodeHarn
     }
 }
 
-/// What a line the prompt API took is reported as.
+/// What a line the session announced it took is reported as.
 fn accepted() -> DeliverOutcome {
     DeliverOutcome::Accepted {
         turn_finished: false,
@@ -141,7 +141,7 @@ fn an_open_turn_never_blocks_the_next_line() {
     assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
     assert_eq!(settle(&mut harness, &msg("m2")).unwrap(), accepted());
     assert_eq!(harness.health().turn_state, TurnState::InTurn);
-    assert_eq!(harness.health().delivery.level, DeliveryLevel::MidTurn);
+    assert_eq!(harness.health().delivery.level, DeliveryLevel::NextStep);
     assert_eq!(
         harness.written_ids(),
         vec!["m1".to_string(), "m2".to_string()]
@@ -159,8 +159,8 @@ fn an_open_turn_never_blocks_the_next_line() {
 fn three_lines_sent_while_a_turn_is_open_are_all_taken_at_once_and_never_twice() {
     // The session's turn is open for the whole test. Each mailbox line must go
     // to the session as a prompt with `delivery: steer`, be accepted when the
-    // prompt API answers, and be written exactly once even when handed over
-    // again.
+    // session announces it took it, and be written exactly once even when
+    // handed over again.
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "inbox");
     for id in ["m1", "m2", "m3"] {
@@ -921,13 +921,97 @@ fn every_prompt_carries_the_lines_own_message_id() {
 }
 
 #[test]
-fn the_service_names_itself_and_delivery_is_mid_turn_and_idempotent() {
+fn the_service_names_itself_and_delivery_is_next_step_and_idempotent() {
     let dir = TempDir::new().unwrap();
     let harness = start(&dir, "finish");
     let delivery = harness.health().delivery;
-    assert_eq!(delivery.level, DeliveryLevel::MidTurn);
+    assert_eq!(delivery.level, DeliveryLevel::NextStep);
     assert!(delivery.idempotent);
     assert_eq!(delivery.peer.as_deref(), Some("opencode 2.1.4"));
+}
+
+#[test]
+fn an_admitted_line_is_in_flight_until_the_session_announces_it_took_it() {
+    // The inbox admitted it, which proves nothing: until the event stream
+    // names it, it stays in flight, is never written again, and is offered
+    // to the next process once this one is gone.
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "undelivered");
+    assert_eq!(harness.deliver(&msg("m1")), Ok(DeliverOutcome::InFlight));
+    assert!(harness.wait_seen("m1", Duration::from_secs(10)));
+    for _ in 0..5 {
+        assert_eq!(harness.deliver(&msg("m1")), Ok(DeliverOutcome::InFlight));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(harness.proven("m1"), None);
+    // The next line is written behind it at once.
+    assert_eq!(harness.deliver(&msg("m2")), Ok(DeliverOutcome::InFlight));
+    eventually(&harness, "m2 is admitted", |harness| harness.seen("m2"));
+    let log = log_of(&dir);
+    assert_eq!(log.matches("\"id\":\"msg_m1\"").count(), 1, "{log}");
+    harness.stop();
+    assert_eq!(harness.proven("m1"), None);
+    assert_eq!(harness.deliver(&msg("m1")), Err(HarnessError::Dead));
+}
+
+#[test]
+fn a_missed_event_across_a_reconnect_is_settled_from_the_conversation() {
+    // The event stream drops while the session consumes `m1`, so no
+    // `session.inbox.delivered` reaches the client. Reconnecting settles the
+    // unproven line from `GET /api/session/{id}/message/{msgID}`.
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "reconnect-settle");
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    assert_eq!(
+        harness.proven("m1"),
+        Some(Proof::Taken {
+            turn_finished: false
+        })
+    );
+    let log = log_of(&dir);
+    assert!(
+        log.contains("api:GET /api/session/ses_fake/message/msg_m1"),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_cancelled_inbox_line_returns_to_the_mailbox_and_is_written_again() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "cancel-once");
+    assert_eq!(
+        settle(&mut harness, &msg("m1")).unwrap(),
+        DeliverOutcome::Deferred
+    );
+    assert_eq!(harness.proven("m1"), None);
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    assert_eq!(
+        harness.proven("m1"),
+        Some(Proof::Taken {
+            turn_finished: false
+        })
+    );
+    let log = log_of(&dir);
+    assert_eq!(log.matches("\"id\":\"msg_m1\"").count(), 2, "{log}");
+}
+
+#[test]
+fn a_refused_event_stream_fails_the_start() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log");
+    let started = OpenCodeHarness::start(
+        scripted_opencode(),
+        Some("ses_fake"),
+        &[
+            ("ANYAGENTS_FAKE_MODE", "event-403"),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("ANYAGENTS_FAKE_STATE", dir.path().to_str().unwrap()),
+        ],
+    );
+    let Err(HarnessError::Failed(reason)) = started else {
+        panic!("expected start to fail on HTTP 403 event stream");
+    };
+    assert!(reason.contains("HTTP 403"), "{reason}");
 }
 
 #[test]

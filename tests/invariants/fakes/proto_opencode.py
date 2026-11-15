@@ -16,11 +16,24 @@ nothing (`SessionInbox.reconcile`); an id another session holds is a 409
 `ConflictError` (`Session.PromptConflictError`), for good. A steer joins the running
 turn at its next step, every pending steer together, in admission order, and
 a turn with steers pending at its end runs another step for them. An idle
-session opens a turn with the input. Consumption is announced only on the
-event stream (`session.inbox.delivered`), which this fake does not serve:
-`GET /api/session/{id}/message/{messageID}` finds a consumed input under its
-own id. `POST /api/experimental/session/{id}/wait` answers 204 once the
-session is idle.
+session opens a turn with the input. Each input the session takes, opening a
+turn or at a step, is announced on the event stream, `GET /api/event`:
+server-sent events, `data: <json>` each, `server.connected` first, then
+`{"type": "session.inbox.delivered", "data": {"sessionID", "inboxID"}}` with
+the input's own id as `inboxID`. The stream is volatile: an event sent while
+no client reads is gone, so `GET /api/session/{id}/message/{messageID}` finds
+a consumed input under its own id. `POST /api/experimental/session/{id}/wait`
+answers 204 once the session is idle.
+
+Read from the 2.1.4 binary and its live service: the routes, the event's
+type and fields (`SessionInbox.publish`), `server.connected` first over a
+chunked `GET /api/event` stream (`opencode api` buffers unending responses),
+that `SessionRunner.advanceToStep` calls `SessionInbox.promote` before both
+the opening step and each continuation step — publishing
+`session.inbox.delivered` in `enqueued_seq` order and projecting each input
+into `session_message` under its own id before `SessionRunner.runStep` — and
+that `GET /api/session/{id}/message/{messageID}` finds a consumed input
+under its own id (no live model call was made).
 
 A `files` entry `{"uri": "file://<path>"}` is read by the service and given
 to the model beside the text; one it cannot read or decode refuses the whole
@@ -32,7 +45,7 @@ The refusal the test asks for is the service's readiness gate: while it is
 before any route, so nothing is admitted. OpenCode declares no other
 transient refusal for a prompt: its 400 and 409 are permanent. Not modelled:
 the inbox records a process left pending when it died (the real inbox keeps
-them; here they go with it), and the event stream.
+them; here they go with it), the stream's other events and its heartbeat.
 """
 import base64
 import http.client
@@ -149,6 +162,8 @@ class OpenCode(Protocol):
         # Pending steers, by their id: the inbox records not yet consumed.
         self.inbox = {}
         self.httpd = None
+        # The event streams being read: each client's socket writer.
+        self.listeners = []
 
     # The session store and the messages the sessions consumed are durable.
 
@@ -172,6 +187,21 @@ class OpenCode(Protocol):
 
     def message(self, ident):
         return next((row for row in self.messages() if row["id"] == ident), None)
+
+    def announce(self, inp):
+        """Tell every event stream the session took `inp`. Written before
+        anything else happens, so a crash right after loses no proof."""
+        frame = "data: %s\n\n" % json.dumps({
+            "id": "evt_" + secrets.token_hex(12), "created": now_ms(),
+            "type": "session.inbox.delivered",
+            "data": {"sessionID": inp.meta["session"], "inboxID": inp.meta["vid"]},
+        })
+        for out in list(self.listeners):
+            try:
+                out.write(frame.encode())
+                out.flush()
+            except OSError:
+                self.listeners.remove(out)
 
     def consume(self, inp):
         """The session took `inp` into its conversation, under its own id."""
@@ -209,12 +239,28 @@ class OpenCode(Protocol):
                 if self.headers.get("authorization") != authorization(protocol.password):
                     self.answer(401, {"_tag": "UnauthorizedError", "message": "Unauthorized"})
                     return
+                if (method, urllib.parse.urlsplit(self.path).path) == ("GET", "/api/event"):
+                    self.stream()
+                    return
                 headers = None
                 try:
                     status, body = protocol.route(method, self.path, raw)
                 except Failure as failure:
                     status, body, headers = failure.status, failure.body, failure.headers
                 self.answer(status, body, headers)
+
+            def stream(self):
+                """Hold the connection open as an event stream."""
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("cache-control", "no-cache")
+                self.end_headers()
+                with protocol.engine.lock:
+                    self.wfile.write(b'data: {"id":"evt_connected","type":"server.connected",'
+                                     b'"data":{}}\n\n')
+                    self.wfile.flush()
+                    protocol.listeners.append(self.wfile)
+                threading.Event().wait()
 
             def do_GET(self):
                 self.handle_one("GET")
@@ -317,6 +363,7 @@ class OpenCode(Protocol):
                 if engine.turn is None:
                     if engine.open_turn(inp):
                         self.consume(inp)
+                    self.announce(inp)
                 else:
                     self.inbox[vid] = record
                     engine.queue(inp)
@@ -354,6 +401,7 @@ class OpenCode(Protocol):
                 self.consume(inp)
             else:
                 self.inbox.pop(inp.meta["vid"], None)
+            self.announce(inp)
 
     def finish(self, consume=True):
         engine = self.engine
