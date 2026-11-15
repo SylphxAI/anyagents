@@ -440,6 +440,16 @@ fn exact_unavailable_receipt_preserves_terminal_backoff_and_mail() {
 }
 
 #[test]
+fn upstream_stream_codes_preserve_terminal_backoff_and_mail() {
+    for error in [
+        "Sylphx AI failure Some(\"service_unavailable\"): The model response was interrupted. Retry the request.",
+        "Sylphx AI failure Some(\"sylphx_ai_stream_no_output\"): The model response was interrupted. Retry the request.",
+    ] {
+        terminal_systemic_fault_keeps_backoff_and_queued_mail(error);
+    }
+}
+
+#[test]
 fn transient_text_cannot_discard_proven_terminal_backoff_and_mail() {
     terminal_systemic_fault_keeps_backoff_and_queued_mail("HTTP 503: service unavailable");
 }
