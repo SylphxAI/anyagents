@@ -640,7 +640,7 @@ mod tests {
         std::fs::rename(&path, &moved).unwrap();
         assert!(store.shared.reader().is_none());
         let reader = store.read_conn();
-        assert!(matches!(&reader, ReadConn::Guard(_)));
+        assert!(matches!(&reader, ReadConn::Guard(..)));
         let name: String = reader
             .query_row(
                 "SELECT name FROM agents WHERE id = ?1",
@@ -649,8 +649,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(name, "reader-fallback");
+        // The fallback reads the search index too, attached for the borrow
+        // only: the writer never keeps it.
+        reader
+            .query_row("SELECT count(*) FROM rag_chunks", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
         drop(reader);
+        let attached: i64 = store
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM pragma_database_list WHERE name = 'memory_index'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attached, 0);
+        // Index maintenance with only the writer to read state does not wait
+        // on a busy index while holding it.
+        let blocker = Connection::open(store.memory_index_path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        let _ = store.sync_memory_index();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        blocker.execute_batch("ROLLBACK").unwrap();
         std::fs::rename(&moved, &path).unwrap();
+    }
+
+    #[test]
+    fn a_reader_that_cannot_attach_the_search_index_is_not_pooled() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("state.db");
+        drop(Store::open(&path).unwrap());
+        assert!(open_reader(&path).is_some());
+        std::fs::remove_file(super::super::memory_index::path_for(&path)).unwrap();
+        assert!(open_reader(&path).is_none());
     }
 
     #[test]

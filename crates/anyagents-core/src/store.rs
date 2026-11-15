@@ -971,12 +971,25 @@ fn open_reader(path: &Path) -> Option<Connection> {
     let _ = conn.pragma_update(None, "query_only", "ON");
     tune_connection(&conn);
     // The mailbox search index, read-only like the rest of this connection:
-    // `rag_chunks` resolves to it, as state has no table of that name.
-    let _ = conn.execute(
-        &format!("ATTACH DATABASE ?1 AS {}", memory_index::ATTACHED),
-        [memory_index::path_for(path).as_os_str().to_string_lossy()],
-    );
+    // `rag_chunks` resolves to it, as state has no table of that name. A
+    // reader without it is not a reader of this store; none is pooled.
+    attach_memory_index(&conn, path).ok()?;
     Some(conn)
+}
+
+/// Attach the search index of the state database at `path` to `conn`.
+fn attach_memory_index(conn: &Connection, path: &Path) -> Result<(), Error> {
+    let index = memory_index::path_for(path);
+    if index.as_os_str().is_empty() {
+        return Err(Error::Message(
+            "a private in-memory store's search index is not attachable".into(),
+        ));
+    }
+    conn.execute(
+        &format!("ATTACH DATABASE ?1 AS {}", memory_index::ATTACHED),
+        [index.as_os_str().to_string_lossy()],
+    )?;
+    Ok(())
 }
 
 /// A pooled read-only connection, with the existing writer as a fallback.
@@ -987,7 +1000,9 @@ pub(crate) enum ReadConn<'a> {
         pool: Arc<Mutex<Vec<Connection>>>,
     },
     Owned(Option<Connection>),
-    Guard(registry::WriterGuard<'a>),
+    /// The writer, when no reader opens; `true` while it has the search
+    /// index attached for this borrow (detached on drop).
+    Guard(registry::WriterGuard<'a>, bool),
 }
 
 impl std::ops::Deref for ReadConn<'_> {
@@ -996,7 +1011,7 @@ impl std::ops::Deref for ReadConn<'_> {
         match self {
             Self::Pooled { conn, .. } => conn.as_ref().expect("pooled reader present until drop"),
             Self::Owned(conn) => conn.as_ref().expect("owned reader present until drop"),
-            Self::Guard(g) => g,
+            Self::Guard(g, _) => g,
         }
     }
 }
@@ -1007,6 +1022,11 @@ impl Drop for ReadConn<'_> {
             && let Some(conn) = conn.take()
         {
             registry::Shared::recycle(pool, conn);
+        }
+        if let Self::Guard(writer, attached) = self
+            && *attached
+        {
+            let _ = writer.execute_batch(&format!("DETACH DATABASE {}", memory_index::ATTACHED));
         }
     }
 }
@@ -2492,6 +2512,8 @@ impl Store {
                 recipient: Box<Agent>,
             },
         }
+        // Stored bodies a channel retry merged a fuller copy into.
+        let mut merged: Vec<String> = Vec::new();
         let tx_outcome = self.write_tx(|tx| -> Result<ReceiveTx, Error> {
         // Author validity shares the write transaction with delivery. A sender
         // deleted while waiting for publication cannot borrow a same-spelled
@@ -2576,6 +2598,7 @@ impl Store {
                 source_key.as_deref(),
                 reply_to_author.as_deref(),
                 &mut redelivery_identity,
+                &mut merged,
             )?
         {
             return Ok(ReceiveTx::Early(Some(ReceiveOutcome::Duplicate(existing))));
@@ -2828,10 +2851,7 @@ impl Store {
         })?;
         match tx_outcome {
             ReceiveTx::Early(outcome) => {
-                // A duplicate can merge a fuller body into the stored row.
-                if let Some(ReceiveOutcome::Duplicate(existing)) = &outcome {
-                    self.reindex_around(&[existing.id.as_str()], &[], || Ok(()))?;
-                }
+                self.reproject_merged(&merged);
                 Ok(outcome)
             }
             ReceiveTx::Inserted {
@@ -2840,6 +2860,7 @@ impl Store {
                 is_passive_reaction,
                 recipient,
             } => {
+                self.reproject_merged(&merged);
                 self.project_mailbox();
                 if woke_agent {
                     self.notify(Wake::Agent {
@@ -3160,12 +3181,7 @@ impl Store {
         // The agent's search rows leave the index after the commit, in the
         // index's own transaction; the pending entry recorded first covers an
         // interruption in between.
-        {
-            let state = self.read_conn();
-            self.shared
-                .memory_index
-                .invalidate(&state, &[], &[id.as_str()])?;
-        }
+        self.invalidate_index(&[], &[id.as_str()])?;
         let (deleted, max_rowids) = self.write_tx(|tx| {
             let agent = agent_by_id(tx, id)?;
             credentials::delete_bindings_for_deleted_agent(tx, id, actor)?;
@@ -3413,7 +3429,9 @@ impl Store {
     /// next search) projects them. Never call it with the state writer held.
     pub(crate) fn project_mailbox(&self) {
         debug_assert!(!registry::holds_store_writer());
-        let state = self.read_conn();
+        let Some(state) = self.index_state_reader() else {
+            return;
+        };
         if let Err(error) = self
             .shared
             .memory_index
@@ -3427,11 +3445,44 @@ impl Store {
     /// [`memory_index::READ_BUDGET`] rows are projected here; a larger
     /// backlog (a new or rebuilt index) is filled in the background.
     pub(crate) fn sync_memory_index(&self) -> Result<(), Error> {
-        let state = self.read_conn();
-        self.shared
-            .memory_index
-            .sync(&state, true, memory_index::READ_BUDGET)?;
+        match self.index_state_reader() {
+            Some(state) => {
+                self.shared
+                    .memory_index
+                    .sync(&state, true, memory_index::READ_BUDGET)?;
+            }
+            // Only the state writer can read state: never wait on the index
+            // while holding it.
+            None => {
+                let state = self.conn();
+                self.shared
+                    .memory_index
+                    .sync(&state, false, memory_index::READ_BUDGET)?;
+            }
+        }
         Ok(())
+    }
+
+    /// Re-project stored bodies a duplicate merged a fuller copy into,
+    /// without waiting: a busy index gets them at its next sync, and a
+    /// process stopped before then has them found by the tail check on the
+    /// next open (`MemoryIndex::check_tail`).
+    fn reproject_merged(&self, merged: &[String]) {
+        if merged.is_empty() {
+            return;
+        }
+        let Some(state) = self.index_state_reader() else {
+            return;
+        };
+        if let Err(error) = self.shared.memory_index.try_reproject(&state, merged) {
+            eprintln!("anyagents memory index: re-projection deferred: {error}");
+        }
+    }
+
+    /// A pooled state reader for index maintenance, never the state writer:
+    /// index work must not hold the state writer while it waits.
+    fn index_state_reader(&self) -> Option<ReadConn<'static>> {
+        self.shared.reader()
     }
 
     /// Re-project `chunks` and refile `agents`' rows around a state change:
@@ -3446,21 +3497,43 @@ impl Store {
         change: impl FnOnce() -> Result<T, Error>,
     ) -> Result<T, Error> {
         debug_assert!(!registry::holds_store_writer());
-        {
-            let state = self.read_conn();
-            self.shared
-                .memory_index
-                .invalidate(&state, chunks, agents)?;
-        }
+        self.invalidate_index(chunks, agents)?;
         let result = change();
-        let state = self.read_conn();
-        let synced = self
-            .shared
-            .memory_index
-            .sync(&state, true, memory_index::READ_BUDGET);
+        let synced = self.sync_memory_index();
         let value = result?;
         synced?;
         Ok(value)
+    }
+
+    /// Record pending index entries before a state change. With only the
+    /// state writer to read state through, the index is not waited for: a
+    /// busy index fails the change before it starts.
+    fn invalidate_index(&self, chunks: &[&str], agents: &[&str]) -> Result<(), Error> {
+        match self.index_state_reader() {
+            Some(state) => self
+                .shared
+                .memory_index
+                .invalidate(&state, chunks, agents, true),
+            None => {
+                let state = self.conn();
+                self.shared
+                    .memory_index
+                    .invalidate(&state, chunks, agents, false)
+            }
+        }
+    }
+
+    /// Open an index write transaction to commit before a state change
+    /// (`memory_index::Staged`). Never call it with the state writer held.
+    pub(crate) fn begin_staged_index(&self) -> Result<memory_index::Staged<'_>, Error> {
+        debug_assert!(!registry::holds_store_writer());
+        self.shared.memory_index.begin_staged()
+    }
+
+    /// Forget a standalone redaction's staged receipt once its audit is in
+    /// state.
+    pub(crate) fn clear_staged_index_redaction(&self, chunk_id: &str) -> Result<(), Error> {
+        self.shared.memory_index.clear_staged_redaction(chunk_id)
     }
 
     /// The search index's file.
@@ -3486,18 +3559,6 @@ impl Store {
         self.shared
             .memory_index
             .standalone_text(agent_id.as_str(), chunk_id)
-    }
-
-    /// Replace a standalone tool summary's text (a redaction).
-    pub(crate) fn rewrite_standalone_index_text(
-        &self,
-        agent_id: &AgentId,
-        chunk_id: &str,
-        text: &str,
-    ) -> Result<(), Error> {
-        self.shared
-            .memory_index
-            .rewrite_standalone(agent_id.as_str(), chunk_id, text)
     }
 
     /// Checkpoint the index's log back into its file and truncate it, without
@@ -5325,7 +5386,11 @@ impl Store {
         // Empty-path databases cannot share a reader. If a file-backed reader
         // cannot open, use the authoritative connection rather than fabricate
         // an empty database that could turn a failed read into missing state.
-        ReadConn::Guard(self.conn())
+        // The writer never keeps the index attached (a write transaction
+        // would lock both files); it has it only for this read.
+        let writer = self.conn();
+        let attached = attach_memory_index(&writer, self.database_path()).is_ok();
+        ReadConn::Guard(writer, attached)
     }
 
     pub fn create_schedule(&self, input: NewSchedule) -> Result<AgentSchedule, Error> {
@@ -7051,6 +7116,7 @@ fn message_by_origin(
     incoming_source_key: Option<&str>,
     incoming_reply_to_author: Option<&str>,
     redelivery_identity: &mut Option<String>,
+    merged: &mut Vec<String>,
 ) -> Result<Option<Message>, Error> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {MESSAGE_COLS} FROM messages
@@ -7165,6 +7231,9 @@ fn message_by_origin(
                 msg.context = updated_context;
                 msg.source_key = None;
                 if let Some(b) = best_body {
+                    if b != msg.text {
+                        merged.push(msg.id.to_string());
+                    }
                     msg.text = b;
                 }
             } else if best_body.is_some()
@@ -7187,6 +7256,9 @@ fn message_by_origin(
                 )?;
                 msg.context = updated_context;
                 if let Some(b) = best_body {
+                    if b != msg.text {
+                        merged.push(msg.id.to_string());
+                    }
                     msg.text = b;
                 }
             }

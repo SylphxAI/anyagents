@@ -543,6 +543,26 @@ fn unverified_full_versions(
         .collect())
 }
 
+/// Record a redaction's audit row, which freezes the target's retained
+/// alias set in the same transaction as the body rewrite.
+fn insert_audit(
+    tx: &rusqlite::Transaction<'_>,
+    target: &AgentId,
+    id: &str,
+    key: &str,
+    receipt: &Receipt,
+) -> Result<(), Error> {
+    tx.execute("INSERT INTO conversation_redactions (
+            id, agent_id, target_id, request_key, actor, permission, reason,
+            created_at_ms, span_unit, span_start, span_end, removed_bytes,
+            removed_chars, receipt, origin_chat_id, origin_message_id
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
+            (SELECT json_extract(origin, '$.chat_id') FROM messages WHERE agent_id = ?2 AND id = ?3),
+            (SELECT json_extract(origin, '$.message_id') FROM messages WHERE agent_id = ?2 AND id = ?3))",
+        params![receipt.audit_id, target.as_str(), id, key, receipt.actor, PERMISSION, receipt.reason, receipt.timestamp_ms, if receipt.span.unit == SpanUnit::Bytes { "bytes" } else { "chars" }, receipt.span.start as i64, receipt.span.end as i64, receipt.removed_bytes as i64, receipt.removed_chars as i64, serde_json::to_string(receipt).map_err(|_| invalid("receipt serialization failed"))?])?;
+    Ok(())
+}
+
 impl Store {
     /// Erase one logical body/span and its exact copies from local managed JSONL.
     /// The target must be quiescent; this does not stop/restart a harness or erase
@@ -593,8 +613,15 @@ impl Store {
             None => None,
         };
         let index_ids: Vec<&str> = index_id.iter().map(String::as_str).collect();
-        let mut standalone_redacted: Option<String> = None;
-        let phase1 = self.reindex_around(&index_ids, &[], || self.write_tx(|tx| -> Result<RedactPhase1, Error> {
+        let phase1 = self.reindex_around(&index_ids, &[], || {
+        // A standalone summary's scrubbed text and staged receipt are
+        // committed in the index before state commits the audit. The index
+        // lock is taken first, so the state transaction never waits on it.
+        let mut staged = match standalone {
+            Some(_) => Some(self.begin_staged_index()?),
+            None => None,
+        };
+        self.write_tx(|tx| -> Result<RedactPhase1, Error> {
         let actor = authorize(tx, &actor, target)?;
         if unresolved_history(self.data_dir(), &history_dir, target)? {
             return Err(invalid(
@@ -618,6 +645,19 @@ impl Store {
             params![target.as_str(), id, key], |r| r.get::<_, String>(0)).optional()?
             .map(|raw| serde_json::from_str::<Receipt>(&raw).map_err(|_| invalid("unreadable redaction receipt")))
             .transpose()?;
+        // An earlier attempt of this request scrubbed the standalone summary
+        // and stopped before its audit committed: complete that audit rather
+        // than redact the scrubbed text again.
+        if replay.is_none()
+            && let Some(staged) = &staged
+            && index_id.as_deref() == Some(id.as_str())
+            && let Some(raw) = staged.staged_receipt(&id, &key)?
+        {
+            let receipt: Receipt = serde_json::from_str(&raw)
+                .map_err(|_| invalid("unreadable staged redaction receipt"))?;
+            insert_audit(tx, target, &id, &key, &receipt)?;
+            return Ok(RedactPhase1::Done(receipt));
+        }
         let state: String = tx.query_row(
             "SELECT state FROM agents WHERE id = ?1",
             [target.as_str()],
@@ -897,22 +937,28 @@ impl Store {
                     }
                 }
             }
-            if standalone.is_some() {
-                standalone_redacted = Some(clean_rag_text(&redacted));
-            }
+        }
+        if let Some(staged) = staged.as_mut()
+            && transcript_index.is_none()
+            && index_id.as_deref() == Some(id.as_str())
+        {
+            let receipt_json = serde_json::to_string(&receipt)
+                .map_err(|_| invalid("receipt serialization failed"))?;
+            staged.stage_redaction(
+                target.as_str(),
+                &id,
+                &clean_rag_text(&redacted),
+                &key,
+                &receipt_json,
+            )?;
+            staged.commit()?;
         }
         // The audit's target_id freezes its complete retained alias set in the
         // same IMMEDIATE transaction as the body/index rewrite. The primary
         // origin columns are audit metadata only, never an unqualified fallback.
         // Ingress joins all aliases to this audit before any ordinary writer.
-        tx.execute("INSERT INTO conversation_redactions (
-                id, agent_id, target_id, request_key, actor, permission, reason,
-                created_at_ms, span_unit, span_start, span_end, removed_bytes,
-                removed_chars, receipt, origin_chat_id, origin_message_id
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
-                (SELECT json_extract(origin, '$.chat_id') FROM messages WHERE agent_id = ?2 AND id = ?3),
-                (SELECT json_extract(origin, '$.message_id') FROM messages WHERE agent_id = ?2 AND id = ?3))",
-            params![receipt.audit_id, target.as_str(), id, key, receipt.actor, PERMISSION, receipt.reason, timestamp_ms, if receipt.span.unit == SpanUnit::Bytes { "bytes" } else { "chars" }, receipt.span.start as i64, receipt.span.end as i64, receipt.removed_bytes as i64, receipt.removed_chars as i64, serde_json::to_string(&receipt).map_err(|_| invalid("receipt serialization failed"))?])?;
+        debug_assert_eq!(receipt.timestamp_ms, timestamp_ms);
+        insert_audit(tx, target, &id, &key, &receipt)?;
             Ok(RedactPhase1::Prepared {
                 receipt,
                 prepared,
@@ -920,9 +966,13 @@ impl Store {
                 whole_body,
                 _process,
             })
-        }))?;
-        if let (Some(id), Some(text)) = (&index_id, &standalone_redacted) {
-            self.rewrite_standalone_index_text(target, id, text)?;
+        })
+        })?;
+        // The audit is in state: the staged receipt has done its work.
+        if standalone.is_some()
+            && let Some(id) = &index_id
+        {
+            self.clear_staged_index_redaction(id)?;
         }
         let (mut receipt, prepared, id, whole_body, _process) = match phase1 {
             RedactPhase1::Done(receipt) => return Ok(receipt),

@@ -32,7 +32,7 @@ fn reject_chunks(store: &Store) {
 
 fn count(store: &Store, table: &str) -> i64 {
     let sql = format!("SELECT count(*) FROM {table}");
-    if table.starts_with("rag_chunks") {
+    if table.starts_with("rag_chunks") || table.starts_with("index_") {
         return ix(store).query_row(&sql, [], |r| r.get(0)).unwrap();
     }
     store.conn().query_row(&sql, [], |r| r.get(0)).unwrap()
@@ -866,4 +866,282 @@ fn reindexing_a_chunk_replaces_only_its_own_search_row() {
     }
     assert_eq!(fts_chunk_lookup("msg_01ABC"), Some("\"01ABC\"".to_string()));
     assert_eq!(fts_chunk_lookup("___"), None);
+}
+
+#[test]
+fn a_standalone_redaction_scrubs_the_index_before_its_audit_and_a_retry_completes_it() {
+    use crate::redaction::{Actor, Request};
+    let (_dir, store, agent) = setup();
+    let tool = store
+        .record_tool_event(&agent.id, "bash", "tool secretcanary")
+        .unwrap();
+    store.set_agent_state(&agent.id, "archived").unwrap();
+    let request = Request {
+        message_id: Some(tool.clone()),
+        seq: None,
+        span: None,
+        reason: "remove".into(),
+    };
+    // The audit fails after the index committed: the secret is already gone
+    // from the index, and nothing in state claims the redaction.
+    store
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_audit BEFORE INSERT ON conversation_redactions BEGIN
+             SELECT RAISE(ABORT, 'fixture-audit-write'); END;",
+        )
+        .unwrap();
+    assert_fault(
+        store
+            .redact_conversation(Actor::Operator, &agent.id, &request)
+            .unwrap_err(),
+        "fixture-audit-write",
+    );
+    let canary = |store: &Store| -> i64 {
+        ix(store)
+            .query_row(
+                "SELECT count(*) FROM rag_chunks WHERE text LIKE '%secretcanary%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(canary(&store), 0);
+    assert_eq!(count(&store, "conversation_redactions"), 0);
+    store
+        .conn()
+        .execute_batch("DROP TRIGGER reject_audit")
+        .unwrap();
+    // The retry completes the staged audit instead of refusing a changed
+    // target, and the replay after it returns the same receipt.
+    let receipt = store
+        .redact_conversation(Actor::Operator, &agent.id, &request)
+        .unwrap();
+    assert_eq!(count(&store, "conversation_redactions"), 1);
+    let staged: i64 = ix(&store)
+        .query_row("SELECT count(*) FROM index_redactions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(staged, 0);
+    assert_eq!(
+        store
+            .redact_conversation(Actor::Operator, &agent.id, &request)
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(canary(&store), 0);
+    let fts: i64 = ix(&store)
+        .query_row(
+            "SELECT count(*) FROM rag_chunks_fts WHERE rag_chunks_fts MATCH 'secretcanary'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fts, 0);
+}
+
+#[test]
+fn deleting_the_newest_agent_keeps_the_index_and_projects_reused_rowids_even_when_interrupted() {
+    let (_dir, store, keeper) = setup();
+    store
+        .receive(&keeper.id, Incoming::new("keeperneedle"))
+        .unwrap();
+    let top = store.create_agent(NewAgent::new("newest", "test")).unwrap();
+    store
+        .receive(&top.id, Incoming::new("newestneedle"))
+        .unwrap();
+    store
+        .record_tool_event(&top.id, "bash", "newesttoolneedle")
+        .unwrap();
+    // A rebuild would re-project this row and lose the marker.
+    let mark_rows = |store: &Store| -> i64 {
+        ix(store)
+            .query_row("SELECT count(*) FROM rag_chunks WHERE seq = -77", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    ix(&store)
+        .execute(
+            "UPDATE rag_chunks SET seq = -77 WHERE agent_id = ?1",
+            [keeper.id.as_str()],
+        )
+        .unwrap();
+    let marks_before: Vec<(String, i64)> = ix(&store)
+        .prepare("SELECT key, value FROM index_meta WHERE key LIKE '%rowid'")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let tool_row: (String, String, String, i64, String) = ix(&store)
+        .query_row(
+            "SELECT chunk_id, agent_id, agent_name, timestamp_ms, text FROM rag_chunks
+             WHERE agent_id = ?1 AND kind = 'tool'",
+            [top.id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    store.invalidate_index(&[], &[top.id.as_str()]).unwrap();
+    let pending: (Option<i64>, Option<i64>) = ix(&store)
+        .query_row(
+            "SELECT cap_messages, cap_outbound FROM index_pending WHERE kind = 'agent'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    store.delete_agent(&top.id).unwrap();
+    assert_eq!(mark_rows(&store), 1, "a delete never rebuilds");
+
+    // Put the index back as a writer stopped between the state commit and
+    // the index's own cleanup leaves it.
+    {
+        let conn = ix(&store);
+        conn.execute(
+            "INSERT INTO index_pending (kind, id, cap_messages, cap_outbound) VALUES ('agent', ?1, ?2, ?3)",
+            params![top.id.as_str(), pending.0, pending.1],
+        )
+        .unwrap();
+        for (key, value) in &marks_before {
+            conn.execute(
+                "UPDATE index_meta SET value = ?2 WHERE key = ?1",
+                params![key, value],
+            )
+            .unwrap();
+        }
+        memory_index::upsert_chunk(
+            &conn,
+            &memory_index::Chunk {
+                id: &tool_row.0,
+                agent_id: &tool_row.1,
+                agent_name: &tool_row.2,
+                direction: "out",
+                sender: "agent:newest",
+                destination: "tool:bash",
+                timestamp_ms: tool_row.3,
+                text: &tool_row.4,
+                kind: Some("tool"),
+                tool: Some("bash"),
+                seq: 1,
+            },
+        )
+        .unwrap();
+    }
+    // The next message reuses the deleted agent's highest rowid.
+    store
+        .receive(&keeper.id, Incoming::new("reusedrowidneedle"))
+        .unwrap();
+    store.sync_memory_index().unwrap();
+    assert_eq!(
+        mark_rows(&store),
+        1,
+        "no rebuild after the interrupted delete"
+    );
+    assert_fts(&store, "reusedrowidneedle");
+    let left: i64 = ix(&store)
+        .query_row(
+            "SELECT count(*) FROM rag_chunks WHERE agent_id = ?1",
+            [top.id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0, "the deleted agent's summary is not an orphan");
+    assert_eq!(count(&store, "index_pending"), 0);
+}
+
+#[test]
+fn a_forced_rebuild_keeps_pending_changes_and_drops_orphaned_summaries() {
+    let (_dir, store, agent) = setup();
+    store
+        .record_tool_event(&agent.id, "bash", "livetoolneedle")
+        .unwrap();
+    let state = store.read_conn();
+    let conn = ix(&store);
+    memory_index::upsert_chunk(
+        &conn,
+        &memory_index::Chunk {
+            id: "tool_orphan",
+            agent_id: "agt_gone",
+            agent_name: "gone",
+            direction: "out",
+            sender: "agent:gone",
+            destination: "tool:bash",
+            timestamp_ms: 1,
+            text: "[tool:bash] orphantoolneedle",
+            kind: Some("tool"),
+            tool: Some("bash"),
+            seq: 1,
+        },
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO index_pending (kind, id, cap_messages, cap_outbound) VALUES ('agent', 'agt_gone', 3, 4)",
+        [],
+    )
+    .unwrap();
+    memory_index::reset(&conn, Some(&state), true).unwrap();
+    let texts: Vec<String> = conn
+        .prepare("SELECT text FROM rag_chunks")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(texts, ["[tool:bash] livetoolneedle"]);
+    let pending: (i64, i64) = conn
+        .query_row(
+            "SELECT cap_messages, cap_outbound FROM index_pending WHERE id = 'agt_gone'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(pending, (3, 4));
+}
+
+#[test]
+fn duplicate_mail_never_waits_on_the_index_and_merged_bodies_are_repaired() {
+    let (dir, store, agent) = setup();
+    let mut keyed = Incoming::new("duplicateneedle");
+    keyed.source_key = Some("retry-key".into());
+    store.receive(&agent.id, keyed.clone()).unwrap();
+    // Another process holds the index: a retried delivery is answered from
+    // state at once and is never failed by the index.
+    let blocker = Connection::open(store.memory_index_path()).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        store.receive(&agent.id, keyed).unwrap(),
+        ReceiveOutcome::Duplicate(_)
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+
+    // A channel message whose stored body changed after it was projected
+    // (a merge a stopped writer did not re-project) is repaired on open.
+    let mut channel = Incoming::new("channelmergedneedle full body");
+    channel.origin = Some(crate::Origin {
+        chat_id: Some(-100),
+        thread_id: None,
+        message_id: Some(42),
+    });
+    let ReceiveOutcome::New(message) = store.receive(&agent.id, channel).unwrap() else {
+        panic!("a new message");
+    };
+    ix(&store)
+        .execute(
+            "UPDATE rag_chunks SET text = 'stale', content_hash = 'stale' WHERE chunk_id = ?1",
+            [message.id.as_str()],
+        )
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+    store.sync_memory_index().unwrap();
+    let text: String = ix(&store)
+        .query_row(
+            "SELECT text FROM rag_chunks WHERE chunk_id = ?1",
+            [message.id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(text.contains("channelmergedneedle"), "{text}");
 }

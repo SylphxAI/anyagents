@@ -44,7 +44,7 @@ pub const FILE_NAME: &str = "memory-index.db";
 /// The schema name state readers attach the index under.
 pub(crate) const ATTACHED: &str = "memory_index";
 /// Layout version; a file with any other version is rebuilt from state.
-const LAYOUT: i64 = 1;
+const LAYOUT: i64 = 2;
 /// Rows projected per index transaction.
 const BATCH: usize = 512;
 /// Rows a reader projects before answering; the rest is left to the
@@ -76,7 +76,20 @@ CREATE TABLE IF NOT EXISTS index_meta (
 CREATE TABLE IF NOT EXISTS index_pending (
     kind TEXT NOT NULL,
     id TEXT NOT NULL,
+    -- For an agent about to be deleted: the highest rowids of every other
+    -- agent's rows, read before the delete. Rows inserted after the delete
+    -- lie above them.
+    cap_messages INTEGER,
+    cap_outbound INTEGER,
     PRIMARY KEY (kind, id)
+);
+-- A standalone summary's redaction, written with its scrubbed text before
+-- state commits the audit: a retry that finds no audit completes it from
+-- this receipt instead of redacting already-scrubbed text again.
+CREATE TABLE IF NOT EXISTS index_redactions (
+    chunk_id TEXT PRIMARY KEY,
+    request_key TEXT NOT NULL,
+    receipt TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS rag_chunks (
     chunk_id TEXT PRIMARY KEY,
@@ -125,6 +138,9 @@ pub(super) struct Chunk<'a> {
 pub(super) struct MemoryIndex {
     path: PathBuf,
     writer: Mutex<Connection>,
+    /// Chunks a non-blocking re-projection found the index busy for; the
+    /// next sync queues them as pending entries.
+    deferred: Mutex<Vec<String>>,
 }
 
 impl MemoryIndex {
@@ -155,6 +171,7 @@ impl MemoryIndex {
         Ok(Self {
             path: path.to_path_buf(),
             writer: Mutex::new(conn),
+            deferred: Mutex::new(Vec::new()),
         })
     }
 
@@ -192,7 +209,16 @@ impl MemoryIndex {
             return Ok(false);
         };
         conn.busy_timeout(if wait { BUSY } else { Duration::ZERO })?;
-        let outcome = sync_on(&mut conn, state, budget);
+        let deferred =
+            std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|p| p.into_inner()));
+        let outcome =
+            queue_chunks(&mut conn, &deferred).and_then(|()| sync_on(&mut conn, state, budget));
+        if outcome.is_err() && !deferred.is_empty() {
+            self.deferred
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend(deferred);
+        }
         conn.busy_timeout(BUSY)?;
         match outcome {
             Err(error) if !wait && error.is_transient_lock_error() => Ok(false),
@@ -209,8 +235,27 @@ impl MemoryIndex {
         state: &Connection,
         chunks: &[&str],
         agents: &[&str],
+        wait: bool,
     ) -> Result<(), Error> {
-        let mut conn = self.writer();
+        let Some(mut conn) = (if wait {
+            Some(self.writer())
+        } else {
+            self.try_writer()
+        }) else {
+            return Err(Error::Message("the search index is busy; retry".into()));
+        };
+        conn.busy_timeout(if wait { BUSY } else { Duration::ZERO })?;
+        let result = Self::invalidate_on(&mut conn, state, chunks, agents);
+        conn.busy_timeout(BUSY)?;
+        result
+    }
+
+    fn invalidate_on(
+        conn: &mut Connection,
+        state: &Connection,
+        chunks: &[&str],
+        agents: &[&str],
+    ) -> Result<(), Error> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for id in chunks {
             tx.execute(
@@ -223,13 +268,33 @@ impl MemoryIndex {
             }
         }
         for id in agents {
-            tx.execute(
-                "INSERT OR IGNORE INTO index_pending (kind, id) VALUES ('agent', ?1)",
+            let (cap_messages, cap_outbound): (i64, i64) = state.query_row(
+                "SELECT (SELECT COALESCE(MAX(rowid), 0) FROM messages WHERE agent_id != ?1),
+                        (SELECT COALESCE(MAX(rowid), 0) FROM outbound_messages WHERE agent_id != ?1)",
                 [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            tx.execute(
+                "INSERT INTO index_pending (kind, id, cap_messages, cap_outbound)
+                 VALUES ('agent', ?1, ?2, ?3)
+                 ON CONFLICT (kind, id) DO UPDATE SET
+                     cap_messages = MIN(COALESCE(cap_messages, excluded.cap_messages), excluded.cap_messages),
+                     cap_outbound = MIN(COALESCE(cap_outbound, excluded.cap_outbound), excluded.cap_outbound)",
+                params![id, cap_messages, cap_outbound],
             )?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Take the index's write lock and open a transaction, for a change that
+    /// must be durable here before state commits (a standalone summary's
+    /// redaction). Taken before the state writer, so the state transaction
+    /// never waits on the index.
+    pub(super) fn begin_staged(&self) -> Result<Staged<'_>, Error> {
+        let conn = self.writer();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(Staged { conn, open: true })
     }
 
     /// Remove a deleted agent's rows. `max_rowids` are the highest
@@ -286,55 +351,12 @@ impl MemoryIndex {
             .optional()?)
     }
 
-    /// Replace a standalone summary's text (a redaction), erasing the old
-    /// text from the table and the full-text index.
-    pub(super) fn rewrite_standalone(
-        &self,
-        agent_id: &str,
-        chunk_id: &str,
-        text: &str,
-    ) -> Result<(), Error> {
-        let mut conn = self.writer();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row = tx
-            .query_row(
-                "SELECT agent_name, direction, sender, destination, timestamp_ms, kind, tool_name, seq
-                 FROM rag_chunks WHERE agent_id = ?1 AND chunk_id = ?2",
-                params![agent_id, chunk_id],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, i64>(4)?,
-                        r.get::<_, String>(5)?,
-                        r.get::<_, String>(6)?,
-                        r.get::<_, i64>(7)?,
-                    ))
-                },
-            )
-            .optional()?;
-        remove_chunk(&tx, chunk_id)?;
-        if let Some((name, direction, sender, destination, ts, kind, tool, seq)) = row {
-            upsert_chunk(
-                &tx,
-                &Chunk {
-                    id: chunk_id,
-                    agent_id,
-                    agent_name: &name,
-                    direction: &direction,
-                    sender: &sender,
-                    destination: &destination,
-                    timestamp_ms: ts,
-                    text,
-                    kind: Some(&kind),
-                    tool: Some(&tool),
-                    seq,
-                },
-            )?;
-        }
-        tx.commit()?;
+    /// Forget a standalone redaction's staged receipt.
+    pub(super) fn clear_staged_redaction(&self, chunk_id: &str) -> Result<(), Error> {
+        self.writer().execute(
+            "DELETE FROM index_redactions WHERE chunk_id = ?1",
+            [chunk_id],
+        )?;
         Ok(())
     }
 
@@ -361,12 +383,19 @@ impl MemoryIndex {
             .query_map([], StandaloneRow::read)?
             .collect::<Result<Vec<_>, _>>()?;
         let mut conn = self.writer();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for row in &rows {
-            upsert_chunk(&tx, &row.chunk())?;
-        }
-        tx.commit()?;
-        Ok(())
+        // State drops its copy right after this returns: the index's copy
+        // must be on disk first, not only in a WAL a power loss can cut.
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let written = (|| -> Result<(), Error> {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for row in &rows {
+                upsert_chunk(&tx, &row.chunk())?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        written
     }
 
     /// Queue the most recent mailbox rows whose projection is missing, which
@@ -394,6 +423,31 @@ impl MemoryIndex {
                 }
             }
         }
+        // A channel message's stored body can be merged with a fuller copy
+        // after it was projected; a writer stopped before re-projecting it
+        // leaves a row whose text no longer matches.
+        let merged: Vec<(String, String)> = state
+            .prepare(
+                "SELECT id, body FROM messages WHERE rowid <= ?1 AND origin IS NOT NULL
+                 ORDER BY rowid DESC LIMIT ?2",
+            )?
+            .query_map(params![marks.0, TAIL_CHECK], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        {
+            let conn = self.writer();
+            let mut probe =
+                conn.prepare_cached("SELECT content_hash FROM rag_chunks WHERE chunk_id = ?1")?;
+            for (id, body) in merged {
+                let cleaned = clean_rag_text(&body);
+                if cleaned.chars().count() < 2 {
+                    continue;
+                }
+                let hash: Option<String> = probe.query_row([&id], |r| r.get(0)).optional()?;
+                if hash.is_some_and(|h| h != rag_content_hash(&cleaned)) {
+                    missing.push(id);
+                }
+            }
+        }
         if missing.is_empty() {
             return Ok(());
         }
@@ -409,12 +463,137 @@ impl MemoryIndex {
         Ok(())
     }
 
+    /// Re-project `chunks` from state without waiting: `false` when another
+    /// writer holds the index, and nothing was done.
+    pub(super) fn try_reproject(
+        &self,
+        state: &Connection,
+        chunks: &[String],
+    ) -> Result<bool, Error> {
+        let defer = || {
+            self.deferred
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend(chunks.iter().cloned());
+        };
+        let Some(mut conn) = self.try_writer() else {
+            defer();
+            return Ok(false);
+        };
+        conn.busy_timeout(Duration::ZERO)?;
+        let result = (|| -> Result<(), Error> {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for id in chunks {
+                match source_row(state, id)? {
+                    Some(row) => upsert_chunk(&tx, &row.chunk())?,
+                    None => remove_chunk(&tx, id)?,
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        conn.busy_timeout(BUSY)?;
+        match result {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                defer();
+                if error.is_transient_lock_error() {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     /// Whether more than one read's budget of rows waits to be projected.
     pub(super) fn far_behind(&self, state: &Connection) -> Result<bool, Error> {
         let marks = marks(&self.writer())?;
         let (messages, outbound) = max_rowids(state)?;
         Ok((messages - marks.0).max(0) + (outbound - marks.1).max(0) > READ_BUDGET as i64)
     }
+}
+
+/// An open index write transaction, rolled back unless committed.
+pub(crate) struct Staged<'a> {
+    conn: MutexGuard<'a, Connection>,
+    open: bool,
+}
+
+impl Staged<'_> {
+    /// The receipt staged for `chunk_id` by an earlier attempt of the same
+    /// request, if that attempt scrubbed the index but its audit is missing.
+    pub(crate) fn staged_receipt(
+        &self,
+        chunk_id: &str,
+        request_key: &str,
+    ) -> Result<Option<String>, Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT receipt FROM index_redactions WHERE chunk_id = ?1 AND request_key = ?2",
+                params![chunk_id, request_key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Scrub a standalone summary to `text` and stage its receipt.
+    pub(crate) fn stage_redaction(
+        &self,
+        agent_id: &str,
+        chunk_id: &str,
+        text: &str,
+        request_key: &str,
+        receipt: &str,
+    ) -> Result<(), Error> {
+        rewrite_standalone_on(&self.conn, agent_id, chunk_id, text)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_redactions (chunk_id, request_key, receipt)
+             VALUES (?1, ?2, ?3)",
+            params![chunk_id, request_key, receipt],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn commit(&mut self) -> Result<(), Error> {
+        if self.open {
+            self.conn.execute_batch("COMMIT")?;
+            self.open = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Staged<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+fn rewrite_standalone_on(
+    conn: &Connection,
+    agent_id: &str,
+    chunk_id: &str,
+    text: &str,
+) -> Result<(), Error> {
+    let row = conn
+        .query_row(
+            "SELECT chunk_id, agent_id, agent_name, direction, sender, destination,
+                    timestamp_ms, text, kind, tool_name, seq
+             FROM rag_chunks WHERE agent_id = ?1 AND chunk_id = ?2",
+            params![agent_id, chunk_id],
+            StandaloneRow::read,
+        )
+        .optional()?;
+    remove_chunk(conn, chunk_id)?;
+    if let Some(mut row) = row {
+        row.text = text.to_string();
+        upsert_chunk(conn, &row.chunk())?;
+    }
+    Ok(())
 }
 
 /// Fill the index in the background until it has caught up with state or the
@@ -485,7 +664,7 @@ fn open_checked(path: &Path) -> Result<Connection, Error> {
             other => Err(other),
         })?;
     if layout != Some(LAYOUT) {
-        reset(&conn, false)?;
+        reset(&conn, None, false)?;
     }
     // A damaged file fails here and is recreated by the caller.
     conn.query_row(
@@ -499,7 +678,11 @@ fn open_checked(path: &Path) -> Result<Connection, Error> {
 /// Drop everything and create the current layout, empty, with marks at zero.
 /// Unless `force`, a file another process brought to the current layout
 /// meanwhile is left as it is.
-fn reset(conn: &Connection, force: bool) -> Result<(), Error> {
+pub(super) fn reset(
+    conn: &Connection,
+    state: Option<&Connection>,
+    force: bool,
+) -> Result<(), Error> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<(), Error> {
         let current = conn
@@ -522,6 +705,49 @@ fn reset(conn: &Connection, force: bool) -> Result<(), Error> {
             )
             .and_then(|mut stmt| {
                 stmt.query_map([], StandaloneRow::read)?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        // A summary whose agent state no longer has would be an orphan
+        // nothing removes.
+        let kept: Vec<StandaloneRow> = match state {
+            Some(state) => {
+                let mut live = state.prepare_cached("SELECT 1 FROM agents WHERE id = ?1")?;
+                let mut alive = Vec::new();
+                for row in kept {
+                    if live
+                        .query_row([&row.agent_id], |_| Ok(()))
+                        .optional()?
+                        .is_some()
+                    {
+                        alive.push(row);
+                    }
+                }
+                alive
+            }
+            None => kept,
+        };
+        // Pending entries describe state changes still to apply; a rebuild
+        // does not apply them (an agent deleted meanwhile, a redaction).
+        type Pending = (String, String, Option<i64>, Option<i64>);
+        let pending: Vec<Pending> = conn
+            .prepare("SELECT kind, id, cap_messages, cap_outbound FROM index_pending")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .or_else(|_| {
+                conn.prepare("SELECT kind, id FROM index_pending")
+                    .and_then(|mut stmt| {
+                        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, None, None)))?
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+            })
+            .unwrap_or_default();
+        let staged: Vec<(String, String, String)> = conn
+            .prepare("SELECT chunk_id, request_key, receipt FROM index_redactions")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                     .collect::<Result<Vec<_>, _>>()
             })
             .unwrap_or_default();
@@ -552,6 +778,20 @@ fn reset(conn: &Connection, force: bool) -> Result<(), Error> {
         )?;
         for row in &kept {
             upsert_chunk(conn, &row.chunk())?;
+        }
+        for (kind, id, cap_messages, cap_outbound) in &pending {
+            conn.execute(
+                "INSERT OR IGNORE INTO index_pending (kind, id, cap_messages, cap_outbound)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![kind, id, cap_messages, cap_outbound],
+            )?;
+        }
+        for (chunk_id, key, receipt) in &staged {
+            conn.execute(
+                "INSERT OR IGNORE INTO index_redactions (chunk_id, request_key, receipt)
+                 VALUES (?1, ?2, ?3)",
+                params![chunk_id, key, receipt],
+            )?;
         }
         Ok(())
     })();
@@ -734,12 +974,17 @@ fn sync_on(conn: &mut Connection, state: &Connection, budget: usize) -> Result<b
     if !pending && messages == max_messages && outbound == max_outbound {
         return Ok(true);
     }
+    // First the pending changes: a deleted agent's entry lowers the marks
+    // past the rowids it held, which is not state moving backwards.
+    if pending {
+        drain_pending(conn, state)?;
+    }
     // State moved backwards (restored, replaced): the projection describes
     // rows state no longer has. Start over.
+    let (messages, outbound) = marks(conn)?;
     if messages > max_messages || outbound > max_outbound {
-        reset(conn, true)?;
+        reset(conn, Some(state), true)?;
     }
-    drain_pending(conn, state)?;
     let mut left = budget;
     for (key, select, rowid, direction) in [
         ("messages_rowid", INBOUND_SELECT, "m.rowid", "in"),
@@ -792,18 +1037,36 @@ fn sync_on(conn: &mut Connection, state: &Connection, budget: usize) -> Result<b
     Ok(true)
 }
 
+fn queue_chunks(conn: &mut Connection, chunks: &[String]) -> Result<(), Error> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for id in chunks {
+        tx.execute(
+            "INSERT OR IGNORE INTO index_pending (kind, id) VALUES ('chunk', ?1)",
+            [id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn drain_pending(conn: &mut Connection, state: &Connection) -> Result<(), Error> {
     loop {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let pending: Vec<(String, String)> = tx
-            .prepare_cached("SELECT kind, id FROM index_pending LIMIT 256")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        type Pending = (String, String, Option<i64>, Option<i64>);
+        let pending: Vec<Pending> = tx
+            .prepare_cached(
+                "SELECT kind, id, cap_messages, cap_outbound FROM index_pending LIMIT 256",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<Result<_, _>>()?;
         if pending.is_empty() {
             tx.commit()?;
             return Ok(());
         }
-        for (kind, id) in &pending {
+        for (kind, id, cap_messages, cap_outbound) in &pending {
             match kind.as_str() {
                 // A standalone summary keeps its row; a mailbox row leaves
                 // state only with its agent, below.
@@ -826,7 +1089,11 @@ fn drain_pending(conn: &mut Connection, state: &Connection) -> Result<(), Error>
                         }
                         None => {
                             forget_agent(&tx, id)?;
-                            let (messages, outbound) = max_rowids(state)?;
+                            // The bound read before the delete: rows a new
+                            // agent added since may reuse the rowids.
+                            let (now_messages, now_outbound) = max_rowids(state)?;
+                            let messages = cap_messages.unwrap_or(now_messages).min(now_messages);
+                            let outbound = cap_outbound.unwrap_or(now_outbound).min(now_outbound);
                             for (key, max) in
                                 [("messages_rowid", messages), ("outbound_rowid", outbound)]
                             {
