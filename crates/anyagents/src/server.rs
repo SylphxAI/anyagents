@@ -4683,6 +4683,7 @@ async fn create_agent_route(
             Principal::Agent { name, .. } => format!("agent:{name}"),
         };
         let finish = SpawnFinish {
+            workdir: agent.workdir.clone(),
             actor,
             caller: caller_agent.as_ref().map(|(id, _)| id.to_string()),
             scope: body.scope,
@@ -4728,6 +4729,9 @@ async fn create_agent_route(
 /// be run again after a stop.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, Deserialize)]
 struct SpawnFinish {
+    /// Allocated workdir, for recovery of rows missing the allocation.
+    #[serde(default)]
+    workdir: Option<String>,
     /// Who spawned: `operator` or `agent:<name>`, for the audit.
     actor: String,
     /// The spawning agent's id: the prompt's sender and a group member.
@@ -4765,6 +4769,11 @@ fn finish_spawn(
         .map(anyagents_core::AgentId::parse)
         .transpose()
         .map_err(ApiError::from_store)?;
+    if let Some(workdir) = finish.workdir.as_deref() {
+        agent = store
+            .set_agent_workdir_if_missing(&agent.id, workdir)
+            .map_err(ApiError::from_store)?;
+    }
     let actor = finish.actor.as_str();
     let mut scope_changed = false;
     if let Some(ref scope_val) = finish.scope {
@@ -10587,6 +10596,7 @@ pub(crate) mod tests {
         new.parent_id = Some(parent.id.clone());
         let child = store.create_agent(new).unwrap();
         let finish = SpawnFinish {
+            workdir: Some("/allocated/worktree".into()),
             actor: "agent:parent".into(),
             caller: Some(parent.id.to_string()),
             scope: None,
@@ -10614,12 +10624,35 @@ pub(crate) mod tests {
             "task"
         );
 
+        assert_eq!(
+            store.agent(&child.id).unwrap().workdir.as_deref(),
+            Some("/allocated/worktree")
+        );
+        // A later authoritative assignment must survive a stale finish record.
+        store
+            .set_agent_running(&child.id, "/current/worktree")
+            .unwrap();
         // Stopped again after the prompt landed but before the record went:
         // the next start finishes without a second prompt.
         record_spawn_finish(&marker, &finish).unwrap();
         assert_eq!(finish_interrupted_spawns(&store, data), 1);
         assert_eq!(store.inbox(&child.id, None).unwrap().len(), 1);
         assert_eq!(finish_interrupted_spawns(&store, data), 0);
+        assert_eq!(
+            store.agent(&child.id).unwrap().workdir.as_deref(),
+            Some("/current/worktree")
+        );
+        // Records written before workdir snapshots remain readable.
+        let mut legacy = serde_json::to_value(&finish).unwrap();
+        legacy.as_object_mut().unwrap().remove("workdir");
+        let legacy: SpawnFinish = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.workdir.is_none());
+        record_spawn_finish(&marker, &legacy).unwrap();
+        assert_eq!(finish_interrupted_spawns(&store, data), 1);
+        assert_eq!(
+            store.agent(&child.id).unwrap().workdir.as_deref(),
+            Some("/current/worktree")
+        );
     }
 
     #[test]
@@ -10635,6 +10668,7 @@ pub(crate) mod tests {
             .create_agent(anyagents_core::NewAgent::new("child", "codex"))
             .unwrap();
         let mut finish = SpawnFinish {
+            workdir: None,
             actor: "operator".into(),
             caller: None,
             scope: None,

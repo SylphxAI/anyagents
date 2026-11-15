@@ -2953,6 +2953,22 @@ impl Store {
         Ok(changed)
     }
 
+    /// Persist an allocated workdir without starting or waking the agent.
+    /// Recovery may fill a missing value, but must not replace a newer one.
+    pub fn set_agent_workdir_if_missing(
+        &self,
+        id: &AgentId,
+        workdir: &str,
+    ) -> Result<Agent, Error> {
+        self.write_tx(|tx| {
+            tx.execute(
+                "UPDATE agents SET workdir = ?1 WHERE id = ?2 AND workdir IS NULL",
+                params![workdir, id.as_str()],
+            )?;
+            agent_by_id(tx, id)
+        })
+    }
+
     /// Store the work directory and mark the agent running.
     pub fn set_agent_running(&self, id: &AgentId, workdir: &str) -> Result<Agent, Error> {
         let changed = self.write_tx(|tx| {
@@ -3120,17 +3136,16 @@ impl Store {
         self.complete_idle_agent(id)
     }
 
-    /// Permanently delete an agent and its associated records from the store.
-    /// A creation that failed before admission (`set_agent_running` is the only
-    /// writer of `workdir`) must not keep its name reserved. When its row has to
-    /// be kept, e.g. as the anchor of a pending revocation journal, archive it
-    /// and rename it to its own id, which can never collide with a chosen name.
-    /// The id, history and journal are untouched. Admitted agents are refused.
+    /// A creation that failed before admission must not keep its name reserved.
+    /// A created row may already have an allocated workdir; allocation alone
+    /// does not admit it. Archive the row, clear its workdir, and rename it to
+    /// its own id, which can never collide with a chosen name. The id, history
+    /// and journal are untouched. Admitted agents are refused.
     pub fn release_unadmitted_agent(&self, id: &AgentId) -> Result<Agent, Error> {
         let released = self.write_tx(|tx| {
             let changed = tx.execute(
-                "UPDATE agents SET name = id, state = 'archived'
-                 WHERE id = ?1 AND workdir IS NULL AND is_admin = 0",
+                "UPDATE agents SET name = id, state = 'archived', workdir = NULL
+                 WHERE id = ?1 AND (workdir IS NULL OR state = 'created') AND is_admin = 0",
                 [id.as_str()],
             )?;
             if changed == 0 {
@@ -3155,7 +3170,7 @@ impl Store {
             let conn = self.read_conn();
             let mut stmt = conn.prepare(
                 "SELECT id, name FROM agents
-                 WHERE workdir IS NULL AND is_admin = 0 AND name != id
+                 WHERE (workdir IS NULL OR state = 'created') AND is_admin = 0 AND name != id
                    AND state IN ('created', 'archived')",
             )?;
             stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -9504,13 +9519,16 @@ mod tests {
     fn failed_creation_releases_its_name_and_admitted_agents_keep_theirs() {
         let (_dir, store) = setup();
         let failed = agent(&store, "reserved");
-        let admitted = agent(&store, "admitted");
-        store.set_agent_running(&admitted.id, "/work").unwrap();
-        store.set_agent_state(&admitted.id, "archived").unwrap();
+        store
+            .set_agent_workdir_if_missing(&failed.id, "/allocated")
+            .unwrap();
+        assert_eq!(store.agent(&failed.id).unwrap().state, "created");
 
         let released = store.release_unadmitted_agent(&failed.id).unwrap();
         assert_eq!(released.name, failed.id.as_str());
         assert_eq!(released.state, "archived");
+        assert_eq!(released.workdir, None);
+        assert_eq!(store.agent(&failed.id).unwrap().workdir, None);
         assert!(matches!(
             store.agent_by_name("reserved"),
             Err(Error::AgentNotFound(_))
@@ -9518,15 +9536,27 @@ mod tests {
         assert_eq!(store.agent(&failed.id).unwrap().id, failed.id);
         agent(&store, "reserved");
 
-        let refused = store.release_unadmitted_agent(&admitted.id).unwrap_err();
-        assert!(refused.to_string().contains("was admitted"), "{refused}");
-        assert_eq!(store.agent(&admitted.id).unwrap().name, "admitted");
+        for state in ["running", "paused", "archived"] {
+            let admitted = agent(&store, state);
+            store.set_agent_running(&admitted.id, "/work").unwrap();
+            store.set_agent_state(&admitted.id, state).unwrap();
+            let refused = store.release_unadmitted_agent(&admitted.id).unwrap_err();
+            assert!(refused.to_string().contains("was admitted"), "{refused}");
+            let retained = store.agent(&admitted.id).unwrap();
+            assert_eq!(retained.name, state);
+            assert_eq!(retained.state, state);
+            assert_eq!(retained.workdir.as_deref(), Some("/work"));
+        }
     }
 
     #[test]
     fn startup_repair_releases_every_ghost_reservation_once() {
         let (_dir, store) = setup();
         let interrupted = agent(&store, "interrupted");
+        let allocated = agent(&store, "allocated");
+        store
+            .set_agent_workdir_if_missing(&allocated.id, "/allocated")
+            .unwrap();
         let ghost = agent(&store, "ghost");
         store.set_agent_state(&ghost.id, "archived").unwrap();
         let running = agent(&store, "running");
@@ -9540,16 +9570,45 @@ mod tests {
         assert_eq!(
             released,
             vec![
+                (allocated.id.clone(), "allocated".to_string()),
                 (ghost.id.clone(), "ghost".to_string()),
                 (interrupted.id.clone(), "interrupted".to_string()),
             ]
         );
         assert!(store.release_unadmitted_names().unwrap().is_empty());
-        for name in ["ghost", "interrupted"] {
-            agent(&store, name);
+        for released in [&allocated, &ghost, &interrupted] {
+            let retained = store.agent(&released.id).unwrap();
+            assert_eq!(retained.name, released.id.as_str());
+            assert_eq!(retained.state, "archived");
+            assert_eq!(retained.workdir, None);
+            agent(&store, &released.name);
         }
         assert_eq!(store.agent(&running.id).unwrap().name, "running");
         assert_eq!(store.agent(&retired.id).unwrap().name, "retired");
+    }
+
+    #[test]
+    fn allocated_workdir_is_durable_without_starting_or_waking() {
+        let (_dir, store) = setup();
+        let agent = agent(&store, "alpha");
+        let wakes = store.subscribe();
+        let allocated = store
+            .set_agent_workdir_if_missing(&agent.id, "/allocated")
+            .unwrap();
+        assert_eq!(allocated.state, agent.state);
+        assert_eq!(allocated.workdir.as_deref(), Some("/allocated"));
+        assert_eq!(store.agent(&agent.id).unwrap().workdir, allocated.workdir);
+        let unchanged = store
+            .set_agent_workdir_if_missing(&agent.id, "/stale")
+            .unwrap();
+        assert_eq!(unchanged.workdir, allocated.workdir);
+        assert!(wakes.try_recv().is_err());
+        assert!(matches!(
+            store
+                .set_agent_workdir_if_missing(&AgentId::generate(), "/missing")
+                .unwrap_err(),
+            Error::AgentNotFound(_)
+        ));
     }
 
     #[test]

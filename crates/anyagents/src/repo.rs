@@ -2336,6 +2336,13 @@ pub(crate) fn seat_executable_test_harness() -> std::io::Result<PathBuf> {
     static COPY: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
     let copy = COPY.get_or_init(|| {
         let copy = || -> std::io::Result<PathBuf> {
+            // Resolve the running inode, not the build path: native fixtures
+            // run as root without DAC override/search, so even root may not
+            // traverse a runner-owned build directory. Use this process ID,
+            // not /proc/self/exe (which would name cp in the copy child).
+            #[cfg(target_os = "linux")]
+            let harness = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+            #[cfg(not(target_os = "linux"))]
             let harness = std::env::current_exe()?;
             let directory = std::env::temp_dir().join(format!(
                 "anyagents-probe-harness-{}-{}",
