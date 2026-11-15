@@ -14,7 +14,13 @@ const PEER_GROUP: u32 = 24104;
 
 fn owned(path: &Path, uid: u32, gid: u32, mode: u32) {
     let name = CString::new(path.as_os_str().as_bytes()).unwrap();
-    assert_eq!(unsafe { libc::chown(name.as_ptr(), uid, gid) }, 0);
+    assert_eq!(
+        unsafe { libc::chown(name.as_ptr(), uid, gid) },
+        0,
+        "chown {} to {uid}:{gid}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
@@ -159,27 +165,6 @@ fn privileged_config_acl_cross_uid() {
         true,
     )
     .unwrap();
-    for file in files {
-        owned(
-            &root.join(file),
-            SEAT,
-            GROUP,
-            if file == "profiles/node" {
-                0o700
-            } else {
-                0o600
-            },
-        );
-    }
-    for dir in dirs.into_iter().rev() {
-        owned(
-            &root.join(dir),
-            SEAT,
-            GROUP,
-            if dir == "brain" { 0o1700 } else { 0o700 },
-        );
-    }
-    owned(&daemon_op, 0, 0, 0o700);
     struct Cleanup(Vec<std::path::PathBuf>);
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -193,6 +178,33 @@ fn privileged_config_acl_cross_uid() {
         }
     }
     let _cleanup = Cleanup(dirs.iter().map(|dir| root.join(dir)).collect());
+    for file in files {
+        owned(
+            &root.join(file),
+            SEAT,
+            GROUP,
+            if file == "profiles/node" {
+                0o700
+            } else {
+                0o600
+            },
+        );
+    }
+    // Establish the daemon-private leaf before its ancestors become seat-only.
+    // This fixture deliberately lacks DAC override/search capabilities.
+    owned(&daemon_op, 0, 0, 0o700);
+    for dir in dirs
+        .into_iter()
+        .rev()
+        .filter(|dir| *dir != "config-home/op")
+    {
+        owned(
+            &root.join(dir),
+            SEAT,
+            GROUP,
+            if dir == "brain" { 0o1700 } else { 0o700 },
+        );
+    }
     assert_eq!(
         File::open(&root).unwrap_err().kind(),
         std::io::ErrorKind::PermissionDenied,
