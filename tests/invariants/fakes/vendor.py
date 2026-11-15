@@ -52,6 +52,8 @@ FAMILIES = {
     "grok": "proto_grok",
     "omp": "proto_omp",
     "agy": "proto_agy",
+    "acp": "proto_acp",
+    "acp-turn-end": "proto_acp",
 }
 
 
