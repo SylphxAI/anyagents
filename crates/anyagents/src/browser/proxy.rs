@@ -237,6 +237,9 @@ mod tests {
     )]
     fn direct_fallback_reaches_the_page_when_the_proxy_is_down() {
         use std::io::{Read, Write};
+        let Some(chromium) = super::super::tests::fixture_chromium() else {
+            return;
+        };
         let closed = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -258,7 +261,7 @@ mod tests {
         let proxy = format!("socks5://{closed},direct://");
         validate(&proxy).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let out = std::process::Command::new(super::super::chromium_binary().expect("Chromium"))
+        let out = std::process::Command::new(chromium)
             .arg("--headless=new")
             .arg("--no-sandbox")
             .arg("--disable-gpu")

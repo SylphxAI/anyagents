@@ -10522,6 +10522,19 @@ esac
         );
     }
 
+    /// The Chromium a fixture test renders with. CI must have one; elsewhere a
+    /// host without Chromium skips the test rather than failing it.
+    pub(super) fn fixture_chromium() -> Option<std::path::PathBuf> {
+        match super::chromium_binary() {
+            Ok(bin) => Some(bin),
+            Err(err) if std::env::var_os("CI").is_none() => {
+                eprintln!("skipped: {err}");
+                None
+            }
+            Err(err) => panic!("CI needs Chromium for this test: {err}"),
+        }
+    }
+
     /// Renders each fixture in real headless Chromium and runs the page
     /// detection on it: a challenge counts only when a human can see it.
     #[test]
@@ -10531,6 +10544,9 @@ esac
     )]
     fn captcha_detection_requires_a_rendered_challenge() {
         use super::*;
+        let Some(chromium) = fixture_chromium() else {
+            return;
+        };
         const TS: &str = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2/av0/rcv0/0/abc/light/normal";
         const RC: &str = "https://www.google.com/recaptcha/api2/anchor?k=site";
         const RC_IMG: &str = "https://www.google.com/recaptcha/api2/bframe?k=site";
@@ -10726,7 +10742,7 @@ esac
             ),
         )
         .unwrap();
-        let out = Command::new(chromium_binary().expect("Chromium for the fixture"))
+        let out = Command::new(chromium)
             .arg("--headless=new")
             .arg("--no-sandbox")
             .arg("--disable-gpu")
