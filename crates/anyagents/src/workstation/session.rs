@@ -549,7 +549,7 @@ async fn start(
     };
     // A fresh session: the lease cannot be held by anyone else yet.
     session.lease(principal).map_err(|e| in_use(profile, e))?;
-    let mount = takeover::mount(&session);
+    let mount = takeover::mount(data, &session);
     let (watcher, hand_backs) = takeover::watch_hand_backs(data, profile, session.clone());
     let now = now_ms();
     Ok(Live {

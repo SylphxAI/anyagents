@@ -41,8 +41,10 @@ static MOUNTS: LazyLock<std::sync::Mutex<HashMap<String, axum::Router>>> =
 
 /// The public base people reach the server's public listener at, when both
 /// are configured.
-fn public_entry() -> Option<url::Url> {
-    crate::server::webhook_listen_addr()?;
+fn public_entry(data: &Path) -> Option<url::Url> {
+    if !crate::server::public_entry_listening(data) {
+        return None;
+    }
     let base = std::env::var("ANYAGENTS_WEBHOOK_URL").ok()?;
     let base = base.trim().trim_end_matches('/');
     url::Url::parse(&format!("{base}/")).ok()
@@ -59,8 +61,8 @@ fn random_key() -> Option<String> {
 
 /// Mount `session`'s takeover page on the public listener when the server
 /// has a public entry; returns its key.
-pub fn mount(session: &DesktopSession) -> Option<String> {
-    let base = public_entry()?;
+pub fn mount(data: &Path, session: &DesktopSession) -> Option<String> {
+    let base = public_entry(data)?;
     let router = session.takeover_router()?;
     let key = random_key()?;
     let url = base

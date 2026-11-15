@@ -1147,6 +1147,15 @@ async fn telegram_webhook(
 /// and MCP for every credential kind. Until a deployment configures
 /// `public_listen` it is also the public one and keeps the `0.0.0.0:8788`
 /// default; once the public listener exists it defaults to loopback.
+#[cfg(target_os = "linux")]
+pub(crate) fn public_entry_listening(data: &Path) -> bool {
+    match crate::remote::Settings::load(data) {
+        Ok(settings) if settings.public_listen.is_some() => true,
+        Ok(_) => webhook_listen_addr(false).is_some(),
+        Err(_) => false,
+    }
+}
+
 fn webhook_listen_addr(public_configured: bool) -> Option<String> {
     local_listen_addr(
         std::env::var("ANYAGENTS_WEBHOOK_LISTEN").ok().as_deref(),
@@ -1193,6 +1202,12 @@ fn binds_loopback(addr: &str) -> bool {
 /// or a forwarding header.
 pub(crate) fn build_public_router(state: AppState) -> Router {
     Router::new()
+        .route("/v1/webhooks/takeover/{key}", any(takeover_page_route))
+        .route("/v1/webhooks/takeover/{key}/", any(takeover_page_route))
+        .route(
+            "/v1/webhooks/takeover/{key}/{*rest}",
+            any(takeover_page_route),
+        )
         .route("/", get(public_healthz))
         .route("/healthz", get(public_healthz))
         .route("/v1/webhooks/healthz", get(public_healthz))
