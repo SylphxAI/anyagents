@@ -14,7 +14,7 @@
 //!
 //! Compatibility path for on-disk state only: delete this module once no
 //! deployment has a `runtime.json` or `takeover.json` under
-//! `browser-profiles/` (the desk had three `runtime.json` on 2026-11-13).
+//! `browser-profiles/`.
 //! Every profile retires its own the first time it opens.
 
 use std::path::Path;
@@ -131,7 +131,24 @@ fn process(pid: i32) -> Result<Option<Process>> {
         if !alive {
             return Ok(None);
         }
-        let cmd = std::fs::read(format!("{root}/cmdline"))?;
+        let mut cmd = std::fs::read(format!("{root}/cmdline"))?;
+        if cmd.is_empty() {
+            for _ in 0..50 {
+                let stat = std::fs::read_to_string(format!("{root}/stat"))?;
+                let (alive, _, g, t) = parse_stat(&stat)?;
+                if !alive {
+                    return Ok(None);
+                }
+                if g != group || t != start {
+                    return Err(invalid("legacy process changed during inspection"));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                cmd = std::fs::read(format!("{root}/cmdline"))?;
+                if !cmd.is_empty() {
+                    break;
+                }
+            }
+        }
         if cmd.is_empty() {
             return Err(invalid("cannot establish legacy process ownership"));
         }
@@ -463,8 +480,8 @@ mod tests {
                 .unwrap()
         };
         let pid = i32::try_from(group.id()).unwrap();
-        let found = (0..100).find_map(|_| {
-            let b = browser_in_group(pid, &user_data);
+        let found = (0..250).find_map(|_| {
+            let b = browser_in_group(pid, &user_data).filter(|&b| b != pid);
             if b.is_none() {
                 std::thread::sleep(Duration::from_millis(20));
             }

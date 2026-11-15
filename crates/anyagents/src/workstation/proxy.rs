@@ -53,9 +53,13 @@ pub(super) fn configure(
         return Err(invalid_proxy());
     }
     // Validate the raw host/port before URL normalization can discard syntax.
-    validate(&format!("{scheme}://{endpoint}"))?;
+    validate_endpoint(&format!("{scheme}://{endpoint}"))?;
     let url = url::Url::parse(value).map_err(|_| invalid_proxy())?;
-    if url.username().is_empty() || url.query().is_some() || url.fragment().is_some() {
+    if url.username().is_empty()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return Err(invalid_proxy());
     }
     let proxy = agent_workstation::Proxy::parse(value).map_err(|_| invalid_proxy())?;
@@ -67,16 +71,16 @@ pub(super) fn configure(
 const DIRECT_FALLBACK: &str = ",direct://";
 
 fn validate(value: &str) -> Result<()> {
-    let invalid = invalid_proxy;
     if value.is_empty() {
         return Ok(());
     }
-    let value = match value.strip_suffix(DIRECT_FALLBACK) {
-        Some("") => return Err(invalid()),
-        Some(endpoint) => endpoint,
-        None => value,
-    };
-    if !value.is_ascii()
+    validate_endpoint(value.strip_suffix(DIRECT_FALLBACK).unwrap_or(value))
+}
+
+fn validate_endpoint(value: &str) -> Result<()> {
+    let invalid = invalid_proxy;
+    if value.is_empty()
+        || !value.is_ascii()
         || value.chars().any(|c| c.is_whitespace() || c.is_control())
         || value.contains(['@', '/', '\\', '?', '#', ';', ',', '=', '\'', '"'])
             && !value.contains("://")
