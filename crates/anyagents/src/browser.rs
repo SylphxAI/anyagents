@@ -2610,14 +2610,15 @@ const CAPTCHA_MIN_SIDE_PX: u32 = 40;
 
 /// `(el, min, box?) => bool`: whether `el` is rendered to a human with at
 /// least `min` CSS pixels per side. `box` replaces `el`'s own rectangle (a
-/// text node's range). The element must not be `display: none`, hidden by
-/// `visibility`, or transparent through any ancestor, and its rectangle,
-/// clipped by every ancestor that clips it (`overflow`, `clip`) and by the
-/// scrollable page or, for fixed content, the viewport, must keep the size.
+/// text node's range). Nothing on the way to the screen may hide it:
+/// `display: none`, `visibility`, transparency, `content-visibility`
+/// (`hidden="until-found"`, a closed `<details>`) on it or any ancestor, in
+/// its document and in every same-origin frame around it. Its rectangle,
+/// clipped by every box that clips it (`overflow`, `clip`, each frame), by
+/// the scrollable page, and by the viewport where the page cannot scroll or
+/// the content is fixed, must keep the size.
 const CAPTCHA_VISIBLE_JS: &str = r#"(el, min, box) => {
   if (!el || !el.isConnected) return false;
-  const doc = el.ownerDocument;
-  const view = doc.defaultView;
   const r = box || el.getBoundingClientRect();
   let left = r.left, top = r.top, right = r.right, bottom = r.bottom;
   const clipTo = (l, t, rr, b) => {
@@ -2625,38 +2626,77 @@ const CAPTCHA_VISIBLE_JS: &str = r#"(el, min, box) => {
     right = Math.min(right, rr); bottom = Math.min(bottom, b);
   };
   const parentOf = (n) => n.parentElement || (n.parentNode && n.parentNode.host) || null;
-  let pos = null;
-  for (let n = el; n; n = parentOf(n)) {
-    const s = view.getComputedStyle(n);
-    if (s.display === 'none') return false;
-    if (n === el && (s.visibility === 'hidden' || s.visibility === 'collapse')) return false;
-    if (parseFloat(s.opacity) <= 0.01) return false;
-    if (n !== el) {
-      const clips = pos === 'fixed' ? s.transform !== 'none'
-        : pos === 'absolute' ? (s.position !== 'static' || s.transform !== 'none')
-        : true;
-      if (!clips) continue;
+  const hides = (overflow) => overflow === 'hidden' || overflow === 'clip';
+  const tokens = (v) => String(v || '').split(/[\s,]+/);
+  // Whether a box is the containing block of fixed descendants.
+  const holdsFixed = (s) =>
+    s.transform !== 'none' || s.filter !== 'none' || (s.backdropFilter || 'none') !== 'none' ||
+    s.perspective !== 'none' ||
+    tokens(s.contain).some(v => ['paint', 'layout', 'strict', 'content'].includes(v)) ||
+    tokens(s.willChange).some(v => ['transform', 'filter', 'perspective'].includes(v));
+  for (let start = el; ; ) {
+    const doc = start.ownerDocument;
+    const view = doc.defaultView;
+    if (typeof start.checkVisibility === 'function' &&
+        !start.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false;
+    const html = doc.documentElement;
+    const rootStyle = view.getComputedStyle(html);
+    // The body's overflow belongs to the viewport when the root's is visible.
+    const viewportBody = doc.body && rootStyle.overflowX === 'visible' && rootStyle.overflowY === 'visible' ? doc.body : null;
+    const viewportStyle = viewportBody ? view.getComputedStyle(viewportBody) : rootStyle;
+    let pos = null;
+    for (let n = start; n; n = parentOf(n)) {
+      const s = view.getComputedStyle(n);
+      if (s.display === 'none') return false;
+      if (n === start && (s.visibility === 'hidden' || s.visibility === 'collapse')) return false;
+      if (parseFloat(s.opacity) <= 0.01) return false;
+      if (n !== start) {
+        const clips = pos === 'fixed' ? holdsFixed(s)
+          : pos === 'absolute' ? (s.position !== 'static' || holdsFixed(s))
+          : true;
+        if (!clips) continue;
+      }
+      pos = s.position;
+      if (n === html || n === viewportBody) continue;
+      const c = n.getBoundingClientRect();
+      if (n !== start && (s.overflowX !== 'visible' || s.overflowY !== 'visible')) {
+        const l = c.left + n.clientLeft, t = c.top + n.clientTop;
+        clipTo(
+          s.overflowX !== 'visible' ? l : -Infinity,
+          s.overflowY !== 'visible' ? t : -Infinity,
+          s.overflowX !== 'visible' ? l + n.clientWidth : Infinity,
+          s.overflowY !== 'visible' ? t + n.clientHeight : Infinity,
+        );
+      }
+      if ((s.position === 'absolute' || s.position === 'fixed') && s.clip.startsWith('rect(')) {
+        const v = s.clip.slice(5, -1).split(/[\s,]+/);
+        const at = (i, base, edge) => v[i] === 'auto' ? edge : base + parseFloat(v[i]);
+        clipTo(at(3, c.left, c.left), at(0, c.top, c.top), at(1, c.left, c.right), at(2, c.top, c.bottom));
+      }
     }
-    pos = s.position;
-    if (n === doc.documentElement || n === doc.body) continue;
-    const c = n.getBoundingClientRect();
-    if (n !== el && (s.overflowX !== 'visible' || s.overflowY !== 'visible')) {
-      const l = c.left + n.clientLeft, t = c.top + n.clientTop;
+    if (pos === 'fixed') {
+      clipTo(0, 0, view.innerWidth, view.innerHeight);
+    } else {
+      const lockX = hides(viewportStyle.overflowX), lockY = hides(viewportStyle.overflowY);
       clipTo(
-        s.overflowX !== 'visible' ? l : -Infinity,
-        s.overflowY !== 'visible' ? t : -Infinity,
-        s.overflowX !== 'visible' ? l + n.clientWidth : Infinity,
-        s.overflowY !== 'visible' ? t + n.clientHeight : Infinity,
+        lockX ? 0 : -view.scrollX,
+        lockY ? 0 : -view.scrollY,
+        lockX ? view.innerWidth : Math.max(view.innerWidth, html.scrollWidth) - view.scrollX,
+        lockY ? view.innerHeight : Math.max(view.innerHeight, html.scrollHeight) - view.scrollY,
       );
     }
-    if ((s.position === 'absolute' || s.position === 'fixed') && s.clip.startsWith('rect(')) {
-      const v = s.clip.slice(5, -1).split(/[\s,]+/);
-      const at = (i, base, edge) => v[i] === 'auto' ? edge : base + parseFloat(v[i]);
-      clipTo(at(3, c.left, c.left), at(0, c.top, c.top), at(1, c.left, c.right), at(2, c.top, c.bottom));
-    }
+    // A cross-origin parent hides its frame element; the caller checks it.
+    let frame = null;
+    try { frame = view.frameElement; } catch (_) { frame = null; }
+    if (!frame) break;
+    const fr = frame.getBoundingClientRect();
+    const fs = frame.ownerDocument.defaultView.getComputedStyle(frame);
+    const ox = fr.left + frame.clientLeft + parseFloat(fs.paddingLeft);
+    const oy = fr.top + frame.clientTop + parseFloat(fs.paddingTop);
+    left += ox; right += ox; top += oy; bottom += oy;
+    clipTo(ox, oy, ox + view.innerWidth, oy + view.innerHeight);
+    start = frame;
   }
-  if (pos === 'fixed') clipTo(0, 0, view.innerWidth, view.innerHeight);
-  else clipTo(-view.scrollX, -view.scrollY, Infinity, Infinity);
   return right - left >= min && bottom - top >= min;
 }"#;
 
@@ -2737,7 +2777,10 @@ fn captcha_frame_kind(url: &str) -> Option<(&'static str, &'static str)> {
             "cloudflare_turnstile",
             "Cloudflare Turnstile iframe challenge",
         ))
-    } else if url.contains("google.com/recaptcha") || url.contains("recaptcha/api2") {
+    } else if url.contains("google.com/recaptcha")
+        || url.contains("recaptcha/api2")
+        || url.contains("recaptcha/enterprise")
+    {
         Some(("recaptcha", "Google reCAPTCHA iframe challenge"))
     } else if url.contains("hcaptcha.com") {
         Some(("hcaptcha", "hCaptcha iframe challenge"))
@@ -2748,21 +2791,57 @@ fn captcha_frame_kind(url: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// Whether the element that owns `frame_id` is visible at
-/// [`CAPTCHA_MIN_SIDE_PX`]. It reaches iframes a page script cannot see (a
-/// closed shadow root); an owner it cannot resolve is not shown.
-fn frame_owner_visible(cdp: &mut CdpSession, frame_id: &str) -> bool {
-    let Some(backend) = cdp
+/// How many out-of-process frames may stand between a challenge frame and
+/// the page.
+const CAPTCHA_FRAME_DEPTH: usize = 4;
+
+/// Whether the element that owns `frame_id` is shown as a challenge: visible
+/// at [`CAPTCHA_MIN_SIDE_PX`] and not the invisible-reCAPTCHA badge. It
+/// reaches frames a page script cannot see (a closed shadow root). An owner
+/// inside an out-of-process frame is checked in that frame, and that frame's
+/// own owner must be shown in turn. An owner it cannot resolve is not shown.
+fn frame_owner_visible(cdp: &mut CdpSession, frame_id: &str, frames: &[ChildFrameInfo]) -> bool {
+    frame_shown(cdp, frame_id, frames, CAPTCHA_FRAME_DEPTH)
+}
+
+fn frame_shown(
+    cdp: &mut CdpSession,
+    frame_id: &str,
+    frames: &[ChildFrameInfo],
+    depth: usize,
+) -> bool {
+    if let Some(shown) = frame_owner_shown_in(cdp, frame_id) {
+        return shown;
+    }
+    if depth == 0 {
+        return false;
+    }
+    for parent in frames.iter().filter(|f| f.frame_id != frame_id) {
+        // Only an out-of-process frame has its own target to connect to.
+        let Ok(mut sub) =
+            CdpSession::connect(cdp.port, &format!("/devtools/page/{}", parent.frame_id))
+        else {
+            continue;
+        };
+        if let Some(shown) = frame_owner_shown_in(&mut sub, frame_id) {
+            return shown && frame_shown(cdp, &parent.frame_id, frames, depth - 1);
+        }
+    }
+    false
+}
+
+/// `None` when `frame_id`'s owner element is not in this session's documents;
+/// otherwise whether it is shown as a challenge there.
+fn frame_owner_shown_in(session: &mut CdpSession, frame_id: &str) -> Option<bool> {
+    let backend = session
         .call(
             "DOM.getFrameOwner",
             serde_json::json!({ "frameId": frame_id }),
         )
-        .ok()
-        .and_then(|v| v.get("backendNodeId").and_then(|v| v.as_i64()))
-    else {
-        return false;
-    };
-    let Some(object_id) = cdp
+        .ok()?
+        .get("backendNodeId")
+        .and_then(|v| v.as_i64())?;
+    let Some(object_id) = session
         .call(
             "DOM.resolveNode",
             serde_json::json!({ "backendNodeId": backend }),
@@ -2774,15 +2853,15 @@ fn frame_owner_visible(cdp: &mut CdpSession, frame_id: &str) -> bool {
                 .map(str::to_string)
         })
     else {
-        return false;
+        return Some(false);
     };
-    let shown = cdp
+    let shown = session
         .call(
             "Runtime.callFunctionOn",
             serde_json::json!({
                 "objectId": object_id,
                 "functionDeclaration": format!(
-                    "function() {{ return ({CAPTCHA_VISIBLE_JS})(this, {CAPTCHA_MIN_SIDE_PX}); }}"
+                    "function() {{ return !this.closest('.grecaptcha-badge') && ({CAPTCHA_VISIBLE_JS})(this, {CAPTCHA_MIN_SIDE_PX}); }}"
                 ),
                 "returnByValue": true,
             }),
@@ -2790,11 +2869,11 @@ fn frame_owner_visible(cdp: &mut CdpSession, frame_id: &str) -> bool {
         .ok()
         .and_then(|v| v.pointer("/result/value").and_then(|v| v.as_bool()))
         == Some(true);
-    let _ = cdp.call(
+    let _ = session.call(
         "Runtime.releaseObject",
         serde_json::json!({ "objectId": object_id }),
     );
-    shown
+    Some(shown)
 }
 
 fn detect_captcha(cdp: &mut CdpSession) -> CaptchaDetection {
@@ -2810,9 +2889,10 @@ fn detect_captcha(cdp: &mut CdpSession) -> CaptchaDetection {
                 .map(str::to_string),
         };
     }
-    for cf in discover_child_frames(cdp) {
+    let frames = discover_child_frames(cdp);
+    for cf in &frames {
         if let Some((kind, summary)) = captcha_frame_kind(&cf.url)
-            && frame_owner_visible(cdp, &cf.frame_id)
+            && frame_owner_visible(cdp, &cf.frame_id, &frames)
         {
             return CaptchaDetection {
                 detected: true,
@@ -10722,6 +10802,84 @@ esac
                 r#"<h1>www.example.com</h1><p>Verify you are human by completing the action below.</p><p>www.example.com needs to review the security of your connection before proceeding.</p>"#.into(),
                 Some("cloudflare_turnstile"),
             ),
+            (
+                "turnstile right of a page that cannot scroll sideways".into(),
+                "Sign in",
+                format!(
+                    "<style>html{{overflow-x:hidden}}</style>{}",
+                    frame(TS, 300, 65, "position:absolute;left:9999px;top:0")
+                ),
+                None,
+            ),
+            (
+                "turnstile below a page that cannot scroll".into(),
+                "Sign in",
+                format!(
+                    "<style>body{{overflow:hidden}}</style>{}",
+                    frame(TS, 300, 65, "position:absolute;left:0;top:10000px")
+                ),
+                None,
+            ),
+            (
+                "turnstile right of a scrollable page".into(),
+                "Sign in",
+                frame(TS, 300, 65, "position:absolute;left:2000px;top:0"),
+                Some("cloudflare_turnstile"),
+            ),
+            (
+                "turnstile in content-visibility hidden".into(),
+                "Sign in",
+                format!(r#"<div style="content-visibility:hidden">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in hidden until found".into(),
+                "Sign in",
+                format!(r#"<div hidden="until-found">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in closed details".into(),
+                "Sign in",
+                format!("<details><summary>More</summary>{}</details>", frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "fixed turnstile escaping a 0x0 overflow wrapper".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="width:0;height:0;overflow:hidden"><div style="position:fixed;top:0;left:0">{}</div></div>"#,
+                    frame(TS, 300, 65, "")
+                ),
+                Some("cloudflare_turnstile"),
+            ),
+            (
+                "fixed turnstile held by a filtered 0x0 wrapper".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="filter:blur(0);width:0;height:0;overflow:hidden"><div style="position:fixed;top:0;left:0">{}</div></div>"#,
+                    frame(TS, 300, 65, "")
+                ),
+                None,
+            ),
+            (
+                "fixed turnstile held by a paint-contained 0x0 wrapper".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="contain:paint;width:0;height:0;overflow:hidden"><div style="position:fixed;top:0;left:0">{}</div></div>"#,
+                    frame(TS, 300, 65, "")
+                ),
+                None,
+            ),
+            (
+                "visible turnstile under a hidden parent".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="visibility:hidden">{}</div>"#,
+                    frame(TS, 300, 65, "visibility:visible")
+                ),
+                Some("cloudflare_turnstile"),
+            ),
         ];
         let fixtures: Vec<serde_json::Value> = cases
             .iter()
@@ -10781,6 +10939,165 @@ esac
                 format!("{name}: want {want:?}, got {}", results[name.as_str()])
             })
             .collect();
+        assert!(wrong.is_empty(), "wrong detections:\n{}", wrong.join("\n"));
+    }
+
+    /// Runs `detect_captcha` over CDP on pages whose challenge frames only the
+    /// frame-owner fallback reaches: closed shadow roots, same-origin frames
+    /// and out-of-process frames, each visible or hidden.
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "needs a Chromium the toolchain resolves"
+    )]
+    fn captcha_frame_owner_fallback_requires_a_rendered_challenge() {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::time::Instant;
+        let Some(chromium) = fixture_chromium() else {
+            return;
+        };
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let widget = |path: &str, w: u32, h: u32| {
+            format!(
+                r#"<iframe src="http://widget.test:{port}{path}" width="{w}" height="{h}" style="border:0"></iframe>"#
+            )
+        };
+        let shadow = |host_style: &str| {
+            format!(
+                r#"<div id="host" style="{host_style}"></div><script>document.getElementById('host').attachShadow({{mode:'closed'}}).innerHTML = '{}';</script>"#,
+                widget("/turnstile", 300, 65)
+            )
+        };
+        let frame = |src: &str| {
+            format!(r#"<iframe src="{src}" width="400" height="200" style="border:0"></iframe>"#)
+        };
+        let zero = |inner: String| {
+            format!(r#"<div style="width:0;height:0;overflow:hidden">{inner}</div>"#)
+        };
+        let login = format!("http://login.test:{port}");
+        let pages: std::collections::HashMap<String, String> = [
+            (
+                "/badge".to_string(),
+                format!(
+                    r#"<div class="grecaptcha-badge" style="position:fixed;right:0;bottom:14px;width:256px;height:60px">{}</div>"#,
+                    widget("/recaptcha/api2/anchor", 256, 60)
+                ),
+            ),
+            ("/shadow-hidden".into(), shadow("width:0;height:0;overflow:hidden")),
+            ("/shadow-visible".into(), shadow("width:300px;height:65px")),
+            ("/inner-visible".into(), widget("/turnstile", 300, 65)),
+            ("/inner-hidden".into(), zero(widget("/turnstile", 300, 65))),
+            ("/same-visible".into(), frame("/inner-visible")),
+            ("/same-hidden".into(), zero(frame("/inner-visible"))),
+            ("/cross-visible".into(), frame(&format!("{login}/inner-visible"))),
+            ("/cross-hidden-inner".into(), frame(&format!("{login}/inner-hidden"))),
+            ("/cross-hidden-outer".into(), zero(frame(&format!("{login}/inner-visible")))),
+        ]
+        .into_iter()
+        .collect();
+        std::thread::spawn(move || {
+            for mut stream in server.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                let body = format!(
+                    "<!doctype html><html><body style=\"margin:0\">{}</body></html>",
+                    pages
+                        .get(path)
+                        .map(String::as_str)
+                        .unwrap_or("<p>widget</p>")
+                );
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+
+        let debug_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let dir = tempfile::tempdir().unwrap();
+        struct Kill(std::process::Child);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _browser = Kill(
+            Command::new(chromium)
+                .arg("--headless=new")
+                .arg("--no-sandbox")
+                .arg("--disable-gpu")
+                .arg("--no-first-run")
+                .arg("--site-per-process")
+                .arg("--window-size=1280,800")
+                .arg("--host-resolver-rules=MAP *.test 127.0.0.1")
+                .arg(format!("--remote-debugging-port={debug_port}"))
+                .arg(format!("--user-data-dir={}", dir.path().display()))
+                .arg("about:blank")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("run Chromium"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let page_id = loop {
+            if chromium_cdp_ready(debug_port, Duration::from_millis(500)).is_ok()
+                && let Ok(body) = cdp_http_get(debug_port, "/json/list")
+                && let Ok(targets) = serde_json::from_slice::<Vec<CdpTarget>>(&body)
+                && let Some(page) = targets.into_iter().find(|t| t.target_type == "page")
+            {
+                break page.id;
+            }
+            assert!(Instant::now() < deadline, "Chromium DevTools never came up");
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let mut cdp = CdpSession::connect(debug_port, &format!("/devtools/page/{page_id}"))
+            .expect("connect to the page");
+
+        let mut wrong = Vec::new();
+        for (path, want) in [
+            ("/badge", None),
+            ("/shadow-hidden", None),
+            ("/shadow-visible", Some("cloudflare_turnstile")),
+            ("/same-hidden", None),
+            ("/same-visible", Some("cloudflare_turnstile")),
+            ("/cross-hidden-inner", None),
+            ("/cross-hidden-outer", None),
+            ("/cross-visible", Some("cloudflare_turnstile")),
+        ] {
+            cdp.call(
+                "Page.navigate",
+                serde_json::json!({ "url": format!("http://top.test:{port}{path}") }),
+            )
+            .expect("navigate");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while eval_js(
+                &mut cdp,
+                &format!("location.pathname === '{path}' && document.readyState === 'complete'"),
+            )
+            .ok()
+                != Some(serde_json::Value::Bool(true))
+            {
+                assert!(Instant::now() < deadline, "{path} never loaded");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // Out-of-process frames register as targets just after load.
+            std::thread::sleep(Duration::from_millis(500));
+            let got = detect_captcha(&mut cdp);
+            if got.kind.as_deref() != want || got.detected != want.is_some() {
+                wrong.push(format!("{path}: want {want:?}, got {:?}", got.kind));
+            }
+        }
         assert!(wrong.is_empty(), "wrong detections:\n{}", wrong.join("\n"));
     }
 }
