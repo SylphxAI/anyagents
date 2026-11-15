@@ -4264,6 +4264,7 @@ async fn outbound_retry_route(
                 text: held.body.clone(),
                 sender: Some(actor.as_address()),
                 reply_to: held.reply_to.clone(),
+                bot: held.bot.clone(),
                 ..SendRequest::default()
             };
             let plan = plan_send(store, &Principal::Operator, &actor, &body)?;
@@ -4554,6 +4555,7 @@ async fn create_agent_route(
                     &state.store,
                     caller_id,
                     &format!("agent:{}", agent.name),
+                    None,
                     None,
                     prompt,
                     None,
@@ -6447,6 +6449,8 @@ fn interact_sync(
         ));
     }
     let actor = Actor::Agent(actor_name.to_string());
+    let bot = body.bot.clone();
+    let bot = bot.as_deref();
     // Resolve target into optional (chat_id, message_id, thread_id, stored_message).
     let mut tg_coords: Option<(i64, i64, Option<i64>)> = None;
     let mut stored_msg: Option<anyagents_core::Message> = None;
@@ -6496,7 +6500,7 @@ fn interact_sync(
             let emoji = body.emoji.as_deref().map(str::trim);
             if let Some((chat_id, message_id, thread_id)) = tg_coords {
                 crate::telegram::react_message(
-                    store, data_dir, actor_name, chat_id, message_id, emoji, thread_id,
+                    store, data_dir, actor_name, bot, chat_id, message_id, emoji, thread_id,
                 )
                 .map_err(ApiError::from_store)?;
                 Ok(Json(InteractResponse {
@@ -6562,6 +6566,7 @@ fn interact_sync(
                     store,
                     data_dir,
                     actor_name,
+                    bot,
                     chat_id,
                     message_id,
                     Some("👍"),
@@ -6571,6 +6576,7 @@ fn interact_sync(
                     store,
                     data_dir,
                     actor_name,
+                    bot,
                     chat_id,
                     &ballot,
                     Some(message_id),
@@ -6627,7 +6633,7 @@ fn interact_sync(
                 let updated = toggle_checklist_items(&msg.text, &body.options, mark_done);
                 if let Some((chat_id, message_id, thread_id)) = tg_coords {
                     crate::telegram::edit_message(
-                        store, data_dir, actor_name, chat_id, message_id, &updated, thread_id,
+                        store, data_dir, actor_name, bot, chat_id, message_id, &updated, thread_id,
                     )
                     .map_err(ApiError::from_store)?;
                 }
@@ -6660,7 +6666,7 @@ fn interact_sync(
                 )
             })?;
             crate::telegram::edit_message(
-                store, data_dir, actor_name, chat_id, message_id, new_text, thread_id,
+                store, data_dir, actor_name, bot, chat_id, message_id, new_text, thread_id,
             )
             .map_err(ApiError::from_store)?;
             Ok(Json(InteractResponse {
@@ -6677,8 +6683,10 @@ fn interact_sync(
                     "delete target must resolve to a Telegram message",
                 )
             })?;
-            crate::telegram::delete_chat_message(store, data_dir, actor_name, chat_id, message_id)
-                .map_err(ApiError::from_store)?;
+            crate::telegram::delete_chat_message(
+                store, data_dir, actor_name, bot, chat_id, message_id,
+            )
+            .map_err(ApiError::from_store)?;
             Ok(Json(InteractResponse {
                 ok: true,
                 action,
@@ -6694,8 +6702,10 @@ fn interact_sync(
                 )
             })?;
             let pin = action == "pin";
-            crate::telegram::pin_message(store, data_dir, actor_name, chat_id, message_id, pin)
-                .map_err(ApiError::from_store)?;
+            crate::telegram::pin_message(
+                store, data_dir, actor_name, bot, chat_id, message_id, pin,
+            )
+            .map_err(ApiError::from_store)?;
             Ok(Json(InteractResponse {
                 ok: true,
                 action,
@@ -6713,7 +6723,7 @@ fn interact_sync(
                     "stop_poll target must resolve to a Telegram poll message",
                 )
             })?;
-            crate::telegram::close_poll(store, data_dir, actor_name, chat_id, message_id)
+            crate::telegram::close_poll(store, data_dir, actor_name, bot, chat_id, message_id)
                 .map_err(ApiError::from_store)?;
             Ok(Json(InteractResponse {
                 ok: true,
@@ -7504,6 +7514,7 @@ fn send_sync(
                         store,
                         sid,
                         &format!("agent:{name}"),
+                        None,
                         body.reply_to.as_deref(),
                         &composed_body,
                         history_key.as_deref(),
@@ -7540,6 +7551,7 @@ fn send_sync(
                         store,
                         sid,
                         &dest,
+                        None,
                         body.reply_to.as_deref(),
                         &composed_body,
                         history_key.as_deref(),
@@ -7589,6 +7601,7 @@ fn send_sync(
                         store,
                         sid,
                         address,
+                        body.bot.as_deref(),
                         body.reply_to.as_deref(),
                         &composed_body,
                         history_key.as_deref(),
@@ -8012,8 +8025,16 @@ fn prepare_telegram(
 ) -> Result<(), ApiError> {
     let from = telegram_sender(actor)?;
     let (chat_id, thread_id, reply_to) = telegram_target(chat, thread, reply, body)?;
-    crate::telegram::outbound_call(store, from, chat_id, &body.text, reply_to, thread_id)
-        .map_err(ApiError::from_store)?;
+    crate::telegram::outbound_call(
+        store,
+        from,
+        body.bot.as_deref(),
+        chat_id,
+        &body.text,
+        reply_to,
+        thread_id,
+    )
+    .map_err(ApiError::from_store)?;
     Ok(())
 }
 
@@ -8151,6 +8172,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &media.kind,
             &media.source,
@@ -8167,6 +8189,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             loc.latitude,
             loc.longitude,
@@ -8181,6 +8204,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &poll.question,
             &poll.options,
@@ -8195,6 +8219,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &cl.title,
             &cl.tasks,
@@ -8208,6 +8233,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &art.title,
             art.content.as_deref(),
@@ -8223,6 +8249,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &body.text,
             reply_to,

@@ -43,6 +43,10 @@ struct Intent {
     effect_key: String,
     agent_id: AgentId,
     destination: String,
+    /// The sender's own channel bot a channel post named. Absent when it
+    /// named none, and in obligations from before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bot: Option<String>,
     reply_to: Option<String>,
     body: Option<String>,
     receipt: Option<Vec<Delivery>>,
@@ -67,6 +71,7 @@ pub(crate) struct Unsettled {
     pub effect_key: String,
     pub agent_id: AgentId,
     pub destination: String,
+    pub bot: Option<String>,
     pub reply_to: Option<String>,
     pub since_ms: Option<i64>,
     pub error: Option<String>,
@@ -79,6 +84,7 @@ impl Unsettled {
             effect_key: intent.effect_key.clone(),
             agent_id: intent.agent_id.clone(),
             destination: intent.destination.clone(),
+            bot: intent.bot.clone(),
             reply_to: intent.reply_to.clone(),
             since_ms: intent.created_at_ms.or(since_ms),
             error: intent.uncertain.clone(),
@@ -136,6 +142,7 @@ impl Intent {
         self.effect_key == other.effect_key
             && self.agent_id == other.agent_id
             && self.destination == other.destination
+            && self.bot == other.bot
             && self.reply_to == other.reply_to
             && self.body == other.body
     }
@@ -424,6 +431,7 @@ fn settle(store: &Store, directory: &Path, name: &str, intent: &Intent) -> Resul
         effect_key: intent.effect_key.clone(),
         agent_id: intent.agent_id.clone(),
         destination: intent.destination.clone(),
+        bot: intent.bot.clone(),
         reply_to: intent.reply_to.clone(),
         body: None,
         receipt: intent.receipt.clone(),
@@ -450,6 +458,7 @@ pub(super) fn deliver<F>(
     store: &Store,
     agent_id: &AgentId,
     destination: &str,
+    bot: Option<&str>,
     reply_to: Option<&str>,
     body: &str,
     key: Option<&str>,
@@ -483,6 +492,7 @@ where
         if intent.effect_key != effect_key
             || &intent.agent_id != agent_id
             || intent.destination != destination
+            || intent.bot.as_deref() != bot
             || intent.reply_to.as_deref() != reply_to
             || intent
                 .body
@@ -526,6 +536,7 @@ where
             effect_key,
             agent_id: agent_id.clone(),
             destination: destination.into(),
+            bot: bot.map(str::to_owned),
             reply_to: reply_to.map(str::to_owned),
             body: Some(body.into()),
             receipt: None,
@@ -799,6 +810,7 @@ fn close_held(
         effect_key: intent.effect_key.clone(),
         agent_id: intent.agent_id.clone(),
         destination: intent.destination.clone(),
+        bot: intent.bot.clone(),
         reply_to: intent.reply_to.clone(),
         body: None,
         receipt: Some(receipt),
@@ -1024,6 +1036,7 @@ mod tests {
             effect_key: key.into(),
             agent_id: sender.clone(),
             destination: "agent:recipient".into(),
+            bot: None,
             reply_to: None,
             body: Some("hello".into()),
             receipt,
@@ -1082,6 +1095,7 @@ mod tests {
             &sender.id,
             "agent:recipient",
             None,
+            None,
             "hello",
             Some("same-call"),
             false,
@@ -1100,6 +1114,7 @@ mod tests {
             &store,
             &sender.id,
             "agent:recipient",
+            None,
             None,
             "hello",
             Some("same-call"),
@@ -1134,6 +1149,7 @@ mod tests {
                 &sender.id,
                 "agent:recipient",
                 None,
+                None,
                 "changed",
                 Some("same-call"),
                 false,
@@ -1155,6 +1171,7 @@ mod tests {
                 &store,
                 &sender.id,
                 "agent:recipient",
+                None,
                 None,
                 "hello",
                 Some("unknown-call"),
@@ -1185,6 +1202,7 @@ mod tests {
                 &store,
                 &sender.id,
                 "agent:recipient",
+                None,
                 None,
                 "hello",
                 Some("unknown-call"),
@@ -1226,6 +1244,7 @@ mod tests {
                 &sender.id,
                 "agent:recipient",
                 None,
+                None,
                 "hello",
                 None,
                 false,
@@ -1251,6 +1270,7 @@ mod tests {
                 &sender,
                 "agent:recipient",
                 None,
+                None,
                 "hello",
                 key,
                 false,
@@ -1275,6 +1295,7 @@ mod tests {
             &store,
             &sender,
             "agent:recipient",
+            None,
             None,
             "hello",
             Some("keyed-call"),
@@ -1339,6 +1360,7 @@ mod tests {
                 &sender,
                 "agent:recipient",
                 None,
+                None,
                 "hello",
                 Some(key),
                 false,
@@ -1402,6 +1424,7 @@ mod tests {
             &store,
             &sender,
             "agent:recipient",
+            None,
             None,
             "hello",
             Some(&key(waiting)),
@@ -1487,6 +1510,7 @@ mod tests {
             &sender,
             "agent:recipient",
             None,
+            None,
             "hello",
             Some("send:acked:0"),
             false,
@@ -1522,6 +1546,7 @@ mod tests {
                 &sender,
                 "agent:recipient",
                 None,
+                None,
                 "hello",
                 Some("blocked-call"),
                 false,
@@ -1550,6 +1575,7 @@ mod tests {
             &store,
             &sender,
             "agent:recipient",
+            None,
             None,
             "hello",
             Some("blocked-call"),
@@ -1601,6 +1627,7 @@ mod tests {
                 &sender,
                 "telegram:chat:1951959493:3662",
                 None,
+                None,
                 "a reply",
                 Some("refused-call"),
                 false,
@@ -1629,6 +1656,7 @@ mod tests {
                 &store,
                 &sender,
                 "agent:recipient",
+                None,
                 None,
                 "hello",
                 None,
@@ -1659,6 +1687,7 @@ mod tests {
                     &store,
                     &sender,
                     "telegram:chat:1951959493",
+                    None,
                     None,
                     "a reply",
                     None,
@@ -1733,6 +1762,7 @@ mod tests {
                 &sender,
                 "telegram:chat:1",
                 None,
+                None,
                 "hello",
                 Some("held-call"),
                 false,
@@ -1769,6 +1799,7 @@ mod tests {
                 &store,
                 &sender,
                 "telegram:chat:1",
+                None,
                 None,
                 "hello",
                 Some("held-call"),

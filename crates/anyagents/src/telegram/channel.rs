@@ -1448,12 +1448,13 @@ pub(crate) struct Outbound {
 pub(crate) fn outbound_call(
     store: &Store,
     from: &str,
+    bot: Option<&str>,
     chat_id: i64,
     text: &str,
     reply_to: Option<i64>,
     thread: Option<i64>,
 ) -> Result<Outbound, anyagents_core::Error> {
-    let channel = channel_for(store, from)?;
+    let channel = channel_for(store, from, bot)?;
     let Some(credential_ref) = channel.credential_ref else {
         return Err(anyagents_core::Error::Message(
             "telegram channel has no credential".into(),
@@ -2379,7 +2380,7 @@ pub fn sync_agent_telegram_bot_name(
     {
         return;
     }
-    let Ok(channel) = channel_for(store, &agent.name) else {
+    let Ok(channel) = channel_for(store, &agent.name, None) else {
         return;
     };
     let Some(credential_ref) = channel.credential_ref.as_deref() else {
@@ -2468,6 +2469,7 @@ pub fn post_text(
     store: &Store,
     data_dir: &std::path::Path,
     from: &str,
+    bot: Option<&str>,
     chat_id: i64,
     text: &str,
     reply_to: Option<i64>,
@@ -2479,7 +2481,7 @@ pub fn post_text(
     let mut first_message_id = None;
     for (idx, chunk) in chunks.iter().enumerate() {
         let chunk_reply = if idx == 0 { reply_to } else { None };
-        let outbound = outbound_call(store, from, chat_id, chunk, chunk_reply, thread)?;
+        let outbound = outbound_call(store, from, bot, chat_id, chunk, chunk_reply, thread)?;
         let token = token_of(
             &FileCredentialStore::new(data_dir),
             &outbound.credential_ref,
@@ -2556,6 +2558,7 @@ pub fn post_location(
     store: &Store,
     data_dir: &std::path::Path,
     from: &str,
+    bot: Option<&str>,
     chat_id: i64,
     latitude: f64,
     longitude: f64,
@@ -2564,7 +2567,7 @@ pub fn post_location(
     reply_to: Option<i64>,
     thread: Option<i64>,
 ) -> Result<i64, anyagents_core::Error> {
-    let channel = channel_for(store, from)?;
+    let channel = channel_for(store, from, bot)?;
     let Some(credential_ref) = channel.credential_ref else {
         return Err(anyagents_core::Error::Message(
             "telegram channel has no credential".into(),
@@ -2611,6 +2614,7 @@ pub fn post_poll(
     store: &Store,
     data_dir: &std::path::Path,
     from: &str,
+    bot: Option<&str>,
     chat_id: i64,
     question: &str,
     options: &[String],
@@ -2619,7 +2623,7 @@ pub fn post_poll(
     reply_to: Option<i64>,
     thread: Option<i64>,
 ) -> Result<i64, anyagents_core::Error> {
-    let channel = channel_for(store, from)?;
+    let channel = channel_for(store, from, bot)?;
     let Some(credential_ref) = channel.credential_ref else {
         return Err(anyagents_core::Error::Message(
             "telegram channel has no credential".into(),
@@ -2708,6 +2712,7 @@ pub fn post_media(
     store: &Store,
     data_dir: &std::path::Path,
     from: &str,
+    bot: Option<&str>,
     chat_id: i64,
     kind: &str,
     source: &str,
@@ -2724,7 +2729,7 @@ pub fn post_media(
                 .into(),
         ));
     }
-    let channel = channel_for(store, from)?;
+    let channel = channel_for(store, from, bot)?;
     let Some(credential_ref) = channel.credential_ref else {
         return Err(anyagents_core::Error::Message(
             "telegram channel has no credential".into(),
@@ -2809,6 +2814,7 @@ pub fn post_checklist(
     store: &Store,
     data_dir: &std::path::Path,
     from: &str,
+    bot: Option<&str>,
     chat_id: i64,
     title: &str,
     tasks: &[String],
@@ -2820,7 +2826,7 @@ pub fn post_checklist(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let channel = channel_for(store, from)?;
+        let channel = channel_for(store, from, bot)?;
         let Some(credential_ref) = channel.credential_ref else {
             return Err(anyagents_core::Error::Message(
                 "telegram channel has no credential".into(),
@@ -2839,7 +2845,9 @@ pub fn post_checklist(
         }
     }
     let formatted = format_checklist_markdown(title, tasks);
-    post_text(store, data_dir, from, chat_id, &formatted, reply_to, thread)
+    post_text(
+        store, data_dir, from, bot, chat_id, &formatted, reply_to, thread,
+    )
 }
 
 /// Post a rich Instant View article through the agent's bot. When `content` is
@@ -2851,6 +2859,7 @@ pub fn post_article(
     store: &Store,
     data_dir: &std::path::Path,
     from: &str,
+    bot: Option<&str>,
     chat_id: i64,
     title: &str,
     content: Option<&str>,
@@ -2879,7 +2888,7 @@ pub fn post_article(
             format!("📰 **{title}**\n\n{body}")
         }
     };
-    post_text(store, data_dir, from, chat_id, &text, reply_to, thread)
+    post_text(store, data_dir, from, bot, chat_id, &text, reply_to, thread)
 }
 
 fn publish_telegraph_article(
@@ -2978,12 +2987,13 @@ pub fn react_message(
     store: &Store,
     data_dir: &std::path::Path,
     from: &str,
+    bot: Option<&str>,
     chat_id: i64,
     message_id: i64,
     emoji: Option<&str>,
     thread: Option<i64>,
 ) -> Result<(), anyagents_core::Error> {
-    let channel = channel_for(store, from)?;
+    let channel = channel_for(store, from, bot)?;
     let Some(credential_ref) = channel.credential_ref else {
         return Err(anyagents_core::Error::Message(
             "telegram channel has no credential".into(),
@@ -3028,6 +3038,7 @@ pub fn edit_message(
     store: &Store,
     data_dir: &std::path::Path,
     from: &str,
+    bot: Option<&str>,
     chat_id: i64,
     message_id: i64,
     text: &str,
@@ -3035,7 +3046,7 @@ pub fn edit_message(
 ) -> Result<(), anyagents_core::Error> {
     let translated = translate_agent_mentions_for_telegram(store, text);
     let text = translated.as_str();
-    let channel = channel_for(store, from)?;
+    let channel = channel_for(store, from, bot)?;
     let Some(credential_ref) = channel.credential_ref else {
         return Err(anyagents_core::Error::Message(
             "telegram channel has no credential".into(),
@@ -3091,10 +3102,11 @@ pub fn delete_chat_message(
     store: &Store,
     data_dir: &std::path::Path,
     from: &str,
+    bot: Option<&str>,
     chat_id: i64,
     message_id: i64,
 ) -> Result<(), anyagents_core::Error> {
-    let channel = channel_for(store, from)?;
+    let channel = channel_for(store, from, bot)?;
     let Some(credential_ref) = channel.credential_ref else {
         return Err(anyagents_core::Error::Message(
             "telegram channel has no credential".into(),
@@ -3132,11 +3144,12 @@ pub fn pin_message(
     store: &Store,
     data_dir: &std::path::Path,
     from: &str,
+    bot: Option<&str>,
     chat_id: i64,
     message_id: i64,
     pin: bool,
 ) -> Result<(), anyagents_core::Error> {
-    let channel = channel_for(store, from)?;
+    let channel = channel_for(store, from, bot)?;
     let Some(credential_ref) = channel.credential_ref else {
         return Err(anyagents_core::Error::Message(
             "telegram channel has no credential".into(),
@@ -3157,10 +3170,11 @@ pub fn close_poll(
     store: &Store,
     data_dir: &std::path::Path,
     from: &str,
+    bot: Option<&str>,
     chat_id: i64,
     message_id: i64,
 ) -> Result<(), anyagents_core::Error> {
-    let channel = channel_for(store, from)?;
+    let channel = channel_for(store, from, bot)?;
     let Some(credential_ref) = channel.credential_ref else {
         return Err(anyagents_core::Error::Message(
             "telegram channel has no credential".into(),
@@ -3702,8 +3716,6 @@ pub fn record_chat(store: &Store, agent: &str, chat_id: i64) -> Result<(), anyag
     Ok(())
 }
 
-/// The one bot an agent posts through. An agent that has none, or more than
-/// one, posts nothing: there is no default bot to fall back to.
 fn resolve_telegram_agent(
     store: &Store,
     reference: &str,
@@ -3714,21 +3726,56 @@ fn resolve_telegram_agent(
     }
 }
 
-fn channel_for(store: &Store, from: &str) -> Result<Channel, anyagents_core::Error> {
+/// The bot an agent posts through. `bot` names one by `@username` or channel
+/// id; it must be a telegram bot attached to this agent. Unnamed, the agent
+/// must have exactly one: there is no default bot to fall back to.
+fn channel_for(
+    store: &Store,
+    from: &str,
+    bot: Option<&str>,
+) -> Result<Channel, anyagents_core::Error> {
     let agent = resolve_telegram_agent(store, from)?;
-    let mine: Vec<Channel> = store
+    let bots = store
         .list_channels()?
         .into_iter()
-        .filter(|channel| channel.kind == "telegram" && channel.credential_ref.is_some())
+        .filter(|channel| channel.kind == "telegram" && channel.credential_ref.is_some());
+    if let Some(bot) = bot.map(str::trim).filter(|bot| !bot.is_empty()) {
+        let wanted = bot.trim_start_matches('@');
+        let mut named = bots
+            .filter(|channel| {
+                channel.id.as_str() == wanted
+                    || channel.identity.as_deref().is_some_and(|identity| {
+                        identity
+                            .trim_start_matches('@')
+                            .eq_ignore_ascii_case(wanted)
+                    })
+            })
+            .collect::<Vec<_>>();
+        if named.is_empty() {
+            return Err(anyagents_core::Error::Message(format!(
+                "no telegram bot {bot}"
+            )));
+        }
+        return match named
+            .iter()
+            .position(|channel| channel.agents.contains(&agent.id))
+        {
+            Some(mine) => Ok(named.swap_remove(mine)),
+            None => Err(anyagents_core::Error::PermissionDenied(format!(
+                "telegram bot {bot} is not {from}'s"
+            ))),
+        };
+    }
+    let mut mine: Vec<Channel> = bots
         .filter(|channel| channel.agents.iter().any(|id| id == &agent.id))
         .collect();
     match mine.len() {
-        1 => Ok(mine.into_iter().next().unwrap_or_else(|| unreachable!())),
+        1 => Ok(mine.remove(0)),
         0 => Err(anyagents_core::Error::Message(format!(
             "no telegram channel for {from}"
         ))),
         _ => Err(anyagents_core::Error::Message(format!(
-            "{from} has more than one telegram bot; name one"
+            "{from} has more than one telegram bot; name one with `bot`"
         ))),
     }
 }
@@ -4234,7 +4281,7 @@ pub(crate) mod tests {
         store.attach_channel(&ada_channel.id, &ada.id).unwrap();
         store.attach_channel(&bea_channel.id, &bea.id).unwrap();
 
-        let sent = outbound_call(&store, "bea", 100, "hello", Some(5), Some(3)).unwrap();
+        let sent = outbound_call(&store, "bea", None, 100, "hello", Some(5), Some(3)).unwrap();
         assert_eq!(sent.credential_ref, "channels/bea");
         assert_eq!(sent.call.method, "sendRichMessage");
         assert_eq!(sent.call.body["chat_id"], 100);
@@ -4245,7 +4292,7 @@ pub(crate) mod tests {
         assert!(!sent.call.body.to_string().contains("token"));
 
         // Nobody else's bot is ever used, and an unknown agent has none.
-        assert!(outbound_call(&store, "cy", 100, "hello", None, None).is_err());
+        assert!(outbound_call(&store, "cy", None, 100, "hello", None, None).is_err());
     }
 
     #[test]
@@ -4265,14 +4312,14 @@ pub(crate) mod tests {
             })
             .unwrap();
         store.attach_channel(&channel.id, &ada.id).unwrap();
-        let sent = outbound_call(&store, "ada", 100, "hello", None, None).unwrap();
+        let sent = outbound_call(&store, "ada", None, 100, "hello", None, None).unwrap();
         assert_eq!(sent.credential_ref, "channels/ada");
         assert_eq!(sent.call.method, "sendRichMessage");
         // There is no default bot: another agent does not post through it.
         let bea = store
             .create_agent(anyagents_core::NewAgent::new("bea", "codex"))
             .unwrap();
-        assert!(outbound_call(&store, "bea", 100, "hi", None, None).is_err());
+        assert!(outbound_call(&store, "bea", None, 100, "hi", None, None).is_err());
         assert!(bea.name == "bea");
     }
 
@@ -4284,9 +4331,66 @@ pub(crate) mod tests {
         let ada = store
             .create_agent(anyagents_core::NewAgent::new("ada", "codex"))
             .unwrap();
-        let err = outbound_call(&store, "ada", 100, "hello", None, None).unwrap_err();
+        let err = outbound_call(&store, "ada", None, 100, "hello", None, None).unwrap_err();
         assert!(err.to_string().contains("no telegram channel"), "{err}");
         assert!(ada.name == "ada");
+    }
+
+    #[test]
+    fn an_agent_with_two_bots_posts_through_the_one_it_names() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let ada = store
+            .create_agent(anyagents_core::NewAgent::new("ada", "codex"))
+            .unwrap();
+        let bea = store
+            .create_agent(anyagents_core::NewAgent::new("bea", "codex"))
+            .unwrap();
+        let bot = |identity: &str, secret: &str| {
+            store
+                .create_channel(anyagents_core::NewChannel {
+                    kind: "telegram".into(),
+                    identity: Some(identity.into()),
+                    config: "{}".into(),
+                    credential_ref: Some(secret.into()),
+                })
+                .unwrap()
+        };
+        let desk = bot("ada_desk_bot", "channels/desk");
+        let promo = bot("ada_promo_bot", "channels/promo");
+        let other = bot("bea_bot", "channels/bea");
+        store.attach_channel(&desk.id, &ada.id).unwrap();
+        store.attach_channel(&promo.id, &ada.id).unwrap();
+        store.attach_channel(&other.id, &bea.id).unwrap();
+
+        // Two bots and none named: no guess.
+        let err = outbound_call(&store, "ada", None, 100, "hi", None, None).unwrap_err();
+        assert!(err.to_string().contains("name one with `bot`"), "{err}");
+        // Named by @username (any case) or by channel id.
+        for name in ["@ada_promo_bot", "ADA_PROMO_BOT", promo.id.as_str()] {
+            let sent = outbound_call(&store, "ada", Some(name), 100, "hi", None, None).unwrap();
+            assert_eq!(sent.credential_ref, "channels/promo", "{name}");
+        }
+        let sent =
+            outbound_call(&store, "ada", Some("ada_desk_bot"), 100, "hi", None, None).unwrap();
+        assert_eq!(sent.credential_ref, "channels/desk");
+        // Another agent's bot is refused as unauthorized, an unknown one as unknown.
+        let err =
+            outbound_call(&store, "ada", Some("@bea_bot"), 100, "hi", None, None).unwrap_err();
+        assert!(
+            matches!(err, anyagents_core::Error::PermissionDenied(_)),
+            "{err}"
+        );
+        let err =
+            outbound_call(&store, "ada", Some("@nobody_bot"), 100, "hi", None, None).unwrap_err();
+        assert!(
+            matches!(err, anyagents_core::Error::Message(ref m) if m.contains("no telegram bot")),
+            "{err}"
+        );
+        // A one-bot agent may still name its own bot.
+        let sent = outbound_call(&store, "bea", Some("@bea_bot"), 100, "hi", None, None).unwrap();
+        assert_eq!(sent.credential_ref, "channels/bea");
     }
 
     #[test]
@@ -4824,7 +4928,7 @@ pub(crate) mod tests {
                     .expect("rotation must preserve a channel-ID credential file");
             assert_eq!(result["status"], "bound");
             let reopened = Store::open(dir.path().join("state.db")).unwrap();
-            let current = channel_for(&reopened, &agent.name).unwrap();
+            let current = channel_for(&reopened, &agent.name, None).unwrap();
             assert_eq!(current.id, original.id);
             assert_eq!(reopened.list_channels().unwrap().len(), 1);
             let current_ref = current.credential_ref.unwrap();
@@ -4907,7 +5011,7 @@ pub(crate) mod tests {
             bind_agent_telegram_token(&store, dir.path(), &agent, "999:new-token", None).unwrap();
         task.join().unwrap();
         assert_eq!(result["status"], "bound");
-        let channel = channel_for(&store, &agent.name).unwrap();
+        let channel = channel_for(&store, &agent.name, None).unwrap();
         assert_eq!(channel.identity.as_deref(), Some("new_bot"));
         assert_eq!(
             token_of(
@@ -5022,10 +5126,13 @@ pub(crate) mod tests {
             .unwrap();
         store.attach_channel(&other.id, &impostor.id).unwrap();
         assert_eq!(
-            channel_for(&store, agent.id.as_str()).unwrap().id,
+            channel_for(&store, agent.id.as_str(), None).unwrap().id,
             channel.id
         );
-        assert_eq!(channel_for(&store, &agent.name).unwrap().id, channel.id);
+        assert_eq!(
+            channel_for(&store, &agent.name, None).unwrap().id,
+            channel.id
+        );
         record_chat(&store, agent.id.as_str(), -1009).unwrap();
         let fresh = store
             .list_channels()
@@ -5120,6 +5227,7 @@ pub(crate) mod tests {
                 &store,
                 dir.path(),
                 agent.id.as_str(),
+                None,
                 -1007,
                 &text,
                 None,

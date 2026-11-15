@@ -885,6 +885,11 @@ struct SendArgs {
     /// or checklist item numbers when `action = "check" | "uncheck"`.
     #[serde(default, deserialize_with = "deserialize_send_targets")]
     options: Vec<String>,
+    /// Optional own channel bot to post or act through (`@username` or channel id),
+    /// needed only when this agent has more than one bot. Unknown bots and other
+    /// agents' bots are refused.
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
+    bot: Option<String>,
     /// Names this send. Send it again with the same value only when an earlier
     /// attempt got no answer.
     #[serde(default, deserialize_with = "crate::api::absent_if_null")]
@@ -1445,6 +1450,9 @@ struct InteractArgs {
     /// New message text when `action = "edit"`, or optional rationale/comment when `action = "vote"`.
     #[serde(default)]
     text: Option<String>,
+    /// Optional own channel bot to act through (`@username` or channel id).
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
+    bot: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1822,6 +1830,7 @@ impl AgentMcp {
                     emoji: args.emoji,
                     options: args.options,
                     text: text_opt,
+                    bot: args.bot,
                 }))
                 .await?
                 .0;
@@ -1851,6 +1860,7 @@ impl AgentMcp {
             poll: args.poll,
             checklist: args.checklist,
             article: args.article,
+            bot: args.bot,
             idempotency_key: args.idempotency_key,
         };
         let closing = body.is_turn_closing_sentinel();
@@ -3146,6 +3156,7 @@ impl AgentMcp {
             emoji: args.emoji,
             options: args.options,
             text: args.text,
+            bot: args.bot,
         };
         let response = self
             .client

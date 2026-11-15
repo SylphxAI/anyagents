@@ -706,6 +706,10 @@ pub struct SendRequest {
     /// Optional rich Instant View article (`title`, `content` or `url`, optional `author_name`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub article: Option<SendArticle>,
+    /// The sender's own channel bot to post through (`@username` or channel
+    /// id), for an agent with more than one. Another agent's bot is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<String>,
     /// Names one send, so a retry after a lost answer is the same delivery
     /// instead of a second one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -777,6 +781,9 @@ pub struct InteractRequest {
     /// New text for `action = "edit"`, or optional rationale/comment for `action = "vote"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// The sender's own channel bot to act through (`@username` or channel id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

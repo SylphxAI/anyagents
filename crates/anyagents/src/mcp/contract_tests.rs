@@ -457,6 +457,7 @@ fn send_reads_null_placeholders_as_absent() {
     let args: SendArgs = serde_json::from_value(json!({
         "action": "send",
         "article": "null",
+        "bot": "null",
         "checklist": "null",
         "emoji": "null",
         "idempotency_key": "null",
@@ -474,7 +475,7 @@ fn send_reads_null_placeholders_as_absent() {
     assert!(args.article.is_none() && args.media.is_none() && args.poll.is_none());
     assert!(args.location.is_none() && args.checklist.is_none());
     assert!(args.reply_to.is_none() && args.target.is_none() && args.quote.is_none());
-    assert!(args.idempotency_key.is_none());
+    assert!(args.idempotency_key.is_none() && args.bot.is_none());
     assert!(args.options.is_empty());
     assert_eq!(args.to, vec!["agent:planner".to_string()]);
     // `emoji: ""` clears a reaction; only the placeholder words are absent.
