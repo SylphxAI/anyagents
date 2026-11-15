@@ -270,12 +270,15 @@ class Agy(Protocol):
 
     # The conversation's durable records.
 
-    def record(self, source, kind, **fields):
+    def record(self, source, kind, quiet=False, **fields):
         row = {"step_index": self.steps, "source": source, "type": kind, "status": "DONE",
                "created_at": now()}
         row.update(fields)
         with self.transcript().open("a") as out:
             out.write(compact(row) + "\n")
+        if quiet:
+            self.steps += 1
+            return
         self.emit({"event": "step_update", "step_update": {
             "conversation_id": self.session, "step_index": self.steps, "state": "DONE",
             "step_type": kind.lower()}})
@@ -294,7 +297,7 @@ class Agy(Protocol):
         (messages / "undelivered" / mail).write_text("")
         inp.meta["mail"] = mail
 
-    def took(self, inp):
+    def took(self, inp, quiet=False):
         """`inp` became a `USER_INPUT` step of the conversation."""
         mail = inp.meta.get("mail")
         if mail:
@@ -304,7 +307,7 @@ class Agy(Protocol):
             read = json.loads(path.read_text()) if path.exists() else {}
             read[mail] = True
             write_atomically(path, compact(read))
-        self.record("USER_EXPLICIT", "USER_INPUT", content=(
+        self.record("USER_EXPLICIT", "USER_INPUT", quiet=quiet, content=(
             "<USER_REQUEST>\n%s\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n"
             "The current local time is: %s.\n</ADDITIONAL_METADATA>" % (inp.text, now())))
 
@@ -372,6 +375,14 @@ class Agy(Protocol):
         self.emit({"event": "result", "result": result})
         if self.backlog:
             self.begin(self.backlog.pop(0))
+
+    def unproven(self, count):
+        """The cascade takes `count` waiting messages and dies before a line
+        about them reaches stdout. Taking a message is writing its record (a
+        `USER_INPUT` step, its mail marked delivered and read) before the
+        model is called on it, so the record outlives the process."""
+        for inp, _ in self.engine.step(count):
+            self.took(inp, quiet=True)
 
     def fail(self):
         """The run fails: what waits for it is not taken."""
