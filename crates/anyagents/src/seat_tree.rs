@@ -327,6 +327,7 @@ fn set_inode(fd: BorrowedFd<'_>, gid: Option<libc::gid_t>, mode: libc::mode_t) -
 }
 
 fn tighten_op_dir(dir: BorrowedFd<'_>) -> io::Result<()> {
+    use std::os::fd::AsFd as _;
     set_inode(dir, None, 0o700)?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     let found = unsafe {
