@@ -844,63 +844,39 @@ fn a_moved_gateway_replaces_the_kept_harnesses_of_api_key_agents() {
     drop(squatter);
 }
 
-/// A server that stops while one of its agents' keepers is still starting
-/// does not wait for that start: it stops at once, and the keeper finishes
-/// its start on its own for the next server.
+/// A server stops promptly while native Spiron waits to complete attach.
+/// Its recorded process remains recoverable and can be explicitly stopped.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_server_stops_at_once_while_a_keeper_is_still_starting() {
-    use std::os::unix::fs::PermissionsExt as _;
+fn a_server_stops_at_once_while_native_spiron_is_still_starting() {
     let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_for_contract(&data);
     create_asker(&data);
-    let name = "slow-start";
-    let out = bin()
-        .env("PATH", machine_path(&data))
-        .arg("--data")
-        .arg(&data)
-        .args(["agents", "create", name, "--harness", "spiron"])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // A vendor that never says it is ready: its keeper's start takes as long
-    // as Spiron's own ready wait.
-    let spiron = data.join("bin").join("spiron-never-ready");
-    std::fs::create_dir_all(spiron.parent().unwrap()).unwrap();
-    std::fs::write(&spiron, "#!/bin/sh\nexec sleep 600\n").unwrap();
-    std::fs::set_permissions(&spiron, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (id, config, program) = native_spiron(&data, "slow-start");
+    std::fs::write(config.join("hold-ready"), b"").unwrap();
     let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
     let server = Server::start_with(
         &data,
         anyagents,
         anyagents,
-        &[("ANYAGENTS_SPIRON_BIN", spiron.to_str().unwrap())],
+        &[("ANYAGENTS_SPIRON_BIN", program.to_str().unwrap())],
     );
-    send(&data, name);
+    send(&data, "slow-start");
+    let record = data.join("detached").join(format!("{id}.json"));
     support::wait_for(
-        || {
-            std::fs::read_dir(data.join("keepers"))
-                .map(|entries| {
-                    entries
-                        .flatten()
-                        .any(|entry| entry.path().join("spawned").exists())
-                })
-                .unwrap_or(false)
-        },
-        "no keeper started",
+        || record.exists() && config.join("spiron.sock").exists(),
+        "native Spiron did not start",
     );
+    let pid = native_pid(&data, &id);
+    assert!(no_keeper(&data, &id));
     let started = Instant::now();
     server.terminate();
     assert!(
         started.elapsed() < Duration::from_secs(20),
-        "the server waited {:?} for a keeper's start",
+        "server waited {:?} for native attach",
         started.elapsed()
     );
     let stopped = bin()
@@ -913,6 +889,10 @@ fn a_server_stops_at_once_while_a_keeper_is_still_starting() {
         stopped.status.success(),
         "{}",
         String::from_utf8_lossy(&stopped.stderr)
+    );
+    support::wait_for(
+        || !alive(pid) && !record.exists(),
+        "stop left native launch in progress",
     );
 }
 
@@ -984,26 +964,147 @@ fn keepers_stop_only_when_no_server_runs() {
     );
 }
 
-/// A real adapter's dedupe under a keeper: Spiron (here its protocol fake)
-/// has a prompt and a steer written into a turn it has not started when the
-/// server crashes. The next server, another binary, offers both again; the
-/// adapter in the keeper answers from its memory, and the vendor process reads
-/// each exactly once.
+/// Strict v2 fixture: the server must launch --listen, attach before input,
+/// and rebuild consumption and open-turn state from journaled replay.
 #[cfg(target_os = "linux")]
-#[test]
-fn a_spiron_adapter_in_its_keeper_never_writes_a_line_twice_across_a_restart() {
+const NATIVE_SPIRON: &str = r#"#!/usr/bin/python3
+"""Strict Unix v2 peer: journal before send, replay before ready, no stdin."""
+import json, os, pathlib, socket, sys, threading, time
+args = sys.argv[1:]
+assert '--listen' in args
+root = pathlib.Path(args[args.index('--state-dir') + 1])
+path = args[args.index('--listen') + 1]
+launches = root / 'launches'
+launch = int(launches.read_text()) + 1 if launches.exists() else 1
+launches.write_text(str(launch))
+lock = threading.RLock()
+client = None
+frames = []
+active = None
+pending = []
+announced = False
+seq = 0
+journal = root / 'journal.jsonl'
+
+def append(path, value):
+    with path.open('a') as out:
+        out.write(json.dumps(value) + '\n')
+
+def write(frame):
+    global client
+    if client is not None:
+        try:
+            client.sendall((json.dumps(frame) + '\n').encode())
+        except OSError:
+            client = None
+
+def emit(kind, request_id=None, **fields):
+    global seq
+    seq += 1
+    frame = dict(type=kind, request_id=request_id, session_id='native-session', seq=seq, **fields)
+    append(root / 'frames.jsonl', frame)
+    frames.append(frame)
+    write(frame)
+
+def journal_input(request_id):
+    ids = [json.loads(line)['id'] for line in journal.read_text().splitlines()] if journal.exists() else []
+    if request_id in ids:
+        return False
+    append(journal, dict(id=request_id, launch=launch))
+    return True
+
+def finish(status):
+    global active, pending, announced
+    emit('result', active, status=status, duplicate=False, is_error=False,
+         usage=dict(input_tokens=3, output_tokens=1), undelivered_steer_ids=pending)
+    active, pending, announced = None, [], False
+
+def drive():
+    global announced, pending
+    while True:
+        with lock:
+            if active is not None and not announced and not (root / 'hold').exists():
+                fresh = journal_input(active)
+                emit('accepted', active, mode='turn' if fresh else 'duplicate')
+                announced = True
+            if active is not None and announced and (root / 'step').exists():
+                for request_id in pending:
+                    fresh = journal_input(request_id)
+                    emit('steer_consumed', active, steer_request_id=request_id, turn_id=active, duplicate=not fresh)
+                pending = []
+                (root / 'step').unlink()
+            if active is not None and announced and (root / 'finish').exists():
+                finish('completed')
+                (root / 'finish').unlink()
+        time.sleep(.005)
+
+try:
+    os.unlink(path)
+except FileNotFoundError:
+    pass
+listener = socket.socket(socket.AF_UNIX)
+listener.bind(path)
+os.chmod(path, 0o660)
+listener.listen()
+threading.Thread(target=drive, daemon=True).start()
+while True:
+    stream, _ = listener.accept()
+    # A readiness connection sends nothing; an attachment must speak first.
+    reader = stream.makefile('r')
+    line = reader.readline()
+    if not line:
+        stream.close()
+        continue
+    attach = json.loads(line)
+    assert attach['type'] == 'attach' and attach['protocol'] == 'spiron.headless/v2', attach
+    assert isinstance(attach['request_id'], str) and attach['request_id']
+    while (root / 'hold-ready').exists():
+        time.sleep(.005)
+    with lock:
+        append(root / 'wire.jsonl', dict(launch=launch, msg=attach))
+        if client is not None:
+            client.close()
+        client = stream
+        after = attach.get('after_seq')
+        if after is not None:
+            for frame in frames:
+                if frame['seq'] > after:
+                    write(frame)
+        emit('ready', attach['request_id'], protocol='spiron.headless/v2',
+             replay=dict(after_seq=after, complete=True))
+    for line in reader:
+        msg = json.loads(line)
+        kind, request_id = msg['type'], msg.get('request_id')
+        assert kind in ('prompt', 'steer', 'cancel', 'stop'), msg
+        assert isinstance(request_id, str) and request_id, msg
+        with lock:
+            append(root / 'wire.jsonl', dict(launch=launch, msg=msg))
+            if kind in ('cancel', 'stop'):
+                if kind == 'cancel':
+                    emit('cancel_ack', request_id, turn_id=active, status='cancelling')
+                if active is not None:
+                    finish('cancelled')
+                if kind == 'stop':
+                    emit('stopped', request_id)
+                    os.unlink(path)
+                    os._exit(0)
+            elif active is not None:
+                pending.append(request_id)
+                emit('steer_ack', request_id, accepted=True, turn_id=active)
+            elif kind == 'steer':
+                emit('rejected', request_id, code='no_active_turn')
+            else:
+                active = request_id
+    stream.close()
+"#;
+
+#[cfg(target_os = "linux")]
+fn native_spiron(data: &Path, name: &str) -> (String, std::path::PathBuf, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
-    let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("data");
-    std::fs::create_dir_all(&data).unwrap();
-    support::operator_for_contract(&data);
-    create_asker(&data);
-    let name = "spirited";
     let out = bin()
-        .env("PATH", machine_path(&data))
+        .env("PATH", machine_path(data))
         .arg("--data")
-        .arg(&data)
+        .arg(data)
         .args(["agents", "create", name, "--harness", "spiron"])
         .output()
         .unwrap();
@@ -1022,56 +1123,101 @@ fn a_spiron_adapter_in_its_keeper_never_writes_a_line_twice_across_a_restart() {
         .unwrap()
         .to_string();
     let config = data.join("agents").join(&id).join("config");
-    let fake = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../anyagents-harness-stream/tests/fake_spiron.py");
-    let spiron = data.join("bin").join("spiron-fake");
-    std::fs::write(
-        &spiron,
-        format!(
-            "#!/bin/sh\nexec /usr/bin/python3 {} \"$@\"\n",
-            fake.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&spiron, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let spiron_env = [
-        ("ANYAGENTS_SPIRON_BIN", spiron.to_str().unwrap()),
-        ("FAKE_SPIRON_CAPABLE", "1"),
-    ];
-    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
-    // No turn is announced yet: the prompt and the steer stay in flight.
+    let program = data.join("bin").join("spiron-native");
+    std::fs::write(&program, NATIVE_SPIRON).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (id, config, program)
+}
+
+#[cfg(target_os = "linux")]
+fn native_lines(config: &Path, file: &str) -> Vec<Value> {
+    std::fs::read_to_string(config.join(file))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn native_pid(data: &Path, id: &str) -> u32 {
+    let record = data.join("detached").join(format!("{id}.json"));
+    let value: Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+    value["process"]["pid"]
+        .as_u64()
+        .unwrap()
+        .try_into()
+        .unwrap()
+}
+
+/// The native process and its pending prompt/steer survive a crash, binary
+/// upgrade and clean restart. Replayed receipts commit each input once.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_native_spiron_never_writes_a_line_twice_across_server_restarts() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let (id, config, program) = native_spiron(&data, "spirited");
+    let env = [("ANYAGENTS_SPIRON_BIN", program.to_str().unwrap())];
     std::fs::write(config.join("hold"), b"").unwrap();
-    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
-    let first = send(&data, name);
-    let second = send(&data, name);
-    let wire = || -> Vec<(u64, String)> {
-        std::fs::read_to_string(config.join("wire.jsonl"))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter_map(|line| {
-                Some((
-                    line["launch"].as_u64()?,
-                    line["msg"]["request_id"].as_str()?.to_string(),
-                ))
-            })
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    let server = Server::start_with(&data, anyagents, anyagents, &env);
+    let first = send(&data, "spirited");
+    let second = send(&data, "spirited");
+    let inputs = || -> Vec<Value> {
+        native_lines(&config, "wire.jsonl")
+            .into_iter()
+            .filter(|line| matches!(line["msg"]["type"].as_str(), Some("prompt" | "steer")))
             .collect()
     };
     support::wait_for(
-        || wire().len() == 2,
-        "the prompt and the steer did not reach the vendor",
+        || inputs().len() == 2,
+        "prompt and steer did not reach native Spiron",
     );
-    let harness = kept_harness(&data, &id);
+    assert_eq!(inputs()[0]["msg"]["type"], "prompt");
+    assert_eq!(inputs()[1]["msg"]["type"], "steer");
+    let pid = native_pid(&data, &id);
+    assert!(no_keeper(&data, &id));
     server.crash();
+    assert!(alive(pid), "Spiron died with its server");
     let upgraded = dir.path().join("anyagents-next");
     std::fs::copy(anyagents, &upgraded).unwrap();
-    let server = Server::start_with(&data, anyagents, &upgraded, &spiron_env);
-    assert_eq!(
-        kept_harness(&data, &id),
-        harness,
-        "the vendor process was restarted"
+    let server = Server::start_with(&data, anyagents, &upgraded, &env);
+    support::wait_for(
+        || {
+            native_lines(&config, "wire.jsonl")
+                .iter()
+                .filter(|l| l["msg"]["type"] == "attach")
+                .count()
+                >= 2
+        },
+        "upgraded server did not attach",
     );
-    // The turn starts, its step journals the steer, and it ends.
+    assert_eq!(native_pid(&data, &id), pid);
+    server.terminate();
+    assert!(alive(pid), "a clean restart ended native Spiron");
+    let server = Server::start_with(&data, anyagents, anyagents, &env);
+    support::wait_for(
+        || {
+            native_lines(&config, "wire.jsonl")
+                .iter()
+                .filter(|l| l["msg"]["type"] == "attach")
+                .count()
+                >= 3
+        },
+        "restarted server did not attach",
+    );
+    let attaches: Vec<_> = native_lines(&config, "wire.jsonl")
+        .into_iter()
+        .filter(|l| l["msg"]["type"] == "attach")
+        .collect();
+    assert!(
+        attaches[1..].iter().all(|l| l["msg"]["after_seq"].is_u64()),
+        "restarts must request replay: {attaches:?}"
+    );
     std::fs::remove_file(config.join("hold")).unwrap();
     std::fs::write(config.join("step"), b"").unwrap();
     let store = Store::open(data.join("state.db")).unwrap();
@@ -1079,18 +1225,32 @@ fn a_spiron_adapter_in_its_keeper_never_writes_a_line_twice_across_a_restart() {
     let last = store.inbox(&agent, None).unwrap().last().unwrap().seq;
     support::wait_for(
         || store.delivered_cursor(&agent).unwrap() >= last,
-        "the consumed lines were not committed",
+        "replayed inputs were not committed",
     );
     assert_eq!(
-        wire(),
-        vec![(1, first.clone()), (1, second.clone())],
-        "a line was written twice, or by another process"
+        inputs()
+            .iter()
+            .map(|l| l["msg"]["request_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [first.as_str(), second.as_str()]
     );
     assert_eq!(
-        std::fs::read_to_string(config.join("launches"))
-            .unwrap()
-            .trim(),
+        std::fs::read_to_string(config.join("launches")).unwrap(),
         "1"
+    );
+    assert_eq!(native_pid(&data, &id), pid);
+    assert!(no_keeper(&data, &id));
+    std::fs::write(config.join("finish"), b"").unwrap();
+    support::wait_for(
+        || store.open_turn(&agent).unwrap().is_none(),
+        "the replayed turn stayed open",
+    );
+    assert_eq!(
+        native_lines(&config, "journal.jsonl")
+            .iter()
+            .map(|l| l["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [first.as_str(), second.as_str()]
     );
     drop(server);
 }
@@ -1100,7 +1260,7 @@ fn a_spiron_adapter_in_its_keeper_never_writes_a_line_twice_across_a_restart() {
 /// own behind its socket, survives a server crash in the middle of a turn
 /// with a steer in it, and the next server reattaches from the launch record
 /// and commits both messages once the turn ends; Spiron's frame journal shows
-/// each consumed exactly once. `keepers stop` then ends it. Without
+/// each consumed exactly once. Idle cleanup then ends it. Without
 /// `SPIRON_BIN` the test says so and passes, unless `ANYAGENTS_REQUIRE_SPIRON=1`.
 #[cfg(target_os = "linux")]
 #[test]
@@ -1261,151 +1421,61 @@ fn a_v2_spiron_needs_no_keeper_and_is_reattached_after_a_server_crash() {
     drop(server);
 }
 
-/// A rollback to a server without v2 Spiron, then a roll forward, with
-/// nothing stopped in between (a guardian that skipped `keepers stop`, or a
-/// crash in the middle of a switch from a kept harness). The old server
-/// starts a v1 Spiron in a keeper beside the running v2 one; the keeper
-/// holds the agent's lock. Rolled forward, the server takes the lock from
-/// the keeper, retires it (its proofs committed) and goes on with the v2
-/// process: every message is committed and one Spiron is left. Needs
-/// `SPIRON_BIN` (v2) and `OLD_ANYAGENTS_BIN` (a server with keepers and no v2
-/// Spiron, such as the current release); without them it says so.
+/// Pausing a native agent cancels its open turn through stop, ends the
+/// process and removes its launch record; it never creates a keeper.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_roll_forward_after_a_rollback_retires_the_keeper_and_keeps_one_spiron() {
-    let (Some(real), Some(old)) = (
-        std::env::var_os("SPIRON_BIN"),
-        std::env::var_os("OLD_ANYAGENTS_BIN"),
-    ) else {
-        eprintln!("SPIRON_BIN and OLD_ANYAGENTS_BIN are not set: the rollback test is not run");
-        return;
-    };
+fn pausing_native_spiron_cancels_its_turn_and_removes_its_launch_record() {
     let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_for_contract(&data);
     create_asker(&data);
-    let name = "native";
-    let out = bin()
-        .env("PATH", machine_path(&data))
+    let (id, config, program) = native_spiron(&data, "native");
+    let env = [("ANYAGENTS_SPIRON_BIN", program.to_str().unwrap())];
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    let server = Server::start_with(&data, anyagents, anyagents, &env);
+    let first = send(&data, "native");
+    support::wait_for(
+        || {
+            native_lines(&config, "frames.jsonl")
+                .iter()
+                .any(|f| f["type"] == "accepted" && f["request_id"] == first)
+        },
+        "native turn did not start",
+    );
+    let pid = native_pid(&data, &id);
+    let paused = bin()
         .arg("--data")
         .arg(&data)
-        .args(["agents", "create", name, "--harness", "spiron"])
+        .args(["agents", "pause", "native"])
         .output()
         .unwrap();
     assert!(
-        out.status.success(),
+        paused.status.success(),
         "{}",
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&paused.stderr)
     );
-    let id = String::from_utf8(out.stdout)
-        .unwrap()
-        .lines()
-        .next()
-        .unwrap()
-        .split('\t')
-        .next()
-        .unwrap()
-        .to_string();
-    let config = data.join("agents").join(&id).join("config");
-    let fixture = dir.path().join("fixture.sse");
-    std::fs::write(
-        &fixture,
-        concat!(
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_sleep\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"sleep 15\\\"}\"}}]}}]}\n",
-            "data: [DONE]\n---\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n",
-            "data: [DONE]\n---\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"done2\"}}]}\n",
-            "data: [DONE]\n---\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"done3\"}}]}\n",
-            "data: [DONE]\n",
-        ),
-    )
-    .unwrap();
-    let real = real.to_str().unwrap().to_string();
-    let fixture = fixture.to_str().unwrap().to_string();
-    let spiron_env = [
-        ("ANYAGENTS_SPIRON_BIN", real.as_str()),
-        ("SPIRON_GATEWAY_FIXTURE", fixture.as_str()),
-    ];
-    let spirons = || -> Vec<u32> {
-        let needle = config.to_str().unwrap().to_string();
-        std::fs::read_dir("/proc")
-            .unwrap()
-            .flatten()
-            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-            .filter(|pid| {
-                let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-                let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
-                cmd.contains("--headless") && cmd.contains(&needle) && !cmd.contains(" mcp ")
-            })
-            .collect()
-    };
-    let store = Store::open(data.join("state.db")).unwrap();
-    let agent = anyagents_core::AgentId::parse(&id).unwrap();
-    // Two Spiron processes share one session here, so a turn may wait for
-    // the other's session lease: longer than the usual wait.
-    let committed = |why: &str| {
-        let last = store.inbox(&agent, None).unwrap().last().unwrap().seq;
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while store.delivered_cursor(&agent).unwrap() < last {
-            assert!(Instant::now() < deadline, "{why}");
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    };
-    let record = data.join("detached").join(format!("{id}.json"));
-    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
-
-    // The new server runs a v2 Spiron, mid-turn when it stops.
-    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
-    send(&data, name);
-    support::wait_for(|| record.exists() && !spirons().is_empty(), "no v2 spiron");
-    committed("the first message was not committed");
-    let launched: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
-    let pid = launched["process"]["pid"].as_u64().unwrap() as u32;
-    server.terminate();
-    assert!(alive(pid));
-
-    // Rolled back with nothing stopped: the old server keeps its harness in
-    // a keeper, a second Spiron on the session.
-    let old = Path::new(&old);
-    let server = Server::start_with(&data, old, old, &spiron_env);
-    send(&data, name);
-    support::wait_for(|| !no_keeper(&data, &id), "the old server kept no harness");
     support::wait_for(
-        || spirons().len() == 2,
-        "the old server started no second spiron",
+        || !alive(pid) && !data.join("detached").join(format!("{id}.json")).exists(),
+        "pause left the native process or record",
     );
-    server.terminate();
-    assert!(alive(pid), "the v2 spiron died with the rollback");
-    assert!(!no_keeper(&data, &id));
-
-    // Rolled forward: the keeper is retired, the v2 process goes on.
-    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
-    send(&data, name);
-    committed("the messages were not committed after the roll forward");
-    support::wait_for(|| no_keeper(&data, &id), "the keeper was not retired");
-    // The v2 process served on (an idle agent's process may since have
-    // ended, with its record): never a new one beside or after it.
-    let left = spirons();
+    let frames = native_lines(&config, "frames.jsonl");
     assert!(
-        left.iter().all(|other| *other == pid),
-        "spirons {left:?}, v2 {pid}"
+        frames.iter().any(|f| f["type"] == "result"
+            && f["request_id"] == first
+            && f["status"] == "cancelled"),
+        "{frames:?}"
     );
-    if let Ok(bytes) = std::fs::read(&record) {
-        let now: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            now["process"], launched["process"],
-            "the v2 spiron was replaced"
-        );
-    }
+    let wire = native_lines(&config, "wire.jsonl");
     assert!(
-        !shared_log(&data).contains("is busy"),
-        "{}",
-        shared_log(&data)
+        wire.iter().any(|l| l["msg"]["type"] == "stop"
+            && l["msg"]["request_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())),
+        "{wire:?}"
     );
+    assert!(no_keeper(&data, &id));
     drop(server);
-    support::stop_keepers(&data);
 }
