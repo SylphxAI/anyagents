@@ -486,14 +486,19 @@ fn detect_captcha_expression() -> String {
 /// Project a successful detection into the caller response. An unavailable or
 /// malformed evaluation is an observation failure, not a failed snapshot.
 #[cfg(target_os = "linux")]
+fn captcha_detected_flag(detection: Option<&serde_json::Value>) -> bool {
+    detection
+        .and_then(|v| v.get("detected"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
 fn insert_captcha_fields(
     m: &mut serde_json::Map<String, serde_json::Value>,
     detection: Option<&serde_json::Value>,
 ) {
-    let detected = detection
-        .and_then(|v| v.get("detected"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let detected = captcha_detected_flag(detection);
     m.insert("captcha_detected".into(), detected.into());
     if detected {
         for (source, target) in [("kind", "captcha_kind"), ("summary", "captcha_summary")] {
@@ -542,7 +547,7 @@ trait BrowserClient {
     fn holder(&self) -> &'static str;
     fn takeover_url(&self) -> Option<String>;
     async fn publish_takeover(&self);
-    fn expect_hand_back(&self);
+    fn expect_hand_back(&self, challenge_detected: bool);
     async fn wait_for_hand_back(&self, wait: std::time::Duration) -> bool;
     fn release_takeover(&self, note: String) -> bool;
 }
@@ -660,8 +665,8 @@ impl BrowserClient for LiveBrowserClient<'_> {
     async fn publish_takeover(&self) {
         self.live.publish_takeover().await;
     }
-    fn expect_hand_back(&self) {
-        self.live.expect_hand_back();
+    fn expect_hand_back(&self, challenge_detected: bool) {
+        self.live.expect_hand_back(challenge_detected);
     }
     async fn wait_for_hand_back(&self, wait: std::time::Duration) -> bool {
         self.live.wait_for_hand_back(wait).await
@@ -1254,7 +1259,7 @@ async fn dispatch_action<C: BrowserClient>(
             // turn an otherwise available takeover into an error.
             let captcha = s.eval(&detect_captcha_expression()).await.ok();
             s.publish_takeover().await;
-            s.expect_hand_back();
+            s.expect_hand_back(captcha_detected_flag(captcha.as_ref()));
             if s.takeover_url().is_none() {
                 return Err(ToolError::unsupported(
                     "this desktop session has no takeover page",
@@ -2511,7 +2516,7 @@ mod tests {
             self.state.lock().unwrap().takeover_url.clone()
         }
         async fn publish_takeover(&self) {}
-        fn expect_hand_back(&self) {}
+        fn expect_hand_back(&self, _challenge_detected: bool) {}
         async fn wait_for_hand_back(&self, _wait: std::time::Duration) -> bool {
             false
         }
