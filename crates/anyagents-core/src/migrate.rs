@@ -67,7 +67,16 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         33,
         include_str!("../migrations/034_message_alias_indexes.sql"),
     ),
+    (
+        MEMORY_INDEX_SPLIT,
+        include_str!("../migrations/035_memory_index_split.sql"),
+    ),
 ];
+
+/// The version that moves the mailbox search index out of the state
+/// database. Opening an older database first copies what only its search
+/// tables hold into the index (`store/memory_index.rs`).
+pub const MEMORY_INDEX_SPLIT: i64 = 34;
 
 /// Apply pending migrations. Each migration commits on its own, in order.
 pub fn migrate(conn: &mut Connection) -> Result<(), Error> {
@@ -145,7 +154,9 @@ mod tests {
             conn.prepare("SELECT before_scope, after_scope, source FROM admin_audit")
                 .unwrap();
             conn.prepare("SELECT owner_agent_id FROM groups").unwrap();
-            conn.prepare("SELECT text_format FROM rag_chunks").unwrap();
+            conn.prepare("SELECT seq FROM outbound_messages").unwrap();
+            assert!(conn.prepare("SELECT 1 FROM rag_chunks").is_err());
+            assert!(conn.prepare("SELECT 1 FROM rag_chunks_fts").is_err());
             conn.prepare("SELECT id, target_id, receipt FROM conversation_redactions")
                 .unwrap();
             conn.prepare(
