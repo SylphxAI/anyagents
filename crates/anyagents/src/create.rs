@@ -3892,10 +3892,8 @@ fn propagate_credentials(
             )?;
             let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         }
-        if store_opt.is_some() {
-            if change == CredentialChange::Replaced {
-                poke_agent_wake_socket(data, &agent_rec.id);
-            }
+        if store_opt.is_some() && change == CredentialChange::Replaced {
+            poke_agent_wake_socket(data, &agent_rec.id);
         }
     }
     Ok(())
