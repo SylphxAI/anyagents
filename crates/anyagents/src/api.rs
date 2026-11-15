@@ -4,6 +4,69 @@ use anyagents_core::Quote;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// One harness's delivery level, as the API shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DeliveryView {
+    /// `turn-end`, `mid-turn` or `next-step`.
+    pub level: String,
+    /// Mail an earlier process of the session consumed is recognised when it
+    /// is handed over again, and is not applied twice.
+    pub idempotent: bool,
+    /// The vendor signal the level rests on.
+    pub proof: String,
+    /// What the running process announced about itself (vendor, version,
+    /// protocol, capabilities). Absent while no process has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+}
+
+impl From<&anyagents_harness::Delivery> for DeliveryView {
+    fn from(delivery: &anyagents_harness::Delivery) -> Self {
+        Self {
+            level: delivery.level.name().to_string(),
+            idempotent: delivery.idempotent,
+            proof: delivery.proof.to_string(),
+            peer: delivery.peer.clone(),
+        }
+    }
+}
+
+impl DeliveryView {
+    /// `AgentView::delivery_mode` for a client from before `delivery`:
+    /// `steer` when mail reaches a running turn, `followup` when it waits.
+    pub fn legacy_mode(&self) -> String {
+        match self.level.as_str() {
+            "next-step" | "mid-turn" => "steer",
+            _ => "followup",
+        }
+        .to_string()
+    }
+
+    /// `AgentView::steer_support` for a client from before `delivery`: `yes`
+    /// when the vendor proves consumption, `unproven` when only acceptance
+    /// is proven, `no` when mail waits for the turn to end.
+    pub fn legacy_steer(&self) -> String {
+        match self.level.as_str() {
+            "next-step" => "yes",
+            "mid-turn" => "unproven",
+            _ => "no",
+        }
+        .to_string()
+    }
+
+    /// The level, with `+idempotent` when redelivery is safe: what a table
+    /// column shows.
+    pub fn label(&self) -> String {
+        if self.level.is_empty() {
+            "-".to_string()
+        } else if self.idempotent {
+            format!("{}+idempotent", self.level)
+        } else {
+            self.level.clone()
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AgentView {
     #[serde(default)]
@@ -47,7 +110,17 @@ pub struct AgentView {
     pub process: String,
     #[serde(default)]
     pub turn_state: String,
+    /// What the agent's harness guarantees for mail that reaches it while a
+    /// turn runs (`docs/delivery.md`).
+    #[serde(default)]
+    pub delivery: DeliveryView,
+    /// Deprecated: `delivery.legacy_mode()`, kept for one release so a CLI or
+    /// MCP client built before `delivery` still parses this view (it requires
+    /// the field). Remove it, with `steer_support`, in the release after.
+    #[serde(default)]
     pub delivery_mode: String,
+    /// Deprecated with `delivery_mode`: `delivery.legacy_steer()`.
+    #[serde(default)]
     pub steer_support: String,
     pub quota_reset_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,8 +148,85 @@ pub struct AgentView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat_gid: Option<u32>,
     /// Active self-scheduled wakes (`at`, `every`) and event watches (`watch`) owned by this agent.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedules: Vec<ScheduleView>,
+    /// Turns in a row that ended in an error, and the parking that follows
+    /// `limit` of them (`docs/delivery.md`). Absent once a turn completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_errors: Option<TurnErrorsView>,
+    /// Messages this agent sent whose delivery could not be confirmed. None
+    /// is resent automatically; `anyagents outbound` retries or discards one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsettled_outbound: Vec<UnsettledOutboundView>,
+}
+
+impl AgentView {
+    /// The lifecycle a listing shows: `faulted` for an agent parked because
+    /// its turns kept ending in an error (its `state` is `paused`).
+    pub fn display_state(&self) -> &str {
+        if self.state == "paused"
+            && self
+                .turn_errors
+                .as_ref()
+                .is_some_and(|errors| errors.faulted_at_ms.is_some())
+        {
+            "faulted"
+        } else {
+            &self.state
+        }
+    }
+}
+
+/// An agent's run of errored turns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TurnErrorsView {
+    /// Turns in a row that ended in an error of the agent's own session
+    /// (strikes). A provider, model, auth, network or host error is recorded
+    /// as `last_error` but is no strike.
+    pub streak: i64,
+    /// Strikes in a row that park the agent.
+    pub limit: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_at_ms: Option<i64>,
+    /// When the agent was parked (`paused`) for them; a resume clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faulted_at_ms: Option<i64>,
+}
+
+impl From<anyagents_core::TurnErrors> for TurnErrorsView {
+    fn from(errors: anyagents_core::TurnErrors) -> Self {
+        Self {
+            streak: errors.streak,
+            limit: anyagents_core::MAX_ERRORED_TURNS,
+            last_error: errors.last_error,
+            last_error_at_ms: errors.last_error_at_ms,
+            faulted_at_ms: errors.faulted_at_ms,
+        }
+    }
+}
+
+/// A sent message whose delivery could not be confirmed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UnsettledOutboundView {
+    /// What `anyagents outbound retry|discard` takes.
+    pub key: String,
+    pub agent_id: String,
+    pub destination: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
+    /// The error that left the outcome unknown, when one was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The first characters of the message.
+    pub excerpt: String,
+}
+
+/// `GET /v1/outbound`: every unsettled outbound message.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct UnsettledOutboundResponse {
+    pub unsettled: Vec<UnsettledOutboundView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -255,6 +405,46 @@ pub struct InboxResponse {
     pub messages: Vec<MessageView>,
 }
 
+/// One report in the operator's inbox.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct OperatorMessageView {
+    pub id: String,
+    pub seq: i64,
+    pub text: String,
+    /// The authenticated author: `agent:<agent id>` or `operator`.
+    pub sender: String,
+    /// The author's display name when it wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
+    pub received_at_ms: i64,
+    /// How many times the same text arrived again, from any sender, within an
+    /// hour of this report.
+    #[serde(default)]
+    pub repeats: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_repeated_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct OperatorInboxResponse {
+    pub messages: Vec<OperatorMessageView>,
+}
+
+impl From<anyagents_core::OperatorMessage> for OperatorMessageView {
+    fn from(message: anyagents_core::OperatorMessage) -> Self {
+        Self {
+            id: message.id.to_string(),
+            seq: message.seq,
+            text: message.body,
+            sender: message.sender,
+            sender_name: message.sender_name,
+            received_at_ms: message.received_at_ms,
+            repeats: message.repeats,
+            last_repeated_at_ms: message.last_repeated_at_ms,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct RawCoordinateView {
     pub segment: String,
@@ -311,6 +501,38 @@ pub struct ConversationResponse {
     pub agent: String,
     pub agent_id: String,
     pub turns: Vec<ConversationTurnView>,
+    /// How a relevance search was ranked; absent for reads that rank nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<RetrievalView>,
+}
+
+/// The ranking stages a relevance search ran. Every turn cites its raw record
+/// whichever stage found it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct RetrievalView {
+    /// `lexical` when no memory service runs on this data directory (the
+    /// default with nothing configured): BM25 alone, by design, not a
+    /// degradation. `hybrid` when one does.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mode: String,
+    /// `lexical` (BM25), then `dense` and `rerank` when the memory service
+    /// answered.
+    pub stages: Vec<String>,
+    /// Why a stage that applies did not run, or ran on partial history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
+    /// History the search could not index before answering. It is being
+    /// indexed in the background, and hits from it may be missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingHistoryView>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PendingHistoryView {
+    /// Sources (files or stores) not yet fully indexed.
+    pub sources: usize,
+    /// Approximate bytes of history still to index.
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -320,10 +542,18 @@ pub struct SendMedia {
     /// Local file path, `https://` URL, or Telegram `file_id`.
     pub source: String,
     /// Optional track title (for `kind = "audio"` or `"music"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub title: Option<String>,
     /// Optional artist/performer name (for `kind = "audio"` or `"music"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub performer: Option<String>,
 }
 
@@ -332,10 +562,18 @@ pub struct SendLocation {
     pub latitude: f64,
     pub longitude: f64,
     /// Optional venue title (when both `title` and `address` are set, sends a rich venue card).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub title: Option<String>,
     /// Optional venue street address.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub address: Option<String>,
 }
 
@@ -356,7 +594,11 @@ pub struct SendChecklist {
     /// Checklist items (`1..=30` task descriptions; prefix with `[x]` or `☑` for pre-checked items).
     pub tasks: Vec<String>,
     /// Optional Telegram Business Connection ID for native `sendChecklist`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub business_connection_id: Option<String>,
 }
 
@@ -365,14 +607,49 @@ pub struct SendArticle {
     /// Article title.
     pub title: String,
     /// Markdown or plain-text body to publish as a Telegram Telegraph (`telegra.ph`) Instant View article.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub content: Option<String>,
     /// Optional external article URL (when already hosted).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub url: Option<String>,
     /// Optional author name shown on the Instant View header.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "absent_if_null"
+    )]
     pub author_name: Option<String>,
+}
+
+/// An optional field written as JSON `null`, `"null"` or `"undefined"` is
+/// absent. Harnesses fill unused optional fields with these strings, and a
+/// `"null"` URL or object is never what was meant. Every other string,
+/// `""` and `"None"` included, keeps its meaning.
+pub fn absent_if_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) if is_null_word(&text) => Ok(None),
+        Some(value) => T::deserialize(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+/// Exactly `"null"` or `"undefined"`: what a harness writes for "no value".
+pub(crate) fn is_null_word(text: &str) -> bool {
+    matches!(text, "null" | "undefined")
 }
 
 pub fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>

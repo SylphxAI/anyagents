@@ -6,6 +6,13 @@
 //! removed has its thread stopped. Dropping the poller stops every thread and
 //! waits for the call each one is in.
 //!
+//! Nothing here wakes on a clock to look for work. The supervisor and every
+//! idle bot wait on one signal, raised when a Telegram binding changes in this
+//! process, when an agent bound to a bot changes its lifecycle (the store's
+//! agent wake), when a local receipt is left pending, and when the poller
+//! stops. A change no event announces, such as another process writing the
+//! store directly, is seen within [`SAFETY_NET`].
+//!
 //! A long poll cannot be cancelled from this process: it ends when Telegram
 //! answers, or when another process calls the same bot. Shutdown therefore ends
 //! every poll rather than abandoning it: it sends `getUpdates` to each bot with
@@ -17,21 +24,33 @@
 //! same bot beside the next server's, so the handoff is never declared finished
 //! early.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyagents_core::{Channel, FileCredentialStore, Store};
+use anyagents_core::{AgentId, Channel, ChannelId, FileCredentialStore, Store, Wake};
 
 use super::channel::{
-    LONG_POLL_S, delete_webhook, ensure_webhook, poll_channel_once, reconcile_channel_groups,
+    CHANGES, LONG_POLL_S, Signal, changed, delete_webhook, ensure_webhook, poll_channel_once,
+    reconcile_channel_groups,
 };
 
-/// How often the supervisor looks for channels that were added or removed.
-const RECONCILE_EVERY: Duration = Duration::from_secs(2);
+/// The longest the supervisor or an idle bot waits with no event. It only
+/// bounds how late a change no event announced is seen.
+const SAFETY_NET: Duration = Duration::from_secs(60);
+
+/// While a local receipt is still pending, its projection is retried this
+/// often.
+const RECEIPT_RETRY: Duration = Duration::from_secs(2);
+
+/// A failed poll or registration waits this long before it is tried again.
+const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(2);
+
+/// A bot pushed by webhook reconciles its groups this often.
+const WEBHOOK_RECONCILE_EVERY: Duration = Duration::from_secs(30);
 
 /// The timeout the shutdown's own call carries, so the held long poll and this
 /// one both come back now that Telegram has answered them.
@@ -57,11 +76,13 @@ impl Poller {
     pub fn start(store: Arc<Store>, data_dir: std::path::PathBuf) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let bots: Arc<Mutex<HashMap<String, Bot>>> = Arc::new(Mutex::new(HashMap::new()));
+        let bound: Arc<Mutex<HashSet<AgentId>>> = Arc::default();
+        forward_lifecycle_wakes(&store, Arc::clone(&bound), Arc::clone(&stop), &CHANGES)?;
         let running = Arc::clone(&bots);
         let flag = Arc::clone(&stop);
         let handle = std::thread::Builder::new()
             .name("anyagents-telegram".into())
-            .spawn(move || supervise(store, data_dir, flag, running))
+            .spawn(move || supervise(store, data_dir, flag, running, bound, &CHANGES))
             .map_err(|err| err.to_string())?;
         Ok(Self {
             stop,
@@ -74,6 +95,7 @@ impl Poller {
     /// exits instead of starting a new 30-second poll.
     pub fn signal_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        changed();
     }
 
     /// Stop every bot's poll and wait for its last offset to be written. The
@@ -82,7 +104,7 @@ impl Poller {
     /// the join returns. The join has no timeout: a poller left behind would be
     /// a second poller for the same bot beside the next server's.
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::SeqCst);
+        self.signal_stop();
         let handles = lock(&self.supervisors).drain(..).collect::<Vec<_>>();
         for handle in handles {
             let _ = handle.join();
@@ -96,22 +118,67 @@ impl Drop for Poller {
     }
 }
 
+/// Raise the signal when an agent bound to a Telegram channel changes its
+/// lifecycle: the store wakes subscribers on every such change, made in this
+/// process or announced by another one on the wake socket.
+fn forward_lifecycle_wakes(
+    store: &Store,
+    bound: Arc<Mutex<HashSet<AgentId>>>,
+    stop: Arc<AtomicBool>,
+    signal: &'static Signal,
+) -> Result<(), String> {
+    let wakes = store.subscribe();
+    std::thread::Builder::new()
+        .name("anyagents-telegram-wake".into())
+        .spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                match wakes.recv_timeout(SAFETY_NET) {
+                    Ok(Wake::Agent { agent_id }) if lock(&bound).contains(&agent_id) => {
+                        signal.raise()
+                    }
+                    Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        })
+        .map(drop)
+        .map_err(|err| err.to_string())
+}
+
 /// Keep one polling thread alive for every Telegram channel in the store.
 fn supervise(
     store: Arc<Store>,
     data_dir: std::path::PathBuf,
     stop: Arc<AtomicBool>,
     bots: Arc<Mutex<HashMap<String, Bot>>>,
+    bound: Arc<Mutex<HashSet<AgentId>>>,
+    signal: &'static Signal,
 ) {
     while !stop.load(Ordering::SeqCst) {
-        if let Err(err) = super::channel::replay_local_receipts(&store) {
-            eprintln!("Telegram local receipt replay pending: {err}");
-        }
-        let channels = match channels_to_poll(&store) {
+        let seen = signal.generation();
+        let receipts_pending = match super::channel::replay_local_receipts(&store) {
+            Ok(_) => false,
+            Err(err) => {
+                eprintln!("Telegram local receipt replay pending: {err}");
+                true
+            }
+        };
+        let retry = if receipts_pending {
+            RECEIPT_RETRY
+        } else {
+            SAFETY_NET
+        };
+        // The bound agents are published before their lifecycles are read, so
+        // a change after that read raises the signal and none falls between.
+        let census = telegram_bots(&store).and_then(|(bots, agents)| {
+            *lock(&bound) = agents;
+            to_poll(&store, bots)
+        });
+        let channels = match census {
             Ok(channels) => channels,
             Err(err) => {
                 eprintln!("Telegram channel census unavailable: {err}");
-                sleep_for(&stop, &stop, RECONCILE_EVERY);
+                signal.pause(RETRY_AFTER_FAILURE, &[&stop]);
                 continue;
             }
         };
@@ -133,6 +200,7 @@ fn supervise(
         for id in gone {
             if let Some(bot) = lock(&bots).remove(&id) {
                 bot.stop.store(true, Ordering::SeqCst);
+                signal.raise();
                 let _ = bot.handle.join();
             }
         }
@@ -148,10 +216,9 @@ fn supervise(
             let global_stop = Arc::clone(&stop);
             let store = Arc::clone(&store);
             let dir = data_dir.clone();
-            let channel_id = channel.id.to_string();
             let started = std::thread::Builder::new()
                 .name(format!("anyagents-telegram-{id}"))
-                .spawn(move || run_channel(store, dir, channel_id, flag, global_stop));
+                .spawn(move || run_channel(store, dir, channel.id, flag, global_stop, signal));
             if let Ok(handle) = started {
                 lock(&bots).insert(
                     id,
@@ -163,11 +230,9 @@ fn supervise(
             }
         }
 
-        // Wait a moment, but wake at once when the server is stopping.
-        let deadline = Instant::now() + RECONCILE_EVERY;
-        while Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // Wait for the next change, but wake at once when the server is
+        // stopping.
+        signal.wait(seen, retry, &[&stop]);
     }
 
     // Shutdown: every bot's poll ends and its last offset is written before its
@@ -176,6 +241,7 @@ fn supervise(
     let running = std::mem::take(&mut *lock(&bots));
     for (_, bot) in running {
         bot.stop.store(true, Ordering::SeqCst);
+        signal.raise();
         let _ = bot.handle.join();
     }
 }
@@ -229,23 +295,25 @@ fn webhook_origin_ready(base: &str) -> bool {
 fn run_channel(
     store: Arc<Store>,
     data_dir: std::path::PathBuf,
-    id: String,
+    id: ChannelId,
     stop: Arc<AtomicBool>,
     global_stop: Arc<AtomicBool>,
+    signal: &'static Signal,
 ) {
+    let stops = [&*stop, &*global_stop];
     let secrets = FileCredentialStore::new(&data_dir);
     let mut webhook_registered_for: Option<String> = None;
+    let mut groups_reconciled_at: Option<Instant> = None;
     while !stop.load(Ordering::SeqCst) && !global_stop.load(Ordering::SeqCst) {
+        let seen = signal.generation();
         // The channel is re-read each pass: its saved offset and chats are what
         // this thread's own writes produced, so a stale copy would write an old
         // state back over them.
-        let channel = match store.list_channels() {
-            Ok(channels) => channels
-                .into_iter()
-                .find(|channel| channel.id.to_string() == id),
+        let channel = match store.channel(&id) {
+            Ok(channel) => channel,
             Err(err) => {
                 eprintln!("Telegram channel read unavailable: {err}");
-                sleep_a_moment(&stop, &global_stop);
+                signal.pause(RETRY_AFTER_FAILURE, &stops);
                 continue;
             }
         };
@@ -256,7 +324,7 @@ fn run_channel(
             Ok(active) => active,
             Err(err) => {
                 eprintln!("Telegram agent lifecycle unavailable: {err}");
-                sleep_a_moment(&stop, &global_stop);
+                signal.pause(RETRY_AFTER_FAILURE, &stops);
                 continue;
             }
         };
@@ -264,7 +332,8 @@ fn run_channel(
             if webhook_registered_for.take().is_some() {
                 let _ = delete_webhook(&secrets, &channel);
             }
-            sleep_for(&stop, &global_stop, Duration::from_secs(5));
+            // Asleep until a bound agent's lifecycle or the binding changes.
+            signal.wait(seen, SAFETY_NET, &stops);
             continue;
         }
         if let Some(base) = configured_webhook_base()
@@ -277,17 +346,31 @@ fn run_channel(
                 if matches!(outcome, Ok(Ok(()))) {
                     webhook_registered_for = Some(base);
                 } else {
-                    sleep_a_moment(&stop, &global_stop);
+                    signal.pause(RETRY_AFTER_FAILURE, &stops);
                     continue;
                 }
             }
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                reconcile_channel_groups(&store, &secrets, &channel);
-            }));
-            sleep_for(&stop, &global_stop, Duration::from_secs(30));
+            // A lifecycle change wakes this loop early so an archived or
+            // paused agent's webhook goes at once; the groups themselves are
+            // reconciled on their own cadence.
+            if groups_reconciled_at.is_none_or(|at| at.elapsed() >= WEBHOOK_RECONCILE_EVERY) {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    reconcile_channel_groups(&store, &secrets, &channel);
+                }));
+                groups_reconciled_at = Some(Instant::now());
+            }
+            let since = groups_reconciled_at.map_or(Duration::ZERO, |at| at.elapsed());
+            signal.wait(seen, WEBHOOK_RECONCILE_EVERY.saturating_sub(since), &stops);
             continue;
         }
         webhook_registered_for = None;
+        groups_reconciled_at = None;
+        if channel.agents.is_empty() {
+            // A bot no agent holds yet has nobody to poll for: wait for the
+            // binding instead of asking again at once.
+            signal.wait(seen, SAFETY_NET, &stops);
+            continue;
+        }
         // The timeout is capped so a shutdown never waits out a full long poll:
         // Telegram answers at once when the timeout is short.
         let timeout = if stop.load(Ordering::SeqCst) || global_stop.load(Ordering::SeqCst) {
@@ -305,14 +388,11 @@ fn run_channel(
         }
         // A failed poll waits a moment; a good one asks again at once.
         if !matches!(outcome, Ok(Ok(()))) {
-            sleep_a_moment(&stop, &global_stop);
+            signal.pause(RETRY_AFTER_FAILURE, &stops);
         }
     }
     if webhook_registered_for.is_some()
-        && let Ok(channels) = store.list_channels()
-        && let Some(channel) = channels
-            .into_iter()
-            .find(|channel| channel.id.to_string() == id)
+        && let Ok(Some(channel)) = store.channel(&id)
     {
         let _ = delete_webhook(&secrets, &channel);
     }
@@ -371,7 +451,7 @@ pub fn release_every_bot(
                 within.as_secs()
             ));
         }
-        match done_rx.recv_timeout(left.min(Duration::from_millis(200))) {
+        match done_rx.recv_timeout(left) {
             Ok((_, Err(reason))) => return Err(reason),
             Ok((_, Ok(()))) => waiting -= 1,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -402,37 +482,40 @@ fn channel_has_eligible_agent(
     Ok(active)
 }
 
-/// A census is authoritative only when every required read succeeds.
-fn channels_to_poll(store: &Store) -> Result<Vec<Channel>, anyagents_core::Error> {
+/// Every Telegram bot with a credential, and every agent bound to one: a
+/// lifecycle change of any of them can change which bots are polled.
+fn telegram_bots(store: &Store) -> Result<(Vec<Channel>, HashSet<AgentId>), anyagents_core::Error> {
+    let bots: Vec<Channel> = store
+        .list_channels()?
+        .into_iter()
+        .filter(|channel| channel.kind == "telegram" && channel.credential_ref.is_some())
+        .collect();
+    let agents = bots
+        .iter()
+        .flat_map(|channel| channel.agents.iter().cloned())
+        .collect();
+    Ok((bots, agents))
+}
+
+/// The bots to poll now. A census is authoritative only when every required
+/// read succeeds.
+fn to_poll(store: &Store, bots: Vec<Channel>) -> Result<Vec<Channel>, anyagents_core::Error> {
     let webhook = configured_webhook_base().is_some();
     let mut channels = Vec::new();
-    for channel in store.list_channels()? {
-        if channel.kind == "telegram"
-            && channel.credential_ref.is_some()
-            && channel_has_eligible_agent(store, &channel, webhook)?
-        {
+    for channel in bots {
+        if channel_has_eligible_agent(store, &channel, webhook)? {
             channels.push(channel);
         }
     }
     Ok(channels)
 }
 
+fn channels_to_poll(store: &Store) -> Result<Vec<Channel>, anyagents_core::Error> {
+    to_poll(store, telegram_bots(store)?.0)
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
-}
-
-fn sleep_a_moment(flag: &AtomicBool, global_stop: &AtomicBool) {
-    sleep_for(flag, global_stop, Duration::from_secs(2));
-}
-
-fn sleep_for(flag: &AtomicBool, global_stop: &AtomicBool, duration: Duration) {
-    let deadline = Instant::now() + duration;
-    while Instant::now() < deadline {
-        if flag.load(Ordering::SeqCst) || global_stop.load(Ordering::SeqCst) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 #[cfg(test)]
@@ -503,5 +586,121 @@ mod tests {
         }
         assert!(should_replace_worker("channel", &wanted, &bot));
         bot.handle.join().unwrap();
+    }
+
+    fn private_signal() -> &'static Signal {
+        Box::leak(Box::new(Signal::new()))
+    }
+
+    fn unbound_bot(store: &Store, name: &str) -> Channel {
+        store
+            .create_channel(anyagents_core::NewChannel {
+                kind: "telegram".into(),
+                identity: None,
+                config: "{}".into(),
+                credential_ref: Some(format!("channels/{name}")),
+            })
+            .unwrap()
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_wait_ends_on_a_raise_on_a_stop_or_at_its_timeout() {
+        let signal = private_signal();
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        signal.wait(signal.generation(), Duration::from_millis(50), &[&stop]);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+
+        let seen = signal.generation();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                signal.raise();
+            });
+            let started = Instant::now();
+            signal.wait(seen, Duration::from_secs(30), &[&stop]);
+            assert!(started.elapsed() < Duration::from_secs(5));
+        });
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                stop.store(true, Ordering::SeqCst);
+                signal.raise();
+            });
+            let started = Instant::now();
+            signal.pause(Duration::from_secs(30), &[&stop]);
+            assert!(started.elapsed() < Duration::from_secs(5));
+        });
+    }
+
+    #[test]
+    fn the_supervisor_looks_at_the_store_again_only_when_signalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        // Bots no agent holds yet: their threads start and then wait, so the
+        // test makes no Telegram call.
+        let first = unbound_bot(&store, "first");
+        let signal = private_signal();
+        let stop = Arc::new(AtomicBool::new(false));
+        let bots: Arc<Mutex<HashMap<String, Bot>>> = Arc::default();
+        let supervisor = {
+            let (store, stop, bots) = (Arc::clone(&store), Arc::clone(&stop), Arc::clone(&bots));
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || supervise(store, dir, stop, bots, Arc::default(), signal))
+        };
+        wait_until("the first bot never started", || {
+            lock(&bots).contains_key(first.id.as_str())
+        });
+
+        // A channel written without a signal is not seen by any clock.
+        let second = unbound_bot(&store, "second");
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(lock(&bots).len(), 1);
+
+        signal.raise();
+        wait_until("the signalled bot never started", || {
+            lock(&bots).contains_key(second.id.as_str())
+        });
+
+        stop.store(true, Ordering::SeqCst);
+        signal.raise();
+        supervisor.join().unwrap();
+        assert!(lock(&bots).is_empty());
+    }
+
+    #[test]
+    fn only_a_bound_agents_lifecycle_raises_the_signal() {
+        let (_dir, store, _, bound_agent) = fixture();
+        let other = store
+            .create_agent(anyagents_core::NewAgent::new("other", "codex"))
+            .unwrap();
+        // Running before the forwarder subscribes, so mail changes no state.
+        store.set_agent_state(&bound_agent.id, "running").unwrap();
+        let signal = private_signal();
+        let stop = Arc::new(AtomicBool::new(false));
+        let bound = Arc::new(Mutex::new(HashSet::from([bound_agent.id.clone()])));
+        forward_lifecycle_wakes(&store, bound, Arc::clone(&stop), signal).unwrap();
+
+        let seen = signal.generation();
+        store.set_agent_state(&other.id, "paused").unwrap();
+        store
+            .receive(&bound_agent.id, anyagents_core::Incoming::new("mail"))
+            .unwrap();
+        signal.wait(seen, Duration::from_millis(300), &[]);
+        assert_eq!(signal.generation(), seen);
+
+        store.set_agent_state(&bound_agent.id, "paused").unwrap();
+        signal.wait(seen, Duration::from_secs(5), &[]);
+        assert_eq!(signal.generation(), seen + 1);
+        stop.store(true, Ordering::SeqCst);
     }
 }

@@ -363,6 +363,65 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_following_a_recovery_notes_hint_binds_to_the_turn_it_covers() {
+        let temp = crate::test_tempdir();
+        let store = anyagents_core::Store::open(temp.path().join("state.db")).unwrap();
+        let worker = store
+            .create_agent(anyagents_core::NewAgent::new("worker", "codex"))
+            .unwrap();
+        let asker = store
+            .create_agent(anyagents_core::NewAgent::new("asker", "codex"))
+            .unwrap();
+        let mut incoming = anyagents_core::Incoming::new("the interrupted task");
+        incoming.sender = Some(format!("agent:{}", asker.name));
+        let anyagents_core::ReceiveOutcome::New(task) =
+            store.receive(&worker.id, incoming).unwrap()
+        else {
+            panic!("new message");
+        };
+        store.note_delivered(&worker.id, task.seq).unwrap();
+        let open = store.open_turn(&worker.id).unwrap().expect("open turn");
+        let note = anyagents_agent::recovery_outbound(&open);
+        // The model reads the note as its harness writes it, and answers with
+        // the reference the trusted header gives.
+        let header = anyagents_harness::compose_message(&note.id, &note.context, &note.text);
+        let hint = header
+            .split("reply_to=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("the note carries a reply reference")
+            .to_string();
+        assert_eq!(hint, reply_ref(task.id.as_str()));
+        let principal = Principal::Agent {
+            agent_id: worker.id.clone(),
+            name: worker.name.clone(),
+        };
+        let bound = resolve(
+            &principal,
+            |name| {
+                store
+                    .message(&worker.id, name)
+                    .map_err(|err| err.to_string())
+            },
+            Some(&hint),
+        )
+        .expect("the reply names a message this mailbox holds")
+        .expect("a destination");
+        assert_eq!(bound.address(), format!("agent:{}", asker.name));
+        // The note's own id is no message: it cannot be the reference.
+        assert!(
+            resolve(
+                &principal,
+                |name| store
+                    .message(&worker.id, name)
+                    .map_err(|err| err.to_string()),
+                Some(&reply_ref(&note.id)),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn a_plain_destination_is_used_as_written() {
         let found = resolve(&agent(), |_| Ok(None), Some("telegram:chat:-5:9")).unwrap();
         assert_eq!(found.unwrap().address(), "telegram:chat:-5:9");

@@ -28,10 +28,11 @@ pub fn base64_encode(bytes: &[u8]) -> String {
 /// ASCII whitespace is ignored, the URL-safe alphabet (`-`/`_`) is accepted alongside
 /// `+`/`/`, `=` contributes value 0, and the legacy per-chunk hole semantics are
 /// preserved exactly: the first byte is emitted always, the byte under a mid-chunk
-/// `=` is dropped, and any following non-`=` byte is emitted. Byte decoding itself is delegated to the standard `base64` crate via
-/// per-chunk canonical re-encoding, so non-canonical inputs the standard crate alone
-/// would reject (non-zero pad bits, padding in non-final chunks) decode exactly as
-/// before.
+/// `=` is dropped, and any following non-`=` byte is emitted (e.g. `Zg=Z` -> `66 19`).
+/// The standard `base64` crate alone rejects inputs this contract accepts (interior
+/// padding, non-zero pad bits), so decoding is a small explicit compatibility
+/// decoder: alphabet mapping plus sextet arithmetic with the pad bits ignored,
+/// exactly matching the legacy behavior.
 pub fn base64_decode(encoded: &str) -> Result<Vec<u8>, String> {
     let clean: Vec<u8> = encoded
         .bytes()
@@ -76,22 +77,13 @@ pub fn base64_decode(encoded: &str) -> Result<Vec<u8>, String> {
         ];
         // Legacy hole semantics: the byte under a mid-chunk '=' is dropped, but a
         // following non-'=' byte is still emitted, e.g. "Zg=Z" -> [0x66, 0x19].
-        let mut emit_buf = [0u8; 3];
-        emit_buf[0] = bytes[0];
-        let mut emit_len = 1;
+        out.push(bytes[0]);
         if chunk[2] != b'=' {
-            emit_buf[emit_len] = bytes[1];
-            emit_len += 1;
+            out.push(bytes[1]);
         }
         if chunk[3] != b'=' {
-            emit_buf[emit_len] = bytes[2];
-            emit_len += 1;
+            out.push(bytes[2]);
         }
-        let canonical_chunk = STANDARD.encode(&emit_buf[..emit_len]);
-        let decoded = STANDARD
-            .decode(canonical_chunk)
-            .expect("canonical chunk produced by STANDARD.encode must decode");
-        out.extend_from_slice(&decoded);
     }
     Ok(out)
 }

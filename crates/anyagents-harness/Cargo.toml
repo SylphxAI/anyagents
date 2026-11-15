@@ -7,6 +7,10 @@ rust-version = "1.98"
 description = "Harness adapter contract and a scripted fake harness"
 
 [dependencies]
+base64 = "0.22"
+# Pure Rust decoders and encoders for the formats a model is given or a
+# channel delivers; no system image library.
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -129,10 +129,22 @@ pub(crate) fn verify_capability(
 /// reads it. The value is never printed, never an argument and never logged.
 pub fn mint(store: &Store, agent_id: &anyagents_core::AgentId) -> Result<(), Error> {
     let token = store.issue_capability(agent_id)?;
+    write_agent_secret(store, agent_id, CAPABILITY_FILE, &token)
+}
+
+/// Write one secret into the agent's own config directory, readable by the
+/// server and that agent's seat only, and replace any earlier value
+/// atomically. The value is never printed, never an argument and never logged.
+pub(crate) fn write_agent_secret(
+    store: &Store,
+    agent_id: &anyagents_core::AgentId,
+    file_name: &str,
+    value: &str,
+) -> Result<(), Error> {
     let dir = config_dir(store.data_dir(), agent_id.as_str());
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(CAPABILITY_FILE);
-    let temp = dir.join(format!("{CAPABILITY_FILE}.new"));
+    let path = dir.join(file_name);
+    let temp = dir.join(format!("{file_name}.new"));
     {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -142,7 +154,7 @@ pub fn mint(store: &Store, agent_id: &anyagents_core::AgentId) -> Result<(), Err
             .truncate(true)
             .mode(0o600)
             .open(&temp)?;
-        file.write_all(token.as_bytes())?;
+        file.write_all(value.as_bytes())?;
         file.write_all(b"\n")?;
         file.sync_all()?;
     }

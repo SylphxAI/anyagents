@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use anyagents_core::{Error, Store, agent_config_dir, agent_work_dir};
 use anyagents_installer::{
-    CommandRunner, InstallError, InstallMethod, LineSink, SignInOutcome, SignInPrompt, SignInSink,
+    CommandRunner, InstallError, LineSink, SignInOutcome, SignInPrompt, SignInSink,
     builtin_catalog, config_dir_variable,
 };
 use sha2::{Digest, Sha256};
@@ -56,13 +56,8 @@ pub fn install_hint(harness: &str) -> Option<String> {
     builtin_catalog()
         .into_iter()
         .find(|entry| entry.id == harness)
-        .map(|entry| match entry.install {
-            InstallMethod::Npm { package } => format!("npm install -g {package}"),
-            InstallMethod::VendorScript { url } => format!("curl -fsSL {url} | sh"),
-            InstallMethod::ReleaseBinary { url, .. } => url,
-            // A tab separates the printed columns; keep the hint one word.
-            InstallMethod::Vendored => "machine-copy".to_string(),
-        })
+        // A tab separates printed columns; keep the hint one whitespace-free token.
+        .map(|entry| entry.source.label())
 }
 
 /// Run the vendor sign-in for the agent's own config directory.

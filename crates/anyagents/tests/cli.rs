@@ -1,3 +1,5 @@
+mod support;
+
 #[path = "support/archive_reap.rs"]
 mod archive_reap;
 
@@ -5,29 +7,7 @@ use std::process::Command;
 
 use anyagents_core::{BillingMode, NewUsage, Store};
 
-/// A `PATH` where `claude` is this binary and `npm` fails, so creating an agent
-/// records the vendor tool the machine already has and downloads nothing.
-fn machine_path(dir: &std::path::Path) -> std::ffi::OsString {
-    use std::os::unix::fs::PermissionsExt;
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let launcher = bin.join("claude");
-    if !launcher.exists() {
-        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_anyagents"), &launcher).unwrap();
-    }
-    let npm = bin.join("npm");
-    if !npm.exists() {
-        // A create installs its harness; these tests run none of it. `view`
-        // answers a version and an install does nothing.
-        std::fs::write(
-            &npm,
-            "#!/bin/sh\ncase \"$1\" in view) echo 0.0.0 ;; esac\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::env::join_paths([bin]).unwrap()
-}
+use support::machine_path;
 
 fn bin() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_anyagents"));
@@ -36,7 +16,8 @@ fn bin() -> Command {
         .env_remove("ANYAGENTS_AGENT_ID")
         .env_remove("ANYAGENTS_AGENT_CONFIG")
         .env_remove("ANYAGENTS_DATA")
-        .env_remove("ANYAGENTS_PARENT_NAME");
+        .env_remove("ANYAGENTS_PARENT_NAME")
+        .env_remove("ANYAGENTS_OWNER_WORKDIR");
     command
 }
 
@@ -50,6 +31,176 @@ fn bin_in(dir: &std::path::Path) -> Command {
         .arg("--data")
         .arg(dir);
     command
+}
+
+#[test]
+fn offline_fixture_creates_verified_receipts_without_runtime_downloads() {
+    let dir = tempfile::tempdir().unwrap();
+    for harness in ["claude-code", "omp", "agy"] {
+        let out = bin_in(dir.path())
+            .args(["agents", "create", harness, "--harness", harness])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let root = dir.path().join("harnesses").join(harness);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("0.0.0/receipt.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt["state"], "ok");
+        assert_eq!(receipt["doctor"]["ok"], true);
+        assert!(receipt["digest"].as_str().unwrap().starts_with("sha256:"));
+        assert_eq!(receipt["launcher"], "bin/harness");
+        let current: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("current.json")).unwrap()).unwrap();
+        assert_eq!(current["version"], "0.0.0");
+    }
+    assert!(!dir.path().join("runtimes").exists());
+}
+
+#[test]
+fn offline_fixture_rejects_tampered_and_undeclared_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    support::managed_harnesses(dir.path());
+    std::fs::write(dir.path().join("bin/managed-harness"), "tampered").unwrap();
+    let out = bin_in(dir.path())
+        .args(["agents", "create", "tampered", "--harness", "agy"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("checksum mismatch"));
+    assert!(!dir.path().join("harnesses/agy/current.json").exists());
+
+    // An explicit empty declaration keeps the production fail-closed default.
+    std::fs::write(dir.path().join("harnesses.toml"), "").unwrap();
+    let out = bin_in(dir.path())
+        .args(["agents", "create", "undeclared", "--harness", "grok"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unverifiable source for grok"));
+    assert!(!dir.path().join("harnesses/grok/current.json").exists());
+}
+
+#[test]
+fn configured_owner_catalog_is_authoritative_for_create_discovery_and_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let owner = dir.path().join("owner");
+    let workspace = dir.path().join("workspace");
+    let home = dir.path().join("home");
+    for base in [&data, &workspace, &home] {
+        std::fs::create_dir_all(base.join(".agents/agents")).unwrap();
+        std::fs::write(base.join(".agents/agents/retired.md"), "Stale template.").unwrap();
+        std::fs::write(base.join(".agents/agents/worker.md"), "Wrong template.").unwrap();
+    }
+    for root in ["agents-templates", "archetypes"] {
+        std::fs::create_dir_all(data.join(root)).unwrap();
+        std::fs::write(data.join(root).join("retired.md"), "Stale template.").unwrap();
+    }
+    let run = |args: &[&str]| {
+        bin_in(&data)
+            .env("ANYAGENTS_OWNER_WORKDIR", &owner)
+            .env("HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let workspace = workspace.to_str().unwrap();
+    // A no-role agent remains possible, even before the catalog exists.
+    let created = run(&["agents", "create", "plain", "--workdir", workspace]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    for state in ["missing", "empty", "populated"] {
+        if state == "empty" {
+            std::fs::create_dir_all(owner.join(".agents/agents")).unwrap();
+        } else if state == "populated" {
+            std::fs::write(
+                owner.join(".agents/agents/worker.md"),
+                "---\nname: worker\ndescription: Current worker\n---\nAuthoritative template.",
+            )
+            .unwrap();
+        }
+        for role in ["retired", "unknown"] {
+            let rejected = run(&[
+                "agents",
+                "create",
+                "rejected",
+                "--workdir",
+                workspace,
+                "--role",
+                role,
+            ]);
+            assert!(!rejected.status.success(), "{state}: accepted {role}");
+            assert!(
+                String::from_utf8_lossy(&rejected.stderr).contains("unknown archetype template"),
+                "{}",
+                String::from_utf8_lossy(&rejected.stderr)
+            );
+            let update = run(&["role", "plain", role]);
+            assert!(
+                !update.status.success(),
+                "{state}: accepted role update {role}"
+            );
+        }
+    }
+    let created = run(&[
+        "agents",
+        "create",
+        "current",
+        "--workdir",
+        workspace,
+        "--role",
+        "worker",
+    ]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let update = run(&["role", "plain", "worker"]);
+    assert!(
+        update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    let store = Store::open(data.join("state.db")).unwrap();
+    assert!(store.agent_by_name("rejected").is_err());
+    let agent = store.agent_by_name("current").unwrap();
+    assert_eq!(agent.role.as_deref(), Some("worker"));
+    assert!(
+        agent
+            .instructions
+            .as_deref()
+            .unwrap()
+            .contains("Authoritative template.")
+    );
+    let prompt = std::fs::read_to_string(
+        data.join("agents")
+            .join(agent.id.as_str())
+            .join("config/AGENTS.md"),
+    )
+    .unwrap();
+    let catalog = prompt
+        .lines()
+        .find(|line| line.contains("Available sub-agent roles"))
+        .unwrap();
+    assert!(catalog.contains("worker"), "{catalog}");
+    assert!(!catalog.contains("retired"), "{catalog}");
+
+    // Removing the last owner role must not resurrect an identically named fallback.
+    std::fs::remove_file(owner.join(".agents/agents/worker.md")).unwrap();
+    let rejected = run(&["agents", "create", "removed", "--role", "worker"]);
+    assert!(!rejected.status.success());
+    let update = run(&["role", "plain", "worker"]);
+    assert!(!update.status.success());
+    assert!(store.agent_by_name("removed").is_err());
 }
 
 #[test]
@@ -281,6 +432,129 @@ fn closed_stdout_uses_sigpipe_without_panicking() {
     );
 }
 
+/// Worktree admission runs this binary's own helper as the seat. It decides
+/// with nothing on `PATH` but the Git it is handed (a host image that wraps
+/// `find`, `sh` or `test` cannot change the answer) and answers through its
+/// exit status: 0 admitted, 1 refused with the reason on stderr, 2 misused.
+#[test]
+fn internal_admission_probe_needs_no_host_tool_but_git() {
+    use std::os::unix::fs::PermissionsExt;
+    // A real Git binary first: the test PATH may start with an operator
+    // wrapper script, which cannot run on the probe's empty PATH.
+    let git = ["/usr/bin", "/usr/local/bin", "/bin"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap()))
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .expect("git on the test PATH");
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(tree.join("src")).unwrap();
+    std::fs::write(tree.join("src/file"), "x").unwrap();
+    let init = Command::new(&git)
+        .args(["init", "-q", "-b", "main"])
+        .arg(&tree)
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    let probe = |args: &[&std::ffi::OsStr]| {
+        bin()
+            .env_clear()
+            .env("PATH", "/nonexistent")
+            .env("HOME", "/nonexistent")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(["internal", "admission-probe"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let full = |path: &std::path::Path| {
+        probe(&[
+            "--git".as_ref(),
+            git.as_os_str(),
+            "--".as_ref(),
+            path.as_os_str(),
+        ])
+    };
+    let admitted = full(&tree);
+    assert!(
+        admitted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&admitted.stderr)
+    );
+    assert_eq!(probe(&["--git".as_ref()]).status.code(), Some(2));
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root may write everything
+    }
+    let file = tree.join("src/file");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let refused = full(&tree);
+    assert_eq!(refused.status.code(), Some(1));
+    let reason = String::from_utf8_lossy(&refused.stderr);
+    assert!(reason.contains(file.to_str().unwrap()), "{reason}");
+}
+
+/// `anyagents internal seat-file`, the helper a seat runs for the daemon's
+/// file changes, needs no environment at all (no `PATH`, so no host tool).
+/// It exits 0 done, 1 refused with the reason on stderr, 2 misused.
+#[test]
+fn internal_seat_file_needs_no_host_tool() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let bytes: Vec<u8> = (0..100_000u32).map(|i| (i % 253) as u8).collect();
+    std::fs::write(&source, &bytes).unwrap();
+    let helper = |args: &[&str]| {
+        bin()
+            .env_clear()
+            .current_dir(dir.path())
+            .args(["internal", "seat-file"])
+            .args(args)
+            .stdin(std::fs::File::open(&source).unwrap())
+            .output()
+            .unwrap()
+    };
+    let copy = dir.path().join(".seat-copy-x");
+    let copied = helper(&["copy", ".seat-copy-x"]);
+    assert!(
+        copied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&copied.stderr)
+    );
+    assert_eq!(std::fs::read(&copy).unwrap(), bytes);
+    assert_eq!(
+        std::fs::metadata(&copy).unwrap().permissions().mode() & 0o7777,
+        0o660
+    );
+    assert!(helper(&["readback", ".seat-copy-x"]).status.success());
+    // A copy never replaces an existing name.
+    assert_eq!(helper(&["copy", ".seat-copy-x"]).status.code(), Some(1));
+    std::fs::write(&source, b"changed").unwrap();
+    let differs = helper(&["readback", ".seat-copy-x"]);
+    assert_eq!(differs.status.code(), Some(1));
+    let reason = String::from_utf8_lossy(&differs.stderr);
+    assert!(reason.contains("differs"), "{reason}");
+    assert!(helper(&["inode", "600"]).status.success());
+    assert_eq!(
+        std::fs::metadata(&source).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+    assert!(helper(&["unlink", ".seat-copy-x"]).status.success());
+    assert!(!copy.exists());
+    assert!(helper(&["unlink", ".seat-copy-x"]).status.success());
+    for misuse in [
+        &["copy", "../escape"][..],
+        &["copy"],
+        &["inode", "99999"],
+        &["inode", "600", "group"],
+        &["chmod", "600"],
+    ] {
+        assert_eq!(helper(misuse).status.code(), Some(2), "{misuse:?}");
+    }
+}
+
 #[test]
 fn plain_log_tail_keeps_the_bounded_conversation_route() {
     use std::io::{Read, Write};
@@ -330,6 +604,71 @@ fn plain_log_tail_keeps_the_bounded_conversation_route() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(value["turns"].as_array().unwrap().is_empty());
     server.join().unwrap();
+}
+
+#[test]
+fn send_operator_reaches_the_operator_inbox_and_an_agent_cannot_read_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let create = bin_in(dir.path())
+        .args(["agents", "create", "alpha"])
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let send = || {
+        bin()
+            .arg("--data")
+            .arg(dir.path())
+            .args(["send", "operator", "git push: 403", "--from", "agent:alpha"])
+            .output()
+            .unwrap()
+    };
+    let first = send();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let again = String::from_utf8(send().stdout).unwrap();
+    assert!(again.trim_end().ends_with("duplicate"), "{again}");
+
+    let read = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .args(["inbox", "--operator", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
+    let messages = value["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1, "{value}");
+    assert_eq!(messages[0]["text"], "git push: 403");
+    assert_eq!(messages[0]["sender_name"], "alpha");
+
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let alpha = store.agent_by_name("alpha").unwrap();
+    let as_agent = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .env("ANYAGENTS_AGENT_ID", alpha.id.as_str())
+        .args(["inbox", "--operator"])
+        .output()
+        .unwrap();
+    assert!(!as_agent.status.success());
+    let mixed = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .args(["inbox", "--operator", "alpha"])
+        .output()
+        .unwrap();
+    assert!(!mixed.status.success());
 }
 
 #[test]
@@ -516,7 +855,8 @@ fn create_registers_mcp_only_in_the_agent_config() {
         agent.workdir.as_deref(),
         Some(std::path::absolute(&custom).unwrap().to_str().unwrap())
     );
-    assert!(dir.path().join("agents").join(&id).join("work").is_dir());
+    assert!(custom.is_dir());
+    assert!(!dir.path().join("agents").join(&id).join("work").exists());
     assert!(!custom.join(".mcp.json").exists());
     assert!(!dir.path().join(".claude.json").exists());
     assert!(!dir.path().join("config.toml").exists());
@@ -561,10 +901,17 @@ fn create_registers_mcp_only_in_the_agent_config() {
         .next()
         .unwrap()
         .to_string();
+    assert!(
+        dir.path()
+            .join("agents")
+            .join(&codex_id)
+            .join("work")
+            .is_dir()
+    );
     let toml = std::fs::read_to_string(
         dir.path()
             .join("agents")
-            .join(codex_id)
+            .join(&codex_id)
             .join("config")
             .join("config.toml"),
     )

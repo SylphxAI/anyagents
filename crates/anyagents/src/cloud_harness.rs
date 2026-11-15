@@ -8,11 +8,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyagents_core::Error;
 use anyagents_harness::normalize_harness_name;
@@ -21,7 +18,8 @@ use serde_json::{Value, json};
 
 #[derive(Args, Clone, Debug)]
 pub struct CloudHarnessArgs {
-    /// Agent configuration directory containing `mcp-capability` and credentials.
+    /// Agent configuration directory containing the server-issued remote session token,
+    /// the MCP callback URL and credentials.
     #[arg(long)]
     pub config: Option<PathBuf>,
     /// Cloud harness identifier (`spiron-cloud`, `claude-cloud`, `openai-cloud`, `cursor-cloud`).
@@ -107,7 +105,7 @@ pub fn run_with_io<R: BufRead, W: Write + Send + 'static>(
     let writer = Arc::new(Mutex::new(writer));
 
     type ActiveTurn = (
-        Arc<AtomicBool>,
+        Arc<TurnCancel>,
         Arc<Mutex<Option<String>>>,
         std::thread::JoinHandle<()>,
     );
@@ -130,7 +128,7 @@ pub fn run_with_io<R: BufRead, W: Write + Send + 'static>(
                     .and_then(Value::as_str)
                     .is_some_and(|s| s == "interrupt" || s == "cancel");
             if is_interrupt && let Some((cancel_flag, active_job_id, handle)) = active_turn.take() {
-                cancel_flag.store(true, Ordering::SeqCst);
+                cancel_flag.cancel();
                 if let Some(job_id) = active_job_id.lock().unwrap().clone() {
                     let base_url = resolve_cloud_base_url(&config, &harness);
                     let auth_token = resolve_cloud_auth_token(&config, &harness);
@@ -148,16 +146,18 @@ pub fn run_with_io<R: BufRead, W: Write + Send + 'static>(
             let _ = prev_handle.join();
         }
 
-        // Echo the user message back immediately so `ClaudeHarness` records the
-        // message marker as echoed (`note_echo` / `note_markers`).
+        // The line starts its turn now: echo it back as Claude Code's
+        // `--replay-user-messages` does, the proof `ClaudeHarness` waits for.
         {
+            let mut echo = event.clone();
+            echo["isReplay"] = Value::Bool(true);
             let mut out = writer.lock().unwrap();
-            writeln!(out, "{trimmed}")?;
+            writeln!(out, "{echo}")?;
             out.flush()?;
         }
 
         let prompt_text = extract_user_prompt(&event);
-        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_flag = Arc::new(TurnCancel::default());
         let active_job_id = Arc::new(Mutex::new(None));
 
         let cfg_clone = config.clone();
@@ -303,42 +303,50 @@ fn extract_user_prompt(event: &Value) -> String {
     String::new()
 }
 
-pub fn resolve_capability_token(config: &Path) -> Result<String, String> {
-    if let Ok(raw) = std::fs::read_to_string(config.join("mcp-capability")) {
-        let trimmed = raw.trim();
+/// The MCP URL this agent's remote session calls back to. The server writes it
+/// from `public_url` when it starts the agent ([`crate::remote::MCP_URL_FILE`]);
+/// `ANYAGENTS_PUBLIC_MCP_URL` and `cloud.json` `mcp_url` remain as overrides
+/// for an adapter run by hand. There is no loopback default: a remote vendor
+/// cannot reach this host's loopback, and a token sent there is wasted.
+pub fn resolve_public_mcp_url(config: &Path) -> Result<String, String> {
+    if let Ok(file_url) = std::fs::read_to_string(config.join(crate::remote::MCP_URL_FILE)) {
+        let trimmed = file_url.trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
         }
     }
-    if let Ok(env_cap) = std::env::var("ANYAGENTS_AGENT_CAPABILITY") {
-        let trimmed = env_cap.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
-    Err(format!("missing `mcp-capability` in {}", config.display()))
-}
-
-pub fn resolve_public_mcp_url(config: &Path) -> String {
     if let Ok(url) = std::env::var("ANYAGENTS_PUBLIC_MCP_URL") {
         let trimmed = url.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    if let Ok(file_url) = std::fs::read_to_string(config.join(".anyagents-mcp-url")) {
-        let trimmed = file_url.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return Ok(trimmed.to_string());
         }
     }
     if let Some(cloud_cfg) = read_cloud_json(config)
         && let Some(url) = cloud_cfg.get("mcp_url").and_then(Value::as_str)
         && !url.trim().is_empty()
     {
-        return url.trim().to_string();
+        return Ok(url.trim().to_string());
     }
-    "http://127.0.0.1:8788/v1/webhooks/mcp".to_string()
+    Err(format!(
+        "no MCP callback URL for this remote agent in {}: set `public_url` under `[server]` in \
+         the server's `{}` and start the agent again",
+        config.display(),
+        crate::remote::CONFIG_FILE
+    ))
+}
+
+/// The MCP profile a remote session asks for: `coordination` when `cloud.json`
+/// names it, else `remote`. A remote session token never gets more.
+fn remote_mcp_profile(config: &Path) -> &'static str {
+    let named = read_cloud_json(config).and_then(|v| {
+        v.get("mcp_profile")
+            .and_then(Value::as_str)
+            .and_then(crate::mcp::McpProfile::from_str_opt)
+    });
+    match named {
+        Some(crate::mcp::McpProfile::Coordination) => "coordination",
+        _ => "remote",
+    }
 }
 
 pub fn mcp_url_with_profile(base_url: &str, profile: &str) -> String {
@@ -550,20 +558,11 @@ pub fn resolve_cloud_disabled_tools(config: &Path) -> Vec<String> {
         }
     }
     if disable_builtin_tools_flag(config) {
-        return vec![
-            "bash".to_string(),
-            "read".to_string(),
-            "write".to_string(),
-            "edit".to_string(),
-            "glob".to_string(),
-            "grep".to_string(),
-            "web_search".to_string(),
-            "web_fetch".to_string(),
-            "memory".to_string(),
-            "skills".to_string(),
-            "browser".to_string(),
-            "computer".to_string(),
-        ];
+        // Only the vendor tools the `remote` MCP profile replaces. File, shell,
+        // web, browser and computer tools stay with the vendor: their AnyAgents
+        // counterparts run on the control-plane host, which a remote session
+        // never reaches.
+        return vec!["memory".to_string(), "skills".to_string()];
     }
     Vec::new()
 }
@@ -671,7 +670,7 @@ pub fn dispatch_cloud_turn(
     session_id: Option<&str>,
     prompt_text: &str,
 ) -> Result<CloudTurnOutcome, String> {
-    let cancel_flag = AtomicBool::new(false);
+    let cancel_flag = TurnCancel::default();
     let active_job_id = Mutex::new(None);
     dispatch_cloud_turn_with_cancel(
         config,
@@ -690,36 +689,23 @@ pub fn dispatch_cloud_turn_with_cancel(
     model: Option<&str>,
     session_id: Option<&str>,
     prompt_text: &str,
-    cancel_flag: &AtomicBool,
+    cancel_flag: &TurnCancel,
     active_job_id: &Mutex<Option<String>>,
 ) -> Result<CloudTurnOutcome, String> {
-    if cancel_flag.load(Ordering::SeqCst) {
+    if cancel_flag.is_cancelled() {
         return Err("cancelled by supervisor interrupt".to_string());
     }
 
-    let capability = resolve_capability_token(config)?;
-    let mcp_base_url = resolve_public_mcp_url(config);
+    // The remote session token the server issued for this agent, read before
+    // every turn so a rotation takes effect at once. The agent's local mailbox
+    // capability is never handed to a vendor.
+    let capability = crate::remote::session_token(config)?;
+    let mcp_base_url = resolve_public_mcp_url(config)?;
     let base_url = resolve_cloud_base_url(config, harness);
     let auth_token = resolve_cloud_auth_token(config, harness);
     let canonical = normalize_harness_name(harness);
 
-    let default_profile = if let Some(explicit) = read_cloud_json(config)
-        .and_then(|v| {
-            v.get("mcp_profile")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .filter(|s| !s.trim().is_empty())
-    {
-        explicit
-    } else if anyagents_tools::SandboxConfig::resolve(Some(config)).is_some()
-        || disable_builtin_tools_flag(config)
-    {
-        "full".to_string()
-    } else {
-        "remote".to_string()
-    };
-    let mcp_url = mcp_url_with_profile(&mcp_base_url, &default_profile);
+    let mcp_url = mcp_url_with_profile(&mcp_base_url, remote_mcp_profile(config));
     let system_prompt = build_cloud_system_prompt(config);
     let disabled_tools = resolve_cloud_disabled_tools(config);
 
@@ -980,31 +966,69 @@ pub fn cancel_cloud_turn(
     Ok(())
 }
 
+/// A turn's cancellation: set once when the supervisor interrupts the turn,
+/// and waited on by the turn between status polls, so an interrupt ends the
+/// wait at once instead of at the next poll.
+#[derive(Default)]
+pub struct TurnCancel {
+    cancelled: Mutex<bool>,
+    signal: Condvar,
+}
+
+impl TurnCancel {
+    pub fn cancel(&self) {
+        *self.cancelled.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.signal.notify_all();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.cancelled.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wait up to `timeout`; `true` when the turn was cancelled.
+    fn wait(&self, timeout: Duration) -> bool {
+        let cancelled = self.cancelled.lock().unwrap_or_else(|e| e.into_inner());
+        *self
+            .signal
+            .wait_timeout_while(cancelled, timeout, |cancelled| !*cancelled)
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+    }
+}
+
+/// The longest wait between two status polls of one cloud job. Polls start
+/// at the configured interval and double up to this, so a short job is seen
+/// at once and a long one costs a request a second, not twenty.
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Polls a job may make at its first interval: the whole wait a job gets.
+const POLL_BUDGET: u32 = 6_000;
+
 fn poll_cloud_job_until_done(
     agent: &ureq::Agent,
     base_url: &str,
     canonical: &str,
     auth_token: Option<&str>,
     job_id: &str,
-    cancel_flag: &AtomicBool,
+    cancel_flag: &TurnCancel,
 ) -> Result<Value, String> {
     let status_url = cloud_job_status_url(base_url, canonical, job_id);
-    let poll_ms = std::env::var("ANYAGENTS_CLOUD_POLL_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(50)
-        .clamp(10, 5_000);
+    let first = Duration::from_millis(
+        std::env::var("ANYAGENTS_CLOUD_POLL_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(50)
+            .clamp(10, 5_000),
+    );
+    let deadline = Instant::now() + first * POLL_BUDGET;
+    let mut interval = first;
 
-    for _ in 0..6_000 {
-        if cancel_flag.load(Ordering::SeqCst) {
+    while Instant::now() < deadline {
+        if cancel_flag.wait(interval) {
             let _ = cancel_cloud_turn(base_url, canonical, auth_token, job_id);
             return Err("cancelled by supervisor interrupt".to_string());
         }
-        std::thread::sleep(Duration::from_millis(poll_ms));
-        if cancel_flag.load(Ordering::SeqCst) {
-            let _ = cancel_cloud_turn(base_url, canonical, auth_token, job_id);
-            return Err("cancelled by supervisor interrupt".to_string());
-        }
+        interval = (interval * 2).min(MAX_POLL_INTERVAL.max(first));
 
         let mut req = agent.get(&status_url);
         if let Some(tok) = auth_token {
@@ -1240,6 +1264,7 @@ mod tests {
         http::{HeaderMap, StatusCode},
         routing::post,
     };
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
@@ -1348,7 +1373,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("agent-cfg");
         std::fs::create_dir_all(&cfg).unwrap();
-        std::fs::write(cfg.join("mcp-capability"), "cap-secret-xyz\n").unwrap();
+        // The local capability is present and must never reach a vendor: the
+        // adapter presents the server-issued remote session token.
+        std::fs::write(cfg.join("mcp-capability"), "cap-local-never-sent\n").unwrap();
+        let remote = format!("aars_{}", "a".repeat(64));
+        std::fs::write(cfg.join(crate::remote::TOKEN_FILE), format!("{remote}\n")).unwrap();
         std::fs::write(
             cfg.join(".anyagents-mcp-url"),
             "https://mcp.example.test/mcp\n",
@@ -1401,7 +1430,7 @@ mod tests {
                 calls[0]["mcp_servers"][0]["url"],
                 "https://mcp.example.test/mcp?profile=remote"
             );
-            assert_eq!(calls[0]["mcp_servers"][0]["bearer_token"], "cap-secret-xyz");
+            assert_eq!(calls[0]["mcp_servers"][0]["bearer_token"], remote.as_str());
             assert_eq!(calls[0]["disabled_tools"], json!(["bash", "write"]));
             let sys = calls[0]["system_prompt"].as_str().unwrap();
             assert!(sys.contains("<learned_memory>"), "{sys}");
@@ -1438,7 +1467,7 @@ mod tests {
             );
             assert_eq!(
                 calls[0].1["mcp_servers"][0]["authorization_token"],
-                "cap-secret-xyz"
+                remote.as_str()
             );
             let sys = calls[0].1["system"].as_str().unwrap();
             assert!(sys.contains("<learned_memory>"), "{sys}");
@@ -1480,7 +1509,7 @@ mod tests {
             );
             assert_eq!(
                 calls[0]["tools"][0]["headers"]["Authorization"],
-                "Bearer cap-secret-xyz"
+                format!("Bearer {remote}").as_str()
             );
             let sys = calls[0]["instructions"].as_str().unwrap();
             assert!(sys.contains("<learned_memory>"), "{sys}");
@@ -1512,7 +1541,7 @@ mod tests {
                 calls[0]["mcp_servers"][0]["url"],
                 "https://mcp.example.test/mcp?profile=remote"
             );
-            assert_eq!(calls[0]["mcp_servers"][0]["bearer_token"], "cap-secret-xyz");
+            assert_eq!(calls[0]["mcp_servers"][0]["bearer_token"], remote.as_str());
             let sys = calls[0]["system_prompt"].as_str().unwrap();
             assert!(sys.contains("<learned_memory>"), "{sys}");
             assert!(sys.contains("<available_skills>"), "{sys}");
@@ -1675,7 +1704,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("agent-cfg");
         std::fs::create_dir_all(&cfg).unwrap();
-        std::fs::write(cfg.join("mcp-capability"), "cap-sse-tok\n").unwrap();
+        std::fs::write(
+            cfg.join(crate::remote::TOKEN_FILE),
+            format!("aars_{}\n", "b".repeat(64)),
+        )
+        .unwrap();
         std::fs::write(
             cfg.join(".anyagents-mcp-url"),
             "https://mcp.example.test/mcp\n",
@@ -1819,5 +1852,142 @@ mod tests {
         {
             assert_eq!(tok.as_deref(), Some("sp_tok_abc123"));
         }
+    }
+
+    /// A job status endpoint that reports `running` until `done_after` has
+    /// passed, counts its polls, and records a cancel.
+    fn job_server(done_after: Option<Duration>) -> (String, Arc<Mutex<(usize, bool)>>) {
+        use std::io::{BufRead as _, Read as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new((0usize, false)));
+        let recorded = Arc::clone(&seen);
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; length];
+                let _ = reader.read_exact(&mut body);
+                let answer = if request_line.contains("/cancel") {
+                    recorded.lock().unwrap().1 = true;
+                    json!({"status": "cancelled"})
+                } else {
+                    recorded.lock().unwrap().0 += 1;
+                    if done_after.is_some_and(|after| started.elapsed() >= after) {
+                        json!({"id": "run_1", "status": "completed", "result": "done"})
+                    } else {
+                        json!({"id": "run_1", "status": "running"})
+                    }
+                }
+                .to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+            }
+        });
+        (base, seen)
+    }
+
+    fn poll_agent() -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .http_status_as_error(false)
+            .build()
+            .into()
+    }
+
+    #[test]
+    fn a_long_job_is_polled_less_often_as_it_runs() {
+        let (base, seen) = job_server(Some(Duration::from_millis(1_500)));
+        let done = poll_cloud_job_until_done(
+            &poll_agent(),
+            &base,
+            "spiron-cloud",
+            None,
+            "run_1",
+            &TurnCancel::default(),
+        )
+        .unwrap();
+        assert_eq!(done["result"], "done");
+        // A fixed 50 ms interval asks about thirty times in 1.5 s.
+        let polls = seen.lock().unwrap().0;
+        assert!((2..=10).contains(&polls), "polled {polls} times");
+    }
+
+    #[test]
+    fn a_cloud_turn_never_falls_back_to_the_local_capability_or_a_loopback_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path();
+        std::fs::write(cfg.join("mcp-capability"), "cap-local\n").unwrap();
+        let err = dispatch_cloud_turn(cfg, "claude-cloud", None, None, "hi").unwrap_err();
+        assert!(err.contains("remote session token"), "{err}");
+
+        std::fs::write(
+            cfg.join(crate::remote::TOKEN_FILE),
+            format!("aars_{}\n", "c".repeat(64)),
+        )
+        .unwrap();
+        if std::env::var_os("ANYAGENTS_PUBLIC_MCP_URL").is_none() {
+            let err = resolve_public_mcp_url(cfg).unwrap_err();
+            assert!(err.contains("public_url"), "{err}");
+            let err = dispatch_cloud_turn(cfg, "claude-cloud", None, None, "hi").unwrap_err();
+            assert!(err.contains("public_url"), "{err}");
+        }
+
+        // A file that does not hold a remote session token is refused.
+        std::fs::write(cfg.join(crate::remote::TOKEN_FILE), "cap-local\n").unwrap();
+        assert!(crate::remote::session_token(cfg).is_err());
+    }
+
+    #[test]
+    fn a_remote_session_asks_for_the_remote_profile_and_keeps_unreplaced_vendor_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path();
+        assert_eq!(remote_mcp_profile(cfg), "remote");
+        std::fs::write(
+            cfg.join("cloud.json"),
+            r#"{"mcp_profile":"full","disable_builtin_tools":true}"#,
+        )
+        .unwrap();
+        assert_eq!(remote_mcp_profile(cfg), "remote");
+        assert_eq!(resolve_cloud_disabled_tools(cfg), vec!["memory", "skills"]);
+        std::fs::write(cfg.join("cloud.json"), r#"{"mcp_profile":"coordination"}"#).unwrap();
+        assert_eq!(remote_mcp_profile(cfg), "coordination");
+    }
+
+    #[test]
+    fn an_interrupt_ends_the_wait_between_polls_at_once() {
+        let (base, seen) = job_server(None);
+        let cancel = Arc::new(TurnCancel::default());
+        let interrupt = Arc::clone(&cancel);
+        let interrupter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1_200));
+            interrupt.cancel();
+            Instant::now()
+        });
+        let error =
+            poll_cloud_job_until_done(&poll_agent(), &base, "spiron-cloud", None, "run_1", &cancel)
+                .unwrap_err();
+        let ended = Instant::now();
+        let interrupted = interrupter.join().unwrap();
+        assert!(error.contains("cancelled"), "{error}");
+        // The wait between polls is a second by now; the interrupt cuts it.
+        assert!(ended.duration_since(interrupted) < Duration::from_millis(500));
+        assert!(seen.lock().unwrap().1, "the remote job was not cancelled");
     }
 }

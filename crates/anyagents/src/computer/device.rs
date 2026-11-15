@@ -57,13 +57,15 @@ async fn run_adb(serial: Option<&str>, args: &[&str], timeout_ms: u64) -> Result
 
 /// Execute a `tools.device` (Android/iOS mobile device control) request.
 pub async fn execute_device_request(work_dir: &Path, req: Value) -> Result<Value, String> {
+    let mutating = device_request_mutates(&req);
     mobile::execute(work_dir, req).await.map_err(|err| {
         if err.contains("\"disposition\"") { err } else {
-            let mut disposition = classify_computer_error(&err);
+            let mut disposition = classify_computer_error(&err, mutating);
             disposition.hint = Some(match disposition.kind.as_str() {
                 "stale_ref" => "Call tools.device.snapshot() for fresh refs on this device.",
                 "settled_absence" => "Inspect the device and take a new tools.device.snapshot(); do not blindly retry.",
                 "retryable_failure" => "Transient device transport failure; retry once.",
+                "delivery_uncertain" => "The action may already have reached the device; take a new tools.device.snapshot() and verify before repeating it.",
                 _ => "Check platform, device identity, and adb/idb/simctl/WDA configuration.",
             }.into());
             format_computer_error(err, disposition)

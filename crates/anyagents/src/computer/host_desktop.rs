@@ -306,11 +306,12 @@ async fn capture_local_screenshot(
 /// **Semantic Accessibility Snapshot Mode (`@<snapshot_id>:e<N>`)** and
 /// **Visual Pixel Mode** with structured error retry dispositions.
 pub async fn execute(config_dir: &Path, req: Value) -> Result<Value, String> {
+    let mutating = computer_request_mutates(&req);
     match execute_inner(config_dir, req).await {
         Ok(val) => Ok(val),
         Err(err) if err.contains("\"disposition\"") => Err(err),
         Err(err) => {
-            let disp = classify_computer_error(&err);
+            let disp = classify_computer_error(&err, mutating);
             Err(format_computer_error(err, disp))
         }
     }

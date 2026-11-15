@@ -204,6 +204,7 @@ fn serve(
 
 struct Server {
     child: Child,
+    _keepers: support::Keepers,
 }
 
 impl Server {
@@ -228,7 +229,10 @@ impl Server {
             assert!(Instant::now() < deadline, "no socket");
             thread::sleep(Duration::from_millis(20));
         }
-        Self { child }
+        Self {
+            child,
+            _keepers: support::Keepers::of(dir),
+        }
     }
 }
 
@@ -239,21 +243,10 @@ impl Drop for Server {
     }
 }
 
-/// A `PATH` where creating an agent installs nothing: `npm` answers a version
-/// and a no-op install.
+/// Preserve the inherited command PATH with explicit offline managed sources.
 fn machine_path(dir: &Path) -> std::ffi::OsString {
-    use std::os::unix::fs::PermissionsExt;
+    support::managed_harnesses(dir);
     let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let npm = bin.join("npm");
-    if !npm.exists() {
-        std::fs::write(
-            &npm,
-            "#!/bin/sh\ncase \"$1\" in view) echo 0.0.0 ;; esac\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
     let mut paths = vec![bin];
     if let Some(sys) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&sys));

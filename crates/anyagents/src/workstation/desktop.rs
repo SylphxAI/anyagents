@@ -8,29 +8,53 @@ use agent_workstation::{Button, Frame, Input};
 use anyagents_core::Error;
 use serde_json::{Value, json};
 
-use super::ToolError;
+use super::{Caller, ToolError};
 use crate::computer::{
     ComputerAction, MouseButton, Point, Region, ScrollDirection, base64_encode,
     parse_computer_action,
 };
 
-/// Execute a session `tools.computer` request for the calling agent.
-pub async fn execute(data: &Path, default_profile: &str, req: Value) -> Result<Value, Error> {
-    run(data, default_profile, req)
+/// Execute a session `tools.computer` request for `caller`.
+pub async fn execute(data: &Path, caller: &Caller, req: Value) -> Result<Value, Error> {
+    let mutating = crate::computer::computer_request_mutates(&req);
+    run(data, caller, req)
         .await
-        .map_err(|e| e.into_error(false))
+        .map_err(|e| e.into_action_error(false, mutating))
 }
 
-fn button(b: MouseButton) -> Result<Button, ToolError> {
+fn button(b: MouseButton) -> Button {
     match b {
-        MouseButton::Left => Ok(Button::Left),
-        MouseButton::Middle => Ok(Button::Middle),
-        MouseButton::Right => Ok(Button::Right),
-        // P6 pending: Button::Back / Forward.
-        MouseButton::Back | MouseButton::Forward => Err(ToolError::unsupported(
-            "back/forward mouse buttons are not available on the session desktop in this release",
-        )),
+        MouseButton::Left => Button::Left,
+        MouseButton::Middle => Button::Middle,
+        MouseButton::Right => Button::Right,
+        MouseButton::Back => Button::Back,
+        MouseButton::Forward => Button::Forward,
     }
+}
+
+/// Translate browser-style key names (`ArrowUp`, `PageDown`, `Control+a`)
+/// into the desktop keyboard's chord names; anything else passes through.
+pub(crate) fn chord(raw: &str) -> String {
+    raw.split('+')
+        .map(|part| {
+            let p = part.trim();
+            match p.to_ascii_lowercase().as_str() {
+                "arrowup" => "up".into(),
+                "arrowdown" => "down".into(),
+                "arrowleft" => "left".into(),
+                "arrowright" => "right".into(),
+                "pageup" | "prior" => "pageup".into(),
+                "pagedown" | "next" => "pagedown".into(),
+                "control" | "ctl" => "ctrl".into(),
+                "option" => "alt".into(),
+                "command" | "win" | "windows" => "super".into(),
+                "spacebar" => "space".into(),
+                "" if raw.trim() == "+" => "+".into(),
+                _ => p.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 fn at(p: Point) -> Input {
@@ -40,16 +64,17 @@ fn at(p: Point) -> Input {
     }
 }
 
-/// B4 pending: modifiers held across pointer input need Input::KeyDown / KeyUp.
-fn no_modifiers(modifiers: &[String]) -> Result<(), ToolError> {
+/// Pointer `steps` with `modifiers` held around them.
+fn with_modifiers(modifiers: &[String], steps: Vec<Input>) -> Vec<Input> {
     if modifiers.is_empty() {
-        Ok(())
-    } else {
-        Err(ToolError::unsupported(
-            "holding modifier keys during pointer input is not available on the session desktop \
-             in this release",
-        ))
+        return steps;
     }
+    let held = chord(&modifiers.join("+"));
+    let mut all = Vec::with_capacity(steps.len() + 2);
+    all.push(Input::KeyDown(held.clone()));
+    all.extend(steps);
+    all.push(Input::KeyUp(held));
+    all
 }
 
 fn png_json(action: &str, png: &[u8], width: u32, height: u32) -> Value {
@@ -87,10 +112,11 @@ fn crop(frame: &Frame, region: Region) -> Result<Frame, ToolError> {
     })
 }
 
-async fn run(data: &Path, default_profile: &str, req: Value) -> Result<Value, ToolError> {
+async fn run(data: &Path, caller: &Caller, req: Value) -> Result<Value, ToolError> {
     let payload = req
         .get("action_json")
         .or_else(|| req.get("payload"))
+        .or_else(|| req.get("request"))
         .cloned()
         .unwrap_or_else(|| req.clone());
     let raw_action = payload
@@ -101,29 +127,7 @@ async fn run(data: &Path, default_profile: &str, req: Value) -> Result<Value, To
         .trim()
         .to_ascii_lowercase();
     let profile =
-        super::sanitize_profile_name(req.get("profile").and_then(Value::as_str), default_profile);
-
-    match raw_action.as_str() {
-        // P4 pending: clipboard_get / clipboard_set.
-        "clipboard_get" | "clipboard_set" => {
-            return Err(ToolError::unsupported(
-                "the session desktop clipboard is not available in this release",
-            ));
-        }
-        // P5 pending: pointer_position.
-        "cursor_position" => {
-            return Err(ToolError::unsupported(
-                "cursor_position is not available on the session desktop in this release",
-            ));
-        }
-        // B4 pending: Input::KeyDown / KeyUp.
-        "hold_key" => {
-            return Err(ToolError::unsupported(
-                "holding keys is not available on the session desktop in this release",
-            ));
-        }
-        _ => {}
-    }
+        super::sanitize_profile_name(req.get("profile").and_then(Value::as_str), &caller.profile);
     if payload
         .get("ref")
         .or_else(|| payload.get("ref_id"))
@@ -135,20 +139,18 @@ async fn run(data: &Path, default_profile: &str, req: Value) -> Result<Value, To
         ));
     }
 
-    let live = super::session::acquire(data, &profile, default_profile, None).await?;
-    let s = &live.session;
+    let live = super::session::acquire(data, &profile, &caller.principal, None).await?;
+    let s = live
+        .session
+        .lease(&caller.principal)
+        .map_err(ToolError::from)?;
     let out = match raw_action.as_str() {
         "snapshot" => {
             let snap = s.snapshot().await?;
-            let id = crate::computer::generate_snapshot_id();
-            live.set_snapshot(Some(super::session::SnapshotMark {
-                id: id.clone(),
-                url: snap.url.clone(),
-            }));
             json!({
                 "action": "snapshot",
                 "platform": "session_desktop",
-                "snapshot_id": id,
+                "snapshot_id": snap.id,
                 "url": snap.url,
                 "snapshot": snap.text,
                 "refs": snap.refs,
@@ -163,7 +165,7 @@ async fn run(data: &Path, default_profile: &str, req: Value) -> Result<Value, To
                 .find(|t| t.active)
                 .map(|t| t.title)
                 .unwrap_or_default();
-            let (w, h) = s.size();
+            let (w, h) = live.session.size();
             json!({
                 "action": "list_windows",
                 "count": 1,
@@ -186,9 +188,20 @@ async fn run(data: &Path, default_profile: &str, req: Value) -> Result<Value, To
             }
             json!({ "action": "focus_window", "window_id": wid, "status": "focused" })
         }
+        "clipboard_get" => {
+            json!({ "action": "clipboard_get", "text": s.clipboard_text().await? })
+        }
+        "clipboard_set" => {
+            let text = payload
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::invalid("clipboard_set requires `text`"))?;
+            s.set_clipboard_text(text).await?;
+            json!({ "action": "clipboard_set", "chars": text.chars().count() })
+        }
         _ => {
             let action = parse_computer_action(&payload).map_err(ToolError::invalid)?;
-            pixel(s, action).await?
+            pixel(&s, action).await?
         }
     };
     live.touch();
@@ -196,7 +209,7 @@ async fn run(data: &Path, default_profile: &str, req: Value) -> Result<Value, To
 }
 
 async fn pixel(
-    s: &agent_workstation::DesktopSession,
+    s: &agent_workstation::Agent<'_>,
     action: ComputerAction,
 ) -> Result<Value, ToolError> {
     Ok(match action {
@@ -213,9 +226,10 @@ async fn pixel(
             v
         }
         ComputerAction::CursorPosition => {
-            return Err(ToolError::unsupported(
-                "cursor_position is not available on the session desktop in this release",
-            ));
+            let (x, y) = s.pointer_position()?.ok_or_else(|| {
+                ToolError::unsupported("the pointer has not been placed on this desktop yet")
+            })?;
+            json!({ "action": "cursor_position", "x": x.round() as i64, "y": y.round() as i64 })
         }
         ComputerAction::MouseMove { coordinate } => {
             s.input(vec![at(coordinate)]).await?;
@@ -227,8 +241,7 @@ async fn pixel(
             count,
             modifiers,
         } => {
-            no_modifiers(&modifiers)?;
-            let b = button(b)?;
+            let b = button(b);
             let mut steps = vec![at(coordinate)];
             for _ in 0..count.max(1) {
                 steps.push(Input::Button {
@@ -240,7 +253,7 @@ async fn pixel(
                     pressed: false,
                 });
             }
-            s.input(steps).await?;
+            s.input(with_modifiers(&modifiers, steps)).await?;
             json!({ "action": "click", "coordinate": coordinate, "count": count.max(1) })
         }
         ComputerAction::MouseDown {
@@ -254,7 +267,7 @@ async fn pixel(
             let pressed = matches!(action, ComputerAction::MouseDown { .. });
             let mut steps: Vec<Input> = coordinate.map(at).into_iter().collect();
             steps.push(Input::Button {
-                button: button(b)?,
+                button: button(b),
                 pressed,
             });
             s.input(steps).await?;
@@ -265,7 +278,7 @@ async fn pixel(
             end,
             button: b,
         } => {
-            let b = button(b)?;
+            let b = button(b);
             let mut steps = vec![
                 at(start),
                 Input::Button {
@@ -295,7 +308,6 @@ async fn pixel(
             amount,
             modifiers,
         } => {
-            no_modifiers(&modifiers)?;
             let n = i32::try_from(amount).unwrap_or(i32::MAX);
             let (dx, dy) = match direction {
                 ScrollDirection::Up => (0, -n),
@@ -303,8 +315,11 @@ async fn pixel(
                 ScrollDirection::Left => (-n, 0),
                 ScrollDirection::Right => (n, 0),
             };
-            s.input(vec![at(coordinate), Input::Scroll { dx, dy }])
-                .await?;
+            s.input(with_modifiers(
+                &modifiers,
+                vec![at(coordinate), Input::Scroll { dx, dy }],
+            ))
+            .await?;
             json!({ "action": "scroll", "coordinate": coordinate, "dx": dx, "dy": dy })
         }
         ComputerAction::Type { text, .. } => {
@@ -314,14 +329,15 @@ async fn pixel(
         ComputerAction::Key { key, modifiers } => {
             let mut parts = modifiers;
             parts.push(key);
-            let chord = super::browser::chord(&parts.join("+"));
+            let chord = chord(&parts.join("+"));
             s.key(&chord).await?;
             json!({ "action": "key", "key": chord })
         }
-        ComputerAction::HoldKey { .. } => {
-            return Err(ToolError::unsupported(
-                "holding keys is not available on the session desktop in this release",
-            ));
+        ComputerAction::HoldKey { key, duration_ms } => {
+            let chord = chord(&key);
+            s.hold_key(&chord, Duration::from_millis(u64::from(duration_ms)))
+                .await?;
+            json!({ "action": "hold_key", "key": chord, "duration_ms": duration_ms })
         }
         ComputerAction::Wait { duration_ms } => {
             tokio::time::sleep(Duration::from_millis(u64::from(duration_ms).min(60_000))).await;
@@ -367,20 +383,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn browser_key_names_become_desktop_chords() {
+        assert_eq!(chord("ArrowUp"), "up");
+        assert_eq!(chord("Control+a"), "ctrl+a");
+        assert_eq!(chord("Enter"), "Enter");
+        assert_eq!(chord("PageDown"), "pagedown");
+    }
+
+    #[test]
+    fn modifiers_are_held_around_pointer_steps() {
+        let steps = vec![Input::Move { x: 1.0, y: 2.0 }];
+        assert_eq!(with_modifiers(&[], steps.clone()), steps);
+        let held = with_modifiers(&["Control".into(), "shift".into()], steps);
+        assert_eq!(held.first(), Some(&Input::KeyDown("ctrl+shift".into())));
+        assert_eq!(held.last(), Some(&Input::KeyUp("ctrl+shift".into())));
+        assert_eq!(held.len(), 3);
+    }
+
     #[tokio::test]
-    async fn pending_desktop_capabilities_are_typed_unsupported() {
+    async fn refs_on_the_session_desktop_point_to_the_browser() {
         let dir = tempfile::tempdir().unwrap();
-        for req in [
-            json!({"action": "clipboard_get"}),
-            json!({"action": "cursor_position"}),
-            json!({"action": "hold_key", "key": "w", "duration_ms": 100}),
+        let caller = Caller {
+            principal: "agent-a".into(),
+            profile: "agent-a".into(),
+        };
+        let err = execute(
+            dir.path(),
+            &caller,
             json!({"action": "click", "ref": "@s1:e1"}),
-        ] {
-            let err = execute(dir.path(), "agent-a", req.clone())
-                .await
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("\"code\":\"UNSUPPORTED\""), "{req}: {err}");
-        }
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("\"code\":\"UNSUPPORTED\""), "{err}");
+        assert!(super::super::session::running(dir.path(), "agent-a").is_none());
     }
 }

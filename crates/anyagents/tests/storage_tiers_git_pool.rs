@@ -1,7 +1,7 @@
 //! End-to-end verification of multi-tier storage isolation:
 //! - Tier 1 (`ANYAGENTS_STATE_DIR`): control-plane SQLite, capabilities, agent configs
-//! - Tier 2 (`ANYAGENTS_WORKSPACES_DIR` + `ANYAGENTS_GIT_POOL_DIR`): linked worktrees
-//!   backed by a shared bare Git object pool (`--reference-if-able` / `worktree add`)
+//! - Tier 2 (`ANYAGENTS_WORKSPACES_DIR` + `ANYAGENTS_GIT_POOL_DIR`): one repository
+//!   per agent, borrowing objects from a read-only bare pool through alternates
 //! - Tier 3 (`ANYAGENTS_SCRATCH_DIR`): per-agent compile & temp trees
 //!   (`<scratch>/builds/<id>/{cargo,gradle,derived-data}`, `<scratch>/tmp/<id>`)
 //!   reaped synchronously on `archive`.
@@ -136,6 +136,8 @@ exec "{scripted_bin}" "$@"
     std::fs::create_dir_all(&sccache_dir).unwrap();
     let remote_base = format!("file://{}", remotes_root.display());
 
+    support::managed_harnesses(&tier1_state);
+
     // Create root parent agent using ANYAGENTS_STATE_DIR (without passing --data!)
     let create_parent = Command::new(bin)
         .env("HOME", &home_dir)
@@ -220,6 +222,8 @@ exec "{scripted_bin}" "$@"
             let _ = self.0.wait();
         }
     }
+    // Declared first, dropped last: once the server is gone.
+    let _keepers = support::Keepers::of(&tier1_state);
     let _server_guard = KillOnDrop(server);
 
     let socket = tier1_state.join("anyagents.sock");
@@ -313,23 +317,39 @@ exec "{scripted_bin}" "$@"
         "Tier 1 state dir must not contain worktree checkouts"
     );
 
-    // Verify Tier 2 Bare Pool & linked worktree
+    // Verify Tier 2: the agent's own repository over the bare pool
     let pool_bare = tier2_pool.join("ExampleOrg").join("demo.git");
     assert!(pool_bare.join("HEAD").is_file(), "bare pool must exist");
     let wt1 = tier2_workspaces.join(&worker1_id);
     assert!(
         wt1.join("README.md").is_file(),
-        "worktree must be checked out in Tier 2"
+        "checkout must be in Tier 2"
+    );
+    assert!(
+        wt1.join(".git").is_dir(),
+        "the agent has its own repository"
     );
     assert_eq!(
-        git(
-            &wt1,
-            &["config", "--bool", "--get", "extensions.worktreeConfig"]
-        ),
-        "true"
+        git(&wt1, &["rev-parse", "--git-common-dir"]),
+        git(&wt1, &["rev-parse", "--git-dir"])
     );
-    let common1 = std::fs::canonicalize(git(&wt1, &["rev-parse", "--git-common-dir"])).unwrap();
-    assert_eq!(common1, std::fs::canonicalize(&pool_bare).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(wt1.join(".git/objects/info/alternates")).unwrap(),
+        format!(
+            "{}\n",
+            std::fs::canonicalize(pool_bare.join("objects"))
+                .unwrap()
+                .display()
+        )
+    );
+    assert_eq!(git(&wt1, &["branch", "--show-current"]), "feat/clean-slice");
+    assert!(
+        git(&pool_bare, &["for-each-ref", "--format=%(refname)"])
+            .lines()
+            .all(|name| name.starts_with("refs/remotes/origin/")),
+        "agents' branches must never reach the pool"
+    );
+    assert_eq!(git(&pool_bare, &["config", "gc.pruneExpire"]), "never");
 
     // Wait for fake wrapper to run and write env-receipt.json in Tier 3 scratch
     let receipt_path = tier3_scratch
@@ -377,7 +397,7 @@ exec "{scripted_bin}" "$@"
         tier3_scratch.display().to_string()
     );
 
-    // Positive test 2: warm Bare Pool second checkout + dirty source preservation vs scratch wipe
+    // Positive test 2: warm pool, second repository + dirty source preservation vs scratch wipe
     let t0 = Instant::now();
     let spawn2_raw = support::call_raw(
         &socket,
@@ -446,7 +466,7 @@ exec "{scripted_bin}" "$@"
     );
     assert!(
         !wt1.exists(),
-        "archive must reap clean Tier 2 worktree <workspaces>/<id>"
+        "archive must reap the clean Tier 2 checkout <workspaces>/<id>"
     );
     assert!(
         tier1_state.join("state.db").is_file() && pool_bare.join("HEAD").is_file(),
@@ -476,6 +496,6 @@ exec "{scripted_bin}" "$@"
     assert_eq!(
         std::fs::read_to_string(wt2.join("README.md")).unwrap(),
         "# Unpushed work in progress\n",
-        "dirty uncommitted source in Tier 2 worktree must never be lost"
+        "dirty uncommitted source in a Tier 2 checkout must never be lost"
     );
 }

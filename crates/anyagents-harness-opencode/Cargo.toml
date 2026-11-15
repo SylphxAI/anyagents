@@ -8,7 +8,6 @@ description = "OpenCode serve adapter"
 
 [dependencies]
 anyagents-harness = { path = "../anyagents-harness" }
-anyagents-harness-stream = { path = "../anyagents-harness-stream" }
 serde_json = "1"
 
 [dev-dependencies]

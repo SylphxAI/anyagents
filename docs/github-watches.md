@@ -13,6 +13,14 @@ head SHA or a newly registered watch resets the interval to 60 seconds. PR watch
 checks complete, because the merge/close transition is still outstanding.
 Merged/closed PR watches and completed check watches settle after delivery.
 
+A PR watch's `merged`, `closed` and `review_failed` transitions are also
+outcomes of the owner's work ([ADR 0008](adr/0008-quality-loop.md)). Each is
+stored once per watcher, keyed by the pull request (and head, for a review
+failure), before the wake that reports it is claimed, and on first sight while
+an earlier wake from the same watch is still unread. A failed write leaves the
+transition for the next pass. `checks_completed` is not an outcome: it does not
+say whether the checks passed.
+
 ## Dedicated credentials
 
 Set `ANYAGENTS_GITHUB_TOKEN_DIR` in the `serve` environment to an absolute

@@ -323,6 +323,12 @@ fn leaving_all_groups_treats_arbitrary_and_former_reserved_names_equally() {
 
 #[test]
 fn schedule_claim_and_wake_share_a_transaction_and_retry_without_loss() {
+    for state in ["idle", "running", "paused"] {
+        schedule_claim_and_wake_retry_in_state(state);
+    }
+}
+
+fn schedule_claim_and_wake_retry_in_state(state: &str) {
     let (dir, store, agent) = setup();
     store.set_agent_state(&agent.id, "idle").unwrap();
     let schedule = store
@@ -355,11 +361,10 @@ fn schedule_claim_and_wake_share_a_transaction_and_retry_without_loss() {
         .create_agent(NewAgent::new("wrong-recipient", "test"))
         .unwrap();
     assert!(!deliver(&store, &other.id, 100).unwrap());
-    for state in ["paused", "archived"] {
-        store.set_agent_state(&agent.id, state).unwrap();
-        assert!(!deliver(&store, &agent.id, 100).unwrap());
-    }
-    store.set_agent_state(&agent.id, "idle").unwrap();
+    // Retirement rejects publication; pause only delays normal mailbox delivery.
+    store.set_agent_state(&agent.id, "archived").unwrap();
+    assert!(!deliver(&store, &agent.id, 100).unwrap());
+    store.set_agent_state(&agent.id, state).unwrap();
     assert!(!deliver(&store, &agent.id, 99).unwrap());
     reject_chunks(&store);
     assert_fault(
@@ -371,7 +376,7 @@ fn schedule_claim_and_wake_share_a_transaction_and_retry_without_loss() {
     assert_eq!(pending[0].next_fire_at_ms, Some(100));
     assert_eq!(pending[0].last_fired_at_ms, None);
     assert!(store.inbox(&agent.id, None).unwrap().is_empty());
-    assert_eq!(store.agent(&agent.id).unwrap().state, "idle");
+    assert_eq!(store.agent(&agent.id).unwrap().state, state);
     store
         .conn()
         .execute_batch("DROP TRIGGER reject_chunk")
@@ -387,7 +392,14 @@ fn schedule_claim_and_wake_share_a_transaction_and_retry_without_loss() {
             .is_empty()
     );
     assert_eq!(store.inbox(&agent.id, None).unwrap().len(), 1);
-    assert_eq!(store.agent(&agent.id).unwrap().state, "running");
+    assert_eq!(
+        store.agent(&agent.id).unwrap().state,
+        if state == "paused" {
+            "paused"
+        } else {
+            "running"
+        }
+    );
     assert_fts(&store, "timerneedle");
 }
 

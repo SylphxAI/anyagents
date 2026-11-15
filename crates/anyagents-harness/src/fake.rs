@@ -1,11 +1,11 @@
 //! Scripted harness. It records every id it is given, writes each id once, and
 //! can be killed between steps.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState,
+    DeliverOutcome, Delivery, DeliveryLevel, DeliveryMode, Harness, HarnessError, HarnessHealth,
+    OutboundMessage, Proof, TurnState,
 };
 
 #[derive(Clone, Debug)]
@@ -31,6 +31,9 @@ pub struct FakeHarness {
     quota_reset_at_ms: Option<i64>,
     auto_finish: bool,
     resumed: Vec<String>,
+    /// Ids the vendor refuses for good, with its reason and whether it
+    /// belongs to that message alone.
+    refused: HashMap<String, (String, bool)>,
 }
 
 impl FakeHarness {
@@ -50,7 +53,22 @@ impl FakeHarness {
             quota_reset_at_ms: None,
             auto_finish: false,
             resumed: Vec::new(),
+            refused: HashMap::new(),
         }
+    }
+
+    /// The vendor refuses `id` for good whenever it is offered, for a
+    /// reason that might hold for every message.
+    pub fn refuse_forever(&mut self, id: &str, reason: &str) {
+        self.refused
+            .insert(id.to_string(), (reason.to_string(), false));
+    }
+
+    /// The vendor refuses `id` for good for a reason of that message alone
+    /// (its size, its content).
+    pub fn refuse_this_message(&mut self, id: &str, reason: &str) {
+        self.refused
+            .insert(id.to_string(), (reason.to_string(), true));
     }
 
     /// Later `deliver` calls fail and write nothing.
@@ -156,13 +174,14 @@ impl FakeHarness {
 impl Harness for FakeHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         self.given.push(message.id.clone());
+        if let Some(Proof::Taken { turn_finished }) = self.proven(&message.id) {
+            return Ok(DeliverOutcome::Accepted { turn_finished });
+        }
         if !self.alive {
             return Err(HarnessError::Dead);
         }
-        if self.seen.contains(&message.id) {
-            return Ok(DeliverOutcome::Accepted {
-                turn_finished: self.finished.contains(&message.id),
-            });
+        if let Some((reason, message_specific)) = self.refused.get(&message.id) {
+            return Ok(DeliverOutcome::rejected(reason.clone(), *message_specific));
         }
         if let Some(reset_at_ms) = self.quota_reset_at_ms {
             return Ok(DeliverOutcome::Quota { reset_at_ms });
@@ -172,6 +191,12 @@ impl Harness for FakeHarness {
             DeliveryMode::Followup => self.accept(message, self.open.is_empty()),
             DeliveryMode::Queue if !self.open.is_empty() => DeliverOutcome::Deferred,
             DeliveryMode::Queue => self.accept(message, true),
+        })
+    }
+
+    fn proven(&self, message_id: &str) -> Option<Proof> {
+        self.seen.contains(message_id).then(|| Proof::Taken {
+            turn_finished: self.finished.contains(message_id),
         })
     }
 
@@ -207,10 +232,14 @@ impl Harness for FakeHarness {
             } else {
                 TurnState::InTurn
             },
-            delivery_mode: self.mode,
-            steer_support: match self.mode {
-                DeliveryMode::Steer => SteerSupport::Yes,
-                DeliveryMode::Followup | DeliveryMode::Queue => SteerSupport::No,
+            delivery: Delivery {
+                level: match self.mode {
+                    DeliveryMode::Steer => DeliveryLevel::MidTurn,
+                    DeliveryMode::Followup | DeliveryMode::Queue => DeliveryLevel::TurnEnd,
+                },
+                idempotent: false,
+                proof: std::borrow::Cow::Borrowed("scripted double"),
+                peer: None,
             },
             quota_reset_at_ms: self.quota_reset_at_ms,
             sign_in_fault: None,

@@ -124,9 +124,8 @@ pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
         .filter(|p| !p.trim().is_empty())
         .unwrap_or_else(|| default_remote_program(&harness).to_string());
 
-    if let Some(ref cfg_dir) = config {
-        let _ = materialize_remote_mcp_config(&sbx, cfg_dir);
-    }
+    let mut mcp_token: Option<String> = None;
+    refresh_remote_mcp_config(&sbx, config.as_deref(), &mut mcp_token);
 
     if args.oneshot {
         let cmd_str = if args.args.is_empty() {
@@ -181,6 +180,7 @@ pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
         stdout.flush()?;
 
         let prompt_text = extract_user_prompt(&event);
+        refresh_remote_mcp_config(&sbx, config.as_deref(), &mut mcp_token);
         match dispatch_remote_sandbox_turn(
             &sbx,
             &harness,
@@ -275,10 +275,17 @@ fn default_remote_program(harness: &str) -> &'static str {
     }
 }
 
-pub fn materialize_remote_mcp_config(sbx: &SandboxConfig, config_dir: &Path) -> Result<(), String> {
-    let capability = crate::cloud_harness::resolve_capability_token(config_dir)?;
-    let mcp_base = crate::cloud_harness::resolve_public_mcp_url(config_dir);
-    let mcp_url = crate::cloud_harness::mcp_url_with_profile(&mcp_base, "full");
+/// Write the sandbox's `.mcp.json`: the server's public MCP URL under the
+/// `remote` profile and the agent's current remote session token. Returns the
+/// token written, so a caller rewrites the file only after a rotation. The
+/// agent's local mailbox capability never enters the sandbox.
+pub fn materialize_remote_mcp_config(
+    sbx: &SandboxConfig,
+    config_dir: &Path,
+) -> Result<String, String> {
+    let capability = crate::remote::session_token(config_dir)?;
+    let mcp_base = crate::cloud_harness::resolve_public_mcp_url(config_dir)?;
+    let mcp_url = crate::cloud_harness::mcp_url_with_profile(&mcp_base, "remote");
     let mcp_doc = json!({
         "mcpServers": {
             "anyagents": {
@@ -295,7 +302,27 @@ pub fn materialize_remote_mcp_config(sbx: &SandboxConfig, config_dir: &Path) -> 
     bytes.push(b'\n');
     RemoteSandboxWorkspace::new(sbx.clone())
         .write_file_bytes(Some(".mcp.json"), &bytes, false, true)
-        .map(|_| ())
+        .map(|_| capability)
+}
+
+/// Rewrite the sandbox's `.mcp.json` when the server rotated the session
+/// token since `written`. A failure is reported once and retried next turn.
+fn refresh_remote_mcp_config(
+    sbx: &SandboxConfig,
+    config: Option<&Path>,
+    written: &mut Option<String>,
+) {
+    let Some(cfg_dir) = config else {
+        return;
+    };
+    let current = crate::remote::session_token(cfg_dir).ok();
+    if current.is_some() && current == *written {
+        return;
+    }
+    match materialize_remote_mcp_config(sbx, cfg_dir) {
+        Ok(token) => *written = Some(token),
+        Err(why) => eprintln!("sandbox-exec: remote MCP config not written: {why}"),
+    }
 }
 
 pub fn dispatch_remote_sandbox_turn(
@@ -700,7 +727,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg_dir = dir.path().join("cfg");
         std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(cfg_dir.join("mcp-capability"), "cap-remote-token-123\n").unwrap();
+        // The local capability is present and must never reach the sandbox.
+        std::fs::write(cfg_dir.join("mcp-capability"), "cap-local-never-sent\n").unwrap();
+        let remote_token = format!("aars_{}", "1".repeat(64));
+        std::fs::write(
+            cfg_dir.join(crate::remote::TOKEN_FILE),
+            format!("{remote_token}\n"),
+        )
+        .unwrap();
         std::fs::write(
             cfg_dir.join(".anyagents-mcp-url"),
             "https://mcp.example.test/mcp\n",
@@ -718,7 +752,10 @@ mod tests {
         let sbx_clone = sbx.clone();
         let cfg_clone = cfg_dir.clone();
         tokio::task::spawn_blocking(move || {
-            materialize_remote_mcp_config(&sbx_clone, &cfg_clone).unwrap();
+            let mut written = None;
+            refresh_remote_mcp_config(&sbx_clone, Some(&cfg_clone), &mut written);
+            // An unchanged token is not written again.
+            refresh_remote_mcp_config(&sbx_clone, Some(&cfg_clone), &mut written);
         })
         .await
         .unwrap();
@@ -729,13 +766,39 @@ mod tests {
             mcp_files[0]
                 .pointer("/mcpServers/anyagents/url")
                 .and_then(Value::as_str),
-            Some("https://mcp.example.test/mcp?profile=full")
+            Some("https://mcp.example.test/mcp?profile=remote")
         );
         assert_eq!(
             mcp_files[0]
                 .pointer("/mcpServers/anyagents/headers/Authorization")
                 .and_then(Value::as_str),
-            Some("Bearer cap-remote-token-123")
+            Some(format!("Bearer {remote_token}").as_str())
+        );
+        assert!(!mcp_files[0].to_string().contains("cap-local-never-sent"));
+
+        // After the server rotates the token, the next turn rewrites the file.
+        let rotated = format!("aars_{}", "2".repeat(64));
+        std::fs::write(
+            cfg_dir.join(crate::remote::TOKEN_FILE),
+            format!("{rotated}\n"),
+        )
+        .unwrap();
+        let sbx_clone = sbx.clone();
+        let cfg_clone = cfg_dir.clone();
+        let first = remote_token.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut written = Some(first);
+            refresh_remote_mcp_config(&sbx_clone, Some(&cfg_clone), &mut written);
+        })
+        .await
+        .unwrap();
+        let mcp_files = state.mcp_files.lock().unwrap().clone();
+        assert_eq!(mcp_files.len(), 2);
+        assert_eq!(
+            mcp_files[1]
+                .pointer("/mcpServers/anyagents/headers/Authorization")
+                .and_then(Value::as_str),
+            Some(format!("Bearer {rotated}").as_str())
         );
 
         // Plain stdout wrapping

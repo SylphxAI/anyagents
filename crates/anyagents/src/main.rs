@@ -7,6 +7,7 @@ use anyagents_core::Error;
 use clap::{Args, Parser, Subcommand};
 
 mod agent;
+mod agent_file;
 mod api;
 mod auth;
 mod channel;
@@ -23,12 +24,17 @@ mod harness_double;
 mod host_memory;
 mod identity;
 mod install;
+mod keeper;
 mod mcp;
 mod mcp_config;
+mod memory_service;
 mod muse_config;
 mod opencode_config;
 mod operator;
+mod outbound;
+mod remote;
 mod reply;
+mod repo;
 mod sandbox;
 mod sandbox_exec;
 mod schedule;
@@ -41,8 +47,6 @@ mod ui;
 mod vendor;
 mod web;
 mod workstation;
-mod worktree;
-mod worktree_access;
 
 #[derive(Parser)]
 #[command(
@@ -165,10 +169,10 @@ enum Command {
         /// Optional upstream provider account profile (e.g. `acct-a`, `acct-b`, `anthropic/acct-b`).
         #[arg(long)]
         profile: Option<String>,
-        /// Optional repository (`<org>/<repo>`, local repo path, or `inherit`) to provision a managed Git worktree.
+        /// Optional repository (`<org>/<repo>`, local repo path, or `inherit`) to provision a Git repository of the agent's own.
         #[arg(long)]
         repo: Option<String>,
-        /// Optional Git branch name for the managed worktree when `--repo` is set (defaults to `agent/<name>`).
+        /// Optional Git branch name for the managed checkout when `--repo` is set (defaults to `agent/<name>`).
         #[arg(long)]
         branch: Option<String>,
         /// Optional starting Git ref/branch when `--repo` is set (defaults to `origin/HEAD`).
@@ -206,10 +210,15 @@ enum Command {
     /// Resume an archived or paused agent (`state = running`) and optionally send a task prompt.
     Resume {
         /// Agent name or `agt_...` id.
-        name: String,
+        #[arg(required_unless_present = "faulted")]
+        name: Option<String>,
         /// Optional task/message to deliver immediately after waking.
         #[arg(long)]
         prompt: Option<String>,
+        /// Resume every agent parked as `faulted` (its own session's errors
+        /// paused it), once its cause is fixed. Operator only.
+        #[arg(long, conflicts_with_all = ["name", "prompt"])]
+        faulted: bool,
     },
     /// Permanently delete an agent and its on-disk directory.
     Delete {
@@ -240,7 +249,7 @@ enum Command {
     },
     /// Send a message, media file, GPS location/venue, or poll to one or more agents, groups, or channels.
     Send {
-        /// Target(s): `agent:<name>`, bare name, comma-separated names (`planner,builder`), `parent`, `children`, `group:<name>`, `all`, or `telegram:chat:<id>[:<topic>]`.
+        /// Target(s): `agent:<name>`, bare name, comma-separated names (`planner,builder`), `parent`, `children`, `group:<name>`, `all`, `operator`, or `telegram:chat:<id>[:<topic>]`.
         to: String,
         /// Message text or caption (optional when sending media, location, or poll).
         #[arg(default_value = "")]
@@ -401,6 +410,37 @@ enum Command {
         #[arg(long)]
         days: Option<i64>,
     },
+    /// Outcomes, recovery and cost per successful outcome (ADR 0008).
+    /// Queried through the daemon socket when it is running; the operator
+    /// falls back to a read of the store otherwise.
+    Outcomes {
+        #[arg(long)]
+        agent: Option<String>,
+        /// `model` (harness and model, the default), `harness`, `role`,
+        /// `profile`, `agent` or `skill`.
+        #[arg(long = "group-by")]
+        group_by: Option<String>,
+        /// Include causal descendants of `--agent`.
+        #[arg(long)]
+        include_descendants: bool,
+        /// Outcomes observed from, inclusive (unix ms).
+        #[arg(long = "since-ms")]
+        since_ms: Option<i64>,
+        /// Outcomes observed until, inclusive (unix ms).
+        #[arg(long = "until-ms")]
+        until_ms: Option<i64>,
+        /// Trailing window in days.
+        #[arg(long)]
+        days: Option<i64>,
+    },
+    /// Record a verdict on an agent's work: `accepted`, `rework`, `rejected`
+    /// or `abandoned`. Only its ancestor, a root admin or the operator may.
+    Verdict {
+        agent: String,
+        verdict: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Speak MCP for one agent. Its capability comes from its config
     /// directory, never from a name.
     Mcp {
@@ -426,6 +466,11 @@ enum Command {
     /// The deployment's boundary contract: what an agent may read, and what it
     /// may write.
     Boundary,
+    /// The keepers that hold harness processes across server restarts.
+    Keepers {
+        #[command(subcommand)]
+        action: KeepersCommand,
+    },
     /// Test double for a streaming vendor. It prints text and no result line,
     /// and records its argv and stdin when `ANYAGENTS_FAKE_LOG` names a file.
     #[command(hide = true)]
@@ -452,6 +497,14 @@ enum Command {
     Flush {
         /// The agent name, or `all`.
         agent: String,
+    },
+    /// List the messages an agent's harness refused for good, or put one
+    /// back in its mailbox as a new message.
+    Requeue {
+        /// The agent name.
+        agent: String,
+        /// A parked message id (`msg_...`). Without it, list the parked ones.
+        message: Option<String>,
     },
     /// Record a channel. The secret is copied into the credential store.
     Channels {
@@ -496,12 +549,12 @@ enum Command {
         #[arg(long)]
         clear: bool,
     },
-    /// Native SOTA anti-detect browser with persistent login profiles (`open`, `snapshot`, `click`, `fill`, `press`, `eval`, `screenshot`, `cookies`, `tabs`, `status`, `profiles`, `close`).
+    /// The browser on a profile's desktop session, with persistent logins (`open`, `snapshot`, `click`, `fill`, `press`, `eval`, `screenshot`, `cookies`, `tabs`, `takeover`, `status`, `profiles`, `close`).
     Browser {
-        /// Action: `open` / `goto`, `back`, `forward`, `reload`, `snapshot`, `read`, `click`, `fill` / `type`, `press`, `screenshot`, `tabs`, `takeover`, `wait_for_user`, `release_takeover`, `status`, `profiles`, or `close` / `stop`. Runs in the server's desktop session for the profile.
+        /// Action: `open` / `goto`, `back`, `forward`, `reload`, `snapshot`, `read`, `html`, `click`, `fill` / `type`, `press`, `hold`, `key_down`, `key_up`, `release_keys`, `eval`, `cookies`, `screenshot`, `tabs`, `takeover`, `wait_for_user`, `release_takeover`, `status`, `profiles`, or `close` / `stop`. Runs in the server's desktop session for the profile, held by the operator while the operator uses it.
         #[arg(default_value = "status")]
         action: String,
-        /// Primary argument: URL (for `open`), snapshot ref such as `@e1` (for `click` / `fill`), key name (for `press`), or output path (for `screenshot`).
+        /// Primary argument: URL (for `open`), snapshot ref such as `@e1` or a CSS selector (for `click` / `fill` / `html`), key name (for `press` / `hold` / `key_down` / `key_up`), JavaScript (for `eval`), or output path (for `screenshot`).
         target: Option<String>,
         /// Secondary argument: text to enter when `action` is `fill` / `type`.
         value: Option<String>,
@@ -511,7 +564,7 @@ enum Command {
         /// Explicit URL override.
         #[arg(long)]
         url: Option<String>,
-        /// Explicit snapshot ref override (`@e1` or `@<snapshot_id>:e1`).
+        /// Explicit element override: a snapshot ref (`@e1` or `@<snapshot_id>:e1`) or a CSS selector.
         #[arg(long)]
         selector: Option<String>,
         /// Explicit text override for `fill` / `type`.
@@ -520,16 +573,25 @@ enum Command {
         /// Secret reference (`op://vault/item/field`, `op-otp://vault/item`, or `secret://key`) resolved in memory for `fill` / `type`.
         #[arg(long = "secret-ref")]
         secret_ref: Option<String>,
+        /// Explicit JavaScript override for `eval`.
+        #[arg(long)]
+        script: Option<String>,
         /// Explicit output path for `screenshot`.
         #[arg(long)]
         path: Option<String>,
-        /// Press Enter / submit form after `fill` / `type`.
+        /// Press Enter in the field after `fill` / `type`.
         #[arg(long)]
         submit: bool,
+        /// Capture the full scrollable page on `screenshot` (the page only, without browser chrome).
+        #[arg(long = "full-page")]
+        full_page: bool,
         /// Wait duration in milliseconds after `open` or `click`.
         #[arg(long = "wait-ms")]
         wait_ms: Option<u64>,
-        /// Key or chord override for `press` (e.g. `Enter`, `ctrl+l`).
+        /// Hold duration in milliseconds for `press` / `hold` (at most 10 s).
+        #[arg(long = "hold-ms", alias = "duration-ms")]
+        hold_ms: Option<u64>,
+        /// Key or chord override for `press` / `hold` / `key_down` / `key_up` (e.g. `Enter`, `ctrl+a`).
         #[arg(long)]
         key: Option<String>,
     },
@@ -557,6 +619,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Sent messages whose delivery could not be confirmed (a timeout, a
+    /// dropped connection, a post cut short). None is resent automatically:
+    /// list them, send one again, or settle it without sending. Operator only.
+    Outbound {
+        #[command(subcommand)]
+        action: Option<OutboundCommand>,
+        /// Output machine-readable JSON.
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// Inspect an agent's live state, schedules, quota/block status, and recent conversation turns.
     Inspect {
         /// Agent name or `agt_...` ID (defaults to `self` inside an agent).
@@ -574,6 +646,27 @@ enum Command {
     /// Run a local CLI harness inside a remote sandbox (`POST /v1/sandboxes/{id}/exec`) speaking `stream-json`.
     #[command(name = "sandbox-exec")]
     SandboxExec(sandbox_exec::SandboxExecArgs),
+    /// Dense retrieval and reranking over raw history, as its own process.
+    #[command(name = "memory-service")]
+    MemoryService(memory_service::MemoryServiceArgs),
+}
+
+#[derive(Subcommand)]
+enum OutboundCommand {
+    /// List every unconfirmed send (the default).
+    List,
+    /// Send one again, as its agent and to its destination. The record
+    /// closes with the new receipt only when that send succeeds.
+    Retry {
+        /// The key `list` shows.
+        key: String,
+    },
+    /// Settle one without sending it: the recipient already has it, or it is
+    /// no longer wanted.
+    Discard {
+        /// The key `list` shows.
+        key: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -594,6 +687,27 @@ enum GroupsCommand {
     Members { group: String },
     /// List all named groups and their members.
     List,
+}
+
+#[derive(Subcommand)]
+enum KeepersCommand {
+    /// List every keeper: its agent, its harness process and the binary it runs.
+    List,
+    /// End keepers and their harness processes: one agent's, or all of them.
+    /// A running server starts a running agent's harness again in a new
+    /// keeper; use this before rolling back to a binary without keepers.
+    Stop {
+        /// Agent name or `agt_...` id.
+        agent: Option<String>,
+        /// Every keeper.
+        #[arg(long, conflicts_with = "agent")]
+        all: bool,
+        /// Also end a keeper that does not answer while its process runs
+        /// (its socket is gone, or it is wedged), by signal, once its
+        /// recorded identity proves the process is that keeper.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -724,6 +838,10 @@ struct SearchArgs {
 #[derive(Args, Clone, Debug)]
 struct InboxArgs {
     agent: Option<String>,
+    /// Read the operator's inbox: what agents reported with `send operator`.
+    /// Only the operator may.
+    #[arg(long, conflicts_with_all = ["agent", "unread", "sender"])]
+    operator: bool,
     /// Exclusive mailbox sequence cursor.
     #[arg(long)]
     since: Option<i64>,
@@ -824,6 +942,14 @@ enum AgentsCommand {
     GrantAdmin { agent: String },
     /// Revoke administrative authority immediately (operator only).
     RevokeAdmin { agent: String },
+    /// End an agent's remote (cloud) sessions now: every token of each stops authenticating on its next call (operator or root admin).
+    RevokeRemote {
+        /// Agent name or `agt_...` ID.
+        agent: String,
+        /// Only this remote session (`rs_...`); all of the agent's sessions when omitted.
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Rename an agent in place while preserving its `agt_...` ID, history, mailbox, grants, seat, and Telegram binding, and keeping the old name as a live alias.
     Rename {
         /// Current agent name or `agt_...` ID.
@@ -854,10 +980,10 @@ enum AgentsCommand {
         /// Optional upstream provider account profile (e.g. `acct-a`, `acct-b`, `anthropic/acct-b`).
         #[arg(long)]
         profile: Option<String>,
-        /// Optional repository (`<org>/<repo>`, local repo path, or `inherit`) to provision a managed Git worktree.
+        /// Optional repository (`<org>/<repo>`, local repo path, or `inherit`) to provision a Git repository of the agent's own.
         #[arg(long)]
         repo: Option<String>,
-        /// Optional Git branch name for the managed worktree when `--repo` is set (defaults to `agent/<name>`).
+        /// Optional Git branch name for the managed checkout when `--repo` is set (defaults to `agent/<name>`).
         #[arg(long)]
         branch: Option<String>,
         /// Optional starting Git ref/branch when `--repo` is set (defaults to `origin/HEAD`).
@@ -937,8 +1063,15 @@ fn main() -> ExitCode {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv.get(1).is_some_and(|arg| arg == "internal") {
+        return internal(&argv[2..]);
+    }
     sandbox::hydrate_operator_groups_if_needed();
     let raw_argv: Vec<String> = std::env::args().collect();
+    if let Some(code) = keeper::try_run(&raw_argv) {
+        return ExitCode::from(u8::try_from(code).unwrap_or(1));
+    }
     if let Some(cloud_args) = cloud_harness::try_parse_from_raw_argv(&raw_argv) {
         return match cloud_harness::run(cloud_args) {
             Ok(()) => ExitCode::SUCCESS,
@@ -976,6 +1109,21 @@ fn main() -> ExitCode {
     }
 }
 
+/// Helpers AnyAgents runs as itself, never commands for an operator. They
+/// start before any deployment setup: no data directory, no group hydration,
+/// no inherited state beyond what the caller passed.
+fn internal(args: &[std::ffi::OsString]) -> ExitCode {
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("admission-probe") => repo::admission_probe_main(&args[1..]),
+        Some("seat-file") => seat_tree::seat_file_main(&args[1..]),
+        Some("browser-jail") => workstation::jail::main(&args[1..]),
+        _ => {
+            eprintln!("anyagents internal: unknown helper");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn resolve_data_dir(raw: PathBuf, _is_serve: bool) -> PathBuf {
     if raw == Path::new(".anyagents")
         && (!raw.exists()
@@ -999,7 +1147,9 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 list_harnesses(&data);
                 Ok(())
             }
-            HarnessesCommand::Profiles { harness } => list_profiles_cmd(&data, harness.as_deref()),
+            HarnessesCommand::Profiles { harness } => {
+                list_profiles_cmd(&data, harness.as_deref(), false)
+            }
             HarnessesCommand::Update { harness } => update_harnesses_cmd(&data, harness.as_deref()),
         },
         Command::Profiles {
@@ -1015,6 +1165,17 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Mcp { config, profile } => mcp::run(&data, config.as_deref(), profile),
         Command::AgentRun { config, command } => sandbox::run(&data, config.as_deref(), &command),
         Command::Boundary => print_boundary(&data),
+        Command::Keepers { action } => match action {
+            KeepersCommand::List => keeper::list(&data),
+            KeepersCommand::Stop { agent, all, force } => {
+                if agent.is_none() && !all {
+                    return Err(anyagents_core::Error::Message(
+                        "name an agent, or pass --all".into(),
+                    ));
+                }
+                keeper::stop(&data, agent.as_deref(), force)
+            }
+        },
         Command::FakeOpencode => fake_opencode::run(),
         Command::Harness {
             config,
@@ -1138,9 +1299,13 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Archive { name } => agent::archive_cmd(&data, name),
         Command::Pause { name } => agent::pause_cmd(&data, name),
         Command::Wake { name, prompt } => agent::resume_cmd(&data, &name, prompt),
-        Command::Resume { name, prompt } => agent::resume_cmd(&data, &name, prompt),
+        Command::Resume { faulted: true, .. } => agent::resume_faulted(&data),
+        Command::Resume { name, prompt, .. } => {
+            agent::resume_cmd(&data, name.as_deref().unwrap_or_default(), prompt)
+        }
         Command::Delete { name } => agent::delete_cmd(&data, &name),
         Command::Flush { agent } => agent::flush(&data, &agent),
+        Command::Requeue { agent, message } => agent::requeue(&data, &agent, message.as_deref()),
         Command::Model {
             agent,
             target_model,
@@ -1369,6 +1534,33 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             agent::UsageError::Store(err) => err,
             agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
         }),
+        Command::Outcomes {
+            agent,
+            group_by,
+            include_descendants,
+            since_ms,
+            until_ms,
+            days,
+        } => agent::outcomes(
+            &data,
+            &agent::UsageParams {
+                agent,
+                group_by,
+                since_ms,
+                until_ms,
+                days,
+                include_descendants: include_descendants.then_some(true),
+            },
+        )
+        .map_err(|err| match err {
+            agent::UsageError::Store(err) => err,
+            agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
+        }),
+        Command::Verdict {
+            agent,
+            verdict,
+            reason,
+        } => agent::verdict_cmd(&data, &agent, &verdict, reason.as_deref()),
         Command::Channels { action } => channel::channels(&data, action),
         Command::Groups { action } => groups(&data, action),
         Command::Describe {
@@ -1391,13 +1583,33 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             selector,
             text,
             secret_ref,
+            script,
             path,
             submit,
+            full_page,
             wait_ms,
+            hold_ms,
             key,
         } => browser_cmd(
-            &data, action, target, value, profile, url, selector, text, secret_ref, path, submit,
-            wait_ms, key,
+            &data,
+            action,
+            target,
+            value,
+            workstation::BrowserRequest {
+                profile,
+                url,
+                selector,
+                text,
+                secret_ref,
+                script,
+                key,
+                path,
+                submit: submit.then_some(true),
+                full_page: full_page.then_some(true),
+                wait_ms,
+                hold_ms,
+                ..Default::default()
+            },
         ),
         Command::Schedule {
             agent,
@@ -1409,8 +1621,14 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             json,
         } => schedule_cmd(&data, agent, at, every, watch, prompt, cancel, json),
         Command::Inspect { agent, limit, json } => inspect_cmd(&data, agent, limit, json),
+        Command::Outbound { action, json } => match action.unwrap_or(OutboundCommand::List) {
+            OutboundCommand::List => outbound::list(&data, json),
+            OutboundCommand::Retry { key } => outbound::retry(&data, &key, json),
+            OutboundCommand::Discard { key } => outbound::discard(&data, &key, json),
+        },
         Command::CloudHarness(args) => cloud_harness::run(args),
         Command::SandboxExec(args) => sandbox_exec::run(args),
+        Command::MemoryService(args) => memory_service::run(&data, args),
     }
 }
 
@@ -1616,11 +1834,42 @@ fn inspect_cmd(data: &Path, agent: Option<String>, limit: usize, json: bool) -> 
             view.has_open_turn,
             view.profile.as_deref().unwrap_or("default")
         );
+        println!(
+            "Delivery: {} ({}){}",
+            view.delivery.label(),
+            view.delivery.proof,
+            view.delivery
+                .peer
+                .as_deref()
+                .map_or_else(String::new, |peer| format!("   Peer: {peer}"))
+        );
         for schedule in &view.schedules {
             println!("  {} {}: {}", schedule.kind, schedule.spec, schedule.prompt);
         }
         if let Some(error) = &view.last_error {
             println!("Error: {error}");
+        }
+        if let Some(errors) = &view.turn_errors {
+            println!(
+                "Errored turns: {} in a row (parked at {}){}",
+                errors.streak,
+                errors.limit,
+                errors.faulted_at_ms.map_or_else(String::new, |ms| format!(
+                    "   Faulted since {} UTC: resume to clear",
+                    ui::format_timestamp_ms(ms)
+                ))
+            );
+        }
+        for held in &view.unsettled_outbound {
+            println!(
+                "Unconfirmed send {} to {} since {} UTC (anyagents outbound retry|discard {}): {}",
+                held.key,
+                held.destination,
+                held.since_ms
+                    .map_or_else(|| "-".to_string(), ui::format_timestamp_ms),
+                held.key,
+                held.excerpt
+            );
         }
         channel::emit_turns(&turns, true, false)?;
     }
@@ -1628,34 +1877,19 @@ fn inspect_cmd(data: &Path, agent: Option<String>, limit: usize, json: bool) -> 
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `anyagents browser`: `flags` carries every explicit option; `target` and
+/// `value` fill the field the action takes positionally.
 fn browser_cmd(
     data: &Path,
     action: String,
     target: Option<String>,
     value: Option<String>,
-    profile: Option<String>,
-    url: Option<String>,
-    selector: Option<String>,
-    text: Option<String>,
-    secret_ref: Option<String>,
-    path: Option<String>,
-    submit: bool,
-    wait_ms: Option<u64>,
-    key: Option<String>,
+    flags: workstation::BrowserRequest,
 ) -> Result<(), anyagents_core::Error> {
     let act = action.trim().to_ascii_lowercase();
     let mut req = workstation::BrowserRequest {
         action: act.clone(),
-        profile,
-        url,
-        selector,
-        text,
-        secret_ref,
-        key,
-        path,
-        submit: submit.then_some(true),
-        wait_ms,
-        ..Default::default()
+        ..flags
     };
     match act.as_str() {
         "takeover" | "human_takeover" | "user_takeover" => {
@@ -1668,9 +1902,14 @@ fn browser_cmd(
                 req.url = target;
             }
         }
-        "click" => {
+        "click" | "html" => {
             if req.selector.is_none() {
                 req.selector = target;
+            }
+        }
+        "eval" | "evaluate" | "js" => {
+            if req.script.is_none() {
+                req.script = target;
             }
         }
         "fill" | "type" | "input" => {
@@ -1681,7 +1920,7 @@ fn browser_cmd(
                 req.text = value;
             }
         }
-        "press" | "key" => {
+        "press" | "key" | "hold" | "key_down" | "keydown" | "key_up" | "keyup" => {
             if req.key.is_none() {
                 req.key = target;
             }
@@ -1754,15 +1993,17 @@ fn print_boundary(data: &Path) -> Result<(), anyagents_core::Error> {
 /// Print the catalog: id, the variable that points the vendor at its private
 /// config directory, and the command that installs it. Never a credential.
 fn list_harnesses(data: &Path) {
+    let catalog = anyagents_installer::Catalog::load(data)
+        .unwrap_or_else(|_| anyagents_installer::Catalog::builtin());
     if ui::is_pretty() {
         println!("\n  {}\n", ui::bold_cyan("Supported Harnesses"));
         let mut table = ui::Table::new(&[
             ("HARNESS", false),
             ("VERSION", false),
             ("CONFIG ENV", false),
-            ("INSTALL COMMAND", false),
+            ("INSTALL SOURCE", false),
         ]);
-        for entry in anyagents_installer::builtin_catalog() {
+        for entry in catalog.harnesses() {
             let ver = install::detect_version(data, &entry.id);
             let ver_cell = if ver == "-" {
                 ui::dim("-")
@@ -1773,35 +2014,49 @@ fn list_harnesses(data: &Path) {
                 ui::bold(&ui::cyan(&entry.id)),
                 ver_cell,
                 ui::dim(signin::config_variable(&entry.id).unwrap_or("-")),
-                signin::install_hint(&entry.id).unwrap_or_else(|| "-".to_string()),
+                entry.source.label(),
             ]);
         }
         table.print();
         println!();
         return;
     }
-    for entry in anyagents_installer::builtin_catalog() {
+    for entry in catalog.harnesses() {
         println!(
             "{}\t{}\t{}",
             entry.id,
             signin::config_variable(&entry.id).unwrap_or("-"),
-            signin::install_hint(&entry.id).unwrap_or_else(|| "-".to_string())
+            entry.source.label()
         );
     }
 }
 
 fn update_harnesses_cmd(data: &Path, target: Option<&str>) -> Result<(), anyagents_core::Error> {
-    let catalog = anyagents_installer::builtin_catalog();
+    let catalog = anyagents_installer::Catalog::load(data)
+        .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
     let targets: Vec<String> = match target.map(str::trim).filter(|s| !s.is_empty()) {
         Some(t) => {
-            if !catalog.iter().any(|c| c.id == t) {
+            let normalized = anyagents_harness::normalize_harness_name(t);
+            if catalog.get(normalized).is_none() {
                 return Err(anyagents_core::Error::Message(format!(
                     "unknown harness `{t}`"
                 )));
             }
-            vec![t.to_string()]
+            vec![normalized.to_string()]
         }
-        None => catalog.into_iter().map(|c| c.id).collect(),
+        None => catalog
+            .harnesses()
+            .iter()
+            .chain(catalog.runtimes())
+            .filter(|entry| {
+                entry.source.is_managed()
+                    && !matches!(
+                        entry.source,
+                        anyagents_installer::source::Source::Unconfigured
+                    )
+            })
+            .map(|entry| entry.id.clone())
+            .collect(),
     };
 
     let mut rows = Vec::new();
@@ -2028,10 +2283,13 @@ fn profiles_cmd(
         }
         Some("refresh") | Some("reset") => {
             create::force_refresh_provider_profiles(data, target)?;
-            if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
+            // A server lists afresh itself; without one, sync here first.
+            if !client::can_call_server(data)
+                && let Ok(store) = anyagents_core::Store::open(data.join("state.db"))
+            {
                 let _ = create::sync_and_list_provider_profiles(&store, data);
             }
-            list_profiles_cmd(data, target)
+            list_profiles_cmd(data, target, true)
         }
         Some("models") | Some("catalog") => {
             let catalogs = if client::can_call_server(data) {
@@ -2066,8 +2324,8 @@ fn profiles_cmd(
                 .unwrap_or("claude-code");
             sign_in(data, prof_target, None)
         }
-        Some("list") => list_profiles_cmd(data, target),
-        other => list_profiles_cmd(data, other),
+        Some("list") => list_profiles_cmd(data, target, false),
+        other => list_profiles_cmd(data, other, false),
     }
 }
 
@@ -2378,7 +2636,14 @@ fn apply_local_subagent_default(
     }
 }
 
-fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_core::Error> {
+/// `profiles`: the server's snapshot when a server answers, which costs no
+/// probe; otherwise a listing made here, probing every provider inline.
+/// `fresh` asks the server for a listing made after this call.
+fn list_profiles_cmd(
+    data: &Path,
+    filter: Option<&str>,
+    fresh: bool,
+) -> Result<(), anyagents_core::Error> {
     let filter = filter.filter(|f| {
         let t = f.trim();
         !t.is_empty()
@@ -2386,31 +2651,28 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
             && !t.eq_ignore_ascii_case("refresh")
             && !t.eq_ignore_ascii_case("reset")
     });
-    let mut entries = if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
-        create::list_provider_profiles_fast(&store, data)
-    } else if client::can_call_server(data) {
-        match client::call::<Vec<create::ProviderProfileEntry>>(
-            data,
-            "GET",
-            "/v1/profiles",
-            None,
-            &client::authority(data),
-        ) {
-            Ok(Some(list)) => list,
-            Ok(None) => {
-                return Err(anyagents_core::Error::Message(
-                    "the server answered nothing".into(),
-                ));
-            }
-            Err(err) => return Err(anyagents_core::Error::Message(err)),
-        }
+    let path = if fresh {
+        "/v1/profiles?fresh=true"
     } else {
-        let store = anyagents_core::Store::open(data.join("state.db"))?;
-        create::list_provider_profiles_fast(&store, data)
+        "/v1/profiles"
     };
-    if entries.iter().any(|e| e.usage.is_none()) {
-        create::enrich_profiles_usage(data, &mut entries);
-    }
+    let (entries, usage_age_ms): (Vec<create::ProviderProfileEntry>, Option<i64>) =
+        match client::get::<Vec<server::ServedProfile>>(data, path)
+            .map_err(anyagents_core::Error::Message)?
+        {
+            Some(served) => {
+                let age = served.iter().filter_map(|s| s.usage_age_ms).max();
+                (served.into_iter().map(|s| s.entry).collect(), age)
+            }
+            None => {
+                let store = anyagents_core::Store::open(data.join("state.db"))?;
+                let mut entries = create::list_provider_profiles_fast(&store, data);
+                if entries.iter().any(|e| e.usage.is_none()) {
+                    create::enrich_profiles_usage(data, &mut entries);
+                }
+                (entries, None)
+            }
+        };
     let matches_filter = |e: &create::ProviderProfileEntry, f_trimmed: &str| -> bool {
         e.provider == f_trimmed
             || e.profile == f_trimmed
@@ -2424,6 +2686,12 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         .into_iter()
         .filter(|e| filter.is_none_or(|f| matches_filter(e, f.trim())))
         .collect();
+    if let Some(age) = usage_age_ms {
+        eprintln!(
+            "usage as of {} ago; the server refreshes it in the background",
+            age_text(age)
+        );
+    }
     if ui::is_pretty() {
         ui::print_profiles_pretty(&filtered);
         return Ok(());
@@ -2446,6 +2714,16 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         );
     }
     Ok(())
+}
+
+/// A short age: `42s`, `3m 05s`, `2h 10m`.
+fn age_text(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {:02}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3600, secs % 3600 / 60),
+    }
 }
 
 fn interact_cmd(
@@ -2498,6 +2776,10 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let public_addr = std::fs::read_to_string(data.join("public.addr"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let boundary = sandbox::boundary_of(data).ok();
     let has_operator_token = operator::operator_token(data).is_some();
 
@@ -2506,12 +2788,14 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         .map(|s| create::sync_and_list_provider_profiles_with_options(&s, data, false))
         .unwrap_or_default();
 
+    let catalog = anyagents_installer::Catalog::load(data)
+        .unwrap_or_else(|_| anyagents_installer::Catalog::builtin());
     let mut harness_rows = Vec::new();
-    for entry in anyagents_installer::builtin_catalog() {
+    for entry in catalog.harnesses() {
         let bin_path = install::program(data, &entry.id);
-        let present = bin_path.is_file() || anyagents_installer::machine_has(&entry.id);
+        let present = install::is_healthy(data, &entry.id) || bin_path.is_file();
         let version = install::recorded_version(data, &entry.id);
-        let (mode, steer) = anyagents_supervisor::declared(&entry.id);
+        let delivery = api::DeliveryView::from(&vendor::declared_delivery(&entry.id));
         let profiles: Vec<String> = provider_profiles
             .iter()
             .filter(|p| p.compatible_harnesses.iter().any(|h| h == &entry.id))
@@ -2522,8 +2806,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             "installed": present,
             "version": version,
             "binary": bin_path.display().to_string(),
-            "delivery_mode": anyagents_supervisor::mode_name(mode),
-            "steer_support": anyagents_supervisor::steer_name(steer),
+            "delivery": delivery,
             "profiles": profiles,
         }));
     }
@@ -2534,17 +2817,37 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
     };
     let archived_count = listed.archived_count;
     let agents_list = listed.agents;
+    // What needs the operator: agents parked after errored turns, and sends
+    // whose delivery is unconfirmed (held, never resent automatically).
+    let faulted: Vec<&api::AgentView> = agents_list
+        .iter()
+        .filter(|agent| agent.display_state() == "faulted")
+        .collect();
+    let unsettled: Vec<&api::UnsettledOutboundView> = agents_list
+        .iter()
+        .flat_map(|agent| agent.unsettled_outbound.iter())
+        .collect();
 
     if json_out {
         let doc = serde_json::json!({
             "server": if server_up { "running" } else { "stopped" },
             "socket": sock.display().to_string(),
             "webhook_addr": webhook_addr,
+            "public_addr": public_addr,
             "operator_token_present": has_operator_token,
             "boundary": boundary,
             "harnesses": harness_rows,
             "agents": agents_list,
             "archived_count": archived_count,
+            "attention": {
+                "faulted": faulted.iter().map(|agent| serde_json::json!({
+                    "id": agent.id,
+                    "name": agent.name,
+                    "parent": agent.parent,
+                    "turn_errors": agent.turn_errors,
+                })).collect::<Vec<_>>(),
+                "unsettled_outbound": unsettled,
+            },
         });
         println!(
             "{}",
@@ -2583,7 +2886,6 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             ("STATUS", false),
             ("VERSION", false),
             ("DELIVERY", false),
-            ("STEER", false),
             ("PROFILES", false),
         ]);
         for h in &harness_rows {
@@ -2599,8 +2901,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             } else {
                 ver.to_string()
             };
-            let mode = h["delivery_mode"].as_str().unwrap_or("-");
-            let steer = h["steer_support"].as_str().unwrap_or("-");
+            let delivery = delivery_label(&h["delivery"]);
             let profs = h["profiles"]
                 .as_array()
                 .map(|arr| {
@@ -2616,8 +2917,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                 ui::bold(&ui::cyan(id)),
                 inst,
                 ver_cell,
-                mode.to_string(),
-                steer.to_string(),
+                delivery,
                 profs,
             ]);
         }
@@ -2632,6 +2932,32 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                 .unwrap_or_else(|| "default".to_string())
         };
         ui::print_agents_table(&agents_list, Some(&profile_lookup), false);
+        if !faulted.is_empty() || !unsettled.is_empty() {
+            println!("\n  {}\n", ui::bold_cyan("Attention"));
+            for agent in &faulted {
+                println!(
+                    "  {} {} {}",
+                    ui::red("◐ faulted"),
+                    ui::bold(&agent.name),
+                    ui::dim(
+                        agent
+                            .turn_errors
+                            .as_ref()
+                            .and_then(|errors| errors.last_error.as_deref())
+                            .unwrap_or("-")
+                    )
+                );
+            }
+            for held in &unsettled {
+                println!(
+                    "  {} {} → {} {}",
+                    ui::yellow("? unconfirmed send"),
+                    held.key,
+                    held.destination,
+                    ui::dim("(anyagents outbound retry|discard <key>)")
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -2654,8 +2980,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         } else {
             "on-demand"
         };
-        let mode = h["delivery_mode"].as_str().unwrap_or("-");
-        let steer = h["steer_support"].as_str().unwrap_or("-");
+        let delivery = delivery_label(&h["delivery"]);
         let profs = h["profiles"]
             .as_array()
             .map(|arr| {
@@ -2667,7 +2992,28 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                 }
             })
             .unwrap_or_else(|| "auto".to_string());
-        println!("  {id}\t{inst}\tdelivery={mode}\tsteer={steer}\tprofiles={profs}");
+        println!("  {id}\t{inst}\tdelivery={delivery}\tprofiles={profs}");
+    }
+    for agent in &faulted {
+        println!(
+            "attention\tfaulted\t{}\t{}\t{}",
+            agent.name,
+            agent.id,
+            agent
+                .turn_errors
+                .as_ref()
+                .and_then(|errors| errors.last_error.as_deref())
+                .unwrap_or("-")
+        );
+    }
+    for held in &unsettled {
+        println!(
+            "attention\tunconfirmed_send\t{}\t{}\t{}\t{}",
+            held.key,
+            held.agent_id,
+            held.destination,
+            held.error.as_deref().unwrap_or("-")
+        );
     }
     let running_count = agents_list.iter().filter(|a| a.state == "running").count();
     let archived_count = agents_list.iter().filter(|a| a.state == "archived").count();
@@ -2682,11 +3028,24 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             .and_then(|id| create::bound_profile_name(&anyagents_core::agent_config_dir(data, id)))
             .unwrap_or_else(|| "default".to_string());
         println!(
-            "  {}\t{}\tharness={}\tprofile={prof}\tstate={}\tprocess={}\tmode={}",
-            a.name, a.id, a.harness, a.state, a.process, a.delivery_mode
+            "  {}\t{}\tharness={}\tprofile={prof}\tstate={}\tprocess={}\tdelivery={}",
+            a.name,
+            a.id,
+            a.harness,
+            a.state,
+            a.process,
+            a.delivery.label()
         );
     }
     Ok(())
+}
+
+/// The delivery column of one harness row: its level, `+idempotent` when a
+/// replay is recognised.
+fn delivery_label(value: &serde_json::Value) -> String {
+    serde_json::from_value::<api::DeliveryView>(value.clone())
+        .map(|delivery| delivery.label())
+        .unwrap_or_else(|_| "-".to_string())
 }
 
 fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Error> {
@@ -2850,6 +3209,18 @@ mod cli_query_tests {
                 Command::Peers { .. }
             ));
         }
+        // `resume` takes a name, or `--faulted` for every parked agent.
+        let faulted = Cli::try_parse_from(["anyagents", "resume", "--faulted"]).unwrap();
+        assert!(matches!(
+            faulted.command,
+            Command::Resume {
+                faulted: true,
+                name: None,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["anyagents", "resume"]).is_err());
+        assert!(Cli::try_parse_from(["anyagents", "resume", "vulcan", "--faulted"]).is_err());
         let inspected = Cli::try_parse_from(["anyagents", "inspect", "vulcan", "-n", "5"]).unwrap();
         assert!(matches!(
             inspected.command,

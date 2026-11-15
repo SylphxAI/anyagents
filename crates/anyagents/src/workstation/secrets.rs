@@ -75,14 +75,25 @@ pub fn resolve_fill_value(
     raw_text: Option<&str>,
     secret_ref: Option<&str>,
 ) -> Result<(String, Option<String>), Error> {
-    resolve_fill_value_with_op(data, raw_text, secret_ref, std::ffi::OsStr::new("op"))
+    resolve_fill_value_with_op(data, raw_text, secret_ref, None)
+}
+
+/// The `op` CLI: `op_program` in tests, otherwise the toolchain's declared
+/// tool (capability `browser.secret_ref`).
+fn resolve_op_program(op_program: Option<&std::ffi::OsStr>) -> Result<std::ffi::OsString, Error> {
+    match op_program {
+        Some(bin) => Ok(bin.to_os_string()),
+        None => anyagents_toolchain::tool("op", "browser.secret_ref")
+            .map(|tool| tool.path.into_os_string())
+            .map_err(|err| Error::Message(err.to_string())),
+    }
 }
 
 fn resolve_fill_value_with_op(
     data: &Path,
     raw_text: Option<&str>,
     secret_ref: Option<&str>,
-    op_program: &std::ffi::OsStr,
+    op_program: Option<&std::ffi::OsStr>,
 ) -> Result<(String, Option<String>), Error> {
     let candidate = secret_ref
         .map(str::trim)
@@ -102,7 +113,8 @@ fn resolve_fill_value_with_op(
                     .into(),
             ));
         }
-        let mut cmd = build_op_secret_command(op_program, &["read", "--no-newline", candidate]);
+        let op_bin = resolve_op_program(op_program)?;
+        let mut cmd = build_op_secret_command(&op_bin, &["read", "--no-newline", candidate]);
         let out = cmd
             .output()
             .map_err(|_| Error::Message("failed to invoke `op` CLI for secret reference".into()))?;
@@ -137,12 +149,11 @@ fn resolve_fill_value_with_op(
                         .into(),
                 ));
             }
-            build_op_secret_command(
-                op_program,
-                &["item", "get", item, "--vault", vault, "--otp"],
-            )
+            let op_bin = resolve_op_program(op_program)?;
+            build_op_secret_command(&op_bin, &["item", "get", item, "--vault", vault, "--otp"])
         } else {
-            build_op_secret_command(op_program, &["item", "get", trimmed, "--otp"])
+            let op_bin = resolve_op_program(op_program)?;
+            build_op_secret_command(&op_bin, &["item", "get", trimmed, "--otp"])
         };
         let out = cmd
             .output()
@@ -353,7 +364,7 @@ esac
             dir.path(),
             None,
             Some("op://vault-alpha/item-beta/password"),
-            shim.as_os_str(),
+            Some(shim.as_os_str()),
         )
         .unwrap();
         assert_eq!(secret, "in-memory-secret-value");
@@ -363,7 +374,7 @@ esac
             dir.path(),
             Some("op://vault-alpha/item-beta/otp?attribute=otp"),
             None,
-            shim.as_os_str(),
+            Some(shim.as_os_str()),
         )
         .unwrap();
         assert_eq!(attr_otp, "987654");
@@ -376,7 +387,7 @@ esac
             dir.path(),
             None,
             Some("op-otp://vault-alpha/item-beta"),
-            shim.as_os_str(),
+            Some(shim.as_os_str()),
         )
         .unwrap();
         assert_eq!(otp, "654321");
@@ -386,7 +397,7 @@ esac
             dir.path(),
             None,
             Some("op-otp://standalone-item"),
-            shim.as_os_str(),
+            Some(shim.as_os_str()),
         )
         .unwrap();
         assert_eq!(single_otp, "112233");
@@ -397,9 +408,13 @@ esac
             "op://vault-alpha/partial-leak/password",
             "op-otp://vault-alpha/partial-leak",
         ] {
-            let err =
-                resolve_fill_value_with_op(dir.path(), None, Some(failing_ref), shim.as_os_str())
-                    .unwrap_err();
+            let err = resolve_fill_value_with_op(
+                dir.path(),
+                None,
+                Some(failing_ref),
+                Some(shim.as_os_str()),
+            )
+            .unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("exit code 2"), "{msg}");
             for forbidden in [
@@ -444,10 +459,14 @@ esac
             "op://vault-alpha/empty-item/password",
             "op-otp://vault-alpha/empty-item",
         ] {
-            let msg =
-                resolve_fill_value_with_op(dir.path(), None, Some(empty_ref), shim.as_os_str())
-                    .unwrap_err()
-                    .to_string();
+            let msg = resolve_fill_value_with_op(
+                dir.path(),
+                None,
+                Some(empty_ref),
+                Some(shim.as_os_str()),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(msg.contains("empty value"), "{msg}");
             assert!(!msg.contains("vault-alpha"), "{msg}");
             assert!(!msg.contains("empty-item"), "{msg}");
@@ -462,7 +481,7 @@ esac
                 dir.path(),
                 None,
                 Some(valid_ref),
-                missing_bin.as_os_str(),
+                Some(missing_bin.as_os_str()),
             )
             .unwrap_err()
             .to_string();
@@ -477,10 +496,14 @@ esac
             "op-otp://vault-alpha/   ",
             "unsupported://vault-alpha/item-beta",
         ] {
-            let msg =
-                resolve_fill_value_with_op(dir.path(), None, Some(malformed_ref), shim.as_os_str())
-                    .unwrap_err()
-                    .to_string();
+            let msg = resolve_fill_value_with_op(
+                dir.path(),
+                None,
+                Some(malformed_ref),
+                Some(shim.as_os_str()),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(!msg.contains("vault-alpha"), "{msg}");
             assert!(!msg.contains("item-beta"), "{msg}");
             assert!(!msg.contains("only-two"), "{msg}");

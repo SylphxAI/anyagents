@@ -18,6 +18,7 @@ use anyagents_core::Store;
 /// A server child that is killed when this value drops.
 struct Server {
     child: Child,
+    _keepers: support::Keepers,
 }
 
 impl Server {
@@ -47,7 +48,10 @@ impl Server {
             assert!(Instant::now() < deadline, "no socket");
             std::thread::sleep(Duration::from_millis(20));
         }
-        Self { child }
+        Self {
+            child,
+            _keepers: support::Keepers::of(dir),
+        }
     }
 }
 
@@ -117,29 +121,7 @@ fn serve_one(mut stream: std::net::TcpStream, seen: &std::sync::Mutex<Vec<String
     let _ = stream.flush();
 }
 
-/// A `PATH` carrying the test double as the `claude` the machine already has,
-/// so nothing is downloaded for an install on this machine.
-fn machine_path(dir: &Path) -> std::ffi::OsString {
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let launcher = bin.join("claude");
-    if !launcher.exists() {
-        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_anyagents"), &launcher).unwrap();
-    }
-    let npm = bin.join("npm");
-    if !npm.exists() {
-        // Creating an agent installs its harness here; this test runs none of
-        // it, so `view` answers a version and an install does nothing.
-        std::fs::write(
-            &npm,
-            "#!/bin/sh\ncase \"$1\" in view) echo 0.0.0 ;; esac\nexit 0\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::env::join_paths([bin]).unwrap()
-}
+use support::machine_path;
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_anyagents"))
@@ -279,8 +261,9 @@ fn an_api_key_agent_gets_the_gateway_and_its_turn_reaches_the_provider() {
     let _server = Server::start(&data);
     read_policy();
 
-    // The restarted server binds a new port and repoints every agent at it, so
-    // the origin is read from the running server, not from before the restart.
+    // The restarted server binds its last port again, or a new one when that
+    // is taken, and points every agent at it, so the origin is read from the
+    // running server, not from before the restart.
     let store = Store::open(data.join("state.db")).unwrap();
     let agent = store.agent_by_name("alpha").unwrap();
     assert!(

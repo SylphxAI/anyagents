@@ -8,6 +8,7 @@
 //! from, so a name the model writes can only choose a destination.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyagents_core::{AgentId, Error};
 use bytes::Bytes;
@@ -28,6 +29,13 @@ use crate::api::{
 use crate::operator::CAPABILITY_FILE;
 use crate::server;
 
+mod code_children;
+pub(crate) mod code_contract;
+#[cfg(test)]
+mod contract_tests;
+
+pub(crate) use code_contract::CodeLimits;
+
 /// MCP tool surface profile.
 #[derive(
     Clone,
@@ -45,14 +53,15 @@ pub enum McpProfile {
     /// Exposes all AnyAgents MCP tools (`send`, `inbox`, `agents`, `groups`, `schedules`,
     /// `conversation`, `code`, `web_search`, `web_fetch`, `memory`, `skills`, `browser`,
     /// `computer`). Default for `anyagents mcp` over `stdio` across all local CLI harnesses
-    /// (`spiron`, `claude-code`, `codex`, `agy`, `opencode`) and for cloud agents bound to a
-    /// `SandboxConfig` or with built-in tools disabled.
+    /// (`spiron`, `claude-code`, `codex`, `agy`, `opencode`). Never served over HTTP, where
+    /// tools run inside the server process ([`McpProfile::resolve_http`]).
     #[default]
     Full,
-    /// Default for Streamable HTTP `POST /mcp` across all Cloud Agents (`spiron-cloud`,
-    /// `claude-cloud`, `openai-cloud`, `cursor-cloud`) when no remote `SandboxConfig` is bound.
-    /// Exposes coordination, `memory`, `skills`, `web_search`, `web_fetch`, `browser`, and
-    /// `computer` while omitting host-local `code`.
+    /// The most any Streamable HTTP `POST /mcp` call gets, whatever its credential, and the
+    /// default there: all Cloud Agents (`spiron-cloud`, `claude-cloud`, `openai-cloud`,
+    /// `cursor-cloud`) and remote sandboxes. Exposes coordination, `memory` and `skills`: control-plane state that
+    /// belongs to the agent. Every tool that runs on or from the control-plane host (`code`,
+    /// `files`, `browser`, `computer`, `device`, `media`, `web_search`, `web_fetch`) is omitted.
     Remote,
     /// Optional explicit coordination-only profile (`--profile coordination` or `?profile=coordination`).
     /// Exposes only pure multi-agent coordination tools (`send`, `inbox`, `agents`, `groups`,
@@ -76,6 +85,9 @@ pub const FULL_MCP_TOOLS: &[&str] = &[
     "computer",
 ];
 
+/// The remote profile: coordination plus the agent's own memory and skills.
+/// `web_search` and `web_fetch` stay out: they spend the server's provider keys
+/// and fetch from the control-plane network, so they are not host-free.
 pub const REMOTE_MCP_TOOLS: &[&str] = &[
     "send",
     "inbox",
@@ -83,12 +95,8 @@ pub const REMOTE_MCP_TOOLS: &[&str] = &[
     "groups",
     "schedules",
     "conversation",
-    "web_search",
-    "web_fetch",
     "memory",
     "skills",
-    "browser",
-    "computer",
 ];
 
 pub const COORDINATION_MCP_TOOLS: &[&str] = &[
@@ -132,11 +140,10 @@ impl McpProfile {
             .strip_prefix("mcp__anyagents__")
             .unwrap_or(raw_name.trim());
         match clean {
-            "code" | "files" => matches!(self, Self::Full),
-            "web" | "web_search" | "web_fetch" | "memory" | "skills" | "browser" | "computer"
-            | "device" | "media" => {
-                matches!(self, Self::Full | Self::Remote)
-            }
+            // Run on, or reach out from, the control-plane host.
+            "code" | "files" | "web" | "web_search" | "web_fetch" | "browser" | "computer"
+            | "device" | "media" => matches!(self, Self::Full),
+            "memory" | "skills" => matches!(self, Self::Full | Self::Remote),
             "send" | "inbox" | "agents" | "groups" | "schedules" | "schedule" | "conversation"
             | "search" | "spawn" | "subagents" | "describe" | "archive" | "wake" | "interact" => {
                 true
@@ -149,22 +156,27 @@ impl McpProfile {
         explicit.unwrap_or(Self::Full)
     }
 
-    pub fn resolve_http_with_config(
-        explicit: Option<&str>,
-        _harness: &str,
-        config_dir: Option<&Path>,
-    ) -> Result<Self, String> {
-        if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-            return Self::from_str_opt(raw).ok_or_else(|| {
-                format!("invalid MCP profile `{raw}`; expected `full`, `remote`, or `coordination`")
-            });
-        }
-        if anyagents_tools::SandboxConfig::resolve(config_dir).is_some()
-            || config_dir.is_some_and(crate::cloud_harness::disable_builtin_tools_flag)
-        {
-            Ok(Self::Full)
-        } else {
-            Ok(Self::Remote)
+    /// The profile an MCP call over HTTP gets, whatever credential it
+    /// presents: `remote`, or the narrower `coordination` when asked for.
+    /// Over HTTP the tools run inside the server process, as the server's own
+    /// user, so `full` (files, exec, code, browser, computer, ...) would hand
+    /// the caller the server's identity. It is never served here; `full`
+    /// exists only on stdio, where the tool server runs as the agent itself.
+    pub fn resolve_http(explicit: Option<&str>) -> Result<Self, String> {
+        match explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(Self::Remote),
+            Some(raw) => match Self::from_str_opt(raw) {
+                Some(Self::Remote) => Ok(Self::Remote),
+                Some(Self::Coordination) => Ok(Self::Coordination),
+                Some(Self::Full) => Err(format!(
+                    "MCP profile `{raw}` is not served over HTTP, where tools would run as the server; \
+                     HTTP serves `remote` or `coordination`, and `full` is available only over stdio \
+                     (`anyagents mcp`)"
+                )),
+                None => Err(format!(
+                    "invalid MCP profile `{raw}`; HTTP serves `remote` or `coordination`"
+                )),
+            },
         }
     }
 }
@@ -498,14 +510,12 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
     let socket = server::socket_path(data);
     let capability = capability_of(config)?;
     let config_buf = config.to_path_buf();
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
-        let client = Client {
-            socket,
-            config: config_buf.clone(),
-            capability,
-        };
-        let (who, harness) = client.whoami_with_harness().await.map_err(Error::Message)?;
+    tool_server_runtime()?.block_on(async {
+        let client = Client::new(socket, config_buf.clone(), capability);
+        let (who, harness, limits) = client.whoami_with_harness().await.map_err(Error::Message)?;
+        // The limits come from the server's environment only; a server that
+        // names none leaves the defaults.
+        CodeLimits::serve(limits.unwrap_or_default());
         // A harness names the agent id it was given; the server already
         // answered with the agent this session acts as, and the two may not
         // differ.
@@ -536,9 +546,21 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
     })
 }
 
+/// The runtime one agent's tool server runs on. Every agent has its own tool
+/// server, so its fixed cost is paid once per agent: one thread drives every
+/// call, and blocking work (file tools, local web fetches, stdio reads) goes
+/// to tokio's on-demand blocking pool, whose idle threads exit by themselves.
+/// A worker per CPU in each of a hundred tool servers is thousands of idle
+/// threads on a shared machine.
+fn tool_server_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
 /// The capability an agent's harness reads: a file only that agent's own
 /// config directory holds.
-fn capability_of(config: &Path) -> Result<String, Error> {
+pub(crate) fn capability_of(config: &Path) -> Result<String, Error> {
     let path = config.join(CAPABILITY_FILE);
     let text = std::fs::read_to_string(&path).map_err(|err| {
         Error::Message(format!(
@@ -559,35 +581,182 @@ fn capability_of(config: &Path) -> Result<String, Error> {
 pub(crate) struct Client {
     pub(crate) socket: PathBuf,
     pub(crate) config: PathBuf,
+    /// The capability read at start, used while the file cannot be read.
     pub(crate) capability: String,
+    /// Set for the tool server the HTTP MCP route runs inside the server
+    /// process: every call it makes carries [`HTTP_MCP_HEADER`], so routes
+    /// that would start or read something on the host refuse it.
+    via_http: bool,
+    /// What every clone of this client shares: idle connections to the
+    /// server and the capability file as last read.
+    link: Arc<ServerLink>,
+}
+
+/// Connections kept open between calls, at most this many while idle. A
+/// burst of parallel calls opens what it needs; the rest close after it.
+const MAX_IDLE_CONNECTIONS: usize = 4;
+
+#[derive(Default)]
+struct ServerLink {
+    idle: std::sync::Mutex<Vec<http1::SendRequest<Full<Bytes>>>>,
+    capability: std::sync::Mutex<Option<(CapabilityStamp, String)>>,
+}
+
+/// The identity of one version of the capability file. A rotation writes a
+/// new file and renames it into place, which changes the inode; an in-place
+/// rewrite changes the size or a timestamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CapabilityStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl CapabilityStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Client {
+    pub(crate) fn new(socket: PathBuf, config: PathBuf, capability: String) -> Self {
+        Self {
+            socket,
+            config,
+            capability,
+            via_http: false,
+            link: Arc::default(),
+        }
+    }
+
+    /// The client of a tool server that answers MCP over HTTP.
+    fn over_http(mut self) -> Self {
+        self.via_http = true;
+        self
+    }
+
+    /// The capability in the agent's config directory now. The server may
+    /// rotate it while this process runs, so every call presents what the
+    /// file holds; the file is read again only when its identity changed.
     fn current_capability(&self) -> String {
-        capability_of(&self.config).unwrap_or_else(|_| self.capability.clone())
+        let Ok(meta) = std::fs::metadata(self.config.join(CAPABILITY_FILE)) else {
+            return self.capability.clone();
+        };
+        let stamp = CapabilityStamp::of(&meta);
+        let mut cached = locked(&self.link.capability);
+        if let Some((seen, token)) = cached.as_ref()
+            && *seen == stamp
+        {
+            return token.clone();
+        }
+        match capability_of(&self.config) {
+            Ok(token) => {
+                *cached = Some((stamp, token.clone()));
+                token
+            }
+            Err(_) => self.capability.clone(),
+        }
+    }
+
+    /// One call on a kept-alive connection to the server. A connection the
+    /// server closed (it restarted, or it is stopping) is dropped and the
+    /// call goes on a new one; a call is sent again only when hyper hands it
+    /// back unsent, so nothing the server may have received is repeated.
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Vec<u8>>,
+        capability: &str,
+        agent_id: Option<&str>,
+    ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
+        let mut request = build_request(
+            method,
+            path,
+            body,
+            Some(capability),
+            None,
+            agent_id,
+            self.via_http,
+        )?;
+        loop {
+            let (mut sender, reused) = match self.idle_connection().await {
+                Some(sender) => (sender, true),
+                // A tool call made while the server restarts waits for it,
+                // within what is left of the call's own wait.
+                None => (connect_waiting(&self.socket, &call_wait()).await?, false),
+            };
+            // A call its harness gave up on while it waited is not sent.
+            if call_cancelled() {
+                return Err("the tool call was cancelled".into());
+            }
+            let response = match sender.try_send_request(request).await {
+                Ok(response) => response,
+                Err(mut error) => match error.take_message() {
+                    Some(unsent) if reused => {
+                        request = unsent;
+                        continue;
+                    }
+                    _ => return Err(error.into_error().to_string()),
+                },
+            };
+            let status = response.status();
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|err| err.to_string())?
+                .to_bytes()
+                .to_vec();
+            let mut idle = locked(&self.link.idle);
+            if idle.len() < MAX_IDLE_CONNECTIONS {
+                idle.push(sender);
+            }
+            return Ok((status, bytes));
+        }
+    }
+
+    /// An idle connection that can take a request now, if one is open.
+    async fn idle_connection(&self) -> Option<http1::SendRequest<Full<Bytes>>> {
+        loop {
+            let mut sender = locked(&self.link.idle).pop()?;
+            if sender.ready().await.is_ok() {
+                return Some(sender);
+            }
+        }
     }
 
     /// The agent this capability authenticates, as the server resolved it.
-    async fn whoami_with_harness(&self) -> Result<(AgentRef, Option<String>), String> {
+    async fn whoami_with_harness(
+        &self,
+    ) -> Result<(AgentRef, Option<String>, Option<CodeLimits>), String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
-        let who: serde_json::Value = request_naming(
-            &self.socket,
-            "GET",
-            "/v1/whoami",
-            None,
-            Some(&cap),
-            None,
-            named.as_deref(),
-        )
-        .await
-        .and_then(|(status, bytes)| {
-            if status.is_success() {
-                serde_json::from_slice(&bytes).map_err(|err| err.to_string())
-            } else {
-                Err(error_message(&bytes))
-            }
-        })?;
+        let who: serde_json::Value = self
+            .send("GET", "/v1/whoami", None, &cap, named.as_deref())
+            .await
+            .and_then(|(status, bytes)| {
+                if status.is_success() {
+                    serde_json::from_slice(&bytes).map_err(|err| err.to_string())
+                } else {
+                    Err(error_message(&bytes))
+                }
+            })?;
         let id = who
             .get("agent_id")
             .and_then(serde_json::Value::as_str)
@@ -608,6 +777,11 @@ impl Client {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let limits = who.get("code_limits").and_then(|value| {
+            serde_json::from_value::<CodeLimits>(value.clone())
+                .ok()
+                .map(|l| CodeLimits::from_parts(Some(l.default_ms), Some(l.max_ms)))
+        });
         Ok((
             AgentRef {
                 id: AgentId::parse(id).map_err(|err| err.to_string())?,
@@ -615,6 +789,7 @@ impl Client {
                 workdir,
             },
             harness,
+            limits,
         ))
     }
 
@@ -635,16 +810,9 @@ impl Client {
     ) -> Result<T, String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
-        let (status, bytes) = request_naming(
-            &self.socket,
-            method,
-            path,
-            body,
-            Some(&cap),
-            None,
-            named.as_deref(),
-        )
-        .await?;
+        let (status, bytes) = self
+            .send(method, path, body, &cap, named.as_deref())
+            .await?;
         if !status.is_success() {
             return Err(error_message(&bytes));
         }
@@ -673,7 +841,7 @@ struct SendArgs {
     /// Broadcasts, channel updates and system events do not. May be
     /// empty (`[]`) when `reply_to` names a mailbox reference (`anyagents:reply:<msg_id>`)
     /// or when performing a message interaction (`action`: `"react"` | `"vote"` | `"edit"` | `"delete"` | `"pin"` | `"unpin"` | `"stop_poll"`).
-    #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
+    #[serde(default, deserialize_with = "deserialize_send_targets")]
     to: Vec<String>,
     /// Message text or caption (Markdown is automatically rendered as rich HTML on Telegram).
     /// Also used as new message text when `action = "edit"` or optional comment when `action = "vote"`.
@@ -681,46 +849,66 @@ struct SendArgs {
     text: String,
     /// Optional reply or interaction target: `anyagents:reply:<msg_id>` from the message header
     /// (answers or reacts in the same chat/topic/agent), or a plain destination address.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     reply_to: Option<String>,
     /// Optional quoted substring or message text to attach as a quote.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     quote: Option<String>,
     /// Optional media attachment (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`)
     /// by local file path, `https://` URL, or Telegram `file_id` (plus optional `title` and `performer` for `music`/`audio`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     media: Option<SendMedia>,
     /// Optional GPS coordinates or venue (`latitude`, `longitude`, optional `title` and `address`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     location: Option<SendLocation>,
     /// Optional interactive poll (`question`, `options`, optional `is_anonymous` and `allows_multiple_answers`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     poll: Option<SendPoll>,
     /// Optional interactive checklist (`title`, `tasks`, optional `business_connection_id`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     checklist: Option<SendChecklist>,
     /// Optional rich Instant View article (`title`, `content` or `url`, optional `author_name`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     article: Option<SendArticle>,
     /// Optional message interaction action (`"send"` default, or `"react"`, `"vote"`, `"check"`, `"uncheck"`,
     /// `"edit"`, `"delete"`, `"pin"`, `"unpin"`, `"stop_poll"` on an existing message identified by `target` or `reply_to`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     action: Option<String>,
     /// Target message for interactions (`anyagents:reply:msg_...`, `msg_...`, or `telegram:chat:<chat_id>:<message_id>`).
     /// Falls back to `reply_to` if omitted.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     target: Option<String>,
     /// Emoji reaction when `action = "react"` (e.g. `"👍"`, `"🔥"`, `"❤️"`, `"🎉"`, or `""` to clear).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     emoji: Option<String>,
     /// Selected poll option(s) when `action = "vote"` (1-based option numbers `"1"`, `"2"` or option text)
     /// or checklist item numbers when `action = "check" | "uncheck"`.
-    #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
+    #[serde(default, deserialize_with = "deserialize_send_targets")]
     options: Vec<String>,
     /// Names this send. Send it again with the same value only when an earlier
     /// attempt got no answer.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     idempotency_key: Option<String>,
+}
+
+/// A destination word that names agents by their relation to the sender.
+fn relation_word(raw: &str) -> Option<&'static str> {
+    let raw = raw.trim();
+    let word = raw.strip_prefix("agent:").unwrap_or(raw);
+    ["parent", "children", "siblings", "peers", "team", "all"]
+        .into_iter()
+        .find(|known| word.eq_ignore_ascii_case(known))
+}
+
+/// `send` destinations or options, without the `"null"` placeholders models
+/// write for an unused list.
+fn deserialize_send_targets<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut targets = crate::api::deserialize_string_or_vec(deserializer)?;
+    targets.retain(|target| !crate::api::is_null_word(target));
+    Ok(targets)
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -827,14 +1015,14 @@ struct AgentsArgs {
     /// Action to perform:
     /// - `"list"` (default: list agents and sub-agents with optional `state` and `parent` filters)
     /// - `"inspect"` / `"status"` (inspect an agent or sub-agent's live status, schedules, and recent conversation turns)
-    /// - `"spawn"` (spawn a new sub-agent under this agent, with optional `repo` / `branch` / `base` / `workdir` for an isolated Git worktree)
+    /// - `"spawn"` (spawn a new sub-agent under this agent, with optional `repo` / `branch` / `base` / `workdir` for an isolated Git repository of its own)
     /// - `"create"` (admin-only: create a standalone root agent with no parent)
     /// - `"describe"` (read any agent's role & responsibility `description` / `instructions`, defaulting `name` to `"self"`, or update a target's `description` / `instructions` / `role` / `scope` — mutations require the target's Parent/Ancestor agent or an Admin)
     /// - `"steer"` / `"send"` (send/steer a follow-up `prompt` into an agent or sub-agent, waking it if archived)
     /// - `"wake"` / `"resume"` (wake an archived or paused agent, with optional `prompt`)
     /// - `"reset_session"` / `"new_session"` (new session for a quiescent managed agent; preserves old pins and raw state)
     /// - `"pause"` (pause an agent)
-    /// - `"archive"` (any agent, including roots and labelled children, may self-archive; preserves browser profiles; auto-reaps clean/pushed managed Git worktrees while preserving dirty ones)
+    /// - `"archive"` (any agent, including roots and labelled children, may self-archive; preserves browser profiles; auto-reaps clean/pushed managed checkouts while preserving dirty ones)
     /// - `"delete"` / `"kill"` (permanently delete a sub-agent or agent)
     /// - `"rename"` (Parent/Ancestor or Admin: rename a descendant or agent in place while keeping its `agt_...` ID and old name as an alias)
     /// - `"role"` (Parent/Ancestor or Admin: set or clear an agent's short role label)
@@ -846,6 +1034,11 @@ struct AgentsArgs {
     ///   `agent`/`day`/`model`/`harness`. Callers with `scope == "public"`, roots and
     ///   the local operator see the whole workspace; other callers see only self plus
     ///   causal descendants, and an explicit out-of-scope target is refused.)
+    /// - `"verdict"` (judge the work of `name`, a descendant: `verdict` is `accepted`,
+    ///   `rework`, `rejected` or `abandoned`, with an optional `reason`; never your own work)
+    /// - `"outcomes"` (successes, failures, recovery and cost per success, with the same
+    ///   target, window and visibility as `usage`; `group_by` is `model`, `harness`,
+    ///   `role`, `profile`, `agent` or `skill`)
     #[serde(default)]
     action: Option<String>,
     /// Target body id when action = "redact"; `transcript:<zero-based-line>` addresses
@@ -858,9 +1051,13 @@ struct AgentsArgs {
     /// Optional end-exclusive decoded-text span. Omit to tombstone the whole body.
     #[serde(default)]
     span: Option<crate::api::RedactionSpan>,
-    /// Required audit reason for redact. Never repeat sensitive text in this field.
+    /// Required audit reason for redact (never repeat sensitive text here); the
+    /// optional reason for a verdict.
     #[serde(default)]
     reason: Option<String>,
+    /// For `verdict`: `"accepted"`, `"rework"`, `"rejected"` or `"abandoned"`.
+    #[serde(default)]
+    verdict: Option<String>,
     /// Optional state filter for `list`: `"running"`, `"working"`, `"errored"`, `"idle"`, `"paused"`, `"archived"`, or `"all"` (default `"all"`).
     #[serde(default)]
     state: Option<String>,
@@ -904,10 +1101,10 @@ struct AgentsArgs {
     /// Optional upstream provider account profile when `action` is `"spawn"`, `"create"`, or `"harness"`.
     #[serde(default)]
     profile: Option<String>,
-    /// Optional repository (`"<org>/<repo>"`, local repo path, or `"inherit"` to branch from the parent's repo) when `action` is `"spawn"` or `"create"` to automatically provision an isolated, lifecycle-managed Git worktree at `<data>/agents/<id>/work`.
+    /// Optional repository (`"<org>/<repo>"`, local repo path, or `"inherit"` to branch from the parent's repo) when `action` is `"spawn"` or `"create"` to automatically provision an isolated, lifecycle-managed Git repository of its own at `<data>/agents/<id>/work`.
     #[serde(default)]
     repo: Option<String>,
-    /// Optional Git branch name for the managed worktree when `repo` is provided (defaults to `agent/<name>`).
+    /// Optional Git branch name for the managed checkout when `repo` is provided (defaults to `agent/<name>`).
     #[serde(default)]
     branch: Option<String>,
     /// Optional starting Git ref/branch when `repo` is provided (defaults to `origin/HEAD` or parent `HEAD`).
@@ -970,7 +1167,8 @@ struct AgentsArgs {
     /// For `usage`: trailing window in days, intersected with `since_ms`/`until_ms`.
     #[serde(default)]
     days: Option<i64>,
-    /// For `usage`: grouping dimension (`agent`, `day`, `model`, `harness`).
+    /// For `usage`: grouping dimension (`agent`, `day`, `model`, `harness`); for
+    /// `outcomes`: `model`, `harness`, `role`, `profile`, `agent` or `skill`.
     #[serde(default)]
     group_by: Option<String>,
 }
@@ -1006,13 +1204,13 @@ struct SpawnArgs {
     /// Optional upstream provider account profile (e.g. `acct-a`, `openai/default`, `sylphx/default`).
     #[serde(default)]
     profile: Option<String>,
-    /// Optional repository (`"<org>/<repo>"`, local repo path, or `"inherit"` to branch from the parent's repo) to automatically provision an isolated, lifecycle-managed Git worktree as the sub-agent's `workdir`.
+    /// Optional repository (`"<org>/<repo>"`, local repo path, or `"inherit"` to branch from the parent's repo) to automatically provision an isolated, lifecycle-managed Git repository of its own as the sub-agent's `workdir`.
     #[serde(default)]
     repo: Option<String>,
-    /// Optional Git branch name to create in the managed worktree when `repo` is provided (defaults to `agent/<name>`).
+    /// Optional Git branch name to create in the managed checkout when `repo` is provided (defaults to `agent/<name>`).
     #[serde(default)]
     branch: Option<String>,
-    /// Optional starting Git ref/branch for the managed worktree when `repo` is provided (defaults to `origin/HEAD` or parent `HEAD`).
+    /// Optional starting Git ref/branch for the managed checkout when `repo` is provided (defaults to `origin/HEAD` or parent `HEAD`).
     #[serde(default)]
     base: Option<String>,
     /// Optional workspace path or mode: `"worktree"` / `"branch"` (isolated Git worktree from the parent repo), `"private"` (clean isolated `<data>/agents/<id>/work`), or `"inherit"` (explicit parent directory sharing). When both `repo` and `workdir` are omitted, a sub-agent gets its own private directory. Root creation may use the operator-configured working directory.
@@ -1123,10 +1321,10 @@ struct SubagentsArgs {
     /// Optional account profile when `action = "spawn"`.
     #[serde(default)]
     profile: Option<String>,
-    /// Optional repository (`"<org>/<repo>"`, local repo path, or `"inherit"`) when `action = "spawn"` to automatically provision an isolated, lifecycle-managed Git worktree.
+    /// Optional repository (`"<org>/<repo>"`, local repo path, or `"inherit"`) when `action = "spawn"` to automatically provision an isolated, lifecycle-managed Git repository of its own.
     #[serde(default)]
     repo: Option<String>,
-    /// Optional Git branch name for the managed worktree when `action = "spawn"` and `repo` is set (defaults to `agent/<name>`).
+    /// Optional Git branch name for the managed checkout when `action = "spawn"` and `repo` is set (defaults to `agent/<name>`).
     #[serde(default)]
     branch: Option<String>,
     /// Optional starting Git ref/branch when `action = "spawn"` and `repo` is set (defaults to `origin/HEAD` or parent `HEAD`).
@@ -1251,16 +1449,16 @@ struct InteractArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct ScheduleArgs {
-    /// Action: `"set"` (create a one-off `at`, recurring `every`, or event `watch` wake),
-    /// `"list"` (list active schedules), or `"cancel"` (cancel a schedule by `id` or `"all"`).
-    /// Inferred automatically when `at`, `every`, `watch`, or `id` is provided.
-    #[serde(default)]
+    /// `"create"` (exactly one of `at`, `every`, `watch`, plus `prompt`), `"list"`, or
+    /// `"cancel"` (`id` or `"all"`). `"at"`, `"every"` and `"watch"` create with that trigger.
+    /// Inferred when omitted: a trigger creates, an `id` cancels, otherwise list.
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     action: Option<String>,
     /// One-off wake time: relative duration (`"1m"`, `"30s"`, `"2h"`) or ISO-8601 / Unix timestamp (`"2026-10-29T16:30:00Z"`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     at: Option<String>,
-    /// Recurring wake interval (`"1m"`, `"5m"`, `"15m"`, `"30m"`, `"1h"`). Fires only when idle and not quota-blocked; a missed wake never double-fires.
-    #[serde(default)]
+    /// Recurring wake interval (`"1m"`, `"5m"`, `"15m"`, `"30m"`, `"1h"`). Each tick enters your mailbox like any other message; ticks missed while one is still undelivered coalesce into it.
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     every: Option<String>,
     /// Event watch specification:
     /// - `"github:pr:<owner>/<repo>#<num>"` (GitHub PR reaching a terminal state: merged/closed or checks terminal)
@@ -1269,16 +1467,37 @@ struct ScheduleArgs {
     /// - `"agent:idle:<name_or_id>"` (AnyAgents agent transitioning to idle)
     /// - `"pid:<pid>"` / `"process:<pid>"` (local background process PID exiting)
     /// - `"file:<path>"` / `"path:<path>"` (local file/directory created or modified)
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     watch: Option<String>,
+    /// The trigger value when `action` names the trigger (`{action: "at", spec: "20m"}`).
+    #[serde(
+        default,
+        alias = "kind",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
+    spec: Option<String>,
     /// Prompt delivered to the agent when the schedule or event watch fires.
-    #[serde(default, alias = "text", alias = "message")]
+    #[serde(
+        default,
+        alias = "text",
+        alias = "message",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
     prompt: Option<String>,
     /// Schedule ID (`sch_...`) or `"all"` when `action = "cancel"`.
-    #[serde(default, alias = "schedule_id")]
+    #[serde(
+        default,
+        alias = "schedule_id",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
     id: Option<String>,
     /// Optional target agent name or `agt_...` ID (defaults to this agent; owners/parents can also inspect or manage a peer/child's schedules).
-    #[serde(default, alias = "name", alias = "target")]
+    #[serde(
+        default,
+        alias = "name",
+        alias = "target",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
     agent: Option<String>,
 }
 
@@ -1469,9 +1688,15 @@ struct FilesArgs {
     /// Optional working directory (relative to the agent's `workdir` or absolute) when `action = "exec"`.
     #[serde(default, alias = "workdir")]
     cwd: Option<String>,
-    /// Optional execution timeout in milliseconds when `action = "exec"` (default `30000`, max `120000`).
+    /// Optional execution timeout in milliseconds when `action = "exec"` (default `30000`, max
+    /// `600000` unless the server sets another ceiling; a remote sandbox stops at `120000`).
     #[serde(default, alias = "timeout")]
     timeout_ms: Option<u64>,
+    /// The `timeout_ms` a `code` snippet asked for, when its call had less
+    /// time left to give; only the result's note reads it.
+    #[serde(default)]
+    #[schemars(skip)]
+    requested_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1500,13 +1725,10 @@ impl DynamicObjectArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct CodeArgs {
-    /// Async TypeScript / JavaScript snippet body to execute in the AnyAgents capability sandbox.
-    /// Has access to `anyagents.{memory,conversation,send,agents,schedule,groups,browser,files}` (and `tools.anyagents.*`)
-    /// plus `workspace.{read,write,edit,multi_edit,patch,glob,grep,list}` (and `tools.workspace.*`) and `console.{log,warn,error}`.
-    /// Ambient `process.env`, `require`, `child_process`, and raw `fs` are isolated and unavailable.
+    /// TypeScript body of an async function, run in the AnyAgents capability sandbox.
     #[serde(alias = "script", alias = "source")]
     code: String,
-    /// Optional execution timeout in milliseconds (default `30000`, max `120000`).
+    /// Wall time for the call in milliseconds (default `30000`, max `600000` unless configured).
     #[serde(default, alias = "timeout")]
     timeout_ms: Option<u64>,
 }
@@ -1541,12 +1763,30 @@ fn send_turn_result(response: SendResponse, closing: bool) -> Result<serde_json:
 #[tool_router]
 impl AgentMcp {
     #[tool(
-        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`planner`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`)."
+        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`planner`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`). Use `operator` to report a defect in AnyAgents, the harness, or the host environment that you cannot fix within your own work. Include the exact error and what you tried. Do not work around it silently."
     )]
     async fn send(
         &self,
         Parameters(args): Parameters<SendArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let mut args = args;
+        // Relation words (`parent`, `children`, ...) read the same in `to` and
+        // in `reply_to`, whatever their case or `agent:` prefix.
+        for target in &mut args.to {
+            if let Some(word) = relation_word(target) {
+                *target = word.to_string();
+            }
+        }
+        if args.to.is_empty()
+            && let Some(word) = args
+                .reply_to
+                .as_deref()
+                .and_then(relation_word)
+                .filter(|word| matches!(*word, "parent" | "children"))
+        {
+            args.to = vec![word.to_string()];
+            args.reply_to = None;
+        }
         let inferred_interact = args
             .action
             .as_deref()
@@ -1661,13 +1901,21 @@ impl AgentMcp {
                 None => self.agent.id.to_string(),
             }
         };
-        let target = args
+        let target = match args
             .agent
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
-            .unwrap_or(default_agent);
+        {
+            Some(raw) => {
+                let resolved = self.resolve_agent_word(raw).await?;
+                resolved
+                    .strip_prefix("agent:")
+                    .unwrap_or(&resolved)
+                    .to_string()
+            }
+            None => default_agent,
+        };
         let mut query = Vec::new();
         if let Some(id) = args.raw_id {
             query.push(format!("raw_id={}", urlencoding_simple(&id)));
@@ -1732,7 +1980,8 @@ impl AgentMcp {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            query.push(format!("with={}", urlencoding_simple(with_peer)));
+            let with_peer = self.resolve_agent_word(with_peer).await?;
+            query.push(format!("with={}", urlencoding_simple(&with_peer)));
         }
         if let Some(dir) = args
             .direction
@@ -1805,11 +2054,11 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`role`, `name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `create`, `rename`, `role`, `harness`, `models`."
+        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`role`, `name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git repository; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed checkouts while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); use `verdict` (`name`, `verdict`: `accepted` | `rework` | `rejected` | `abandoned`, `reason`) to judge a descendant's work, and `outcomes` (like `usage`) for successes and cost per success; or use `create`, `rename`, `role`, `harness`, `models`."
     )]
     async fn agents(
         &self,
-        Parameters(args): Parameters<AgentsArgs>,
+        Parameters(mut args): Parameters<AgentsArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
         let action = args
             .action
@@ -1834,8 +2083,14 @@ impl AgentMcp {
                     "list".to_string()
                 }
             });
+        // `name` names the agent acted on, except where it names a new one.
+        if !matches!(action.as_str(), "list" | "spawn" | "create")
+            && let Some(raw) = args.name.as_deref()
+        {
+            args.name = Some(self.resolve_agent_word(raw).await?);
+        }
         match action.as_str() {
-            "usage" => {
+            "usage" | "outcomes" => {
                 let mut qs = String::new();
                 let mut push = |k: &str, v: String| {
                     if !qs.is_empty() {
@@ -1863,12 +2118,37 @@ impl AgentMcp {
                 if let Some(v) = args.group_by.as_deref().filter(|v| !v.trim().is_empty()) {
                     push("group_by", v.to_string());
                 }
+                let route = format!("/v1/{action}");
                 let path = if qs.is_empty() {
-                    "/v1/usage".to_string()
+                    route
                 } else {
-                    format!("/v1/usage?{qs}")
+                    format!("{route}?{qs}")
                 };
                 let response = self.client.get(&path, None).await?;
+                Ok(rmcp::handler::server::wrapper::Json(response))
+            }
+            "verdict" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        "verdict requires the agent `name` whose work is judged".to_string()
+                    })?;
+                let verdict = args.verdict.as_deref().ok_or_else(|| {
+                    "verdict requires `verdict`: accepted, rework, rejected or abandoned"
+                        .to_string()
+                })?;
+                let body = serde_json::json!({ "verdict": verdict, "reason": args.reason });
+                let path = format!(
+                    "/v1/agents/{}/verdict",
+                    urlencoding_simple(target.strip_prefix("agent:").unwrap_or(target))
+                );
+                let response = self
+                    .client
+                    .get(&path, Some(body.to_string().into_bytes()))
+                    .await?;
                 Ok(rmcp::handler::server::wrapper::Json(response))
             }
             "redact" => {
@@ -1983,9 +2263,6 @@ impl AgentMcp {
                     args.limit,
                     args.cursor,
                 );
-                for a in &mut response.agents {
-                    a.instructions = None;
-                }
                 let mut val = serde_json::to_value(&response).map_err(|e| e.to_string())?;
                 if let Some(obj) = val.as_object_mut() {
                     obj.insert("next_cursor".to_string(), summary["next_cursor"].clone());
@@ -2309,6 +2586,7 @@ impl AgentMcp {
                         .get(&conv_path, None)
                         .await
                         .unwrap_or(ConversationResponse {
+                            retrieval: None,
                             agent_id: view.id.clone(),
                             agent: view.name.clone(),
                             turns: Vec::new(),
@@ -2375,7 +2653,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Spawn a new sub-agent with this agent as its `parent` (supports multi-level sub-agent trees). Pass `repo` (e.g. `\"example-org/workspace\"` or `\"inherit\"` to branch from your current repo, with optional `branch` and `base`) to automatically provision an isolated, lifecycle-managed Git worktree at `<data>/agents/<id>/work` (cleanly reaped on `archive` when pushed, or preserved if dirty). If both `repo` and `workdir` are omitted, defaults to its own isolated `<data>/agents/<id>/work`. Every sub-agent automatically receives the shared `AGENTS.md` and top-level `skills` in its config home."
+        description = "Spawn a new sub-agent with this agent as its `parent` (supports multi-level sub-agent trees). Pass `repo` (e.g. `\"example-org/workspace\"` or `\"inherit\"` to branch from your current repo, with optional `branch` and `base`) to automatically provision an isolated, lifecycle-managed Git repository of its own at `<data>/agents/<id>/work` (cleanly reaped on `archive` when pushed, or preserved if dirty). If both `repo` and `workdir` are omitted, defaults to its own isolated `<data>/agents/<id>/work`. Every sub-agent automatically receives the shared `AGENTS.md` and top-level `skills` in its config home."
     )]
     async fn spawn(
         &self,
@@ -2425,7 +2703,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `steer` | `wake` | `pause` | `archive` | `delete`, supporting multi-level sub-agent trees). Use `list` (default) to view your sub-agents and their live status (`running`, `paused`, `archived`, `turn_state`); use `inspect` with `agent` to view live status AND recent conversation turns; use `spawn` to launch a sub-agent on any harness (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`), model, profile, and workspace (`repo`: `\"<org>/<repo>\"` or `\"inherit\"` for an isolated Git worktree at `<data>/agents/<id>/work`; `workdir`: path, `\"worktree\"`, `\"private\"`, or `\"inherit\"` for explicit parent sharing; omitting both `repo` and `workdir` gives a private directory); use `steer` to send follow-up instructions; use `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), `wake`, or `delete` to control its lifecycle."
+        description = "Unified cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `steer` | `wake` | `pause` | `archive` | `delete`, supporting multi-level sub-agent trees). Use `list` (default) to view your sub-agents and their live status (`running`, `paused`, `archived`, `turn_state`); use `inspect` with `agent` to view live status AND recent conversation turns; use `spawn` to launch a sub-agent on any harness (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`), model, profile, and workspace (`repo`: `\"<org>/<repo>\"` or `\"inherit\"` for an isolated Git repository at `<data>/agents/<id>/work`; `workdir`: path, `\"worktree\"`, `\"private\"`, or `\"inherit\"` for explicit parent sharing; omitting both `repo` and `workdir` gives a private directory); use `steer` to send follow-up instructions; use `pause`, `archive` (auto-reaps clean/pushed managed checkouts while preserving dirty ones), `wake`, or `delete` to control its lifecycle."
     )]
     async fn subagents(
         &self,
@@ -2486,9 +2764,6 @@ impl AgentMcp {
                     args.limit,
                     args.cursor,
                 );
-                for a in &mut resp.agents {
-                    a.instructions = None;
-                }
                 Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
                     "parent": self.agent.name,
                     "next_cursor": summary["next_cursor"],
@@ -2522,6 +2797,7 @@ impl AgentMcp {
                         .get(&conv_path, None)
                         .await
                         .unwrap_or(ConversationResponse {
+                            retrieval: None,
                             agent_id: view.id.clone(),
                             agent: view.name.clone(),
                             turns: Vec::new(),
@@ -2734,7 +3010,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Archive an agent (`state = archived`), stopping its OS process while preserving its permanent `agt_...` ID, mailbox, and session so an intentional direct `send` or `wake` call resumes it. For sub-agents with a managed Git worktree, automatically runs `git worktree remove` if the worktree is clean and has no unpushed commits, or preserves the worktree on disk if uncommitted/unpushed work remains."
+        description = "Archive an agent (`state = archived`), stopping its OS process while preserving its permanent `agt_...` ID, mailbox, and session so an intentional direct `send` or `wake` call resumes it. For sub-agents with a managed Git checkout, automatically removes it if it is clean and has no unpushed commits, or preserves it on disk if uncommitted/unpushed work remains."
     )]
     async fn archive(
         &self,
@@ -2970,7 +3246,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Your browser: one headful browser on your own headless desktop, with a persistent login profile (`action`: `open` | `back` | `forward` | `reload` | `snapshot` | `read` | `click` | `fill` | `press` | `screenshot` | `tabs` | `takeover` | `takeover_status` | `wait_for_user` | `release_takeover` | `status` | `profiles` | `close`). Pass `action: \"open\"` with `url` to navigate and receive an accessibility snapshot whose interactive elements carry refs (`@<snapshot_id>:e1`); pass `action: \"click\"` or `\"fill\"` with `selector` set to a ref; fill credentials with `secret_ref` (`op://...`, `op-otp://...`, `secret://...`) so the value never enters your context. `screenshot` captures the whole desktop (browser chrome and dialogs included); `tools.computer` acts on the same desktop's pixels. When a CAPTCHA or 2FA challenge needs a person, call `action: \"takeover\"` with a `reason` and send `takeover_url` (plus `screenshot_path` via `send` media) to the user: they control the whole desktop until they hand back, and you receive `[Browser Takeover Completed]`. Calls fail with `HUMAN_IN_CONTROL` while they hold it. `close` stops the desktop; logins stay on disk."
+        description = "Your browser: one headful browser on your own headless desktop, with a persistent login profile that one agent drives at a time (`action`: `open` | `back` | `forward` | `reload` | `snapshot` | `read` | `html` | `click` | `fill` | `press` | `hold` | `key_down` | `key_up` | `release_keys` | `eval` | `cookies` | `screenshot` | `tabs` | `takeover` | `takeover_status` | `wait_for_user` | `release_takeover` | `status` | `profiles` | `close`). Pass `action: \"open\"` with `url` to navigate and receive an accessibility snapshot whose interactive elements carry refs (`@<snapshot_id>:e1`); pass `action: \"click\"` or `\"fill\"` with `selector` set to a ref or a CSS selector (refs fail with `STALE_REF` once the page navigates; take a new snapshot). Fill credentials with `secret_ref` (`op://...`, `op-otp://...`, `secret://...`) so the value never enters your context; `submit: true` presses Enter in the field. `press`/`hold`/`key_down` act inside the page. `screenshot` captures the whole desktop (browser chrome and dialogs included), or the page with `full_page`; `tools.computer` acts on the same desktop's pixels. When a CAPTCHA or 2FA challenge needs a person, call `action: \"takeover\"` with a `reason` and send `takeover_url` (plus `screenshot_path` via `send` media) to the user: they control the whole desktop until they hand back, and you receive `[Browser Takeover Completed]`. Calls fail with `HUMAN_IN_CONTROL` while they hold it, and with `DESKTOP_IN_USE` when another agent holds the profile. `close` stops the desktop; logins stay on disk."
     )]
     async fn browser(
         &self,
@@ -2999,18 +3275,23 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Schedule your own wakes (`at` or `every` with `prompt`) and external event watches (`watch` with `prompt`), or `list` and `cancel` (`id`: `<sch_...>` | `\"all\"`) your schedules. Supported `watch` specs: `github:pr:<owner>/<repo>#<num>` (PR or checks terminal), `github:check:<owner>/<repo>@<ref>` (check runs terminal), `spiron:promise:<id>` (Spiron promise state change pulled from the public API), and `agent:idle:<name_or_id>` (AnyAgents agent going idle). Wakes fire only when you are idle and not quota-blocked, and a missed wake never fires twice."
+        description = SCHEDULES_TOOL_DESCRIPTION
     )]
     async fn schedule(
         &self,
         Parameters(args): Parameters<ScheduleArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
-        let target_opt = args
+        let target_opt = match args
             .agent
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("self"))
-            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string());
+        {
+            Some(raw) => Some(self.resolve_agent_word(raw).await?),
+            None => None,
+        }
+        .map(|s| s.strip_prefix("agent:").unwrap_or(&s).to_string())
+        .filter(|s| s != &self.agent.name && s != self.agent.id.as_str());
         let path = match target_opt.as_deref() {
             Some(target) => format!("/v1/agents/{target}/schedules"),
             None => "/v1/schedules".to_string(),
@@ -3020,6 +3301,7 @@ impl AgentMcp {
             "at": args.at,
             "every": args.every,
             "watch": args.watch,
+            "spec": args.spec,
             "prompt": args.prompt,
             "id": args.id,
             "agent": target_opt,
@@ -3069,7 +3351,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Schedule your own wakes (`at` or `every` with `prompt`) and external event watches (`watch` with `prompt`), or `list` and `cancel` (`id`: `<sch_...>` | `\"all\"`) your schedules. Supported `watch` specs: `github:pr:<owner>/<repo>#<num>` (PR or checks terminal), `github:check:<owner>/<repo>@<ref>` (check runs terminal), `spiron:promise:<id>` (Spiron promise state change pulled from the public API), and `agent:idle:<name_or_id>` (AnyAgents agent going idle). Wakes fire only when you are idle and not quota-blocked, and a missed wake never fires twice."
+        description = SCHEDULES_TOOL_DESCRIPTION
     )]
     async fn schedules(
         &self,
@@ -3097,6 +3379,7 @@ impl AgentMcp {
         Parameters(args): Parameters<SkillsArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
         let val = self.execute_skills_tool(args)?;
+        self.record_skill_read(&val).await;
         Ok(rmcp::handler::server::wrapper::Json(val))
     }
 
@@ -3151,7 +3434,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Desktop computer use. Without a host target it drives your own session desktop (the headless desktop your browser runs on): `screenshot`, `zoom`, `move`, `click`, `mouse_down`, `mouse_up`, `drag`, `scroll`, `type`, `key`, `wait`, `snapshot` (the browser's refs), `list_windows`, or an Anthropic/OpenAI computer-use `action`. With `platform` (`linux` | `macos` | `windows` | `chromeos`), `display`, or `wayland_display` it drives that host desktop instead, adding Semantic Accessibility Snapshot Mode (`@<snapshot_id>:e<N>` refs, `STALE_REF` guard), `list_windows`, `focus_window`, `clipboard_get`, `clipboard_set`, `cursor_position`, and `hold_key`; on a non-Linux host the host desktop is the default. `session_id` or `provider: \"cloud\"` forwards to a cloud sandbox."
+        description = "Desktop computer use. Without a host target it drives your own session desktop (the headless desktop your browser runs on): `screenshot`, `zoom`, `cursor_position`, `move`, `click` (with `modifiers`, and `back`/`forward` buttons), `mouse_down`, `mouse_up`, `drag`, `scroll`, `type`, `key`, `hold_key`, `wait`, `clipboard_get`, `clipboard_set`, `snapshot` (the browser's refs), `list_windows`, or an Anthropic/OpenAI computer-use `action`. With `platform` (`linux` | `macos` | `windows` | `chromeos`), `display`, or `wayland_display` it drives that host desktop instead, adding Semantic Accessibility Snapshot Mode (`@<snapshot_id>:e<N>` refs, `STALE_REF` guard) and `focus_window`; on a non-Linux host the host desktop is the default. `session_id` or `provider: \"cloud\"` forwards to a cloud sandbox."
     )]
     async fn computer(
         &self,
@@ -3215,21 +3498,24 @@ impl AgentMcp {
     ) -> Result<MultimediaJson, String> {
         let base_dir = self.resolve_workdir();
         let config_dir = self.client.config.clone();
+        let limits = CodeLimits::current();
+        // The blocking thread outlives an aborted await: it carries what it
+        // needs to stop a command once the call that started it is over.
+        let scope = current_call().scope();
         let (val, media) = tokio::task::spawn_blocking(move || {
+            let _scope = code_children::enter(scope);
             let backend = <dyn anyagents_tools::WorkspaceBackend>::resolve(
                 Some(&config_dir),
                 base_dir.clone(),
             );
-            execute_files_tool_with_media_backend(backend.as_ref(), &base_dir, args)
+            execute_files_tool_with_media_backend(backend.as_ref(), &base_dir, args, limits)
         })
         .await
         .map_err(|e| format!("files task join error: {e}"))??;
         Ok(MultimediaJson(val, media))
     }
 
-    #[tool(
-        description = "Unified Cross-Harness Code Mode / Programmatic Tool Calling (`code`, optional `timeout_ms` default 30000, max 120000). Executes an async TypeScript / JavaScript snippet in an isolated capability sandbox (`process.env`, `require`, `child_process`, and raw `fs` are unavailable) with `anyagents.{memory,conversation,send,agents,schedule,groups,browser,web,computer,device,media,files}` (alias `tools.anyagents`), `web.{search,fetch}` (alias `tools.web`), `computer.{snapshot,list_windows,focus_window,clipboard_get,clipboard_set,screenshot,cursor_position,move,click,mouse_down,mouse_up,drag,scroll,type,key,hold_key,wait,zoom,action}` (alias `tools.computer`), `device.{screenshot,tap,swipe,type,press,install_app,launch_app,terminate_app,open_url,rotate}` (alias `tools.device`), `media.{image_generate,speech,transcribe}` (alias `tools.media`), and `workspace.{read,write,edit,multi_edit,patch,glob,grep,list,exec}` (alias `tools.workspace`). Calling `workspace.read(path)` on images, PDFs, audio, or video (or calling `browser.screenshot`, `computer.screenshot`, `device.screenshot`, `media.image_generate`, `media.speech`) natively attaches MCP multimedia content blocks (`image`, `audio`, `resource`) directly to the tool response for visual/multimodal inspection. Compose parallel multi-tool queries with `await Promise.all([...])`, filter/aggregate intermediate data in memory, log diagnostics via `console.log`, and `return` only the compact result `{ result, logs, duration_ms }`."
-    )]
+    #[tool(description = CODE_TOOL_DESCRIPTION)]
     async fn code(&self, Parameters(args): Parameters<CodeArgs>) -> Result<MultimediaJson, String> {
         self.execute_code_tool(args).await
     }
@@ -3237,6 +3523,37 @@ impl AgentMcp {
 
 #[cfg(test)]
 pub const CANONICAL_MCP_TOOLS: &[&str] = &["code"];
+
+/// The `schedules` tool's contract, with the exact shape of each action.
+const SCHEDULES_TOOL_DESCRIPTION: &str = "Wake yourself later or on an event. Create: `{action: \"create\", prompt, <one trigger>}` with `at` (\"20m\" or an ISO time), `every` (\"15m\") or `watch`: `github:pr:<owner>/<repo>#<num>` (PR or its checks terminal), `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name_or_id>`. `action: \"at\"|\"every\"|\"watch\"` with that field also creates. One trigger per schedule; make two calls for a watch plus a deadline. `{action: \"list\"}`; `{action: \"cancel\", id: \"sch_...\"|\"all\"}`. A fired schedule enters your mailbox like any message (steered into a running turn, held while you are paused or quota-blocked) and never queues a second wake while its last one is undelivered.";
+
+/// The `code` tool's contract: language, scope, limits and every callable
+/// name, compact because every agent turn pays for it.
+/// `tool_definitions_with_roles` rewrites the limits to the configured ones.
+const CODE_TOOL_DESCRIPTION: &str = "Run a TypeScript snippet (plain JS works; NOT Python). `code` is the body of an async function: `await` calls, `return` a JSON value; you get `{result, logs, duration_ms}`. No `import`, `require`, `process`, `Buffer`, `fs` or `fetch`; use the globals below. `timeout_ms`: default 30000, max 600000. An inner `workspace.exec` gets the remaining time, or its own `timeout_ms` (the call stretches to fit, up to the max).\n\
+workspace: read(path|{path, start_line?, end_line?}), write(path, content), edit({path, target, replacement}), multi_edit({path, edits: [{target, replacement}]}), patch(text), glob(pattern|{pattern, path?}), grep(query|{query, path?, glob?}), list(path?), exec(cmd|{cmd, cwd?, timeout_ms?}) -> {exit_code, stdout, stderr}.\n\
+anyagents: send, inbox, agents, schedule, conversation, groups, browser, skills, interact; each takes its MCP tool's object, e.g. `anyagents.schedule({action: \"create\", watch: \"github:pr:o/r#1\", prompt: \"...\"})`. memory: read(topic), write({topic, description, content}), search(query), list(). web: search(query), fetch(url). computer, device, media: `<ns>.<action>(opts)`. All also under `tools.`.\n\
+`console.log` goes to `logs`. Use `Promise.all` for independent calls. Run other languages from a file you `workspace.write`, not a quoted one-liner. Reading images, PDF, audio or video, and screenshots, attach the media.";
+
+const CODE_TOOL_LIMITS_TEXT: &str = "default 30000, max 600000";
+
+/// The `code` description with the limits this server enforces and what the
+/// agent's workspace backend (`WorkspaceBackend::kind`) does with an exec's
+/// `timeout_ms`.
+fn code_tool_description(limits: CodeLimits, backend: &str) -> String {
+    let mut limits_text = format!("default {}, max {}", limits.default_ms, limits.max_ms);
+    match backend {
+        "local" => {}
+        "docker" => limits_text.push_str(
+            "; `workspace.exec` runs in your container, which does not stop a command at its `timeout_ms`",
+        ),
+        _ => limits_text.push_str(&format!(
+            "; `workspace.exec` runs in your remote sandbox, which stops a command at {}",
+            anyagents_tools::REMOTE_EXEC_MAX_TIMEOUT_MS
+        )),
+    }
+    CODE_TOOL_DESCRIPTION.replace(CODE_TOOL_LIMITS_TEXT, &limits_text)
+}
 
 /// Remove prose keys (`description`, `title`) from a JSON Schema tree. Field
 /// prose duplicates the tool-level description and is the main driver of
@@ -3351,9 +3668,7 @@ impl rmcp::ServerHandler for AgentMcp {
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
-        let wd = self.resolve_workdir();
-        let data_dir = self.client.socket.parent();
-        let tools = tool_definitions_with_roles(self.profile, Some(&wd), data_dir);
+        let tools = self.listed_tools();
         Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
             tools,
@@ -3379,8 +3694,13 @@ impl rmcp::ServerHandler for AgentMcp {
                 None,
             ));
         }
+        let ct = context.ct.clone();
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        Self::tool_router().call(tcc).await
+        as_call(
+            Call::new(Arc::new(move || ct.is_cancelled())),
+            Self::tool_router().call(tcc),
+        )
+        .await
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
@@ -3414,8 +3734,12 @@ const DEFAULT_GREP_MAX_RESULTS: usize = 100;
 const HARD_GREP_MAX_RESULTS: usize = 2_000;
 const DEFAULT_LIST_MAX_RESULTS: usize = 500;
 const HARD_LIST_MAX_RESULTS: usize = 5_000;
-const DEFAULT_CODE_TIMEOUT_MS: u64 = 30_000;
-const MAX_CODE_TIMEOUT_MS: u64 = 120_000;
+/// How far past a command's own timeout the `code` call it runs in stays
+/// open, so the command's error reaches the snippet before the call ends.
+/// A timed-out command's group gets [`code_children::TERM_GRACE`] after
+/// SIGTERM before SIGKILL; the call must outlast that and the answer.
+const CODE_CALL_GRACE_MS: u64 = code_children::TERM_GRACE.as_millis() as u64 + 1_500;
+const _: () = assert!(CODE_CALL_GRACE_MS >= code_children::TERM_GRACE.as_millis() as u64 + 1_000);
 const MAX_CODE_RESULT_BYTES: usize = 48 * 1024;
 const MAX_CODE_TOOL_CALLS: usize = 256;
 
@@ -3484,10 +3808,23 @@ function hostCallRaw(tool, reqJson, onOk, onErr) {
 }
 
 function hostSleepRaw(ms, cb) {
-  const delay = Math.max(0, Math.min(120000, Number(ms) || 0));
+  const delay = Math.max(0, Math.min(86400000, Number(ms) || 0));
   outerSetTimeout(() => {
     try { cb(); } catch {}
   }, delay);
+}
+
+// A compile error without the host's stack, numbered by the snippet's own
+// lines: the statement wrapper puts two lines above it.
+function compileError(err) {
+  const text = err && err.stack ? String(err.stack) : String(err);
+  const lines = text.split("\n").filter((line) => !/^\s+at /.test(line));
+  const where = lines.length ? /^(?:evalmachine\.<anonymous>)?:(\d+)$/.exec(lines[0]) : null;
+  if (where) {
+    const line = Number(where[1]) - 2;
+    lines[0] = line >= 1 ? `snippet line ${line}:` : "";
+  }
+  return lines.join("\n").trim();
 }
 
 function compileUserCode(rawCode, ctx) {
@@ -3503,7 +3840,9 @@ function compileUserCode(rawCode, ctx) {
       return vm.runInContext(exprJs, ctx);
     } catch {}
   }
-  const stmtTs = "var __fn = async (tools: any, anyagents: any, workspace: any, web: any, console: any) => {\n  \"use strict\";\n" + rawCode + "\n};";
+  // The inner block lets the snippet declare its own `tools`, `web`, ...
+  // over the parameters instead of failing to compile.
+  const stmtTs = "var __fn = async (tools: any, anyagents: any, workspace: any, web: any, console: any) => {\n  \"use strict\"; {\n" + rawCode + "\n}};";
   const stmtJs = stripTS(stmtTs) + "\n;__fn;";
   return vm.runInContext(stmtJs, ctx);
 }
@@ -3640,6 +3979,9 @@ rl.on("line", async (line) => {
           search: (req = {}) => callTool("conversation", req),
           groups: (req = {}) => callTool("groups", req),
           schedule: (req = {}) => callTool("schedule", req),
+          schedules: (req = {}) => callTool("schedule", req),
+          inbox: (req = {}) => callTool("inbox", req),
+          skills: (req = {}) => callTool("skills", typeof req === "string" ? { action: "read", name: req } : req),
           browser: (req = {}) => callTool("browser", req),
           files: (req = {}) => callTool("files", req),
           subagents: (req = {}) => callTool("subagents", req),
@@ -3650,7 +3992,7 @@ rl.on("line", async (line) => {
           interact: (req = {}) => callTool("interact", req),
         });
         const workspace = Object.freeze({
-          read: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { path: opts } : opts), action: "read" }),
+          read: (opts = {}, extra = {}) => callTool("files", { ...(typeof opts === "string" ? { ...extra, path: opts } : opts), action: "read" }),
           write: (opts = {}, content) => callTool("files", typeof opts === "string" ? { path: opts, content: content ?? "", action: "write" } : { ...opts, action: "write" }),
           edit: (opts = {}) => callTool("files", { ...opts, action: "edit" }),
           multi_edit: (opts = {}) => callTool("files", { ...opts, action: "multi_edit" }),
@@ -3658,7 +4000,7 @@ rl.on("line", async (line) => {
           glob: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { pattern: opts } : opts), action: "glob" }),
           grep: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { query: opts } : opts), action: "grep" }),
           list: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { path: opts } : opts), action: "list" }),
-          exec: (opts = {}) => callTool("files", { ...(typeof opts === "string" ? { cmd: opts } : opts), action: "exec" }),
+          exec: (opts = {}, extra = {}) => callTool("files", { ...(typeof opts === "string" ? { ...extra, cmd: opts } : opts), action: "exec" }),
         });
         const tools = Object.freeze({ anyagents, workspace, memory: memoryFn, web: webFn, computer: computerFn, device: deviceFn, media: mediaFn });
         const console = Object.freeze({
@@ -3686,7 +4028,13 @@ rl.on("line", async (line) => {
         return Object.freeze({ tools, anyagents, workspace, memory: memoryFn, web: webFn, computer: computerFn, device: deviceFn, media: mediaFn, console });
       })`, ctx);
       const env = bootstrap(hostCallRaw, hostLogRaw, hostSleepRaw);
-      const fn = compileUserCode(msg.code, ctx);
+      let fn;
+      try {
+        fn = compileUserCode(msg.code, ctx);
+      } catch (err) {
+        stdoutWrite(JSON.stringify({ type: "done", ok: false, phase: "compile", error: compileError(err), logs }) + "\n", () => exitProcess(0));
+        return;
+      }
       try {
         Object.defineProperty(Function.prototype, "constructor", { value: undefined, writable: false, configurable: false });
         Object.defineProperty((async () => {}).constructor.prototype, "constructor", { value: undefined, writable: false, configurable: false });
@@ -3730,46 +4078,149 @@ impl Drop for CodeChildGuard {
     }
 }
 
-static CACHED_JS_RUNTIME: std::sync::OnceLock<Option<(PathBuf, bool)>> = std::sync::OnceLock::new();
-
-fn find_js_runtime() -> Option<(PathBuf, bool)> {
-    CACHED_JS_RUNTIME
-        .get_or_init(|| {
-            let mut dirs = Vec::new();
-            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-                dirs.push(home.join(".local/opt/node/bin"));
-                dirs.push(home.join(".local/opt/bun/bin"));
-                if let Some(host_home) = crate::sandbox::host_home_dir() {
-                    dirs.push(host_home.join(".local/opt/node/bin"));
-                    dirs.push(host_home.join(".local/opt/bun/bin"));
-                }
-                dirs.push(home.join(".local/bin"));
-                dirs.push(home.join(".bun/bin"));
-            } else if let Some(host_home) = crate::sandbox::host_home_dir() {
-                dirs.push(host_home.join(".local/opt/node/bin"));
-                dirs.push(host_home.join(".local/opt/bun/bin"));
-            }
-            if let Some(path_os) = std::env::var_os("PATH") {
-                dirs.extend(std::env::split_paths(&path_os));
-            }
-            dirs.push(PathBuf::from("/usr/local/bin"));
-            dirs.push(PathBuf::from("/usr/bin"));
-            dirs.push(PathBuf::from("/bin"));
-
-            for (bin_name, is_node) in [("node", true), ("bun", false)] {
-                for dir in &dirs {
-                    let candidate = dir.join(bin_name);
-                    if candidate.is_file() {
-                        return Some((candidate, is_node));
-                    }
+/// Drive `work` until it finishes or the moving deadline (milliseconds after
+/// `started`) passes.
+async fn until_deadline<F: std::future::Future>(
+    started: std::time::Instant,
+    deadline_ms: &std::sync::atomic::AtomicU64,
+    work: F,
+) -> Result<F::Output, ()> {
+    use std::sync::atomic::Ordering;
+    let mut work = std::pin::pin!(work);
+    loop {
+        let at = started + std::time::Duration::from_millis(deadline_ms.load(Ordering::SeqCst));
+        tokio::select! {
+            out = &mut work => return Ok(out),
+            () = tokio::time::sleep_until(at.into()) => {
+                let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if now >= deadline_ms.load(Ordering::SeqCst) {
+                    return Err(());
                 }
             }
-            None
-        })
-        .clone()
+        }
+    }
+}
+
+/// Fit a `workspace.exec` a snippet runs into the time its `code` call has.
+/// Without `timeout_ms` the command gets what is left of the call. With one,
+/// the call stays open that much longer, up to the ceiling; a command asking
+/// for more than the ceiling still allows is cut to fit, and its result says
+/// so (`requested_timeout_ms`).
+fn budget_code_call(
+    tool: &str,
+    mut args: serde_json::Value,
+    elapsed: std::time::Duration,
+    deadline_ms: &std::sync::atomic::AtomicU64,
+    max_ms: u64,
+) -> serde_json::Value {
+    use std::sync::atomic::Ordering;
+    if tool.trim().trim_start_matches("mcp__anyagents__") != "files" {
+        return args;
+    }
+    let Some(obj) = args.as_object_mut() else {
+        return args;
+    };
+    let action = obj
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .map(|a| a.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_exec = match action.as_str() {
+        "exec" | "bash" | "sh" | "command" => true,
+        "" => obj.contains_key("cmd") || obj.contains_key("command"),
+        _ => false,
+    };
+    if !is_exec {
+        return args;
+    }
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let wanted = ["timeout_ms", "timeout"]
+        .iter()
+        .find_map(|key| obj.get(*key).and_then(serde_json::Value::as_u64));
+    let Some(wanted) = wanted else {
+        let left = deadline_ms
+            .load(Ordering::SeqCst)
+            .saturating_sub(elapsed_ms)
+            .saturating_sub(CODE_CALL_GRACE_MS)
+            .max(100);
+        obj.insert("timeout_ms".to_string(), left.into());
+        return args;
+    };
+    // What the ceiling still allows this call, leaving the grace for the
+    // command's answer to reach the snippet.
+    let room = max_ms
+        .saturating_sub(elapsed_ms)
+        .saturating_sub(CODE_CALL_GRACE_MS)
+        .max(100);
+    let granted = wanted.min(room);
+    if granted < wanted {
+        obj.remove("timeout");
+        obj.insert("timeout_ms".to_string(), granted.into());
+        obj.insert("requested_timeout_ms".to_string(), wanted.into());
+    }
+    deadline_ms.fetch_max(
+        (elapsed_ms + granted + CODE_CALL_GRACE_MS).min(max_ms),
+        Ordering::SeqCst,
+    );
+    args
+}
+
+fn find_js_runtime() -> Result<(PathBuf, bool), String> {
+    let resolved = anyagents_toolchain::global()
+        .first_of(&["node", "bun"], "mcp.js")
+        .map_err(|err| err.to_string())?;
+    let is_node = resolved.name == "node";
+    Ok((resolved.path, is_node))
 }
 
 impl AgentMcp {
+    /// `self`, `me` and `parent` as the agent they name for this caller; any
+    /// other name as written. Every tool that takes an agent name reads these
+    /// words the way `send` reads them in `to`.
+    async fn resolve_agent_word(&self, raw: &str) -> Result<String, String> {
+        let name = raw.trim();
+        let word = name.strip_prefix("agent:").unwrap_or(name);
+        if word.eq_ignore_ascii_case("self") || word.eq_ignore_ascii_case("me") {
+            return Ok(self.agent.name.clone());
+        }
+        if !word.eq_ignore_ascii_case("parent") {
+            return Ok(name.to_string());
+        }
+        let me: AgentView = self
+            .client
+            .get(&format!("/v1/agents/{}", self.agent.id), None)
+            .await?;
+        let parent_id = me.parent.ok_or_else(|| {
+            format!(
+                "`parent`: `{}` is a root agent and has no parent",
+                self.agent.name
+            )
+        })?;
+        // History and peer filters match names, so answer with the name.
+        let parent: AgentView = self
+            .client
+            .get(&format!("/v1/agents/{parent_id}"), None)
+            .await?;
+        Ok(parent.name)
+    }
+
+    /// The tools this agent sees, with the `code` limits its workspace
+    /// backend enforces.
+    fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
+        let wd = self.resolve_workdir();
+        let mut tools =
+            tool_definitions_with_roles(self.profile, Some(&wd), self.client.socket.parent());
+        if tools.iter().any(|t| t.name == "code") {
+            let backend =
+                <dyn anyagents_tools::WorkspaceBackend>::resolve(Some(&self.client.config), wd);
+            let description = code_tool_description(CodeLimits::current(), backend.kind());
+            for tool in tools.iter_mut().filter(|t| t.name == "code") {
+                tool.description = Some(description.clone().into());
+            }
+        }
+        tools
+    }
+
     fn resolve_workdir(&self) -> PathBuf {
         if let Some(ref wd) = self.agent.workdir
             && !wd.as_os_str().is_empty()
@@ -3838,7 +4289,16 @@ impl AgentMcp {
                 || t.eq_ignore_ascii_case(&self.agent.name)
                 || t == self.agent.id.as_str()
         });
-        let local_agent_root = self.client.config.parent().map(Path::to_path_buf);
+        // Over HTTP this tool server runs as the server's own user, and the
+        // agent's memory directory is writable by its seat: a planted link
+        // would make an in-process read or write reach a server file. There,
+        // every memory operation goes through the server's routes, which open
+        // files without following links.
+        let local_agent_root = if self.client.via_http {
+            None
+        } else {
+            self.client.config.parent().map(Path::to_path_buf)
+        };
 
         match action.as_str() {
             "list" | "ls" | "index" => {
@@ -4273,13 +4733,48 @@ impl AgentMcp {
     ) -> Self {
         Self {
             agent,
-            client: Client {
-                socket,
-                config,
-                capability,
-            },
+            client: Client::new(socket, config, capability).over_http(),
             profile,
         }
+    }
+
+    /// One skill file's text. Over stdio this tool server runs as the agent
+    /// and reads what the agent can read. Over HTTP it runs as the server, and
+    /// the skill directories it scans are writable by the agent's seat, so it
+    /// never follows a link the seat could have planted: a linked skill
+    /// directory (a `skills-view` entry) is followed once and only into the
+    /// shared or the agent's own skill root, and every component from there
+    /// is opened without following links.
+    fn read_skill_text(&self, dir: &Path, rel: &Path) -> std::io::Result<String> {
+        if !self.client.via_http {
+            return std::fs::read_to_string(dir.join(rel));
+        }
+        let base = if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
+            let link = std::fs::read_link(dir)?;
+            let target = match dir.parent() {
+                Some(parent) if link.is_relative() => parent.join(link),
+                _ => link,
+            };
+            let mut roots = Vec::new();
+            if let Some(data_dir) = self.client.socket.parent() {
+                roots.push(data_dir.join("skills"));
+            }
+            if let Some(agent_root) = self.client.config.parent() {
+                roots.push(agent_root.join("skills"));
+            }
+            if !roots.iter().any(|root| target.starts_with(root)) {
+                return Err(std::io::Error::other(
+                    "a linked skill directory points outside the skill roots",
+                ));
+            }
+            target
+        } else {
+            dir.to_path_buf()
+        };
+        let mut file = anyagents_core::raw_segment::open_readonly(&base.join(rel))?;
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text)?;
+        Ok(text)
     }
 
     fn collect_skill_directories(&self) -> std::collections::BTreeMap<String, PathBuf> {
@@ -4317,6 +4812,32 @@ impl AgentMcp {
         map
     }
 
+    /// Tell the server which skill file this agent read and the digest of the
+    /// bytes it got (ADR 0008). Telemetry never fails the read itself.
+    async fn record_skill_read(&self, answer: &serde_json::Value) {
+        if answer.get("action").and_then(serde_json::Value::as_str) != Some("read") {
+            return;
+        }
+        let field = |key| answer.get(key).and_then(serde_json::Value::as_str);
+        let (Some(skill), Some(file), Some(content)) =
+            (field("name"), field("file"), field("content"))
+        else {
+            return;
+        };
+        let body = serde_json::json!({
+            "skill": skill,
+            "file": file,
+            "sha256": anyagents_core::learned_memory::sha256(content.as_bytes()),
+        });
+        if let Err(err) = self
+            .client
+            .get::<serde_json::Value>("/v1/skills/reads", Some(body.to_string().into_bytes()))
+            .await
+        {
+            eprintln!("skill read of `{skill}/{file}` not recorded: {err}");
+        }
+    }
+
     fn execute_skills_tool(&self, args: SkillsArgs) -> Result<serde_json::Value, String> {
         let raw_name = args
             .name
@@ -4352,7 +4873,9 @@ impl AgentMcp {
                 let limit = args.limit.unwrap_or(50).max(1);
                 let mut skills = Vec::new();
                 for (slug, dir) in skill_dirs.into_iter().take(limit) {
-                    let md = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
+                    let md = self
+                        .read_skill_text(&dir, Path::new("SKILL.md"))
+                        .unwrap_or_default();
                     let (_, description) =
                         anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &md);
                     skills.push(serde_json::json!({
@@ -4389,8 +4912,8 @@ impl AgentMcp {
                 {
                     return Err(format!("invalid skill file path `{rel_file}`"));
                 }
-                let target = dir.join(rel_path);
-                let content = std::fs::read_to_string(&target)
+                let content = self
+                    .read_skill_text(dir, rel_path)
                     .map_err(|e| format!("cannot read `{name}/{rel_file}`: {e}"))?;
                 let (_, description) =
                     anyagents_core::learned_memory::parse_topic_frontmatter(&name, &content);
@@ -4415,7 +4938,9 @@ impl AgentMcp {
                 let limit = args.limit.unwrap_or(20).max(1);
                 let mut hits = Vec::new();
                 for (slug, dir) in skill_dirs {
-                    let md = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
+                    let md = self
+                        .read_skill_text(&dir, Path::new("SKILL.md"))
+                        .unwrap_or_default();
                     let (_, description) =
                         anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &md);
                     let hay = format!("{slug} {description} {md}").to_ascii_lowercase();
@@ -4523,9 +5048,7 @@ impl AgentMcp {
                 "result": {}
             })),
             "tools/list" => {
-                let wd = self.resolve_workdir();
-                let data_dir = self.client.socket.parent();
-                let tools = tool_definitions_with_roles(self.profile, Some(&wd), data_dir);
+                let tools = self.listed_tools();
                 Some(serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id_val,
@@ -4779,15 +5302,15 @@ impl AgentMcp {
         use std::io::{BufRead, BufReader, Write};
         use std::process::{Command, Stdio};
         use std::sync::{Arc, Mutex};
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
-        let timeout_ms = args
-            .timeout_ms
-            .unwrap_or(DEFAULT_CODE_TIMEOUT_MS)
-            .clamp(100, MAX_CODE_TIMEOUT_MS);
-        let (runtime_bin, is_node) = find_js_runtime().ok_or_else(|| {
-            "neither `node` nor `bun` was found on this machine to execute `code` mode".to_string()
-        })?;
+        let limits = CodeLimits::current();
+        let timeout_ms = limits.resolve(args.timeout_ms);
+        // Milliseconds after `started` at which the call ends. A command the
+        // snippet runs with its own `timeout_ms` moves it out, up to the
+        // ceiling (`budget_code_call`).
+        let deadline_ms = std::sync::atomic::AtomicU64::new(timeout_ms);
+        let (runtime_bin, is_node) = find_js_runtime()?;
 
         let started = Instant::now();
         let mut cmd = Command::new(&runtime_bin);
@@ -4875,8 +5398,13 @@ impl AgentMcp {
         let media_blocks = Arc::new(Mutex::new(Vec::<rmcp::model::ContentBlock>::new()));
         let mut in_flight = tokio::task::JoinSet::new();
         let mut call_count = 0usize;
+        // Every command the snippet starts ends with this call, however it
+        // ends: on time, out of time, or dropped by a cancelling harness.
+        let children = Arc::new(code_children::CodeChildren::default());
+        let _end_children = code_children::EndOnDrop(Arc::clone(&children));
+        let code_call = current_call().with_children(Arc::clone(&children));
 
-        let loop_res = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+        let loop_res = until_deadline(started, &deadline_ms, async {
             while let Some(msg) = rx.recv().await {
                 let msg_type = msg.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
                 match msg_type {
@@ -4905,11 +5433,19 @@ impl AgentMcp {
                             .get("args")
                             .cloned()
                             .unwrap_or_else(|| serde_json::json!({}));
+                        let tool_args = budget_code_call(
+                            &tool_name,
+                            tool_args,
+                            started.elapsed(),
+                            &deadline_ms,
+                            limits.max_ms,
+                        );
                         let mcp = self.clone();
                         let stdin_clone = Arc::clone(&shared_stdin);
                         let deliveries = Arc::clone(&deliveries);
                         let media_blocks = Arc::clone(&media_blocks);
-                        in_flight.spawn(async move {
+                        let call = code_call.clone();
+                        in_flight.spawn(as_call(call, async move {
                             let res = mcp.dispatch_code_tool(&tool_name, tool_args).await;
                             if tool_name.trim().trim_start_matches("mcp__anyagents__") == "send"
                                 && let Ok((val, _)) = &res
@@ -4944,7 +5480,7 @@ impl AgentMcp {
                                 let _ = writeln!(guard, "{reply}");
                                 let _ = guard.flush();
                             }
-                        });
+                        }));
                     }
                     "done" => {
                         return Ok(msg);
@@ -4957,22 +5493,38 @@ impl AgentMcp {
         .await;
 
         in_flight.abort_all();
-        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(timeout_ms);
+        let ran_until_ms = deadline_ms.load(std::sync::atomic::Ordering::SeqCst);
+        // A command still running belongs to a call that is over: stop it
+        // (its whole group) and say so, so a partial write is checked.
+        children.end();
+        let stopped = children.settle(code_children::SETTLE).await;
+        let stopped_note = code_children::stopped_note(&stopped);
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(ran_until_ms);
 
         let done_msg = match loop_res {
             Ok(Ok(msg)) => msg,
             Ok(Err(err)) => {
                 let stderr_text = stderr_handle.join().unwrap_or_default();
                 let stderr_trimmed = stderr_text.trim();
+                let err = match stopped_note {
+                    Some(note) => format!("{err}. {note}"),
+                    None => err,
+                };
                 if stderr_trimmed.is_empty() {
                     return Err(err);
                 }
                 return Err(format!("{err}: {stderr_trimmed}"));
             }
-            Err(_) => {
-                return Err(format!(
-                    "`code` execution timed out after {timeout_ms}ms and was terminated"
-                ));
+            Err(()) => {
+                let message = code_contract::code_timeout_message(
+                    ran_until_ms,
+                    args.timeout_ms,
+                    limits.max_ms,
+                );
+                return Err(match stopped_note {
+                    Some(note) => format!("{message} {note}"),
+                    None => message,
+                });
             }
         };
 
@@ -4996,13 +5548,22 @@ impl AgentMcp {
                 .get("error")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown code execution error");
-            if logs.is_empty() {
-                return Err(format!("code execution error: {err}"));
+            let compile =
+                done_msg.get("phase").and_then(serde_json::Value::as_str) == Some("compile");
+            let mut text = format!("code execution error: {err}");
+            if let Some(fix) = code_contract::diagnose(&args.code, err, compile) {
+                text.push_str("\nfix: ");
+                text.push_str(&fix);
             }
-            return Err(format!(
-                "code execution error: {err}\nlogs:\n{}",
-                logs.join("\n")
-            ));
+            if let Some(note) = &stopped_note {
+                text.push('\n');
+                text.push_str(note);
+            }
+            if !logs.is_empty() {
+                text.push_str("\nlogs:\n");
+                text.push_str(&logs.join("\n"));
+            }
+            return Err(text);
         }
 
         let deliveries = deliveries
@@ -5029,30 +5590,33 @@ impl AgentMcp {
                 MAX_CODE_RESULT_BYTES,
                 &serialized[tail_start..]
             );
-            return Ok(MultimediaJson(
-                serde_json::json!({
-                    "result": preview,
-                    "deliveries": deliveries,
-                    "truncated": true,
-                    "original_bytes": serialized.len(),
-                    "max_bytes": MAX_CODE_RESULT_BYTES,
-                    "logs": logs,
-                    "duration_ms": duration_ms,
-                }),
-                media_blocks,
-            ));
-        }
-
-        Ok(MultimediaJson(
-            serde_json::json!({
-                "result": raw_result,
+            let mut value = serde_json::json!({
+                "result": preview,
                 "deliveries": deliveries,
-                "truncated": false,
+                "truncated": true,
+                "original_bytes": serialized.len(),
+                "max_bytes": MAX_CODE_RESULT_BYTES,
                 "logs": logs,
                 "duration_ms": duration_ms,
-            }),
-            media_blocks,
-        ))
+            });
+            if let Some(note) = stopped_note {
+                value["stopped"] = note.into();
+            }
+            return Ok(MultimediaJson(value, media_blocks));
+        }
+
+        let mut value = serde_json::json!({
+            "result": raw_result,
+            "deliveries": deliveries,
+            "truncated": false,
+            "logs": logs,
+            "duration_ms": duration_ms,
+        });
+        // The snippet returned while a command it started still ran.
+        if let Some(note) = stopped_note {
+            value["stopped"] = note.into();
+        }
+        Ok(MultimediaJson(value, media_blocks))
     }
 }
 
@@ -5060,9 +5624,17 @@ impl AgentMcp {
 pub struct MultimediaJson(pub serde_json::Value, pub Vec<rmcp::model::ContentBlock>);
 
 impl rmcp::handler::server::tool::IntoCallToolResult for MultimediaJson {
+    /// The JSON as text, then each media block. With media the JSON is not
+    /// also sent as `structuredContent`: a client that prefers structured
+    /// content gives its model that alone and drops the media (Codex does),
+    /// and no tool that returns media declares an output schema that would
+    /// require it.
     fn into_call_tool_result(self) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let mut res = rmcp::model::CallToolResult::structured(self.0);
-        res.content.extend(self.1);
+        if !self.1.is_empty() {
+            res.structured_content = None;
+            res.content.extend(self.1);
+        }
         Ok(res.into())
     }
 }
@@ -5277,7 +5849,9 @@ impl Drop for ScopedTempDir {
 fn transcode_image_to_png_bytes(path: &Path) -> Option<Vec<u8>> {
     let dir = ScopedTempDir::new().ok()?;
     let out_png = dir.path().join("converted.png");
-    let status = std::process::Command::new("convert")
+    let convert = anyagents_toolchain::tool("convert", "mcp.read").ok()?;
+    let status = convert
+        .command()
         .arg(format!("{}[0]", path.display()))
         .arg(&out_png)
         .stdout(std::process::Stdio::null())
@@ -5390,23 +5964,38 @@ fn read_multimedia_file(
 
     if mime_type.starts_with("image/") {
         let dims = parse_image_dimensions(mime_type, full_bytes);
-        let (b64, attached_mime) = if matches!(
-            mime_type,
-            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-        ) {
-            (crate::computer::base64_encode(full_bytes), mime_type)
-        } else if let Some(png_bytes) = transcode_image_to_png_bytes(resolved) {
-            (crate::computer::base64_encode(&png_bytes), "image/png")
-        } else {
-            (crate::computer::base64_encode(full_bytes), mime_type)
-        };
-        media_blocks.push(rmcp::model::ContentBlock::image(b64, attached_mime));
+        // What a model is given: within every provider's limits, scaled or
+        // converted here when it is not (a format only the toolchain's
+        // converter reads goes through it first).
+        let prepared = anyagents_harness::media::model_image(full_bytes).or_else(|err| {
+            transcode_image_to_png_bytes(resolved)
+                .ok_or(err)
+                .and_then(|png| anyagents_harness::media::model_image(&png))
+        });
         let (width, height) = dims.unwrap_or((0, 0));
         let dim_str = if width > 0 && height > 0 {
             format!("{width}x{height}, ")
         } else {
             String::new()
         };
+        let content = match &prepared {
+            Ok(image) if image.converted => format!(
+                "[Native {mime_type} image ({dim_str}{total_bytes} bytes) attached as MCP image content block, as {} {}x{} ({} bytes)]",
+                image.mime,
+                image.width,
+                image.height,
+                image.data.len()
+            ),
+            Ok(_) => format!(
+                "[Native {mime_type} image ({dim_str}{total_bytes} bytes) attached as MCP image content block]"
+            ),
+            Err(err) => {
+                format!("[{mime_type} image ({dim_str}{total_bytes} bytes) not attached: {err}]")
+            }
+        };
+        if let Ok(image) = &prepared {
+            media_blocks.push(rmcp::model::ContentBlock::image(image.base64(), image.mime));
+        }
         return Ok((
             serde_json::json!({
                 "action": "read",
@@ -5419,10 +6008,8 @@ fn read_multimedia_file(
                 "total_bytes": total_bytes,
                 "truncated": false,
                 "sha256": sha256,
-                "image_attached": true,
-                "content": format!(
-                    "[Native {mime_type} image ({dim_str}{total_bytes} bytes) attached as MCP image content block]"
-                ),
+                "image_attached": prepared.is_ok(),
+                "content": content,
             }),
             media_blocks,
         ));
@@ -5446,17 +6033,21 @@ fn read_multimedia_file(
             .max(start_page)
             .min(start_page + 9);
 
-        let extracted_text = std::process::Command::new("pdftotext")
-            .args([
-                "-f",
-                &start_page.to_string(),
-                "-l",
-                &end_page.to_string(),
-                &resolved.display().to_string(),
-                "-",
-            ])
-            .output()
+        let extracted_text = anyagents_toolchain::tool("pdftotext", "mcp.read")
             .ok()
+            .and_then(|tool| {
+                tool.command()
+                    .args([
+                        "-f",
+                        &start_page.to_string(),
+                        "-l",
+                        &end_page.to_string(),
+                        &resolved.display().to_string(),
+                        "-",
+                    ])
+                    .output()
+                    .ok()
+            })
             .filter(|out| out.status.success())
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
             .unwrap_or_default();
@@ -5464,21 +6055,23 @@ fn read_multimedia_file(
         let mut pages_rendered = 0usize;
         if let Ok(tmp_dir) = ScopedTempDir::new() {
             let prefix = tmp_dir.path().join("page");
-            if let Ok(status) = std::process::Command::new("pdftoppm")
-                .args([
-                    "-jpeg",
-                    "-r",
-                    "100",
-                    "-f",
-                    &start_page.to_string(),
-                    "-l",
-                    &end_page.to_string(),
-                    &resolved.display().to_string(),
-                    &prefix.display().to_string(),
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
+            if let Ok(pdftoppm) = anyagents_toolchain::tool("pdftoppm", "mcp.read")
+                && let Ok(status) = pdftoppm
+                    .command()
+                    .args([
+                        "-jpeg",
+                        "-r",
+                        "100",
+                        "-f",
+                        &start_page.to_string(),
+                        "-l",
+                        &end_page.to_string(),
+                        &resolved.display().to_string(),
+                        &prefix.display().to_string(),
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
                 && status.success()
                 && let Ok(entries) = std::fs::read_dir(tmp_dir.path())
             {
@@ -5684,16 +6277,18 @@ fn execute_files_tool_with_media_backend(
     backend: &dyn anyagents_tools::WorkspaceBackend,
     base_dir: &Path,
     args: FilesArgs,
+    limits: CodeLimits,
 ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
     if backend.is_remote() {
-        return execute_remote_files_tool_with_media(backend, args);
+        return execute_remote_files_tool_with_media(backend, args, limits);
     }
-    execute_files_tool_with_media(base_dir, args)
+    execute_files_tool_with_media(base_dir, args, limits)
 }
 
 fn execute_remote_files_tool_with_media(
     backend: &dyn anyagents_tools::WorkspaceBackend,
     args: FilesArgs,
+    limits: CodeLimits,
 ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
     let action = args
         .action
@@ -5913,25 +6508,38 @@ fn execute_remote_files_tool_with_media(
                 .ok_or_else(|| "`workspace.exec` requires a non-empty `cmd`".to_string())?;
             let raw_cwd = args.cwd.as_deref().or(args.path.as_deref());
             let resolved_cwd = backend.resolve_path(raw_cwd, false)?;
-            let timeout_ms = args
-                .timeout_ms
-                .unwrap_or(DEFAULT_CODE_TIMEOUT_MS)
-                .clamp(100, MAX_CODE_TIMEOUT_MS);
+            let timeout_ms = limits.resolve(args.timeout_ms);
             let started = std::time::Instant::now();
             let out = backend.exec(cmd_str, Some(&resolved_cwd), Some(timeout_ms))?;
             let duration_ms = started.elapsed().as_millis() as u64;
-            Ok((
-                serde_json::json!({
-                    "action": "exec",
-                    "cmd": cmd_str,
-                    "cwd": resolved_cwd,
-                    "exit_code": out.exit_code,
-                    "stdout": out.stdout,
-                    "stderr": out.stderr,
-                    "duration_ms": duration_ms,
-                }),
-                Vec::new(),
-            ))
+            let mut result = serde_json::json!({
+                "action": "exec",
+                "cmd": cmd_str,
+                "cwd": resolved_cwd,
+                "exit_code": out.exit_code,
+                "stdout": out.stdout,
+                "stderr": out.stderr,
+                "duration_ms": duration_ms,
+            });
+            let asked = args.requested_timeout_ms.or(args.timeout_ms);
+            let note = match backend.kind() {
+                "docker" => None,
+                _ => code_contract::exec_clamp_note(
+                    asked,
+                    timeout_ms.min(anyagents_tools::REMOTE_EXEC_MAX_TIMEOUT_MS),
+                    &format!(
+                        "your remote sandbox stops a command at {}ms",
+                        anyagents_tools::REMOTE_EXEC_MAX_TIMEOUT_MS
+                    ),
+                ),
+            }
+            .or_else(|| {
+                code_contract::exec_clamp_note(asked, timeout_ms, &limits.ceiling_reason())
+            });
+            if let Some(note) = note {
+                result["note"] = note.into();
+            }
+            Ok((result, Vec::new()))
         }
         other => Err(format!(
             "remote sandbox `files` action `{other}` is not supported directly; use `read`, `write`, `edit`, `multi_edit`, `list`, or `exec`"
@@ -5942,6 +6550,7 @@ fn execute_remote_files_tool_with_media(
 fn execute_files_tool_with_media(
     base_dir: &Path,
     args: FilesArgs,
+    limits: CodeLimits,
 ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
     let is_read_action = matches!(
         args.action
@@ -5979,11 +6588,15 @@ fn execute_files_tool_with_media(
         }
     }
 
-    let val = execute_files_tool(base_dir, args)?;
+    let val = execute_files_tool(base_dir, args, limits)?;
     Ok((val, Vec::new()))
 }
 
-fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Value, String> {
+fn execute_files_tool(
+    base_dir: &Path,
+    args: FilesArgs,
+    limits: CodeLimits,
+) -> Result<serde_json::Value, String> {
     let action = args
         .action
         .as_deref()
@@ -6500,10 +7113,7 @@ fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Va
                     resolved_cwd.display()
                 ));
             }
-            let timeout_ms = args
-                .timeout_ms
-                .unwrap_or(DEFAULT_CODE_TIMEOUT_MS)
-                .clamp(100, MAX_CODE_TIMEOUT_MS);
+            let timeout_ms = limits.resolve(args.timeout_ms);
             let started = std::time::Instant::now();
             let mut cmd = std::process::Command::new("/bin/bash");
             cmd.arg("-c")
@@ -6544,12 +7154,24 @@ fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Va
             });
             let mut guard = CodeChildGuard { child: Some(child) };
             let deadline = started + std::time::Duration::from_millis(timeout_ms);
+            // A command a `code` call started ends with that call, and one
+            // whose tool call the harness cancelled ends then.
+            let scope = code_children::current();
+            let registration = scope
+                .children
+                .as_ref()
+                .map(code_children::CodeChildren::start);
+            let mut stopped_early = false;
             let status_opt = loop {
                 if let Some(ref mut c) = guard.child {
                     match c.try_wait() {
                         Ok(Some(st)) => break Some(st),
                         Ok(None) => {
                             if std::time::Instant::now() >= deadline {
+                                break None;
+                            }
+                            if scope.should_stop(registration.as_ref()) {
+                                stopped_early = true;
                                 break None;
                             }
                             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -6560,19 +7182,48 @@ fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Va
                     break None;
                 }
             };
+            if status_opt.is_none()
+                && let Some(mut child) = guard.child.take()
+            {
+                // The whole group, gently first: git removes its lock files
+                // on SIGTERM and leaves them behind on SIGKILL.
+                code_children::stop_group(&mut child, code_children::TERM_GRACE);
+                if stopped_early && let Some(registration) = &registration {
+                    registration.stopped(cmd_str, started.elapsed());
+                }
+            }
             drop(guard);
             let stdout = stdout_handle.join().unwrap_or_default();
             let stderr = stderr_handle.join().unwrap_or_default();
             let duration_ms = started.elapsed().as_millis() as u64;
+            let note = code_contract::exec_clamp_note(
+                args.requested_timeout_ms.or(args.timeout_ms),
+                timeout_ms,
+                &limits.ceiling_reason(),
+            );
             let Some(status) = status_opt else {
+                if stopped_early {
+                    return Err(format!(
+                        "workspace.exec was stopped after {}ms because the call that started it ended; \
+                         its whole process group was ended (SIGTERM, then SIGKILL), so a write it was making may be partial \
+                         (stdout: {}, stderr: {})",
+                        started.elapsed().as_millis(),
+                        stdout.trim(),
+                        stderr.trim()
+                    ));
+                }
                 return Err(format!(
-                    "workspace.exec timed out after {timeout_ms}ms (stdout: {}, stderr: {})",
+                    "workspace.exec timed out after {timeout_ms}ms and was killed{}; {} (stdout: {}, stderr: {})",
+                    note.as_deref()
+                        .map(|n| format!(" ({n})"))
+                        .unwrap_or_default(),
+                    code_contract::exec_timeout_hint(limits.max_ms),
                     stdout.trim(),
                     stderr.trim()
                 ));
             };
             let exit_code = status.code().unwrap_or(-1);
-            Ok(serde_json::json!({
+            let mut result = serde_json::json!({
                 "action": "exec",
                 "cmd": cmd_str,
                 "cwd": resolved_cwd.display().to_string(),
@@ -6580,7 +7231,11 @@ fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Va
                 "stdout": stdout,
                 "stderr": stderr,
                 "duration_ms": duration_ms,
-            }))
+            });
+            if let Some(note) = note {
+                result["note"] = note.into();
+            }
+            Ok(result)
         }
         other => Err(format!(
             "unknown `files` action `{other}`; expected `read`, `write`, `edit`, `multi_edit`, `patch`, `list`, `glob`, `grep`, or `exec`"
@@ -8055,6 +8710,11 @@ pub(crate) fn filter_and_summarize_agent_list(
     let next_cursor = (end < matched).then_some(end);
     agents.drain(..start);
     agents.truncate(cap);
+    // List responses stay compact; full instructions and schedules live on `agents inspect` / `schedules list`.
+    for a in agents.iter_mut() {
+        a.instructions = None;
+        a.schedules.clear();
+    }
 
     serde_json::json!({
         "total": total,
@@ -8083,7 +8743,9 @@ fn error_message(bytes: &[u8]) -> String {
         .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
 }
 
-/// One call on the socket: the status code and the body.
+/// One call on its own connection to the socket: the status code and the
+/// body. For a one-shot command; a tool server keeps its connections open
+/// between calls (see [`Client`]).
 pub(crate) async fn request(
     socket: &Path,
     method: &str,
@@ -8092,23 +8754,41 @@ pub(crate) async fn request(
     capability: Option<&str>,
     operator: Option<&str>,
 ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
-    request_naming(socket, method, path, body, capability, operator, None).await
+    let request = build_request(method, path, body, capability, operator, None, false)?;
+    let response = connect(socket)
+        .await?
+        .send_request(request)
+        .await
+        .map_err(|err| err.to_string())?;
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|err| err.to_string())?
+        .to_bytes()
+        .to_vec();
+    Ok((status, bytes))
 }
 
-/// One call on the socket, with the agent id this tool server was given. The id
-/// is what a deployment without the boundary uses to name its one route; with
-/// the boundary only the capability decides, and an operator token alone is
-/// accepted beside it.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn request_naming(
-    socket: &Path,
+/// One request to the server's API, with whichever credentials the caller
+/// presents. The agent id is what a deployment without the boundary uses to
+/// name its one route; with the boundary only the capability decides, and an
+/// operator token alone is accepted beside it.
+/// Marks a call made by the tool server behind the HTTP MCP route. It can only
+/// narrow what a call may do, so a caller that omits it gains nothing: the
+/// tool server that runs as the server's own user always sets it.
+pub(crate) const HTTP_MCP_HEADER: &str = "x-anyagents-via-http-mcp";
+
+fn build_request(
     method: &str,
     path: &str,
     body: Option<Vec<u8>>,
     capability: Option<&str>,
     operator: Option<&str>,
     agent_id: Option<&str>,
-) -> Result<(hyper::StatusCode, Vec<u8>), String> {
+    via_http: bool,
+) -> Result<hyper::Request<Full<Bytes>>, String> {
     let payload = body.unwrap_or_default();
     let mut builder = hyper::Request::builder()
         .method(method)
@@ -8124,31 +8804,221 @@ pub(crate) async fn request_naming(
     if let Some(id) = agent_id {
         builder = builder.header(crate::auth::AGENT_ID_HEADER, id);
     }
-    let request = builder
+    if via_http {
+        builder = builder.header(HTTP_MCP_HEADER, "1");
+    }
+    builder
         .body(Full::new(Bytes::from(payload)))
-        .map_err(|err| err.to_string())?;
-    let stream = tokio::net::UnixStream::connect(socket)
-        .await
-        .map_err(|err| format!("cannot reach the server: {err}"))?;
-    let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+        .map_err(|err| err.to_string())
+}
+
+/// How long a tool server's call waits for the server's socket to come back.
+/// The harness outlives a server restart or upgrade (its keeper holds it),
+/// and for that moment nothing listens: the socket is missing or refuses.
+/// Only the connection is tried again; no request is ever sent twice. A
+/// one-shot command does not wait: an operator's read falls back to the
+/// store at once.
+///
+/// The wait stays well inside the shortest tool-call timeout found among the
+/// harnesses AnyAgents runs, so a call is not carried out after the harness
+/// gave up on it: Codex 60 s (`tool_timeout_sec`); Claude Code (stdio: about
+/// 28 h, 30 min idle), OpenCode (12 h) and Gemini CLI (10 min) wait longer.
+/// A harness that cancels the call (`notifications/cancelled`) ends the wait
+/// at once.
+const RECONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// One tool call as the requests it makes see it: whether its harness
+/// cancelled it, and the time it has spent waiting for the server's socket,
+/// shared by every request the call (and everything it spawns) makes.
+#[derive(Clone)]
+struct Call {
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    wait: SocketWait,
+    /// The commands of the `code` call this tool call runs inside, which
+    /// end with it.
+    children: Option<Arc<code_children::CodeChildren>>,
+}
+
+impl Call {
+    /// A call `cancelled` reports on, with the whole wait still ahead.
+    fn new(cancelled: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        Self {
+            cancelled,
+            wait: SocketWait::new(RECONNECT_WITHIN),
+            children: None,
+        }
+    }
+
+    /// This call, serving a `code` call whose commands are `children`.
+    fn with_children(mut self, children: Arc<code_children::CodeChildren>) -> Self {
+        self.children = Some(children);
+        self
+    }
+
+    /// What a blocking tool thread needs to stop a command this call started.
+    fn scope(&self) -> code_children::Scope {
+        code_children::Scope {
+            children: self.children.clone(),
+            cancelled: Some(Arc::clone(&self.cancelled)),
+        }
+    }
+
+    #[cfg(test)]
+    fn waiting_at_most(
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+        budget: std::time::Duration,
+    ) -> Self {
+        Self {
+            cancelled,
+            wait: SocketWait::new(budget),
+            children: None,
+        }
+    }
+}
+
+/// The time spent waiting for the server's socket, against a budget: only
+/// the time some request actually waits counts (requests waiting at once
+/// count it once), so a call that has run long still has its whole wait.
+#[derive(Clone)]
+struct SocketWait {
+    budget: std::time::Duration,
+    spent: Arc<std::sync::Mutex<Spent>>,
+}
+
+#[derive(Default)]
+struct Spent {
+    before: std::time::Duration,
+    waiters: usize,
+    since: Option<tokio::time::Instant>,
+}
+
+impl SocketWait {
+    fn new(budget: std::time::Duration) -> Self {
+        Self {
+            budget,
+            spent: Arc::default(),
+        }
+    }
+
+    fn spent(&self) -> std::sync::MutexGuard<'_, Spent> {
+        self.spent.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// What is left of the budget.
+    fn left(&self) -> std::time::Duration {
+        let spent = self.spent();
+        let running = spent
+            .since
+            .map_or(std::time::Duration::ZERO, |since| since.elapsed());
+        self.budget.saturating_sub(spent.before + running)
+    }
+
+    /// One request starts waiting; the wait counts until the guard drops.
+    fn begin(&self) -> Waiting<'_> {
+        let mut spent = self.spent();
+        if spent.waiters == 0 {
+            spent.since = Some(tokio::time::Instant::now());
+        }
+        spent.waiters += 1;
+        Waiting(self)
+    }
+}
+
+/// A request waiting for the socket.
+struct Waiting<'a>(&'a SocketWait);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut spent = self.0.spent();
+        spent.waiters -= 1;
+        if spent.waiters == 0
+            && let Some(since) = spent.since.take()
+        {
+            spent.before += since.elapsed();
+        }
+    }
+}
+
+tokio::task_local! {
+    /// The tool call this task serves.
+    static CALL: Call;
+}
+
+/// The current tool call was cancelled by its harness.
+fn call_cancelled() -> bool {
+    CALL.try_with(|call| (call.cancelled)()).unwrap_or(false)
+}
+
+/// The current tool call's wait for the server's socket; a request outside
+/// any call has the whole wait to itself.
+fn call_wait() -> SocketWait {
+    CALL.try_with(|call| call.wait.clone())
+        .unwrap_or_else(|_| SocketWait::new(RECONNECT_WITHIN))
+}
+
+/// Run `body` as `call`, so the requests it makes are neither connected nor
+/// sent once its harness cancelled it, and wait no longer than it may.
+async fn as_call<F: std::future::Future>(call: Call, body: F) -> F::Output {
+    CALL.scope(call, body).await
+}
+
+/// The current call, to carry into a task it spawns.
+fn current_call() -> Call {
+    CALL.try_with(Call::clone)
+        .unwrap_or_else(|_| Call::new(Arc::new(|| false)))
+}
+/// How often a missing or refusing socket is tried again.
+const RECONNECT_PROBE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A new HTTP/1 connection to the server's socket, or an error at once when
+/// nothing listens. Its driver runs as a task until the server closes it or
+/// the last sender is dropped.
+async fn connect(socket: &Path) -> Result<http1::SendRequest<Full<Bytes>>, String> {
+    connect_waiting(socket, &SocketWait::new(std::time::Duration::ZERO)).await
+}
+
+/// [`connect`], waiting up to `within` while nothing listens on `socket`.
+#[cfg(test)]
+async fn connect_within(
+    socket: &Path,
+    within: std::time::Duration,
+) -> Result<http1::SendRequest<Full<Bytes>>, String> {
+    connect_waiting(socket, &SocketWait::new(within)).await
+}
+
+/// [`connect`], waiting within what is left of `wait` while nothing listens
+/// on `socket`.
+async fn connect_waiting(
+    socket: &Path,
+    wait: &SocketWait,
+) -> Result<http1::SendRequest<Full<Bytes>>, String> {
+    let mut waiting = None;
+    let stream = loop {
+        if call_cancelled() {
+            return Err("the tool call was cancelled".into());
+        }
+        match tokio::net::UnixStream::connect(socket).await {
+            Ok(stream) => break stream,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) && !wait.left().is_zero() =>
+            {
+                waiting.get_or_insert_with(|| wait.begin());
+                tokio::time::sleep(RECONNECT_PROBE.min(wait.left())).await;
+            }
+            Err(err) => return Err(format!("cannot reach the server: {err}")),
+        }
+    };
+    drop(waiting);
+    let (sender, connection) = http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|err| err.to_string())?;
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    let response = sender
-        .send_request(request)
-        .await
-        .map_err(|err| err.to_string())?;
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|err| err.to_string())?
-        .to_bytes()
-        .to_vec();
-    Ok((status, bytes))
+    Ok(sender)
 }
 
 /// Parse an explicit bounded read without turning malformed bounds into absence.
@@ -8178,6 +9048,194 @@ fn parse_sequence_range(range: Option<&str>) -> Result<(Option<i64>, Option<i64>
         return Err("sequence range start must not exceed end".into());
     }
     Ok((Some(start), Some(end)))
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use std::sync::Arc;
+    /// A tool call made while the server restarts waits for its socket to
+    /// come back, and its request is sent once, on the new server.
+    #[tokio::test]
+    async fn a_call_made_while_the_server_restarts_reaches_the_next_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let listening = socket.clone();
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            let listener = tokio::net::UnixListener::bind(&listening).unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !String::from_utf8_lossy(&seen).contains("\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                seen.extend_from_slice(&buf[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            // A second request on another connection would block here.
+            drop(listener);
+            seen
+        });
+        let mut sender = super::connect_within(&socket, std::time::Duration::from_secs(20))
+            .await
+            .unwrap();
+        let request =
+            super::build_request("GET", "/v1/health", None, None, None, None, false).unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        let seen = server.await.unwrap();
+        let seen = String::from_utf8_lossy(&seen);
+        assert!(
+            seen.starts_with("GET ") && seen.contains("/v1/health"),
+            "{seen}"
+        );
+    }
+
+    /// A call its harness cancels while it waits for the server is never
+    /// carried out: the next server never sees it.
+    #[tokio::test]
+    async fn a_call_cancelled_while_it_waits_never_reaches_the_next_server() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let client = super::Client::new(
+            socket.clone(),
+            dir.path().join("config"),
+            "synthetic-test-capability".into(),
+        );
+        let call = tokio::spawn(super::as_call(
+            super::Call::new(Arc::new(move || flag.load(Ordering::SeqCst))),
+            async move {
+                client
+                    .send("POST", "/v1/send", Some(b"{}".to_vec()), "cap", None)
+                    .await
+            },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        cancelled.store(true, Ordering::SeqCst);
+        // The harness gave up; then the next server comes up.
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let error = call
+            .await
+            .unwrap()
+            .expect_err("a cancelled call was carried out");
+        assert!(error.contains("cancelled"), "{error}");
+        // It may have connected in the instant before it saw the cancel, but
+        // it sends nothing on that connection.
+        if let Ok(accepted) =
+            tokio::time::timeout(std::time::Duration::from_millis(800), listener.accept()).await
+        {
+            use tokio::io::AsyncReadExt as _;
+            let (mut stream, _) = accepted.unwrap();
+            let mut seen = Vec::new();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_to_end(&mut seen),
+            )
+            .await;
+            assert!(
+                seen.is_empty(),
+                "the cancelled call reached the next server: {}",
+                String::from_utf8_lossy(&seen)
+            );
+        }
+    }
+
+    /// The wait is the call's, not each request's: requests a call makes one
+    /// after another while the server is gone share it.
+    #[tokio::test]
+    async fn requests_in_one_call_share_its_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let client = super::Client::new(
+            socket,
+            dir.path().join("config"),
+            "synthetic-test-capability".into(),
+        );
+        let started = std::time::Instant::now();
+        let call = super::Call::waiting_at_most(
+            Arc::new(|| false),
+            std::time::Duration::from_millis(1_000),
+        );
+        let failures = super::as_call(call, async move {
+            let mut failures = 0;
+            for _ in 0..3 {
+                if client
+                    .send("GET", "/v1/whoami", None, "cap", None)
+                    .await
+                    .is_err()
+                {
+                    failures += 1;
+                }
+            }
+            failures
+        })
+        .await;
+        assert_eq!(failures, 3);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_900),
+            "each request waited on its own: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Only time spent waiting for the socket counts against a call's wait:
+    /// a call that has run long still waits the whole time for a server
+    /// that restarts.
+    #[tokio::test]
+    async fn a_call_that_ran_long_still_waits_for_a_restarting_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let client = super::Client::new(
+            socket.clone(),
+            dir.path().join("config"),
+            "synthetic-test-capability".into(),
+        );
+        let call = super::Call::waiting_at_most(
+            Arc::new(|| false),
+            std::time::Duration::from_millis(1_000),
+        );
+        let answer = tokio::spawn(super::as_call(call, async move {
+            // Longer than the whole wait, at work before the server goes.
+            tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+            client.send("GET", "/v1/whoami", None, "cap", None).await
+        }));
+        // The server comes back within the wait, after the call's work.
+        tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !String::from_utf8_lossy(&seen).contains("\r\n\r\n") {
+            let read = stream.read(&mut buf).await.unwrap();
+            seen.extend_from_slice(&buf[..read]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let answer = answer.await.unwrap();
+        assert!(answer.is_ok(), "{answer:?}");
+    }
+
+    /// Past the wait, a server that is still gone is an error, as before.
+    #[tokio::test]
+    async fn a_server_still_gone_after_the_wait_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let started = std::time::Instant::now();
+        let error = super::connect_within(&socket, std::time::Duration::from_millis(600))
+            .await
+            .expect_err("a missing server was reached");
+        assert!(error.starts_with("cannot reach the server"), "{error}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(600));
+    }
 }
 
 #[cfg(test)]
@@ -8214,11 +9272,7 @@ mod spawn_args_tests {
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
         });
-        let client = Client {
-            socket,
-            config: dir.path().join("config"),
-            capability: "test-capability".into(),
-        };
+        let client = Client::new(socket, dir.path().join("config"), "test-capability".into());
         assert_eq!(
             client
                 .request_method::<serde_json::Value>("POST", "/v1/agents", None)
@@ -8432,6 +9486,13 @@ mod spawn_args_tests {
         }
         let send_tool = tools.iter().find(|t| t.name == "send").unwrap();
         assert!(
+            send_tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Use `operator` to report a defect in AnyAgents")
+        );
+        assert!(
             !send_tool
                 .description
                 .as_deref()
@@ -8532,8 +9593,9 @@ mod spawn_args_tests {
             state: state.to_string(),
             process: "none".to_string(),
             turn_state: turn_state.to_string(),
-            delivery_mode: "turn".to_string(),
-            steer_support: "send".to_string(),
+            delivery: Default::default(),
+            delivery_mode: String::new(),
+            steer_support: String::new(),
             quota_reset_at_ms: None,
             block_reason: None,
             last_error: None,
@@ -8545,6 +9607,8 @@ mod spawn_args_tests {
             seat_uid: None,
             seat_gid: None,
             schedules: Vec::new(),
+            turn_errors: None,
+            unsettled_outbound: Vec::new(),
         }
     }
 
@@ -8768,6 +9832,20 @@ mod spawn_args_tests {
         ));
         for a in &mut population {
             a.instructions = Some("PRIVATE_PROMPT".into());
+            a.schedules = vec![crate::api::ScheduleView {
+                id: "sch_test".into(),
+                agent_id: a.id.clone(),
+                kind: "at".into(),
+                spec: "2026-11-14T00:00:00Z".into(),
+                prompt: "LONG_SCHEDULE_PROMPT".into(),
+                interval_ms: None,
+                next_fire_at_ms: Some(1_794_614_400_000),
+                last_fired_at_ms: None,
+                watch_baseline: None,
+                last_observed: None,
+                state: "active".into(),
+                created_at_ms: 1_794_500_000_000,
+            }];
             a.parent = Some(parent_id.to_string());
         }
         let body = serde_json::to_vec(&AgentsResponse {
@@ -8810,11 +9888,11 @@ mod spawn_args_tests {
                 name: "parent".into(),
                 workdir: None,
             },
-            client: Client {
+            client: Client::new(
                 socket,
-                config: dir.path().join("config"),
-                capability: "synthetic-test-capability".into(),
-            },
+                dir.path().join("config"),
+                "synthetic-test-capability".into(),
+            ),
             profile: McpProfile::Full,
         };
         for legacy in [false, true] {
@@ -8848,7 +9926,10 @@ mod spawn_args_tests {
                     .unwrap();
                 assert_eq!(rows.len(), expected_len);
                 assert_eq!(rows[0]["name"], first);
-                assert!(rows.iter().all(|a| a["instructions"].is_null()));
+                assert!(
+                    rows.iter()
+                        .all(|a| a["instructions"].is_null() && a.get("schedules").is_none())
+                );
                 assert_eq!(result["next_cursor"], json!(next));
                 assert_eq!(result["summary"]["total"], 105);
                 assert_eq!(result["summary"]["matched"], 105);
@@ -8907,11 +9988,11 @@ mod spawn_args_tests {
                 name: "tester".into(),
                 workdir: Some(workdir.clone()),
             },
-            client: Client {
-                socket: dir.path().join("unused.sock"),
-                config: dir.path().join("config"),
-                capability: "test-cap".into(),
-            },
+            client: Client::new(
+                dir.path().join("unused.sock"),
+                dir.path().join("config"),
+                "test-cap".into(),
+            ),
             profile: McpProfile::Full,
         };
 
@@ -9078,11 +10159,11 @@ mod spawn_args_tests {
                 name: "receipt-worker".into(),
                 workdir: Some(dir.path().into()),
             },
-            client: Client {
+            client: Client::new(
                 socket,
-                config: dir.path().join("config"),
-                capability: "synthetic-receipt-capability".into(),
-            },
+                dir.path().join("config"),
+                "synthetic-receipt-capability".into(),
+            ),
             profile: McpProfile::Full,
         };
         let fabricated = mcp
@@ -9176,7 +10257,8 @@ mod spawn_args_tests {
             gateway: None,
         })
         .unwrap();
-        let server = tokio::spawn(async move {
+        let (served, server) = tokio::sync::oneshot::channel::<()>();
+        let later = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
             loop {
@@ -9192,6 +10274,30 @@ mod spawn_args_tests {
             );
             stream.write_all(header.as_bytes()).await.unwrap();
             stream.write_all(&body).await.unwrap();
+            drop(stream);
+            let _ = served.send(());
+            // The server stays up, as a real one does: what it does not
+            // serve here (memory reads) is answered `404`, and the tools fall
+            // back to the agent's own files.
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    match stream.read_u8().await {
+                        Ok(byte) => request.push(byte),
+                        Err(_) => break,
+                    }
+                }
+                let body = br#"{"error":"not served here"}"#;
+                let head = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
         });
 
         let mcp = AgentMcp {
@@ -9200,11 +10306,11 @@ mod spawn_args_tests {
                 name: "parent".into(),
                 workdir: Some(workdir.clone()),
             },
-            client: Client {
+            client: Client::new(
                 socket,
-                config: dir.path().join("config"),
-                capability: "synthetic-test-capability".into(),
-            },
+                dir.path().join("config"),
+                "synthetic-test-capability".into(),
+            ),
             profile: McpProfile::Full,
         };
 
@@ -9245,6 +10351,7 @@ mod spawn_args_tests {
         assert_eq!(code_res["logs"], json!(["parallel calls done 2"]));
         assert!(workdir.join("computed.txt").is_file());
         server.await.unwrap();
+        let _serving = &later;
 
         // 2. Verify capability sandbox blocks `process`, `process.env`, `require`, `child_process`, `fs`, `fetch`, and Function constructor escapes.
         let sandbox_probe = mcp
@@ -9428,6 +10535,7 @@ mod spawn_args_tests {
         assert_eq!(evo_res["result"]["execExit"], 0);
         assert_eq!(evo_res["result"]["execStdout"], "hello-exec");
         assert_eq!(evo_res["result"]["hasWebHelpers"], true);
+        later.abort();
     }
 
     #[tokio::test]
@@ -9437,14 +10545,12 @@ mod spawn_args_tests {
         let workdir = dir.path().join("work");
         std::fs::create_dir_all(&workdir).unwrap();
 
-        // 1. Write a valid PNG header (640x480), WAV header, and minimal PDF file.
-        let mut png_bytes = Vec::new();
-        png_bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-        png_bytes.extend_from_slice(&13u32.to_be_bytes());
-        png_bytes.extend_from_slice(b"IHDR");
-        png_bytes.extend_from_slice(&640u32.to_be_bytes());
-        png_bytes.extend_from_slice(&480u32.to_be_bytes());
-        png_bytes.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        // 1. Write a 640x480 PNG, a WAV header, and a minimal PDF file.
+        let mut png_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(640, 480))
+            .write_to(&mut png_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let png_bytes = png_bytes.into_inner();
         std::fs::write(workdir.join("frame.png"), &png_bytes).unwrap();
 
         let mut wav_bytes = Vec::new();
@@ -9463,11 +10569,11 @@ mod spawn_args_tests {
                 name: "multimedia-worker".into(),
                 workdir: Some(workdir.clone()),
             },
-            client: Client {
-                socket: dir.path().join("unused.sock"),
-                config: dir.path().join("config"),
-                capability: "test-cap".into(),
-            },
+            client: Client::new(
+                dir.path().join("unused.sock"),
+                dir.path().join("config"),
+                "test-cap".into(),
+            ),
             profile: McpProfile::Full,
         };
         assert!(
@@ -9537,7 +10643,13 @@ mod spawn_args_tests {
         let rmcp::model::CallToolResponse::Complete(call_res) = call_tool_resp else {
             panic!("expected CallToolResponse::Complete");
         };
-        assert!(call_res.structured_content.is_some());
+        // The JSON goes as text, not also as structured content, which a
+        // client that prefers it would give its model instead of the media.
+        assert!(call_res.structured_content.is_none());
+        assert!(matches!(
+            &call_res.content[0],
+            rmcp::model::ContentBlock::Text(text) if text.text.contains("\"imgDims\":[640,480]")
+        ));
         assert!(call_res.content.iter().any(
             |c| matches!(c, rmcp::model::ContentBlock::Image(i) if i.mime_type == "image/png")
         ));
@@ -9555,8 +10667,117 @@ mod spawn_args_tests {
         )));
     }
 
+    /// What each harness's model is given when its agent reads a media path
+    /// with `code`, by that vendor's MCP client rules
+    /// (`tests/invariants/fakes/mcp_client.py`): the photo itself on every
+    /// harness whose client gives MCP images to its model; on AGY, which
+    /// gives one only up to 10,240 bytes, the path of the file it offloaded,
+    /// which its native `read_file` opens; and a small image inline there.
     #[tokio::test]
-    async fn remote_sandbox_backend_executes_files_and_code_and_upgrades_http_mcp_profile() {
+    async fn an_image_an_agent_reads_from_the_media_directory_reaches_each_model() {
+        use rmcp::handler::server::tool::IntoCallToolResult as _;
+        use sha2::Digest as _;
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("work");
+        let media = dir.path().join(anyagents_harness::media::MEDIA_DIR);
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::create_dir_all(&media).unwrap();
+        // A Telegram photo's shape: a 1280x697 JPEG of tens of kilobytes.
+        let jpeg = |width: u32, height: u32| {
+            let image = image::RgbImage::from_fn(width, height, |x, y| {
+                let noise = (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503)) >> 13;
+                image::Rgb([(x % 251) as u8, (y % 241) as u8, noise as u8])
+            });
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image)
+                .write_to(&mut bytes, image::ImageFormat::Jpeg)
+                .unwrap();
+            bytes.into_inner()
+        };
+        let photo = jpeg(1280, 697);
+        assert!(photo.len() > 10_240, "{} bytes", photo.len());
+        let thumb = jpeg(32, 32);
+        assert!(thumb.len() <= 10_240, "{} bytes", thumb.len());
+        let digest = |bytes: &[u8]| {
+            sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: AgentId::generate(),
+                name: "media-reader".into(),
+                workdir: Some(workdir.clone()),
+            },
+            client: Client::new(
+                dir.path().join("unused.sock"),
+                dir.path().join("config"),
+                "test-cap".into(),
+            ),
+            profile: McpProfile::Full,
+        };
+        let read = |name: &str, bytes: &[u8]| {
+            let path = media.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let line = anyagents_harness::media::local_media_line("photo", &path);
+            assert!(line.contains(&path.display().to_string()));
+            let mcp = mcp.clone();
+            async move {
+                let result = mcp
+                    .code(Parameters(CodeArgs {
+                        code: format!(
+                            "const img = await workspace.read({{ path: {:?} }}); return img.mime_type;",
+                            path.display().to_string()
+                        ),
+                        timeout_ms: Some(15_000),
+                    }))
+                    .await
+                    .unwrap();
+                let rmcp::model::CallToolResponse::Complete(result) =
+                    result.into_call_tool_result().unwrap()
+                else {
+                    panic!("expected a complete result");
+                };
+                serde_json::to_vec(&result).unwrap()
+            }
+        };
+        let seen_by = |harness: &str, result: &[u8]| -> serde_json::Value {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new("python3")
+                .args(["-I", anyagents_invariants::conformance::MCP_CLIENT, harness])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(result).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{harness}");
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+        let photo_result = read("complete_photo_large.jpg", &photo).await;
+        for harness in ["claude-code", "codex", "muse", "omp", "opencode"] {
+            let seen = seen_by(harness, &photo_result);
+            assert_eq!(
+                seen["images"],
+                json!([{"mime": "image/jpeg", "sha256": digest(&photo)}]),
+                "{harness}: {seen}"
+            );
+        }
+        let agy = seen_by("agy", &photo_result);
+        assert_eq!(agy["images"], json!([]), "{agy}");
+        assert_eq!(agy["offloaded"].as_array().unwrap().len(), 1, "{agy}");
+        let thumb_result = read("complete_photo_small.jpg", &thumb).await;
+        let agy = seen_by("agy", &thumb_result);
+        assert_eq!(
+            agy["images"],
+            json!([{"mime": "image/jpeg", "sha256": digest(&thumb)}]),
+            "{agy}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sandbox_backend_executes_files_and_code_and_never_upgrades_http_mcp_profile() {
         use axum::{
             Router,
             body::Bytes,
@@ -9712,11 +10933,8 @@ mod spawn_args_tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::create_dir_all(&host_workdir).unwrap();
 
-        // Without sandbox.json, HTTP MCP defaults to Remote profile (code disabled).
-        assert_eq!(
-            McpProfile::resolve_http_with_config(None, "claude-cloud", Some(&config_dir)),
-            Ok(McpProfile::Remote)
-        );
+        // HTTP MCP defaults to the Remote profile (code disabled).
+        assert_eq!(McpProfile::resolve_http(None), Ok(McpProfile::Remote));
 
         // Write sandbox.json into agent config_dir.
         std::fs::write(
@@ -9731,11 +10949,10 @@ mod spawn_args_tests {
         )
         .unwrap();
 
-        // With sandbox.json present, HTTP MCP upgrades to Full profile so remote sandbox agents can use `code` and `files`.
-        assert_eq!(
-            McpProfile::resolve_http_with_config(None, "claude-cloud", Some(&config_dir)),
-            Ok(McpProfile::Full)
-        );
+        // A sandbox.json never upgrades HTTP MCP: over HTTP the tools would run
+        // as the server, so `full` is refused there and served only over stdio.
+        assert_eq!(McpProfile::resolve_http(None), Ok(McpProfile::Remote));
+        assert!(McpProfile::resolve_http(Some("full")).is_err());
 
         let mcp = AgentMcp {
             agent: AgentRef {
@@ -9743,11 +10960,11 @@ mod spawn_args_tests {
                 name: "remote-sandbox-worker".into(),
                 workdir: Some(host_workdir.clone()),
             },
-            client: Client {
-                socket: dir.path().join("unused.sock"),
-                config: config_dir.clone(),
-                capability: "test-cap".into(),
-            },
+            client: Client::new(
+                dir.path().join("unused.sock"),
+                config_dir.clone(),
+                "test-cap".into(),
+            ),
             profile: McpProfile::Full,
         };
 
@@ -9829,5 +11046,217 @@ mod spawn_args_tests {
         assert_eq!(code_res["result"]["execExit"], 0);
 
         server_handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod tool_server_runtime_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A server that answers every call with an empty JSON object.
+    async fn answering_server(socket: &Path) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let app = axum::Router::new().fallback(|| async { axum::Json(serde_json::json!({})) });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        })
+    }
+
+    #[test]
+    fn one_thread_answers_a_call_while_another_waits_on_blocking_work() {
+        let runtime = tool_server_runtime().unwrap();
+        assert_eq!(
+            runtime.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread
+        );
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("anyagents.sock");
+            let server = answering_server(&socket).await;
+            let mcp = AgentMcp {
+                agent: AgentRef {
+                    id: AgentId::generate(),
+                    name: "worker".into(),
+                    workdir: Some(dir.path().to_path_buf()),
+                },
+                client: Client::new(socket, dir.path().join("config"), "test-cap".into()),
+                profile: McpProfile::Full,
+            };
+            // A command that blocks for two seconds runs on the blocking
+            // pool, so the one runtime thread keeps answering other calls.
+            let slow = mcp.dispatch_any_tool(
+                "files",
+                serde_json::json!({"action": "exec", "cmd": "sleep 2"}),
+            );
+            let quick = async {
+                let started = Instant::now();
+                mcp.dispatch_any_tool("schedule", serde_json::json!({"action": "list"}))
+                    .await
+                    .unwrap();
+                started.elapsed()
+            };
+            let (slow, quick) = tokio::join!(slow, quick);
+            slow.unwrap();
+            assert!(quick < Duration::from_secs(1), "quick call took {quick:?}");
+            server.abort();
+        });
+    }
+}
+
+#[cfg(test)]
+mod client_link_tests {
+    use super::*;
+    use axum::serve::ListenerExt as _;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// A stand-in for the server: counts the connections it accepted and
+    /// records the capability each call presented.
+    struct Recorder {
+        accepted: Arc<AtomicUsize>,
+        presented: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Serve on `socket` from whichever runtime is current.
+    fn serve(socket: &Path) -> (Recorder, impl std::future::Future<Output = ()> + use<>) {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let presented = Arc::new(Mutex::new(Vec::new()));
+        let counted = Arc::clone(&accepted);
+        let listener = tokio::net::UnixListener::bind(socket)
+            .unwrap()
+            .tap_io(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+        let recorded = Arc::clone(&presented);
+        let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                if let Some(token) = headers
+                    .get(crate::operator::AGENT_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    recorded.lock().unwrap().push(token.to_string());
+                }
+                axum::Json(serde_json::json!({"ok": true}))
+            }
+        });
+        let server = async move {
+            let _ = axum::serve(listener, app).await;
+        };
+        (
+            Recorder {
+                accepted,
+                presented,
+            },
+            server,
+        )
+    }
+
+    async fn call(client: &Client) -> serde_json::Value {
+        client
+            .request_method("GET", "/v1/whoami", None)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sequential_calls_share_one_connection_and_parallel_calls_open_what_they_need() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let (recorder, server) = serve(&socket);
+        let server = tokio::spawn(server);
+        let client = Client::new(socket, dir.path().join("config"), "cap".into());
+        for _ in 0..5 {
+            assert_eq!(call(&client).await["ok"], true);
+        }
+        assert_eq!(recorder.accepted.load(Ordering::SeqCst), 1);
+
+        let calls = (0..8).map(|_| call(&client));
+        for answer in futures::future::join_all(calls).await {
+            assert_eq!(answer["ok"], true);
+        }
+        let opened = recorder.accepted.load(Ordering::SeqCst);
+        assert!((1..=9).contains(&opened), "opened {opened}");
+        assert!(locked(&client.link.idle).len() <= MAX_IDLE_CONNECTIONS);
+        // The connections kept after the burst serve the next calls.
+        call(&client).await;
+        assert_eq!(recorder.accepted.load(Ordering::SeqCst), opened);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_restarted_server_is_reached_on_a_new_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let client = Client::new(socket.clone(), dir.path().join("config"), "cap".into());
+
+        // The first server runs on its own runtime, so stopping that runtime
+        // closes its connections the way a server process exit does.
+        let first = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (before, server) = {
+            let _entered = first.enter();
+            serve(&socket)
+        };
+        first.spawn(server);
+        call(&client).await;
+        assert_eq!(before.accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(locked(&client.link.idle).len(), 1);
+        first.shutdown_background();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !locked(&client.link.idle)
+            .iter()
+            .all(|sender| sender.is_closed())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the closed connection was never seen"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::fs::remove_file(&socket).unwrap();
+        let (after, server) = serve(&socket);
+        let server = tokio::spawn(server);
+        assert_eq!(call(&client).await["ok"], true);
+        assert_eq!(after.accepted.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn every_call_presents_the_capability_the_file_holds_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let config = dir.path().join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let file = config.join(CAPABILITY_FILE);
+        std::fs::write(&file, "first\n").unwrap();
+        let (recorder, server) = serve(&socket);
+        let server = tokio::spawn(server);
+        let client = Client::new(socket, config.clone(), "at-start".into());
+
+        call(&client).await;
+        call(&client).await;
+        // A rotation writes a new file and renames it into place.
+        let staged = config.join("mcp-capability.new");
+        std::fs::write(&staged, "second\n").unwrap();
+        std::fs::rename(&staged, &file).unwrap();
+        call(&client).await;
+        // A rewrite in place that changes the size is seen too.
+        std::fs::write(&file, "third-and-longer\n").unwrap();
+        call(&client).await;
+        // With no readable file the capability read at start is presented.
+        std::fs::remove_file(&file).unwrap();
+        call(&client).await;
+        assert_eq!(
+            *recorder.presented.lock().unwrap(),
+            ["first", "first", "second", "third-and-longer", "at-start"]
+        );
+        server.abort();
     }
 }

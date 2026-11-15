@@ -1,6 +1,6 @@
 # AnyAgents architecture
 
-Status: design. Decisions behind it are in [adr/0001-server-first-one-binary.md](adr/0001-server-first-one-binary.md) and [adr/0002-runtime-drivers-and-capability-identity.md](adr/0002-runtime-drivers-and-capability-identity.md).
+Status: design. Decisions behind it are in [adr/0001-server-first-one-binary.md](adr/0001-server-first-one-binary.md), [adr/0002-runtime-drivers-and-capability-identity.md](adr/0002-runtime-drivers-and-capability-identity.md) and, for which process holds what, [adr/0007-process-architecture.md](adr/0007-process-architecture.md).
 
 ## The standard, and the shape
 
@@ -19,10 +19,12 @@ The established pattern for running vendor agents is a long-lived gateway that d
      |  sign-in    |  adapters   |  three acks |             |  aggregates |
      +-------------+-------------+-------------+-------------+-------------+
                                        |
+                       keepers: one `anyagents keeper` per harness
+                                       |
                     vendor processes: claude, codex, opencode, gemini, ...
 ```
 
-Everything runs in one process, `anyagents serve`, with one embedded database. Each module below is one crate with one public interface; the protocol gateway is a sixth module used only in API-key mode.
+`anyagents serve` is the kernel: the API, identity, the mailboxes, supervision, schedules and the one embedded database run in it. Each harness process is held by its own keeper, a small process (`anyagents keeper`, the same binary) that starts the harness, owns its pipes and hosts the vendor adapter, so the kernel can stop, crash or be replaced by a newer binary while every harness keeps running ([ADR 0007](adr/0007-process-architecture.md)); on Linux only, see [Agents](#agents-create-and-supervise). The protocol gateway, used only in API-key mode, runs inside the kernel. Dense retrieval and reranking run beside it as a separate, optional process, `anyagents memory-service` ([host-memory.md](host-memory.md#hybrid-retrieval-and-the-memory-service)); without it the server ranks history lexically and says so.
 
 ## Three-axis vendor-neutral model (`Harness × Profile × Sandbox`)
 
@@ -61,7 +63,7 @@ Clients show only valid combinations, so an invalid one is never offered rather 
 
 ## Protocol gateway (API-key mode)
 
-A local HTTP server inside `anyagents serve`, bound to loopback, reachable only by the harness processes AnyAgents started (each gets a per-agent gateway token).
+A local HTTP server inside `anyagents serve`, bound to loopback, reachable only by the harness processes AnyAgents started (each gets a per-agent gateway token). Its port is kept in `<data>/gateway.port` and bound again at the next start, so a harness that outlived the last server in its keeper still reaches the gateway at the origin it was started with; only when that port is taken does the gateway take another and repoint every agent.
 
 - **Inbound protocols:** the Anthropic Messages API (`/v1/messages`, streaming), and the OpenAI Chat Completions and Responses APIs (`/v1/chat/completions`, `/v1/responses`, streaming), because those are what the supported harnesses speak.
 - **Outbound:** the provider's native API for the chosen model. When inbound and outbound are the same protocol the request passes through unchanged apart from the key and model; otherwise the gateway maps messages, system prompts, tool definitions, tool calls and results, streaming events, stop reasons and usage between them.
@@ -102,7 +104,8 @@ AnyAgents is a message switchboard plus a process supervisor. It never models a 
 
 Each agent is one long-lived vendor process in its programmatic mode, run under a supervisor:
 
-- A per-agent lock: a second process for the same agent is refused, never started beside the first.
+- Its own keeper. The vendor process and the adapter that speaks to it live in a keeper process, not in the server. A server that stops, crashes or is upgraded leaves every keeper running; the next server takes each running agent's keeper over, with the adapter's memory of the session intact, and resumes delivery from the mailbox cursor. A process taken over gets no `[Recovery]` note: its turn never stopped. A keeper whose agent no longer runs is stopped at startup. `anyagents keepers list` shows every keeper; `anyagents keepers stop` ends them. Keepers are Linux-only, a platform limitation: taking one over rests on proving a process's identity from `/proc`, which other platforms do not offer. On macOS the server hosts each harness in its own process, and a server restart restarts its agents; keepers there need a macOS process-identity source (`proc_pidinfo`, with the start time from `kinfo_proc`) ([ADR 0007](adr/0007-process-architecture.md#9-where-in-process-hosting-remains)).
+- A per-agent lock: a second process for the same agent is refused, never started beside the first. The keeper holds a copy of the lock for the life of its process, so the lock stays held while no server runs.
 - Restart with exponential backoff and jitter after a crash, resuming the same vendor session id. Starting a new session in place of a failed resume is reported as a failed resume, not hidden.
 - A quota or rate-limit answer from the vendor (for example an HTTP 429 with a reset time) is a health state with its reset time, not a crash and not a restart loop.
 - A process that has gone is replaced after its backoff, resuming the session, and the lines after the one cursor go to the new process. A line already taken is never written twice: each adapter remembers the ids its session holds.
@@ -182,47 +185,22 @@ One adapter per harness. A new harness is an adapter plus a catalog entry; the m
 
 | Call | Obligation |
 | --- | --- |
-| `deliver(message)` | Put one mailbox message into the live vendor process through that harness's own input or steer API. Return `accepted` once the vendor has taken it (its acknowledgement, echo or written line), or the reason it could not. |
+| `deliver(message)` | Put one mailbox message into the live vendor process through that harness's own input or steer API, and answer what the vendor has shown about it: taken with the proof the harness's level requires, in flight, already held by the session, not now, or a fault ([delivery.md](delivery.md)). |
 | `background()` | Ask the vendor tool to move running work off the turn, where the tool supports it. Never wrap the tool's own tools. |
 | `resume(session)` | Reattach to the same vendor session id. |
 | `cancel()` | The vendor's own interrupt for the current turn. |
-| `health()` | Process alive, declared delivery mode, steer support (yes, no or unproven), and any current quota or sign-in fault. |
+| `health()` | Process alive, the delivery level (`turn-end`, `mid-turn` or `next-step`, and whether a redelivery is recognised) with what the running process announced in its handshake, and any current quota or sign-in fault. |
 | `last_usage()` | Tokens and cost the vendor reported for the runs this process made, read once when the mailbox has drained. Never part of delivery. |
 
-Every harness is admitted. The delivery mode is whatever that tool does best, declared rather than hidden. Every line is written the moment it arrives; the vendor decides whether it joins the running turn or starts the next one.
+Every harness is admitted at the delivery level its protocol can prove, reported rather than assumed ([delivery.md](delivery.md)); the conformance suite in `tests/invariants` holds each adapter to it.
 
 The native Sylphx HTTP transport sends JSON request bodies as bytes. Its curl
 fallback reads the body from stdin, so growing conversation history does not
 become one command-line argument or encounter the operating system's per-argument
 size limit. HTTP refusals retain their status and response body.
 
-| Harness | Mode | How a line reaches it |
-| --- | --- | --- |
-| `spiron` (legacy `sylphx` alias) | `steer` | External `spiron --headless --json` process. Correlated `user` JSONL receives `accepted` (new turn) or `steer_ack` (active turn) before mailbox acceptance. Only the matching terminal `result` closes a turn; `cancel_ack` alone does not. |
-| `opencode` | `steer` | `POST /api/session/{id}/prompt` with `delivery: "steer"`; the session's own inbox decides whether it joins the running turn or starts the next one. Accepted when the prompt API answers with `data`. |
-| `codex` | `steer` | `turn/start`, with `ifBusy: "steer"` while a turn is open. |
-| `claude-code` | `steer` | Idle: a stream-json `user` message. Active turn: an SDK `PreToolUse` callback returns pending lines as `additionalContext` in the current transcript before the tool proceeds; stdin replay alone is not evidence of mid-turn delivery. |
-| `muse` | `steer` | `turn/start` with `ifBusy: "steer"`. |
-| `omp` | `steer` | Stream-json child stdin with `steer` delivery into the active turn. |
-| `dsh` | `steer` | `POST /api/session/prompt` with `mode: "steer"` on the session controller HTTP gateway. |
-| `grok` | `steer` | ACP JSON-RPC 2.0 `session/prompt` over stdio with `follow_up_behavior = "steer"`. |
-| `agy` | `steer` | Stream-json child stdin plus native `LanguageServerService/SendUserCascadeMessage` Connect RPC steering into an open cascade turn. |
-| `followup` mode | `followup` | The contract double (`ANYAGENTS_HARNESS_BIN`) reads one line per turn and answers with a `result`; a line written mid-turn waits for that turn to end. |
-
-Claude Code initializes its SDK hook before accepting input and fails startup if
-initialization is rejected or times out. A busy delivery is deferred, leaving the
-mailbox cursor unchanged, until its hook response is written successfully.
-Repeated offers of the same mailbox id are coalesced; messages retain their
-sender, room context and reply reference. If the turn finishes without another
-tool call, the undelivered line starts the next idle turn instead. The hook write
-is a transport acceptance, not proof that the model acted on the message. Dedupe
-between acceptance and cursor commit is local to the retained harness instance;
-this does not add transactional exactly-once delivery across a vendor process
-crash. Hook protocol, cursor replay and tool ordering are covered by scripted
-fixtures, not a live authenticated Claude model test.
-
-
-No harness here uses `queue`: none of them is a one-shot run that must wait.
+How a line reaches each harness, the level it holds and the vendor signal that
+level rests on are listed in [delivery.md](delivery.md#harnesses).
 
 The per-harness programmatic modes, sign-in methods and usage fields are listed with their sources in [harnesses.md](harnesses.md).
 
@@ -257,137 +235,55 @@ this adapter does not invoke a setter or edit shared service configuration.
 
 ### Antigravity and Muse
 
-- **Antigravity (`agy`).** The installed CLI documents a turn per stream-json input line and `--conversation <id>` for resume. The adapter reports followup/unproven. Its hook helpers are not wired to a confirmed customization root and have no vendor consumption acknowledgement. AGY 1.4.5's embedded lifecycle documentation specifies `hooks.json` in a customization root (for example `.agents/hooks.json`), with a named hook's flat `PreInvocation` command array and output `{"injectSteps":[{"userMessage":"..."}]}`. It does not specify the durable acceptance/replay contract needed to commit the mailbox cursor across hook abort or process restart. The existing `agy-hook` helper only offers `received` rows, while stream pipe writes already mark rows delivered; it cannot establish native mid-turn delivery. Do not advertise steer support or install a hook bound to a seat in a shared workspace until isolated hook discovery and consumption/recovery semantics are verified.
-- **Muse (`muse serve`).** One JSON-RPC child that owns the session: `initialize`, `session/start` (or `session/resume`), `session/setApprovalMode` `allowAll`. Delivery mode is steer: `turn/start` when no turn is open, and `turn/start` with `ifBusy: "steer"` during one. `turn/started` opens a turn, `turn/completed` closes it with its usage or its error, and an `approval/request` is answered by the host. `MUSE_CONFIG_HOME` points the vendor at the agent's config directory, where `settings.json` names the MCP server and the `:unrestricted` permission profile. On Windows the clone is a directory junction at `%APPDATA%\meta\muse`.
+- **Antigravity (`agy`).** The installed CLI runs a turn per stream-json input line and resumes with `--conversation <id>`. A message for a running cascade goes through the language server's `SendUserCascadeMessage`, which queues it in the cascade's durable mailbox for the next step; its level and settlement are in [delivery.md](delivery.md#harnesses). AGY's hook (`hooks.json`, `PreInvocation` with `injectSteps`) is not used: it has no acceptance or replay contract to commit the mailbox cursor on.
+- **Muse (`muse serve`).** One JSON-RPC child that owns the session: `initialize`, `session/start` (or `session/resume`), `session/setApprovalMode` `allowAll`. Every message is `turn/start` with `ifBusy: "steer"` and a `commandId` derived from its mailbox id; the `userMessage` item carrying that id proves it entered the conversation ([delivery.md](delivery.md#harnesses)). `turn/started` opens a turn, `turn/completed` closes it with its usage or its error, and an `approval/request` is answered by the host. `MUSE_CONFIG_HOME` points the vendor at the agent's config directory, where `settings.json` names the MCP server and the `:unrestricted` permission profile. On Windows the clone is a directory junction at `%APPDATA%\meta\muse`.
 
 ### Managed local checkouts
 
-Repository-backed local agents use a caller-configured checkout provider through
-`ANYAGENTS_CHECKOUT_PROVIDER_BIN`. Repository slugs and GitHub URLs, `repo: "inherit"`, and
-local repository paths use that provider for fetching and checkout. The provider
-owns sparse-checkout and hook policy. Fetch, checkout and executable-launch failures
-refuse the spawn with its diagnostic; an unavailable configured provider never
-silently selects a different checkout mechanism.
+Each repository-backed agent gets a Git repository of its own ([ADR 0010](adr/0010-execution-identity-and-trust.md) D5, [0006](adr/0006-runtime-state-and-lifecycle.md) decision 11). Its config, refs, index and hooks belong to it alone; the only thing it shares is objects, which it borrows read-only from a pool through `objects/info/alternates`. So a new checkout costs a checkout, not a download, and two agents on one repository cannot see each other's branches or configuration.
 
-Explicit `workdir` paths, including `/scratch/wt/...` and `/scratch/tmp/...`, are
-honoured or refused, never replaced by the default directory. Before an agent
-becomes running, its execution seat must be able to write and traverse its
-working tree, the per-worktree Git directory and the common objects/refs
-storage, and create lock files. New worktrees are shared with that seat's group.
-On Linux, additive POSIX ACLs grant writes only to shared `objects/`, `refs/`,
-`logs/refs/`, an existing `packed-refs`, and the child's private `worktrees/<name>/`.
-The common root, `worktrees/` and `logs/` are traversal-only with no default ACLs;
-the main worktree's `logs/HEAD` stays child-unwritable. Defaults
-exist only inside the shared content subtrees, the private gitdir and a dedicated
-`anyagents-config/` directory, never on mixed metadata ancestors. Common `config`
-is an exact symlink to `anyagents-config/config`: the dedicated directory grants
-recorded active readers traversal and read-only inheritance, so the parent's
-ordinary `git config`, `git remote` and `git push -u` replacements remain readable
-immediately, without a launch or wake. Its defaults grant no owning-group or
-outsider access. Adoption holds Git's original `config.lock`, journals a
-quarantined intent, hard-links the original inode into the dedicated directory
-and atomically replaces the old pathname with the link, preserving config bytes
-and ownership. The journal pins the directory and symlink identities, while Git
-may replace only the target config inode. Interrupted adoption preserves the
-original bytes and refuses launch/reap pending operator recovery. Revocation
-removes access and default entries only when no active same-seat reader remains.
-Retired server-owned journals retain the dedicated directory/link provenance for
-later admission, even after their private gitdirs are reaped; that provenance
-never restores a retired reader's access.
-Common `config`, `hooks/` and `info/` are not child-writable. A parent-owned sticky
-private gitdir protects `config.worktree` (and its unlink/rename), `commondir` and
-`gitdir`; mutable HEAD/index files belong to the child so Git lock+rename works.
-Temporary cleanup inspections persist each ACL target's exact path, device and
-inode before granting read/traverse access. Startup recovers those objects through
-no-follow descriptors; legacy intents use a best-effort no-follow tree walk.
-An unsafe recovery target or failed revocation quarantines only the recorded
-worktree and emits a warning, never aborting unrelated server startup.
-Quarantine preserves checkout data and refuses automatic harness launch, wake and
-reap until the operator repairs the recorded recovery state; it does not assert
-that an unreachable or hard-linked object's residual ACL was removed.
-Shared refs remain a same-repository integrity boundary: a child can move another
-branch ref. This is not hostile-repository isolation, and AnyAgents does not
-intercept arbitrary harness commit/push commands or provide a branch-tip guard.
-AnyAgents production code never runs `git commit` or `git push`; the supported
-source-publication path belongs to the caller's checkout and publication tools. Its Git metadata reads, skill sync and cleanup
-commands pin `core.hooksPath=/dev/null` and disable fsmonitor. The parent commit
-and its parent-owned hooks-path pin in the three-UID proof belong to the test fixture.
-Shared common and worktree configs refuse `include`/`includeIf` rather than
-following a potentially child-controlled configuration graph.
-Caller-configured commit identity is set in the protected private
-`config.worktree`, never by replacing the parent's common config. The consumer
-must enable `extensions.worktreeConfig`; otherwise admission refuses. Seat Git
-configuration resets legacy wildcard trust and lists only the seat's exact
-checkout and recorded common gitdir, preserving other settings. Cleanup loads
-its gitdir/worktree pair from the server journal, verifies the protected metadata
-ownership and effective ACLs, and passes both paths explicitly: a child-edited
-`.git` pointer never selects metadata. A missing, broken or changed pointer on a
-journaled checkout preserves its entire workdir (including build-named output)
-and emits a diagnostic; it cannot select non-Git directory deletion. Cleanup Git
-runs as the journaled seat UID/GID, with no inherited secret environment or socket
-group, because checkout and index attributes can select drivers from trusted
-configuration. It excludes global/system config and attribute files and keeps
-default dubious-ownership checks; unrecorded legacy or arbitrary repositories
-are preserved rather than inspected through their `.git` pointer. After archive
-revokes access, inspection adds only temporary read/traverse ACL entries to the
-journaled metadata allowlist, never write or default entries, and retains active
-same-seat bindings. Inspection intent is synced before granting; ACL changes are
-serialized without holding the global journal lock during Git. Success and
-failure both revoke and read back temporary access. Both server modes recover
-any open inspection intent before starting consumers; failed recovery refuses
-startup. A completed check never stands in for a fresh deletion eligibility check.
-Deletion additionally requires an empty pinned status and zero commits in HEAD
-or any local branch outside the recorded remote-tracking refs. A seat-owned
-initial-head marker cannot waive that test. Dirty or unpushed checkouts and their
-private registration remain; clean, pushed pairs are removed without invoking
-`git worktree remove` or its nested Git subprocesses. Remote-tracking refs remain
-within the documented shared-ref integrity boundary, not a live publication proof.
-A server-owned grant journal is file- and directory-synced before sharing. Its
-serialized transitions preserve bindings needed by another active agent on the
-same OS seat; retiring one agent revokes its private metadata without removing
-the surviving agent's shared-store access. Archive, reap and failed
-admission revoke the seat's named group/user ACL entries and defaults through
-opened descriptors, read the result back, and retain the journal on failure.
-Revocation runs even when dirty or external checkout bytes must be retained.
-An ACL write or readback failure is a typed permission error; non-Linux hosts
-accept only already-permitted metadata access. Existing explicit directories are
-validated without rewriting their permissions. Sharing does not follow symlinks
-or alter hard-linked files that require permission changes.
+- **The pool.** One bare repository per remote under `ANYAGENTS_GIT_POOL_DIR` (default `<data>/git-pool`), laid out as `<pool>/<org>/<repo>.git`. Only the control plane fetches into it, under a per-pool lock. It is created readable by every agent (`core.sharedRepository=0644`) and is never pruned (`gc.auto=0`, `gc.pruneExpire=never`, `gc.cruftPacks=true`): pruning a reference repository can corrupt the clones that borrow from it. Agents' branches never reach it.
+- **A checkout.** `git init`, an alternates line naming the pool's `objects/`, `origin` set to the remote, the default branch and the requested base as remote-tracking refs, then `git checkout -b <branch> <commit>` (or `--detach`). A caller-configured identity (`ANYAGENTS_GIT_AUTHOR_NAME` and `ANYAGENTS_GIT_AUTHOR_EMAIL`, both or neither) is written into the repository's own config. Pushes go to `origin` with whatever credentials the agent already has.
+- **Refreshing a base.** `git fetch origin` refreshes what the repository's fetch refspecs cover: every branch for a pool checkout; for an adopted checkout, the store's own refspec plus the agent's branch and its base. Any other branch is fetched explicitly with `git fetch origin +refs/heads/<base>:refs/remotes/origin/<base>`; `git fetch origin <base>` alone only updates `FETCH_HEAD` under a single-branch refspec. Objects the pool already has are not downloaded again.
+- **A checkout provider.** A deployment may name one with `ANYAGENTS_CHECKOUT_PROVIDER_BIN`; it accepts `fetch <source> <ref>` and `worktree <source> <target> <branch> [base]` and owns its sparse-checkout and hook policy. If it makes a linked worktree of its own store, AnyAgents adopts the result in place (below), and the provider's store becomes that repository's pool, so it must never prune either: adoption refuses a store without `gc.pruneExpire=never` and `gc.cruftPacks=true`. A failure or a result that cannot be adopted refuses the spawn with the reason; an unavailable provider never falls back to the pool.
+- **Seat access.** A new checkout is shared with its seat's group with ordinary permissions (group, `g+rw`, setgid directories), its own `.git` included, and `.git` is closed to everyone else. There are no ACLs, no shared metadata to protect and no grant journal. Before an agent becomes running, the admission probe (`anyagents internal admission-probe`, run as the seat with a cleared environment and Git as its only external program) walks the tree, creates and removes a lock file in the tree, in `.git`, `.git/objects` and `.git/refs`, and runs `git status`. A seat that cannot execute the server binary is refused with a message naming it. Seat Git configuration lists only the exact checkout in `safe.directory`.
+- **Local sources.** For `repo: "inherit"` and local paths, AnyAgents selects a GitHub remote (preferring `origin`) from the source's config and requires the source HEAD and the requested base to be reachable from the remote's live advertised branches and tags. The remote is asked from outside the source, so a source an agent owns never selects a program the server runs; only plain reads (`config`, `rev-parse`, `merge-base`) run inside it. Push unpublished commits before spawning. Sources without a GitHub remote are refused. A nonempty target is refused, never adopted.
+- **Adopting a linked worktree.** A linked worktree of a shared store is converted in place, without touching the working tree:
+  - The store must never prune (`gc.pruneExpire=never`, `gc.cruftPacks=true`); otherwise nothing changes.
+  - A new Git directory is built beside the `.git` pointer: the store's config minus other checkouts' branch settings, this checkout's `config.worktree`, glob fetch refspecs for the agent's branch and base (a glob, because an exact refspec for a branch the remote lacks makes every `git fetch origin` fail), HEAD and branch, index (and split-index part), reflogs, sparse patterns, excludes, attributes, hooks (a linked hook stays a link, to an absolute target), remote-tracking refs and tags, with the store as its pool. Copies keep their modification time: Git rechecks an index entry only while it is no older than the index, so a newer copy would hide a same-size edit.
+  - Objects only this checkout reaches (unpushed and reflog-only commits, staged blobs) are packed into it.
+  - A keep ref in the store, `refs/anyagents/keep/<hash of the checkout path>`, points at one commit whose parents are every commit the new repository's refs reach, so the store holds the base even if its own refs move and it is pruned explicitly. The ref goes when the repository is reaped.
+  - The conversion stands only if `git status` reads the same before and after. The new directory is synced to disk, then exchanged with the pointer in one rename (`renameat2(RENAME_EXCHANGE)`, `renamex_np(RENAME_SWAP)` on macOS); the store's registration is removed, and its branch when the keep ref or another ref holds every commit. A crash after the exchange leaves the old pointer at the staging path, and the next call finishes the release from it, accepting it only when the registration names this checkout back.
+  - An operation in progress (merge, rebase, cherry-pick, revert, bisect, a held index lock, submodules in the private Git directory), a locked worktree, or a registration that does not name the checkout back declines and changes nothing.
+- **Existing checkouts.** Linked worktrees made before this change keep working as they are for the life of their agent; nothing in AnyAgents writes their store's metadata any more. Archive cleanup adopts one first, then judges it like any checkout.
+- **Cleanup.** A managed checkout is removed on archive only when `.git` is its own directory (a pointer could name any other repository), `git status` is clean apart from harness files, and the remote holds everything else: no stash, no tag or note the remote does not advertise with the same object, and no commit of HEAD, a branch, a tag, a note or any other ref but remote-tracking ones that no advertised ref reaches. The proof is the remote's own answer (`ls-remote`, asked by the server from outside the checkout with its own credentials, for a GitHub repository or a local path only), never the checkout's own remote-tracking refs; a checkout it cannot ask about stays. Status and the reachability check run as the agent's seat, with the Git directory and working tree named explicitly, no inherited environment, no global or system configuration, hooks and fsmonitor off. Dirty or unproven checkouts stay, and only their build output goes; a managed repository checkout whose `.git` has gone is kept the same way. Repositories an agent made inside a private workdir are kept. AnyAgents production code never runs `git commit` or `git push`.
 
-For inherit/local sources, AnyAgents selects a GitHub remote (preferring
-`origin`), reads its live advertised branches and tags, and requires both the
-source HEAD and requested base to be reachable from them. Push unpublished
-commits before spawning. If a remote tip is not available in local history,
-fetch that remote before trying again. The consumer fetches the verified ref
-and checks out the exact selected commit, including a published feature-branch
-commit that is not on the default branch. Sources without a GitHub remote are
-refused. Existing nonempty checkout targets are not silently adopted by
-repository provisioning. `workdir: "private"` remains an empty directory and
-needs no Git consumer. Cloud-sandbox workspace preparation is unchanged.
+Explicit `workdir` paths, including `/scratch/wt/...` and `/scratch/tmp/...`, are honoured or refused, never replaced by the default directory, and never reaped. `workdir: "private"` remains an empty directory and needs no checkout. Cloud-sandbox workspace preparation is unchanged.
 
 ## Mailbox: one log per agent
 
 Every input to an agent (a Telegram message, another agent's `send`, a CLI or TUI message) is appended to that agent's mailbox. The mailbox is the only path into a harness.
 
 - **Sequence.** On durable receive the server assigns the next per-agent sequence number. Delivery, acknowledgement and replay key on that sequence. A message's source time (the Telegram `date`, the sender's clock) is kept as metadata and shown, but never used to order: a late, older event gets the next sequence and is not inserted behind messages already delivered.
-- **One delivery cursor.** A row is `received` when its insert commits, and `delivered` when the harness's own input or steer API has taken it. There is no second cursor and no turn bookkeeping: a row is done the moment the vendor has it.
+- **One delivery cursor.** A row is `received` when its insert commits, and `delivered` when the harness has shown the evidence its delivery level requires ([delivery.md](delivery.md)): the vendor's acceptance, or its proof that the running turn consumed the row. Rows written ahead of that proof are in flight; the cursor moves only over a contiguous consumed prefix. There is no second cursor and no turn bookkeeping.
 - **Contiguous cursor.** It advances only over a contiguous prefix of the sequence, one row at a time, so one row the harness did not take is visible as the oldest undelivered one rather than skipped.
-- **Idempotent delivery.** After a crash, rows past the cursor are handed over again. Each adapter remembers the ids its session holds and drops one it has already written, so a replay never reaches the agent twice. Claude Code and Codex also carry the id in the line itself, and Codex sends it as `clientUserMessageId`. Inbound channel events dedupe on their source key (for Telegram, the bot and its update id).
+- **Idempotent delivery.** After a crash, rows past the cursor are handed over again. An adapter never writes a row twice to one process, and an idempotent harness recognises a row an earlier process of the session consumed, by the vendor's own deduplication of an id AnyAgents sends or by reading the vendor's durable history first ([delivery.md](delivery.md)). The adapter lives in the harness's keeper, so a server crash or restart loses none of its memory of what it wrote, and a request the dying server was writing reaches the adapter whole or not at all. Inbound channel events dedupe on their source key (for Telegram, the bot and its update id).
 - **Egress is the agent's own `send`.** An agent replies by calling its MCP `send` tool, or a channel tool; the switchboard routes that immediately. A reply to a Telegram message carries that chat as its target, so the agent's `send` reaches the same chat. Nothing reads a vendor's transcript to find an answer.
 - **Retention.** Delivered messages are kept for a configurable period for `inbox` and audit, then compacted.
 
 ### Guarantees
 
-These are invariants with tests (`tests/invariants/`), run against a scripted fake harness that implements each delivery mode and can be killed at any point:
+These are invariants with tests (`tests/invariants/`): crash injection against a scripted in-memory harness that can be killed at any point, and the delivery conformance suite run against every real adapter over a scripted vendor process ([delivery.md](delivery.md#the-conformance-suite)):
 
 1. No message that reached `received` is lost across a server or harness crash.
-2. No message reaches the agent twice, including after a crash between the harness taking it and the cursor recording it.
+2. No message reaches the agent twice as input of its own, including after a crash between the harness taking it and the cursor recording it, for a harness whose level is idempotent. A harness that is not idempotent states the crash window in its level.
 3. Per agent, delivery follows sequence order. A late event never reorders what was already delivered.
 4. No source starves another: order is receipt order, not a priority among channels.
 5. Lag is always visible: `health` reports the age of the oldest message the harness has not taken, per agent.
 6. A quota fault is a reported state with a reset time, and the server keeps the mailbox growing durably while it lasts.
 7. One vendor process per agent.
 8. A line is handed over once per burst: never twice across a restart, never lost across one.
+9. A server restart, crash or upgrade ends no harness process and interrupts no turn; the next server resumes delivery from the cursor (`anyagents-keeper` process tests and `server_harnesses::a_harness_outlives_a_server_crash_an_upgrade_and_a_clean_stop`).
 
 ## Channels
 
@@ -397,6 +293,7 @@ A channel adapter has an inbound side (a stream of events, each with its source 
 
 - **Long polling.** A local server usually has no public URL, so the transport is `getUpdates` long polling, one poll per bot at a time on a thread that stops with the server. A webhook is the option for a server that is reachable; it is not built yet.
 - **What one update becomes.** A typed message, or a media message with a caption, becomes one mailbox message. Its source key is the bot and the update id, so the same update stored twice is one row. `sender` is `telegram:user:<id>:<message id>`. `reply_to` is the target a bare reply goes to: `telegram:chat:<chat id>`, or `telegram:chat:<chat id>:<message thread id>` for a forum topic, so a reply lands in the same chat and the same topic. Stickers, edited messages and membership changes are not delivered.
+- **Media.** A photo, document, voice note or other file (up to Telegram's 20 MB download limit) is downloaded once into `<data>/media` and named in the body with a `[Local media (<kind>) file: <path>]` line. The message carries only that path; the agent decides whether to look ([media.md](media.md)).
 - **Poll offset.** The next update id lives in the channel's `state` JSON and is saved only after the updates it covers are in the mailbox, so a restart asks for what it has not stored.
 - **Sending.** The `send` tool takes `telegram:chat:<id>[:<topic>]`, and `telegram:user:<id>[:<message>]` where the message is what the reply answers, plus `reply_to` for an explicit Telegram message id. A forum post carries its `message_thread_id`. The returned id is the Telegram message id.
 - **Bot to bot.** A bot generally does not receive messages sent by other bots ([bot FAQ](https://core.telegram.org/bots/faq#what-messages-will-my-bot-get)), and recent Bot API versions deliver only some of them. So a chat an agent's bot deals in is remembered in the channel state, and when an agent posts into a chat through its bot the server also delivers that post into the mailbox of every other agent on the same chat, keyed by the outbound message id; if Telegram also delivers the same post, the copy is dropped by its source key. The sender does not receive its own post.
@@ -407,9 +304,63 @@ A channel adapter has an inbound side (a stream of events, each with its source 
 
 AnyAgents selects the exposed MCP tool profile according to the execution boundary:
 
-1. **`full` (Default for Local 3rd-Party CLI Harnesses over `stdio` — `claude-code`, `codex`, `agy`, `opencode`):** Exposes the local workspace `code` tool (`read`, `write`, `edit`, `bash`, `search` inside the agent's local worktree), `memory`, `skills`, `web_search`, `web_fetch`, `browser`, `computer`, and the coordination tools (`send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`).
-2. **`remote` (Default for Streamable HTTPS `POST /mcp` — Closed-Box 3rd-Party Cloud Agents such as Claude Cloud, OpenAI Responses/Codex Cloud, and Cursor Cloud Agents):** Closed-box vendor cloud containers keep their own native container file/bash sandbox tools; AnyAgents' remote `/mcp` omits host-local `code` (so a cloud agent never accidentally edits the orchestrator host's disk) while exposing `send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`, `memory`, `skills`, `web_search`, `web_fetch`, `browser`, and `computer`.
+1. **`full` (Default for Local 3rd-Party CLI Harnesses over `stdio` — `claude-code`, `codex`, `agy`, `opencode`; never served over HTTP, where the tools would run inside the server process as the server's own user):** Exposes the local workspace `code` tool (`read`, `write`, `edit`, `bash`, `search` inside the agent's local worktree), `memory`, `skills`, `web_search`, `web_fetch`, `browser`, `computer`, and the coordination tools (`send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`).
+2. **`remote` (Default and maximum for Streamable HTTP `POST /mcp` with any credential; `?profile=full` is refused with 403 — Closed-Box 3rd-Party Cloud Agents such as Claude Cloud, OpenAI Responses/Codex Cloud, and Cursor Cloud Agents, and remote sandboxes):** Closed-box vendor cloud containers keep their own native file, shell and web tools; AnyAgents' remote `/mcp` exposes only control-plane state that belongs to the agent: `send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`, `memory` and `skills`. Everything that runs on or reaches out from the control-plane host (`code`, `files`, `browser`, `computer`, `device`, `media`, `web_search`, `web_fetch`) is omitted. Calls made over HTTP also cannot place an agent on a host harness, wake an agent that runs on the host, or attach media by local path: the tool server behind HTTP marks its calls, and those routes refuse them.
 3. **`coordination` (Default when `harness == "spiron"` or `--profile coordination` / `?profile=coordination`):** Because the first-party `spiron` harness natively embeds the shared capability core's `code`, file, `web_search`, `web_fetch`, `memory`, and `skills` tools, AnyAgents exposes only the orchestration and host-device tools (`send`, `inbox`, `agents`, `groups`, `schedules`, `conversation`, `browser`, `computer`), eliminating duplicate tool definitions and duplicate `<available_skills>` / `<memory>` prompt blocks.
+
+A remote session (a cloud harness or a remote sandbox) never holds the agent's local capability. Each launch begins a remote session: the server issues a token bound to that agent and session, stores only its SHA-256 digest, writes it with `<public_url>/v1/webhooks/mcp` into the agent's config directory, rotates it at half its lifetime (`remote_session_ttl_secs`, default one hour), and revokes it on pause, archive, relaunch, deletion or `anyagents agents revoke-remote`. `public_url` lives under `[server]` in `<data>/anyagents.toml`; without it a remote agent is neither created nor started. `public_listen` in the same table binds the public listener, which accepts remote session tokens only ([serving identity](serving-identity.md#listeners)). A remote session token authenticates only while its agent runs off this host.
+
+## Desktop sessions: browser and computer use
+
+Browser use is one view of computer use, and one engine serves both: the
+open-source [`agent-workstation`](https://github.com/SylphxAI/agent-workstation)
+crate. Spiron embeds it natively; AnyAgents runs it in the server and exposes
+it to every third-party harness through the MCP `browser` and `computer`
+tools ([computer-and-device.md](computer-and-device.md) has the tool surface).
+
+- **One isolated desktop per session.** A session is one headless Wayland
+  compositor (`sway`, software rendering, a private runtime directory, no X
+  server and no TCP listener) running exactly one headful Chromium-family
+  browser with its native chrome. The server keeps at most one session per
+  browser profile directory and starts it on the first call for that profile.
+- **Two views of one state.** Web actions go over the browser's loopback
+  DevTools endpoint, with accessibility snapshots whose `@eN` refs are bound to
+  the document they read: any navigation of that document, and any newer
+  snapshot, invalidates them deterministically (`STALE_REF`). Desktop actions
+  go through Wayland screencopy and virtual pointer and keyboard devices, so
+  they reach browser chrome, file dialogs, native bubbles and every window. A
+  DevTools navigation hands keyboard focus to the page, so both views agree on
+  where keys go.
+- **One agent principal per session.** The engine leases a session to one
+  agent at a time; every other agent's call fails with a typed error
+  (`DESKTOP_IN_USE` on the tool surface) until the session stops.
+- **Human takeover of the whole desktop.** wayvnc behind a token-protected
+  WebSocket and a noVNC page. While a person holds control, every agent action
+  and observation returns `HUMAN_IN_CONTROL`, until they hand back or after
+  five idle minutes. The server mounts each session's page on its public
+  listener under `/v1/webhooks/takeover/<key>/`, reached at
+  `ANYAGENTS_WEBHOOK_URL` (the deployment's stable public entry); without one
+  it falls back to a quick tunnel started at the first takeover, or loopback.
+  CAPTCHAs and 2FA challenges go to a person this way; agents never bypass
+  them.
+- **No fingerprint spoofing.** Nothing is injected into pages to change what a
+  site sees. A profile's fingerprint seed fixes its desktop size, timezone and
+  locale at launch. Residential egress goes through an authorized proxy the
+  caller names.
+- **Caller-held state.** Profiles, proxy tunnels and secrets belong to the
+  caller; the engine holds no global state. A `secret_ref` is resolved at the
+  moment of insertion, bound to the selected field and its frame's origin,
+  and never logged or returned to the model.
+- **Lifecycle.** A session stops on `close` by its holder, after
+  `ANYAGENTS_BROWSER_IDLE_SECS` without calls (never while a person holds
+  control), when its holder is deleted or archived, and on server shutdown;
+  the browser always closes gracefully so the profile is flushed.
+
+Host desktop control (`tools.computer` with `platform`, `display` or
+`wayland_display`: macOS JXA, Windows PowerShell, X11 tools) stays in
+`crates/anyagents/src/computer/` as it is. It moves to a future device app
+built on the same engine with the platform accessibility APIs (macOS AX,
+Windows UI Automation), and is not being extended here.
 
 ## Identity: one authenticated connection per agent session
 
@@ -482,27 +433,40 @@ one SQLite transaction; refusals return HTTP 403 without partial group changes.
 Agent creation's `group` option uses the same checks, and agent CLI mutations
 require an authenticated server rather than an offline database fallback.
 
-- `send(to: [address], text, reply_to?)`. An address is an agent (`agent:<name>`, or a bare name), a named group of agents (`group:<name>`), or a channel target (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>[:<message>]`). A list of one is a direct message; a mixed list delivers once per address. There is no default address.
+- `send(to: [address], text, reply_to?)`. An address is an agent (`agent:<name>`, or a bare name), a named group of agents (`group:<name>`), a channel target (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>[:<message>]`), or `operator`. A list of one is a direct message; a mixed list delivers once per address. There is no default address.
+- `operator` is the operator's inbox, for a defect in AnyAgents, the harness or the host that an agent cannot fix within its own work. Agents write and only the operator reads it (`anyagents inbox --operator [--since <seq>] [-n <limit>]`, `GET /v1/operator/inbox`); a root admin cannot. No agent may be named `operator`. It is its own table, not agent mail: there is no agent row to own it and no harness to deliver to. The same text from any sender within an hour of a report is that report, and the repeat is counted on it. Each sender may store 3 reports a minute and 10 an hour, and all senders together 60 a minute and 500 an hour. The operator target is written before every other address of a send, in the transaction that decides the limit, so a refusal (HTTP 429) leaves the whole send unwritten. A report is at most 16 KiB, and reports older than 30 days are pruned.
 - `inbox(since?)` reads this agent's own mailbox. It never sends.
-- `conversation(...)` / `search(...)` run **Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`)**:
+- `conversation(...)` / `search(...)` run **hybrid retrieval over raw history (`Raw-RAG`)**: BM25 over the host index, dense candidates from the memory service fused by reciprocal rank, and a cross-encoder rerank of the fused head. Every result cites its raw record: a raw coordinate (segment, offset, length, SHA-256) for native history and memory, the message id for mailbox rows. The response's `retrieval` names the stages that ran and why any did not:
   - **Read authorization:** Non-admin agents read only their own and descendant mailboxes/transcripts. `agent: "all"` and `"*"` mean that authorized tree, not the workspace. Messaging scope, public reachability and shared groups do not grant private history access; explicit parent/sibling/peer reads return forbidden. `with`, sender, range and radius can only narrow the authorized rows. Operator and explicitly privileged root-admin reads are unrestricted and audited. Agent CLI reads require the authenticated server, without an offline SQLite fallback.
-  - **No vector embeddings and no LLM-written memory mutations:** History stays 100% lossless in the append-only transcript and SQLite `rag_chunks_fts` (`unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams). There is zero embedding API cost, zero embedding latency, and zero model-lock degradation. Exceptional erasure uses the permissioned, audited [redaction operation](redaction.md), preserving ids/order and replacing only explicitly selected content; ordinary coordinator history reads remain lossless.
+  - **Raw history is the source of truth; no model rewrites it:** History stays lossless in each harness's own files and stores and in the mailbox; the lexical indexes (`rag_chunks_fts` for the mailbox, the host index for native history: `unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams) and the dense index are rebuildable projections. By default embedding and reranking run locally on CPU with pinned open models and no network call; the operator can bind either to a remote model through an AnyAgents profile ([providers](host-memory.md#embedding-and-rerank-providers)). Exceptional erasure uses the permissioned, audited [redaction operation](redaction.md), preserving ids/order and replacing only explicitly selected content; ordinary coordinator history reads remain lossless.
   - **Multi-query & negative filtering:** `query` plus `queries: [...]` (OR-combined keyword/synonym sets) and `exclude: [...]` (negative filters).
   - **Tool history toggles:** `include_tools` (default `true`; `false` restricts search to messages without tool/system noise), `only_tools` (`true` restricts search to tool calls and outputs), and `tool_name` (filters tool history to a specific tool such as `"bash"`, `"browser"`, `"agents"`, `"schedule"`, `"send"`).
-  - **Structured filters & ordering:** Filter by `with` (peer/channel/group), `direction` (`"in"` / `"out"`), `sender`, `role` (`"user"` / `"assistant"` / `"tool"`), `since_ms` / `until_ms`, and order by `sort = "relevance"` (BM25 + CJK bigram + exact-match boost + query coverage + recency), `"newest"` (`timestamp DESC`), or `"oldest"` (`timestamp ASC`).
+  - **Structured filters & ordering:** Filter by `with` (peer/channel/group), `direction` (`"in"` / `"out"`), `sender`, `role` (`"user"` / `"assistant"` / `"tool"`), `since_ms` / `until_ms`, and order by `sort = "relevance"` (hybrid: BM25 and dense fused, then reranked; filters apply to dense candidates exactly as to lexical ones), `"newest"` (`timestamp DESC`), or `"oldest"` (`timestamp ASC`).
   - **Range reads & contiguous episode windows:** Read transcript ranges (`range = "seq:<from>-<to>"` or `"transcript:<from>-<to>"`, or `from_seq` / `to_seq`) and expand `radius` (`0..=10`) contiguous neighboring events around each hit to preserve causal paths `P(path | result)`.
 - Harness-local recall, context windowing and compaction belong to the external CLI, not AnyAgents. Spiron receives `--state-dir` and `--instructions-file` pointing into the existing agent configuration directory, plus workspace, skills and MCP paths. The adapter reads `spiron-session-id` or legacy `sylphx-session-id` and writes only the canonical session marker. Legacy transcript, window, cloud-session and Goal files remain available to Spiron's continuity reader; AnyAgents never rewrites or summarizes them.
 - `agents()` lists the agents on the server with their harness, state and lag, so agents can see each other.
 
 ## Usage and cost
 
-After each turn the adapter reads the usage the vendor tool reports and the server writes one usage record: agent, harness, model, input, output, cache-read and cache-write tokens, the cost the vendor reported (if it reports one), an estimated list-price cost from a versioned price table, the billing mode (subscription or API key), and any quota state the vendor reported. The `usage` API aggregates by agent, harness, model and day. Records are also exported as OpenTelemetry metrics using the [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) when an endpoint is configured.
+After each turn the adapter reads the usage the vendor tool reports and the server writes one usage record: agent, harness, model, input, output, cache-read and cache-write tokens, the cost the vendor reported (if it reports one), the billing mode (subscription or API key), and any quota state the vendor reported. The record also has an estimated list-price cost field, which stays empty: there is no price table. The `usage` API aggregates by agent, harness, model and day.
 
-A subscription harness often reports tokens but no price; its record says `subscription` and shows the list-price estimate separately, never as money spent.
+Claude Code and Muse report a cost with each turn; Spiron and AGY report tokens only. A cost on a `subscription` record is the vendor's figure for the turn, never money spent.
+
+## Outcomes
+
+[ADR 0008](adr/0008-quality-loop.md) records what work achieved beside what it cost. An `outcomes` row is a fact from a source the measured agent does not control:
+
+- a PR watch's `merged`, `closed` or `review_failed` transition, stored for the watch's owner before the wake that reports it (and on first sight while an earlier wake is unread);
+- a verdict (`accepted`, `rework`, `rejected` or `abandoned`) that an ancestor, a root admin or the operator records through `agents` `verdict`, `POST /v1/agents/{name}/verdict` or `anyagents verdict`. An agent never records one on its own work.
+
+Each row keeps the harness, model, role and profile the agent ran with. `skill_reads` records every file an agent reads through the `skills` tool, with the SHA-256 of its bytes.
+
+`GET /v1/outcomes` (also `agents` `outcomes` and `anyagents outcomes`) groups outcomes by harness and model, harness, role, profile, agent or skill, within the usage caller boundary. A shared pull request counts once, for the agent that watched it first. A terminal verdict supersedes pull request evidence. The cost of an outcome is the agent's usage since its previous one. Cost per success is shown only when every attributed turn reported a cost, and usage no outcome covers is reported as `unattributed`.
 
 ## Security model
 
 - The API listens on a Unix socket readable only by the user. A TCP listener is opt-in and requires a bearer token.
+- Each keeper listens on `<data>/keepers/<instance>/s`, in a directory that must be the server user's own with mode `0700`, and refuses (with an explicit `forbidden`) a peer of another uid; a harness, which runs as its seat, cannot reach it. Only the keeper's current owner, the server that took it over last, may act on it. A harness's launch, environment included, reaches its keeper through a pipe and is never written to disk. A recorded pid is signalled only when its boot id, pid namespace and start time prove it the recorded process.
 - Each agent's MCP capability is scoped to that agent, and minted fresh for each of its instances; the last one stops working at once.
 - The operator's authority is its own token, never an agent's.
 - Secrets (channel tokens, API keys, the capability itself) live in the OS keychain or a 0600 file, never in the database, logs, tool arguments or usage records.
@@ -548,14 +512,54 @@ ORDER BY id;
 
 One embedded SQLite database in WAL mode under the data directory holds every resource, the mailboxes and the usage records. A message is `received` when its insert has committed. Schema changes are versioned migrations applied at server start.
 
+### Locks and their order
+
+A process has one read-write connection per database (the Store writer); every
+write of the daemon queues on it. Locks are taken in this order and never the
+other way round:
+
+1. the outbound-history publication barrier (`outbound-history/.publication.lock`,
+   shared by sends and settlement, exclusive for an erasure);
+2. one outbound effect key (`outbound-history/<key>.lock`);
+3. one agent's lifecycle lock (`locks/<id>.lifecycle`); an archive takes its
+   descendants' locks only downward and without waiting;
+4. the Store writer;
+5. the host history index's write transaction.
+
+A thread holding the Store writer never waits for a file lock (debug builds assert
+it); a non-blocking attempt, which cannot wait, is allowed. Every write of the
+process waits while one holds the writer, so whole-history reads stay outside it:
+ingress reads the stored history a channel line refers to (a reply's quoted
+message, a reaction's target, an edit's original) on a read snapshot before it
+takes the writer, because those lookups match text patterns and can read every
+stored message. Waiting file locks are taken on blocking-pool
+or dedicated threads, never on an async worker. Maintenance never waits for a
+lifecycle: the archived-agent reaper and sleep-memory consolidation try the
+lock and skip a busy agent, and history verification takes none (it queues the source for the host history
+indexer). Host history indexing reads with no lock held and takes an owner's
+lifecycle only to publish one bounded batch, then the index write (3, then 5);
+a search does it on the blocking pool, and the background indexer on its own
+thread.
+
 ### Host history index refresh
 
-Host history keeps raw text in its source files. The rebuildable contentless FTS
+Host history keeps raw text in its sources: JSONL files, and the SQLite stores
+Spiron (`sessions.sqlite3`) and OpenCode (`opencode.db`) keep, read through a
+read-only connection that never creates a file beside the store. A store row is
+addressed as `<database>/<table>/<rowid>`; its bytes are the row's event text.
+The rebuildable contentless FTS
 index stores metadata, bounded search windows and SHA-256 raw coordinates, not a
-second raw transcript. Each source frontier and its documents/windows commit
-atomically. A source changing during publication defers that snapshot without
-advancing its frontier. `memory` and `transcripts` queries refresh/prune only their
-requested source class; `all` refreshes both.
+second raw transcript. A source is read, hashed and projected in bounded
+batches (about 2 MiB or 512 store rows) with no lifecycle lock and no index
+transaction held; each batch then publishes its documents, windows, call
+correlations and frontier atomically under the owner's lifecycle lock, only if
+the source still holds what was read and no redaction intervened. A batch that
+fails those checks is dropped without advancing the frontier. `memory` and
+`transcripts` queries refresh/prune only their requested source class; `all`
+refreshes both. A query indexes at most 4 MiB of new history before answering;
+the rest is queued for a daemon thread at nice 19 and idle I/O priority, and the
+response reports it in `retrieval.pending`. That thread also pre-warms every
+agent's history once per daemon start.
 
 An unchanged native JSONL source reuses its persisted cursor. For the same device
 and inode with no size decrease, a changed source checks the last **64 KiB before
@@ -567,13 +571,17 @@ always verify their own SHA; explicit whole-event readback verifies the event SH
 
 This is deliberately not an append-only proof: a same-size edit **outside** the
 boundary may remain missing/stale in the index until full verification. The daemon
-maintenance loop fully rebuilds at most **one due source per 60-second tick**, with
-sources due **one hour after their last full verification**. Backlog, a continuously
-changing source or failures can extend that detection delay; no fixed one-hour
-upper bound is promised. Failed sources rotate behind other due sources without
+maintenance loop schedules at most **one due source every 15 minutes** (every
+15th 60-second tick), with sources due **one hour after their last full verification**.
+The maintenance worker only records the attempt and queues the source; it never
+reads it or waits for a lock. The background indexer reads it in batches,
+republishes documents whose bytes changed, and records the verification and
+frontier once it has read the whole source. Backlog, a continuously changing
+source or failures can extend that detection delay; no fixed one-hour upper
+bound is promised. Failed sources rotate behind other due sources without
 publishing a new frontier. A stale returned window is refused immediately by its
-SHA check. Full verification uses the same lifecycle locks and pending-redaction
-path exclusions as query refresh; it never edits the source. This maintenance is
+SHA check. Full verification uses the same pending-redaction path exclusions as
+query refresh. It never edits the source. This maintenance is
 host-driven, not an LLM schedule. Native transcript writers remain active in PR1;
 the host raw append port is not activated by this index.
 
@@ -624,14 +632,18 @@ policy or built-in role templates.
 
 Callers may supply local Markdown templates through `archetype` (aliases:
 `template`, `type`, `preset`). A name is a single ASCII filename stem containing
-only letters, digits, `-` or `_`, without a `.md` suffix. Lookup searches the
-explicit and parent workspaces' `.agents/agents`, the data directory's
-`agents-templates`, `archetypes` and `.agents/agents`, then the home and owner
-workspaces' `.agents/agents`. Both `<name>.md` and `<name>/agent.md` (or `AGENT.md`)
-are supported. An explicit nonempty selector must resolve; an unknown name is a
-validation error. Without a selector, a matching `role` or its lowercase,
-space-to-hyphen form may supply template defaults; an unmatched label stays a
-label. Templates prepend their Markdown body to caller instructions and supply
+only letters, digits, `-` or `_`, without a `.md` suffix. When
+`ANYAGENTS_OWNER_WORKDIR` is configured, its `.agents/agents` catalog is the
+sole source for discovery, creation and role updates, even if missing or empty;
+unknown roles fail closed. No workspace, home or data-directory fallback is used.
+Without that configuration, lookup searches explicit and ancestor workspaces'
+`.agents/agents`, the data directory's fallback catalogs, and the home catalog
+when no workspace catalog exists. Both `<name>.md` and `<name>/agent.md` (or
+`AGENT.md`) are supported. An explicit archetype must resolve. Without owner
+configuration, creation rejects unknown roles when a catalog exists; role updates
+retain free-form labels when no roles are discovered. A matching `role` or its
+lowercase, space-to-hyphen form supplies defaults.
+Templates prepend their Markdown body to caller instructions and supply
 missing fields from YAML frontmatter (`description`/`summary`, `scope`,
 `workdir`/`workspace`, `harness`, `model`, `role`, `profile`). Unknown keys,
 invalid scopes, malformed or unclosed frontmatter and
@@ -665,23 +677,14 @@ deliveries and schedules remain intact. There is no role-based residency flag.
 Topology and child discovery follow relationships and explicit scope, never the
 presence of a role label. The default CLI depth limit applies equally to all roles.
 
-### External steering custody
+### Interrupted turns
 
-A Spiron `steer_ack` proves socket acceptance, not journal commit. AnyAgents
-writes an ID-only `spiron-unconfirmed-steers.json` hold in the agent's config
-directory before any input bytes are dispatched; a hold-write error refuses the
-unsent input without advancing its mailbox cursor, and confirmed terminal
-completion without `undelivered_steers` clears the hold. Standalone adapter and
-`DeliveryLoop::run_once` passes never silently replay raw input while a hold is
-present.
-
-Under `Supervisor`, mid-turn process exits, coordinator restarts, unconfirmed
-`undelivered_steers` receipts, and transient upstream stream/server failures
-automatically reconcile `spiron-unconfirmed-steers.json` against Spiron's local
-`sessions.sqlite3` (`session_entries`), promote all messages of the interrupted
-turn into `turn_recovery`, archive/clear the hold and stale error state, and
-resume via an explicit `[Recovery]` turn instructing the agent to verify actual
-state before repeating side effects. An explicit `reset-session` similarly
-archives any retired-generation hold under `sessions/retired-<generation>/`,
-clears `.anyagents-last-error.json`, and retains unfinished mail in
-`turn_recovery` so the new session generation starts cleanly with `[Recovery]`.
+A turn a vendor process exit, a server restart or a transient upstream fault
+cut short stays open in `turn_recovery`. Once the replacement process is up
+and the mailbox holds nothing it has not taken, the supervisor offers one
+`[Recovery]` note listing the interrupted turn's messages and the outbound
+messages already sent, and asking the agent to check the actual state before
+repeating anything that may have taken effect. New mail that arrives first
+supersedes the note. An explicit `reset-session` starts a new session
+generation and clears `.anyagents-last-error.json`; mail the old session never
+took is handed to the new one.

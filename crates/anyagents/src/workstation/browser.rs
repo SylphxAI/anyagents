@@ -1,8 +1,9 @@
 //! `tools.browser`: the session desktop's browser.
 //!
-//! Every action maps onto one `agent-workstation` operation; this module adds
-//! only caller policy: profile selection, snapshot ids for stale-ref checks,
-//! secret references, screenshot files, and the response shape.
+//! Every action maps onto `agent-workstation` operations on the calling
+//! agent's lease of the profile's desktop; this module adds only caller
+//! policy: profile selection, secret references, screenshot files, response
+//! size limits, and the response shape.
 
 use std::path::Path;
 #[cfg(target_os = "linux")]
@@ -12,20 +13,29 @@ use anyagents_core::Error;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::Caller;
 #[cfg(target_os = "linux")]
 use super::ToolError;
+
+/// Largest script result or HTML returned to the model, in bytes.
+#[cfg(target_os = "linux")]
+const MAX_TEXT_RESULT: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct BrowserRequest {
     /// Browser action: `"open"` / `"goto"` (start the profile's desktop if needed and navigate to `url`),
     /// `"back"` / `"forward"` / `"reload"`,
     /// `"snapshot"` (accessibility outline with `@e1`, `@e2` refs to interactive elements),
-    /// `"read"` (visible page text),
-    /// `"click"` (click a ref),
+    /// `"read"` (visible page text), `"html"` (outer HTML of `selector`, or of the page),
+    /// `"click"` (click a ref or CSS selector),
     /// `"fill"` / `"type"` (replace a field's value with `text` or a secret reference, optional `submit`),
-    /// `"press"` (press `key`, such as `"Escape"` or `"ctrl+l"`, on the desktop keyboard: it reaches
-    /// whatever has keyboard focus on the desktop, which after `open` is the address bar),
-    /// `"screenshot"` (PNG of the whole desktop, saved to `path` or the profile's screenshots directory),
+    /// `"press"` (press `key`, such as `"Enter"` or `"ctrl+a"`, inside the page: it reaches the page's
+    /// focused element, or `selector` focused first; optional `hold_ms`),
+    /// `"hold"` / `"key_down"` / `"key_up"` / `"release_keys"` (hold page keys; held modifiers apply to clicks),
+    /// `"eval"` (evaluate `script` in the page and return its JSON value),
+    /// `"cookies"` (set `cookies`, then list the page's cookies),
+    /// `"screenshot"` (PNG of the whole desktop, or of the page with `full_page`, saved to `path` or the
+    /// profile's screenshots directory),
     /// `"tabs"` (list tabs, or open/switch/close via `tab_action` and `target_id`),
     /// `"takeover"` (return the URL where a person takes over the whole desktop, e.g. to solve a CAPTCHA or 2FA challenge),
     /// `"takeover_status"` / `"wait_for_user"` (inspect, or wait for, a person's hand-back),
@@ -33,8 +43,7 @@ pub struct BrowserRequest {
     /// `"status"` (profile status and fingerprint),
     /// `"profiles"` / `"list"` (all persistent profiles),
     /// or `"close"` / `"stop"` (stop the desktop; logins stay on disk).
-    /// `"eval"`, `"cookies"`, `"hold"`, `"key_down"`, `"key_up"`, `"release_keys"` and `full_page`
-    /// screenshots return `UNSUPPORTED` in this release.
+    /// One agent at a time holds a profile's desktop; another agent gets `DESKTOP_IN_USE`.
     #[serde(default)]
     pub action: String,
     /// Persistent browser profile name (e.g. `"default"`, `"research"`, `"shopping"`); defaults to
@@ -44,8 +53,9 @@ pub struct BrowserRequest {
     /// URL for `"open"`, `"takeover"` or a new tab (`https://` is assumed without a scheme).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Element ref for `"click"` and `"fill"`: snapshot-qualified (`"@<snapshot_id>:e1"`, rejected
-    /// with `STALE_REF` once a newer snapshot or navigation replaced it) or short (`"@e1"`).
+    /// Element for `"click"`, `"fill"`, `"press"` and `"html"`: a snapshot ref (`"@e1"`, or
+    /// `"@<snapshot_id>:e1"`) or a CSS selector (`"#email"`). Refs fail with `STALE_REF` once a
+    /// newer snapshot or any navigation of their page replaced them.
     #[serde(
         default,
         alias = "ref",
@@ -65,19 +75,21 @@ pub struct BrowserRequest {
     /// Explicit secret reference (`"op://..."`, `"op-otp://..."`, or `"secret://..."`) for `"fill"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<String>,
-    /// Key or chord for `"press"` (e.g. `"Enter"`, `"Tab"`, `"Escape"`, `"ArrowUp"`, `"ctrl+l"`).
+    /// Key or chord for `"press"`, `"hold"`, `"key_down"` and `"key_up"` (e.g. `"Enter"`, `"Tab"`,
+    /// `"ArrowUp"`, `"shift"`, `"ctrl+a"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
-    /// Keys pressed together as one chord, modifiers first (e.g. `["ctrl", "shift", "t"]`).
+    /// Keys held together, modifiers first (e.g. `["ctrl", "shift", "t"]`, or `["w", "d"]` with
+    /// `hold_ms`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<String>>,
-    /// Hold duration in milliseconds (key holding returns `UNSUPPORTED` in this release).
+    /// Hold duration in milliseconds for `"press"` / `"hold"` (at most 10 s).
     #[serde(default, alias = "hold", skip_serializing_if = "Option::is_none")]
     pub hold_ms: Option<u64>,
     /// Alias of `hold_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
-    /// JavaScript for `"eval"` (returns `UNSUPPORTED` in this release).
+    /// JavaScript expression for `"eval"` (a promise is awaited).
     #[serde(
         default,
         alias = "expression",
@@ -88,12 +100,10 @@ pub struct BrowserRequest {
     /// Output file for `"screenshot"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// Press Enter inside the page after `"fill"` (returns `UNSUPPORTED` in this release; click
-    /// the form's submit button ref instead).
+    /// Press Enter inside the field after `"fill"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submit: Option<bool>,
-    /// Capture the full scrollable page (returns `UNSUPPORTED` in this release; screenshots
-    /// show the whole desktop).
+    /// Capture the full scrollable page for `"screenshot"` (the page only, without browser chrome).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_page: Option<bool>,
     /// Extra wait in milliseconds after the action (at most 10 s; for `"wait_for_user"`, the wait
@@ -104,6 +114,7 @@ pub struct BrowserRequest {
     /// (credentials allowed: `http://user:pass@host:port`), or `host[:port]` (HTTP).
     /// Omitted: keep a running profile's proxy, otherwise use `ANYAGENTS_BROWSER_PROXY`.
     /// Empty string: direct connection, overriding environment/system proxies.
+    /// Append `,direct://` to a proxy URL to fall back to a direct connection if it fails.
     /// Close a running profile before changing its proxy; logins stay on disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
@@ -113,7 +124,8 @@ pub struct BrowserRequest {
     /// Tab id for `"tabs"` `activate` / `close`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_id: Option<String>,
-    /// Cookies to set for `"cookies"` (returns `UNSUPPORTED` in this release).
+    /// Cookies to set for `"cookies"`, in DevTools fields: `name`, `value`, and `url` or `domain`
+    /// (optional `path`, `expires`, `httpOnly`, `secure`, `sameSite`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookies: Option<Vec<serde_json::Value>>,
     /// Why a person is needed (`"takeover"`; returned for the message you send them), or the
@@ -133,25 +145,44 @@ impl BrowserRequest {
     }
 }
 
-/// Execute `req` for the calling agent (`default_profile` is its profile).
+fn request_mutates(req: &BrowserRequest) -> bool {
+    let action = req.action.trim().to_ascii_lowercase();
+    match action.as_str() {
+        "" => req.url.is_some(),
+        "snapshot" | "dom" | "read" | "text" | "content" | "html" | "screenshot" | "shot"
+        | "status" | "info" | "fingerprint" | "profiles" | "list" | "takeover_status"
+        | "wait_for_user" => false,
+        "cookies" => req.cookies.is_some(),
+        "tabs" => req
+            .tab_action
+            .as_deref()
+            .is_some_and(|a| !matches!(a.trim(), "" | "list")),
+        _ => true,
+    }
+}
+
+/// Execute `req` for `caller`.
 #[cfg(target_os = "linux")]
 pub async fn execute(
     data: &Path,
-    default_profile: &str,
+    caller: &Caller,
     req: BrowserRequest,
+    files: &crate::agent_file::FileAuthority,
 ) -> Result<serde_json::Value, Error> {
     let redact = req.carries_secret();
-    run(data, default_profile, req)
+    let mutating = request_mutates(&req);
+    run(data, caller, req, files)
         .await
-        .map_err(|e| e.into_error(redact))
+        .map_err(|e| e.into_action_error(redact, mutating))
 }
 
 /// Non-Linux hosts have no session desktop.
 #[cfg(not(target_os = "linux"))]
 pub async fn execute(
     _data: &Path,
-    _default_profile: &str,
+    _caller: &Caller,
     _req: BrowserRequest,
+    _files: &crate::agent_file::FileAuthority,
 ) -> Result<serde_json::Value, Error> {
     Err(super::unsupported_host().into())
 }
@@ -166,155 +197,286 @@ fn normalize_url(raw: &str) -> String {
     }
 }
 
+/// An explicit wait the agent asked for (never a default delay).
 #[cfg(target_os = "linux")]
-fn unsupported_until(what: &str) -> ToolError {
-    ToolError::unsupported(format!("{what} is not available in this release"))
-}
-
-#[cfg(target_os = "linux")]
-async fn pause(ms: Option<u64>, default: u64) {
-    let ms = ms.unwrap_or(default).min(10_000);
+async fn pause(ms: Option<u64>) {
+    let ms = ms.unwrap_or(0).min(10_000);
     if ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
-}
-
-/// Translate browser key names (`ArrowUp`, `PageDown`, `Control+a`) into the
-/// desktop keyboard's chord names; anything else passes through.
-#[cfg(target_os = "linux")]
-pub(crate) fn chord(raw: &str) -> String {
-    raw.split('+')
-        .map(|part| {
-            let p = part.trim();
-            match p.to_ascii_lowercase().as_str() {
-                "arrowup" => "up".into(),
-                "arrowdown" => "down".into(),
-                "arrowleft" => "left".into(),
-                "arrowright" => "right".into(),
-                "pageup" | "prior" => "pageup".into(),
-                "pagedown" | "next" => "pagedown".into(),
-                "control" | "ctl" => "ctrl".into(),
-                "option" => "alt".into(),
-                "command" | "win" | "windows" => "super".into(),
-                "spacebar" => "space".into(),
-                "" if raw.trim() == "+" => "+".into(),
-                _ => p.to_string(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("+")
 }
 
 #[cfg(target_os = "linux")]
 fn is_modifier(key: &str) -> bool {
     matches!(
         key.trim().to_ascii_lowercase().as_str(),
-        "shift" | "ctrl" | "control" | "alt" | "option" | "super" | "meta" | "cmd" | "command"
+        "shift"
+            | "ctrl"
+            | "control"
+            | "alt"
+            | "option"
+            | "super"
+            | "meta"
+            | "cmd"
+            | "command"
+            | "win"
+            | "windows"
     )
 }
 
-/// The chord a `press` request names.
+/// The keys a key request names: one chord (`key`, or `keys` that are
+/// modifiers plus one key), or several keys held together (`keys` with more
+/// than one non-modifier).
 #[cfg(target_os = "linux")]
-fn requested_chord(req: &BrowserRequest) -> Result<String, ToolError> {
+fn requested_keys(req: &BrowserRequest) -> Result<Vec<String>, ToolError> {
     match (req.key.as_deref(), req.keys.as_deref()) {
         (_, Some(keys)) if !keys.is_empty() => {
             let (last, mods) = keys.split_last().expect("non-empty");
             if mods.iter().all(|k| is_modifier(k)) {
                 let mut parts: Vec<&str> = mods.iter().map(String::as_str).collect();
                 parts.push(last);
-                Ok(chord(&parts.join("+")))
+                Ok(vec![parts.join("+")])
             } else {
-                Err(unsupported_until(
-                    "holding several non-modifier keys together",
-                ))
+                Ok(keys.to_vec())
             }
         }
-        (Some(k), _) if !k.trim().is_empty() => Ok(chord(k)),
-        _ => Err(ToolError::invalid("browser press requires `key`")),
+        (Some(k), _) if !k.trim().is_empty() => Ok(vec![k.trim().to_string()]),
+        _ => Err(ToolError::invalid("this browser key action requires `key`")),
     }
 }
 
-/// Resolve a request ref against the session's latest snapshot.
-///
-/// `@<snapshot_id>:eN` must name the latest snapshot (otherwise `STALE_REF`);
-/// `@eN` / `eN` name the latest snapshot implicitly. CSS selectors are not
-/// refs.
+/// Cut text returned to the model at `MAX_TEXT_RESULT` bytes.
 #[cfg(target_os = "linux")]
-fn resolve_ref(raw: &str, current: Option<&str>) -> Result<String, ToolError> {
-    let r = raw.trim();
-    let body = r.strip_prefix('@').unwrap_or(r);
-    let (snapshot, short) = match body.split_once(':') {
-        Some((s, e)) => (Some(s), e),
-        None => (None, body),
-    };
-    let is_ref =
-        short.len() > 1 && short.starts_with('e') && short[1..].bytes().all(|b| b.is_ascii_digit());
-    if !is_ref {
-        // P3 pending: DesktopSession::query for CSS selectors.
-        return Err(ToolError::unsupported(format!(
-            "`{r}` is not a snapshot ref; CSS selectors are not available in this release, so take \
-             a snapshot and use its @eN refs"
-        )));
+fn bounded(mut text: String) -> (String, bool) {
+    if text.len() <= MAX_TEXT_RESULT {
+        return (text, false);
     }
-    if let Some(id) = snapshot
-        && current != Some(id)
-    {
-        return Err(ToolError::stale_ref(format!(
-            "STALE_REF: `{r}` belongs to snapshot `{id}`, which a newer snapshot or navigation replaced"
-        )));
+    let mut end = MAX_TEXT_RESULT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
     }
-    Ok(short.to_string())
+    text.truncate(end);
+    (text, true)
 }
 
-/// B7 interim: the crate will invalidate refs on every main-frame navigation.
-///
-/// Resolve `raw` against the latest snapshot, which must still describe the
-/// page the tab shows: a navigation the tool did not make (a link, a form
-/// submission, a script) leaves the old refs pointing into another document.
+/// The smallest box, in CSS pixels per side, a human can see and act on as a
+/// challenge. A background widget mounted at 0x0 or 1x1 never reaches it; the
+/// smallest real challenge checkbox does.
 #[cfg(target_os = "linux")]
-async fn current_ref(live: &super::session::Live, raw: &str) -> Result<String, ToolError> {
-    let mark = live.snapshot();
-    let short = resolve_ref(raw, mark.as_ref().map(|m| m.id.as_str()))?;
-    let Some(mark) = mark else {
-        return Err(ToolError::stale_ref(format!(
-            "STALE_REF: `{raw}` has no current snapshot; take one first"
-        )));
-    };
-    let url = live.session.current_url().await?;
-    if url != mark.url {
-        live.set_snapshot(None);
-        return Err(ToolError::stale_ref(format!(
-            "STALE_REF: the page changed since snapshot `{}` (now {url})",
-            mark.id
-        )));
+const CAPTCHA_MIN_SIDE_PX: u32 = 40;
+
+/// `(el, min, box?) => bool`: whether `el` is rendered to a human with at
+/// least `min` CSS pixels per side. `box` replaces `el`'s own rectangle (a
+/// text node's range). Nothing on the way to the screen may hide it:
+/// `display: none`, `visibility`, transparency, `content-visibility`
+/// (`hidden="until-found"`, a closed `<details>`) on it or any ancestor, in
+/// its document and in every same-origin frame around it. Its rectangle,
+/// clipped by every box that clips it (`overflow`, `clip`, each frame), by
+/// the scrollable page, and by the viewport where the page cannot scroll or
+/// the content is fixed, must keep the size.
+#[cfg(target_os = "linux")]
+const CAPTCHA_VISIBLE_JS: &str = r#"(el, min, box) => {
+  if (!el || !el.isConnected) return false;
+  const r = box || el.getBoundingClientRect();
+  let left = r.left, top = r.top, right = r.right, bottom = r.bottom;
+  const clipTo = (l, t, rr, b) => {
+    left = Math.max(left, l); top = Math.max(top, t);
+    right = Math.min(right, rr); bottom = Math.min(bottom, b);
+  };
+  const parentOf = (n) => n.parentElement || (n.parentNode && n.parentNode.host) || null;
+  const hides = (overflow) => overflow === 'hidden' || overflow === 'clip';
+  const tokens = (v) => String(v || '').split(/[\s,]+/);
+  // Whether a box is the containing block of fixed descendants.
+  const holdsFixed = (s) =>
+    s.transform !== 'none' || s.filter !== 'none' || (s.backdropFilter || 'none') !== 'none' ||
+    s.perspective !== 'none' ||
+    tokens(s.contain).some(v => ['paint', 'layout', 'strict', 'content'].includes(v)) ||
+    tokens(s.willChange).some(v => ['transform', 'filter', 'perspective'].includes(v));
+  for (let start = el; ; ) {
+    const doc = start.ownerDocument;
+    const view = doc.defaultView;
+    if (typeof start.checkVisibility === 'function' &&
+        !start.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false;
+    const html = doc.documentElement;
+    const rootStyle = view.getComputedStyle(html);
+    // The body's overflow belongs to the viewport when the root's is visible.
+    const viewportBody = doc.body && rootStyle.overflowX === 'visible' && rootStyle.overflowY === 'visible' ? doc.body : null;
+    const viewportStyle = viewportBody ? view.getComputedStyle(viewportBody) : rootStyle;
+    let pos = null;
+    for (let n = start; n; n = parentOf(n)) {
+      const s = view.getComputedStyle(n);
+      if (s.display === 'none') return false;
+      if (n === start && (s.visibility === 'hidden' || s.visibility === 'collapse')) return false;
+      if (parseFloat(s.opacity) <= 0.01) return false;
+      if (n !== start) {
+        const clips = pos === 'fixed' ? holdsFixed(s)
+          : pos === 'absolute' ? (s.position !== 'static' || holdsFixed(s))
+          : true;
+        if (!clips) continue;
+      }
+      pos = s.position;
+      if (n === html || n === viewportBody) continue;
+      const c = n.getBoundingClientRect();
+      if (n !== start && (s.overflowX !== 'visible' || s.overflowY !== 'visible')) {
+        const l = c.left + n.clientLeft, t = c.top + n.clientTop;
+        clipTo(
+          s.overflowX !== 'visible' ? l : -Infinity,
+          s.overflowY !== 'visible' ? t : -Infinity,
+          s.overflowX !== 'visible' ? l + n.clientWidth : Infinity,
+          s.overflowY !== 'visible' ? t + n.clientHeight : Infinity,
+        );
+      }
+      if ((s.position === 'absolute' || s.position === 'fixed') && s.clip.startsWith('rect(')) {
+        const v = s.clip.slice(5, -1).split(/[\s,]+/);
+        const at = (i, base, edge) => v[i] === 'auto' ? edge : base + parseFloat(v[i]);
+        clipTo(at(3, c.left, c.left), at(0, c.top, c.top), at(1, c.left, c.right), at(2, c.top, c.bottom));
+      }
     }
-    Ok(short)
+    if (pos === 'fixed') {
+      clipTo(0, 0, view.innerWidth, view.innerHeight);
+    } else {
+      const lockX = hides(viewportStyle.overflowX), lockY = hides(viewportStyle.overflowY);
+      clipTo(
+        lockX ? 0 : -view.scrollX,
+        lockY ? 0 : -view.scrollY,
+        lockX ? view.innerWidth : Math.max(view.innerWidth, html.scrollWidth) - view.scrollX,
+        lockY ? view.innerHeight : Math.max(view.innerHeight, html.scrollHeight) - view.scrollY,
+      );
+    }
+    // A cross-origin parent hides its frame element; the caller checks it.
+    let frame = null;
+    try { frame = view.frameElement; } catch (_) { frame = null; }
+    if (!frame) break;
+    const fr = frame.getBoundingClientRect();
+    const fs = frame.ownerDocument.defaultView.getComputedStyle(frame);
+    // A transformed frame scales everything inside it.
+    const sx = frame.offsetWidth ? fr.width / frame.offsetWidth : 0;
+    const sy = frame.offsetHeight ? fr.height / frame.offsetHeight : 0;
+    const ox = fr.left + (frame.clientLeft + parseFloat(fs.paddingLeft)) * sx;
+    const oy = fr.top + (frame.clientTop + parseFloat(fs.paddingTop)) * sy;
+    left = ox + left * sx; right = ox + right * sx;
+    top = oy + top * sy; bottom = oy + bottom * sy;
+    clipTo(ox, oy, ox + view.innerWidth * sx, oy + view.innerHeight * sy);
+    start = frame;
+  }
+  return right - left >= min && bottom - top >= min;
+}"#;
+
+/// `(visible, min) => detection`, applied to [`CAPTCHA_VISIBLE_JS`]: a challenge
+/// counts only when a human can see it. A widget, container or challenge
+/// iframe matches when it is visible at [`CAPTCHA_MIN_SIDE_PX`]; challenge
+/// wording matches only in rendered text.
+#[cfg(target_os = "linux")]
+const DETECT_CAPTCHA_JS: &str = r#"((visible, MIN) => {
+  const shown = (el) => !el.closest('.grecaptcha-badge') && visible(el, MIN);
+  const hasSel = (s) => {
+    try { return Array.from(document.querySelectorAll(s)).some(shown); } catch (_) { return false; }
+  };
+  const iframes = Array.from(document.querySelectorAll('iframe'));
+  const hasFrame = (pred) => iframes.some(f => pred((f.src || f.getAttribute('src') || '').toLowerCase()) && shown(f));
+  const renderedText = () => {
+    if (!document.body) return '';
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const range = document.createRange();
+    const parts = [];
+    let len = 0;
+    for (let n = walker.nextNode(), seen = 0; n && seen < 5000 && len < 20000; n = walker.nextNode(), seen++) {
+      const t = n.nodeValue.trim();
+      if (!t || !n.parentElement) continue;
+      range.selectNodeContents(n);
+      if (!visible(n.parentElement, 1, range.getBoundingClientRect())) continue;
+      parts.push(t);
+      len += t.length + 1;
+    }
+    return parts.join(' ').toLowerCase();
+  };
+  const title = (document.title || '').toLowerCase();
+  let text = null;
+  const bodyText = () => (text === null ? (text = renderedText()) : text);
+  if (
+    hasSel('#cf-chl-widget, .cf-turnstile, #challenge-running, #challenge-stage') ||
+    hasFrame(u => u.includes('challenges.cloudflare.com') || u.includes('turnstile')) ||
+    (title.includes('just a moment') && (bodyText().includes('verify you are human') || bodyText().includes('cloudflare'))) ||
+    title.includes('attention required! | cloudflare')
+  ) {
+    return { detected: true, kind: 'cloudflare_turnstile', summary: 'Cloudflare Turnstile / human verification challenge' };
+  }
+  if (
+    hasSel('.g-recaptcha, #g-recaptcha') ||
+    hasFrame(u => u.includes('google.com/recaptcha') || u.includes('recaptcha/api2') || u.includes('recaptcha/enterprise'))
+  ) {
+    return { detected: true, kind: 'recaptcha', summary: 'Google reCAPTCHA verification challenge' };
+  }
+  if (hasSel('.h-captcha') || hasFrame(u => u.includes('hcaptcha.com'))) {
+    return { detected: true, kind: 'hcaptcha', summary: 'hCaptcha verification challenge' };
+  }
+  if (hasSel('#arkose, [data-arkose]') || hasFrame(u => u.includes('arkoselabs.com') || u.includes('funcaptcha.com'))) {
+    return { detected: true, kind: 'arkose_funcaptcha', summary: 'Arkose Labs / FunCaptcha challenge' };
+  }
+  if (hasSel('.geetest_panel, .geetest_holder, .nc_scale, #nc_1_n1z')) {
+    return { detected: true, kind: 'slider_captcha', summary: 'Slider / Geetest verification challenge' };
+  }
+  if (
+    hasSel('[data-captcha], #captcha-box') ||
+    title === 'robot check' ||
+    title === 'security check' ||
+    (bodyText().includes('verify you are human') && bodyText().length < 1500)
+  ) {
+    return { detected: true, kind: 'generic_captcha', summary: 'Human verification / CAPTCHA challenge' };
+  }
+  return { detected: false };
+})"#;
+
+/// The page expression that runs [`DETECT_CAPTCHA_JS`].
+#[cfg(target_os = "linux")]
+fn detect_captcha_expression() -> String {
+    format!("{DETECT_CAPTCHA_JS}({CAPTCHA_VISIBLE_JS}, {CAPTCHA_MIN_SIDE_PX})")
+}
+
+/// Project a successful detection into the caller response. An unavailable or
+/// malformed evaluation is an observation failure, not a failed snapshot.
+#[cfg(target_os = "linux")]
+fn insert_captcha_fields(
+    m: &mut serde_json::Map<String, serde_json::Value>,
+    detection: Option<&serde_json::Value>,
+) {
+    let detected = detection
+        .and_then(|v| v.get("detected"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    m.insert("captcha_detected".into(), detected.into());
+    if detected {
+        for (source, target) in [("kind", "captcha_kind"), ("summary", "captcha_summary")] {
+            if let Some(value) = detection
+                .and_then(|v| v.get(source))
+                .and_then(serde_json::Value::as_str)
+            {
+                m.insert(target.into(), value.into());
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 async fn snapshot_json(
-    live: &super::session::Live,
+    s: &agent_workstation::Agent<'_>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, ToolError> {
-    let snap = live.session.snapshot().await?;
-    let id = crate::computer::generate_snapshot_id();
-    live.set_snapshot(Some(super::session::SnapshotMark {
-        id: id.clone(),
-        url: snap.url.clone(),
-    }));
-    let title = active_title(live).await;
+    let snap = s.snapshot().await?;
+    let title = active_title(s).await;
     let mut m = serde_json::Map::new();
     m.insert("url".into(), snap.url.into());
     m.insert("title".into(), title.into());
     m.insert("snapshot".into(), snap.text.into());
-    m.insert("snapshot_id".into(), id.into());
+    m.insert("snapshot_id".into(), snap.id.into());
     m.insert("refs".into(), snap.refs.into());
+    let captcha = s.eval(&detect_captcha_expression()).await.ok();
+    insert_captcha_fields(&mut m, captcha.as_ref());
     Ok(m)
 }
 
 #[cfg(target_os = "linux")]
-async fn active_title(live: &super::session::Live) -> String {
-    live.session
-        .tabs()
+async fn active_title(s: &agent_workstation::Agent<'_>) -> String {
+    s.tabs()
         .await
         .ok()
         .and_then(|tabs| tabs.into_iter().find(|t| t.active))
@@ -330,20 +492,57 @@ fn with_profile(
 ) -> serde_json::Value {
     m.insert("profile".into(), profile.into());
     m.insert("holder".into(), live.holder().into());
-    if let Some(url) = &live.takeover_url {
-        m.insert("takeover_url".into(), url.clone().into());
+    if m.get("captcha_detected")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        let request = serde_json::json!({ "action": "takeover", "profile": profile, "reason": "solve CAPTCHA" });
+        m.insert("takeover_hint".into(), format!(
+            "Human verification / CAPTCHA detected. Call `browser({request})` and send `takeover_url` (and `screenshot_path`) to the user."
+        ).into());
+    }
+    if let Some(url) = live.takeover_url() {
+        m.insert("takeover_url".into(), url.into());
     }
     serde_json::Value::Object(m)
+}
+
+/// A cookie as the model sees it: an `HttpOnly` cookie's value is a
+/// credential the page itself cannot read, so it is withheld.
+#[cfg(target_os = "linux")]
+fn cookie_json(c: agent_workstation::Cookie) -> serde_json::Value {
+    let http_only = c.http_only == Some(true);
+    let mut v = serde_json::to_value(&c).unwrap_or_default();
+    if http_only && let Some(m) = v.as_object_mut() {
+        m.insert("value".into(), serde_json::Value::Null);
+        m.insert("value_withheld".into(), true.into());
+    }
+    v
+}
+
+#[cfg(target_os = "linux")]
+fn required_selector<'r>(req: &'r BrowserRequest, action: &str) -> Result<&'r str, ToolError> {
+    req.selector
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ToolError::invalid(format!(
+                "browser {action} requires `selector` (an @eN ref or a CSS selector)"
+            ))
+        })
 }
 
 #[cfg(target_os = "linux")]
 async fn run(
     data: &Path,
-    default_profile: &str,
+    caller: &Caller,
     req: BrowserRequest,
+    files: &crate::agent_file::FileAuthority,
 ) -> Result<serde_json::Value, ToolError> {
     use super::session;
     use serde_json::json;
+    use std::time::Duration;
 
     let action = if req.action.trim().is_empty() {
         if req.url.is_some() { "open" } else { "status" }
@@ -351,7 +550,7 @@ async fn run(
         req.action.trim()
     }
     .to_ascii_lowercase();
-    let profile = super::sanitize_profile_name(req.profile.as_deref(), default_profile);
+    let profile = super::sanitize_profile_name(req.profile.as_deref(), &caller.profile);
     if req.proxy.is_some()
         && matches!(
             action.as_str(),
@@ -366,6 +565,12 @@ async fn run(
     match action.as_str() {
         "profiles" | "list" => return Ok(json!({ "profiles": list_profiles(data)? })),
         "close" | "stop" | "shutdown" => {
+            // Only the agent holding a desktop closes it.
+            if let Some(live) = session::running(data, &profile) {
+                live.session
+                    .lease(&caller.principal)
+                    .map_err(ToolError::from)?;
+            }
             let was_running = session::stop(data, &profile).await;
             return Ok(json!({
                 "profile": profile,
@@ -375,35 +580,14 @@ async fn run(
             }));
         }
         "status" | "info" | "fingerprint" => return status(data, &profile).await,
-        // B2 pending: DesktopSession::evaluate.
-        "eval" | "evaluate" | "js" => return Err(unsupported_until("evaluating page scripts")),
-        "html" => return Err(unsupported_until("reading page HTML")),
-        // B3 pending: DesktopSession::cookies / set_cookies.
-        "cookies" => return Err(unsupported_until("reading and setting cookies")),
-        // B4 pending: Input::KeyDown / KeyUp.
-        "hold" | "key_down" | "keydown" | "key_up" | "keyup" | "release" | "release_keys" => {
-            return Err(unsupported_until("holding keys"));
-        }
-        // B6 interim: page-level Enter needs the crate's in-page key press.
-        "fill" | "type" | "input" if req.submit.unwrap_or(false) => {
-            return Err(ToolError::unsupported(
-                "`submit` (pressing Enter inside the page) is not available in this release; fill, \
-                 then click the form's submit button ref",
-            ));
-        }
         _ => {}
     }
 
-    // A stale qualified ref fails before anything starts or a secret resolves.
-    if let Some(sel) = req.selector.as_deref().filter(|s| !s.trim().is_empty()) {
-        let current = session::running(data, &profile)
-            .and_then(|l| l.snapshot())
-            .map(|m| m.id);
-        resolve_ref(sel, current.as_deref())?;
-    }
-
-    let live = session::acquire(data, &profile, default_profile, req.proxy.as_deref()).await?;
-    let s = &live.session;
+    let live = session::acquire(data, &profile, &caller.principal, req.proxy.as_deref()).await?;
+    let s = live
+        .session
+        .lease(&caller.principal)
+        .map_err(ToolError::from)?;
     let out = match action.as_str() {
         "open" | "goto" | "navigate" => {
             let url = req
@@ -411,25 +595,23 @@ async fn run(
                 .as_deref()
                 .filter(|u| !u.trim().is_empty())
                 .ok_or_else(|| ToolError::invalid("browser open requires `url`"))?;
-            live.set_snapshot(None);
             s.navigate(&normalize_url(url)).await?;
-            pause(req.wait_ms, 0).await;
-            let mut m = snapshot_json(&live).await?;
+            pause(req.wait_ms).await;
+            let mut m = snapshot_json(&s).await?;
             m.insert("status".into(), "running".into());
             with_profile(&profile, &live, m)
         }
         "back" | "forward" | "reload" => {
-            live.set_snapshot(None);
             let url = match action.as_str() {
                 "back" => s.back().await?,
                 "forward" => s.forward().await?,
                 _ => s.reload().await?,
             };
-            pause(req.wait_ms, 0).await;
+            pause(req.wait_ms).await;
             with_profile(&profile, &live, json_map(json!({ "url": url })))
         }
         "snapshot" | "dom" => {
-            let m = snapshot_json(&live).await?;
+            let m = snapshot_json(&s).await?;
             with_profile(&profile, &live, m)
         }
         "read" | "text" | "content" => {
@@ -441,34 +623,64 @@ async fn run(
                 json_map(json!({ "url": url, "text": text })),
             )
         }
-        "click" => {
-            let raw = req
+        "html" => {
+            let target = req
                 .selector
                 .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| {
-                    ToolError::invalid("browser click requires `selector` (an @eN ref)")
-                })?;
-            let r = current_ref(&live, raw).await?;
-            s.click(&r).await?;
-            pause(req.wait_ms, 300).await;
-            let url = s.current_url().await?;
-            let title = active_title(&live).await;
+                .map(str::trim)
+                .filter(|t| !t.is_empty());
+            let (html, truncated) = bounded(s.html(target).await?);
             with_profile(
                 &profile,
                 &live,
-                json_map(json!({ "clicked": raw, "url": url, "title": title })),
+                json_map(json!({ "html": html, "truncated": truncated })),
+            )
+        }
+        "eval" | "evaluate" | "js" => {
+            let script = req
+                .script
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| ToolError::invalid("browser eval requires `script`"))?;
+            let value = s.eval(script).await?;
+            let text = value.to_string();
+            let m = if text.len() > MAX_TEXT_RESULT {
+                let (cut, _) = bounded(text);
+                json!({ "result_json_truncated": cut, "truncated": true })
+            } else {
+                json!({ "result": value })
+            };
+            with_profile(&profile, &live, json_map(m))
+        }
+        "cookies" => {
+            if let Some(raw) = &req.cookies {
+                let cookies: Vec<agent_workstation::Cookie> =
+                    serde_json::from_value(serde_json::Value::Array(raw.clone()))
+                        .map_err(|e| ToolError::invalid(format!("invalid `cookies`: {e}")))?;
+                s.set_cookies(&cookies).await?;
+            }
+            let cookies: Vec<serde_json::Value> =
+                s.cookies(&[]).await?.into_iter().map(cookie_json).collect();
+            with_profile(
+                &profile,
+                &live,
+                json_map(json!({ "count": cookies.len(), "cookies": cookies })),
+            )
+        }
+        "click" => {
+            let target = required_selector(&req, "click")?;
+            s.click(target).await?;
+            pause(req.wait_ms).await;
+            let url = s.current_url().await?;
+            let title = active_title(&s).await;
+            with_profile(
+                &profile,
+                &live,
+                json_map(json!({ "clicked": target, "url": url, "title": title })),
             )
         }
         "fill" | "type" | "input" => {
-            let raw = req
-                .selector
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| {
-                    ToolError::invalid("browser fill requires `selector` (an @eN ref)")
-                })?;
-            let r = current_ref(&live, raw).await?;
+            let target = required_selector(&req, "fill")?;
             let secret = req
                 .secret_ref
                 .as_deref()
@@ -483,49 +695,105 @@ async fn run(
             match secret {
                 Some(secret_ref) => {
                     let resolver = super::secrets::SecretRefs::new(data);
-                    s.fill_secret(&r, secret_ref, &resolver, None).await?;
+                    s.fill_secret(target, secret_ref, &resolver, None).await?;
                 }
-                None => s.fill(&r, req.text.as_deref().unwrap_or("")).await?,
+                None => s.fill(target, req.text.as_deref().unwrap_or("")).await?,
             }
-            pause(req.wait_ms, 0).await;
-            let mut m = json_map(json!({ "filled": raw }));
+            if req.submit.unwrap_or(false) {
+                s.focus(target).await?;
+                s.press("Enter").await?;
+            }
+            pause(req.wait_ms).await;
+            let mut m = json_map(json!({ "filled": target }));
             if let Some(src) = secret {
                 m.insert("secret_source".into(), src.into());
             }
+            if req.submit.unwrap_or(false) {
+                m.insert("submitted".into(), true.into());
+            }
             with_profile(&profile, &live, m)
         }
-        "press" | "key" => {
-            if req.hold_ms.or(req.duration_ms).unwrap_or(0) > 0 {
-                return Err(unsupported_until("holding keys"));
+        "press" | "key" | "hold" => {
+            let keys = requested_keys(&req)?;
+            if let Some(target) = req
+                .selector
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                s.focus(target).await?;
             }
-            if req.selector.is_some() {
-                return Err(ToolError::unsupported(
-                    "pressing a key on a ref is not available in this release; `click` or `fill` \
-                     the element first, then `press`",
-                ));
+            let hold = req
+                .hold_ms
+                .or(req.duration_ms)
+                .unwrap_or(if action == "hold" { 500 } else { 0 });
+            let hold = Duration::from_millis(hold);
+            if hold > agent_workstation::MAX_HOLD {
+                return Err(ToolError::invalid("a key is held for at most 10 s"));
             }
-            let chord = requested_chord(&req)?;
-            s.key(&chord).await?;
-            pause(req.wait_ms, 0).await;
-            with_profile(&profile, &live, json_map(json!({ "pressed": chord })))
-        }
-        "screenshot" | "shot" => {
-            // P2 pending: DesktopSession::page_screenshot.
-            if req.full_page.unwrap_or(false) {
-                return Err(unsupported_until("full-page screenshots"));
+            match keys.as_slice() {
+                [chord] if hold.is_zero() => s.press(chord).await?,
+                [chord] => s.press_and_hold(chord, hold).await?,
+                several => {
+                    for k in several {
+                        s.key_down(k).await?;
+                    }
+                    tokio::time::sleep(hold).await;
+                    for k in several.iter().rev() {
+                        s.key_up(k).await?;
+                    }
+                }
             }
-            let png = s.screenshot().await?.to_png().map_err(ToolError::from)?;
-            let path = save_screenshot(data, &profile, req.path.as_deref(), &png)?;
+            pause(req.wait_ms).await;
             with_profile(
                 &profile,
                 &live,
-                json_map(json!({
-                    "path": path.display().to_string(),
-                    "bytes": png.len(),
-                    "mime_type": "image/png",
-                    "image_base64": crate::computer::base64_encode(&png),
-                })),
+                json_map(json!({ "pressed": keys, "held_ms": hold.as_millis() as u64 })),
             )
+        }
+        "key_down" | "keydown" | "key_up" | "keyup" => {
+            for k in requested_keys(&req)? {
+                if action.starts_with("key_d") || action == "keydown" {
+                    s.key_down(&k).await?;
+                } else {
+                    s.key_up(&k).await?;
+                }
+            }
+            with_profile(
+                &profile,
+                &live,
+                json_map(json!({ "held_keys": s.held_keys().await? })),
+            )
+        }
+        "release" | "release_keys" => {
+            s.release_keys().await?;
+            with_profile(&profile, &live, json_map(json!({ "held_keys": [] })))
+        }
+        "screenshot" | "shot" => {
+            let (png, width, height, truncated) = if req.full_page.unwrap_or(false) {
+                let page = s.page_screenshot(true).await?;
+                (page.png, page.width, page.height, page.truncated)
+            } else {
+                let frame = s.screenshot().await?;
+                (frame.to_png()?, frame.width, frame.height, false)
+            };
+            let (path, path_refused) =
+                save_screenshot(data, &profile, req.path.as_deref(), &png, files)?;
+            let mut m = json_map(json!({
+                "path": path.display().to_string(),
+                "bytes": png.len(),
+                "width": width,
+                "height": height,
+                "mime_type": "image/png",
+                "image_base64": crate::computer::base64_encode(&png),
+            }));
+            if let Some(why) = path_refused {
+                m.insert("path_refused".into(), why.into());
+            }
+            if truncated {
+                m.insert("truncated".into(), true.into());
+            }
+            with_profile(&profile, &live, m)
         }
         "tabs" => {
             let sub = req
@@ -535,11 +803,10 @@ async fn run(
                 .filter(|s| !s.is_empty())
                 .unwrap_or("list")
                 .to_ascii_lowercase();
-            let m = match sub.as_str() {
+            let mut m = match sub.as_str() {
                 "list" => json_map(json!({})),
                 "new" | "open" => {
                     let url = normalize_url(req.url.as_deref().unwrap_or("about:blank"));
-                    live.set_snapshot(None);
                     let id = s.new_tab(&url).await?;
                     json_map(json!({ "target_id": id, "url": url }))
                 }
@@ -548,59 +815,47 @@ async fn run(
                         .target_id
                         .as_deref()
                         .ok_or_else(|| ToolError::invalid("tabs activate requires target_id"))?;
-                    live.set_snapshot(None);
                     s.select_tab(id).await?;
                     json_map(json!({ "active_target_id": id }))
                 }
                 "close" => {
-                    let tabs = s.tabs().await?;
                     let id = match req.target_id.as_deref() {
                         Some(id) => id.to_string(),
-                        None => tabs
-                            .iter()
+                        None => s
+                            .tabs()
+                            .await?
+                            .into_iter()
                             .find(|t| t.active)
-                            .map(|t| t.id.clone())
+                            .map(|t| t.id)
                             .ok_or_else(|| ToolError::invalid("tabs close requires target_id"))?,
                     };
-                    live.set_snapshot(None);
-                    // B8 interim: activate the next tab first, so closing never leaves the
-                    // session choosing among tabs that are still going away.
-                    if tabs.iter().any(|t| t.id == id && t.active)
-                        && let Some(next) = tabs.iter().find(|t| t.id != id)
-                    {
-                        s.select_tab(&next.id).await?;
-                    }
                     s.close_tab(&id).await?;
-                    // B8 interim: the browser lists a closed tab briefly after closing it.
-                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-                    while s.tabs().await?.iter().any(|t| t.id == id)
-                        && tokio::time::Instant::now() < deadline
-                    {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
                     json_map(json!({ "closed_target_id": id }))
                 }
                 other => {
                     return Err(ToolError::invalid(format!("unknown tab_action `{other}`")));
                 }
             };
-            let mut m = m;
             m.insert("tabs".into(), json!(s.tabs().await?));
             with_profile(&profile, &live, m)
         }
         "takeover" | "human_takeover" | "user_takeover" => {
             if let Some(url) = req.url.as_deref().filter(|u| !u.trim().is_empty()) {
-                live.set_snapshot(None);
                 s.navigate(&normalize_url(url)).await?;
             }
             let shot = match s.screenshot().await.and_then(|f| f.to_png()) {
-                Ok(png) => save_screenshot(data, &profile, None, &png)
+                Ok(png) => save_screenshot(data, &profile, None, &png, files)
                     .ok()
-                    .map(|p| p.display().to_string()),
+                    .map(|(p, _)| p.display().to_string()),
                 Err(_) => None,
             };
             let url = s.current_url().await.unwrap_or_default();
-            if live.takeover_url.is_none() {
+            // Observe before handing control to the person; evaluation must not
+            // turn an otherwise available takeover into an error.
+            let captcha = s.eval(&detect_captcha_expression()).await.ok();
+            live.publish_takeover().await;
+            live.expect_hand_back();
+            if live.takeover_url().is_none() {
                 return Err(ToolError::unsupported(
                     "this desktop session has no takeover page",
                 ));
@@ -613,8 +868,9 @@ async fn run(
                 "screenshot_path": shot,
                 "instructions": "Send `takeover_url` (and `screenshot_path` via `send` media) to the user. They see this whole desktop, press Take control, work in the browser, and press Hand back. You receive `[Browser Takeover Completed]` when they hand back, or call `browser({ \"action\": \"wait_for_user\", \"wait_ms\": 120000 })`.",
             }));
+            insert_captcha_fields(&mut m, captcha.as_ref());
             if let Some(ms) = req.wait_ms.filter(|ms| *ms > 0) {
-                let completed = wait_for_hand_back(&live, ms).await;
+                let completed = live.wait_for_hand_back(hand_back_wait(ms)).await;
                 m.insert("completed".into(), completed.into());
                 m.insert(
                     "status".into(),
@@ -632,7 +888,8 @@ async fn run(
             let wait = matches!(action.as_str(), "wait_for_user" | "wait_takeover")
                 || req.wait_ms.is_some_and(|w| w > 0);
             let completed = if wait {
-                wait_for_hand_back(&live, req.wait_ms.unwrap_or(60_000)).await
+                live.wait_for_hand_back(hand_back_wait(req.wait_ms.unwrap_or(60_000)))
+                    .await
             } else {
                 live.holder() == "agent"
             };
@@ -648,7 +905,7 @@ async fn run(
                 .as_deref()
                 .or(req.text.as_deref())
                 .unwrap_or("released by agent");
-            let released = s.gate().release(Some(note.to_string()));
+            let released = live.session.gate().release(Some(note.to_string()));
             let url = s.current_url().await?;
             with_profile(
                 &profile,
@@ -659,7 +916,8 @@ async fn run(
         other => {
             return Err(ToolError::invalid(format!(
                 "unknown browser action `{other}`; expected `open`, `back`, `forward`, `reload`, \
-                 `snapshot`, `read`, `click`, `fill`, `press`, `screenshot`, `tabs`, `takeover`, \
+                 `snapshot`, `read`, `html`, `click`, `fill`, `press`, `hold`, `key_down`, `key_up`, \
+                 `release_keys`, `eval`, `cookies`, `screenshot`, `tabs`, `takeover`, \
                  `takeover_status`, `wait_for_user`, `release_takeover`, `status`, `profiles`, or `close`"
             )));
         }
@@ -676,40 +934,32 @@ fn json_map(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> 
     }
 }
 
-/// Wait until a person who holds (or takes) control hands back, up to
-/// `wait_ms` (at most one hour). `true` once the agent holds control after a
-/// person did.
+/// How long `wait_for_user` waits: `wait_ms`, at most one hour.
 #[cfg(target_os = "linux")]
-async fn wait_for_hand_back(live: &super::session::Live, wait_ms: u64) -> bool {
-    use agent_workstation::Holder;
-    let mut rx = live.session.gate().subscribe();
-    let wait = std::time::Duration::from_millis(wait_ms.min(3_600_000));
-    let mut saw_human = matches!(*rx.borrow(), Holder::Human { .. });
-    let done = tokio::time::timeout(wait, async {
-        loop {
-            if rx.changed().await.is_err() {
-                return false;
-            }
-            match *rx.borrow_and_update() {
-                Holder::Human { .. } => saw_human = true,
-                Holder::Agent if saw_human => return true,
-                Holder::Agent => {}
-            }
-        }
-    })
-    .await;
-    live.touch();
-    done.unwrap_or(false)
+fn hand_back_wait(wait_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(wait_ms.min(3_600_000))
 }
 
 #[cfg(target_os = "linux")]
 async fn status(data: &Path, profile: &str) -> Result<serde_json::Value, ToolError> {
     use serde_json::json;
-    let p = agent_workstation::Profile::new(profile, super::profile_dir(data, profile));
+    let Some(dir) = super::server_profile_dir(data, profile, false)
+        .map_err(|e| ToolError::invalid(e.to_string()))?
+    else {
+        return Ok(json!({"profile": profile, "status": "stopped", "fingerprint": null}));
+    };
+    let p = agent_workstation::Profile::new(profile, dir);
     let fingerprint = agent_workstation::Fingerprint::read(&p.fingerprint_path())?;
     match super::session::running(data, profile) {
         Some(live) => {
-            let tabs = live.session.tabs().await.unwrap_or_default();
+            // Status is an observation: it reads tabs only for the holder.
+            let tabs = match live.leaseholder() {
+                Some(holder) => match live.session.lease(&holder) {
+                    Ok(agent) => agent.tabs().await.unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                },
+                None => Vec::new(),
+            };
             Ok(with_profile(
                 profile,
                 &live,
@@ -718,6 +968,7 @@ async fn status(data: &Path, profile: &str) -> Result<serde_json::Value, ToolErr
                     "started_at_ms": live.started_at_ms(),
                     "last_used_at_ms": live.last_used_ms(),
                     "proxy_configured": live.proxy.as_deref().is_some_and(|p| !p.is_empty()),
+                    "held_by": live.leaseholder(),
                     "desktop": { "width": live.session.size().0, "height": live.session.size().1 },
                     "fingerprint": fingerprint,
                     "tabs": tabs,
@@ -736,10 +987,14 @@ async fn status(data: &Path, profile: &str) -> Result<serde_json::Value, ToolErr
 fn list_profiles(data: &Path) -> Result<Vec<serde_json::Value>, ToolError> {
     use serde_json::json;
     let mut names = std::collections::BTreeSet::new();
+    super::server_profile_dir(data, "default", false)
+        .map_err(|e| ToolError::invalid(e.to_string()))?;
     if let Ok(entries) = std::fs::read_dir(super::profiles_root(data)) {
         for entry in entries.flatten() {
-            if entry.path().is_dir()
-                && let Some(name) = entry.file_name().to_str()
+            if let Some(name) = entry.file_name().to_str()
+                && super::server_profile_dir(data, name, false)
+                    .map_err(|e| ToolError::invalid(e.to_string()))?
+                    .is_some()
             {
                 names.insert(name.to_string());
             }
@@ -752,6 +1007,7 @@ fn list_profiles(data: &Path) -> Result<Vec<serde_json::Value>, ToolError> {
                 "profile": name,
                 "status": "running",
                 "holder": live.holder(),
+                "held_by": live.leaseholder(),
                 "last_used_at_ms": live.last_used_ms(),
             }),
             None => json!({ "profile": name, "status": "stopped" }),
@@ -759,115 +1015,518 @@ fn list_profiles(data: &Path) -> Result<Vec<serde_json::Value>, ToolError> {
         .collect())
 }
 
-/// Write a screenshot to `requested` (or the profile's `screenshots/`). When
-/// the requested directory belongs to another uid (an agent seat), the file
-/// is copied in as that uid.
+/// Write caller-selected paths only through the caller's file authority.
 #[cfg(target_os = "linux")]
 fn save_screenshot(
     data: &Path,
     profile: &str,
     requested: Option<&str>,
     png: &[u8],
-) -> Result<PathBuf, ToolError> {
-    use std::process::Command;
-    let io = |e: std::io::Error| ToolError {
+    files: &crate::agent_file::FileAuthority,
+) -> Result<(PathBuf, Option<String>), ToolError> {
+    let requested = requested.map(str::trim).filter(|s| !s.is_empty());
+    let refused = if let Some(target) = requested {
+        match files.write(Path::new(target), png) {
+            Ok(()) => return Ok((PathBuf::from(target), None)),
+            Err(why) => Some(why),
+        }
+    } else {
+        None
+    };
+    // Only the validated server-owned profile receives the fallback copy.
+    // Never infer the caller's identity from a target's filesystem owner.
+    let dir = super::server_profile_dir(data, profile, true)
+        .map_err(|e| ToolError::invalid(e.to_string()))?
+        .ok_or_else(|| ToolError::invalid("browser profile is missing"))?;
+    let save = || -> std::io::Result<PathBuf> {
+        use std::io::Write as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        // Keep the complete profile chain open; path validation followed by
+        // a separate open would permit an intervening directory replacement.
+        let root = std::fs::File::open(data)?;
+        let profiles = super::owned_child_dir(
+            &root,
+            std::ffi::OsStr::new("browser-profiles"),
+            0o755,
+            false,
+        )?
+        .ok_or_else(|| std::io::Error::other("browser profiles disappeared"))?;
+        let profile_fd =
+            super::owned_child_dir(&profiles, std::ffi::OsStr::new(profile), 0o755, false)?
+                .ok_or_else(|| std::io::Error::other("browser profile disappeared"))?;
+        let parent = super::owned_child_dir(
+            &profile_fd,
+            std::ffi::OsStr::new("screenshots"),
+            0o755,
+            true,
+        )?
+        .ok_or_else(|| std::io::Error::other("screenshots directory disappeared"))?;
+        let shots = dir.join("screenshots");
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "shot-{}-{}.png",
+            anyagents_core::now_ms(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let c_name = std::ffi::CString::new(name.as_str()).expect("generated filename");
+        // The descriptor fixes the directory across renames; O_EXCL refuses
+        // existing entries, including symlinks. No server write follows a link.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(png)?;
+        file.sync_all()?;
+        Ok(shots.join(name))
+    };
+    let path = save().map_err(|e| ToolError {
         code: "IO",
         message: format!("cannot save the screenshot: {e}"),
-        hint: "Choose a writable `path`.",
+        hint: "Choose a writable path.",
         retryable: false,
-    };
-    let shots_dir = super::profile_dir(data, profile).join("screenshots");
-    std::fs::create_dir_all(&shots_dir).map_err(io)?;
-    let fallback = shots_dir.join(format!("shot-{}.png", anyagents_core::now_ms()));
-    let Some(target) = requested
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-    else {
-        std::fs::write(&fallback, png).map_err(io)?;
-        return Ok(fallback);
-    };
-    if let Some(parent) = target.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if std::fs::write(&target, png).is_ok() {
-        return Ok(target);
-    }
-    std::fs::write(&fallback, png).map_err(io)?;
-    let copied_to_seat = {
-        use std::os::unix::fs::MetadataExt as _;
-        if let Some(parent) = target.parent()
-            && let Ok(meta) = std::fs::metadata(parent)
-            // SAFETY: geteuid has no preconditions.
-            && meta.uid() != unsafe { libc::geteuid() }
-            && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
-        {
-            let uid_s = meta.uid().to_string();
-            let gid_s = meta.gid().to_string();
-            Command::new("/usr/local/bin/anyagents-setpriv")
-                .args([
-                    "--reuid",
-                    &uid_s,
-                    "--regid",
-                    &gid_s,
-                    "--groups",
-                    &gid_s,
-                    "--no-new-privs",
-                    "--",
-                    "/bin/cp",
-                    "-f",
-                ])
-                .arg(&fallback)
-                .arg(&target)
-                .status()
-                .is_ok_and(|s| s.success())
-        } else {
-            false
+    })?;
+    Ok((path, refused))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn fixture_chromium() -> Option<PathBuf> {
+    match super::session::tool("chromium", "browser") {
+        Ok(path) => Some(path),
+        Err(err) => {
+            if std::env::var_os("CI").is_some() {
+                panic!("CI needs Chromium for this test: {}", err.message);
+            }
+            eprintln!("skipped: {}", err.message);
+            None
         }
-    };
-    Ok(if copied_to_seat { target } else { fallback })
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
+    /// Render every reference fixture in real Chromium: only visible challenges count.
     #[test]
-    fn refs_resolve_against_the_latest_snapshot_only() {
-        assert_eq!(resolve_ref("@e3", None).unwrap(), "e3");
-        assert_eq!(resolve_ref("e12", Some("s1")).unwrap(), "e12");
-        assert_eq!(resolve_ref("@s1:e2", Some("s1")).unwrap(), "e2");
-        assert_eq!(
-            resolve_ref("@s0:e2", Some("s1")).unwrap_err().code,
-            "STALE_REF"
-        );
-        assert_eq!(resolve_ref("@s0:e2", None).unwrap_err().code, "STALE_REF");
-        assert_eq!(
-            resolve_ref("#email", Some("s1")).unwrap_err().code,
-            "UNSUPPORTED"
-        );
-        assert_eq!(resolve_ref("@e", None).unwrap_err().code, "UNSUPPORTED");
+    fn captcha_detection_requires_a_rendered_challenge() {
+        use std::process::{Command, Stdio};
+        let Some(chromium) = fixture_chromium() else {
+            return;
+        };
+        const TS: &str = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2/av0/rcv0/0/abc/light/normal";
+        const RC: &str = "https://www.google.com/recaptcha/api2/anchor?k=site";
+        const RC_IMG: &str = "https://www.google.com/recaptcha/api2/bframe?k=site";
+        const HC: &str =
+            "https://newassets.hcaptcha.com/captcha/v1/abc/static/hcaptcha.html#frame=checkbox";
+        const HC_IMG: &str =
+            "https://newassets.hcaptcha.com/captcha/v1/abc/static/hcaptcha.html#frame=challenge";
+        let frame = |src: &str, w: u32, h: u32, style: &str| {
+            format!(
+                r#"<iframe src="{src}" width="{w}" height="{h}" style="border:0;{style}"></iframe>"#
+            )
+        };
+        let login =
+            r#"<form><label>Email <input name="email"></label><button>Continue</button></form>"#;
+        let cases: Vec<(String, &str, String, Option<&str>)> = vec![
+            ("turnstile 0x0".into(), "Sign in", frame(TS, 0, 0, ""), None),
+            ("turnstile 1x1".into(), "Sign in", frame(TS, 1, 1, ""), None),
+            ("hcaptcha 1x1".into(), "Sign in", frame(HC, 1, 1, ""), None),
+            ("recaptcha 0x0".into(), "Sign in", frame(RC, 0, 0, ""), None),
+            ("recaptcha 1x1".into(), "Sign in", frame(RC, 1, 1, ""), None),
+            ("turnstile display none".into(), "Sign in", frame(TS, 300, 65, "display:none"), None),
+            ("turnstile visibility hidden".into(), "Sign in", frame(TS, 300, 65, "visibility:hidden"), None),
+            ("turnstile opacity 0".into(), "Sign in", frame(TS, 300, 65, "opacity:0"), None),
+            ("turnstile offscreen".into(), "Sign in", frame(TS, 300, 65, "position:absolute;left:-9999px;top:0"), None),
+            ("turnstile fixed offscreen".into(), "Sign in", frame(TS, 300, 65, "position:fixed;top:-9999px;left:0"), None),
+            ("turnstile scale 0".into(), "Sign in", frame(TS, 300, 65, "transform:scale(0)"), None),
+            (
+                "turnstile in 0x0 overflow wrapper".into(),
+                "Sign in",
+                format!(r#"<div style="width:0;height:0;overflow:hidden">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in display none wrapper".into(),
+                "Sign in",
+                format!(r#"<div style="display:none">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in hidden attribute wrapper".into(),
+                "Sign in",
+                format!(r#"<div hidden aria-hidden="true">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in visibility hidden wrapper".into(),
+                "Sign in",
+                format!(r#"<div style="visibility:hidden">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in transparent wrapper".into(),
+                "Sign in",
+                format!(r#"<div style="opacity:0">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in clip rect wrapper".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="position:absolute;clip:rect(0,0,0,0)">{}</div>"#,
+                    frame(TS, 300, 65, "")
+                ),
+                None,
+            ),
+            (
+                "turnstile in offscreen wrapper".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="position:absolute;left:-9999px">{}</div>"#,
+                    frame(TS, 300, 65, "")
+                ),
+                None,
+            ),
+            (
+                "empty managed turnstile container".into(),
+                "Sign in",
+                format!(r#"{login}<div class="cf-turnstile" data-sitekey="x"></div><input type="hidden" name="cf-turnstile-response">"#),
+                None,
+            ),
+            (
+                "parked recaptcha image challenge".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="visibility:hidden;position:absolute;top:-10000px">{}</div>"#,
+                    frame(RC_IMG, 400, 580, "")
+                ),
+                None,
+            ),
+            (
+                "invisible recaptcha badge".into(),
+                "Sign in",
+                format!(
+                    r#"<div class="grecaptcha-badge" style="position:fixed;right:0;bottom:14px;width:256px;height:60px">{}</div>"#,
+                    frame(RC, 256, 60, "")
+                ),
+                None,
+            ),
+            (
+                "hidden interstitial wording".into(),
+                "Just a moment...",
+                format!(r#"{login}<div style="display:none">Verify you are human. Cloudflare</div>"#),
+                None,
+            ),
+            (
+                "transparent and offscreen challenge wording".into(),
+                "Sign in",
+                format!(
+                    r#"{login}<p style="opacity:0">Verify you are human</p><p style="position:absolute;left:-9999px">Verify you are human</p>"#
+                ),
+                None,
+            ),
+            (
+                "visible turnstile widget".into(),
+                "Sign in",
+                format!(r#"{login}<div class="cf-turnstile" style="width:300px;height:65px">{}</div>"#, frame(TS, 300, 65, "")),
+                Some("cloudflare_turnstile"),
+            ),
+            (
+                "visible bare turnstile iframe".into(),
+                "Sign in",
+                format!("{login}{}", frame(TS, 300, 65, "")),
+                Some("cloudflare_turnstile"),
+            ),
+            (
+                "visible turnstile below the fold".into(),
+                "Sign in",
+                format!(r#"<div style="height:2000px"></div>{}"#, frame(TS, 300, 65, "")),
+                Some("cloudflare_turnstile"),
+            ),
+            (
+                "visible turnstile in scroll container".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="width:400px;height:200px;overflow:auto">{}</div>"#,
+                    frame(TS, 300, 65, "")
+                ),
+                Some("cloudflare_turnstile"),
+            ),
+            (
+                "visible recaptcha checkbox".into(),
+                "Sign in",
+                format!(r#"{login}<div class="g-recaptcha">{}</div>"#, frame(RC, 304, 78, "")),
+                Some("recaptcha"),
+            ),
+            (
+                "visible recaptcha image challenge".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="position:absolute;top:10px;left:10px">{}</div>"#,
+                    frame(RC_IMG, 400, 580, "")
+                ),
+                Some("recaptcha"),
+            ),
+            (
+                "visible hcaptcha checkbox".into(),
+                "Sign in",
+                format!("{login}{}", frame(HC, 303, 78, "")),
+                Some("hcaptcha"),
+            ),
+            (
+                "visible hcaptcha image challenge".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="position:fixed;top:50px;left:100px">{}</div>"#,
+                    frame(HC_IMG, 400, 600, "")
+                ),
+                Some("hcaptcha"),
+            ),
+            (
+                "visible full-page interstitial".into(),
+                "Just a moment...",
+                r#"<h1>www.example.com</h1><p>Verify you are human by completing the action below.</p><p>www.example.com needs to review the security of your connection before proceeding.</p>"#.into(),
+                Some("cloudflare_turnstile"),
+            ),
+            (
+                "turnstile right of a page that cannot scroll sideways".into(),
+                "Sign in",
+                format!(
+                    "<style>html{{overflow-x:hidden}}</style>{}",
+                    frame(TS, 300, 65, "position:absolute;left:9999px;top:0")
+                ),
+                None,
+            ),
+            (
+                "turnstile below a page that cannot scroll".into(),
+                "Sign in",
+                format!(
+                    "<style>body{{overflow:hidden}}</style>{}",
+                    frame(TS, 300, 65, "position:absolute;left:0;top:10000px")
+                ),
+                None,
+            ),
+            (
+                "turnstile right of a scrollable page".into(),
+                "Sign in",
+                frame(TS, 300, 65, "position:absolute;left:2000px;top:0"),
+                Some("cloudflare_turnstile"),
+            ),
+            (
+                "turnstile in content-visibility hidden".into(),
+                "Sign in",
+                format!(r#"<div style="content-visibility:hidden">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in hidden until found".into(),
+                "Sign in",
+                format!(r#"<div hidden="until-found">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in closed details".into(),
+                "Sign in",
+                format!("<details><summary>More</summary>{}</details>", frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "fixed turnstile escaping a 0x0 overflow wrapper".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="width:0;height:0;overflow:hidden"><div style="position:fixed;top:0;left:0">{}</div></div>"#,
+                    frame(TS, 300, 65, "")
+                ),
+                Some("cloudflare_turnstile"),
+            ),
+            (
+                "fixed turnstile held by a filtered 0x0 wrapper".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="filter:blur(0);width:0;height:0;overflow:hidden"><div style="position:fixed;top:0;left:0">{}</div></div>"#,
+                    frame(TS, 300, 65, "")
+                ),
+                None,
+            ),
+            (
+                "fixed turnstile held by a paint-contained 0x0 wrapper".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="contain:paint;width:0;height:0;overflow:hidden"><div style="position:fixed;top:0;left:0">{}</div></div>"#,
+                    frame(TS, 300, 65, "")
+                ),
+                None,
+            ),
+            (
+                "visible turnstile under a hidden parent".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="visibility:hidden">{}</div>"#,
+                    frame(TS, 300, 65, "visibility:visible")
+                ),
+                Some("cloudflare_turnstile"),
+            ),
+        ];
+        let fixtures: Vec<serde_json::Value> = cases
+            .iter()
+            .map(|(name, title, html, _)| serde_json::json!({ "name": name, "title": title, "html": html }))
+            .collect();
+        let script = format!(
+            "const cases = {};\nconst results = {{}};\nfor (const c of cases) {{\n  document.title = c.title;\n  document.body.innerHTML = c.html;\n  window.scrollTo(0, 0);\n  const r = {};\n  results[c.name] = r.detected ? r.kind : null;\n}}\ndocument.title = 'done';\ndocument.body.innerHTML = '';\nconst out = document.createElement('pre');\nout.id = 'results';\nout.textContent = JSON.stringify(results);\ndocument.body.appendChild(out);",
+            serde_json::Value::Array(fixtures),
+            detect_captcha_expression()
+        )
+        .replace("</", "<\\/");
+        let dir = tempfile::tempdir().unwrap();
+        let page = dir.path().join("captcha.html");
+        std::fs::write(
+            &page,
+            format!(
+                "<!doctype html><html><head><title>t</title></head><body style=\"margin:0\"><script>{script}</script></body></html>"
+            ),
+        )
+        .unwrap();
+        let out = Command::new(chromium)
+            .arg("--headless=new")
+            .arg("--no-sandbox")
+            .arg("--disable-gpu")
+            .arg("--no-first-run")
+            .arg("--hide-scrollbars")
+            .arg("--window-size=1280,800")
+            .arg("--host-resolver-rules=MAP * ~NOTFOUND")
+            .arg("--timeout=20000")
+            .arg(format!(
+                "--user-data-dir={}",
+                dir.path().join("profile").display()
+            ))
+            .arg("--dump-dom")
+            .arg(format!("file://{}", page.display()))
+            .stdin(Stdio::null())
+            .output()
+            .expect("run Chromium");
+        let dom = String::from_utf8_lossy(&out.stdout);
+        let json = dom
+            .split_once("<pre id=\"results\">")
+            .and_then(|(_, rest)| rest.split_once("</pre>"))
+            .map(|(json, _)| json)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no results in the dumped page: {dom}\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+        let results: serde_json::Value = serde_json::from_str(json).expect("results JSON");
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(name, _, _, want)| {
+                results.get(name.as_str()).and_then(|v| v.as_str()) != *want
+            })
+            .map(|(name, _, _, want)| {
+                format!("{name}: want {want:?}, got {}", results[name.as_str()])
+            })
+            .collect();
+        assert!(wrong.is_empty(), "wrong detections:\n{}", wrong.join("\n"));
     }
 
     #[test]
-    fn browser_key_names_become_desktop_chords() {
-        assert_eq!(chord("ArrowUp"), "up");
-        assert_eq!(chord("Control+a"), "ctrl+a");
-        assert_eq!(chord("Enter"), "Enter");
-        assert_eq!(chord("PageDown"), "pagedown");
+    fn captcha_expression_applies_the_visibility_gate_and_minimum_size() {
+        let expression = detect_captcha_expression();
+        assert_eq!(CAPTCHA_MIN_SIDE_PX, 40);
+        assert_eq!(
+            expression,
+            format!("{DETECT_CAPTCHA_JS}({CAPTCHA_VISIBLE_JS}, 40)")
+        );
+        assert!(expression.contains("visible(el, MIN)"));
+        assert!(expression.contains("visible(n.parentElement, 1, range.getBoundingClientRect())"));
+        assert!(expression.contains("!el.closest('.grecaptcha-badge')"));
+        assert!(expression.contains("right - left >= min && bottom - top >= min"));
+        assert!(!expression.contains("document.body.innerText"));
+    }
+
+    #[test]
+    fn captcha_fields_serialize_detection_without_replacing_snapshot_data() {
+        let mut m = json_map(json!({ "snapshot": "page", "refs": 3 }));
+        insert_captcha_fields(
+            &mut m,
+            Some(&json!({
+                "detected": true,
+                "kind": "recaptcha",
+                "summary": "Google reCAPTCHA verification challenge"
+            })),
+        );
+        let serialized = serde_json::to_string(&m).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "snapshot": "page", "refs": 3, "captcha_detected": true,
+                "captcha_kind": "recaptcha",
+                "captcha_summary": "Google reCAPTCHA verification challenge"
+            })
+        );
+    }
+
+    #[test]
+    fn captcha_fields_default_false_and_omit_absent_or_invalid_metadata() {
+        for detection in [
+            None,
+            Some(json!(null)),
+            Some(json!({})),
+            Some(json!({ "detected": "true" })),
+            Some(json!({ "detected": false, "kind": "recaptcha", "summary": "hidden" })),
+        ] {
+            let mut m = serde_json::Map::new();
+            insert_captcha_fields(&mut m, detection.as_ref());
+            assert_eq!(
+                serde_json::to_value(m).unwrap(),
+                json!({ "captcha_detected": false })
+            );
+        }
+        let mut m = serde_json::Map::new();
+        insert_captcha_fields(
+            &mut m,
+            Some(&json!({ "detected": true, "kind": 7, "summary": null })),
+        );
+        assert_eq!(
+            serde_json::to_value(m).unwrap(),
+            json!({ "captcha_detected": true })
+        );
+    }
+
+    fn caller() -> Caller {
+        Caller {
+            principal: "agent-a".into(),
+            profile: "agent-a".into(),
+        }
+    }
+
+    #[test]
+    fn key_requests_name_one_chord_or_keys_held_together() {
         let req = |keys: &[&str]| BrowserRequest {
             keys: Some(keys.iter().map(|k| k.to_string()).collect()),
             ..Default::default()
         };
         assert_eq!(
-            requested_chord(&req(&["ctrl", "shift", "t"])).unwrap(),
-            "ctrl+shift+t"
+            requested_keys(&req(&["ctrl", "shift", "t"])).unwrap(),
+            ["ctrl+shift+t"]
         );
+        assert_eq!(requested_keys(&req(&["w", "d"])).unwrap(), ["w", "d"]);
+        let key = BrowserRequest {
+            key: Some(" Enter ".into()),
+            ..Default::default()
+        };
+        assert_eq!(requested_keys(&key).unwrap(), ["Enter"]);
         assert_eq!(
-            requested_chord(&req(&["w", "d"])).unwrap_err().code,
-            "UNSUPPORTED"
+            requested_keys(&BrowserRequest::default()).unwrap_err().code,
+            "INVALID_INPUT"
         );
     }
 
@@ -884,42 +1543,54 @@ mod tests {
         assert!(req.carries_secret());
     }
 
+    #[test]
+    fn http_only_cookie_values_are_withheld_from_the_model() {
+        let visible = cookie_json(agent_workstation::Cookie {
+            name: "theme".into(),
+            value: "dark".into(),
+            ..Default::default()
+        });
+        assert_eq!(visible["value"], "dark");
+        let session = cookie_json(agent_workstation::Cookie {
+            name: "sid".into(),
+            value: "s3cret".into(),
+            http_only: Some(true),
+            ..Default::default()
+        });
+        assert!(session["value"].is_null() && session["value_withheld"] == true);
+        assert!(!session.to_string().contains("s3cret"));
+    }
+
+    #[test]
+    fn long_results_are_cut_on_a_character_boundary() {
+        let (short, cut) = bounded("é".repeat(10));
+        assert!(!cut && short.len() == 20);
+        let (long, cut) = bounded("é".repeat(MAX_TEXT_RESULT));
+        assert!(cut && long.len() <= MAX_TEXT_RESULT && long.chars().all(|c| c == 'é'));
+    }
+
     #[tokio::test]
-    async fn pending_capabilities_are_typed_unsupported_without_starting_a_desktop() {
+    async fn requests_are_checked_before_a_desktop_starts() {
         let dir = tempfile::tempdir().unwrap();
-        for action in [
-            "eval",
-            "cookies",
-            "hold",
-            "key_down",
-            "release_keys",
-            "html",
+        for (req, code) in [
+            (json!({"action": "close", "proxy": "x:1"}), "INVALID_INPUT"),
+            (json!({"action": "status", "proxy": ""}), "INVALID_INPUT"),
         ] {
-            let req = BrowserRequest {
-                action: action.into(),
-                ..Default::default()
-            };
-            let err = execute(dir.path(), "agent-a", req)
-                .await
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("\"code\":\"UNSUPPORTED\""), "{action}: {err}");
+            let req: BrowserRequest = serde_json::from_value(req).unwrap();
+            let err = execute(
+                dir.path(),
+                &caller(),
+                req,
+                &crate::agent_file::FileAuthority::Own,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(&format!("\"code\":\"{code}\"")), "{err}");
         }
         assert!(super::super::session::running(dir.path(), "agent-a").is_none());
-        let err = execute(
-            dir.path(),
-            "agent-a",
-            BrowserRequest {
-                action: "click".into(),
-                selector: Some("@s0:e1".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("STALE_REF"), "{err}");
     }
+    use serde_json::json;
 }
 
 #[cfg(all(test, not(target_os = "linux")))]
@@ -929,14 +1600,19 @@ mod tests {
     #[tokio::test]
     async fn non_linux_hosts_answer_unsupported_naming_the_routing_setting() {
         let dir = tempfile::tempdir().unwrap();
+        let caller = Caller {
+            principal: "agent-a".into(),
+            profile: "agent-a".into(),
+        };
         let err = execute(
             dir.path(),
-            "agent-a",
+            &caller,
             BrowserRequest {
                 action: "open".into(),
                 url: Some("https://example.com".into()),
                 ..Default::default()
             },
+            &crate::agent_file::FileAuthority::Own,
         )
         .await
         .unwrap_err()

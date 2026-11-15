@@ -34,32 +34,159 @@ pub fn format_agent_display(name: &str, role: Option<&str>) -> String {
 }
 
 /// New config roots are private before credentials or a seat grant exist.
-/// DirBuilder leaves an existing root's admitted group/mode unchanged.
+/// Parent directories are created first with umask-governed traversable
+/// permissions; only the target directory itself is restricted to `0o700`,
+/// leaving an existing root's admitted group/mode unchanged.
 fn create_private_config_dir(config: &Path) -> std::io::Result<()> {
+    if let Some(parent) = config.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(config)
+    match builder.create(config) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if err.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(config).is_ok_and(|m| m.is_dir()) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// What one creation attempt made on disk, so that a failed attempt removes
+/// exactly that and nothing that existed before it.
+#[derive(Default)]
+struct MadeDirs {
+    /// `<data>/agents/<id>`, which only this attempt's row names, and whether
+    /// this attempt created it.
+    root: Option<(PathBuf, bool)>,
+    /// Work directories and their parents this attempt created, oldest
+    /// first. Rollback removes each only while it is empty.
+    dirs: Vec<PathBuf>,
+}
+
+/// Unix permission bits of `path` itself, never of a symlink target.
+#[cfg(unix)]
+fn own_mode(path: &Path) -> std::io::Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta = std::fs::symlink_metadata(path)?;
+    Ok((meta.is_dir() && !meta.file_type().is_symlink())
+        .then(|| meta.permissions().mode() & 0o7777))
+}
+
+#[cfg(unix)]
+fn set_own_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// An agent tree is private from its first byte: the root is made `0o700`
+/// before anything is written into it, and opened for traversal only by
+/// [`open_agent_root`] once its config is private. A root that already exists
+/// can only have been made for this new id by a writer racing the creation; it
+/// is closed the same way and kept by rollback.
+fn create_private_agent_root(root: &Path, config: &Path) -> std::io::Result<bool> {
+    if let Some(parent) = root.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        // `<data>/agents` is the shared inventory every seat enumerates.
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(root) {
+        Ok(()) => Ok(true),
+        Err(err)
+            if err.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(root)
+                    .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) =>
+        {
+            #[cfg(unix)]
+            {
+                for dir in [root, config] {
+                    match own_mode(dir) {
+                        Ok(Some(mode)) if mode & 0o077 != 0 => set_own_mode(dir, mode & 0o7700)?,
+                        Ok(_) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = config;
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The seat reaches its config and a legacy managed workdir through the agent
+/// root. Open the root for traversal only after its config is private, with
+/// the same bits a umask-created root had.
+fn open_agent_root(root: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(mode) = own_mode(root)?
+        && mode & 0o011 == 0
+    {
+        set_own_mode(root, (mode | 0o755) & 0o7777)?;
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+    Ok(())
+}
+
+/// `create_dir_all` that records every level it made, so a failed creation
+/// can remove those levels and no directory that existed before it.
+fn create_dir_all_recorded(
+    path: &Path,
+    made: &std::cell::RefCell<MadeDirs>,
+) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = Some(path);
+    while let Some(dir) = cursor.filter(|dir| !dir.as_os_str().is_empty()) {
+        match std::fs::symlink_metadata(dir) {
+            Ok(_) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(dir.to_path_buf());
+                cursor = dir.parent();
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    for dir in missing.into_iter().rev() {
+        match std::fs::create_dir(&dir) {
+            Ok(()) => made.borrow_mut().dirs.push(dir),
+            // Another writer made it first; it is not this attempt's.
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agent, Error> {
-    create_with_consumer(
-        store,
-        data,
-        request,
-        &crate::worktree::Consumer::configured(),
-    )
+    let data = std::path::absolute(data)?;
+    let checkouts = crate::repo::Checkouts::configured(&data);
+    create_with_consumer(store, &data, request, &checkouts)
 }
 
 fn create_with_consumer(
     store: &Store,
     data: &Path,
     request: CreateRequest,
-    consumer: &crate::worktree::Consumer,
+    consumer: &crate::repo::Checkouts,
 ) -> Result<Agent, Error> {
     create_with_seat(store, data, request, consumer, None)
 }
@@ -70,7 +197,7 @@ fn create_with_seat(
     store: &Store,
     data: &Path,
     request: CreateRequest,
-    consumer: &crate::worktree::Consumer,
+    consumer: &crate::repo::Checkouts,
     seat_override: Option<WorkdirSeat>,
 ) -> Result<Agent, Error> {
     let normalized_harness = normalize_harness_name(&request.harness).to_string();
@@ -104,6 +231,8 @@ fn create_with_seat(
     let data = std::path::absolute(data)?;
     // A checkout the consumer produced for this creation; rollback removes it.
     let provisioned: std::cell::RefCell<Option<PathBuf>> = std::cell::RefCell::new(None);
+    // Every directory this call made; rollback removes exactly these.
+    let made: std::cell::RefCell<MadeDirs> = std::cell::RefCell::new(MadeDirs::default());
     let finish = (|| -> Result<Agent, Error> {
         crate::sandbox::bind_principal(store, &agent)?;
         // Nothing is installed until an agent needs it: this is that moment. A
@@ -125,8 +254,13 @@ fn create_with_seat(
         }
         store.set_agent_launch_env(&agent.id, &pairs)?;
         let managed = agent_work_dir(&data, &agent.id);
-        std::fs::create_dir_all(&managed)?;
         let config = agent_config_dir(&data, &agent.id);
+        let root = config
+            .parent()
+            .ok_or_else(|| Error::Message("agent config has no root".into()))?
+            .to_path_buf();
+        let made_root = create_private_agent_root(&root, &config)?;
+        made.borrow_mut().root = Some((root.clone(), made_root));
         create_private_config_dir(&config)?;
         let _ = std::fs::create_dir_all(config.join("tmp"));
         if let Some(prof) = request
@@ -254,6 +388,7 @@ fn create_with_seat(
                     &target_wt,
                     parent_name.as_deref(),
                     &provisioned,
+                    &made,
                 )?;
                 target_wt
             }
@@ -285,9 +420,11 @@ fn create_with_seat(
         } else {
             match &explicit_workdir {
                 Some(path) => {
-                    std::fs::create_dir_all(path).map_err(|error| Error::WorkdirPermission {
-                        path: path.display().to_string(),
-                        message: error.to_string(),
+                    create_dir_all_recorded(path, &made).map_err(|error| {
+                        Error::WorkdirPermission {
+                            path: path.display().to_string(),
+                            message: error.to_string(),
+                        }
                     })?;
                     let abs = std::path::absolute(path)?;
                     if agent.parent_id.is_some()
@@ -319,7 +456,7 @@ fn create_with_seat(
                     } else {
                         match &request.workdir_default {
                             Some(shared) => {
-                                std::fs::create_dir_all(shared)?;
+                                create_dir_all_recorded(shared, &made)?;
                                 std::path::absolute(shared)?
                             }
                             None => managed_abs.clone(),
@@ -328,35 +465,26 @@ fn create_with_seat(
                 }
             }
         };
-        if let Some((_, uid, gid, launch)) = seat_override
+        if cwd == managed_abs && !managed_abs.exists() {
+            create_dir_all_recorded(&managed_abs, &made)?;
+        }
+        // The config is private; the seat may now traverse to its own tree.
+        open_agent_root(&root)?;
+        let (uid, gid, launch) = match seat_override
             .clone()
             .or_else(|| resolved_agent_seat_info(store, &agent))
         {
-            if workdir_created || cwd == managed_abs {
-                crate::sandbox::share_worktree_with_seat(
-                    &cwd,
-                    uid,
-                    gid,
-                    &crate::worktree_access::grant_path(&data, &agent.id),
-                )?;
-            }
-            crate::worktree_access::verify(&cwd, uid, gid, launch.as_deref())?;
-        } else {
-            if workdir_created || cwd == managed_abs {
-                crate::sandbox::share_worktree_with_seat(
-                    &cwd,
-                    crate::sandbox::server_uid(),
-                    crate::sandbox::server_gid(),
-                    &crate::worktree_access::grant_path(&data, &agent.id),
-                )?;
-            }
-            crate::worktree_access::verify(
-                &cwd,
+            Some((_, uid, gid, launch)) => (uid, gid, launch),
+            None => (
                 crate::sandbox::server_uid(),
                 crate::sandbox::server_gid(),
                 None,
-            )?;
+            ),
+        };
+        if workdir_created || cwd == managed_abs {
+            crate::sandbox::share_worktree_with_seat(&cwd, gid)?;
         }
+        crate::repo::verify(&cwd, uid, gid, launch.as_deref())?;
         crate::operator::mint(store, &agent.id)?;
         store.set_agent_launch_env(&agent.id, &pairs)?;
         if anyagents_tools::SandboxConfig::from_config_dir(&config).is_none()
@@ -379,9 +507,9 @@ fn create_with_seat(
     if let Err(error) = finish {
         return Err(roll_back_failed_creation(
             store,
-            &data,
             &agent,
             provisioned.into_inner().as_deref(),
+            &made.into_inner(),
             error,
         ));
     }
@@ -389,39 +517,39 @@ fn create_with_seat(
 }
 
 /// Undo a creation that failed after its name was reserved. The same name must
-/// always be retryable. If revocation of a partial worktree grant fails, the
-/// row, journal and checkout are kept (maintenance needs them to finish the
-/// revocation) but the row releases its name. Otherwise the row and the
-/// agent's directory are removed; a row that cannot be deleted releases its
-/// name the same way.
+/// always be retryable. The row, the checkout this attempt made and the
+/// directories it made are removed; a row that cannot be deleted releases its
+/// name instead. Whatever stays behind is closed to seats first, so a kept
+/// tree never fails another seat's peer-boundary check.
 fn roll_back_failed_creation(
     store: &Store,
-    data: &Path,
     agent: &Agent,
     provisioned: Option<&Path>,
+    made: &MadeDirs,
     error: Error,
 ) -> Error {
-    if let Err(revocation) = crate::worktree_access::revoke_recorded(data, &agent.id) {
-        if let Err(release) = store.release_unadmitted_agent(&agent.id) {
-            eprintln!(
-                "warning: failed creation of {} kept its name: {release}",
-                agent.name
-            );
-        }
+    #[cfg(unix)]
+    if let Some((root, _)) = &made.root
+        && let Ok(Some(mode)) = own_mode(root)
+        && mode & 0o077 != 0
+        && let Err(close) = set_own_mode(root, mode & 0o7700)
+    {
         eprintln!(
-            "warning: failed creation {} keeps its worktree grant journal for recovery: {revocation}",
+            "warning: cannot close partial directory {} of failed creation {}: {close}",
+            root.display(),
             agent.id
         );
-        return error;
     }
+    let mut kept_checkout = None;
     if let Some(checkout) = provisioned
-        && let Err(cleanup) = remove_provisioned_checkout(checkout)
+        && let Err(cleanup) = crate::repo::discard(checkout)
     {
         eprintln!(
             "warning: cannot remove checkout {} of failed creation {}: {cleanup}",
             checkout.display(),
             agent.id
         );
+        kept_checkout = Some(checkout);
     }
     if let Err(delete) = store.delete_agent(&agent.id) {
         eprintln!(
@@ -436,104 +564,45 @@ fn roll_back_failed_creation(
         }
         return error;
     }
-    if let Err(remove) = std::fs::remove_dir_all(data.join("agents").join(agent.id.as_str()))
-        && remove.kind() != std::io::ErrorKind::NotFound
-    {
-        eprintln!(
-            "warning: cannot remove partial directory of failed creation {}: {remove}",
-            agent.id
-        );
-    }
+    remove_made_dirs(made, kept_checkout, &agent.id);
     error
 }
 
-/// Undo a checkout made for a failed creation so the same name (and so the
-/// same default branch) can be provisioned again. Only this worktree's
-/// registration is removed. Its branch is deleted only by compare-and-delete
-/// when the tip is unchanged and still reachable from another ref, so no
-/// commit can be lost; otherwise the branch is kept.
-fn remove_provisioned_checkout(checkout: &Path) -> std::io::Result<()> {
-    let git = |dir: &Path, args: &[&std::ffi::OsStr]| -> std::io::Result<Option<String>> {
-        let out = std::process::Command::new("git")
-            .args([
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-C",
-            ])
-            .arg(dir)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()?;
-        Ok(out
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string()))
-    };
-    let os = |s: &'static str| std::ffi::OsStr::new(s);
-    if !checkout.join(".git").exists() {
-        return Ok(());
+/// Remove, newest first, exactly the directories one failed creation made.
+/// Work directories go only while empty, so no content this attempt did not
+/// write is ever removed. The agent root this attempt made holds only what it
+/// wrote, unless a checkout it could not remove lives inside; then it stays.
+fn remove_made_dirs(made: &MadeDirs, kept_checkout: Option<&Path>, id: &AgentId) {
+    for dir in made.dirs.iter().rev() {
+        match std::fs::remove_dir(dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => eprintln!(
+                "warning: keeping directory {} of failed creation {id}: {err}",
+                dir.display()
+            ),
+        }
     }
-    let Some(common) = git(
-        checkout,
-        &[
-            os("rev-parse"),
-            os("--path-format=absolute"),
-            os("--git-common-dir"),
-        ],
-    )?
-    else {
-        return Err(std::io::Error::other(
-            "checkout has no readable common store",
-        ));
+    let Some((root, true)) = &made.root else {
+        return;
     };
-    let common = PathBuf::from(common);
-    let branch = git(checkout, &[os("symbolic-ref"), os("--quiet"), os("HEAD")])?;
-    let tip = git(checkout, &[os("rev-parse"), os("--verify"), os("HEAD")])?;
-    if git(
-        &common,
-        &[
-            os("worktree"),
-            os("remove"),
-            os("--force"),
-            checkout.as_os_str(),
-        ],
-    )?
-    .is_none()
+    if kept_checkout.is_some_and(|checkout| checkout.starts_with(root)) {
+        eprintln!(
+            "warning: keeping directory {} of failed creation {id}: it holds a checkout",
+            root.display()
+        );
+        return;
+    }
+    if let Err(remove) = std::fs::remove_dir_all(root)
+        && remove.kind() != std::io::ErrorKind::NotFound
     {
-        return Err(std::io::Error::other("git worktree remove refused"));
+        eprintln!("warning: cannot remove partial directory of failed creation {id}: {remove}");
     }
-    let (Some(branch), Some(tip)) = (branch, tip) else {
-        return Ok(());
-    };
-    let containing = git(
-        &common,
-        &[
-            os("for-each-ref"),
-            os("--format=%(refname)"),
-            os("--contains"),
-            std::ffi::OsStr::new(&tip),
-        ],
-    )?
-    .unwrap_or_default();
-    if containing.lines().any(|name| name != branch) {
-        git(
-            &common,
-            &[
-                os("update-ref"),
-                os("-d"),
-                std::ffi::OsStr::new(&branch),
-                std::ffi::OsStr::new(&tip),
-            ],
-        )?;
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn provision_managed_worktree(
-    consumer: &crate::worktree::Consumer,
+    consumer: &crate::repo::Checkouts,
     store: &Store,
     agent: &Agent,
     config: &Path,
@@ -543,6 +612,7 @@ fn provision_managed_worktree(
     target_wt: &Path,
     _parent_name: Option<&str>,
     provisioned: &std::cell::RefCell<Option<PathBuf>>,
+    made: &std::cell::RefCell<MadeDirs>,
 ) -> Result<(), Error> {
     if target_wt.exists() {
         let is_empty = std::fs::read_dir(target_wt)
@@ -558,7 +628,7 @@ fn provision_managed_worktree(
         }
     }
     if let Some(parent_dir) = target_wt.parent() {
-        std::fs::create_dir_all(parent_dir)?;
+        create_dir_all_recorded(parent_dir, made)?;
     }
     let branch = branch_opt
         .map(str::trim)
@@ -590,10 +660,6 @@ fn provision_managed_worktree(
     }
     // The target was absent or empty above: this checkout belongs to us.
     *provisioned.borrow_mut() = Some(target_wt.to_path_buf());
-
-    // Identity belongs to this checkout, not A's common config. Replacing the
-    // common file as the server would drop its owner and existing named ACLs.
-    crate::worktree_access::set_worktree_identity(target_wt)?;
 
     record_managed_worktree_marker(config, target_wt, repo_raw, Some(&branch))?;
     Ok(())
@@ -910,7 +976,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
         doc.push_str("- **Parent**: none (root)\n");
     }
 
-    doc.push_str("- **Lifecycle**: Role templates may declare `lifecycle: standing | task`. Sub-agents never archive themselves; the spawning parent closes/archives a task sub-agent (`action: \"archive\"`) once its deliverable is accepted. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
+    doc.push_str("- **Lifecycle**: Role templates may declare `lifecycle: standing | task`. Sub-agents never archive themselves; the spawning parent records its verdict on the deliverable (`action: \"verdict\"`) and closes/archives a task sub-agent (`action: \"archive\"`) once it is accepted. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
 
     if let Some(custom) = agent
         .instructions
@@ -1176,7 +1242,7 @@ pub(crate) fn ensure_seat_environment(target_config: &Path, workdir: &Path) -> R
             let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777));
         }
     }
-    crate::worktree_access::configure_seat_git(target_config, workdir)?;
+    crate::repo::configure_seat_git(target_config, workdir)?;
     #[cfg(unix)]
     {
         let shared: Vec<String> = std::env::var("ANYAGENTS_SHARED_HOME_DIRS")
@@ -1254,42 +1320,66 @@ pub(crate) fn read_shared_agents_md(config: &Path) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// Fast-forward the checkout that holds the shared `skills` and `AGENTS.md`.
+/// One `ls-remote` names origin's `main`; while it is the commit this process
+/// last pulled, the checkout is neither scanned nor pulled.
 #[cfg(unix)]
 pub(crate) fn sync_canonical_skills(data_dir: &Path) {
-    for rel in ["skills", "AGENTS.md"] {
-        let target_path = data_dir.join(rel);
-        if let Ok(resolved) = std::fs::canonicalize(&target_path)
-            && let Some(repo_root) = resolved.parent()
-            && repo_root.join(".git").exists()
-        {
-            let is_clean = std::process::Command::new("git")
-                .args([
-                    "-c",
-                    "core.fsmonitor=false",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                ])
-                .arg("-C")
-                .arg(repo_root)
-                .args(["status", "--porcelain"])
-                .output()
-                .ok()
-                .is_some_and(|o| o.status.success() && o.stdout.is_empty());
-            if is_clean {
-                let _ = std::process::Command::new("git")
-                    .args([
-                        "-c",
-                        "core.fsmonitor=false",
-                        "-c",
-                        "core.hooksPath=/dev/null",
-                    ])
-                    .arg("-C")
-                    .arg(repo_root)
-                    .args(["pull", "--ff-only", "--quiet", "origin", "main"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+    static PULLED: Mutex<BTreeMap<PathBuf, String>> = Mutex::new(BTreeMap::new());
+    let git = |repo_root: &Path| {
+        let mut command = std::process::Command::new("git");
+        command
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .arg("-C")
+            .arg(repo_root);
+        command
+    };
+    let repo_roots: std::collections::BTreeSet<PathBuf> = ["skills", "AGENTS.md"]
+        .into_iter()
+        .filter_map(|rel| std::fs::canonicalize(data_dir.join(rel)).ok())
+        .filter_map(|resolved| resolved.parent().map(Path::to_path_buf))
+        .filter(|repo_root| repo_root.join(".git").exists())
+        .collect();
+    for repo_root in repo_roots {
+        let remote_main = git(&repo_root)
+            .args(["ls-remote", "--quiet", "origin", "refs/heads/main"])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string)
+            });
+        let pulled = || PULLED.lock().unwrap_or_else(PoisonError::into_inner);
+        if remote_main.is_some() && pulled().get(&repo_root) == remote_main.as_ref() {
+            continue;
+        }
+        let is_clean = git(&repo_root)
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .is_some_and(|o| o.status.success() && o.stdout.is_empty());
+        if !is_clean {
+            continue;
+        }
+        let fast_forwarded = git(&repo_root)
+            .args(["pull", "--ff-only", "--quiet", "origin", "main"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if fast_forwarded && let Some(commit) = remote_main {
+            pulled().insert(repo_root, commit);
         }
     }
 }
@@ -1598,12 +1688,36 @@ pub(crate) fn write_seat_shared_file(dst: &Path, bytes: &[u8], mode: u32) -> boo
     }
 }
 
+/// Markers live in an agent tree that creation made private. Writing one never
+/// makes that tree: a writer holding a row read before its creation made the
+/// tree, or after a failed creation removed it, would otherwise leave an
+/// orphan `<data>/agents/<id>` with umask permissions, which every seat's
+/// peer-boundary check refuses. Only a config directory missing inside an
+/// existing agent root is made, and privately.
 pub(crate) fn write_profile_marker(
     config_dir: &Path,
     marker_file: &str,
     content: &str,
 ) -> Result<(), Error> {
-    write_required_file(&config_dir.join(marker_file), content.as_bytes(), 0o664)
+    if !config_dir.is_dir() {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(config_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && config_dir.is_dir() => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    anyagents_harness::atomic_write_in_existing_dir(
+        &config_dir.join(marker_file),
+        content.as_bytes(),
+        0o664,
+    )
+    .map_err(Error::from)
 }
 
 pub(crate) fn seeded_profile_name(config_dir: &Path) -> Option<String> {
@@ -2082,6 +2196,10 @@ pub(crate) fn seed_harness_credentials(
             ".grok/settings_cache.json",
         ],
         "spiron" | "spiron-cloud" => &[
+            "spiron-agent.json",
+            "sylphx-agent.json",
+            "opencode.json",
+            "opencode/opencode.json",
             "auth.json",
             "credentials.json",
             "config.toml",
@@ -2223,10 +2341,12 @@ pub(crate) fn seed_harness_credentials(
                     | ".omp/agent/agent.db"
                     | "agent.db"
             );
+        let is_seat_selector = matches!(rel.as_str(), "spiron-agent.json" | "sylphx-agent.json");
         let dst_non_empty = dst.metadata().is_ok_and(|m| m.len() > 0);
-        if dst_non_empty && !is_auth_cred {
+        if !profile_changed && !is_seat_selector && dst_non_empty && !is_auth_cred {
             continue;
         }
+        let mut found_in_profile = false;
         for profile_root in &profile_roots {
             let mut src = profile_root.join(rel);
             if !src.is_file() {
@@ -2259,12 +2379,22 @@ pub(crate) fn seed_harness_credentials(
                 } else {
                     raw_src_bytes
                 };
+                if src_bytes.is_empty() && !is_auth_cred {
+                    let already_empty = dst.is_file() && dst.metadata().is_ok_and(|m| m.len() == 0);
+                    if !already_empty {
+                        anyagents_harness::atomic_write_file(&dst, &src_bytes, 0o660)
+                            .map_err(Error::from)?;
+                    }
+                    found_in_profile = true;
+                    break;
+                }
                 if dst_non_empty {
                     if std::fs::read(&dst).is_err() {
                         chmod_seat_file_readable(&dst);
                     }
                     if let Ok(dst_bytes) = std::fs::read(&dst) {
                         if src_bytes == dst_bytes {
+                            found_in_profile = true;
                             break;
                         }
                         if !profile_changed && !is_anthropic_cred {
@@ -2285,16 +2415,43 @@ pub(crate) fn seed_harness_credentials(
                                 || (src_exp.is_some_and(|s_exp| s_exp > now_ms)
                                     && dst_exp.is_none());
                             if !newer_oauth {
+                                found_in_profile = true;
                                 break;
                             }
                         }
                     } else if !profile_changed && !is_anthropic_cred {
+                        found_in_profile = true;
                         break;
                     }
                 }
-                write_required_file(&dst, &src_bytes, 0o660)?;
+                if !(dst_non_empty
+                    && !is_auth_cred
+                    && std::fs::read(&dst).is_ok_and(|cur| cur == src_bytes))
+                {
+                    write_required_file(&dst, &src_bytes, 0o660)?;
+                }
+                found_in_profile = true;
                 break;
             }
+        }
+        if !found_in_profile
+            && !profile_roots.is_empty()
+            && dst.exists()
+            && (is_seat_selector
+                || (profile_changed
+                    && (is_auth_cred
+                        || matches!(
+                            rel.as_str(),
+                            "config.toml"
+                                | "opencode.json"
+                                | "opencode/opencode.json"
+                                | ".config/opencode/opencode.json"
+                                | "settings.json"
+                                | "models_cache.json"
+                                | "model-catalog-direct.json"
+                        ))))
+        {
+            let _ = std::fs::remove_file(&dst);
         }
     }
     if crate::vendor::is_spiron_harness(&agent.harness) {
@@ -2346,7 +2503,6 @@ pub(crate) fn reset_agent_session_locked(
     }
     let _process = store.try_lock_agent(&agent.id)?;
     let root = store.data_dir().join("agents").join(agent.id.as_str());
-    promote_retired_spiron_hold_to_recovery(store, agent, &root)?;
     let session = anyagents_core::host_session::reset_session_with_source(
         &root,
         &agent.harness,
@@ -2358,42 +2514,6 @@ pub(crate) fn reset_agent_session_locked(
         "generation": session.generation, "harness": session.harness,
         "memory_sha256": session.memory.sha256,
     }))
-}
-
-fn promote_retired_spiron_hold_to_recovery(
-    store: &Store,
-    agent: &Agent,
-    root: &Path,
-) -> Result<(), Error> {
-    let hold_path = root.join("config/spiron-unconfirmed-steers.json");
-    if let Ok(meta) = std::fs::symlink_metadata(&hold_path)
-        && meta.file_type().is_file()
-        && meta.len() > 0
-        && let Ok(bytes) = std::fs::read(&hold_path)
-        && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
-    {
-        let mut ids: Vec<String> = val
-            .get("request_ids")
-            .and_then(serde_json::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(turn_id) = val.get("turn_id").and_then(serde_json::Value::as_str)
-            && !turn_id.is_empty()
-            && !ids.iter().any(|id| id == turn_id)
-        {
-            ids.insert(0, turn_id.to_string());
-        }
-        if !ids.is_empty() {
-            store.promote_messages_to_open_turn(&agent.id, &ids)?;
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
@@ -2778,7 +2898,11 @@ pub(crate) fn reconcile_agent_runtime_config(
                     &command,
                     &args,
                 )?;
-                crate::vendor::ensure_agy_steering_settings(config, work_dir)?;
+                crate::vendor::ensure_agy_steering_settings(
+                    config,
+                    work_dir,
+                    &data.join(anyagents_harness::media::MEDIA_DIR),
+                )?;
             }
             "muse" => {
                 muse_config::write(config, agent.model.as_deref(), &command, &args)?;
@@ -3138,6 +3262,23 @@ pub(crate) fn poke_agent_wake_socket_mail(data: &Path, agent_id: &AgentId) {
     }
 }
 
+/// Install the harness a runtime change moves an agent onto. A change of model
+/// or profile alone keeps the binary the agent already runs, so it installs
+/// nothing and cannot fail on that harness's source.
+fn install_changed_harness(
+    data: &Path,
+    previous_harness: &str,
+    target_harness: &str,
+    record: impl FnOnce(&Path, &str) -> Result<crate::install::Install, String>,
+) -> Result<(), Error> {
+    if normalize_harness_name(previous_harness) == target_harness {
+        return Ok(());
+    }
+    record(data, target_harness)
+        .map(|_| ())
+        .map_err(Error::Message)
+}
+
 /// Declaratively update an existing agent's runtime configuration (`harness`, `model`, `profile`)
 /// in `state.db` without deleting or recreating its identity, killing an in-progress turn,
 /// replaying already-delivered messages, or reopening paused scope.
@@ -3168,7 +3309,12 @@ pub(crate) fn configure_agent_runtime(
         && !crate::sandbox::is_isolated_test_env()
         && actor != "system:profile-rebalance"
     {
-        crate::install::record(data, &target_harness).map_err(Error::Message)?;
+        install_changed_harness(
+            data,
+            &previous_harness,
+            &target_harness,
+            crate::install::record,
+        )?;
     }
     let current_bound = bound_profile_name(&config);
 
@@ -3451,11 +3597,37 @@ fn write_profile_key_file(dir: &Path, filename: &str, key: &str) -> Result<(), E
     write_required_file(&key_path, format!("{key}\n").as_bytes(), 0o600)
 }
 
+/// How a credential write relates to the processes already running on it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialChange {
+    /// New credentials: running processes move to them at their next boundary.
+    Replaced,
+    /// The same account renewed its token. The harness renews tokens by itself,
+    /// so this only refreshes files for future launches.
+    Renewed,
+}
+
 pub(crate) fn propagate_profile_files_to_bound_agents(
     data: &Path,
     provider: &str,
     profile: &str,
     rel_paths: &[&str],
+) -> Result<(), Error> {
+    propagate_credentials(
+        data,
+        provider,
+        profile,
+        rel_paths,
+        CredentialChange::Replaced,
+    )
+}
+
+fn propagate_credentials(
+    data: &Path,
+    provider: &str,
+    profile: &str,
+    rel_paths: &[&str],
+    change: CredentialChange,
 ) -> Result<(), Error> {
     let prof_dir = data.join("profiles").join(provider).join(profile);
     let target_tag = format!("{provider}/{profile}");
@@ -3536,28 +3708,29 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
             ".anyagents-seeded-profile",
             &format!("{target_tag}\n"),
         )?;
-        let now_prop = anyagents_core::now_ms();
-        let _ = write_profile_marker(
-            &cfg,
-            ".anyagents-quota-cleared-ms",
-            &format!("{now_prop}\n"),
-        );
-        let has_open = store_opt
-            .as_ref()
-            .is_some_and(|s| s.has_open_turn(&agent_rec.id).unwrap_or(false));
-        if !has_open {
+        if change == CredentialChange::Replaced {
+            let now_prop = anyagents_core::now_ms();
+            let _ = write_profile_marker(
+                &cfg,
+                ".anyagents-quota-cleared-ms",
+                &format!("{now_prop}\n"),
+            );
+            // A profile change holds no mail and never preempts a live turn:
+            // the supervisor moves the process at its next idle or faulted point.
             write_profile_marker(
                 &cfg,
                 ".anyagents-profile-rotated-ms",
                 &format!("{now_prop}\n"),
             )?;
+            let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         }
-        let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         if let Some(s) = store_opt.as_ref() {
             if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
                 crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
             }
-            poke_agent_wake_socket(data, &agent_rec.id);
+            if change == CredentialChange::Replaced {
+                poke_agent_wake_socket(data, &agent_rec.id);
+            }
         }
     }
     Ok(())
@@ -5105,17 +5278,82 @@ fn merge_preserved_oauth_metadata(src_bytes: &[u8], dst_bytes: &[u8]) -> Option<
     changed.then(|| serde_json::to_vec(&src_val).ok()).flatten()
 }
 
+/// A file's identity and content stamp: any rewrite, rename or chmod changes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+type CopyStamps = (FileStamp, FileStamp);
+
+/// `(source, destination)` pairs a copy last found nothing to do for, with the
+/// stamps both files had then. The decision depends only on the two files, so
+/// while neither changes it stands without reading them again.
+static SETTLED_COPIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(PathBuf, PathBuf), CopyStamps>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn settled_copies()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<(PathBuf, PathBuf), CopyStamps>> {
+    SETTLED_COPIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+thread_local! {
+    static COPY_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
+    let key = (src.to_path_buf(), dst.to_path_buf());
+    let stamps = std::fs::symlink_metadata(src)
+        .ok()
+        .zip(std::fs::metadata(dst).ok())
+        .map(|(src_meta, dst_meta)| (FileStamp::of(&src_meta), FileStamp::of(&dst_meta)));
+    if stamps.is_some() && settled_copies().get(&key) == stamps.as_ref() {
+        return false;
+    }
+    let copied = copy_seat_file_if_newer_uncached(src, dst);
+    // Stamps taken before the read: a change during it is seen next time.
+    match stamps.filter(|_| !copied) {
+        Some(stamps) => settled_copies().insert(key, stamps),
+        None => settled_copies().remove(&key),
+    };
+    copied
+}
+
+fn copy_seat_file_if_newer_uncached(src: &Path, dst: &Path) -> bool {
+    #[cfg(test)]
+    COPY_EVALUATIONS.with(|count| count.set(count.get() + 1));
     let Ok(src_meta) = std::fs::symlink_metadata(src) else {
         return false;
     };
     if src_meta.file_type().is_symlink() || !src_meta.file_type().is_file() || src_meta.len() == 0 {
         return false;
     }
-    if std::fs::read(src).is_err() {
+    let read = std::fs::read(src).or_else(|_| {
         chmod_seat_file_readable(src);
-    }
-    let Ok(mut src_bytes) = std::fs::read(src) else {
+        std::fs::read(src)
+    });
+    let Ok(mut src_bytes) = read else {
         return false;
     };
     if src_bytes.is_empty() {
@@ -5248,8 +5486,9 @@ fn sync_and_list_provider_profiles_inner(
 
         // Seed upstream provider profiles from existing seats on this server so pre-existing
         // logins (Subscriptions, Coding Plans, API Keys) are registered in the Master Pool.
+        // A seat still being created (or whose creation failed) is not one yet.
         for agent in &agents {
-            if agent.state == "archived" {
+            if matches!(agent.state.as_str(), "archived" | "created") {
                 continue;
             }
             let cfg = agent_config_dir(data, &agent.id);
@@ -5473,7 +5712,9 @@ fn sync_and_list_provider_profiles_inner(
             _ => (expected_provider.clone(), "default".to_string()),
         };
         let normalized = format!("{bound_prov}/{bound_prof}");
-        if bound.as_deref() != Some(normalized.as_str()) {
+        // A listing never writes into an agent whose creation is in flight or
+        // failed: its tree may be gone, and a write would bring it back.
+        if agent.state != "created" && bound.as_deref() != Some(normalized.as_str()) {
             write_profile_marker(&cfg, ".anyagents-profile", &format!("{normalized}\n"))
                 .unwrap_or_else(|err| eprintln!("runtime persistence failed: {err}"));
         }
@@ -5599,10 +5840,11 @@ fn rebalance_provider_profiles(
         // Working seats still contribute load, but automatic maintenance must
         // not rewrite their credentials or request a process rotation mid-turn.
         // Read the durable turn state afresh rather than trusting the census.
+        // An agent still being created is never moved: its tree may be gone.
         let can_move = |name: &str| {
-            store
-                .agent_by_name(name)
-                .is_ok_and(|agent| store.has_open_turn(&agent.id).is_ok_and(|open| !open))
+            store.agent_by_name(name).is_ok_and(|agent| {
+                agent.state != "created" && store.has_open_turn(&agent.id).is_ok_and(|open| !open)
+            })
         };
         // Step 1: evacuate exhausted profiles (0% left) onto any profile with remaining quota (> 0% left).
         let prof_keys: Vec<String> = bound.keys().cloned().collect();
@@ -5896,6 +6138,15 @@ fn overlay_active_quota_reset_on_cached_usage(
 }
 
 pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
+    if let Ok(store) = Store::open(data.join("state.db")) {
+        sync_fresher_bound_agent_credentials_in(&store, data);
+    }
+}
+
+/// Copy fresher credentials between live agents' seats and their bound
+/// profiles. Archived agents run no harness, so their seats never refresh a
+/// token; a pair of files unchanged since the last pass is not read again.
+pub(crate) fn sync_fresher_bound_agent_credentials_in(store: &Store, data: &Path) {
     let profiles_root = data.join("profiles");
     let now_ms = anyagents_core::now_ms();
     let sync_stamp = profiles_root.join(".last-agent-cred-sync-ms");
@@ -5916,20 +6167,14 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
             }
         }
     }
-    if let Ok(store) = Store::open(data.join("state.db"))
-        && let Ok(agents) = store.list_agents()
-    {
+    if let Ok(agents) = store.list_live_agents() {
         for agent in &agents {
-            if agent.state == "archived" {
+            // A seat still being created (or whose creation failed) has no
+            // credentials to sync, and a write could recreate a removed tree.
+            if agent.state == "created" {
                 continue;
             }
             let cfg = agent_config_dir(data, &agent.id);
-            if agent.harness == "claude-code"
-                && let Some(reset_ms) =
-                    anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now_ms)
-            {
-                record_profile_quota_reset(data, agent, reset_ms);
-            }
             let bound = bound_profile_name(&cfg);
             let seeded = seeded_profile_name(&cfg);
             if seeded.is_some() && bound.is_some() && seeded != bound {
@@ -5962,11 +6207,16 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
                 }
             }
             if updated_any {
-                propagate_profile_files_to_bound_agents(data, &provider, &prof_name, rels)
+                let change = if provider == "google-antigravity" {
+                    CredentialChange::Renewed
+                } else {
+                    CredentialChange::Replaced
+                };
+                propagate_credentials(data, &provider, &prof_name, rels, change)
                     .unwrap_or_else(|err| eprintln!("runtime persistence failed: {err}"));
             } else if provider == "anthropic" {
                 sync_anthropic_agent_credentials_from_profile(
-                    Some(&store),
+                    Some(store),
                     data,
                     agent,
                     &cfg,
@@ -7082,18 +7332,25 @@ pub(crate) fn probe_one_profile_usage(
                         .and_then(|s| s.trim().parse::<i64>().ok())
                         .unwrap_or(0);
                     if now_ms.saturating_sub(last_attempt_ms) < 300_000 {
+                        let cached_expired = std::fs::read_to_string(&last_usage_path)
+                            .ok()
+                            .is_some_and(|s| s.trim().starts_with("oauth expired"));
+                        if cached_expired {
+                            return Some("oauth expired".to_string());
+                        }
                         write_seat_shared_file(&last_usage_path, b"__NONE__\n", 0o600);
                         return None;
                     }
                     let rtok = tok_val
                         .pointer("/token/refresh_token")
                         .or_else(|| tok_val.get("refresh_token"))
-                        .and_then(serde_json::Value::as_str)?
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
                         .trim()
                         .to_string();
                     if rtok.is_empty() {
-                        write_seat_shared_file(&last_usage_path, b"__NONE__\n", 0o600);
-                        return None;
+                        write_seat_shared_file(&last_usage_path, b"oauth expired\n", 0o600);
+                        return Some("oauth expired".to_string());
                     }
                     let reservation = match OAuthRefreshDiskReservation::acquire(
                         &prof_dir,
@@ -7138,8 +7395,8 @@ pub(crate) fn probe_one_profile_usage(
                         }
                     }
                     let Some((new_acc, new_ref)) = refreshed_tokens else {
-                        write_seat_shared_file(&last_usage_path, b"__NONE__\n", 0o600);
-                        return None;
+                        write_seat_shared_file(&last_usage_path, b"oauth expired\n", 0o600);
+                        return Some("oauth expired".to_string());
                     };
                     if let Some(tok_obj) = tok_val
                         .get_mut("token")
@@ -7170,11 +7427,12 @@ pub(crate) fn probe_one_profile_usage(
                                 eprintln!("credential refresh persistence failed: {err}")
                             })
                             .ok()?;
-                        propagate_profile_files_to_bound_agents(
+                        propagate_credentials(
                             data,
                             provider,
                             profile,
                             &[tok_rel],
+                            CredentialChange::Renewed,
                         )
                         .map_err(|err| eprintln!("runtime persistence failed: {err}"))
                         .ok()?;
@@ -8478,7 +8736,7 @@ pub(crate) fn try_rotate_exhausted_profile(
     if has_active_quota_hold && cur_pct.is_some_and(|pct| pct <= 0) {
         let bound_counts = count_bound_profile_agents(
             data,
-            &store.list_agents().unwrap_or_default(),
+            &store.list_live_agents().unwrap_or_default(),
             &provider,
             &agent.id,
         );
@@ -8628,10 +8886,35 @@ const PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS: i64 = 300_000;
 /// most recent refresh attempt also happened recently (so the token cannot silently
 /// recover on its own). Never probes the network and never treats a missing or stale
 /// signal as unhealthy evidence.
+fn google_oauth_expiry_ms(val: &serde_json::Value) -> Option<i64> {
+    for ptr in ["/token/expiry", "/expiry"] {
+        if let Some(raw) = val.pointer(ptr).and_then(serde_json::Value::as_str)
+            && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw.trim())
+        {
+            return Some(dt.timestamp_millis());
+        }
+    }
+    for ptr in [
+        "/token/expires_at",
+        "/expires_at",
+        "/token/expiry_date",
+        "/expiry_date",
+    ] {
+        if let Some(n) = val.pointer(ptr).and_then(serde_json::Value::as_i64) {
+            return Some(if n > 0 && n < 10_000_000_000 {
+                n.saturating_mul(1_000)
+            } else {
+                n
+            });
+        }
+    }
+    None
+}
+
 fn profile_has_unhealthy_evidence(dir: &Path) -> bool {
     let now_ms = anyagents_core::now_ms();
     let usage_path = dir.join(".anyagents-last-usage.txt");
-    if let Ok(usage) = std::fs::read_to_string(&usage_path) {
+    let usage_text_and_age = std::fs::read_to_string(&usage_path).ok().map(|usage| {
         let age_ms = std::fs::metadata(&usage_path)
             .and_then(|meta| meta.modified())
             .map(|mtime| {
@@ -8641,32 +8924,63 @@ fn profile_has_unhealthy_evidence(dir: &Path) -> bool {
                     .unwrap_or(0)
             })
             .unwrap_or(i64::MAX);
-        if parse_remaining_pct_from_usage(&usage, None) == Some(0)
+        (usage, age_ms)
+    });
+    if let Some((ref usage, age_ms)) = usage_text_and_age {
+        let trimmed = usage.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("oauth expired") && age_ms < PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS
+        {
+            return true;
+        }
+        if parse_remaining_pct_from_usage(trimmed, None) == Some(0)
             && age_ms < PROFILE_HEALTHY_USAGE_FRESHNESS_MS
         {
             return true;
         }
     }
-    let cred_text = std::fs::read_to_string(dir.join(".credentials.json"))
-        .or_else(|_| std::fs::read_to_string(dir.join(".claude/.credentials.json")));
-    let Ok(cred_text) = cred_text else {
-        return false;
-    };
-    let Ok(cred) = serde_json::from_str::<serde_json::Value>(&cred_text) else {
-        return false;
-    };
-    let expires_at = cred
-        .pointer("/claudeAiOauth/expiresAt")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(i64::MAX);
-    if expires_at > now_ms {
-        return false;
-    }
     let last_attempt_ms = std::fs::read_to_string(dir.join(OAUTH_REFRESH_ATTEMPT_FILE))
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
-    now_ms.saturating_sub(last_attempt_ms) < PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS
+    let recent_refresh_attempt = last_attempt_ms > 0
+        && now_ms.saturating_sub(last_attempt_ms) < PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS;
+
+    if let Ok(cred_text) = std::fs::read_to_string(dir.join(".credentials.json"))
+        .or_else(|_| std::fs::read_to_string(dir.join(".claude/.credentials.json")))
+        && let Ok(cred) = serde_json::from_str::<serde_json::Value>(&cred_text)
+    {
+        let expires_at = cred
+            .pointer("/claudeAiOauth/expiresAt")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(i64::MAX);
+        if expires_at <= now_ms && recent_refresh_attempt {
+            return true;
+        }
+    }
+
+    if let Ok(tok_text) =
+        std::fs::read_to_string(dir.join(".gemini/antigravity-cli/antigravity-oauth-token"))
+            .or_else(|_| std::fs::read_to_string(dir.join(".gemini/oauth_creds.json")))
+        && let Ok(tok) = serde_json::from_str::<serde_json::Value>(&tok_text)
+    {
+        let expires_at = google_oauth_expiry_ms(&tok).unwrap_or(i64::MAX);
+        let has_refresh_token = tok
+            .pointer("/token/refresh_token")
+            .or_else(|| tok.get("refresh_token"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        let usage_failed = usage_text_and_age.as_ref().is_none_or(|(u, _)| {
+            u.trim() == "__NONE__" || u.trim().to_ascii_lowercase().starts_with("oauth expired")
+        });
+        if (expires_at <= now_ms && (!has_refresh_token || recent_refresh_attempt))
+            || (recent_refresh_attempt && usage_failed)
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Selects (or reuses the already-bound) Upstream Provider Profile for `agent`
@@ -8982,6 +9296,36 @@ pub(crate) fn archetype_search_roots_with_ancestors(
     ancestor_workdirs: &[PathBuf],
     data_dir: &Path,
 ) -> Vec<(PathBuf, PathBuf)> {
+    archetype_search_roots_for_owner(
+        explicit_workdir,
+        ancestor_workdirs,
+        data_dir,
+        configured_owner_archetype_workdir().as_deref(),
+    )
+}
+
+fn configured_owner_archetype_workdir() -> Option<PathBuf> {
+    #[cfg(not(test))]
+    {
+        crate::server::owner_workdir()
+    }
+    #[cfg(test)]
+    {
+        None
+    }
+}
+
+fn archetype_search_roots_for_owner(
+    explicit_workdir: Option<&Path>,
+    ancestor_workdirs: &[PathBuf],
+    data_dir: &Path,
+    owner_workdir: Option<&Path>,
+) -> Vec<(PathBuf, PathBuf)> {
+    // Configuration is authoritative even when its catalog is missing or empty.
+    // Do not resurrect removed templates from a workspace, data directory or HOME.
+    if let Some(owner) = owner_workdir {
+        return vec![(owner.to_path_buf(), PathBuf::from(".agents/agents"))];
+    }
     let mut search_roots: Vec<(PathBuf, PathBuf)> = Vec::new();
     if let Some(wd) = explicit_workdir
         && !is_archetype_workdir_keyword(wd)
@@ -9000,12 +9344,6 @@ pub(crate) fn archetype_search_roots_with_ancestors(
                 PathBuf::from(".agents/agents"),
             );
         }
-    }
-    #[cfg(not(test))]
-    if search_roots.is_empty()
-        && let Some(owd) = crate::server::owner_workdir()
-    {
-        push_unique_search_root(&mut search_roots, owd, PathBuf::from(".agents/agents"));
     }
     let has_workspace_agents_dir = search_roots
         .iter()
@@ -9098,9 +9436,10 @@ pub(crate) fn has_configured_archetype_roots_with_ancestors(
     ancestor_workdirs: &[PathBuf],
     data_dir: &Path,
 ) -> bool {
-    archetype_search_roots_with_ancestors(explicit_workdir, ancestor_workdirs, data_dir)
-        .into_iter()
-        .any(|(base, rel_root)| base.join(rel_root).exists())
+    configured_owner_archetype_workdir().is_some()
+        || archetype_search_roots_with_ancestors(explicit_workdir, ancestor_workdirs, data_dir)
+            .into_iter()
+            .any(|(base, rel_root)| base.join(rel_root).exists())
 }
 
 pub(crate) fn discover_available_archetype_templates(
@@ -9553,7 +9892,7 @@ pub(crate) fn normalize_or_validate_agent_role(
             .unwrap_or(slugified));
     }
     let available = discover_available_archetype_slugs(agent_workdir, parent_workdir, data_dir);
-    if !available.is_empty() {
+    if !available.is_empty() || configured_owner_archetype_workdir().is_some() {
         return Err(Error::Message(format!(
             "unknown role template {role:?} (available: {})",
             available.join(", ")
@@ -9722,6 +10061,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_model_change_on_an_unconfigured_harness_installs_nothing() {
+        let _environment = crate::server::tests::env_lock();
+        let root = crate::test_tempdir();
+        let installer = crate::install::Installer::new(root.path());
+        // `agy` ships Unconfigured, so installing it fails ...
+        assert!(installer.ensure("agy").is_err());
+        // ... but a model or profile change keeps the binary the agent runs,
+        // including under a legacy spelling of the same harness.
+        for (previous, target) in [("agy", "agy"), ("sylphx", "spiron")] {
+            let mut asked = Vec::new();
+            install_changed_harness(root.path(), previous, target, |_, harness| {
+                asked.push(harness.to_string());
+                installer.ensure(harness)
+            })
+            .unwrap();
+            assert!(
+                asked.is_empty(),
+                "{previous} -> {target} installed {asked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_harness_change_still_verifies_the_target_harness() {
+        let _environment = crate::server::tests::env_lock();
+        let root = crate::test_tempdir();
+        let installer = crate::install::Installer::new(root.path());
+        let mut asked = Vec::new();
+        let err = install_changed_harness(root.path(), "codex", "agy", |_, harness| {
+            asked.push(harness.to_string());
+            installer.ensure(harness)
+        })
+        .unwrap_err();
+        assert_eq!(asked, ["agy"]);
+        assert!(err.to_string().contains("unverifiable source"), "{err}");
+    }
+
+    #[test]
     fn legacy_harness_selectors_create_and_switch_to_spiron_without_renaming_gateway() {
         let dir = crate::test_tempdir();
         let data = dir.path();
@@ -9846,14 +10223,122 @@ mod tests {
             .collect()
     }
 
+    /// A fully created agent on `openai/busy`; rebalancing never moves one
+    /// whose creation is still in flight.
     fn rebalance_test_agent(store: &Store, name: &str, parent: Option<&Agent>) -> Agent {
         let mut new = NewAgent::new(name, "codex");
         new.parent_id = parent.map(|a| a.id.clone());
         let agent = store.create_agent(new).unwrap();
+        let agent = store.set_agent_state(&agent.id, "idle").unwrap();
         let cfg = agent_config_dir(store.data_dir(), &agent.id);
         std::fs::create_dir_all(&cfg).unwrap();
         write_profile_marker(&cfg, ".anyagents-profile", "openai/busy\n").unwrap();
         agent
+    }
+
+    /// A marker writer holding a row whose tree does not exist (read before a
+    /// creation made it, or after a failed creation removed it) cannot make an
+    /// orphan tree; an existing root only gains a private config directory.
+    #[cfg(unix)]
+    #[test]
+    fn markers_never_make_an_agent_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("racing", "codex"))
+            .unwrap();
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        assert!(write_profile_marker(&cfg, ".anyagents-profile", "openai/default\n").is_err());
+        assert!(!dir.path().join("agents").join(agent.id.as_str()).exists());
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "openai/default\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(bound_profile_name(&cfg).as_deref(), Some("openai/default"));
+    }
+
+    /// The agent root is private before anything is written into it and opens
+    /// for traversal only through [`open_agent_root`]. A root a racing writer
+    /// made with umask permissions is closed, root and config alike, and is
+    /// not this attempt's to remove.
+    #[cfg(unix)]
+    #[test]
+    fn agent_roots_are_private_from_the_first_byte() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = crate::test_tempdir();
+        let root = dir.path().join("agents/fresh");
+        let config = root.join("config");
+        assert!(create_private_agent_root(&root, &config).unwrap());
+        assert_eq!(mode(&root), 0o700);
+        create_private_config_dir(&config).unwrap();
+        assert_eq!(mode(&config), 0o700);
+        open_agent_root(&root).unwrap();
+        assert_eq!(mode(&root), 0o755);
+        assert_eq!(
+            mode(&config),
+            0o700,
+            "opening the root leaves config private"
+        );
+
+        let raced = dir.path().join("agents/raced");
+        std::fs::create_dir_all(raced.join("config")).unwrap();
+        for path in [&raced, &raced.join("config")] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(raced.join("config/.anyagents-profile"), "openai/default\n").unwrap();
+        assert!(!create_private_agent_root(&raced, &raced.join("config")).unwrap());
+        assert_eq!(mode(&raced), 0o700);
+        assert_eq!(mode(&raced.join("config")), 0o700);
+        assert!(raced.join("config/.anyagents-profile").is_file());
+    }
+
+    /// A failed creation removes exactly the directories it made: its private
+    /// agent tree and the levels of an explicit workdir it created, never a
+    /// directory that existed before it or anything inside one.
+    #[cfg(unix)]
+    #[test]
+    fn failed_creation_removes_exactly_the_directories_it_made() {
+        let dir = crate::test_tempdir();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let f = crate::repo::tests::Fixture::new(&data);
+        // No capability key: the creation fails after admitting its workdir.
+        let store = Store::open(data.join("state.db")).unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::write(existing.join("user-work.txt"), "kept").unwrap();
+        let mut request = worktree_request("failing", None);
+        request.workdir = Some(existing.join("new/deeper"));
+        let err = create_with_consumer(&store, &data, request, &f.checkouts).unwrap_err();
+        assert!(err.to_string().contains("capability key"), "{err}");
+        assert!(matches!(
+            store.agent_by_name("failing"),
+            Err(Error::AgentNotFound(_))
+        ));
+        assert_eq!(std::fs::read_dir(data.join("agents")).unwrap().count(), 0);
+        assert!(!existing.join("new").exists(), "made levels are removed");
+        assert_eq!(
+            std::fs::read_to_string(existing.join("user-work.txt")).unwrap(),
+            "kept"
+        );
+
+        let mut request = worktree_request("failing", None);
+        request.workdir = Some(existing.clone());
+        assert!(create_with_consumer(&store, &data, request, &f.checkouts).is_err());
+        assert!(existing.is_dir(), "a pre-existing workdir is never removed");
+        assert_eq!(std::fs::read_dir(data.join("agents")).unwrap().count(), 0);
+
+        // A made workdir that gained content it did not get from this attempt stays.
+        let made = std::cell::RefCell::new(MadeDirs::default());
+        let target = dir.path().join("made-then-used");
+        create_dir_all_recorded(&target, &made).unwrap();
+        std::fs::write(target.join("late.txt"), "kept").unwrap();
+        remove_made_dirs(&made.into_inner(), None, &AgentId::generate());
+        assert!(target.join("late.txt").is_file());
     }
 
     #[cfg(unix)]
@@ -9864,6 +10349,11 @@ mod tests {
         let config = dir.path().join("created/config");
         create_private_config_dir(&config).unwrap();
         assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o777, 0o700);
+        assert_ne!(
+            std::fs::metadata(config.parent().unwrap()).unwrap().mode() & 0o011,
+            0,
+            "agent root parent must remain traversable when config is created"
+        );
         std::fs::write(config.join("credential"), "retained credential").unwrap();
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o2770)).unwrap();
         create_private_config_dir(&config).unwrap();
@@ -9876,6 +10366,191 @@ mod tests {
         std::fs::write(&blocked, "preserved").unwrap();
         assert!(create_private_config_dir(&blocked).is_err());
         assert_eq!(std::fs::read_to_string(blocked).unwrap(), "preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspaces_dir_keeps_agent_root_traversable_and_avoids_unused_managed_dirs() {
+        use std::os::unix::fs::MetadataExt;
+        const PROBE: &str = "ANYAGENTS_WORKSPACES_CREATE_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            for key in [
+                "ANYAGENTS_PRINCIPAL_REGISTRY",
+                "ANYAGENTS_PRINCIPALS",
+                "ANYAGENTS_AGENTS",
+                "ANYAGENTS_AGENT_UID",
+                "ANYAGENTS_AGENT_GID",
+                "ANYAGENTS_SOCKET_GID",
+                "ANYAGENTS_LAUNCHER",
+                "ANYAGENTS_SETPRIV",
+                "ANYAGENTS_DATA",
+                "ANYAGENTS_STATE_DIR",
+                "ANYAGENTS_WORKSPACES_DIR",
+                "ANYAGENTS_SCRATCH_DIR",
+                "ANYAGENTS_GIT_POOL_DIR",
+                "ANYAGENTS_PROTECTED_ROOTS",
+            ] {
+                cmd.env_remove(key);
+            }
+            let output = cmd
+                .env(PROBE, "1")
+                .env("ANYAGENTS_TEST_STORAGE_TIERS", "1")
+                .args([
+                    "--exact",
+                    "create::tests::workspaces_dir_keeps_agent_root_traversable_and_avoids_unused_managed_dirs",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "probe failed:
+stdout: {}
+stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        unsafe {
+            libc::umask(0o022);
+        }
+        let tmp = crate::test_tempdir();
+        let data = tmp.path().join("data");
+        let workspaces = tmp.path().join("workspaces");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&workspaces).unwrap();
+        unsafe {
+            std::env::set_var("ANYAGENTS_WORKSPACES_DIR", &workspaces);
+        }
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+
+        let managed_agent = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: "managed-worker".to_string(),
+                role: None,
+                harness: "codex".to_string(),
+                model: Some("test-model".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        let expected_managed = workspaces.join(managed_agent.id.as_str());
+        assert_eq!(
+            managed_agent.workdir.as_deref(),
+            Some(expected_managed.to_str().unwrap())
+        );
+        assert!(expected_managed.is_dir());
+
+        let managed_config = agent_config_dir(&data, &managed_agent.id);
+        let managed_root = managed_config.parent().unwrap();
+        assert_ne!(
+            std::fs::metadata(managed_root).unwrap().mode() & 0o011,
+            0,
+            "<data>/agents/<id> must be traversable with ANYAGENTS_WORKSPACES_DIR set"
+        );
+        // Simulate a fresh unshared private config before seat sharing.
+        let unshared_root = data.join("agents/unshared-probe");
+        let unshared_config = unshared_root.join("config");
+        create_private_config_dir(&unshared_config).unwrap();
+        assert_eq!(
+            std::fs::metadata(&unshared_root).unwrap().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(&unshared_config).unwrap().mode() & 0o777,
+            0o700
+        );
+        let (uid, gid) = (crate::sandbox::server_uid(), crate::sandbox::server_gid());
+        crate::sandbox::prepare_config_with_seat_uid(&unshared_config, uid, gid).unwrap();
+        assert_ne!(std::fs::metadata(&unshared_root).unwrap().mode() & 0o011, 0);
+        assert_eq!(
+            std::fs::metadata(&unshared_config).unwrap().mode() & 0o7777,
+            0o2770
+        );
+
+        let explicit_dir = tmp.path().join("explicit-work");
+        let explicit_agent = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: "explicit-worker".to_string(),
+                role: None,
+                harness: "codex".to_string(),
+                model: Some("test-model".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: Some(explicit_dir.clone()),
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_agent.workdir.as_deref(),
+            Some(explicit_dir.to_str().unwrap())
+        );
+        assert!(
+            !workspaces.join(explicit_agent.id.as_str()).exists(),
+            "explicit workdir must not eagerly create unused dir in ANYAGENTS_WORKSPACES_DIR"
+        );
+        let explicit_root = agent_config_dir(&data, &explicit_agent.id)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert_ne!(std::fs::metadata(&explicit_root).unwrap().mode() & 0o011, 0);
+
+        // If creation fails after creating managed workspace in ANYAGENTS_WORKSPACES_DIR,
+        // rollback must remove both <data>/agents/<id> and <workspaces>/<id>.
+        unsafe {
+            std::env::set_var("ANYAGENTS_PROTECTED_ROOTS", &workspaces);
+        }
+        let failed = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: "rollback-worker".to_string(),
+                role: None,
+                harness: "codex".to_string(),
+                model: Some("test-model".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: None,
+                description: None,
+                instructions: None,
+                parent_id: None,
+            },
+        );
+        assert!(failed.is_err());
+        let workspace_entries: Vec<_> = std::fs::read_dir(&workspaces)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            workspace_entries,
+            vec![expected_managed.file_name().unwrap().to_os_string()]
+        );
     }
 
     #[test]
@@ -9915,6 +10590,31 @@ mod tests {
             assert_eq!(after.model, moved.model);
             assert_eq!(after.state, moved.state);
         }
+    }
+
+    /// An agent whose creation is in flight or failed is never moved, even off
+    /// an exhausted profile: its tree may be gone, and a move would write it.
+    #[test]
+    fn rebalance_provider_profiles_never_moves_an_agent_being_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let entries = rebalance_test_profiles(data, 0);
+        let spawning = store
+            .create_agent(NewAgent::new("spawning", "codex"))
+            .unwrap();
+        let cfg = agent_config_dir(data, &spawning.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "openai/busy\n").unwrap();
+        let before = std::fs::read_dir(&cfg).unwrap().count();
+
+        rebalance_provider_profiles(&store, data, &store.list_agents().unwrap(), &entries);
+
+        assert_eq!(bound_profile_name(&cfg).as_deref(), Some("openai/busy"));
+        assert_eq!(std::fs::read_dir(&cfg).unwrap().count(), before);
     }
 
     #[test]
@@ -10043,7 +10743,7 @@ mod tests {
     }
 
     #[test]
-    fn propagate_profile_files_defers_rotated_marker_during_open_turn() {
+    fn propagate_profile_files_marks_working_seats_without_holding_their_turn() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
         let store = Store::open(data.join("state.db")).unwrap();
@@ -10071,9 +10771,11 @@ mod tests {
             idle_cfg.join(".anyagents-profile-rotated-ms").exists(),
             "idle seat should receive rotated marker on credential refresh"
         );
+        // The supervisor applies a profile change at the next idle point, so
+        // the marker never preempts the open turn or holds its mail.
         assert!(
-            !working_cfg.join(".anyagents-profile-rotated-ms").exists(),
-            "working seat with open turn must not receive rotated marker mid-turn"
+            working_cfg.join(".anyagents-profile-rotated-ms").exists(),
+            "working seat should learn of the profile change"
         );
         assert!(
             working_cfg.join(".anyagents-quota-cleared-ms").exists(),
@@ -10714,45 +11416,33 @@ mod tests {
         .unwrap();
 
         let child_cfg = anyagents_core::agent_config_dir(data, &child.id);
-        let sess_dir = child_cfg.join("sessions/2026/10/29");
-        std::fs::create_dir_all(&sess_dir).unwrap();
-        let rollout_path = sess_dir.join("rollout-2026-10-29T18-51-32-test.jsonl");
-        let rollout_line = serde_json::json!({
-            "timestamp": "2026-10-29T18:51:40.000Z",
-            "ordinal": 4,
-            "type": "event_msg",
-            "payload": {
-                "type": "task_complete",
-                "root_turn_id": "t1",
-                "turn_id": "t1",
-                "last_agent_message": null,
-                "error": {
-                    "message": "workspace routing discovery unauthorized (401)"
-                }
-            }
-        });
-        std::fs::write(&rollout_path, format!("{rollout_line}\n")).unwrap();
-        let rotated_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        // The Codex adapter persists a 401 turn fault as this record.
+        let persist_fault = |timestamp_ms: i64| {
+            std::fs::write(
+                child_cfg.join(".anyagents-last-error.json"),
+                serde_json::json!({
+                    "error": "workspace routing discovery unauthorized (401)",
+                    "quota_reset_at_ms": null,
+                    "timestamp_ms": timestamp_ms,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
         std::fs::write(
             child_cfg.join(".anyagents-profile-rotated-ms"),
             "1700000000000\n",
         )
         .unwrap();
-        let rollout = std::fs::File::options()
-            .write(true)
-            .open(&rollout_path)
-            .unwrap();
-        rollout.set_modified(rotated_at).unwrap();
+        persist_fault(1_700_000_000_000);
 
         let health = anyagents_supervisor::HealthBoard::default();
-        let (delivery_mode, steer_support) = anyagents_supervisor::declared(&child.harness);
         health.publish(
             &child.id,
             anyagents_supervisor::LiveState {
                 process_alive: true,
                 turn_state: anyagents_harness::TurnState::InTurn,
-                delivery_mode,
-                steer_support,
+                delivery: Some(crate::vendor::declared_delivery(&child.harness)),
                 quota_reset_at_ms: None,
                 restart_at_ms: None,
                 pid: None,
@@ -10764,16 +11454,14 @@ mod tests {
         );
         let mut views;
 
-        // A rollout at the rotation boundary is stale, even if it contains an
-        // error. Do not let wall-clock or filesystem precision decide freshness.
+        // A fault recorded at the rotation boundary is stale. Do not let
+        // wall-clock precision decide freshness.
         views = vec![crate::server::agent_view(&store, &health, &child).unwrap()];
         assert_eq!(views[0].turn_state, "working");
         assert!(views[0].last_error.is_none());
         assert!(store.next_undelivered(&parent.id).unwrap().is_none());
 
-        rollout
-            .set_modified(rotated_at + std::time::Duration::from_secs(1))
-            .unwrap();
+        persist_fault(1_700_000_001_000);
         views = vec![crate::server::agent_view(&store, &health, &child).unwrap()];
         assert_eq!(views[0].turn_state, "errored");
         assert_eq!(
@@ -10825,7 +11513,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         std::fs::create_dir(&data).unwrap();
-        let f = crate::worktree::tests::Fixture::new(&data);
+        let f = crate::repo::tests::Fixture::new(&data);
         let store = Store::open(data.join("state.db")).unwrap();
         store
             .hold_capability_key("0123456789abcdef0123456789abcdef")
@@ -10834,7 +11522,7 @@ mod tests {
         std::fs::create_dir(&explicit).unwrap();
         let mut request = worktree_request("explicit", None);
         request.workdir = Some(explicit.clone());
-        let agent = create_with_consumer(&store, &data, request, &f.consumer).unwrap();
+        let agent = create_with_consumer(&store, &data, request, &f.checkouts).unwrap();
         assert_eq!(agent.workdir.as_deref(), explicit.to_str());
         assert!(!f.log.exists());
     }
@@ -10848,7 +11536,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         std::fs::create_dir(&data).unwrap();
-        let f = crate::worktree::tests::Fixture::new(&data);
+        let f = crate::repo::tests::Fixture::new(&data);
         let store = Store::open(data.join("state.db")).unwrap();
         store
             .hold_capability_key("0123456789abcdef0123456789abcdef")
@@ -10860,7 +11548,7 @@ mod tests {
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o444)).unwrap();
         let mut request = worktree_request("blocked", None);
         request.workdir = Some(explicit.clone());
-        let err = create_with_consumer(&store, &data, request, &f.consumer).unwrap_err();
+        let err = create_with_consumer(&store, &data, request, &f.checkouts).unwrap_err();
         assert!(matches!(err, Error::WorkdirPermission { .. }), "{err}");
         assert!(err.to_string().contains(blocked.to_str().unwrap()), "{err}");
         assert!(store.agent_by_name("blocked").is_err());
@@ -10878,10 +11566,10 @@ mod tests {
         store
             .hold_capability_key("0123456789abcdef0123456789abcdef")
             .unwrap();
-        let f = crate::worktree::tests::Fixture::new(dir.path());
+        let f = crate::repo::tests::Fixture::new(dir.path());
         let mut request = worktree_request("missing-inherit", None);
         request.workdir = Some("inherit".into());
-        let err = create_with_consumer(&store, dir.path(), request, &f.consumer).unwrap_err();
+        let err = create_with_consumer(&store, dir.path(), request, &f.checkouts).unwrap_err();
         assert!(matches!(err, Error::WorkdirPermission { .. }), "{err}");
         assert!(
             err.to_string().contains("parent has no accessible workdir"),
@@ -10891,811 +11579,11 @@ mod tests {
         assert!(!f.log.exists());
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn privileged_cross_uid_spawn_can_create_commit_and_status() {
-        use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
-        use std::process::Command;
-        let caps = std::fs::read_to_string("/proc/self/status").unwrap();
-        let effective = caps
-            .lines()
-            .find_map(|l| l.strip_prefix("CapEff:\t"))
-            .and_then(|n| u64::from_str_radix(n, 16).ok())
-            .unwrap_or(0);
-        let required = (1 << 0) | (1 << 6) | (1 << 7); // CHOWN, SETGID, SETUID
-        if effective & required != required || crate::sandbox::server_uid() != 0 {
-            assert!(
-                std::env::var_os("ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST").is_none(),
-                "requires privilege: CAP_CHOWN, CAP_SETGID and CAP_SETUID"
-            );
-            eprintln!(
-                "requires privilege: CAP_CHOWN, CAP_SETGID and CAP_SETUID; A→B worktree acceptance not executed"
-            );
-            return;
-        }
-        if std::env::var_os("ANYAGENTS_PRIVILEGED_WORKER").is_none() {
-            let out = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "create::tests::privileged_cross_uid_spawn_can_create_commit_and_status",
-                    "--nocapture",
-                ])
-                .env("ANYAGENTS_PRIVILEGED_WORKER", "1")
-                // This proof selects a private identity independently of A's
-                // common config; an unset override deliberately preserves A's.
-                .env("ANYAGENTS_GIT_AUTHOR_NAME", "Example Author")
-                .env("ANYAGENTS_GIT_AUTHOR_EMAIL", "author@example.test")
-                .env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "safe.directory")
-                .env("GIT_CONFIG_VALUE_0", "*")
-                .output()
-                .unwrap();
-            eprintln!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            assert!(out.status.success(), "privileged worktree worker failed");
-            return;
-        }
-        unsafe { std::env::set_var("ANYAGENTS_LAUNCHER", "/usr/bin/setpriv") };
-        if let Ok(data) = std::env::var("ANYAGENTS_INSPECTION_ABORT_DATA") {
-            let id = anyagents_core::AgentId::parse(
-                &std::env::var("ANYAGENTS_INSPECTION_ABORT_ID").unwrap(),
-            )
-            .unwrap();
-            let checkout =
-                PathBuf::from(std::env::var("ANYAGENTS_INSPECTION_ABORT_CHECKOUT").unwrap());
-            let record =
-                crate::worktree_access::RecordedWorktree::load(Path::new(&data), &id, &checkout)
-                    .unwrap();
-            let _: std::io::Result<()> = record.inspect(|| {
-                let status = record.command()?.args(["status", "--porcelain"]).output()?;
-                assert!(
-                    status.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&status.stderr)
-                );
-                // No Drop or unwind cleanup may run before restart recovery.
-                unsafe { libc::raise(libc::SIGKILL) };
-                std::process::abort();
-            });
-            panic!("inspection did not reach its abort barrier");
-        }
-        struct Users(Vec<String>);
-        impl Drop for Users {
-            fn drop(&mut self) {
-                for user in &self.0 {
-                    let _ = Command::new("userdel").arg(user).status();
-                }
-            }
-        }
-        let mut users = Users(Vec::new());
-        let mut ids = Vec::new();
-        for suffix in ["a", "b", "c"] {
-            let name = format!("aa-wt-{}-{suffix}", std::process::id());
-            assert!(
-                Command::new("useradd")
-                    .args(["--no-create-home", "--user-group", &name])
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-            users.0.push(name.clone());
-            let id = |flag: &str| {
-                String::from_utf8(
-                    Command::new("id")
-                        .args([flag, &name])
-                        .output()
-                        .unwrap()
-                        .stdout,
-                )
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap()
-            };
-            ids.push((id("-u"), id("-g")));
-        }
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let data = dir.path().join("data");
-        std::fs::create_dir(&data).unwrap();
-        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let f = crate::worktree::tests::Fixture::new(&data);
-        let (a_uid, a_gid) = ids[0];
-        let (b_uid, b_gid) = ids[1];
-        // Match the consumer's already-initialized shared repository. Sparse
-        // checkout must write only its private config, not initialize A's.
-        crate::worktree::tests::git(&f.source, &["config", "extensions.worktreeConfig", "true"]);
-        crate::worktree::tests::git(&f.source, &["config", "user.name", "Original local owner"]);
-        crate::worktree::tests::git(
-            &f.source,
-            &["config", "user.email", "original@example.invalid"],
-        );
-        std::fs::set_permissions(
-            f.source.join(".git/config"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-        assert!(
-            Command::new("chown")
-                .args(["-R", &format!("{a_uid}:{a_gid}")])
-                .arg(&data)
-                .status()
-                .unwrap()
-                .success()
-        );
-        // A's config must survive byte-for-byte. The new seat gets its own
-        // identity, never a common rewrite.
-        let common_config = f.source.join(".git/config");
-        let config_before = std::fs::read(&common_config).unwrap();
-        let config_inode =
-            std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&common_config).unwrap());
-        let authority = data.join("consumer-authority");
-        std::fs::rename(data.join("consumer"), &authority).unwrap();
-        crate::worktree::tests::write_executable(
-            &data.join("consumer"),
-            &format!(
-                "#!/bin/sh\nexec /usr/bin/setpriv --reuid {a_uid} --regid {a_gid} --clear-groups -- env HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent GIT_CONFIG_GLOBAL=/dev/null {:?} \"$@\"\n",
-                authority
-            ),
-        );
-        let store = Store::open(data.join("state.db")).unwrap();
-        store
-            .hold_capability_key("0123456789abcdef0123456789abcdef")
-            .unwrap();
-        let parent = store
-            .create_agent(NewAgent::new("parent-a", "codex"))
-            .unwrap();
-        store
-            .set_agent_running(&parent.id, f.source.to_str().unwrap())
-            .unwrap();
-        let target = dir.path().join("checkout");
-        // The consumer executes as A and must be able to create the checkout.
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
-        let mut request = worktree_request("child-b", Some("inherit".into()));
-        request.parent_id = Some(parent.id.clone());
-        request.workdir = Some(target.clone());
-        let agent = create_with_seat(
-            &store,
-            &data,
-            request,
-            &f.consumer,
-            Some((users.0[1].clone(), b_uid, b_gid, None)),
-        )
-        .unwrap();
-        assert_eq!(agent.workdir.as_deref(), target.to_str());
-        use std::os::unix::fs::MetadataExt;
-        let config_after = std::fs::metadata(&common_config).unwrap();
-        assert_eq!(config_after.uid(), a_uid);
-        assert_eq!(config_after.ino(), config_inode);
-        assert_eq!(config_after.mode() & 0o707, 0o600);
-        assert_eq!(std::fs::read(&common_config).unwrap(), config_before);
-        let readable = Command::new("/usr/bin/setpriv")
-            .args([
-                "--reuid",
-                &a_uid.to_string(),
-                "--regid",
-                &a_gid.to_string(),
-                "--clear-groups",
-                "--",
-                "cat",
-            ])
-            .arg(&common_config)
-            .output()
-            .unwrap();
-        assert!(readable.status.success(), "A must still read its config");
-        assert_eq!(readable.stdout, config_before);
-        let common = crate::worktree::tests::git(
-            &target,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        );
-        let objects = PathBuf::from(common).join("objects");
-        let new_object_dir = (0..256)
-            .map(|n| objects.join(format!("{n:02x}")))
-            .find(|p| !p.exists())
-            .unwrap();
-        let b_config = agent_config_dir(&data, &agent.id);
-        crate::sandbox::share_config_with_seat_uid(&b_config, b_uid, b_gid);
-        let push_remote = dir.path().join("seat-push.git");
-        let out = Command::new("/usr/bin/setpriv")
-            .env_remove("GIT_CONFIG_COUNT")
-            .env_remove("GIT_AUTHOR_NAME").env_remove("GIT_AUTHOR_EMAIL")
-            .env_remove("GIT_COMMITTER_NAME").env_remove("GIT_COMMITTER_EMAIL")
-            .env("HOME", &b_config)
-            .env("XDG_CONFIG_HOME", "/nonexistent")
-            .env("GIT_CONFIG_GLOBAL", b_config.join(".gitconfig"))
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .args(["--reuid", &b_uid.to_string(), "--regid", &b_gid.to_string(), "--clear-groups", "--", "/bin/sh", "-c",
-                r#"set -eu; mkdir "$2"; cd "$1"; printf child > src/child; git add src/child; git commit -m 'Child commit'; git status --porcelain; git init --bare "$3"; git push "$3" HEAD:refs/heads/seat-proof"#, "child-seat"])
-            .arg(&target).arg(&new_object_dir).arg(&push_remote).output().unwrap();
-        assert!(
-            out.status.success(),
-            "B create/commit/status: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.join("src/child")).unwrap(),
-            "child"
-        );
-        assert_eq!(
-            crate::worktree::tests::git(&target, &["log", "-1", "--format=%an <%ae>%n%cn <%ce>"]),
-            "Example Author <author@example.test>\nExample Author <author@example.test>"
-        );
-        let common = objects.parent().unwrap();
-        let private = PathBuf::from(crate::worktree::tests::git(
-            &target,
-            &["rev-parse", "--path-format=absolute", "--git-dir"],
-        ));
-        let run_as = |uid: u32, gid: u32, script: &str, paths: &[&Path]| {
-            let mut command = Command::new("/usr/bin/setpriv");
-            command
-                // Keep probes in the shared fixture root; these seats cannot
-                // traverse the CI checkout's ancestors.
-                .current_dir(dir.path())
-                .env("HOME", "/nonexistent")
-                .env("XDG_CONFIG_HOME", "/nonexistent")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .args([
-                    "--reuid",
-                    &uid.to_string(),
-                    "--regid",
-                    &gid.to_string(),
-                    "--clear-groups",
-                    "--",
-                    "/bin/sh",
-                    "-c",
-                    script,
-                    "seat-proof",
-                ]);
-            for path in paths {
-                command.arg(path);
-            }
-            let out = command.output().unwrap();
-            assert!(
-                out.status.success(),
-                "uid={uid}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        // Each forbidden operation must fail as B, including rename/unlink (a
-        // read-only file alone would not stop either in a writable directory).
-        run_as(
-            b_uid,
-            b_gid,
-            r#"
-set -eu
-mkdir "$1/evil-hooks"
-printf '#!/bin/sh\nprintf compromised > "%s"\n' "$1/hook-executed" > "$1/evil-hooks/pre-commit"
-chmod +x "$1/evil-hooks/pre-commit"
-if printf evil >> "$2/config"; then exit 11; fi
-if printf evil >> "$2/hooks/pre-commit"; then exit 12; fi
-if printf evil > "$2/hooks/child-hook"; then exit 13; fi
-if printf evil > "$2/info/child-info"; then exit 14; fi
-if git -c safe.directory="$1" -C "$1" config --worktree core.hooksPath "$1/evil-hooks"; then exit 15; fi
-if printf evil >> "$3/config.worktree"; then exit 16; fi
-if rm "$3/config.worktree"; then exit 17; fi
-printf evil > "$3/child-config"
-if mv "$3/child-config" "$3/config.worktree"; then exit 18; fi
-if printf evil >> "$3/commondir"; then exit 19; fi
-test -f "$2/logs/HEAD"
-if printf evil >> "$2/logs/HEAD"; then exit 27; fi
-if rm "$2/logs/HEAD"; then exit 28; fi
-"#,
-            &[&target, common, &private],
-        );
-        assert!(!target.join("hook-executed").exists());
-        // B's ACL grant and new Git objects must not revoke sibling A.
-        assert_eq!(std::fs::metadata(&new_object_dir).unwrap().uid(), b_uid);
-        let out = Command::new("/usr/bin/setpriv")
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-            .env("GIT_CONFIG_VALUE_0", target.join("evil-hooks"))
-            .env("HOME", "/nonexistent")
-            .env("XDG_CONFIG_HOME", "/nonexistent")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .args(["--reuid", &a_uid.to_string(), "--regid", &a_gid.to_string(), "--clear-groups", "--", "/bin/sh", "-c",
-                "set -eu; : > \"$2/sibling-write\"; rm \"$2/sibling-write\"; cd \"$1\"; printf sibling > src/sibling; git -c safe.directory=\"$1\" add src/sibling; git -c safe.directory=\"$1\" -c user.name='Example Author' -c user.email=author@example.test -c core.hooksPath=\"$3/hooks\" commit -m 'Sibling commit' ; git -c safe.directory=\"$1\" status --porcelain", "sibling-seat"])
-            .arg(&f.source).arg(&new_object_dir).arg(objects.parent().unwrap()).output().unwrap();
-        assert!(
-            out.status.success(),
-            "A still creates/commits/status after B: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        // Existing explicit workdirs are checked as B without rewriting them.
-        let mut explicit = worktree_request("explicit-b", None);
-        explicit.workdir = Some(target.clone());
-        let accepted = create_with_seat(
-            &store,
-            &data,
-            explicit,
-            &f.consumer,
-            Some((users.0[1].clone(), b_uid, b_gid, None)),
-        )
-        .unwrap();
-        assert_eq!(accepted.workdir.as_deref(), target.to_str());
-        let blocked = target.join("src/parent-only");
-        std::fs::write(&blocked, "preserve").unwrap();
-        assert!(
-            Command::new("chown")
-                .arg(format!("{a_uid}:{a_gid}"))
-                .arg(&blocked)
-                .status()
-                .unwrap()
-                .success()
-        );
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let mut explicit = worktree_request("refused-b", None);
-        explicit.workdir = Some(target.clone());
-        let err = create_with_seat(
-            &store,
-            &data,
-            explicit,
-            &f.consumer,
-            Some((users.0[1].clone(), b_uid, b_gid, None)),
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::WorkdirPermission { .. }), "{err}");
-        assert!(err.to_string().contains(blocked.to_str().unwrap()), "{err}");
-        assert!(store.agent_by_name("refused-b").is_err());
-        assert_eq!(
-            std::fs::metadata(&blocked).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "preserve");
-        // End this refusal scenario before the independent wake positive.
-        // Restore must not widen access to a later parent-only checkout file.
-        std::fs::remove_file(&blocked).unwrap();
-        assert!(
-            !target.join("hook-executed").exists(),
-            "parent must ignore B's planted hook"
-        );
-        let (c_uid, c_gid) = ids[2];
-        let mut request = worktree_request("child-c", Some("ExampleOrg/demo".into()));
-        request.workdir = Some(dir.path().join("checkout-c"));
-        request.parent_id = Some(agent.id.clone());
-        let c = create_with_seat(
-            &store,
-            &data,
-            request,
-            &f.consumer,
-            Some((users.0[2].clone(), c_uid, c_gid, None)),
-        )
-        .unwrap();
-        run_as(
-            c_uid,
-            c_gid,
-            r#"set -eu; test -x "$1"; if cat "$2/HEAD"; then exit 21; fi; if cat "$2/index"; then exit 22; fi"#,
-            &[common, &private],
-        );
-        let c_private = PathBuf::from(crate::worktree::tests::git(
-            Path::new(c.workdir.as_deref().unwrap()),
-            &["rev-parse", "--path-format=absolute", "--git-dir"],
-        ));
-        run_as(
-            b_uid,
-            b_gid,
-            r#"set -eu; if cat "$1/HEAD"; then exit 23; fi"#,
-            &[&c_private],
-        );
-        // Parent config/remote/push-u lock+rename must preserve both active
-        // readers immediately. No launch, wake or inspecting read may repair
-        // the config between the parent's write and these real-UID probes.
-        let parent_push = dir.path().join("parent-push.git");
-        for edit in [
-            r#"git -c safe.directory="$1" -C "$1" config test.replacement inherited"#,
-            r#"git -c safe.directory="$1" -C "$1" remote add refresh-proof /nonexistent/refresh-proof"#,
-            r#"set -eu; git init --bare "$2"; git -c safe.directory="$1" -C "$1" push -u "$2" HEAD:refs/heads/parent-proof"#,
-        ] {
-            // push -u can replace config twice. Keep the old inode allocated
-            // until comparison so a later replacement cannot reuse its number.
-            let before = std::fs::File::open(&common_config).unwrap();
-            run_as(a_uid, a_gid, edit, &[&f.source, &parent_push]);
-            assert_ne!(
-                std::fs::metadata(&common_config).unwrap().ino(),
-                before.metadata().unwrap().ino(),
-                "parent config rewrite did not replace the pinned inode: {edit}"
-            );
-            drop(before);
-            for (uid, gid, checkout, sibling) in [
-                (b_uid, b_gid, target.as_path(), &c_private),
-                (
-                    c_uid,
-                    c_gid,
-                    Path::new(c.workdir.as_deref().unwrap()),
-                    &private,
-                ),
-            ] {
-                run_as(
-                    uid,
-                    gid,
-                    r#"set -eu; test -r "$2/config"; git -c safe.directory="$1" -C "$1" status --porcelain; if printf evil >> "$2/config"; then exit 41; fi; if printf evil > "$2/anyagents-config/config.lock"; then exit 45; fi; if rm "$2/config"; then exit 46; fi; if printf evil >> "$2/hooks/pre-commit"; then exit 42; fi; if printf evil > "$2/info/refresh-leak"; then exit 43; fi; if cat "$3/index"; then exit 44; fi"#,
-                    &[checkout, common, sibling],
-                );
-            }
-            assert_eq!(std::fs::metadata(&common_config).unwrap().uid(), a_uid);
-            run_as(
-                a_uid,
-                a_gid,
-                r#"set -eu; test -r "$1"; test -w "$1""#,
-                &[&common_config],
-            );
-        }
-        // A third, unrecorded principal cannot acquire the config's read grant.
-        run_as(
-            65534,
-            65534,
-            r#"if cat "$1/config"; then exit 47; fi"#,
-            &[common],
-        );
-        // Vesta's same-size clean-filter payload: merely disabling hooks and
-        // fsmonitor does not stop `status` executing a configured clean driver.
-        let original_dotgit = std::fs::read(target.join(".git")).unwrap();
-        let forged = dir.path().join("child-controlled.git");
-        let seed = dir.path().join("filter-seed");
-        let filter = dir.path().join("clean-filter");
-        let filter_marker = dir.path().join("filter-executed");
-        run_as(
-            b_uid,
-            b_gid,
-            r#"
-set -eu
-umask 022
-git -C "$5/.." init -b main --separate-git-dir="$2" "$1"
-mkdir "$1/src"
-printf 'included\n' > "$1/src/keep"
-printf 'src/keep filter=x\n' > "$1/.gitattributes"
-git -C "$1" add .
-git -C "$1" -c user.name='Fixture' -c user.email=fixture@example.invalid commit -m 'Synthetic filter baseline'
-printf '#!/bin/sh\nid -u >> "%s"\ncat\n' "$4" > "$3"
-chmod +x "$3"
-git --git-dir="$2" config filter.x.clean "$3"
-git --git-dir="$2" config filter.x.required true
-git --git-dir="$2" config core.worktree "$5"
-# The protected A-owned pointer is not writable by B. The attack replaces
-# its directory entry using B's checkout-directory rights instead.
-test ! -w "$5/.git"
-rm "$5/.git"
-printf 'gitdir: %s\n' "$2" > "$5/.git"
-printf 'src/keep filter=x\n' > "$5/.gitattributes"
-printf 'changed!\n' > "$5/src/keep"
-printf 'changed!\n' > "$1/src/keep"
-# Positive exploit control: this seat owns the planted gitdir and must run it.
-git -c safe.directory="$5" -C "$5" status --porcelain
-"#,
-            &[&seed, &forged, &filter, &filter_marker, &target],
-        );
-        let executions = std::fs::read_to_string(&filter_marker).unwrap();
-        assert!(!executions.is_empty());
-        assert!(executions.lines().all(|line| line == b_uid.to_string()));
-        std::fs::remove_file(&filter_marker).unwrap();
-        let recorded =
-            crate::worktree_access::RecordedWorktree::load(&data, &agent.id, &target).unwrap();
-        let pinned = recorded
-            .command()
-            .unwrap()
-            .args(["status", "--porcelain"])
-            .output()
-            .unwrap();
-        assert!(
-            pinned.status.success(),
-            "trusted cleanup status: {}",
-            String::from_utf8_lossy(&pinned.stderr)
-        );
-        assert!(!crate::server::is_git_worktree_safe_to_reap(
-            &data, &agent.id, &target
-        ));
-        assert!(
-            !filter_marker.exists(),
-            "server cleanup followed B's .git pointer"
-        );
-        // The A and C seat homes trust only their own recorded roots, not B's.
-        let a_config = agent_config_dir(&data, &parent.id);
-        std::fs::create_dir_all(&a_config).unwrap();
-        ensure_seat_environment(&a_config, &f.source).unwrap();
-        crate::sandbox::share_config_with_seat_uid(&a_config, a_uid, a_gid);
-        for (uid, gid, config) in [
-            (a_uid, a_gid, &a_config),
-            (c_uid, c_gid, &agent_config_dir(&data, &c.id)),
-        ] {
-            crate::sandbox::share_config_with_seat_uid(config, uid, gid);
-            let out = Command::new("/usr/bin/setpriv")
-                .env_remove("GIT_CONFIG_COUNT")
-                .env("HOME", config)
-                .env("XDG_CONFIG_HOME", "/nonexistent")
-                .env("GIT_CONFIG_GLOBAL", config.join(".gitconfig"))
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .args([
-                    "--reuid",
-                    &uid.to_string(),
-                    "--regid",
-                    &gid.to_string(),
-                    "--clear-groups",
-                    "--",
-                    "git",
-                    "-C",
-                ])
-                .arg(&seed)
-                .args(["status", "--porcelain"])
-                .output()
-                .unwrap();
-            assert!(!out.status.success());
-            assert!(
-                String::from_utf8_lossy(&out.stderr).contains("dubious ownership"),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            assert!(
-                !filter_marker.exists(),
-                "foreign seat executed B's clean filter"
-            );
-        }
-        std::fs::write(target.join(".git"), original_dotgit).unwrap();
-        std::fs::write(target.join("src/keep"), "included\n").unwrap();
-        std::fs::remove_file(target.join(".gitattributes")).unwrap();
-        // A trusted filter definition is still executable when B selects it
-        // through checkout or index attributes. It may run only with B's rights.
-        let parent_only = dir.path().join("parent-only");
-        std::fs::create_dir(&parent_only).unwrap();
-        std::fs::set_permissions(&parent_only, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let parent_marker = parent_only.join("filter-ran");
-        std::fs::write(
-            &filter,
-            format!(
-                "#!/bin/sh\nid -u >> '{}'\nprintf hit > '{}' 2>/dev/null || :\ncat\n",
-                filter_marker.display(),
-                parent_marker.display()
-            ),
-        )
-        .unwrap();
-        run_as(
-            a_uid,
-            a_gid,
-            r#"set -eu; git -c safe.directory="$1" -C "$1" config filter.trusted.clean "$2"; git -c safe.directory="$1" -C "$1" config filter.trusted.required true"#,
-            &[&f.source, &filter],
-        );
-        crate::worktree_access::ensure_launchable(&data, &agent.id).unwrap();
-        run_as(
-            b_uid,
-            b_gid,
-            r#"set -eu; printf 'src/keep filter=trusted\n' > "$1/.gitattributes"; printf 'changed!\n' > "$1/src/keep"; git -c safe.directory="$1" -C "$1" add .gitattributes"#,
-            &[&target],
-        );
-        std::fs::remove_file(&filter_marker).ok();
-        crate::worktree_access::revoke_recorded(&data, &agent.id).unwrap();
-        assert!(!crate::server::is_git_worktree_safe_to_reap(
-            &data, &agent.id, &target
-        ));
-        let executions = std::fs::read_to_string(&filter_marker).unwrap();
-        assert!(!executions.is_empty(), "trusted filter was not exercised");
-        assert!(
-            executions.lines().all(|line| line == b_uid.to_string()),
-            "filter ran as another UID: {executions}"
-        );
-        assert!(
-            !parent_marker.exists(),
-            "cleanup filter retained parent rights"
-        );
-        run_as(
-            b_uid,
-            b_gid,
-            r#"set -eu; if cat "$1/index"; then exit 31; fi; if mkdir "$2/revoked-check"; then exit 32; fi"#,
-            &[&private, &objects],
-        );
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "create::tests::privileged_cross_uid_spawn_can_create_commit_and_status",
-                "--nocapture",
-            ])
-            .env("ANYAGENTS_INSPECTION_ABORT_DATA", &data)
-            .env("ANYAGENTS_INSPECTION_ABORT_ID", agent.id.as_str())
-            .env("ANYAGENTS_INSPECTION_ABORT_CHECKOUT", &target)
-            .output()
-            .unwrap();
-        assert_eq!(
-            status.status.signal(),
-            Some(libc::SIGKILL),
-            "abort worker: {}{}",
-            String::from_utf8_lossy(&status.stdout),
-            String::from_utf8_lossy(&status.stderr)
-        );
-        let receipt = || -> serde_json::Value {
-            serde_json::from_slice(
-                &std::fs::read(crate::worktree_access::grant_path(&data, &agent.id)).unwrap(),
-            )
-            .unwrap()
-        };
-        assert_eq!(receipt()["active"], false);
-        assert_eq!(receipt()["inspection"], true);
-        run_as(
-            b_uid,
-            b_gid,
-            r#"set -eu; test -r "$1/index"; if printf evil >> "$2/../config"; then exit 33; fi; if mkdir "$2/read-only-check"; then exit 34; fi"#,
-            &[&private, &objects],
-        );
-        crate::worktree_access::recover_inspections(&data).unwrap();
-        assert_eq!(receipt()["inspection"], false);
-        run_as(
-            b_uid,
-            b_gid,
-            r#"set -eu; if cat "$1/index"; then exit 35; fi; if mkdir "$2/recovery-check"; then exit 36; fi"#,
-            &[&private, &objects],
-        );
-        assert!(!crate::server::is_git_worktree_safe_to_reap(
-            &data, &agent.id, &target
-        ));
-        assert!(
-            target.join("src/child").is_file(),
-            "recovery lost the dirty checkout"
-        );
-        assert_eq!(receipt()["inspection"], false);
-        assert!(!parent_marker.exists());
-        crate::worktree_access::restore_recorded(&data, &agent.id).unwrap();
-        run_as(
-            b_uid,
-            b_gid,
-            r#"set -eu; git -c safe.directory="$1" -C "$1" reset HEAD -- .gitattributes; rm "$1/.gitattributes"; printf 'included\n' > "$1/src/keep""#,
-            &[&target],
-        );
-        // Keep both the trusted config and driver unchanged through the checks;
-        // remove them only after the owner-UID and interrupted-check proofs.
-        run_as(
-            a_uid,
-            a_gid,
-            r#"git -c safe.directory="$1" -C "$1" config --remove-section filter.trusted"#,
-            &[&f.source],
-        );
-        // Concurrent agents commonly share one OS seat. B2 admission and B1
-        // archive must not revoke either live workspace's effective bindings.
-        let b2_target = dir.path().join("checkout-b2");
-        let mut request = worktree_request("child-b2", Some("ExampleOrg/demo".into()));
-        request.workdir = Some(b2_target.clone());
-        let b2 = create_with_seat(
-            &store,
-            &data,
-            request,
-            &f.consumer,
-            Some((users.0[1].clone(), b_uid, b_gid, None)),
-        )
-        .unwrap();
-        crate::worktree_access::verify(&target, b_uid, b_gid, None).unwrap();
-        crate::worktree_access::verify(&b2_target, b_uid, b_gid, None).unwrap();
-        // Archive a dirty external checkout: preserve its bytes but revoke the
-        // common-store grant before any clean-worktree deletion decision.
-        store.set_agent_state(&agent.id, "archived").unwrap();
-        assert!(crate::server::reap_subagent_ephemeral_dirs(
-            &data, &agent.id
-        ));
-        assert!(target.join("src/child").is_file());
-        run_as(
-            b_uid,
-            b_gid,
-            r#"set -eu; if cat "$1/HEAD"; then exit 24; fi; mkdir "$2/same-seat-live"; rmdir "$2/same-seat-live""#,
-            &[&private, &objects],
-        );
-        run_as(
-            b_uid,
-            b_gid,
-            r#"set -eu; cd "$1"; printf survivor > src/survivor; git -c safe.directory="$1" add src/survivor; git -c safe.directory="$1" -c user.name='Example Author' -c user.email=author@example.test commit -m 'Survivor commit'; git -c safe.directory="$1" status --porcelain"#,
-            &[&b2_target],
-        );
-        let receipt: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(crate::worktree_access::grant_path(&data, &agent.id)).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(receipt["active"], false);
-        // A deliberate wake restores only the original allowlisted metadata.
-        crate::worktree_access::restore_recorded(&data, &agent.id).unwrap();
-        crate::worktree_access::verify(&target, b_uid, b_gid, None).unwrap();
-        crate::worktree_access::revoke_recorded(&data, &agent.id).unwrap();
-        crate::worktree_access::verify(&b2_target, b_uid, b_gid, None).unwrap();
-        store.set_agent_state(&b2.id, "archived").unwrap();
-        assert!(crate::server::reap_subagent_ephemeral_dirs(&data, &b2.id));
-        run_as(
-            b_uid,
-            b_gid,
-            r#"set -eu; if mkdir "$1/revoked"; then exit 25; fi"#,
-            &[&objects],
-        );
-        // C still works after B's revocation (separate principals, same store).
-        crate::worktree_access::verify(
-            Path::new(c.workdir.as_deref().unwrap()),
-            c_uid,
-            c_gid,
-            None,
-        )
-        .unwrap();
-        store.set_agent_state(&c.id, "archived").unwrap();
-        assert!(crate::server::reap_subagent_ephemeral_dirs(&data, &c.id));
-        // An admission refusal AFTER sharing must revoke, read back, and only
-        // then discard the child row and its private state.
-        let mut request = worktree_request("rollback-b", Some("ExampleOrg/demo".into()));
-        request.workdir = Some(dir.path().join("rollback-b"));
-        let err = create_with_seat(
-            &store,
-            &data,
-            request,
-            &f.consumer,
-            Some((users.0[1].clone(), b_uid, b_gid, Some("invalid".into()))),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("invalid seat launcher"), "{err}");
-        assert!(store.agent_by_name("rollback-b").is_err());
-        run_as(
-            b_uid,
-            b_gid,
-            r#"set -eu; if mkdir "$1/rollback-leak"; then exit 26; fi"#,
-            &[&objects],
-        );
-        // A real child seat can take flock(LOCK_EX) through a read-only HEAD
-        // descriptor. Inspection cleanup must fail closed without waiting for
-        // that child; the fresh-server matrix proves both startup entrypoints.
-        let mut request = worktree_request("locked-b", Some("ExampleOrg/demo".into()));
-        request.workdir = Some(dir.path().join("locked-checkout"));
-        let locked = create_with_seat(
-            &store,
-            &data,
-            request,
-            &f.consumer,
-            Some((users.0[1].clone(), b_uid, b_gid, None)),
-        )
-        .unwrap();
-        let locked_checkout = Path::new(locked.workdir.as_deref().unwrap());
-        let record =
-            crate::worktree_access::RecordedWorktree::load(&data, &locked.id, locked_checkout)
-                .unwrap();
-        crate::worktree_access::revoke_recorded(&data, &locked.id).unwrap();
-        let ready = dir.path().join("seat-flock-ready");
-        struct Locker(std::process::Child);
-        impl Drop for Locker {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let mut locker = None;
-        let started = std::time::Instant::now();
-        let inspection = record.inspect(|| {
-            locker = Some(Locker(Command::new("/usr/bin/setpriv")
-                .current_dir(dir.path())
-                .args(["--reuid", &b_uid.to_string(), "--regid", &b_gid.to_string(), "--clear-groups", "--", "/bin/sh", "-c",
-                    r#"exec 9< "$1/HEAD"; /usr/bin/flock -n -x 9 || exit; : > "$2"; read ignored"#, "seat-flock"])
-                .arg(record.private()).arg(&ready)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .spawn()?));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while !ready.exists() {
-                assert!(locker.as_mut().unwrap().0.try_wait()?.is_none()
-                    && std::time::Instant::now() < deadline, "seat did not acquire the read-only HEAD flock");
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Ok(())
-        });
-        assert!(inspection.is_err());
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
-            "seat flock blocked inspection recovery"
-        );
-        let receipt: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(crate::worktree_access::grant_path(&data, &locked.id)).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(receipt["quarantined"], true);
-        assert!(crate::worktree_access::ensure_launchable(&data, &locked.id).is_err());
-        drop(locker);
-        eprintln!(
-            "A→B→C worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}, third uid={c_uid}; writes, protected config/hooks/info/config.worktree/shared logs/HEAD, sticky rename denial, sibling metadata denial, same-seat B1/B2 survival, archive/reap/rollback revocation, parent hook pin, private commit identity, exact seat trust/status/commit/push, planted-filter cleanup/foreign-seat denial, trusted-config filter owner-UID execution, config/remote/push-u mid-session inherited readers without launch/wake, SIGKILL inspection-grant recovery, and read-only HEAD-flock bounded quarantine passed"
-        );
-    }
-
     #[test]
     fn consumer_refusal_rolls_back_spawn_and_private_never_calls_consumer() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path();
-        let fixture = crate::worktree::tests::Fixture::new(data);
+        let fixture = crate::repo::tests::Fixture::new(data);
         let store = Store::open(data.join("state.db")).unwrap();
         store
             .hold_capability_key("0123456789abcdef0123456789abcdef")
@@ -11705,7 +11593,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             &store,
             data,
             worktree_request("refused", Some("ExampleOrg/demo".into())),
-            &fixture.consumer,
+            &fixture.checkouts,
         )
         .unwrap_err();
         assert!(
@@ -11721,7 +11609,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         let before = std::fs::read_to_string(&fixture.log).unwrap();
         let mut request = worktree_request("private", None);
         request.workdir = Some("private".into());
-        let private = create_with_consumer(&store, data, request, &fixture.consumer).unwrap();
+        let private = create_with_consumer(&store, data, request, &fixture.checkouts).unwrap();
         let wd = PathBuf::from(private.workdir.unwrap());
         assert!(wd.is_dir());
         assert!(!wd.join(".git").exists());
@@ -11729,203 +11617,67 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         assert_eq!(std::fs::read_to_string(&fixture.log).unwrap(), before);
     }
 
-    /// A refused admission after the name was reserved rolls back completely:
-    /// no row, no directory, no grant journal, and the same name is retryable.
+    /// A refusal after the name was reserved rolls back completely: no row,
+    /// no directory, no registration left in the provider's store, and the
+    /// same name (and so the same default branch) is retryable.
     #[test]
-    fn refused_admission_rolls_back_and_the_same_name_is_retryable() {
-        use std::os::unix::fs::PermissionsExt;
+    fn refused_provisioning_rolls_back_and_the_same_name_is_retryable() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path();
-        let fixture = crate::worktree::tests::Fixture::new(data);
+        let fixture = crate::repo::tests::Fixture::new(data);
         let store = Store::open(data.join("state.db")).unwrap();
         store
             .hold_capability_key("0123456789abcdef0123456789abcdef")
             .unwrap();
-        let probe = data.join("probe");
-        fixture
-            .consumer
-            .remote("ExampleOrg/demo", &probe, "probe", None)
-            .unwrap();
-        let common = PathBuf::from(crate::worktree::tests::git(
-            &probe,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        ));
-        let mode = std::fs::metadata(&common).unwrap().permissions().mode();
-        std::fs::set_permissions(&common, std::fs::Permissions::from_mode(mode | 0o020)).unwrap();
+        // The provider leaves a merge in progress: its checkout cannot be adopted.
+        std::fs::write(&fixture.fail, "merge").unwrap();
         let err = create_with_consumer(
             &store,
             data,
             worktree_request("retryable", Some("ExampleOrg/demo".into())),
-            &fixture.consumer,
+            &fixture.checkouts,
         )
         .unwrap_err();
-        assert!(matches!(err, Error::WorkdirPermission { .. }), "{err}");
-        assert!(
-            err.to_string().contains("untrusted Git metadata directory"),
-            "{err}"
-        );
+        assert!(matches!(err, Error::WorktreeProvisioning { .. }), "{err}");
         assert!(matches!(
             store.agent_by_name("retryable"),
             Err(Error::AgentNotFound(_))
         ));
         assert_eq!(std::fs::read_dir(data.join("agents")).unwrap().count(), 0);
-        let journals = std::fs::read_dir(data.join("worktree-grants"))
-            .map(|d| {
-                d.filter(|e| {
-                    e.as_ref()
-                        .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "json"))
-                })
-                .count()
-            })
-            .unwrap_or(0);
-        assert_eq!(journals, 0, "refused admission left a grant journal");
-        std::fs::set_permissions(&common, std::fs::Permissions::from_mode(mode)).unwrap();
+        let registered = crate::repo::tests::git(&fixture.source, &["worktree", "list"]);
+        assert_eq!(registered.lines().count(), 1, "{registered}");
+        std::fs::remove_file(&fixture.fail).unwrap();
         let agent = create_with_consumer(
             &store,
             data,
             worktree_request("retryable", Some("ExampleOrg/demo".into())),
-            &fixture.consumer,
+            &fixture.checkouts,
         )
         .unwrap();
         assert_eq!(agent.name, "retryable");
         assert_eq!(agent.state, "running");
-        let worktrees = crate::worktree::tests::git(&probe, &["worktree", "list", "--porcelain"]);
-        assert_eq!(
-            worktrees
-                .matches("branch refs/heads/agent/retryable")
-                .count(),
-            1,
-            "the refused attempt left a worktree registration: {worktrees}"
-        );
-    }
-
-    /// Rollback removes only its own checkout registration and never loses a
-    /// commit: an untouched branch is deleted, a branch with unique work stays.
-    #[test]
-    fn provisioned_checkout_rollback_never_deletes_unique_commits() {
-        use crate::worktree::tests::git;
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source");
-        std::fs::create_dir_all(&source).unwrap();
-        git(&source, &["init", "-q", "-b", "main"]);
-        git(
-            &source,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@example.invalid",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "base",
-            ],
-        );
-        let untouched = dir.path().join("untouched");
-        let worked = dir.path().join("worked");
-        let sibling = dir.path().join("sibling");
-        for (path, branch) in [
-            (&untouched, "agent/untouched"),
-            (&worked, "agent/worked"),
-            (&sibling, "agent/sibling"),
-        ] {
-            git(
-                &source,
-                &[
-                    "worktree",
-                    "add",
-                    "-q",
-                    "-b",
-                    branch,
-                    path.to_str().unwrap(),
-                ],
-            );
-        }
-        git(
-            &worked,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@example.invalid",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "unique",
-            ],
-        );
-        remove_provisioned_checkout(&untouched).unwrap();
-        remove_provisioned_checkout(&worked).unwrap();
-        assert!(!untouched.exists() && !worked.exists());
-        let branches = git(&source, &["branch", "--format=%(refname:short)"]);
-        assert!(
-            !branches.lines().any(|b| b == "agent/untouched"),
-            "{branches}"
-        );
-        assert!(
-            branches.lines().any(|b| b == "agent/worked"),
-            "unique work lost: {branches}"
-        );
-        let worktrees = git(&source, &["worktree", "list", "--porcelain"]);
-        assert!(
-            worktrees.contains(sibling.to_str().unwrap()),
-            "sibling registration removed"
-        );
-        assert!(!worktrees.contains(untouched.to_str().unwrap()));
-        assert!(sibling.join(".git").exists());
-    }
-
-    /// When a partial grant cannot be revoked, rollback keeps the row and
-    /// journal for recovery but still releases the name for an immediate retry.
-    #[test]
-    fn unrevocable_rollback_keeps_recovery_state_and_releases_the_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path();
-        let store = Store::open(data.join("state.db")).unwrap();
-        let agent = store
-            .create_agent(NewAgent::new("held", "claude-code"))
-            .unwrap();
-        let journal = crate::worktree_access::grant_path(data, &agent.id);
-        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
-        std::fs::write(&journal, b"not a journal").unwrap();
-        let original = Error::Message("injected admission failure".into());
-        let returned = roll_back_failed_creation(&store, data, &agent, None, original);
-        assert_eq!(returned.to_string(), "injected admission failure");
-        let kept = store.agent(&agent.id).unwrap();
-        assert_eq!(kept.state, "archived");
-        assert_eq!(kept.name, agent.id.as_str());
-        assert!(journal.exists(), "the recovery journal must be kept");
-        assert!(matches!(
-            store.agent_by_name("held"),
-            Err(Error::AgentNotFound(_))
-        ));
-        let retried = store
-            .create_agent(NewAgent::new("held", "claude-code"))
-            .unwrap();
-        assert_ne!(retried.id, agent.id);
+        fixture.assert_checkout(Path::new(agent.workdir.as_deref().unwrap()));
     }
 
     #[test]
     fn existing_git_target_is_not_adopted_or_modified() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path();
-        let fixture = crate::worktree::tests::Fixture::new(data);
+        let fixture = crate::repo::tests::Fixture::new(data);
         let store = Store::open(data.join("state.db")).unwrap();
         store
             .hold_capability_key("0123456789abcdef0123456789abcdef")
             .unwrap();
-        let before = crate::worktree::tests::git(&fixture.source, &["rev-parse", "HEAD"]);
+        let before = crate::repo::tests::git(&fixture.source, &["rev-parse", "HEAD"]);
         let mut request = worktree_request("existing", Some("ExampleOrg/demo".into()));
         request.workdir = Some(fixture.source.clone());
-        let err = create_with_consumer(&store, data, request, &fixture.consumer).unwrap_err();
+        let err = create_with_consumer(&store, data, request, &fixture.checkouts).unwrap_err();
         assert!(
             matches!(err, Error::Message(ref message) if message.contains("already exists and is not empty")),
             "{err}"
         );
         assert_eq!(
-            crate::worktree::tests::git(&fixture.source, &["rev-parse", "HEAD"]),
+            crate::repo::tests::git(&fixture.source, &["rev-parse", "HEAD"]),
             before
         );
         assert!(fixture.source.join("excluded/large").is_file());
@@ -11940,7 +11692,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
     fn local_repo_spawn_uses_consumer_and_refuses_unpushed_head() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path();
-        let fixture = crate::worktree::tests::Fixture::new(data);
+        let fixture = crate::repo::tests::Fixture::new(data);
         let store = Store::open(data.join("state.db")).unwrap();
         store
             .hold_capability_key("0123456789abcdef0123456789abcdef")
@@ -11950,18 +11702,18 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             &store,
             data,
             worktree_request("local", Some(repo.clone())),
-            &fixture.consumer,
+            &fixture.checkouts,
         )
         .unwrap();
         fixture.assert_checkout(Path::new(agent.workdir.as_deref().unwrap()));
         let inherited_workdir = Path::new(agent.workdir.as_deref().unwrap());
-        crate::worktree::tests::git(
+        crate::repo::tests::git(
             inherited_workdir,
             &["commit", "--allow-empty", "-m", "Unpublished parent"],
         );
         let mut inherit = worktree_request("unpublished-parent", Some("inherit".into()));
         inherit.parent_id = Some(agent.id.clone());
-        let err = create_with_consumer(&store, data, inherit, &fixture.consumer).unwrap_err();
+        let err = create_with_consumer(&store, data, inherit, &fixture.checkouts).unwrap_err();
         assert!(
             matches!(err, Error::WorktreeSourceUnpublished { ref message, .. }
             if message.contains("push HEAD first")),
@@ -11971,7 +11723,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             store.agent_by_name("unpublished-parent"),
             Err(Error::AgentNotFound(_))
         ));
-        crate::worktree::tests::git(
+        crate::repo::tests::git(
             &fixture.source,
             &["commit", "--allow-empty", "-m", "Unpublished"],
         );
@@ -11980,7 +11732,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             &store,
             data,
             worktree_request("unpublished", Some(repo)),
-            &fixture.consumer,
+            &fixture.checkouts,
         )
         .unwrap_err();
         assert!(
@@ -12011,9 +11763,9 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         )
         .unwrap();
 
-        let fixture = crate::worktree::tests::Fixture::new(data);
+        let fixture = crate::repo::tests::Fixture::new(data);
         let create = |store: &Store, data: &Path, request: CreateRequest| {
-            create_with_consumer(store, data, request, &fixture.consumer)
+            create_with_consumer(store, data, request, &fixture.checkouts)
         };
 
         // 3. Create L0 Root Agent
@@ -12097,8 +11849,8 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         assert!(l2_wt.join("README.md").is_file());
         fixture.assert_checkout(&l2_wt);
         assert_eq!(
-            crate::worktree::tests::git(&l1_wt, &["rev-parse", "HEAD"]),
-            crate::worktree::tests::git(&l2_wt, &["rev-parse", "HEAD"]),
+            crate::repo::tests::git(&l1_wt, &["rev-parse", "HEAD"]),
+            crate::repo::tests::git(&l2_wt, &["rev-parse", "HEAD"]),
         );
         assert_eq!(
             std::fs::read_to_string(&fixture.log)
@@ -12402,6 +12154,117 @@ git -c safe.directory="$5" -C "$5" status --porcelain
     }
 
     #[test]
+    #[cfg(unix)]
+    fn canonical_skills_pull_only_when_origin_main_moves() {
+        use crate::repo::tests::git;
+        let dir = tempfile::tempdir().unwrap();
+        let commit = |repo: &Path, file: &str| {
+            std::fs::create_dir_all(repo.join("skills")).unwrap();
+            std::fs::write(repo.join("skills").join(file), file).unwrap();
+            git(repo, &["add", "."]);
+            git(
+                repo,
+                &[
+                    "-c",
+                    "user.name=Example",
+                    "-c",
+                    "user.email=example@example.org",
+                    "commit",
+                    "-qm",
+                    file,
+                ],
+            );
+        };
+        let origin = dir.path().join("origin.git");
+        let author = dir.path().join("author");
+        let checkout = dir.path().join("checkout");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        git(
+            dir.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                author.to_str().unwrap(),
+            ],
+        );
+        git(&author, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        commit(&author, "one.md");
+        commit(&author, "two.md");
+        git(&author, &["push", "-q", "origin", "main"]);
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::os::unix::fs::symlink(checkout.join("skills"), data.join("skills")).unwrap();
+
+        sync_canonical_skills(&data);
+        let synced = git(&checkout, &["rev-parse", "HEAD"]);
+        // Origin has not moved since the last pull: the checkout is left alone,
+        // even one a local reset put behind.
+        git(&checkout, &["reset", "-q", "--hard", "HEAD~1"]);
+        sync_canonical_skills(&data);
+        assert_ne!(git(&checkout, &["rev-parse", "HEAD"]), synced);
+
+        commit(&author, "three.md");
+        git(&author, &["push", "-q", "origin", "main"]);
+        sync_canonical_skills(&data);
+        assert_eq!(
+            git(&checkout, &["rev-parse", "HEAD"]),
+            git(&author, &["rev-parse", "HEAD"])
+        );
+        assert!(checkout.join("skills/three.md").is_file());
+    }
+
+    #[test]
+    fn unchanged_credential_pairs_are_not_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("seat/.credentials.json");
+        let dst = dir.path().join("profile/.credentials.json");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        let cred = |token: &str, expires_at: i64| {
+            serde_json::json!({"claudeAiOauth": {
+                "accessToken": token,
+                "refreshToken": "refresh",
+                "expiresAt": expires_at,
+            }})
+            .to_string()
+        };
+        std::fs::write(&src, cred("same", 2_000_000_000_000)).unwrap();
+        std::fs::write(&dst, cred("same", 2_000_000_000_000)).unwrap();
+        let evaluations = || COPY_EVALUATIONS.with(std::cell::Cell::get);
+        let start = evaluations();
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert_eq!(evaluations() - start, 1, "an unchanged pair was read again");
+
+        std::fs::write(&src, cred("fresher", 2_000_000_100_000)).unwrap();
+        assert!(copy_seat_file_if_newer(&src, &dst));
+        assert!(std::fs::read_to_string(&dst).unwrap().contains("fresher"));
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert!(!copy_seat_file_if_newer(&src, &dst));
+        assert_eq!(evaluations() - start, 3);
+    }
+
+    #[test]
     fn copy_seat_file_if_newer_syncs_rotated_refresh_token_and_preserves_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         let prof_cred = tmp.path().join("profile-credentials.json");
@@ -12683,6 +12546,65 @@ git -c safe.directory="$5" -C "$5" status --porcelain
 #[cfg(test)]
 mod archetype_tests {
     use super::*;
+
+    #[test]
+    fn configured_owner_catalog_excludes_all_other_roots_even_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = dir.path().join("owner");
+        let workspace = dir.path().join("workspace");
+        let ancestor = dir.path().join("ancestor");
+        let data = dir.path().join("data");
+        for base in [&workspace, &ancestor, &data] {
+            std::fs::create_dir_all(base.join(".agents/agents")).unwrap();
+            std::fs::write(base.join(".agents/agents/retired.md"), "Stale.").unwrap();
+        }
+        for root in ["agents-templates", "archetypes"] {
+            std::fs::create_dir_all(data.join(root)).unwrap();
+            std::fs::write(data.join(root).join("retired.md"), "Stale.").unwrap();
+        }
+        let roots = || {
+            archetype_search_roots_for_owner(
+                Some(&workspace),
+                std::slice::from_ref(&ancestor),
+                &data,
+                Some(&owner),
+            )
+        };
+        let expected = vec![(owner.clone(), PathBuf::from(".agents/agents"))];
+        // Missing configuration never widens the search to legacy catalogs.
+        assert_eq!(roots(), expected);
+        std::fs::create_dir_all(owner.join(".agents/agents")).unwrap();
+        assert_eq!(roots(), expected); // Empty catalogs are authoritative too.
+        std::fs::write(owner.join(".agents/agents/worker.md"), "Current.").unwrap();
+        assert_eq!(roots(), expected);
+        for (base, relative) in roots() {
+            assert!(
+                read_archetype_file(&base, &relative.join("retired.md"))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                read_archetype_file(&base, &relative.join("worker.md"))
+                    .unwrap()
+                    .as_deref(),
+                Some("Current.")
+            );
+        }
+        // Unconfigured installations retain workspace and data fallback behavior.
+        let fallback = archetype_search_roots_for_owner(Some(&workspace), &[ancestor], &data, None);
+        assert!(fallback.contains(&(workspace, PathBuf::from(".agents/agents"))));
+        assert!(fallback.contains(&(data, PathBuf::from("agents-templates"))));
+    }
+
+    #[test]
+    fn empty_unconfigured_catalog_preserves_free_form_role_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".agents/agents")).unwrap();
+        assert_eq!(
+            normalize_or_validate_agent_role("retired", None, None, dir.path()).unwrap(),
+            "retired"
+        );
+    }
 
     #[test]
     fn data_archetypes_accept_name_metadata_and_prefer_shipped_templates() {
@@ -13142,6 +13064,43 @@ mod runtime_config_tests {
     }
 
     #[test]
+    fn a_renewed_token_refreshes_files_without_rotating_the_running_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sample", "agy"))
+            .unwrap();
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        let rel = ".gemini/antigravity-cli/antigravity-oauth-token";
+        std::fs::create_dir_all(cfg.join(".gemini/antigravity-cli")).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "google-antigravity/target\n").unwrap();
+        std::fs::write(cfg.join(".anyagents-last-error.json"), b"{}").unwrap();
+        let prof = dir.path().join("profiles/google-antigravity/target");
+        std::fs::create_dir_all(prof.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::write(prof.join(rel), b"renewed-token").unwrap();
+
+        propagate_credentials(
+            dir.path(),
+            "google-antigravity",
+            "target",
+            &[rel],
+            CredentialChange::Renewed,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(cfg.join(rel)).unwrap(), b"renewed-token");
+        assert!(!cfg.join(".anyagents-profile-rotated-ms").exists());
+        assert!(cfg.join(".anyagents-last-error.json").exists());
+
+        propagate_profile_files_to_bound_agents(dir.path(), "google-antigravity", "target", &[rel])
+            .unwrap();
+        assert!(cfg.join(".anyagents-profile-rotated-ms").exists());
+        assert!(!cfg.join(".anyagents-last-error.json").exists());
+    }
+
+    #[test]
     fn unknown_or_malformed_quota_observations_never_fabricate_remaining_quota() {
         for value in [
             serde_json::json!(null),
@@ -13359,16 +13318,18 @@ mod runtime_config_tests {
             .unwrap();
         let agents: Vec<_> = (0..3)
             .map(|n| {
-                store
+                let agent = store
                     .create_agent(anyagents_core::NewAgent::new(
                         format!("sample-{n}"),
                         "codex",
                     ))
-                    .unwrap()
+                    .unwrap();
+                store.set_agent_state(&agent.id, "idle").unwrap()
             })
             .collect();
         for agent in &agents {
             let cfg = agent_config_dir(dir.path(), &agent.id);
+            std::fs::create_dir_all(&cfg).unwrap();
             write_profile_marker(&cfg, ".anyagents-profile", "openai/unknown\n").unwrap();
         }
         let entry = |profile: &str, usage: Option<&str>| ProviderProfileEntry {
@@ -13659,6 +13620,8 @@ Connection: close
                 "claude-code",
             ))
             .unwrap();
+        // Mid-session: a running seat (a seat still being created is skipped).
+        store.set_agent_state(&agent.id, "running").unwrap();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -14482,7 +14445,7 @@ Connection: close
     }
 
     #[test]
-    fn reset_agent_session_clears_zero_byte_and_archives_nonempty_spiron_steer_hold() {
+    fn reset_agent_session_clears_the_last_error_and_leaves_mail_to_the_cursor() {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let mut agent = store
@@ -14493,79 +14456,31 @@ Connection: close
         let config_dir = root.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
         anyagents_core::host_session::new_session(&root, "spiron").unwrap();
-
-        let hold_path = config_dir.join("spiron-unconfirmed-steers.json");
         let err_path = config_dir.join(".anyagents-last-error.json");
-        std::fs::write(&hold_path, b"").unwrap();
-        std::fs::write(
-            &err_path,
-            r#"{"error":"Spiron reported unconfirmed steering input; Reconcile spiron-unconfirmed-steers.json","timestamp_ms":100}"#,
-        )
-        .unwrap();
-
-        let out1 = reset_agent_session_locked(&store, &agent).unwrap();
-        let gen1 = out1["generation"].as_str().unwrap().to_string();
-        assert!(!gen1.is_empty());
-        assert!(!hold_path.exists(), "0-byte hold file must be removed");
-        assert!(
-            !err_path.exists(),
-            "stale unconfirmed-steers error must be cleared"
-        );
-
+        std::fs::write(&err_path, r#"{"error":"stale","timestamp_ms":100}"#).unwrap();
         let anyagents_core::ReceiveOutcome::New(m1) = store
-            .receive(&agent.id, anyagents_core::Incoming::new("turn 1"))
+            .receive(&agent.id, anyagents_core::Incoming::new("taken"))
             .unwrap()
         else {
             panic!("expected m1");
         };
         store.note_delivered(&agent.id, m1.seq).unwrap();
         let anyagents_core::ReceiveOutcome::New(m2) = store
-            .receive(&agent.id, anyagents_core::Incoming::new("steered"))
+            .receive(&agent.id, anyagents_core::Incoming::new("not taken"))
             .unwrap()
         else {
             panic!("expected m2");
         };
-        store.note_delivered(&agent.id, m2.seq).unwrap();
-        std::fs::write(
-            &hold_path,
-            serde_json::json!({
-                "turn_id": m1.id,
-                "request_ids": [m1.id, m2.id]
-            })
-            .to_string(),
-        )
-        .unwrap();
 
-        let out2 = reset_agent_session_locked(&store, &agent).unwrap();
-        let gen2 = out2["generation"].as_str().unwrap().to_string();
-        assert_ne!(gen1, gen2);
-        assert!(
-            !hold_path.exists(),
-            "non-empty hold must move out of config/"
-        );
-        assert!(
-            root.join("sessions")
-                .join(format!("retired-{gen2}"))
-                .join("spiron-unconfirmed-steers.json")
-                .is_file(),
-            "forensic hold copy must be archived under sessions/"
-        );
-        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), m2.seq);
-        assert!(
-            store.next_undelivered(&agent.id).unwrap().is_none(),
-            "reset-session must keep unconfirmed messages in turn_recovery rather than raw replay"
-        );
-        let open = store
-            .open_turn(&agent.id)
-            .unwrap()
-            .expect("open turn retained for [Recovery]");
-        assert_eq!(open.messages.len(), 2);
-        assert_eq!(open.messages[0].id, m1.id);
-        assert_eq!(open.messages[1].id, m2.id);
-        assert!(
-            config_dir
-                .join(".anyagents-session-reset-recovery")
-                .is_file()
+        let first = reset_agent_session_locked(&store, &agent).unwrap();
+        let second = reset_agent_session_locked(&store, &agent).unwrap();
+        assert_ne!(first["generation"], second["generation"]);
+        assert!(!err_path.exists(), "a reset clears the stale error");
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), m1.seq);
+        assert_eq!(
+            store.next_undelivered(&agent.id).unwrap().unwrap().id,
+            m2.id,
+            "the new session is handed what the old one never took"
         );
     }
 
@@ -14788,7 +14703,7 @@ Connection: close
             "unexpected error: {explicit_inherit_err}"
         );
 
-        let fixture = crate::worktree::tests::Fixture::new(data);
+        let fixture = crate::repo::tests::Fixture::new(data);
         let git_parent = create_with_consumer(
             &store,
             data,
@@ -14807,7 +14722,7 @@ Connection: close
                 instructions: None,
                 parent_id: None,
             },
-            &fixture.consumer,
+            &fixture.checkouts,
         )
         .unwrap();
 
@@ -14829,10 +14744,152 @@ Connection: close
                 instructions: None,
                 parent_id: Some(git_parent.id.clone()),
             },
-            &fixture.consumer,
+            &fixture.checkouts,
         )
         .unwrap();
         let child_git_wd = PathBuf::from(child_under_git.workdir.as_deref().unwrap());
         fixture.assert_checkout(&child_git_wd);
+    }
+
+    #[test]
+    fn spiron_profile_switch_removes_stale_seat_selector_and_refreshes_gateway_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let mut new_agent = NewAgent::new("spiron-switch", "spiron");
+        new_agent.model = Some("openrouter/model-a".to_string());
+        let agent = store.create_agent(new_agent).unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let alt = data.join("profiles/gw/alt");
+        std::fs::create_dir_all(&alt).unwrap();
+        std::fs::write(
+            alt.join("sylphx-agent.json"),
+            br#"{"gateway_base_url":"https://alt.example/v1"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            alt.join("config.toml"),
+            b"sylphx_ai_url = \"https://alt.example/v1\"\nalways_approve = true\n",
+        )
+        .unwrap();
+        std::fs::write(alt.join("auth.json"), br#"{"access_token":"tok-a"}"#).unwrap();
+
+        let primary = data.join("profiles/gw/default");
+        std::fs::create_dir_all(primary.join(".config/opencode")).unwrap();
+        std::fs::write(
+            primary.join(".config/opencode/opencode.json"),
+            br#"{"provider":{"openrouter":{"options":{"baseURL":"https://gw.example/v1"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(primary.join("auth.json"), br#"{"access_token":"tok-b"}"#).unwrap();
+
+        write_profile_marker(&cfg, ".anyagents-profile", "gw/alt\n").unwrap();
+        seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+        assert!(cfg.join("sylphx-agent.json").exists());
+
+        write_profile_marker(&cfg, ".anyagents-profile", "gw/default\n").unwrap();
+        seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+        crate::spiron::write_spiron_config(
+            &cfg,
+            agent.model.as_deref(),
+            std::path::Path::new("/usr/bin/anyagents"),
+            &["mcp".to_string()],
+        )
+        .unwrap();
+
+        assert!(!cfg.join("sylphx-agent.json").exists());
+        let toml = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+        assert!(toml.contains("https://gw.example/v1"), "{toml}");
+        assert!(!toml.contains("https://alt.example/v1"), "{toml}");
+    }
+
+    #[test]
+    fn seed_harness_credentials_writes_empty_gemini_migrated_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("agy-migrated", "agy"))
+            .unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let prof = data.join("profiles/google-antigravity/default");
+        std::fs::create_dir_all(prof.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::create_dir_all(prof.join(".gemini/config")).unwrap();
+        std::fs::write(
+            prof.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            br#"{"email":"a@example.com","token":{"access_token":"ya29.ok","refresh_token":"1//r"}}"#,
+        )
+        .unwrap();
+        std::fs::write(prof.join(".gemini/config/.migrated"), b"").unwrap();
+
+        seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+        assert!(
+            cfg.join(".gemini/antigravity-cli/antigravity-oauth-token")
+                .is_file()
+        );
+        let migrated = cfg.join(".gemini/config/.migrated");
+        assert!(migrated.is_file());
+        assert_eq!(std::fs::metadata(&migrated).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn initial_bind_skips_google_default_with_expired_oauth_and_refresh_failure() {
+        let (dir, store) = bind_test_store();
+        let data = dir.path();
+        let default = data.join("profiles/google-antigravity/default");
+        let healthy = data.join("profiles/google-antigravity/team-alpha");
+        std::fs::create_dir_all(default.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::create_dir_all(healthy.join(".gemini/antigravity-cli")).unwrap();
+
+        let past_expiry = (chrono::Utc::now() - chrono::Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        std::fs::write(
+            default.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            serde_json::json!({
+                "email": "expired@example.com",
+                "token": {
+                    "access_token": "ya29.expired",
+                    "expiry": past_expiry,
+                    "refresh_token": "1//revoked"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            default.join(OAUTH_REFRESH_ATTEMPT_FILE),
+            anyagents_core::now_ms().to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            default.join(".anyagents-last-usage.txt"),
+            b"__NONE__
+",
+        )
+        .unwrap();
+
+        std::fs::write(
+            healthy.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            br#"{"email":"healthy@example.com","token":{"access_token":"ya29.ok","refresh_token":"1//ok"}}"#,
+        )
+        .unwrap();
+
+        let mut new_agent = NewAgent::new("agy-expired-default", "agy");
+        new_agent.model = Some("google-antigravity/gemini-3-flash".to_string());
+        let agent = store.create_agent(new_agent).unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let picked = select_or_bind_profile(data, &[], &agent, &cfg);
+        assert_eq!(picked, vec![healthy]);
+        assert_eq!(
+            bound_profile_name(&cfg).as_deref(),
+            Some("google-antigravity/team-alpha")
+        );
     }
 }

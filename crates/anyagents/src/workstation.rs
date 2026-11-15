@@ -4,9 +4,11 @@
 //! The server owns every session ([`session`]); `tools.browser` drives the
 //! browser over the crate's web operations ([`browser`]) and session
 //! `tools.computer` requests drive the same desktop's pixels ([`desktop`]).
-//! AnyAgents supplies only caller policy: profile names and directories,
-//! secret references ([`secrets`]), proxy and browser settings from the
-//! environment, snapshot ids, idle reaping, and takeover delivery.
+//! One agent holds a session at a time (the crate's lease); another agent's
+//! call for that profile gets `DESKTOP_IN_USE`. AnyAgents supplies only
+//! caller policy: profile names and directories, who the caller is, secret
+//! references ([`secrets`]), proxy and browser settings from the environment
+//! and the toolchain, idle reaping, and takeover delivery ([`takeover`]).
 //!
 //! Sessions need Linux. Other hosts answer every call with a typed
 //! `UNSUPPORTED` error that names [`REMOTE_WORKSTATION_ENV`]; there the
@@ -22,18 +24,33 @@ use crate::computer::{ErrorDisposition, format_computer_error};
 pub mod browser;
 #[cfg(target_os = "linux")]
 pub mod desktop;
+pub(crate) mod jail;
 #[cfg(target_os = "linux")]
 mod legacy;
+#[cfg(target_os = "linux")]
+mod proxy;
 pub mod secrets;
 #[cfg(target_os = "linux")]
 pub mod session;
 #[cfg(target_os = "linux")]
-mod takeover;
+pub mod takeover;
 
 #[cfg(all(test, target_os = "linux"))]
-mod headful;
+mod headful_tests;
 
 pub use browser::BrowserRequest;
+
+/// The lease principal of operator calls (the CLI and operator API).
+pub const OPERATOR: &str = "operator";
+
+/// Who a desktop call is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Caller {
+    /// Lease principal: the agent's name, or [`OPERATOR`].
+    pub principal: String,
+    /// The caller's own browser profile (used when a request names none).
+    pub profile: String,
+}
 
 #[cfg(any(test, not(target_os = "linux")))]
 /// Setting that remote routing reads: the base URL of a Linux workstation
@@ -48,6 +65,252 @@ pub fn profiles_root(data: &Path) -> PathBuf {
 /// Directory of `profile` (`user-data/` and `fingerprint.json` inside).
 pub fn profile_dir(data: &Path, profile: &str) -> PathBuf {
     profiles_root(data).join(profile)
+}
+
+// Profile trees are server-owned. Host ancestors are operator-managed:
+// callers must ensure seats cannot rename those host directories.
+#[cfg(target_os = "linux")]
+fn trusted_directory(
+    dir: &std::fs::File,
+    server_only: bool,
+    sticky_parent: bool,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = dir.metadata()?;
+    let server = crate::sandbox::server_uid();
+    if !meta.is_dir() || (meta.uid() != server && (server_only || meta.uid() != 0)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "a directory outside server/root ownership",
+        ));
+    }
+    if meta.mode() & 0o022 != 0 && !(sticky_parent && meta.mode() & 0o1000 != 0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "a group/other-writable directory permits profile replacement",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_directory_at(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    if Path::new(name).components().count() != 1
+        || !matches!(
+            Path::new(name).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "expected one directory name",
+        ));
+    }
+    let c = std::ffi::CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: a live directory descriptor and a NUL-terminated single component.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT) => Ok(None),
+            Some(libc::ELOOP | libc::ENOTDIR) => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "a link or a file where a directory belongs",
+            )),
+            _ => Err(error),
+        };
+    }
+    // SAFETY: openat returned a new descriptor.
+    Ok(Some(unsafe { std::fs::File::from_raw_fd(fd) }))
+}
+
+/// Walk from an anchored root, never following even an ancestor symlink.
+/// Host ancestor ownership/modes are operator-managed and not profile policy.
+/// Ownership/mode requirements are applied by the caller on its boundary.
+#[cfg(target_os = "linux")]
+fn directory_chain(data: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
+    let absolute = if data.is_absolute() {
+        data.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(data)
+    };
+    let mut dir = std::fs::File::open("/")?;
+    let mut path = PathBuf::from("/");
+    for component in absolute.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => {
+                dir = open_directory_at(&dir, name)?.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "data directory ancestor is missing",
+                    )
+                })?;
+                path.push(name);
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "data path must not contain parent traversal",
+                ));
+            }
+        }
+    }
+    Ok((dir, path))
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_data_dir(data: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
+    let (dir, path) = directory_chain(data)?;
+    trusted_directory(&dir, true, false)?;
+    Ok((dir, path))
+}
+
+#[cfg(target_os = "linux")]
+fn owned_child_dir(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    mode: libc::mode_t,
+    create: bool,
+) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    trusted_directory(parent, false, true)?;
+    // Validate before mkdirat as well as openat: neither accepts traversal.
+    if Path::new(name).components().count() != 1
+        || !matches!(
+            Path::new(name).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "expected one directory name",
+        ));
+    }
+    let c = std::ffi::CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: a directory descriptor and a NUL-terminated single name.
+    if create && unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), mode) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    let dir = open_directory_at(parent, name)?;
+    if let Some(dir) = &dir {
+        trusted_directory(dir, true, false)?;
+    }
+    Ok(dir)
+}
+
+// These leaves are consumed by path-based upstream startup before the jail runs.
+// Protected directory boundaries alone do not make an existing leaf safe.
+#[cfg(target_os = "linux")]
+fn validate_startup_leaves(profile: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::MetadataExt as _;
+    if let Some(dir) = open_directory_at(profile, "user-data".as_ref())? {
+        trusted_directory(&dir, true, false)?;
+    }
+    let name = c"fingerprint.json";
+    // SAFETY: profile is a live directory descriptor and name is NUL terminated.
+    let fd = unsafe {
+        libc::openat(
+            profile.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        return if e.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(e)
+        };
+    }
+    // SAFETY: openat returned a new descriptor exclusively owned here.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != crate::sandbox::server_uid()
+        || metadata.mode() & 0o022 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "fingerprint is not a protected server-owned regular file",
+        ));
+    }
+    Ok(())
+}
+
+/// The profile's server-owned directory. Ancestors are descriptor-walked from
+/// root without following links; their access policy belongs to the operator.
+/// Data, browser-profiles and the profile must not be group/other-writable.
+/// Missing profiles return None without creation when create is false.
+#[cfg(target_os = "linux")]
+pub(crate) fn server_profile_dir(
+    data: &Path,
+    profile: &str,
+    create: bool,
+) -> Result<Option<PathBuf>, Error> {
+    if profile.is_empty()
+        || Path::new(profile).components().count() != 1
+        || !matches!(
+            Path::new(profile).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(Error::Message(
+            "a browser profile is one directory name".into(),
+        ));
+    }
+    let refuse = |error: std::io::Error| {
+        Error::Message(format!(
+            "browser profile `{profile}` is not the server's own directory: {error}"
+        ))
+    };
+    let (data_dir, data_path) = trusted_data_dir(data).map_err(refuse)?;
+    let Some(root) =
+        owned_child_dir(&data_dir, "browser-profiles".as_ref(), 0o755, create).map_err(refuse)?
+    else {
+        return Ok(None);
+    };
+    match owned_child_dir(&root, profile.as_ref(), 0o755, create).map_err(refuse)? {
+        Some(dir) => {
+            validate_startup_leaves(&dir).map_err(refuse)?;
+            Ok(Some(profile_dir(&data_path, profile)))
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn private_dir(path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(Error::Message(format!("{} has no parent", path.display())));
+    };
+    let (parent, _) = directory_chain(parent)?;
+    let dir = owned_child_dir(&parent, name, 0o700, true)
+        .map_err(|error| Error::Message(format!("{}: {error}", path.display())))?
+        .ok_or_else(|| Error::Message(format!("{} is missing", path.display())))?;
+    if dir.metadata()?.mode() & 0o077 != 0 {
+        dir.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// A filesystem-safe profile name; `fallback` when `raw` is empty.
@@ -132,6 +395,24 @@ impl ToolError {
         d
     }
 
+    /// A timed-out mutation may have reached the browser. Never offer a
+    /// blind retry for it; a startup refusal has its own STARTING code.
+    pub fn into_action_error(self, redact: bool, mutating: bool) -> Error {
+        if !mutating || self.code != "TIMEOUT" {
+            return self.into_error(redact);
+        }
+        let mut disposition = ErrorDisposition::delivery_uncertain(
+            "Inspect the current page before repeating this action; it may already have completed.",
+        );
+        disposition.code = Some(self.code.to_string());
+        let message = if redact {
+            "browser secret input failed (provider/page details withheld)".to_string()
+        } else {
+            self.message
+        };
+        Error::Message(format_computer_error(message, disposition))
+    }
+
     /// Render for the tool surface; `redact` replaces the message for calls
     /// that carried a secret reference.
     pub fn into_error(self, redact: bool) -> Error {
@@ -159,6 +440,15 @@ impl From<agent_workstation::Error> for ToolError {
                 "HUMAN_IN_CONTROL",
                 "A person controls this desktop; call browser({action: 'wait_for_user'}) or release_takeover.",
             ),
+            W::Leased { .. } => (
+                "DESKTOP_IN_USE",
+                "Another agent holds this profile's desktop; use another `profile`.",
+            ),
+            W::StaleRef(_) => (
+                "STALE_REF",
+                "Call browser({action: 'snapshot'}) to refresh refs.",
+            ),
+            W::Script(_) => ("SCRIPT_ERROR", "The page script threw; fix the expression."),
             W::NotFound(_) => (
                 "NOT_FOUND",
                 "Inspect the page with a new browser snapshot before acting.",
@@ -172,7 +462,11 @@ impl From<agent_workstation::Error> for ToolError {
                 "REFUSED",
                 "A precondition refused the action; inspect the page first.",
             ),
-            W::Timeout(_) | W::Starting { .. } => (
+            W::Starting { .. } => (
+                "STARTING",
+                "The desktop is starting; inspect browser status or retry later.",
+            ),
+            W::Timeout(_) => (
                 "TIMEOUT",
                 "Transient browser failure; retry once or inspect browser status.",
             ),
@@ -253,5 +547,185 @@ mod tests {
             .to_string();
         assert!(rendered.contains("INVALID_INPUT"), "{rendered}");
         assert!(!rendered.contains("vault"), "{rendered}");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod profile_authority_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    fn temp() -> tempfile::TempDir {
+        tempfile::tempdir_in("/tmp").unwrap()
+    }
+    fn mode(path: &Path, value: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(value)).unwrap();
+    }
+    fn create(data: &Path) -> PathBuf {
+        server_profile_dir(data, "profile", true).unwrap().unwrap()
+    }
+
+    #[test]
+    fn private_runtime_directories_accept_tmp_and_refuse_links_or_writable_parents() {
+        let root = temp();
+        super::private_dir(root.path()).unwrap();
+        let child = root.path().join("chromium-tmp");
+        super::private_dir(&child).unwrap();
+        assert_eq!(
+            fs::metadata(&child).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let link = root.path().join("linked");
+        symlink(&child, &link).unwrap();
+        assert!(super::private_dir(&link).is_err());
+        mode(root.path(), 0o777);
+        let blocked = root.path().join("blocked");
+        assert!(super::private_dir(&blocked).is_err());
+        assert!(!blocked.exists());
+        mode(root.path(), 0o700);
+    }
+
+    #[test]
+    fn protected_profile_creation_and_lookup_preserve_existing_data() {
+        let data = temp();
+        assert!(
+            server_profile_dir(data.path(), "profile", false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!profiles_root(data.path()).exists());
+        let profile = create(data.path());
+        fs::create_dir(profile.join("user-data")).unwrap();
+        mode(&profile.join("user-data"), 0o755);
+        fs::write(profile.join("user-data/cookies"), "login").unwrap();
+        fs::write(profile.join("fingerprint.json"), "fingerprint").unwrap();
+        mode(&profile.join("fingerprint.json"), 0o644);
+        assert_eq!(
+            server_profile_dir(data.path(), "profile", false).unwrap(),
+            Some(profile.clone())
+        );
+        assert_eq!(
+            fs::read_to_string(profile.join("user-data/cookies")).unwrap(),
+            "login"
+        );
+        for name in ["", ".", "..", "../escape", "one/two", "/absolute"] {
+            assert!(
+                server_profile_dir(data.path(), name, true).is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn writable_data_roots_and_profiles_are_refused() {
+        let outer = temp();
+        let data = outer.path().join("data");
+        fs::create_dir(&data).unwrap();
+        mode(&data, 0o700);
+        let profile = create(&data);
+        for target in [data.clone(), profiles_root(&data), profile.clone()] {
+            for permissions in [0o775, 0o777] {
+                mode(&target, permissions);
+                assert!(
+                    server_profile_dir(&data, "profile", false).is_err(),
+                    "{} mode {permissions:o}",
+                    target.display()
+                );
+                mode(&target, 0o755);
+            }
+        }
+        for target in [profiles_root(&data), profile] {
+            mode(&target, 0o1777);
+            assert!(server_profile_dir(&data, "profile", false).is_err());
+            mode(&target, 0o755);
+        }
+    }
+
+    #[test]
+    fn host_ancestor_modes_are_outside_profile_policy() {
+        let outer = temp();
+        let data = outer.path().join("data");
+        fs::create_dir(&data).unwrap();
+        mode(&data, 0o700);
+        mode(outer.path(), 0o1777);
+        mode(&data, 0o700);
+        let profile = create(&data);
+        assert_eq!(
+            server_profile_dir(&data, "profile", false).unwrap(),
+            Some(profile)
+        );
+        mode(outer.path(), 0o2775);
+        assert!(
+            server_profile_dir(&data, "profile", false)
+                .unwrap()
+                .is_some()
+        );
+        mode(outer.path(), 0o700);
+    }
+
+    #[test]
+    fn no_ancestor_root_profile_or_user_data_link_is_followed() {
+        let base = temp();
+        let actual = base.path().join("actual");
+        fs::create_dir(&actual).unwrap();
+        mode(&actual, 0o700);
+        let alias = base.path().join("alias");
+        symlink(&actual, &alias).unwrap();
+        assert!(server_profile_dir(&alias, "profile", true).is_err());
+        assert!(!profiles_root(&actual).exists());
+        let outside = temp();
+        symlink(outside.path(), profiles_root(&actual)).unwrap();
+        assert!(server_profile_dir(&actual, "profile", true).is_err());
+        fs::remove_file(profiles_root(&actual)).unwrap();
+        fs::create_dir(profiles_root(&actual)).unwrap();
+        mode(&profiles_root(&actual), 0o755);
+        let profile = profile_dir(&actual, "profile");
+        symlink(outside.path(), &profile).unwrap();
+        assert!(server_profile_dir(&actual, "profile", true).is_err());
+        fs::remove_file(&profile).unwrap();
+        let profile = create(&actual);
+        symlink(outside.path(), profile.join("user-data")).unwrap();
+        assert!(server_profile_dir(&actual, "profile", false).is_err());
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn fingerprint_links_writable_files_and_nonregular_files_are_refused() {
+        let data = temp();
+        let profile = create(data.path());
+        let leaf = profile.join("fingerprint.json");
+        let outside = temp();
+        let target = outside.path().join("private");
+        fs::write(&target, "untouched").unwrap();
+        symlink(&target, &leaf).unwrap();
+        assert!(server_profile_dir(data.path(), "profile", false).is_err());
+        fs::remove_file(&leaf).unwrap();
+        fs::hard_link(&target, &leaf).unwrap();
+        assert!(server_profile_dir(data.path(), "profile", false).is_err());
+        fs::remove_file(&leaf).unwrap();
+        fs::write(&leaf, "valid").unwrap();
+        mode(&leaf, 0o666);
+        assert!(server_profile_dir(data.path(), "profile", false).is_err());
+        fs::remove_file(&leaf).unwrap();
+        fs::create_dir(&leaf).unwrap();
+        assert!(server_profile_dir(data.path(), "profile", false).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+    }
+
+    #[test]
+    fn descriptor_stays_on_old_directory_but_replacement_path_is_refused() {
+        let data = temp();
+        let profile = create(data.path());
+        let root = fs::File::open(profiles_root(data.path())).unwrap();
+        let held = open_directory_at(&root, "profile".as_ref())
+            .unwrap()
+            .unwrap();
+        let saved = profile.with_file_name("saved");
+        fs::rename(&profile, &saved).unwrap(); // simulate a privileged migration
+        symlink(temp().path(), &profile).unwrap();
+        assert!(trusted_directory(&held, true, false).is_ok());
+        assert!(server_profile_dir(data.path(), "profile", false).is_err());
+        assert!(saved.is_dir());
     }
 }

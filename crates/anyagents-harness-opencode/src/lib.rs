@@ -1,38 +1,75 @@
 //! OpenCode adapter.
 //!
-//! `opencode serve` is an HTTP server, not a line protocol on stdin. The desk's
-//! own worker drives it through `opencode api`, and so does this adapter:
+//! `opencode serve` is an HTTP server, not a line protocol on stdin. This
+//! adapter starts one private service per agent and drives it with `opencode
+//! api`, one process per request, as the desk's own worker does. It speaks the
+//! OpenCode 2.x API:
 //!
+//! - the service must be 2.x. A 1.x `serve` announces `opencode server
+//!   listening on …` and no password, and has neither `opencode api` nor `GET
+//!   /api/info`: the start fails at once, saying so. A service whose `GET
+//!   /api/info` answers 404 (OpenCode's own sign of an incompatible service) or
+//!   names a version below 2 fails the start the same way, before any session
+//!   is touched;
 //! - the session is a fixed id (`--session`), resumed across restarts;
 //! - a mailbox line is a prompt: `POST /api/session/{id}/prompt` with the text
-//!   `anyagents-message:<id>` on its first line and `delivery: "steer"`;
-//! - the session takes the prompt as accepted as soon as the API answers with
-//!   `data`, and its own inbox decides whether that joins the running turn or
-//!   starts the next one. The host does not wait for a turn to end: there is
-//!   nothing here to wait for, and a mailbox that stopped until an idle would
-//!   stop for good one the frame that carries it was missed;
-//! - the answer is the assistant text that followed the prompt, which the agent
-//!   itself usually sends through its MCP `send` tool.
+//!   `anyagents-message:<id>` on its first line, `delivery: "steer"`, and the
+//!   mailbox id as the prompt's own message id (`msg_…`). The service admits
+//!   it to the session's durable inbox, and its turn takes every pending
+//!   steer at its next step, in admission order, or a new turn starts with
+//!   it. Given an id it already holds, as an inbox row or as a message of the
+//!   session, the service answers with that record and admits nothing;
+//! - the admission is the proof delivery rests on (`MidTurn`): the service
+//!   reports consumption only on its event stream, which a one-shot `opencode
+//!   api` call does not read. Because the id travels with the prompt, writing
+//!   the same line again, from this process or a later one, never applies it
+//!   twice, and a record that predates the request and is already in the
+//!   conversation is answered as a duplicate;
+//! - prompts are written one at a time, in mailbox order, each on a thread of
+//!   its own: a slow service holds the mailbox, never the host, and no prompt
+//!   call has a timeout. What the service answers decides the line:
+//!   - a 400 (a malformed request) or a 409 (the id belongs to another durable
+//!     record) refuses it for good: it is `Rejected`, and answered so again
+//!     whenever it is offered again, without another call;
+//!   - a 503 `service_starting` or `service_stopping` is the service's
+//!     readiness gate, which answers before any route and admits nothing: the
+//!     line waits out the one-second `retry-after` the service asks for, goes
+//!     back to the mailbox, and the host is woken to offer it again;
+//!   - an outcome that may or may not have admitted it (another server error,
+//!     a lost connection) is settled by writing the same id again; a second
+//!     such outcome is a fault of the service;
+//!   - a 401 or 403, or a 503 `service_failed`, is a fault of the process;
+//! - a turn ends when `POST /api/experimental/session/{id}/wait`, asked after
+//!   the newest admission, answers: the service's own idle signal;
+//! - before the host replaces the process (`stop`), a prompt call that is out
+//!   is waited for, up to a minute, so what it proved is known; one still
+//!   unanswered then is unknown, and the next process writes its id again.
+//!   The proofs outlive the process.
 //!
-//! The mailbox id travels in the prompt text, so the agent's own `send` (its
-//! MCP tool) is the reply path and the server records it against the same
-//! agent. Nothing here reads a credential: the service's address and password
-//! come from the private service this adapter starts for this agent.
+//! The mailbox id on the prompt's first line also makes the agent's own `send`
+//! (its MCP tool) the reply path, recorded against the same agent. Nothing
+//! here reads a credential: the service's address and password come from the
+//! private service this adapter starts for this agent.
 
 mod port;
 
+use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage, SteerItem,
-    SteerQueue, SteerSupport, TurnState, TurnUsage, compose_message,
+    DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    Proof, TurnState, TurnUsage, compose_message,
 };
 use serde_json::{Value, json};
 
-/// How long one API call may take.
+/// How long a call off the delivery path may take: startup, usage, answers and
+/// cancel; and how long `stop` lets a prompt call that is out answer before
+/// the service goes. A prompt, and the wait for a turn to end, have no limit.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the adapter waits for a started service to announce itself.
 ///
@@ -44,17 +81,55 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the adapter waits for the started service's API to answer.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How often an open turn is checked when the service cannot wait for it.
+const TURN_POLL: Duration = Duration::from_secs(1);
+
+/// The `retry-after` OpenCode's readiness gate sends with a 503
+/// `service_starting` or `service_stopping` (one second, always). `opencode
+/// api` prints no header, so the service's fixed value is kept here.
+const RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// The prefix a 1.x `opencode serve` announces its address with. A 2.x
+/// service prints `server listening on <url>` and then `server password …`.
+const LEGACY_ANNOUNCEMENT: &str = "opencode server listening on ";
+
+/// What this adapter guarantees for mail that reaches a busy agent
+/// (`docs/delivery.md`).
+pub const DELIVERY: Delivery = Delivery {
+    level: DeliveryLevel::MidTurn,
+    idempotent: true,
+    proof: std::borrow::Cow::Borrowed("durable inbox admission, by id"),
+    peer: None,
+};
+
 /// One long-lived OpenCode service and the session it serves.
 pub struct OpenCodeHarness {
+    vendor: Arc<Vendor>,
+    child: Option<Child>,
+    port: Option<port::PortLease>,
+}
+
+/// What a started service printed before it was waited for no longer.
+enum Announcement {
+    /// Its private address and password: a 2.x service.
+    Ready,
+    /// A 1.x service's address line, with no password.
+    Legacy(String),
+    /// Nothing usable before the start deadline, or it exited.
+    Silent,
+}
+
+/// What every call to the service needs, shared with the threads that carry a
+/// prompt or wait for a turn to end.
+struct Vendor {
     program: PathBuf,
     /// The agent's config directory; its session id is kept here.
     config_dir: Option<PathBuf>,
     work_dir: Option<PathBuf>,
     environment: Vec<(String, String)>,
-    child: Option<Child>,
-    port: Option<port::PortLease>,
-    shared: Arc<Mutex<State>>,
-    steer: Option<SteerQueue>,
+    state: Mutex<State>,
+    /// Signalled whenever `State::epoch` moves or the process goes.
+    changed: Condvar,
 }
 
 #[derive(Clone, Debug)]
@@ -64,11 +139,52 @@ struct PriorPrompt {
     text: String,
 }
 
+/// What became of one mailbox line this process wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Prompt {
+    /// Its prompt call is out.
+    Sending,
+    /// The session's inbox holds it.
+    Admitted,
+    /// An earlier process wrote it and the session already consumed it.
+    Applied,
+    /// The service's readiness gate turned it away and admitted nothing; it
+    /// waits for its next offer.
+    Refused,
+    /// The service refused it for good and admitted nothing.
+    Rejected(String),
+    /// The call ended without saying whether the service admitted it.
+    Unknown,
+    /// The service failed in a way only a new process can clear.
+    Fault(String),
+}
+
 #[derive(Default)]
 struct State {
     session: Option<String>,
     alive: bool,
-    /// Ids the prompt API took, in the order they were written.
+    /// The harness is being dropped: background calls stop acting.
+    closing: bool,
+    /// Which service start this is, so the output of an earlier one that
+    /// closes late cannot mark this one gone.
+    launch: u64,
+    launch_ended: bool,
+    /// Moves on every change a host waits for: an answered prompt, a turn
+    /// that ended, the process gone.
+    epoch: u64,
+    /// The service this adapter started, and the password it printed. A
+    /// separate `opencode api` must be pointed at that address, or it talks to
+    /// whatever service the machine happens to run.
+    service: Option<String>,
+    password: Option<String>,
+    /// `opencode <version>`, as `GET /api/info` reports it.
+    peer: Option<String>,
+    /// What became of each line this process wrote, by mailbox id.
+    prompts: HashMap<String, Prompt>,
+    /// The line whose prompt call is out. One at a time: the service admits
+    /// them in the order the calls arrive.
+    sending: Option<String>,
+    /// Ids the service admitted from this process, in order.
     written: Vec<String>,
     /// Prior messages accepted in this adapter session, used to restore
     /// conversation context if the OpenCode session later returns HTTP 404.
@@ -79,20 +195,37 @@ struct State {
     /// Stale session ID replaced after an HTTP 404, pending context
     /// restoration on the first prompt delivered to the replacement session.
     recovered_from_session: Option<String>,
-    /// Turns the session reported failed, by message id.
-    failures: Vec<(String, String)>,
-    /// The service this adapter started, and the password it printed. A
-    /// separate `opencode api` must be pointed at that address, or it talks to
-    /// whatever service the machine happens to run.
-    service: Option<String>,
-    password: Option<String>,
     turn_open: bool,
-    last_prompt_at: Option<Instant>,
+    /// Lines admitted so far. A turn ends only when the service went idle
+    /// after the newest of them.
+    admissions: u64,
+    /// A thread is waiting for the open turn to end.
+    watching: bool,
     turns_completed: u32,
-    last_usage_poll: Option<Instant>,
-    last_usage_written: usize,
+    /// `turns_completed` when the session's totals were last read.
+    usage_read_at: Option<u32>,
+    /// What this process served, as last read: the host records differences
+    /// of it, so it counts from this process's start, never the session's.
     cached_usage: TurnUsage,
-    quota_reset_at_ms: Option<i64>,
+    /// The session this process serves now, and its totals when this process
+    /// began serving it: what came before is an earlier process's.
+    usage_base: Option<(String, TurnUsage)>,
+    /// What this process served in sessions it served before this one.
+    usage_earlier: TurnUsage,
+}
+
+/// `a` and `b` added, field by field.
+fn plus(a: &TurnUsage, b: &TurnUsage) -> TurnUsage {
+    TurnUsage {
+        input_tokens: a.input_tokens + b.input_tokens,
+        output_tokens: a.output_tokens + b.output_tokens,
+        cache_read_tokens: a.cache_read_tokens + b.cache_read_tokens,
+        cache_write_tokens: a.cache_write_tokens + b.cache_write_tokens,
+        reported_cost_micros: match (a.reported_cost_micros, b.reported_cost_micros) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        },
+    }
 }
 
 impl OpenCodeHarness {
@@ -122,19 +255,10 @@ impl OpenCodeHarness {
         work_dir: Option<&Path>,
         config_dir: Option<&Path>,
     ) -> Result<Self, HarnessError> {
-        let mut harness = Self {
-            program: program.into(),
-            config_dir: config_dir.map(Path::to_path_buf),
-            work_dir: work_dir.map(Path::to_path_buf),
-            environment: environment
-                .iter()
-                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-                .collect(),
-            child: None,
-            port: None,
-            shared: Arc::new(Mutex::new(State::default())),
-            steer: None,
-        };
+        let mut environment: Vec<(String, String)> = environment
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
         if let Some(dir) = config_dir {
             // Override inherited host roots, including OpenCode's explicit
             // config override, before any vendor command can discover a service.
@@ -144,13 +268,25 @@ impl OpenCodeHarness {
                 ("XDG_DATA_HOME", dir.join("data-home")),
                 ("XDG_STATE_HOME", dir.join("state-home")),
             ] {
-                harness.environment.retain(|(name, _)| name != key);
-                harness
-                    .environment
-                    .push((key.into(), value.display().to_string()));
+                environment.retain(|(name, _)| name != key);
+                environment.push((key.into(), value.display().to_string()));
             }
         }
-        harness.lock().session = session_id.map(str::to_string);
+        let mut harness = Self {
+            vendor: Arc::new(Vendor {
+                program: program.into(),
+                config_dir: config_dir.map(Path::to_path_buf),
+                work_dir: work_dir.map(Path::to_path_buf),
+                environment,
+                state: Mutex::new(State {
+                    session: session_id.map(str::to_string),
+                    ..State::default()
+                }),
+                changed: Condvar::new(),
+            }),
+            child: None,
+            port: None,
+        };
         harness.begin()?;
         Ok(harness)
     }
@@ -166,27 +302,31 @@ impl OpenCodeHarness {
         Self::start_with(program, session_id, environment, work_dir, Some(config_dir))
     }
 
-    /// Also watch `queue` for lines a channel pushed between model steps.
-    pub fn with_steer(mut self, queue: SteerQueue) -> Self {
-        self.steer = Some(queue);
-        self
-    }
-
-    /// Ids the prompt API took, in the order they were written.
+    /// Ids the service admitted from this process, in the order they were written.
     pub fn written_ids(&self) -> Vec<String> {
-        self.lock().written.clone()
+        self.vendor.lock().written.clone()
     }
     pub fn session_id(&self) -> Option<String> {
-        self.lock().session.clone()
+        self.vendor.lock().session.clone()
     }
-    /// Whether the prompt API has taken `id`.
+    /// Whether the service has admitted `id` from this process.
     pub fn seen(&self, id: &str) -> bool {
-        self.lock().written.iter().any(|written| written == id)
+        self.vendor
+            .lock()
+            .written
+            .iter()
+            .any(|written| written == id)
     }
     pub fn wait_seen(&self, id: &str, timeout: Duration) -> bool {
-        self.wait(timeout, |state| {
-            state.written.iter().any(|written| written == id)
-        })
+        let state = self.vendor.lock();
+        let (state, _) = self
+            .vendor
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                !state.written.iter().any(|written| written == id)
+            })
+            .unwrap_or_else(|err| err.into_inner());
+        state.written.iter().any(|written| written == id)
     }
     /// Whether the session has answered `id`, as read from the session.
     pub fn wait_answered(&self, id: &str, timeout: Duration) -> bool {
@@ -198,13 +338,32 @@ impl OpenCodeHarness {
             if Instant::now() >= deadline {
                 return false;
             }
-            let _ = self.poll();
-            std::thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
         }
     }
     /// The answer the session holds for `id`, as read from the session now.
     pub fn answer(&self, id: &str) -> Option<String> {
         self.answer_in_session(id)
+    }
+
+    /// The answer the session holds for this mailbox id: the assistant message
+    /// that follows the user message carrying `anyagents-message:<id>`.
+    ///
+    /// The session lists messages newest first, so the answer is the first
+    /// assistant message *before* that user message in that order. Reasoning
+    /// parts are never the answer.
+    pub fn answer_in_session(&self, id: &str) -> Option<String> {
+        let session = self.vendor.lock().session.clone()?;
+        let listing = self
+            .vendor
+            .call(
+                "GET",
+                &format!("/api/session/{session}/message"),
+                None,
+                Some(CALL_TIMEOUT),
+            )
+            .ok()?;
+        answer_of(listing.get("data")?.as_array()?, id)
     }
 
     /// Start the service, wait until it answers, and resume the session.
@@ -218,13 +377,20 @@ impl OpenCodeHarness {
         for attempt in 0..3 {
             let previous = self.port.take().map(|lease| lease.port);
             self.port = Some(port::PortLease::acquire(
-                self.config_dir.as_deref(),
+                self.vendor.config_dir.as_deref(),
                 previous,
             )?);
             let port = self.port.as_ref().expect("allocated port").port;
             let (announced, collision) = self.launch_service(port)?;
-            if announced {
-                return self.resume_session();
+            match announced {
+                Announcement::Ready => return self.resume_session(),
+                Announcement::Legacy(line) => {
+                    self.stop_child();
+                    return Err(HarnessError::Failed(format!(
+                        "OpenCode 1.x service ({line:?}, no password): this adapter speaks the OpenCode 2.x API (`opencode api`, the session inbox); install OpenCode 2.x. The session is untouched"
+                    )));
+                }
+                Announcement::Silent => {}
             }
             self.stop_child();
             // The holder may already have released the port. Preserve the
@@ -250,8 +416,9 @@ impl OpenCodeHarness {
     fn launch_service(
         &mut self,
         port: u16,
-    ) -> Result<(bool, std::sync::mpsc::Receiver<bool>), HarnessError> {
-        let mut command = anyagents_harness::spawn_command(&self.program, &self.environment)?;
+    ) -> Result<(Announcement, std::sync::mpsc::Receiver<bool>), HarnessError> {
+        let vendor = Arc::clone(&self.vendor);
+        let mut command = anyagents_harness::spawn_command(&vendor.program, &vendor.environment)?;
         command
             .args([
                 "serve",
@@ -263,7 +430,7 @@ impl OpenCodeHarness {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(dir) = &self.work_dir {
+        if let Some(dir) = &vendor.work_dir {
             command.current_dir(dir);
         }
         // Inherited credentials suppress the password announcement. Generate a
@@ -272,149 +439,335 @@ impl OpenCodeHarness {
             .env_remove("OPENCODE_PASSWORD")
             .env_remove("OPENCODE_SERVER_PASSWORD");
         self.port.as_mut().expect("allocated port").handoff();
+        let launch = {
+            let mut state = vendor.lock();
+            state.launch += 1;
+            state.launch_ended = false;
+            state.service = None;
+            state.password = None;
+            state.launch
+        };
         let mut child = command
             .spawn()
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
         self.write_service_pid(child.id());
         let collision = port::watch_collision(child.stderr.take().expect("piped stderr"));
+        let stdout = child.stdout.take().expect("piped stdout");
         self.child = Some(child);
-        if let Some(stdout) = self.child.as_mut().and_then(|child| child.stdout.take()) {
-            use std::io::{BufRead, BufReader, Read};
-            use std::sync::mpsc;
-            // A service that never announces itself must not wedge the
-            // adapter, so the lines are read on their own thread and waited
-            // for with a deadline.
-            let (lines, heard) = mpsc::channel();
+        use std::io::{BufRead, BufReader};
+        use std::sync::mpsc;
+        // A service that never announces itself must not wedge the adapter,
+        // so the lines are read on their own thread and waited for with a
+        // deadline. The same thread then drains the output, so the child never
+        // blocks on a full pipe, and says when it closes: the service is gone.
+        let (lines, heard) = mpsc::channel();
+        let reader_vendor = Arc::clone(&vendor);
+        thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
-            std::thread::spawn(move || {
-                loop {
-                    let mut line = String::new();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {
-                            if lines.send(line).is_err() {
-                                break;
-                            }
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if lines.send(line).is_err() {
+                            break;
                         }
                     }
                 }
-                // Keep draining so the child never blocks on a full pipe.
-                let mut sink = reader;
-                let mut buffer = [0u8; 4096];
-                while sink.read(&mut buffer).unwrap_or(0) > 0 {}
-            });
-            let deadline = Instant::now() + START_TIMEOUT;
-            while Instant::now() < deadline {
-                let left = deadline.saturating_duration_since(Instant::now());
-                let line = match heard.recv_timeout(left.min(Duration::from_millis(500))) {
-                    Ok(line) => line,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                };
-                let line = line.trim();
-                if let Some(rest) = line.strip_prefix("server listening on ") {
-                    let endpoint = rest.trim_end_matches('/');
-                    if endpoint == format!("http://127.0.0.1:{port}") {
-                        self.lock().service = Some(endpoint.to_string());
-                    }
-                }
-                if let Some(password) = line.strip_prefix("server password ") {
-                    self.lock().password = Some(password.trim().to_string());
-                }
-                if self.lock().service.is_some() && self.lock().password.is_some() {
-                    break;
+            }
+            let mut buffer = [0u8; 4096];
+            while reader.read(&mut buffer).unwrap_or(0) > 0 {}
+            let mut state = reader_vendor.lock();
+            if state.launch == launch {
+                state.launch_ended = true;
+                state.alive = false;
+                state.epoch += 1;
+            }
+            drop(state);
+            reader_vendor.changed.notify_all();
+        });
+        let deadline = Instant::now() + START_TIMEOUT;
+        let mut legacy = None;
+        while Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let line = match heard.recv_timeout(left.min(Duration::from_millis(500))) {
+                Ok(line) => line,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            };
+            let line = line.trim();
+            // A 1.x service says who it is in its first line; nothing it
+            // prints later makes it one this adapter can drive.
+            if line.starts_with(LEGACY_ANNOUNCEMENT) {
+                legacy = Some(line.to_string());
+                break;
+            }
+            let mut state = vendor.lock();
+            if let Some(rest) = line.strip_prefix("server listening on ") {
+                let endpoint = rest.trim_end_matches('/');
+                if endpoint == format!("http://127.0.0.1:{port}") {
+                    state.service = Some(endpoint.to_string());
                 }
             }
+            if let Some(password) = line.strip_prefix("server password ") {
+                state.password = Some(password.trim().to_string());
+            }
+            if state.service.is_some() && state.password.is_some() {
+                break;
+            }
         }
-        let announced = self.lock().service.is_some() && self.lock().password.is_some();
-        self.lock().alive = announced;
+        let mut state = vendor.lock();
+        let ready = legacy.is_none() && state.service.is_some() && state.password.is_some();
+        state.alive = ready && !state.launch_ended;
+        let announced = match legacy {
+            Some(line) => Announcement::Legacy(line),
+            None if ready => Announcement::Ready,
+            None => Announcement::Silent,
+        };
         Ok((announced, collision))
     }
 
     fn resume_session(&mut self) -> Result<(), HarnessError> {
+        let vendor = Arc::clone(&self.vendor);
         let ready = Instant::now() + READY_TIMEOUT;
         let mut up = false;
         while Instant::now() < ready {
-            if self.api("GET", "/api/session", None).is_ok() {
+            if vendor
+                .call("GET", "/api/session", None, Some(CALL_TIMEOUT))
+                .is_ok()
+            {
                 up = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(200));
+            thread::sleep(Duration::from_millis(200));
         }
         if !up {
             return Err(HarnessError::Failed(
                 "the OpenCode service did not answer; the session is untouched".into(),
             ));
         }
+        // Who answers, as the service names itself, before any session is
+        // looked up or created: an adapter that speaks 2.x must never drive
+        // an older service.
+        let peer = match vendor.call("GET", "/api/info", None, Some(CALL_TIMEOUT)) {
+            Ok(info) => info
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            Err(err) if err.status == Some(404) => {
+                return Err(HarnessError::Failed(
+                    "OpenCode service without GET /api/info (HTTP 404): an OpenCode 1.x service; this adapter speaks the OpenCode 2.x API. The session is untouched".into(),
+                ));
+            }
+            Err(err) => {
+                return Err(HarnessError::Failed(format!(
+                    "cannot learn the OpenCode service's version: {err}; the session is untouched"
+                )));
+            }
+        };
+        if let Some(version) = &peer
+            && major_version(version).is_none_or(|major| major < 2)
+        {
+            return Err(HarnessError::Failed(format!(
+                "OpenCode {version} speaks the OpenCode 1.x API; this adapter speaks 2.x. The session is untouched"
+            )));
+        }
+        vendor.lock().peer = peer.map(|version| format!("opencode {version}"));
         // The stored session is resumed. A new one is created only when it is
         // truly gone from this agent's own store, and that is said out loud so
         // a lost conversation is never silent.
-        let wanted = self.lock().session.clone();
+        let wanted = vendor.lock().session.clone();
         // A stored session is resumed unless the service clearly says it does
         // not exist. A transient failure is retried, never read as "gone": a
         // new session there would strand the answers already in the old one.
-        let usable =
-            match &wanted {
-                Some(session) => {
-                    let mut state = Missing::Unknown;
-                    for _ in 0..5 {
-                        match self.api("GET", &format!("/api/session/{session}"), None) {
-                            Ok(_) => {
-                                state = Missing::Present;
-                                break;
-                            }
-                            Err(err) => {
-                                state = if is_session_not_found(&err) {
-                                    Missing::Gone
-                                } else {
-                                    Missing::Unknown
-                                };
-                                if state == Missing::Gone {
-                                    break;
-                                }
-                                std::thread::sleep(Duration::from_millis(300));
-                            }
+        let usable = match &wanted {
+            Some(session) => {
+                let mut state = Missing::Unknown;
+                for _ in 0..5 {
+                    match vendor.call(
+                        "GET",
+                        &format!("/api/session/{session}"),
+                        None,
+                        Some(CALL_TIMEOUT),
+                    ) {
+                        Ok(_) => {
+                            state = Missing::Present;
+                            break;
+                        }
+                        Err(err) if err.status == Some(404) => {
+                            state = Missing::Gone;
+                            break;
+                        }
+                        Err(_) => {
+                            state = Missing::Unknown;
+                            thread::sleep(Duration::from_millis(300));
                         }
                     }
-                    match state {
-                        Missing::Present => true,
-                        Missing::Gone => false,
-                        Missing::Unknown => return Err(HarnessError::Failed(
+                }
+                match state {
+                    Missing::Present => true,
+                    Missing::Gone => false,
+                    Missing::Unknown => {
+                        return Err(HarnessError::Failed(
                             "OpenCode session availability is unknown; refusing a new conversation"
                                 .into(),
-                        )),
+                        ));
                     }
                 }
-                None => false,
-            };
-        if !usable {
-            self.recreate_session(wanted.as_deref())?;
-        } else {
-            self.remember_session()?;
-        }
-        if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
-            // OpenCode boots location services and MCP servers lazily on the first
-            // directory-scoped call (`GET /api/mcp` or `POST /api/session/<id>/prompt`).
-            // Poll `GET /api/mcp` briefly so the `anyagents` MCP server is connected
-            // before the very first turn builds its tool catalog.
-            for _ in 0..15 {
-                let Ok(mcp) = self.api("GET", "/api/mcp", None) else {
-                    break;
-                };
-                let Some(items) = mcp.get("data").and_then(Value::as_array) else {
-                    break;
-                };
-                if items.iter().any(|item| {
-                    item.get("name").and_then(Value::as_str) == Some("anyagents")
-                        && item.pointer("/status/status").and_then(Value::as_str)
-                            == Some("connected")
-                }) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(200));
             }
+            None => false,
+        };
+        if usable {
+            vendor.remember_session()?;
+            if let Some(session) = wanted.as_deref() {
+                // A resumed session's totals so far are earlier processes'.
+                vendor.begin_usage(session, vendor.session_totals(session));
+            }
+        } else {
+            vendor.recreate_session(wanted.as_deref(), Some(CALL_TIMEOUT))?;
+        }
+        // OpenCode boots location services and MCP servers lazily on the first
+        // directory-scoped call (`GET /api/mcp` or `POST /api/session/<id>/prompt`).
+        // Poll `GET /api/mcp` briefly so the `anyagents` MCP server is connected
+        // before the very first turn builds its tool catalog.
+        for _ in 0..15 {
+            let Ok(mcp) = vendor.call("GET", "/api/mcp", None, Some(CALL_TIMEOUT)) else {
+                break;
+            };
+            let Some(items) = mcp.get("data").and_then(Value::as_array) else {
+                break;
+            };
+            if items.iter().any(|item| {
+                item.get("name").and_then(Value::as_str) == Some("anyagents")
+                    && item.pointer("/status/status").and_then(Value::as_str) == Some("connected")
+            }) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        // The inbox is durable: a service that picked up where an earlier one
+        // stopped is running a turn already, and its end is waited for too.
+        let session = vendor.lock().session.clone().unwrap_or_default();
+        if let Ok(active) = vendor.call("GET", "/api/session/active", None, Some(CALL_TIMEOUT))
+            && active
+                .get("data")
+                .and_then(|data| data.get(&session))
+                .is_some()
+        {
+            let mut state = vendor.lock();
+            state.turn_open = true;
+            watch(&vendor, &mut state);
         }
         Ok(())
+    }
+}
+
+impl Vendor {
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Say what became of a line, unless the harness is gone and nobody waits.
+    fn note(&self, line: &str) {
+        if !self.lock().closing {
+            eprintln!("anyagents-opencode: {line}");
+        }
+    }
+
+    /// One `opencode api` call. Its own process, so a hung call holds only the
+    /// thread that made it, and a failure names the call and never a secret.
+    /// `limit` bounds a call off the delivery path; a prompt and a turn's wait
+    /// pass `None` and take as long as the service does.
+    fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        limit: Option<Duration>,
+    ) -> Result<Value, ApiError> {
+        let (service, password) = {
+            let state = self.lock();
+            (state.service.clone(), state.password.clone())
+        };
+        let service = service.ok_or_else(|| {
+            ApiError::local(
+                method,
+                path,
+                "the OpenCode private endpoint is unavailable; refusing service discovery",
+            )
+        })?;
+        let mut command = anyagents_harness::spawn_command(&self.program, &self.environment)
+            .map_err(|err| ApiError::local(method, path, err.to_string()))?;
+        // `opencode api --server <url> <METHOD> <path>`, as the CLI reads it:
+        // the subcommand comes first, then its flags.
+        command.args(["api", "--server", &service, method, path]);
+        if let Some(body) = body {
+            command.args(["-d", &body.to_string()]);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(dir) = &self.work_dir {
+            command.current_dir(dir);
+        }
+        if let Some(password) = password {
+            command.env("OPENCODE_PASSWORD", password);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|err| ApiError::local(method, path, err.to_string()))?;
+        // Both pipes are read while the call runs: an answer larger than a pipe
+        // buffer must never hold the child.
+        let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut bytes);
+                }
+                bytes
+            })
+        };
+        let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+        let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+        let status = match limit {
+            None => child.wait(),
+            Some(limit) => {
+                let deadline = Instant::now() + limit;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break Ok(status),
+                        Ok(None) if Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(20));
+                        }
+                        Ok(None) => {
+                            anyagents_harness::kill_child(&mut child, &self.environment);
+                            let _ = child.wait();
+                            return Err(ApiError::local(
+                                method,
+                                path,
+                                format!("no answer within {}s", limit.as_secs()),
+                            ));
+                        }
+                        Err(err) => break Err(err),
+                    }
+                }
+            }
+        }
+        .map_err(|err| ApiError::local(method, path, err.to_string()))?;
+        let stdout = stdout.join().unwrap_or_default();
+        let stderr = stderr.join().unwrap_or_default();
+        if !status.success() {
+            return Err(ApiError::answered(method, path, &stdout, &stderr));
+        }
+        let text = String::from_utf8_lossy(&stdout);
+        let text = text.trim();
+        // A 204 prints nothing.
+        if text.is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(text)
+            .map_err(|err| ApiError::local(method, path, format!("undecodable answer: {err}")))
     }
 
     /// Keep this agent's session id beside its config, so the next start
@@ -437,13 +790,19 @@ impl OpenCodeHarness {
 
     /// Create a fresh OpenCode session, persist its id to `opencode-session-id`,
     /// and mark recovery context to be seeded when replacing a missing session.
-    fn recreate_session(&mut self, stale_session: Option<&str>) -> Result<String, HarnessError> {
+    fn recreate_session(
+        &self,
+        stale_session: Option<&str>,
+        limit: Option<Duration>,
+    ) -> Result<String, HarnessError> {
         if let Some(session) = stale_session {
             eprintln!(
                 "anyagents-opencode: session {session} is gone from this agent's store; starting a new one"
             );
         }
-        let fresh = self.api("POST", "/api/session", Some(json!({})))?;
+        let fresh = self
+            .call("POST", "/api/session", Some(&json!({})), limit)
+            .map_err(|err| HarnessError::Failed(err.to_string()))?;
         let id = fresh
             .pointer("/data/id")
             .and_then(Value::as_str)
@@ -455,6 +814,8 @@ impl OpenCodeHarness {
             self.lock().session = previous;
             return Err(err);
         }
+        // A session this process created holds nothing of an earlier one.
+        self.begin_usage(&id, Some(TurnUsage::default()));
         if let Some(stale) = stale_session {
             self.sync_config_recovery_instructions();
             let mut state = self.lock();
@@ -464,6 +825,55 @@ impl OpenCodeHarness {
             state.turn_open = false;
         }
         Ok(id)
+    }
+
+    /// The session's own running totals, as the service reports them.
+    fn session_totals(&self, session: &str) -> Option<TurnUsage> {
+        let info = self
+            .call(
+                "GET",
+                &format!("/api/session/{session}"),
+                None,
+                Some(CALL_TIMEOUT),
+            )
+            .ok()?
+            .get("data")
+            .cloned()?;
+        let tokens = info.get("tokens").cloned().unwrap_or(Value::Null);
+        let number = |key: &str| tokens.get(key).and_then(Value::as_u64).unwrap_or(0);
+        Some(TurnUsage {
+            input_tokens: number("input"),
+            output_tokens: number("output"),
+            cache_read_tokens: tokens
+                .pointer("/cache/read")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cache_write_tokens: tokens
+                .pointer("/cache/write")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            reported_cost_micros: info
+                .get("cost")
+                .and_then(Value::as_f64)
+                .map(|cost| (cost * 1_000_000.0) as i64),
+        })
+    }
+
+    /// This process begins serving `session`, whose totals are `base` now:
+    /// what it serves from here is counted from them, on top of what it
+    /// served in sessions before. Unknown totals are taken at the first
+    /// reading, so an earlier process's usage is never counted as this one's.
+    fn begin_usage(&self, session: &str, base: Option<TurnUsage>) {
+        let mut state = self.lock();
+        if state
+            .usage_base
+            .as_ref()
+            .is_some_and(|(serving, _)| serving == session)
+        {
+            return;
+        }
+        state.usage_earlier = state.cached_usage.clone();
+        state.usage_base = base.map(|base| (session.to_string(), base));
     }
 
     fn sync_config_recovery_instructions(&self) {
@@ -617,44 +1027,129 @@ impl OpenCodeHarness {
         out
     }
 
-    fn send_prompt(&mut self, message: &OutboundMessage) -> Result<Value, HarnessError> {
-        let Some(session) = self.lock().session.clone() else {
-            return Err(HarnessError::Failed("no session".into()));
+    /// Write one line and say what became of it. A session the service says
+    /// is gone is replaced once, and the line written there with the context
+    /// of the old one.
+    fn write_prompt(&self, message: &OutboundMessage, replay: bool) -> Prompt {
+        let (session, stale) = {
+            let state = self.lock();
+            (state.session.clone(), state.recovered_from_session.clone())
         };
-        let pending_recovery = self.lock().recovered_from_session.clone();
-        let initial_text = match pending_recovery.as_deref() {
-            Some(stale) => self.compose_prompt(message, Some((stale, &session))),
-            None => self.compose_prompt(message, None),
+        let Some(session) = session else {
+            return Prompt::Fault("no OpenCode session".into());
         };
-        let body = json!({
-            "text": initial_text,
-            "delivery": "steer",
-        });
-        match self.api(
-            "POST",
-            &format!("/api/session/{session}/prompt"),
-            Some(body),
-        ) {
-            Ok(answer) => Ok(answer),
-            Err(err) if is_session_not_found(&err) => {
-                let stale = pending_recovery.unwrap_or_else(|| session.clone());
-                let new_session = self.recreate_session(Some(&stale))?;
-                let retry_body = json!({
-                    "text": self.compose_prompt(message, Some((&stale, &new_session))),
-                    "delivery": "steer",
-                });
-                self.api(
-                    "POST",
-                    &format!("/api/session/{new_session}/prompt"),
-                    Some(retry_body),
-                )
+        let text = self.compose_prompt(
+            message,
+            stale.as_deref().map(|stale| (stale, session.as_str())),
+        );
+        match self.admit(&session, message, &text, replay) {
+            Ok(prompt) => prompt,
+            Err(_) => {
+                let stale = stale.unwrap_or(session);
+                let fresh = match self.recreate_session(Some(&stale), None) {
+                    Ok(fresh) => fresh,
+                    Err(err) => return Prompt::Fault(err.to_string()),
+                };
+                let text = self.compose_prompt(message, Some((&stale, &fresh)));
+                match self.admit(&fresh, message, &text, replay) {
+                    Ok(prompt) => prompt,
+                    Err(err) => Prompt::Fault(err.to_string()),
+                }
             }
-            Err(err) => Err(err),
         }
     }
 
-    fn record_prompt_accepted(&self, message: &OutboundMessage) {
-        let mut state = self.lock();
+    /// `POST /api/session/{session}/prompt` with the line's own id. `Err` is
+    /// the service saying the session does not exist.
+    fn admit(
+        &self,
+        session: &str,
+        message: &OutboundMessage,
+        text: &str,
+        replay: bool,
+    ) -> Result<Prompt, ApiError> {
+        let id = vendor_message_id(&message.id);
+        let body = json!({ "id": id, "text": text, "delivery": "steer" });
+        let sent_at = now_ms();
+        let answer = match self.call(
+            "POST",
+            &format!("/api/session/{session}/prompt"),
+            Some(&body),
+            None,
+        ) {
+            Ok(answer) => answer,
+            Err(err) => {
+                return match err.refusal() {
+                    Refusal::SessionGone => Err(err),
+                    Refusal::Permanent => {
+                        self.note(&format!("{err}; the line is rejected"));
+                        Ok(Prompt::Rejected(err.to_string()))
+                    }
+                    Refusal::NotReady => {
+                        self.note(&format!(
+                            "{err}; the line goes back to the mailbox after {}s",
+                            RETRY_AFTER.as_secs()
+                        ));
+                        Ok(Prompt::Refused)
+                    }
+                    Refusal::Fault => Ok(Prompt::Fault(err.to_string())),
+                    Refusal::Unknown if replay => Ok(Prompt::Fault(err.to_string())),
+                    Refusal::Unknown => {
+                        self.note(&format!("{err}; the same id is written again"));
+                        Ok(Prompt::Unknown)
+                    }
+                };
+            }
+        };
+        let Some(record) = answer.get("data").filter(|record| record.is_object()) else {
+            return Ok(if replay {
+                Prompt::Fault(format!("prompt answered without its record: {answer}"))
+            } else {
+                Prompt::Unknown
+            });
+        };
+        // The service answers an id it already holds with that record, created
+        // before this request. If the session already took it into its
+        // conversation, an earlier process applied the line.
+        let existed = record
+            .pointer("/time/created")
+            .and_then(Value::as_i64)
+            .is_some_and(|created| created < sent_at);
+        if existed
+            && self
+                .call(
+                    "GET",
+                    &format!("/api/session/{session}/message/{id}"),
+                    None,
+                    None,
+                )
+                .is_ok()
+        {
+            return Ok(Prompt::Applied);
+        }
+        Ok(Prompt::Admitted)
+    }
+}
+
+/// Write one line on this thread and record what became of it. Whatever the
+/// answer, the host is woken to offer the line, or the next one, again.
+fn carry(vendor: &Arc<Vendor>, message: &OutboundMessage, replay: bool) {
+    let outcome = vendor.write_prompt(message, replay);
+    if outcome == Prompt::Refused {
+        // The service asked to be called again after its `retry-after`. The
+        // line still holds the send slot, so nothing overtakes it meanwhile.
+        thread::sleep(RETRY_AFTER);
+    }
+    let mut state = vendor.lock();
+    if state.sending.as_deref() == Some(message.id.as_str()) {
+        state.sending = None;
+    }
+    if state.closing {
+        drop(state);
+        vendor.changed.notify_all();
+        return;
+    }
+    if outcome == Prompt::Admitted {
         if state.initial_topology.is_none()
             && let Some(topo) = &message.context.topology
         {
@@ -670,215 +1165,193 @@ impl OpenCodeHarness {
             text: message.text.clone(),
         });
         state.written.push(message.id.clone());
+        state.admissions += 1;
         state.turn_open = true;
-        state.last_prompt_at = Some(Instant::now());
+        watch(vendor, &mut state);
     }
+    state.prompts.insert(message.id.clone(), outcome);
+    state.epoch += 1;
+    drop(state);
+    vendor.changed.notify_all();
+}
 
-    /// One `opencode api` call. Its own process, so a hung vendor call cannot
-    /// hold the adapter, and a failure names the call and never a secret.
-    fn api(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, HarnessError> {
-        let mut command = anyagents_harness::spawn_command(&self.program, &self.environment)?;
-        // `opencode api --server <url> <METHOD> <path>`, as the CLI reads it:
-        // the subcommand comes first, then its flags.
-        command.arg("api");
-        let service = self.lock().service.clone().ok_or_else(|| {
-            HarnessError::Failed(
-                "OpenCode private endpoint is unavailable; refusing service discovery".into(),
-            )
-        })?;
-        command.args(["--server", &service]);
-        command.args([method, path]);
-        if let Some(body) = &body {
-            command.args(["-d", &body.to_string()]);
-        }
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(dir) = &self.work_dir {
-            command.current_dir(dir);
-        }
-        if let Some(password) = self.lock().password.clone() {
-            command.env("OPENCODE_PASSWORD", password);
-        }
-        // A vendor that never answers is a failure after `CALL_TIMEOUT`, not a
-        // wedged adapter.
-        let mut child = command
-            .spawn()
-            .map_err(|err| HarnessError::Failed(format!("{method} {path}: {err}")))?;
-        let deadline = Instant::now() + CALL_TIMEOUT;
-        loop {
-            if let Ok(Some(status)) = child.try_wait() {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|err| HarnessError::Failed(format!("{method} {path}: {err}")))?;
-                if !status.success() {
-                    let text = String::from_utf8_lossy(&output.stderr);
-                    let error_body = serde_json::from_slice::<Value>(&output.stdout).ok();
-                    let reason = if error_body
-                        .as_ref()
-                        .and_then(|body| body.pointer("/error/code").or_else(|| body.get("code")))
-                        .and_then(Value::as_u64)
-                        == Some(404)
-                        || error_body
-                            .as_ref()
-                            .and_then(|body| body.get("name"))
-                            .and_then(Value::as_str)
-                            == Some("NotFoundError")
-                    {
-                        "resource not found (404)".to_string()
-                    } else if let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) {
-                        line.to_string()
-                    } else if let Some(body) = &error_body {
-                        let code = body
-                            .pointer("/error/code")
-                            .or_else(|| body.get("code"))
-                            .and_then(Value::as_u64);
-                        let msg = body
-                            .pointer("/error/message")
-                            .or_else(|| body.get("message"))
-                            .or_else(|| body.get("error"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("request failed");
-                        match code {
-                            Some(code) => format!("{msg} ({code})"),
-                            None => msg.to_string(),
-                        }
-                    } else {
-                        "no reason".to_string()
-                    };
-                    return Err(HarnessError::Failed(format!("{method} {path}: {reason}")));
+/// Wait for the open turn to end on a thread of its own, unless one already does.
+fn watch(vendor: &Arc<Vendor>, state: &mut State) {
+    if state.watching {
+        return;
+    }
+    let waiter = Arc::clone(vendor);
+    match thread::Builder::new()
+        .name("anyagents-opencode-turn".into())
+        .spawn(move || watch_turn(&waiter))
+    {
+        Ok(_) => state.watching = true,
+        Err(err) => eprintln!("anyagents-opencode: cannot wait for the turn to end: {err}"),
+    }
+}
+
+/// End the open turn once the service is idle after the newest admission.
+///
+/// `POST /api/experimental/session/{id}/wait` answers when the session's
+/// agent loop is idle, and a prompt wakes that loop before its call answers,
+/// so a wait asked after an admission returns only once the turn that took it
+/// has ended. A service without that route is asked which sessions run, once
+/// per `TURN_POLL`.
+fn watch_turn(vendor: &Arc<Vendor>) {
+    // Whether the service has the wait route at all.
+    let mut can_wait = true;
+    loop {
+        let (session, admitted) = {
+            let mut state = vendor.lock();
+            let Some(session) = state
+                .session
+                .clone()
+                .filter(|_| state.alive && !state.closing)
+            else {
+                state.watching = false;
+                return;
+            };
+            (session, state.admissions)
+        };
+        let waited = if can_wait {
+            match vendor.call(
+                "POST",
+                &format!("/api/experimental/session/{session}/wait"),
+                None,
+                None,
+            ) {
+                Ok(_) => Some(true),
+                Err(err) if err.tag.as_deref() == Some("SessionNotFoundError") => Some(true),
+                Err(err) => {
+                    can_wait = err.status != Some(404);
+                    None
                 }
-                return serde_json::from_slice(&output.stdout)
-                    .map_err(|err| HarnessError::Failed(format!("{method} {path}: {err}")));
             }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(HarnessError::Failed(format!(
-                    "{method} {path}: no answer within {}s",
-                    CALL_TIMEOUT.as_secs()
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Read the session's newest messages and record a turn it reported failed.
-    /// A delivery never waits for this: the session takes every prompt on its
-    /// own, and the answer is read from the session when it is asked for.
-    fn poll(&self) -> Result<(), HarnessError> {
-        let Some(session) = self.lock().session.clone() else {
-            return Ok(());
+        } else {
+            None
         };
-        let listing = self.api("GET", &format!("/api/session/{session}/message"), None)?;
-        let Some(messages) = listing.get("data").and_then(Value::as_array) else {
-            return Ok(());
-        };
-        // Only the newest turn is read: the listing is newest first, and an
-        // older idle frame belongs to a turn that is already settled.
-        let Some(outcome) = messages.iter().find_map(|message| {
-            (message.get("type").and_then(Value::as_str) == Some("idle"))
-                .then(|| {
-                    message
-                        .get("outcome")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .flatten()
-        }) else {
-            return Ok(());
-        };
-        if outcome != "failed" && outcome != "interrupted" {
-            return Ok(());
+        let idle = waited.unwrap_or_else(|| {
+            thread::sleep(TURN_POLL);
+            matches!(
+                vendor.call("GET", "/api/session/active", None, Some(CALL_TIMEOUT)),
+                Ok(active) if active.get("data").and_then(|data| data.get(&session)).is_none()
+            )
+        });
+        let mut state = vendor.lock();
+        if !state.alive || state.closing {
+            state.watching = false;
+            return;
         }
-        // The idle frame marks the end of the newest turn; every line the
-        // session has taken and not answered belongs to it.
-        let mut state = self.lock();
-        for id in state.written.clone() {
-            if !state.failures.iter().any(|(item, _)| item == &id) {
-                state.failures.push((id, outcome.clone()));
-            }
+        // A later prompt woke the session again: its turn ends after that one.
+        if !idle || state.admissions != admitted {
+            continue;
         }
-        Ok(())
-    }
-
-    /// The answer the session holds for this mailbox id: the assistant message
-    /// that follows the user message carrying `anyagents-message:<id>`.
-    ///
-    /// The session lists messages newest first, so the answer is the first
-    /// assistant message *before* that user message in that order. Reasoning
-    /// parts are never the answer.
-    pub fn answer_in_session(&self, id: &str) -> Option<String> {
-        let session = self.lock().session.clone()?;
-        let listing = self
-            .api("GET", &format!("/api/session/{session}/message"), None)
-            .ok()?;
-        answer_of(listing.get("data")?.as_array()?, id)
-    }
-
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.shared.lock().unwrap_or_else(|err| err.into_inner())
-    }
-
-    /// Wait until `ready` holds for the state, polling the session.
-    fn wait(&self, timeout: Duration, ready: impl Fn(&State) -> bool) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if ready(&self.lock()) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return ready(&self.lock());
-            }
-            let _ = self.poll();
-            if ready(&self.lock()) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
+        state.watching = false;
+        state.turn_open = false;
+        state.turns_completed = state.turns_completed.saturating_add(1);
+        state.epoch += 1;
+        drop(state);
+        vendor.changed.notify_all();
+        return;
     }
 }
 
 impl Harness for OpenCodeHarness {
-    /// Write one mailbox line into the session's inbox as a prompt with
-    /// `delivery: "steer"`, and accept it when the prompt API answers with
-    /// `data`.
-    ///
-    /// The session owns the turn: the prompt joins the running turn or starts
-    /// the next one, whichever its inbox decides. Nothing here waits for a turn
-    /// to end, so a missed idle frame cannot hold every line behind it.
+    /// Write one mailbox line into the session's inbox as a steer that
+    /// carries the line's own id, and accept it once the service admitted it.
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        if !self.lock().alive {
+        let mut state = self.vendor.lock();
+        // What the service said stands even after the process went.
+        match state.prompts.get(&message.id) {
+            Some(Prompt::Admitted) => {
+                return Ok(DeliverOutcome::Accepted {
+                    turn_finished: false,
+                });
+            }
+            Some(Prompt::Applied) => return Ok(DeliverOutcome::Duplicate),
+            Some(Prompt::Rejected(reason)) => {
+                // A 409 names this line's id, held by another record; a size
+                // refusal is this line's own. A 400 may be every line's.
+                let message_specific = reason.contains("(HTTP 409)")
+                    || reason.contains("(HTTP 413)")
+                    || anyagents_harness::names_message_size(reason);
+                return Ok(DeliverOutcome::rejected(reason.clone(), message_specific));
+            }
+            _ => {}
+        }
+        if !state.alive {
             return Err(HarnessError::Dead);
         }
-        if let Some(reset_at_ms) = self.lock().quota_reset_at_ms {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            if reset_at_ms > now_ms {
-                return Ok(DeliverOutcome::Quota { reset_at_ms });
+        let replay = match state.prompts.get(&message.id) {
+            Some(Prompt::Sending) => return Ok(DeliverOutcome::InFlight),
+            Some(Prompt::Refused) => {
+                // Nothing was admitted, and the service's wait is over: the
+                // line goes back to the mailbox and is written again on its
+                // next offer, which the wake that recorded this asks for.
+                state.prompts.remove(&message.id);
+                return Ok(DeliverOutcome::Deferred);
             }
-            self.lock().quota_reset_at_ms = None;
+            Some(Prompt::Fault(reason)) => {
+                let reason = reason.clone();
+                state.prompts.remove(&message.id);
+                return Err(HarnessError::Failed(reason));
+            }
+            // The service may or may not hold it: the same id again settles
+            // that, since the service admits an id once.
+            Some(Prompt::Unknown) => true,
+            _ => false,
+        };
+        // One prompt call at a time keeps the inbox in mailbox order.
+        if state.sending.is_some() {
+            return Ok(DeliverOutcome::Deferred);
         }
-        // An id already written is not written again: a replay after a crash
-        // must not prompt the agent twice.
-        if self.lock().written.iter().any(|one| one == &message.id) {
-            return Ok(DeliverOutcome::Accepted {
-                turn_finished: false,
-            });
-        }
-        let answer = self.send_prompt(message)?;
-        if answer.get("data").is_none() {
+        state.sending = Some(message.id.clone());
+        state.prompts.insert(message.id.clone(), Prompt::Sending);
+        drop(state);
+        let vendor = Arc::clone(&self.vendor);
+        let line = message.clone();
+        if let Err(err) = thread::Builder::new()
+            .name("anyagents-opencode-prompt".into())
+            .spawn(move || carry(&vendor, &line, replay))
+        {
+            let mut state = self.vendor.lock();
+            state.sending = None;
+            state.prompts.remove(&message.id);
             return Err(HarnessError::Failed(format!(
-                "prompt was not taken: {answer}"
+                "cannot start the prompt call: {err}"
             )));
         }
-        self.record_prompt_accepted(message);
-        Ok(DeliverOutcome::Accepted {
-            turn_finished: false,
-        })
+        Ok(DeliverOutcome::InFlight)
+    }
+
+    /// What the service admitted, by this process or (as a record already in
+    /// the conversation) by an earlier one. Read only.
+    fn proven(&self, message_id: &str) -> Option<Proof> {
+        match self.vendor.lock().prompts.get(message_id)? {
+            Prompt::Admitted => Some(Proof::Taken {
+                turn_finished: false,
+            }),
+            Prompt::Applied => Some(Proof::Duplicate),
+            _ => None,
+        }
+    }
+
+    /// Wait for the prompt call that is out to answer or fail, so what it
+    /// proved is known, then stop the service. The proofs stay readable. A
+    /// service that does not answer within [`CALL_TIMEOUT`] is stopped
+    /// anyway, so a stuck service never holds its replacement: the call then
+    /// fails, its outcome is unknown, and the next process writes the same id
+    /// once more, which OpenCode admits once.
+    fn stop(&mut self) {
+        {
+            let state = self.vendor.lock();
+            let _state = self
+                .vendor
+                .changed
+                .wait_timeout_while(state, CALL_TIMEOUT, |state| state.sending.is_some())
+                .unwrap_or_else(|err| err.into_inner());
+        }
+        self.stop_child();
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {
@@ -886,170 +1359,112 @@ impl Harness for OpenCodeHarness {
     }
 
     fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
-        let previous = self.lock().session.replace(session.to_string());
-        if let Err(err) = self.remember_session() {
-            self.lock().session = previous;
+        let previous = self.vendor.lock().session.replace(session.to_string());
+        if let Err(err) = self.vendor.remember_session() {
+            self.vendor.lock().session = previous;
             return Err(err);
         }
         Ok(())
     }
 
     fn cancel(&mut self) -> Result<(), HarnessError> {
-        let Some(session) = self.lock().session.clone() else {
+        let Some(session) = self.vendor.lock().session.clone() else {
             return Ok(());
         };
-        self.api(
-            "POST",
-            &format!("/api/session/{session}/interrupt"),
-            Some(json!({})),
-        )?;
-        self.lock().turn_open = false;
+        self.vendor
+            .call(
+                "POST",
+                &format!("/api/session/{session}/interrupt"),
+                None,
+                Some(CALL_TIMEOUT),
+            )
+            .map_err(|err| HarnessError::Failed(err.to_string()))?;
+        self.vendor.lock().turn_open = false;
         Ok(())
     }
 
     fn health(&self) -> HarnessHealth {
-        let state = self.lock();
+        let state = self.vendor.lock();
         HarnessHealth {
             process_alive: state.alive,
-            turn_state: if state.turn_open && state.quota_reset_at_ms.is_none() {
+            // A prompt still being written is work under way, not an idle agent.
+            turn_state: if state.turn_open || state.sending.is_some() {
                 TurnState::InTurn
             } else {
                 TurnState::Idle
             },
-            delivery_mode: DeliveryMode::Steer,
-            steer_support: SteerSupport::Yes,
-            quota_reset_at_ms: state.quota_reset_at_ms,
+            delivery: DELIVERY.with_peer(state.peer.clone()),
+            quota_reset_at_ms: None,
             sign_in_fault: None,
         }
     }
 
-    fn clear_quota(&mut self) {
-        self.lock().quota_reset_at_ms = None;
-    }
-
     fn turns_served(&self) -> u32 {
-        self.lock().turns_completed
+        self.vendor.lock().turns_completed
     }
 
-    /// The session's own running totals, read from the session itself rather
-    /// than from anything this adapter kept. The host records the difference.
+    /// What this process served: the session's running totals, read from
+    /// the session once per finished turn, less what the session held when
+    /// this process began serving it (the session outlives a process, and the
+    /// host counts from each process's start). The host records the
+    /// difference.
     fn served_usage(&self) -> TurnUsage {
-        let fake_mode = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
-            || self
-                .environment
-                .iter()
-                .any(|(k, _)| k == "ANYAGENTS_FAKE_MODE");
-        let (session, written_len) = {
-            let state = self.lock();
+        let (session, turns) = {
+            let state = self.vendor.lock();
             let Some(session) = state.session.clone() else {
                 return TurnUsage::default();
             };
-            if !fake_mode {
-                if !state.turn_open || state.written.is_empty() {
-                    return state.cached_usage.clone();
-                }
-                if state
-                    .last_prompt_at
-                    .is_some_and(|t| t.elapsed() < Duration::from_millis(500))
-                {
-                    return state.cached_usage.clone();
-                }
-                if state
-                    .last_usage_poll
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
-                {
-                    return state.cached_usage.clone();
-                }
+            if state.usage_read_at == Some(state.turns_completed) {
+                return state.cached_usage.clone();
             }
-            (session, state.written.len())
+            (session, state.turns_completed)
         };
-        if !fake_mode
-            && let Ok(active) = self.api("GET", "/api/session/active", None)
-            && active
-                .pointer(&format!("/data/{session}/type"))
-                .and_then(Value::as_str)
-                == Some("running")
-        {
-            let mut state = self.lock();
-            state.last_usage_poll = Some(Instant::now());
-            return state.cached_usage.clone();
-        }
-        let Ok(info) = self.api("GET", &format!("/api/session/{session}"), None) else {
-            return self.lock().cached_usage.clone();
+        let Some(total) = self.vendor.session_totals(&session) else {
+            return self.vendor.lock().cached_usage.clone();
         };
-        let Some(info) = info.get("data") else {
-            return self.lock().cached_usage.clone();
+        let mut state = self.vendor.lock();
+        let base = match &state.usage_base {
+            Some((serving, base)) if *serving == session => base.clone(),
+            _ => {
+                // Totals read before this process began counting are none of
+                // its own.
+                state.usage_earlier = state.cached_usage.clone();
+                state.usage_base = Some((session.clone(), total.clone()));
+                total.clone()
+            }
         };
-        let tokens = info.get("tokens").cloned().unwrap_or(Value::Null);
-        let number = |key: &str| tokens.get(key).and_then(Value::as_u64).unwrap_or(0);
-        let usage = TurnUsage {
-            input_tokens: number("input"),
-            output_tokens: number("output"),
-            cache_read_tokens: tokens
-                .pointer("/cache/read")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            cache_write_tokens: tokens
-                .pointer("/cache/write")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            reported_cost_micros: info
-                .get("cost")
-                .and_then(Value::as_f64)
-                .map(|cost| (cost * 1_000_000.0) as i64),
-        };
-        let mut state = self.lock();
-        state.last_usage_poll = Some(Instant::now());
-        if written_len > state.last_usage_written {
-            state.turns_completed = state.turns_completed.saturating_add(1);
-        }
-        if state.written.len() == written_len {
-            state.turn_open = false;
-        }
-        state.last_usage_written = written_len;
+        let usage = plus(&state.usage_earlier, &total.difference(base));
+        state.usage_read_at = Some(turns);
         state.cached_usage = usage.clone();
         usage
     }
 
-    fn poll_steer(&mut self) -> Result<Option<SteerItem>, HarnessError> {
-        let Some(queue) = &self.steer else {
-            return Ok(None);
-        };
-        queue
-            .try_take()
-            .map_err(|err| HarnessError::Failed(format!("steer queue: {err}")))
-    }
-
-    fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {
-        // A mailbox line already written is not written a second time. The
-        // prompt API told the session it has it, so this is a success.
-        if self.seen(&message.id) {
-            return Ok(true);
-        }
-        if !self.lock().alive {
-            return Err(HarnessError::Dead);
-        }
-        if self.lock().session.is_none() {
-            return Ok(false);
-        }
-        // The same prompt `deliver` writes: the session decides where it goes.
-        match self.send_prompt(message) {
-            Ok(answer) => {
-                if answer.get("data").is_some() {
-                    self.record_prompt_accepted(message);
-                    Ok(true)
-                } else {
-                    Ok(false)
+    fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        let vendor = Arc::clone(&self.vendor);
+        let _ = thread::Builder::new()
+            .name("anyagents-opencode-watch".into())
+            .spawn(move || {
+                let mut state = vendor.lock();
+                let mut seen = state.epoch;
+                loop {
+                    if !state.alive || state.closing {
+                        drop(state);
+                        notify();
+                        return;
+                    }
+                    if state.epoch != seen {
+                        seen = state.epoch;
+                        drop(state);
+                        notify();
+                        state = vendor.lock();
+                        continue;
+                    }
+                    state = vendor
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(|err| err.into_inner());
                 }
-            }
-            Err(_) => Ok(false),
-        }
-    }
-
-    fn release_steer(&mut self, keep: &str) {
-        if let Some(queue) = &self.steer {
-            queue.release_for(keep);
-        }
+            });
     }
 }
 
@@ -1057,7 +1472,7 @@ const SERVICE_PID_FILE: &str = "opencode-service-pid";
 
 impl OpenCodeHarness {
     fn write_service_pid(&self, pid: u32) {
-        let Some(dir) = self.config_dir.as_deref() else {
+        let Some(dir) = self.vendor.config_dir.as_deref() else {
             return;
         };
         let path = dir.join(SERVICE_PID_FILE);
@@ -1071,7 +1486,7 @@ impl OpenCodeHarness {
     }
 
     fn clear_service_pid(&self, expected: Option<u32>) {
-        let Some(dir) = self.config_dir.as_deref() else {
+        let Some(dir) = self.vendor.config_dir.as_deref() else {
             return;
         };
         let path = dir.join(SERVICE_PID_FILE);
@@ -1085,7 +1500,7 @@ impl OpenCodeHarness {
     }
 
     fn reap_prior_service(&self) {
-        let Some(dir) = self.config_dir.as_deref() else {
+        let Some(dir) = self.vendor.config_dir.as_deref() else {
             return;
         };
         let pid_path = dir.join(SERVICE_PID_FILE);
@@ -1107,7 +1522,7 @@ impl OpenCodeHarness {
     }
 
     fn stored_port_occupied(&self) -> bool {
-        let Some(port) = self.config_dir.as_deref().and_then(|dir| {
+        let Some(port) = self.vendor.config_dir.as_deref().and_then(|dir| {
             std::fs::read_to_string(dir.join("opencode-service-port"))
                 .ok()?
                 .trim()
@@ -1123,45 +1538,50 @@ impl OpenCodeHarness {
     }
 
     fn terminate_service_pid(&self, pid: u32) {
+        let environment = &self.vendor.environment;
         let children = direct_child_pids(pid);
-        anyagents_harness::kill_pid(pid, "-TERM", &self.environment);
+        anyagents_harness::kill_pid(pid, "-TERM", environment);
         let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline && (process_exists(pid) || self.stored_port_occupied()) {
-            std::thread::sleep(Duration::from_millis(25));
+            thread::sleep(Duration::from_millis(25));
         }
         if process_exists(pid) || self.stored_port_occupied() {
-            anyagents_harness::kill_pid(pid, "-KILL", &self.environment);
+            anyagents_harness::kill_pid(pid, "-KILL", environment);
             let kill_deadline = Instant::now() + Duration::from_millis(500);
             while Instant::now() < kill_deadline
                 && (process_exists(pid) || self.stored_port_occupied())
             {
-                std::thread::sleep(Duration::from_millis(25));
+                thread::sleep(Duration::from_millis(25));
             }
         }
         for child_pid in children {
             if child_pid > 1 && process_exists(child_pid) {
-                anyagents_harness::kill_pid(child_pid, "-KILL", &self.environment);
+                anyagents_harness::kill_pid(child_pid, "-KILL", environment);
             }
         }
     }
 
+    /// Stop the service. It is reported gone once it has exited (or never
+    /// ran); its stdout reader says the same at end of file. Nothing it proves
+    /// arrives on stdout: a proof is a prompt call's answer, which `stop`
+    /// waits for first.
     fn stop_child(&mut self) {
-        self.lock().alive = false;
         if let Some(mut child) = self.child.take() {
+            let environment = &self.vendor.environment;
             let pid = child.id();
             let children = direct_child_pids(pid);
             // The exact child, never a pattern or a group: a shared desk refuses
             // a group signal it does not own, and it is right to.
-            anyagents_harness::kill_pid(pid, "-TERM", &self.environment);
+            anyagents_harness::kill_pid(pid, "-TERM", environment);
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
                     Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(50));
+                        thread::sleep(Duration::from_millis(50));
                     }
                     _ => {
-                        anyagents_harness::kill_child(&mut child, &self.environment);
+                        anyagents_harness::kill_child(&mut child, environment);
                         break;
                     }
                 }
@@ -1169,13 +1589,18 @@ impl OpenCodeHarness {
             let _ = child.wait();
             for child_pid in children {
                 if child_pid > 1 && process_exists(child_pid) {
-                    anyagents_harness::kill_pid(child_pid, "-KILL", &self.environment);
+                    anyagents_harness::kill_pid(child_pid, "-KILL", environment);
                 }
             }
             self.clear_service_pid(Some(pid));
         }
-        self.lock().service = None;
-        self.lock().password = None;
+        let mut state = self.vendor.lock();
+        state.alive = false;
+        state.service = None;
+        state.password = None;
+        state.epoch += 1;
+        drop(state);
+        self.vendor.changed.notify_all();
     }
 }
 
@@ -1325,6 +1750,7 @@ fn find_orphan_service_pids(config_dir: &Path) -> Vec<u32> {
 
 impl Drop for OpenCodeHarness {
     fn drop(&mut self) {
+        self.vendor.lock().closing = true;
         self.stop_child();
     }
 }
@@ -1337,13 +1763,141 @@ enum Missing {
     Unknown,
 }
 
-fn is_session_not_found(err: &HarnessError) -> bool {
-    let text = err.to_string();
-    let reason = text
-        .split_once(": ")
-        .map_or(text.as_str(), |(_, reason)| reason);
-    let lower = reason.to_ascii_lowercase();
-    reason.contains("404") || lower.contains("not found") || reason.contains("NotFound")
+/// One `opencode api` call that did not answer 2xx, or did not answer at all.
+#[derive(Debug)]
+struct ApiError {
+    call: String,
+    /// The HTTP status `opencode api` reported (`HTTP <status> <text>` on
+    /// stderr, after the answer's body on stdout). `None`: no answer arrived.
+    status: Option<u16>,
+    /// The error's `_tag`, from the answer's body.
+    tag: Option<String>,
+    /// The error's `code`, from the answer's body (the readiness gate's 503).
+    code: Option<String>,
+    reason: String,
+}
+
+/// What a prompt call that did not answer 2xx says about the line.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// 404: the session does not exist.
+    SessionGone,
+    /// 400 or 409: admitted nothing, and never will.
+    Permanent,
+    /// 503 `service_starting` or `service_stopping`: admitted nothing yet.
+    NotReady,
+    /// 401, 403, 503 `service_failed`: the process is at fault.
+    Fault,
+    /// Anything else, or no answer: it may or may not have been admitted.
+    Unknown,
+}
+
+impl ApiError {
+    fn local(method: &str, path: &str, reason: impl Into<String>) -> Self {
+        Self {
+            call: format!("{method} {path}"),
+            status: None,
+            tag: None,
+            code: None,
+            reason: reason.into(),
+        }
+    }
+
+    fn answered(method: &str, path: &str, stdout: &[u8], stderr: &[u8]) -> Self {
+        let stderr = String::from_utf8_lossy(stderr);
+        let status = stderr.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("HTTP ")?
+                .split_whitespace()
+                .next()?
+                .parse::<u16>()
+                .ok()
+        });
+        let body = serde_json::from_slice::<Value>(stdout).ok();
+        let field = |key: &str| {
+            body.as_ref()
+                .and_then(|body| body.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let reason = field("message")
+            .or_else(|| field("code"))
+            .or_else(|| {
+                stderr
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty() && !line.starts_with("HTTP "))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "request failed".into());
+        Self {
+            call: format!("{method} {path}"),
+            status,
+            tag: field("_tag"),
+            code: field("code"),
+            reason,
+        }
+    }
+
+    /// What this answer to `POST /api/session/{id}/prompt` means for the line.
+    /// OpenCode 2.x declares 400 (`BadRequest`: a payload that does not
+    /// decode, an attachment or a skill it cannot take), 409
+    /// (`PromptConflictError`: the id belongs to another durable record) and
+    /// 404 (`Session.NotFoundError`) for the route; its readiness gate answers
+    /// 503 before any route.
+    fn refusal(&self) -> Refusal {
+        match self.status {
+            Some(404) => Refusal::SessionGone,
+            Some(400 | 409) => Refusal::Permanent,
+            Some(401 | 403) => Refusal::Fault,
+            Some(503) => match self.code.as_deref() {
+                Some("service_starting" | "service_stopping") => Refusal::NotReady,
+                Some("service_failed") => Refusal::Fault,
+                _ => Refusal::Unknown,
+            },
+            _ => Refusal::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            Some(status) => write!(f, "{}: {} (HTTP {status})", self.call, self.reason),
+            None => write!(f, "{}: {}", self.call, self.reason),
+        }
+    }
+}
+
+/// The id a line's prompt carries. OpenCode takes any id that starts with
+/// `msg_` and recognises it when it is sent again. A mailbox id already is
+/// one; another id (a recovery note's `recovery_msg_…`) gets the prefix, so
+/// the same line always carries the same id.
+fn vendor_message_id(id: &str) -> String {
+    if id.starts_with("msg_") {
+        id.to_string()
+    } else {
+        format!("msg_{id}")
+    }
+}
+
+/// The major number of a version such as `2.1.4`.
+fn major_version(version: &str) -> Option<u64> {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Milliseconds since the Unix epoch, the clock the service stamps its records with.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// The answer the session holds for one mailbox id: the assistant text created

@@ -15,12 +15,12 @@ use std::sync::{Arc, Mutex};
 use anyagents_core::{Address, Agent, Error, Incoming, ReceiveOutcome, Store, now_ms};
 use anyagents_gateway::MemoryRoutes;
 use anyagents_installer::{CommandRunner, InstallError, LineSink, builtin_catalog, sign_in};
-use anyagents_supervisor::{HealthBoard, Supervisor, SystemClock, declared, mode_name, steer_name};
+use anyagents_supervisor::{HealthBoard, Supervisor, SystemClock};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use serde::Deserialize;
@@ -28,15 +28,25 @@ use serde::Deserialize;
 use crate::api::{
     AgentView, AgentsResponse, ConversationResponse, ConversationTurnView, CreateAgentRequest,
     Delivery, GroupActionRequest, GroupView, GroupsResponse, InboxResponse, InteractRequest,
-    InteractResponse, MessageView, SendRequest, SendResponse,
+    InteractResponse, MessageView, OperatorInboxResponse, SendRequest, SendResponse,
 };
 use crate::auth::{self, Principal};
 use crate::create::{self, CreateRequest};
 use crate::identity::ServingIdentity;
 use crate::operator;
-use crate::vendor::{self, VendorHarness};
+use crate::vendor::{self, HarnessHost, VendorHarness};
 
-mod outbound_history;
+mod file_cache;
+mod hybrid;
+#[cfg(test)]
+mod latency_tests;
+mod memory_backlog;
+pub(crate) mod outbound_history;
+mod profiles;
+mod quota_rotation;
+mod reap_queue;
+
+pub(crate) use profiles::ServedProfile;
 
 const SOCKET_NAME: &str = "anyagents.sock";
 /// `sockaddr_un.sun_path` holds 108 bytes, including the trailing NUL.
@@ -49,19 +59,36 @@ pub fn socket_path(data: &Path) -> PathBuf {
     data.join(SOCKET_NAME)
 }
 
+/// Run the server. Every harness runs in a keeper started from this binary,
+/// so stopping, crashing or upgrading the server ends no agent's work.
 pub fn run(data: &Path) -> Result<(), Error> {
     let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-    run_with(data, Arc::new(Mutex::new(ProcessRunner)), stop_rx)
+    let host = crate::keeper::host().map_err(Error::Message)?;
+    run_with_identity(
+        data,
+        Arc::new(Mutex::new(ProcessRunner)),
+        stop_rx,
+        Arc::new(ServingIdentity::capture()),
+        host,
+    )
 }
 
-/// Run the server with a sign-in runner the caller supplies. Tests use this so
-/// no vendor command is started. `stop` ends the server when the caller drops it.
+/// Run the server with a sign-in runner the caller supplies, so no vendor
+/// command is started. `stop` ends the server when the caller drops it.
+/// Harnesses run in this process: a test binary has no keeper mode.
+#[cfg(test)]
 pub fn run_with(
     data: &Path,
     runner: Arc<Mutex<dyn CommandRunner + Send>>,
     stop: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), Error> {
-    run_with_identity(data, runner, stop, Arc::new(ServingIdentity::capture()))
+    run_with_identity(
+        data,
+        runner,
+        stop,
+        Arc::new(ServingIdentity::capture()),
+        HarnessHost::InProcess,
+    )
 }
 
 fn run_with_identity(
@@ -69,14 +96,41 @@ fn run_with_identity(
     runner: Arc<Mutex<dyn CommandRunner + Send>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
     identity: Arc<ServingIdentity>,
+    host: HarnessHost,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         tokio::select! {
-            result = serve(data, runner, identity) => result,
+            result = serve(data, runner, identity, host) => result,
             _ = &mut stop => Ok(()),
         }
     })
+}
+
+/// The supervisor of a serving kernel. However the kernel stops (a signal, an
+/// error, a test dropping it), its harness processes are left to the next
+/// kernel when they live in keepers; hosted in this process, they end.
+struct Retaining(Option<Supervisor<VendorHarness>>, bool);
+
+impl std::ops::Deref for Retaining {
+    type Target = Supervisor<VendorHarness>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("supervisor until drop")
+    }
+}
+
+impl Drop for Retaining {
+    fn drop(&mut self) {
+        if let Some(supervisor) = self.0.take() {
+            // A keeper still starting is not waited for: it finishes its
+            // start on its own, and the next kernel takes it over.
+            if self.1 {
+                anyagents_keeper::abandon_starts();
+            }
+            supervisor.retain_processes();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -86,6 +140,8 @@ pub(crate) struct AppState {
     pub(crate) sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
     pub(crate) auth: auth::Mode,
     pub(crate) identity: Arc<ServingIdentity>,
+    /// The last provider-profile listing, refreshed in the background.
+    pub(crate) profiles: Arc<profiles::ProfileSnapshots>,
 }
 
 /// This process's capability key. Tests name one so a server and the fixture
@@ -101,6 +157,43 @@ fn capability_key() -> Result<String, Error> {
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
+
+/// Index host history in the background: what searches left for later,
+/// sources due for full verification, and a pre-warm pass over every agent
+/// after the daemon starts. It runs on its own thread at the lowest CPU and
+/// I/O priority, so it reads only when nothing else wants the machine.
+fn start_host_history_indexer(store: Arc<Store>) {
+    let spawned = std::thread::Builder::new()
+        .name("host-history".into())
+        .spawn(move || {
+            lower_this_thread_priority();
+            // Let the daemon finish starting before the pre-warm pass reads.
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            store.run_host_history_indexer();
+        });
+    if let Err(error) = spawned {
+        eprintln!("anyagents-host-history: background indexer not started: {error}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn lower_this_thread_priority() {
+    const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+    const IOPRIO_CLASS_IDLE: libc::c_long = 3;
+    // SAFETY: plain syscalls that lower only the calling thread's priority.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid);
+        libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, 19);
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            tid,
+            IOPRIO_CLASS_IDLE << 13,
+        );
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn lower_this_thread_priority() {}
 
 fn acquire_server_lock(data: &Path) -> Result<std::fs::File, Error> {
     std::fs::create_dir_all(data)?;
@@ -127,7 +220,7 @@ fn acquire_server_lock(data: &Path) -> Result<std::fs::File, Error> {
 
 fn active_seat_ids(store: &Store) -> Result<Vec<String>, Error> {
     Ok(store
-        .list_agents()?
+        .list_live_agents()?
         .into_iter()
         .filter(|agent| agent.state != "archived")
         .map(|agent| agent.id.to_string())
@@ -138,9 +231,10 @@ async fn serve(
     data: &Path,
     sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
     identity: Arc<ServingIdentity>,
+    host: HarnessHost,
 ) -> Result<(), Error> {
     let _server_lock = acquire_server_lock(data)?;
-    crate::worktree_access::recover_inspections(data)?;
+    anyagents_toolchain::init_server(data, crate::sandbox::host_home_dir());
     let store = Arc::new(Store::open(data.join("state.db"))?);
     // The server lock excludes concurrent creation: no unadmitted row is in
     // flight, so each is a failed creation still holding its name.
@@ -206,7 +300,7 @@ async fn serve(
     // The gateway is up and every agent repointed before anything is bound or
     // started: a client that sees the socket must find a live origin, not the
     // port of the server that just stopped.
-    crate::gateway::start(data)?;
+    let gateway = crate::gateway::start(data)?;
     // The API is bound before any vendor starts: an agent that is slow, silent
     // or wedged must never stop the server from answering.
     prepare_socket(&path)?;
@@ -217,13 +311,30 @@ async fn serve(
         crate::sandbox::share_socket_with_seats(&path);
     }
     let launch_store = Arc::clone(&store);
-    let supervisor = Supervisor::<VendorHarness>::start(
-        Arc::clone(&store),
-        Arc::new(SystemClock::new()),
-        Arc::new(move |request| vendor::vendor_launch_with_store(request, &launch_store)),
-        vendor::child_env(),
-    )
-    .map_err(Error::Message)?;
+    // A harness kept from the last server on a gateway origin that moved
+    // would send its token wherever that port now leads: it is replaced.
+    let refused = if gateway.moved {
+        gateway.agents
+    } else {
+        Vec::new()
+    };
+    let custody = crate::keeper::custody(data, &host, refused);
+    let kept = matches!(host, HarnessHost::Keeper(_));
+    let supervisor = Retaining(
+        Some(
+            Supervisor::<VendorHarness>::start_with_custody(
+                Arc::clone(&store),
+                Arc::new(SystemClock::new()),
+                Arc::new(move |request| {
+                    vendor::vendor_launch_hosted(request, &launch_store, &host)
+                }),
+                vendor::child_env(),
+                custody,
+            )
+            .map_err(Error::Message)?,
+        ),
+        kept,
+    );
     if auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&data.join("wake.sock"));
     }
@@ -233,6 +344,7 @@ async fn serve(
         sign_in,
         auth,
         identity,
+        profiles: Default::default(),
     };
     let _ = boundary;
     let listener = api_listener;
@@ -240,6 +352,9 @@ async fn serve(
         .map_err(Error::Message)?;
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
+        quota_rotation::start(Arc::clone(&store));
+        start_host_history_indexer(Arc::clone(&store));
+        let memory_backlog = memory_backlog::start(&store);
         let reaper_root = data.to_path_buf();
         let reaper_store = Arc::clone(&store);
         let reaper_health = state.health.clone();
@@ -250,9 +365,11 @@ async fn serve(
                 interval.tick().await;
                 tick_count = tick_count.wrapping_add(1);
                 let run_verify = tick_count.is_multiple_of(15);
+                let first_pass = tick_count == 1;
                 let root = reaper_root.clone();
                 let store = Arc::clone(&reaper_store);
                 let health = reaper_health.clone();
+                let memory_backlog = Arc::clone(&memory_backlog);
                 let _ = tokio::task::spawn_blocking(move || {
                     // The daemon is the long-lived writer: keep the WAL bounded
                     // from here so it never grows while readers overlap.
@@ -270,8 +387,11 @@ async fn serve(
                     if let Err(error) = outbound_history::reconcile(&store) {
                         eprintln!("outbound history settlement remains pending: {error}");
                     }
+                    if first_pass {
+                        crate::vendor::settle_stale_spiron_holds(&store);
+                    }
                     reap_archived_agents(&store, &root, &health);
-                    consolidate_idle_agent_memory(&store, &root, &health);
+                    consolidate_idle_agent_memory(&store, &root, &health, &memory_backlog);
                     if run_verify
                         && let Err(error) =
                             store.verify_one_host_history_source(anyagents_core::now_ms())
@@ -280,7 +400,11 @@ async fn serve(
                     }
                     #[cfg(target_os = "linux")]
                     crate::workstation::session::reap_idle(&root);
-                    crate::create::sync_fresher_bound_agent_credentials(&root);
+                    if let Err(error) = crate::remote::rotate_due(&store) {
+                        eprintln!("anyagents-remote: session rotation deferred: {error}");
+                    }
+                    record_live_quota_resets(&store, &root, &health);
+                    crate::create::sync_fresher_bound_agent_credentials_in(&store, &root);
                     #[cfg(unix)]
                     crate::create::sync_canonical_skills(&root);
                 })
@@ -288,21 +412,50 @@ async fn serve(
             }
         });
         let updater_root = data.to_path_buf();
+        let updater_store = Arc::clone(&store);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
             loop {
                 interval.tick().await;
                 let root = updater_root.clone();
+                let store_for_update = Arc::clone(&updater_store);
                 let _ = tokio::task::spawn_blocking(move || {
-                    for entry in anyagents_installer::builtin_catalog() {
-                        if let Ok((before, after, true)) =
-                            crate::install::update_harness(&root, &entry.id)
+                    let catalog = match anyagents_installer::Catalog::load(&root) {
+                        Ok(catalog) => catalog,
+                        Err(err) => {
+                            eprintln!("anyagents-updater: failed to load catalog overrides: {err}");
+                            return;
+                        }
+                    };
+                    for entry in catalog.harnesses().iter().chain(catalog.runtimes()) {
+                        if !entry.source.is_managed()
+                            || matches!(
+                                entry.source,
+                                anyagents_installer::source::Source::Unconfigured
+                            )
                         {
-                            eprintln!(
-                                "anyagents-updater: upgraded harness `{}` {} -> {}",
-                                entry.id, before, after
-                            );
+                            continue;
+                        }
+                        match crate::install::update_harness_with_store(
+                            &root,
+                            &entry.id,
+                            Arc::clone(&store_for_update)
+                                as Arc<dyn anyagents_installer::LeaseView>,
+                        ) {
+                            Ok((before, after, true)) => {
+                                eprintln!(
+                                    "anyagents-updater: upgraded harness `{}` {} -> {}",
+                                    entry.id, before, after
+                                );
+                            }
+                            Ok((_, _, false)) => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "anyagents-updater: failed to update `{}`: {err}",
+                                    entry.id
+                                );
+                            }
                         }
                     }
                 })
@@ -311,7 +464,51 @@ async fn serve(
         });
         start_schedule_loops(Arc::clone(&store), state.health.clone());
     }
-    if let Some(addr) = webhook_listen_addr() {
+    // `public_listen` decides whether the local TCP listener is also the
+    // public one. A configuration file that cannot be read fails closed: no
+    // public listener, and the local listener defaults to loopback.
+    let (public_listen, public_configured) = match crate::remote::Settings::load(data) {
+        Ok(settings) => (settings.public_listen, settings.public_listen.is_some()),
+        Err(why) => {
+            eprintln!(
+                "warning: {why}; the public listener is off and the local listener defaults to loopback"
+            );
+            (None, true)
+        }
+    };
+    if public_listen.is_none() {
+        let _ = std::fs::remove_file(data.join("public.addr"));
+    }
+    if let Some(addr) = public_listen {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(tcp_listener) => {
+                if let Ok(local) = tcp_listener.local_addr() {
+                    let addr_path = data.join("public.addr");
+                    if let Err(err) = anyagents_harness::atomic_write_nonempty_file(
+                        &addr_path,
+                        format!("{local}\n").as_bytes(),
+                        0o644,
+                    ) {
+                        eprintln!("cannot persist {}: {err}", addr_path.display());
+                    }
+                }
+                let public_app = build_public_router(state.clone());
+                tokio::spawn(async move {
+                    let _ = axum::serve(tcp_listener, public_app).await;
+                });
+            }
+            Err(err) => {
+                eprintln!("warning: public TCP listener ({addr}) did not bind: {err}");
+            }
+        }
+    }
+    if let Some(addr) = webhook_listen_addr(public_configured) {
+        if public_configured && !binds_loopback(&addr) {
+            eprintln!(
+                "warning: the local TCP listener ({addr}) is not loopback while `public_listen` is set; \
+                 it accepts every local credential, so bind it to 127.0.0.1"
+            );
+        }
         match tokio::net::TcpListener::bind(&addr).await {
             Ok(tcp_listener) => {
                 if let Ok(local) = tcp_listener.local_addr() {
@@ -385,31 +582,28 @@ pub(crate) fn mark_explicitly_archived_locked(
     data_dir: &Path,
     agent: &Agent,
 ) -> Result<Vec<anyagents_core::AgentId>, anyagents_core::Error> {
-    crate::worktree_access::revoke_recorded(data_dir, &agent.id)?;
     let mut archived = vec![agent.id.clone()];
     mark_archive_generation_locked(store, data_dir, agent);
-    if let Ok(all_agents) = store.list_agents() {
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(agent.id.clone());
-        let mut seen = std::collections::HashSet::new();
-        seen.insert(agent.id.clone());
-        while let Some(pid) = queue.pop_front() {
-            for child in all_agents
-                .iter()
-                .filter(|a| a.parent_id.as_ref() == Some(&pid))
-            {
-                if seen.insert(child.id.clone()) {
-                    queue.push_back(child.id.clone());
-                    let Ok(_child_lifecycle) = store.try_lock_agent_lifecycle(&child.id) else {
-                        continue;
-                    };
-                    let Ok(child) = store.set_agent_state(&child.id, "archived") else {
-                        continue;
-                    };
-                    crate::worktree_access::revoke_recorded(data_dir, &child.id)?;
-                    mark_archive_generation_locked(store, data_dir, &child);
-                    archived.push(child.id.clone());
-                }
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(agent.id.clone());
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(agent.id.clone());
+    while let Some(pid) = queue.pop_front() {
+        let Ok(mut children) = store.children_of(&pid) else {
+            continue;
+        };
+        children.sort_by(|a, b| a.name.cmp(&b.name));
+        for child in &children {
+            if seen.insert(child.id.clone()) {
+                queue.push_back(child.id.clone());
+                let Ok(_child_lifecycle) = store.try_lock_agent_lifecycle(&child.id) else {
+                    continue;
+                };
+                let Ok(child) = store.set_agent_state(&child.id, "archived") else {
+                    continue;
+                };
+                mark_archive_generation_locked(store, data_dir, &child);
+                archived.push(child.id.clone());
             }
         }
     }
@@ -430,9 +624,16 @@ fn mark_archive_generation_locked(store: &Store, data_dir: &Path, agent: &Agent)
     ) {
         eprintln!("cannot persist {}: {err}", archived_marker.display());
     }
+    if agent.parent_id.is_some() {
+        reap_queue::enqueue(data_dir, &agent.id);
+    }
     if let Ok(schedules) = store.list_schedules(Some(&agent.id), true) {
+        let any = !schedules.is_empty();
         for sched in schedules {
             let _ = store.cancel_schedule(Some(&agent.id), &sched.id);
+        }
+        if any {
+            crate::schedule::schedules_changed(store.data_dir());
         }
     }
     crate::telegram::detach_archived_agent_from_telegram_groups(store, data_dir, agent, true);
@@ -445,11 +646,13 @@ pub(crate) fn reap_archived_agent_locked(
     data_dir: &Path,
     agent_id: &anyagents_core::AgentId,
 ) {
-    let Ok(agent) = store.agent(agent_id) else {
-        return;
+    let agent = match store.agent(agent_id) {
+        Ok(agent) => agent,
+        Err(Error::AgentNotFound(_)) => return reap_queue::dequeue(data_dir, agent_id),
+        Err(_) => return reap_queue::note_failure(data_dir, agent_id, now_ms()),
     };
     if agent.state != "archived" || agent.parent_id.is_none() {
-        return;
+        return reap_queue::dequeue(data_dir, agent_id);
     }
     let cfg = anyagents_core::agent_config_dir(data_dir, agent_id);
     let archived = cfg.join(".anyagents-archived");
@@ -460,66 +663,71 @@ pub(crate) fn reap_archived_agent_locked(
         // Upgrade legacy or interrupted empty archive markers under the wake lock.
         mark_archive_generation_locked(store, data_dir, &agent);
     }
-    let Ok(generation) = std::fs::read(&archived) else {
-        return;
-    };
+    let generation = std::fs::read(&archived).unwrap_or_default();
     if generation.is_empty() {
-        return;
+        return reap_queue::note_failure(data_dir, agent_id, now_ms());
     }
     let reaped = cfg.join(".anyagents-reaped");
     if std::fs::read(&reaped).is_ok_and(|done| done == generation) {
-        return;
+        return reap_queue::dequeue(data_dir, agent_id);
     }
-    if reap_subagent_ephemeral_dirs(data_dir, agent_id)
-        && let Err(err) = anyagents_harness::atomic_write_nonempty_file(&reaped, &generation, 0o644)
-    {
-        eprintln!("cannot persist {}: {err}", reaped.display());
+    if !reap_subagent_ephemeral_dirs_in(store, data_dir, agent_id) {
+        return reap_queue::note_failure(data_dir, agent_id, now_ms());
+    }
+    match anyagents_harness::atomic_write_nonempty_file(&reaped, &generation, 0o644) {
+        Ok(()) => reap_queue::dequeue(data_dir, agent_id),
+        Err(err) => {
+            eprintln!("cannot persist {}: {err}", reaped.display());
+            reap_queue::note_failure(data_dir, agent_id, now_ms());
+        }
     }
 }
 
 /// The maintenance worker runs this at startup and each minute without waiting
-/// for an agent lock.
+/// for an agent lock. It visits only archives whose cleanup is owed and due.
 fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
-    let Ok(agents) = store.list_agents() else {
-        return;
-    };
-    let large_pop = agents.len() > 32 && std::env::var_os("ANYAGENTS_TESTS").is_none();
-    for agent in agents {
-        if agent.state != "archived" || agent.parent_id.is_none() {
-            continue;
-        }
-        if large_pop {
-            let cfg = anyagents_core::agent_config_dir(data_dir, &agent.id);
-            if cfg.join(".anyagents-reaped").is_file() {
-                continue;
-            }
-        }
-        let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
+    reap_archived_agents_at(store, data_dir, health, now_ms());
+}
+
+fn reap_archived_agents_at(store: &Store, data_dir: &Path, health: &HealthBoard, now: i64) {
+    reap_queue::backfill(store, data_dir);
+    for agent_id in reap_queue::due(data_dir, now) {
+        let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent_id) else {
             continue;
         };
-        // A wake followed by a new self-archive may have started a process since
-        // the population read. Check current health only after taking the lock.
-        if health.get(&agent.id).is_some_and(|live| live.process_alive) {
+        // A wake followed by a new self-archive may have started a process
+        // since the archive. Check current health only after taking the lock.
+        if health.get(&agent_id).is_some_and(|live| live.process_alive) {
             continue;
         }
-        // Re-read under the lock: this population may predate a direct wake.
-        reap_archived_agent_locked(store, data_dir, &agent.id);
+        // Re-read under the lock: the queue may predate a direct wake.
+        reap_archived_agent_locked(store, data_dir, &agent_id);
     }
 }
 
 /// Consolidate idle agents' topic files without changing the active session's
 /// immutable snapshot. Updated files are pinned only at the next explicit session.
-fn consolidate_idle_agent_memory(store: &Store, data_dir: &Path, health: &HealthBoard) {
-    let Ok(agents) = store.list_agents() else {
-        return;
-    };
+/// Only agents in the backlog are visited; one leaves once its consolidation
+/// has caught up with its mailbox.
+fn consolidate_idle_agent_memory(
+    store: &Store,
+    data_dir: &Path,
+    health: &HealthBoard,
+    backlog: &memory_backlog::MemoryBacklog,
+) {
     let mut llm_consolidated_count = 0usize;
-    for agent in agents {
-        if agent.state == "archived" {
-            continue;
-        }
+    for agent_id in backlog.pending() {
+        let agent = match store.agent(&agent_id) {
+            Ok(agent) if agent.state != "archived" => agent,
+            Err(err) if !matches!(err, Error::AgentNotFound(_)) => continue,
+            _ => {
+                backlog.settle(&agent_id);
+                continue;
+            }
+        };
         let agent_root = data_dir.join("agents").join(agent.id.as_str());
         if !agent_root.join("memory").is_dir() {
+            backlog.settle(&agent_id);
             continue;
         }
         let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
@@ -532,10 +740,28 @@ fn consolidate_idle_agent_memory(store: &Store, data_dir: &Path, health: &Health
             continue;
         }
         let allow_llm = llm_consolidated_count < 1;
-        if let Ok((_, true)) =
-            store.consolidate_agent_sleep_memory_with_options(&agent.id, allow_llm)
-        {
+        let consolidated = store.consolidate_agent_sleep_memory_with_options(&agent.id, allow_llm);
+        if let Ok((_, true)) = consolidated {
             llm_consolidated_count += 1;
+        }
+        if consolidated.is_ok() && store.sleep_memory_caught_up(&agent.id).unwrap_or(false) {
+            backlog.settle(&agent_id);
+        }
+    }
+}
+
+/// Record the reset of each profile whose live agent the supervisor reports
+/// quota-held, so profile listings and rotation see it. The board is in memory:
+/// a fleet with no quota hold costs one indexed read.
+fn record_live_quota_resets(store: &Store, data_dir: &Path, health: &HealthBoard) {
+    let now = now_ms();
+    for agent in store.list_live_agents().unwrap_or_default() {
+        if let Some(reset_ms) = health
+            .get(&agent.id)
+            .and_then(|live| live.quota_reset_at_ms)
+            .filter(|&reset_ms| reset_ms > now)
+        {
+            create::record_profile_quota_reset(data_dir, &agent, reset_ms);
         }
     }
 }
@@ -544,47 +770,17 @@ pub(crate) fn clear_explicitly_archived(data_dir: &Path, agent_id: &anyagents_co
     let cfg = anyagents_core::agent_config_dir(data_dir, agent_id);
     let _ = std::fs::remove_file(cfg.join(".anyagents-reaped"));
     let _ = std::fs::remove_file(cfg.join(".anyagents-archived"));
+    reap_queue::dequeue(data_dir, agent_id);
 }
 
-/// Both intervals tick immediately at startup. Each loop owns its blocking
-/// pass, so an in-flight external request cannot hold the next local tick.
+/// Local timers and network watches run on separate timers, so an in-flight
+/// external request cannot hold a local tick. Each sleeps until its next due
+/// time or a schedule change.
 fn start_schedule_loops(
     store: Arc<Store>,
     health: HealthBoard,
 ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
-    let local = spawn_schedule_loop(
-        Arc::clone(&store),
-        health.clone(),
-        std::time::Duration::from_secs(1),
-        crate::schedule::tick_local_schedules_once,
-    );
-    let external = spawn_schedule_loop(
-        store,
-        health,
-        std::time::Duration::from_secs(3),
-        crate::schedule::tick_external_watches_once,
-    );
-    (local, external)
-}
-
-fn spawn_schedule_loop(
-    store: Arc<Store>,
-    health: HealthBoard,
-    period: std::time::Duration,
-    tick: fn(&Store, &HealthBoard, i64) -> usize,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(period);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            let st = Arc::clone(&store);
-            let hb = health.clone();
-            if let Err(err) = tokio::task::spawn_blocking(move || tick(&st, &hb, now_ms())).await {
-                eprintln!("Schedule pass failed: {err}");
-            }
-        }
-    })
+    crate::schedule::start_loops(store, health)
 }
 
 /// How this server authenticates. A machine started without an operator token
@@ -642,23 +838,82 @@ async fn mint_capability(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "agents.mint_capability", &name)?;
-    let agent = state
-        .store
-        .agent_by_name(&name)
-        .map_err(ApiError::from_store)?;
-    operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
-    Ok(Json(
-        serde_json::json!({ "agent": agent.name, "minted": true }),
-    ))
+    spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "agents.mint_capability", &name)?;
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
+        Ok(Json(
+            serde_json::json!({ "agent": agent.name, "minted": true }),
+        ))
+    })
+    .await
 }
 
-/// `GET /v1/webhooks/healthz`: unauthenticated readiness probe for the public
-/// webhook listener (`https://webhooks.example.com/v1/webhooks/healthz`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeRemoteSessionsRequest {
+    /// One session to revoke; every session of the agent when absent.
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// `POST /v1/operator/agents/{name}/remote-sessions/revoke`: the operator or a
+/// root admin ends an agent's remote sessions now. Every token of a revoked
+/// session stops authenticating on its next call.
+async fn revoke_remote_sessions_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<RevokeRemoteSessionsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        require_admin_or_operator(
+            &state.store,
+            &principal,
+            "agents.revoke_remote_sessions",
+            &name,
+        )?;
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        let session = body
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let revoked = crate::remote::revoke(&state.store, &agent.id, session)
+            .map_err(ApiError::from_store)?;
+        Ok(Json(serde_json::json!({
+            "agent": agent.name,
+            "session_id": session,
+            "revoked": revoked,
+        })))
+    })
+    .await
+}
+
+/// `GET /v1/webhooks/healthz` on `anyagents.sock`: the serving identity
+/// (version, source SHA, binary SHA-256) for the operator and the release
+/// tooling. The public listener answers [`public_healthz`] instead.
 async fn webhook_healthz(State(state): State<AppState>) -> impl IntoResponse {
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(state.identity.status()),
+    )
+}
+
+/// `GET /`, `/healthz` and `/v1/webhooks/healthz` on the public TCP listener:
+/// readiness only. The build identity names the exact binary this server
+/// runs, which tells a scanner which advisories apply, so it stays on the
+/// Unix socket.
+async fn public_healthz() -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({ "ok": true })),
     )
 }
 
@@ -703,27 +958,126 @@ async fn telegram_webhook(
     .await
 }
 
-fn webhook_listen_addr() -> Option<String> {
-    if let Ok(addr) = std::env::var("ANYAGENTS_WEBHOOK_LISTEN") {
+/// The TCP listener for the local API surface: readiness, Telegram webhooks
+/// and MCP for every credential kind. Until a deployment configures
+/// `public_listen` it is also the public one and keeps the `0.0.0.0:8788`
+/// default; once the public listener exists it defaults to loopback.
+fn webhook_listen_addr(public_configured: bool) -> Option<String> {
+    local_listen_addr(
+        std::env::var("ANYAGENTS_WEBHOOK_LISTEN").ok().as_deref(),
+        std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+            || std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some(),
+        public_configured,
+    )
+}
+
+fn local_listen_addr(
+    explicit: Option<&str>,
+    test_double: bool,
+    public_configured: bool,
+) -> Option<String> {
+    if let Some(addr) = explicit {
         let trimmed = addr.trim();
         if trimmed.is_empty() || trimmed == "0" || trimmed.eq_ignore_ascii_case("off") {
             return None;
         }
         return Some(trimmed.to_string());
     }
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
-        || std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some()
-    {
+    if test_double {
         return None;
     }
-    Some("0.0.0.0:8788".to_string())
+    Some(if public_configured {
+        "127.0.0.1:8788".to_string()
+    } else {
+        "0.0.0.0:8788".to_string()
+    })
 }
 
-pub(crate) fn build_webhook_router(state: AppState) -> Router {
+/// Whether `addr` binds only the loopback interface.
+fn binds_loopback(addr: &str) -> bool {
+    addr.parse::<std::net::SocketAddr>()
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or_else(|_| addr.starts_with("localhost:"))
+}
+
+/// The public listener (`[server] public_listen`): the only surface a network
+/// peer reaches once it is configured. It serves readiness, Telegram webhooks
+/// (each verified by its channel's secret token) and MCP for remote session
+/// tokens only; every other path is 404. Which credentials it accepts is
+/// decided by the listener the request arrived on, never by a source address
+/// or a forwarding header.
+pub(crate) fn build_public_router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(webhook_healthz))
-        .route("/healthz", get(webhook_healthz))
-        .route("/v1/webhooks/healthz", get(webhook_healthz))
+        .route("/", get(public_healthz))
+        .route("/healthz", get(public_healthz))
+        .route("/v1/webhooks/healthz", get(public_healthz))
+        .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
+        .route(
+            "/v1/webhooks/mcp",
+            get(public_mcp_get_route).post(public_mcp_post_route),
+        )
+        .fallback(public_not_found)
+        .with_state(state)
+}
+
+async fn public_not_found() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "not found" })),
+    )
+}
+
+pub(crate) async fn takeover_page_route(req: axum::extract::Request) -> Response {
+    #[cfg(target_os = "linux")]
+    {
+        use tower::ServiceExt as _;
+        let prefix = crate::workstation::takeover::MOUNT_PREFIX;
+        let path = req.uri().path().to_string();
+        let tail = path.strip_prefix(prefix).unwrap_or_default();
+        let (key, rest) = tail.split_once('/').unwrap_or((tail, ""));
+        let Some(page) = crate::workstation::takeover::mounted(key) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let query = req
+            .uri()
+            .query()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
+        if !tail.contains('/') {
+            // The page loads its assets relative to a directory URL.
+            return axum::response::Redirect::permanent(&format!("{path}/{query}")).into_response();
+        }
+        let (mut parts, body) = req.into_parts();
+        let Ok(uri) = format!("/{rest}{query}").parse() else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        parts.uri = uri;
+        match page
+            .oneshot(axum::extract::Request::from_parts(parts, body))
+            .await
+        {
+            Ok(response) => response,
+            Err(never) => match never {},
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = req;
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+fn build_webhook_router(state: AppState) -> Router {
+    Router::new()
+        .route("/v1/webhooks/takeover/{key}", any(takeover_page_route))
+        .route("/v1/webhooks/takeover/{key}/", any(takeover_page_route))
+        .route(
+            "/v1/webhooks/takeover/{key}/{*rest}",
+            any(takeover_page_route),
+        )
+        .route("/", get(public_healthz))
+        .route("/healthz", get(public_healthz))
+        .route("/v1/webhooks/healthz", get(public_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
@@ -793,8 +1147,19 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(mint_capability),
         )
         .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
+        .route("/v1/operator/inbox", get(operator_reports))
+        .route(
+            "/v1/operator/agents/{name}/remote-sessions/revoke",
+            post(revoke_remote_sessions_route),
+        )
         .route("/v1/whoami", get(whoami))
         .route("/v1/usage", get(usage_report))
+        .route("/v1/outcomes", get(outcome_report))
+        .route("/v1/agents/{name}/verdict", post(verdict_route))
+        .route("/v1/skills/reads", post(skill_read_route))
+        .route("/v1/outbound", get(outbound_list_route))
+        .route("/v1/outbound/{key}/retry", post(outbound_retry_route))
+        .route("/v1/outbound/{key}/discard", post(outbound_discard_route))
         .route("/v1/webhooks/healthz", get(webhook_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
@@ -809,10 +1174,53 @@ struct McpRouteQuery {
     profile: Option<String>,
 }
 
+/// Which listener an MCP call arrived on. Every listener takes remote session
+/// tokens only; the public one also answers anything else with a plain 401,
+/// so a network peer never learns whether a token is a valid local capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpListener {
+    Local,
+    Public,
+}
+
+/// Who made one MCP call, and with which kind of credential.
+struct McpCaller {
+    agent: Agent,
+    /// What the call's tools present on the internal socket: the agent's own
+    /// local capability, which the server reads and which never leaves this
+    /// host.
+    internal_token: String,
+    /// The remote session the presented token belongs to.
+    remote: Option<anyagents_core::RemoteSessionGrant>,
+}
+
+impl McpCaller {
+    /// The tool profile this call gets: `remote`, or `coordination` when it
+    /// asks, for every credential kind. Over HTTP the tools run inside the
+    /// server process as the server's own user, so `full` is never served
+    /// here (403); it exists only over stdio, where the tool server runs as
+    /// the agent.
+    fn profile(&self, requested: Option<&str>) -> Result<crate::mcp::McpProfile, ApiError> {
+        crate::mcp::McpProfile::resolve_http(requested).map_err(|msg| {
+            let known = requested.and_then(crate::mcp::McpProfile::from_str_opt);
+            let status = if known.is_some() {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            ApiError::new(status, msg)
+        })
+    }
+}
+
+/// Authenticate one MCP call over HTTP. Only a remote session token (bound to
+/// one agent and session, unexpired, unrevoked) is accepted. A valid local
+/// mailbox capability is refused with 403, and anything else with 401.
 fn authenticate_mcp_request(
     store: &Store,
     headers: &axum::http::HeaderMap,
-) -> Result<(Agent, String), ApiError> {
+    listener: McpListener,
+) -> Result<McpCaller, ApiError> {
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -837,13 +1245,60 @@ fn authenticate_mcp_request(
                 "missing MCP capability token (expected `Authorization: Bearer <mcp-capability>` or `x-anyagents-agent`)",
             )
         })?;
-    let agent = store.authenticate_agent(token).map_err(|_| {
-        ApiError::new(
+    if token.starts_with(anyagents_core::REMOTE_SESSION_TOKEN_PREFIX) {
+        let unauthenticated = || {
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid, expired or revoked remote session token",
+            )
+        };
+        let grant = store
+            .authenticate_remote_session(token)
+            .map_err(|_| unauthenticated())?;
+        let agent = store
+            .agent(&grant.agent_id)
+            .map_err(|_| unauthenticated())?;
+        // A remote token is for an agent that runs off this host. One whose
+        // harness was moved back onto the host no longer has a remote session.
+        let config_dir = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+        if !crate::remote::runs_off_host(&agent, &config_dir) {
+            return Err(unauthenticated());
+        }
+        operator::ensure(store, &agent.id).map_err(ApiError::from_store)?;
+        let internal_token = crate::mcp::capability_of(&anyagents_core::agent_config_dir(
+            store.data_dir(),
+            &agent.id,
+        ))
+        .map_err(ApiError::from_store)?;
+        return Ok(McpCaller {
+            agent,
+            internal_token,
+            remote: Some(grant),
+        });
+    }
+    // The public listener never tells a network peer whether a token is a
+    // valid local capability: anything but a remote session token is 401.
+    if listener == McpListener::Public {
+        return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
-            "invalid or expired MCP capability token",
-        )
-    })?;
-    Ok((agent, token.to_string()))
+            "this listener accepts only remote session tokens",
+        ));
+    }
+    // MCP over HTTP runs the tools inside the server process, as the server's
+    // own user, on every listener including the Unix socket. A local agent's
+    // tools run over stdio (`anyagents mcp`) as the agent itself, so its
+    // capability is never accepted here.
+    if store.authenticate_agent(token).is_ok() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "MCP over HTTP accepts only remote session tokens; a local agent's tools run over stdio \
+             (`anyagents mcp`), as the agent itself",
+        ));
+    }
+    Err(ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "invalid or expired MCP capability token",
+    ))
 }
 
 fn ensure_internal_socket_listener(state: &AppState) -> PathBuf {
@@ -865,14 +1320,37 @@ async fn mcp_get_route(
     headers: axum::http::HeaderMap,
     Query(query): Query<McpRouteQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    let (agent, _token) = authenticate_mcp_request(&state.store, &headers)?;
-    let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-    let profile = crate::mcp::McpProfile::resolve_http_with_config(
-        query.profile.as_deref(),
-        &agent.harness,
-        Some(&config_dir),
-    )
-    .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+    mcp_get(McpListener::Local, state, headers, query).await
+}
+
+async fn public_mcp_get_route(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<McpRouteQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    mcp_get(McpListener::Public, state, headers, query).await
+}
+
+async fn mcp_get(
+    listener: McpListener,
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    query: McpRouteQuery,
+) -> Result<axum::response::Response, ApiError> {
+    let presented = headers.clone();
+    let (caller, profile) = spawn_store(move || {
+        let caller = authenticate_mcp_request(&state.store, &presented, listener)?;
+        let profile = caller.profile(query.profile.as_deref())?;
+        Ok((caller, profile))
+    })
+    .await?;
+    let agent = &caller.agent;
+    let remote_session = caller.remote.as_ref().map(|grant| {
+        serde_json::json!({
+            "session_id": grant.session_id,
+            "expires_at_ms": grant.expires_at_ms,
+        })
+    });
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -886,6 +1364,7 @@ async fn mcp_get_route(
             "harness": agent.harness,
             "profile": profile.as_str(),
             "tools": profile.exposed_tools(),
+            "remote_session": remote_session,
         });
         return Ok(axum::response::IntoResponse::into_response(Json(body)));
     }
@@ -916,28 +1395,58 @@ async fn mcp_post_route(
     Query(query): Query<McpRouteQuery>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<axum::response::Response, ApiError> {
-    let (agent, token) = authenticate_mcp_request(&state.store, &headers)?;
-    let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-    let profile = crate::mcp::McpProfile::resolve_http_with_config(
-        query.profile.as_deref(),
-        &agent.harness,
-        Some(&config_dir),
-    )
-    .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
-    let sock = ensure_internal_socket_listener(&state);
-    let _ = std::fs::create_dir_all(&config_dir);
-    let mcp = crate::mcp::AgentMcp::new_for_http(
-        crate::mcp::AgentRef {
-            id: agent.id.clone(),
-            name: agent.name.clone(),
-            workdir: agent.workdir.as_deref().map(PathBuf::from),
-        },
-        sock,
-        config_dir,
-        token,
-        profile,
-    );
-    match mcp.handle_jsonrpc_request(payload).await {
+    mcp_post(McpListener::Local, state, headers, query, payload).await
+}
+
+async fn public_mcp_post_route(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<McpRouteQuery>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<axum::response::Response, ApiError> {
+    mcp_post(McpListener::Public, state, headers, query, payload).await
+}
+
+async fn mcp_post(
+    listener: McpListener,
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    query: McpRouteQuery,
+    payload: serde_json::Value,
+) -> Result<axum::response::Response, ApiError> {
+    let mcp = spawn_store(move || {
+        let caller = authenticate_mcp_request(&state.store, &headers, listener)?;
+        let profile = caller.profile(query.profile.as_deref())?;
+        let McpCaller {
+            agent,
+            internal_token: token,
+            ..
+        } = caller;
+        let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+        let sock = ensure_internal_socket_listener(&state);
+        let _ = std::fs::create_dir_all(&config_dir);
+        Ok(crate::mcp::AgentMcp::new_for_http(
+            crate::mcp::AgentRef {
+                id: agent.id.clone(),
+                name: agent.name.clone(),
+                workdir: agent.workdir.as_deref().map(PathBuf::from),
+            },
+            sock,
+            config_dir,
+            token,
+            profile,
+        ))
+    })
+    .await?;
+    // A tool call mixes file, process and socket work into its async steps
+    // (`crate::mcp`), so the whole call is driven from a blocking-pool thread:
+    // whatever it waits on holds that thread, never an async worker.
+    let runtime = tokio::runtime::Handle::current();
+    let answered =
+        tokio::task::spawn_blocking(move || runtime.block_on(mcp.handle_jsonrpc_request(payload)))
+            .await
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    match answered {
         Some(response_json) => Ok(axum::response::IntoResponse::into_response((
             StatusCode::OK,
             Json(response_json),
@@ -969,35 +1478,48 @@ struct UsageQuery {
 /// operator, a public-scope caller and a root caller may aggregate the whole
 /// workspace or any target, while every other caller is confined to itself
 /// and its causal descendants, and any wider request fails closed.
+/// Every agent, and the ones `principal` may read usage and outcomes for:
+/// the operator, a public-scope caller and a root caller may read the whole
+/// workspace or any target; every other caller only itself and its causal
+/// descendants, and any wider request fails closed.
+fn usage_scope(
+    store: &Store,
+    principal: &Principal,
+    target: Option<&str>,
+    include_descendants: Option<bool>,
+) -> Result<(Vec<Agent>, Vec<anyagents_core::AgentId>), ApiError> {
+    let caller = match principal {
+        Principal::Operator => None,
+        Principal::Agent { agent_id, .. } => Some(
+            store
+                .agent(agent_id)
+                .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?,
+        ),
+    };
+    let agents = store.list_agents().map_err(ApiError::from_store)?;
+    let agent_ids =
+        anyagents_core::resolve_usage_agents(caller.as_ref(), &agents, target, include_descendants)
+            .map_err(|err| match err {
+                anyagents_core::UsageAccessError::Forbidden(why) => ApiError::forbidden(why),
+                anyagents_core::UsageAccessError::Invalid(why) => {
+                    ApiError::new(StatusCode::BAD_REQUEST, why)
+                }
+            })?;
+    Ok((agents, agent_ids))
+}
+
 async fn usage_report(
     principal: Principal,
     State(state): State<AppState>,
     Query(query): Query<UsageQuery>,
 ) -> Result<Json<anyagents_core::UsageReport>, ApiError> {
     spawn_store(move || {
-        let caller = match &principal {
-            Principal::Operator => None,
-            Principal::Agent { agent_id, .. } => Some(
-                state
-                    .store
-                    .agent(agent_id)
-                    .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?,
-            ),
-        };
-        let agents = state.store.list_agents().map_err(ApiError::from_store)?;
-        let include_descendants = query.include_descendants.or(query.subtree);
-        let agent_ids = anyagents_core::resolve_usage_agents(
-            caller.as_ref(),
-            &agents,
+        let (agents, agent_ids) = usage_scope(
+            &state.store,
+            &principal,
             query.agent.as_deref(),
-            include_descendants,
-        )
-        .map_err(|err| match err {
-            anyagents_core::UsageAccessError::Forbidden(why) => ApiError::forbidden(why),
-            anyagents_core::UsageAccessError::Invalid(why) => {
-                ApiError::new(StatusCode::BAD_REQUEST, why)
-            }
-        })?;
+            query.include_descendants.or(query.subtree),
+        )?;
         let group_by = match query.group_by.as_deref() {
             None => anyagents_core::UsageGroupBy::Agent,
             Some(raw) => anyagents_core::UsageGroupBy::parse(raw)
@@ -1022,6 +1544,141 @@ async fn usage_report(
     .await
 }
 
+/// `GET /v1/outcomes`: outcomes, recovery and cost per successful outcome
+/// (ADR 0008), over the same caller boundary and query parameters as
+/// `GET /v1/usage`. `group_by` is `model` (harness and model, the default),
+/// `harness`, `role`, `profile`, `agent` or `skill`. The window bounds when
+/// outcomes were observed; their cost may predate it.
+async fn outcome_report(
+    principal: Principal,
+    State(state): State<AppState>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<anyagents_core::OutcomeReport>, ApiError> {
+    spawn_store(move || {
+        let (_, agent_ids) = usage_scope(
+            &state.store,
+            &principal,
+            query.agent.as_deref(),
+            query.include_descendants.or(query.subtree),
+        )?;
+        let group_by =
+            anyagents_core::OutcomeGroupBy::parse(query.group_by.as_deref().unwrap_or(""))
+                .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
+        let now = now_ms();
+        let (since, until) = anyagents_core::UsageFilter {
+            since_ms: query.since_ms,
+            until_ms: query.until_ms,
+            days: query.days,
+            group_by: anyagents_core::UsageGroupBy::Agent,
+        }
+        .window(now)
+        .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
+        let report = state
+            .store
+            .outcome_report(&agent_ids, since, until.unwrap_or(now), group_by)
+            .map_err(ApiError::from_store)?;
+        Ok(Json(report))
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerdictRequest {
+    /// `accepted`, `rework`, `rejected` or `abandoned`.
+    verdict: String,
+    #[serde(default, alias = "note")]
+    reason: Option<String>,
+}
+
+/// `POST /v1/agents/{name}/verdict`: record a verdict on an agent's work
+/// (ADR 0008). Only a strict ancestor, a root admin or the operator may judge
+/// it; an agent never records an outcome of its own work.
+async fn verdict_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<VerdictRequest>,
+) -> Result<Json<anyagents_core::Outcome>, ApiError> {
+    spawn_store(move || {
+        let kind = anyagents_core::OutcomeKind::parse_verdict(&body.verdict).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "verdict must be accepted, rework, rejected or abandoned",
+            )
+        })?;
+        let target = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        let actor = match &principal {
+            Principal::Operator => "operator".to_string(),
+            Principal::Agent { agent_id, .. } if *agent_id == target.id => {
+                return Err(ApiError::forbidden(
+                    "an agent cannot record a verdict on its own work",
+                ));
+            }
+            Principal::Agent { agent_id, name } => {
+                if is_self_or_ancestor(&state.store, agent_id, &target) {
+                    format!("agent:{name}")
+                } else {
+                    require_admin_or_operator(
+                        &state.store,
+                        &principal,
+                        "agents.verdict",
+                        &target.name,
+                    )?
+                }
+            }
+        };
+        let config = anyagents_core::agent_config_dir(state.store.data_dir(), &target.id);
+        let (outcome, _) = state
+            .store
+            .record_outcome(anyagents_core::NewOutcome::verdict(
+                target.id.clone(),
+                kind,
+                actor,
+                body.reason,
+                now_ms(),
+                create::bound_profile_name(&config),
+            ))
+            .map_err(ApiError::from_store)?;
+        Ok(Json(outcome))
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillReadRequest {
+    skill: String,
+    file: String,
+    sha256: String,
+}
+
+/// `POST /v1/skills/reads`: the calling agent read one skill file whose bytes
+/// had `sha256` (ADR 0008). Recorded for the authenticated agent only.
+async fn skill_read_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<SkillReadRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Principal::Agent { agent_id, .. } = principal else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "skill reads are recorded for the calling agent",
+        ));
+    };
+    spawn_store(move || {
+        state
+            .store
+            .record_skill_read(&agent_id, &body.skill, &body.file, &body.sha256)
+            .map_err(ApiError::from_store)?;
+        Ok(Json(serde_json::json!({ "recorded": true })))
+    })
+    .await
+}
+
 /// `GET /v1/whoami`: the agent this call acts as. A tool server asks before it
 /// speaks for anyone, and gets the id the server resolved from the capability,
 /// never the name a caller wrote.
@@ -1031,15 +1688,21 @@ async fn whoami(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     match ctx.principal {
         Principal::Agent { agent_id, name } => {
-            let agent_record = state.store.agent(&agent_id).ok();
-            let workdir = agent_record.as_ref().and_then(|a| a.workdir.clone());
-            let harness = agent_record.as_ref().map(|a| a.harness.clone());
-            Ok(Json(serde_json::json!({
-                "agent_id": agent_id.as_str(),
-                "name": name,
-                "workdir": workdir,
-                "harness": harness,
-            })))
+            spawn_store(move || {
+                let agent_record = state.store.agent(&agent_id).ok();
+                let workdir = agent_record.as_ref().and_then(|a| a.workdir.clone());
+                let harness = agent_record.as_ref().map(|a| a.harness.clone());
+                Ok(Json(serde_json::json!({
+                    "agent_id": agent_id.as_str(),
+                    "name": name,
+                    "workdir": workdir,
+                    "harness": harness,
+                    // The `code` limits come from this server's environment
+                    // only, never from a file an agent could write.
+                    "code_limits": crate::mcp::CodeLimits::from_env(),
+                })))
+            })
+            .await
         }
         Principal::Operator => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -1071,8 +1734,9 @@ impl axum::extract::FromRequestParts<AppState> for Whoami {
             // A machine without the boundary: the tool server says which agent
             // its own config directory belongs to, and the server checks that
             // the agent exists. Only here, and only for this read.
-            let principal =
-                auth::agent_by_name(&state.store, id.trim()).map_err(auth::AuthRejection)?;
+            let store = Arc::clone(&state.store);
+            let id = id.trim().to_string();
+            let principal = auth::off_worker(move || auth::agent_by_name(&store, &id)).await?;
             return Ok(Self { principal });
         }
         use axum::extract::FromRequestParts;
@@ -1091,12 +1755,12 @@ async fn operator_inbox(
     AxumPath(name): AxumPath<String>,
     Query(query): Query<Since>,
 ) -> Result<Json<InboxResponse>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "agents.operator_inbox", &name)?;
-    let agent = state
-        .store
-        .agent_by_name(&name)
-        .map_err(ApiError::from_store)?;
     spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "agents.operator_inbox", &name)?;
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
         inbox_of(
             &state.store,
             &agent.id,
@@ -1105,6 +1769,30 @@ async fn operator_inbox(
             query.unread.unwrap_or(false),
             query.sender.as_deref(),
         )
+    })
+    .await
+}
+
+/// `GET /v1/operator/inbox`: the reports agents sent to `operator`. Only the
+/// operator reads them; every agent, a root admin included, may only write.
+async fn operator_reports(
+    principal: Principal,
+    State(state): State<AppState>,
+    Query(query): Query<Since>,
+) -> Result<Json<OperatorInboxResponse>, ApiError> {
+    if !principal.is_operator() {
+        return Err(ApiError::forbidden(
+            "only the operator reads the operator inbox; an agent may only send to `operator`",
+        ));
+    }
+    spawn_store(move || {
+        let messages = state
+            .store
+            .operator_inbox(query.since, query.limit)
+            .map_err(ApiError::from_store)?;
+        Ok(Json(OperatorInboxResponse {
+            messages: messages.into_iter().map(Into::into).collect(),
+        }))
     })
     .await
 }
@@ -1156,29 +1844,32 @@ async fn set_admin_route(
     Json(body): Json<AdminRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_operator(&principal)?;
-    let agent = state
-        .store
-        .agent_by_name(&name)
-        .map_err(ApiError::from_store)?;
-    state
-        .store
-        .set_agent_admin(&agent.id, body.admin)
-        .map_err(ApiError::from_store)?;
-    state
-        .store
-        .record_admin_audit(
-            "operator",
-            if body.admin {
-                "agents.grant_admin"
-            } else {
-                "agents.revoke_admin"
-            },
-            &agent.name,
-        )
-        .map_err(ApiError::from_store)?;
-    Ok(Json(
-        serde_json::json!({"agent": agent.name, "admin": body.admin}),
-    ))
+    spawn_store(move || {
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        state
+            .store
+            .set_agent_admin(&agent.id, body.admin)
+            .map_err(ApiError::from_store)?;
+        state
+            .store
+            .record_admin_audit(
+                "operator",
+                if body.admin {
+                    "agents.grant_admin"
+                } else {
+                    "agents.revoke_admin"
+                },
+                &agent.name,
+            )
+            .map_err(ApiError::from_store)?;
+        Ok(Json(
+            serde_json::json!({"agent": agent.name, "admin": body.admin}),
+        ))
+    })
+    .await
 }
 
 // Socket requests carry secret values, never host filesystem paths.
@@ -1241,8 +1932,10 @@ async fn harness_route(
     principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<HarnessRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let via_http = via_http_mcp(&headers);
     spawn_store(move || {
         let found = state
             .store
@@ -1259,6 +1952,8 @@ async fn harness_route(
                 require_admin_or_operator(&state.store, &principal, "agents.harness", &found.name)?
             }
         };
+        require_remote_callback(state.store.data_dir(), &body.harness)?;
+        refuse_host_placement_over_http(via_http, &body.harness)?;
         let out = create::set_agent_harness(
             &state.store,
             state.store.data_dir(),
@@ -1269,9 +1964,65 @@ async fn harness_route(
             body.profile.as_deref(),
         )
         .map_err(ApiError::from_store)?;
+        // The agent's profile binding may have moved.
+        state.profiles.invalidate(&state.store);
         Ok(Json(out))
     })
     .await
+}
+
+/// Whether this call was made by the tool server behind the HTTP MCP route.
+/// That tool server runs inside the server process as the server's own user,
+/// so a call it makes may not start or read anything on the host.
+fn via_http_mcp(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(crate::mcp::HTTP_MCP_HEADER)
+}
+
+/// Whether an agent's harness runs off this host.
+fn runs_off_host(data_dir: &Path, agent: &Agent) -> bool {
+    crate::remote::runs_off_host(
+        agent,
+        &anyagents_core::agent_config_dir(data_dir, &agent.id),
+    )
+}
+
+/// Over HTTP MCP an agent is created on, or moved to, a cloud harness only:
+/// any other harness would run on this host on the call's behalf.
+fn refuse_host_placement_over_http(via_http: bool, harness: &str) -> Result<(), ApiError> {
+    if via_http && !vendor::is_cloud_harness(harness) {
+        return Err(ApiError::forbidden(format!(
+            "a call over HTTP MCP places agents only on a cloud harness (`claude-cloud`, \
+             `openai-cloud`, `cursor-cloud`, `spiron-cloud`); `{harness}` would run on this host"
+        )));
+    }
+    Ok(())
+}
+
+/// Over HTTP MCP a media attachment is a URL. A local path would have the
+/// server read a host file as its own user and upload it, and a bare name may
+/// resolve against the server's working directory.
+fn refuse_host_media_over_http(body: &SendRequest) -> Result<(), ApiError> {
+    if let Some(media) = &body.media {
+        let source = media.source.trim();
+        if !(source.starts_with("https://") || source.starts_with("http://")) {
+            return Err(ApiError::forbidden(
+                "a call over HTTP MCP attaches media by `https://` URL only; a local path or file id \
+                 would be read on this host",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A harness that runs off this host can only call back through
+/// `public_url`; refuse to create or move an agent onto one without it, before
+/// anything is written.
+fn require_remote_callback(data_dir: &Path, harness: &str) -> Result<(), ApiError> {
+    if vendor::is_cloud_harness(harness) {
+        crate::remote::require_public_url(data_dir)
+            .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1417,21 +2168,38 @@ async fn transfer_agent_route(
     .await
 }
 
+/// Unused fields arrive as `null` or `"null"`; both are absent.
 #[derive(Deserialize, Default)]
 struct ScheduleRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     action: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     at: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     every: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     watch: Option<String>,
-    #[serde(default)]
+    /// A trigger value or mode under a generic name; see
+    /// `schedule::resolve_schedule_call`.
+    #[serde(
+        default,
+        alias = "kind",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
+    spec: Option<String>,
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     prompt: Option<String>,
-    #[serde(default, alias = "schedule_id")]
+    #[serde(
+        default,
+        alias = "schedule_id",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
     id: Option<String>,
-    #[serde(default, alias = "name")]
+    #[serde(
+        default,
+        alias = "name",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
     agent: Option<String>,
 }
 
@@ -1551,28 +2319,28 @@ async fn self_schedules_action_route(
 async fn handle_schedule_action(
     principal: Principal,
     state: AppState,
-    body: ScheduleRequest,
+    mut body: ScheduleRequest,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::schedule::ScheduleVerb;
     spawn_store(move || {
-        let has_spec = body.at.as_deref().is_some_and(|s| !s.trim().is_empty())
-            || body.every.as_deref().is_some_and(|s| !s.trim().is_empty())
-            || body.watch.as_deref().is_some_and(|s| !s.trim().is_empty());
-        let action = body
-            .action
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(if has_spec {
-                "create"
-            } else if body.id.is_some() {
-                "cancel"
-            } else {
-                "list"
-            })
-            .to_ascii_lowercase();
+        let mut trigger = crate::schedule::ScheduleTrigger {
+            at: body.at.take(),
+            every: body.every.take(),
+            watch: body.watch.take(),
+            spec: body.spec.take(),
+        };
+        let verb = crate::schedule::resolve_schedule_call(
+            body.action.as_deref(),
+            &mut trigger,
+            body.id.is_some(),
+        )
+        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+        body.at = trigger.at;
+        body.every = trigger.every;
+        body.watch = trigger.watch;
 
-        match action.as_str() {
-            "list" | "ls" => {
+        match verb {
+            ScheduleVerb::List => {
                 if matches!(principal, Principal::Operator) && body.agent.is_none() {
                     let schedules: Vec<crate::api::ScheduleView> = state
                         .store
@@ -1598,7 +2366,7 @@ async fn handle_schedule_action(
                     "schedules": schedules,
                 })))
             }
-            "create" | "set" | "add" | "schedule" => {
+            ScheduleVerb::Create => {
                 let target =
                     authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
                 let prompt = body.prompt.as_deref().unwrap_or("");
@@ -1626,7 +2394,7 @@ async fn handle_schedule_action(
                     "schedules": schedules,
                 })))
             }
-            "cancel" | "delete" | "remove" | "clear" | "off" | "pause" | "disable" | "stop" => {
+            ScheduleVerb::Cancel => {
                 let target =
                     authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
                 let id_or_all = body
@@ -1639,6 +2407,7 @@ async fn handle_schedule_action(
                     .store
                     .cancel_schedule(Some(&target.id), id_or_all)
                     .map_err(ApiError::from_store)?;
+                crate::schedule::schedules_changed(state.store.data_dir());
                 let schedules: Vec<crate::api::ScheduleView> = state
                     .store
                     .list_schedules(Some(&target.id), true)
@@ -1653,12 +2422,6 @@ async fn handle_schedule_action(
                     "schedules": schedules,
                 })))
             }
-            other => Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "unknown schedule action `{other}`; expected `create`, `list`, or `cancel`"
-                ),
-            )),
         }
     })
     .await
@@ -1670,37 +2433,37 @@ async fn model_route(
     AxumPath(name): AxumPath<String>,
     Json(body): Json<ModelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = require_admin_or_operator(&state.store, &principal, "agents.model", &name)?;
-    let agent = state
-        .store
-        .agent_by_name(&name)
-        .map_err(ApiError::from_store)?;
-    if body.profile.is_some() && (body.key.is_some() || body.base_url.is_some()) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "profile cannot be combined with a key or base URL",
-        ));
-    }
-    if body.key.is_none() && body.base_url.is_none() {
-        let has_harness = body
-            .harness
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
-        let has_model = body
-            .model
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
-        let has_profile = body
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
-        if !has_harness && !has_model && !has_profile {
-            return Err(ApiError::new(StatusCode::BAD_REQUEST, "model is required"));
+    spawn_store(move || {
+        let actor = require_admin_or_operator(&state.store, &principal, "agents.model", &name)?;
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        if body.profile.is_some() && (body.key.is_some() || body.base_url.is_some()) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "profile cannot be combined with a key or base URL",
+            ));
         }
-        return spawn_store(move || {
+        if body.key.is_none() && body.base_url.is_none() {
+            let has_harness = body
+                .harness
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            let has_model = body
+                .model
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            let has_profile = body
+                .profile
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            if !has_harness && !has_model && !has_profile {
+                return Err(ApiError::new(StatusCode::BAD_REQUEST, "model is required"));
+            }
             let out = create::configure_agent_runtime(
                 &state.store,
                 state.store.data_dir(),
@@ -1711,32 +2474,34 @@ async fn model_route(
                 body.profile.as_deref(),
             )
             .map_err(ApiError::from_store)?;
-            Ok(Json(out))
-        })
-        .await;
-    }
-    let model_str = body
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "model is required"))?;
-    let key = body.key.as_deref().unwrap_or("").trim();
-    if key.is_empty() || key.contains(char::is_whitespace) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "a nonempty single-line key is required",
-        ));
-    }
-    let base_url = body
-        .base_url
-        .as_deref()
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "base URL is required"))?;
-    crate::gateway::store_key(state.store.data_dir(), &agent, base_url, model_str, key)
-        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "could not bind provider key"))?;
-    Ok(Json(
-        serde_json::json!({"agent": agent.name, "model": model_str}),
-    ))
+            // The agent's profile binding may have moved.
+            state.profiles.invalidate(&state.store);
+            return Ok(Json(out));
+        }
+        let model_str = body
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "model is required"))?;
+        let key = body.key.as_deref().unwrap_or("").trim();
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "a nonempty single-line key is required",
+            ));
+        }
+        let base_url = body
+            .base_url
+            .as_deref()
+            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "base URL is required"))?;
+        crate::gateway::store_key(state.store.data_dir(), &agent, base_url, model_str, key)
+            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "could not bind provider key"))?;
+        Ok(Json(
+            serde_json::json!({"agent": agent.name, "model": model_str}),
+        ))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1881,27 +2646,41 @@ async fn profile_models_route(
     State(state): State<AppState>,
     Query(query): Query<ProfileModelsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "profiles.models", "profiles")?;
-    let data = state.store.data_dir().to_path_buf();
-    let prof = query.profile;
     spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "profiles.models", "profiles")?;
         Ok(Json(create::probe_profile_models_catalog(
-            &data,
-            prof.as_deref(),
+            state.store.data_dir(),
+            query.profile.as_deref(),
         )))
     })
     .await
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ProfilesQuery {
+    /// Answer with a listing made after this call rather than the snapshot.
+    #[serde(default)]
+    fresh: Option<bool>,
+}
+
+/// `GET /v1/profiles`: the last listing at once, each entry marked with the
+/// age of its usage reading; see [`profiles`].
 async fn profiles_route(
     principal: Principal,
     State(state): State<AppState>,
-) -> Result<Json<Vec<create::ProviderProfileEntry>>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "profiles.list", "profiles")?;
-    Ok(Json(create::list_provider_profiles_fast(
-        &state.store,
-        state.store.data_dir(),
-    )))
+    Query(query): Query<ProfilesQuery>,
+) -> Result<Json<Vec<ServedProfile>>, ApiError> {
+    let store = Arc::clone(&state.store);
+    spawn_store(move || {
+        require_admin_or_operator(&store, &principal, "profiles.list", "profiles").map(drop)
+    })
+    .await?;
+    state
+        .profiles
+        .list(&state.store, query.fresh.unwrap_or(false))
+        .await
+        .map(Json)
+        .map_err(|why| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, why))
 }
 
 #[derive(Deserialize)]
@@ -1916,21 +2695,26 @@ async fn set_profile_route(
     State(state): State<AppState>,
     Json(body): Json<SetProfileRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "profiles.set", &body.profile)?;
-    let (provider, profile) =
-        create::set_provider_profile(state.store.data_dir(), &body.profile, &body.key)
-            .map_err(ApiError::from_store)?;
-    Ok(Json(serde_json::json!({
-        "provider": provider,
-        "profile": profile,
-    })))
+    spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "profiles.set", &body.profile)?;
+        let (provider, profile) =
+            create::set_provider_profile(state.store.data_dir(), &body.profile, &body.key)
+                .map_err(ApiError::from_store)?;
+        state.profiles.invalidate(&state.store);
+        quota_rotation::profiles_changed(Some(provider.as_str()));
+        Ok(Json(serde_json::json!({
+            "provider": provider,
+            "profile": profile,
+        })))
+    })
+    .await
 }
 
 async fn get_subagent_defaults_route(
     _principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<create::SubagentDefaultsConfig>, ApiError> {
-    Ok(Json(create::load_subagent_defaults(state.store.data_dir())))
+    spawn_store(move || Ok(Json(create::load_subagent_defaults(state.store.data_dir())))).await
 }
 
 #[derive(Deserialize)]
@@ -1949,50 +2733,54 @@ async fn set_subagent_defaults_route(
     State(state): State<AppState>,
     Json(body): Json<SetSubagentDefaultsRequest>,
 ) -> Result<Json<create::SubagentDefaultsConfig>, ApiError> {
-    let target_label = body.agent.as_deref().unwrap_or("global");
-    require_admin_or_operator(
-        &state.store,
-        &principal,
-        "subagents.set_default",
-        target_label,
-    )?;
-    let mut cfg = create::load_subagent_defaults(state.store.data_dir());
-    if body.clear.unwrap_or(false) {
-        if let Some(ref ag) = body.agent {
-            cfg.agents.remove(ag.trim());
+    spawn_store(move || {
+        let target_label = body.agent.as_deref().unwrap_or("global");
+        require_admin_or_operator(
+            &state.store,
+            &principal,
+            "subagents.set_default",
+            target_label,
+        )?;
+        let mut cfg = create::load_subagent_defaults(state.store.data_dir());
+        if body.clear.unwrap_or(false) {
+            if let Some(ref ag) = body.agent {
+                cfg.agents.remove(ag.trim());
+            } else {
+                cfg.default = create::SubagentDefaultSpec {
+                    mode: "inherit".to_string(),
+                    harness: None,
+                    model: None,
+                    profile: None,
+                };
+            }
         } else {
-            cfg.default = create::SubagentDefaultSpec {
-                mode: "inherit".to_string(),
-                harness: None,
-                model: None,
-                profile: None,
+            let spec = create::SubagentDefaultSpec {
+                mode: body.mode,
+                harness: body
+                    .harness
+                    .as_deref()
+                    .map(anyagents_harness::normalize_harness_name)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+                model: body.model.filter(|s| !s.trim().is_empty()),
+                profile: body.profile.filter(|s| !s.trim().is_empty()),
             };
-        }
-    } else {
-        let spec = create::SubagentDefaultSpec {
-            mode: body.mode,
-            harness: body
-                .harness
+            if let Some(ag) = body
+                .agent
                 .as_deref()
-                .map(anyagents_harness::normalize_harness_name)
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            model: body.model.filter(|s| !s.trim().is_empty()),
-            profile: body.profile.filter(|s| !s.trim().is_empty()),
-        };
-        if let Some(ag) = body
-            .agent
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            cfg.agents.insert(ag.to_string(), spec);
-        } else {
-            cfg.default = spec;
+            {
+                cfg.agents.insert(ag.to_string(), spec);
+            } else {
+                cfg.default = spec;
+            }
         }
-    }
-    create::save_subagent_defaults(state.store.data_dir(), &cfg).map_err(ApiError::from_store)?;
-    Ok(Json(cfg))
+        create::save_subagent_defaults(state.store.data_dir(), &cfg)
+            .map_err(ApiError::from_store)?;
+        Ok(Json(cfg))
+    })
+    .await
 }
 
 #[derive(Deserialize, Default)]
@@ -2252,11 +3040,19 @@ async fn set_description_route(
     .await
 }
 
-/// The caller's own browser profile: an agent's name, or `default`.
-fn default_browser_profile(principal: &Principal) -> String {
+/// Who a desktop call is for: its lease principal (an agent's name, or the
+/// operator) and that caller's own browser profile (the agent's name, or
+/// `default`).
+fn desktop_caller(principal: &Principal) -> crate::workstation::Caller {
     match principal {
-        Principal::Agent { name, .. } => name.clone(),
-        Principal::Operator => "default".to_string(),
+        Principal::Agent { name, .. } => crate::workstation::Caller {
+            principal: name.clone(),
+            profile: name.clone(),
+        },
+        Principal::Operator => crate::workstation::Caller {
+            principal: crate::workstation::OPERATOR.to_string(),
+            profile: "default".to_string(),
+        },
     }
 }
 
@@ -2265,8 +3061,9 @@ async fn browser_route(
     State(state): State<AppState>,
     Json(body): Json<crate::workstation::BrowserRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let profile = default_browser_profile(&principal);
-    crate::workstation::browser::execute(state.store.data_dir(), &profile, body)
+    let caller = desktop_caller(&principal);
+    let files = crate::agent_file::FileAuthority::of(&state.store, &principal);
+    crate::workstation::browser::execute(state.store.data_dir(), &caller, body, &files)
         .await
         .map(Json)
         .map_err(ApiError::from_store)
@@ -2281,8 +3078,8 @@ async fn computer_route(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     #[cfg(target_os = "linux")]
     {
-        let profile = default_browser_profile(&principal);
-        crate::workstation::desktop::execute(state.store.data_dir(), &profile, body)
+        let caller = desktop_caller(&principal);
+        crate::workstation::desktop::execute(state.store.data_dir(), &caller, body)
             .await
             .map(Json)
             .map_err(ApiError::from_store)
@@ -2300,42 +3097,45 @@ async fn channels_route(
     principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
-    let channels: Vec<_> = state
-        .store
-        .list_channels()
-        .map_err(ApiError::from_store)?
-        .into_iter()
-        .map(|c| {
-            let mem = anyagents_channel_telegram::Memory::try_from_state(&c.state)
-                .map_err(ApiError::from_store)?;
-            let bot_username = c
-                .identity
-                .clone()
-                .or_else(|| {
-                    mem.bot
-                        .as_deref()
-                        .and_then(|b| b.split_once(':').map(|(_, u)| u.to_string()))
-                })
-                .map(|u| {
-                    let clean = u.trim().trim_start_matches('@');
-                    format!("@{clean}")
-                });
-            let agents: Vec<String> = c
-                .agents
-                .iter()
-                .filter_map(|id| state.store.agent(id).ok().map(|a| a.name))
-                .collect();
-            Ok(serde_json::json!({
-                "id": c.id.to_string(),
-                "kind": c.kind,
-                "bot": bot_username,
-                "agents": agents,
-                "pending_managed_bots": mem.pending_managed_bots,
-            }))
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(Json(serde_json::json!({"channels": channels})))
+    spawn_store(move || {
+        require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
+        let channels: Vec<_> = state
+            .store
+            .list_channels()
+            .map_err(ApiError::from_store)?
+            .into_iter()
+            .map(|c| {
+                let mem = anyagents_channel_telegram::Memory::try_from_state(&c.state)
+                    .map_err(ApiError::from_store)?;
+                let bot_username = c
+                    .identity
+                    .clone()
+                    .or_else(|| {
+                        mem.bot
+                            .as_deref()
+                            .and_then(|b| b.split_once(':').map(|(_, u)| u.to_string()))
+                    })
+                    .map(|u| {
+                        let clean = u.trim().trim_start_matches('@');
+                        format!("@{clean}")
+                    });
+                let agents: Vec<String> = c
+                    .agents
+                    .iter()
+                    .filter_map(|id| state.store.agent(id).ok().map(|a| a.name))
+                    .collect();
+                Ok(serde_json::json!({
+                    "id": c.id.to_string(),
+                    "kind": c.kind,
+                    "bot": bot_username,
+                    "agents": agents,
+                    "pending_managed_bots": mem.pending_managed_bots,
+                }))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        Ok(Json(serde_json::json!({"channels": channels})))
+    })
+    .await
 }
 
 fn default_channel_kind() -> String {
@@ -2387,6 +3187,16 @@ fn is_self_or_ancestor(
     false
 }
 
+/// An unrestricted reader's scope: every agent, archived ones included.
+fn every_agent_id(store: &Store) -> Result<Vec<String>, ApiError> {
+    Ok(store
+        .agent_ids()
+        .map_err(ApiError::from_store)?
+        .iter()
+        .map(ToString::to_string)
+        .collect())
+}
+
 /// Resolve the caller's conversation visibility once, before selecting a
 /// recent or Raw-RAG read path. Non-admin agents see only themselves and their
 /// descendants; `all` is an alias for exactly that set. Administrative reads
@@ -2423,27 +3233,15 @@ fn conversation_visibility(
                 return Ok((requested.to_string(), None));
             }
 
-            let agents = store.list_agents().map_err(ApiError::from_store)?;
-            let mut visible_ids = std::collections::HashSet::from([caller.id.clone()]);
-            let mut changed = true;
-            while changed {
-                changed = false;
-                for agent in &agents {
-                    if let Some(parent) = &agent.parent_id
-                        && visible_ids.contains(parent)
-                        && visible_ids.insert(agent.id.clone())
-                    {
-                        changed = true;
-                    }
-                }
-            }
-            let visible_agent_ids: Vec<String> =
-                visible_ids.iter().map(ToString::to_string).collect();
-
             if requested.eq_ignore_ascii_case("self") {
                 return Ok((caller.name, Some(vec![caller.id.to_string()])));
             }
+            let mut visible_ids = store
+                .descendant_ids(&caller.id)
+                .map_err(ApiError::from_store)?;
+            visible_ids.insert(caller.id.clone());
             if requested.eq_ignore_ascii_case("all") || requested == "*" {
+                let visible_agent_ids = visible_ids.iter().map(ToString::to_string).collect();
                 return Ok(("all".to_string(), Some(visible_agent_ids)));
             }
 
@@ -2452,8 +3250,8 @@ fn conversation_visibility(
                 .map_err(ApiError::from_store)?;
             if !visible_ids.contains(&target.id) {
                 return Err(ApiError::forbidden(format!(
-                    "agent `{}` cannot read private conversation history of `{}`",
-                    caller.name, target.name
+                    "agent `{}` cannot read private conversation history of `{}`; your own messages with it are in your history: `conversation({{with: \"{}\"}})`",
+                    caller.name, target.name, target.name
                 )));
             }
             Ok((target.name, Some(vec![target.id.to_string()])))
@@ -2533,10 +3331,10 @@ async fn add_channel_route(
 
 /// A loopback port the operating system picked, held open until the caller
 /// serves on it, or why none could be bound.
-pub fn listen_on_loopback() -> Result<(u16, tokio::net::TcpListener), Error> {
+pub fn listen_on_loopback(port: u16) -> Result<(u16, tokio::net::TcpListener), Error> {
     // A non-blocking listener before it joins the runtime; the runtime makes it
     // blocking-polled itself.
-    let address = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let address = std::net::TcpListener::bind(("127.0.0.1", port))?;
     address.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(address)?;
     let port = listener.local_addr()?.port();
@@ -2796,6 +3594,16 @@ async fn list_agents(
 }
 
 fn compute_caller_relationship(store: &Store, caller: &Agent, target: &Agent) -> String {
+    relationship_with(caller, target, |ancestor, agent| {
+        is_self_or_ancestor(store, ancestor, agent)
+    })
+}
+
+fn relationship_with(
+    caller: &Agent,
+    target: &Agent,
+    is_self_or_ancestor: impl Fn(&anyagents_core::AgentId, &Agent) -> bool,
+) -> String {
     if caller.id == target.id {
         "self".to_string()
     } else if caller.parent_id.as_ref() == Some(&target.id) {
@@ -2804,14 +3612,91 @@ fn compute_caller_relationship(store: &Store, caller: &Agent, target: &Agent) ->
         "child".to_string()
     } else if caller.parent_id.is_some() && caller.parent_id == target.parent_id {
         "sibling".to_string()
-    } else if is_self_or_ancestor(store, &target.id, caller) {
+    } else if is_self_or_ancestor(&target.id, caller) {
         "ancestor".to_string()
-    } else if is_self_or_ancestor(store, &caller.id, target) {
+    } else if is_self_or_ancestor(&caller.id, target) {
         "descendant".to_string()
     } else if caller.parent_id.is_none() && target.parent_id.is_none() {
         "peer".to_string()
     } else {
         "other".to_string()
+    }
+}
+
+/// An agent caller's view of one roster, read once per request instead of
+/// once per listed agent. Every check is the predicate the single-agent routes
+/// use; only where the rows come from differs.
+struct RosterCaller<'a> {
+    store: &'a Store,
+    caller: &'a Agent,
+    /// The roster rows, so an ancestor walk reads the store only for a parent
+    /// outside the roster.
+    rows: HashMap<&'a str, &'a Agent>,
+    /// Agents that share a group or Telegram chat with the caller.
+    sharing: HashSet<anyagents_core::AgentId>,
+}
+
+impl<'a> RosterCaller<'a> {
+    fn new(store: &'a Store, caller: &'a Agent, roster: &'a [Agent]) -> Self {
+        Self {
+            store,
+            caller,
+            rows: roster.iter().map(|a| (a.id.as_str(), a)).collect(),
+            sharing: store.agents_sharing_group_or_chat(&caller.id),
+        }
+    }
+
+    /// [`is_self_or_ancestor`] over the roster rows.
+    fn is_self_or_ancestor(&self, ancestor: &anyagents_core::AgentId, target: &Agent) -> bool {
+        if ancestor == &target.id {
+            return true;
+        }
+        let mut cursor = target.parent_id.clone();
+        let mut depth = 0usize;
+        while let Some(pid) = cursor {
+            if &pid == ancestor {
+                return true;
+            }
+            cursor = match self.rows.get(pid.as_str()) {
+                Some(parent) => parent.parent_id.clone(),
+                None => self.store.agent(&pid).ok().and_then(|a| a.parent_id),
+            };
+            depth += 1;
+            if depth > 16 {
+                break;
+            }
+        }
+        false
+    }
+
+    /// The isolated-scope rule of [`get_agent`].
+    fn sees(&self, agent: &Agent) -> bool {
+        !(self.caller.is_isolated()
+            && !self.is_self_or_ancestor(&self.caller.id, agent)
+            && self.caller.parent_id.as_ref() != Some(&agent.id)
+            && !self.sharing.contains(&agent.id))
+    }
+
+    fn annotate(&self, view: &mut AgentView, agent: &Agent) {
+        view.relationship = Some(relationship_with(self.caller, agent, |ancestor, target| {
+            self.is_self_or_ancestor(ancestor, target)
+        }));
+        view.can_message = Some(
+            can_sender_message_agent_with(
+                self.store,
+                self.caller,
+                agent,
+                || self.sharing.contains(&agent.id),
+                || self.is_self_or_ancestor(&self.caller.id, agent),
+            )
+            .is_ok(),
+        );
+        // [`can_actor_read_agent_private`] for this caller.
+        let reads_private = self.is_self_or_ancestor(&self.caller.id, agent)
+            || (self.caller.is_admin && self.caller.parent_id.is_none());
+        if !reads_private {
+            view.instructions = None;
+        }
     }
 }
 
@@ -2831,43 +3716,26 @@ fn list_agents_sync_for_principal(
     };
     // Only the selected state and its ancestors are read; the archive is
     // counted by index instead of being deserialized row by row.
-    let (all_agents, archived_count) = state
+    let (roster, archived_count) = state
         .store
         .roster_agents(query.state.as_deref())
         .map_err(ApiError::from_store)?;
-    let all_agents: Vec<_> = all_agents
-        .into_iter()
-        .filter(|agent| {
-            !caller_agent.as_ref().is_some_and(|caller| {
-                caller.is_isolated()
-                    && !is_self_or_ancestor(&state.store, &caller.id, agent)
-                    && caller.parent_id.as_ref() != Some(&agent.id)
-                    && !state.store.share_any_group_or_chat(&caller.id, &agent.id)
-            })
-        })
+    let caller = caller_agent
+        .as_ref()
+        .map(|caller| RosterCaller::new(&state.store, caller, &roster));
+    let visible: Vec<&Agent> = roster
+        .iter()
+        .filter(|agent| caller.as_ref().is_none_or(|caller| caller.sees(agent)))
         .collect();
-    let mut listed = roster_views(
-        &state.store,
-        &state.health,
-        all_agents,
-        archived_count,
-        query,
-    )?;
-    for view in &mut listed.agents {
-        let Some(ref caller) = caller_agent else {
-            continue;
-        };
-        let agent = state
-            .store
-            .agent_by_name(&view.id)
-            .map_err(ApiError::from_store)?;
-        view.relationship = Some(compute_caller_relationship(&state.store, caller, &agent));
-        view.can_message = Some(
-            can_actor_message_agent(&state.store, &Actor::Agent(caller.name.clone()), &agent)
-                .is_ok(),
-        );
-        if !can_actor_read_agent_private(&state.store, principal, &agent) {
-            view.instructions = None;
+    let mut listed = roster_views(&state.store, &state.health, &visible, archived_count, query)?;
+    if let Some(caller) = &caller {
+        let by_id: HashMap<&str, &Agent> = visible.iter().map(|a| (a.id.as_str(), *a)).collect();
+        for view in &mut listed.agents {
+            let agent = by_id
+                .get(view.id.as_str())
+                .copied()
+                .expect("every view comes from a visible row");
+            caller.annotate(view, agent);
         }
     }
     Ok(Json(listed))
@@ -2877,7 +3745,7 @@ fn list_agents_sync_for_principal(
 pub(crate) fn roster_views(
     store: &Store,
     health: &HealthBoard,
-    all_agents: Vec<Agent>,
+    all_agents: &[&Agent],
     archived_count: usize,
     query: &ListAgentsQuery,
 ) -> Result<AgentsResponse, ApiError> {
@@ -2892,7 +3760,7 @@ pub(crate) fn roster_views(
             "invalid agent state",
         ));
     }
-    let by_id: HashMap<_, _> = all_agents.iter().map(|a| (a.id.as_str(), a)).collect();
+    let by_id: HashMap<_, _> = all_agents.iter().map(|a| (a.id.as_str(), *a)).collect();
     let selected_name = query
         .name
         .as_deref()
@@ -2907,7 +3775,7 @@ pub(crate) fn roster_views(
         .transpose()
         .map_err(ApiError::from_store)?;
     let mut selected = HashSet::new();
-    for agent in &all_agents {
+    for agent in all_agents {
         let state_matches = match query.state.as_deref() {
             Some("all") => true,
             Some(state) => agent.state == state,
@@ -2949,13 +3817,15 @@ pub(crate) fn roster_views(
         }
     }
     let mut metadata = store.agent_query_metadata().map_err(ApiError::from_store)?;
-    let seats = crate::sandbox::roster_seats();
+    let files = file_cache::cache();
+    files.catch_up();
+    let seats = view_seats(files);
     let mut agents = Vec::with_capacity(selected.len());
-    for agent in &all_agents {
+    for agent in all_agents {
         if !selected.contains(agent.id.as_str()) {
             continue;
         }
-        let view = agent_view_preloaded(store, health, agent, Some(&mut metadata), Some(&seats))?;
+        let view = agent_view_preloaded(store, health, agent, Some(&mut metadata), &seats)?;
         agents.push(view);
     }
     Ok(AgentsResponse {
@@ -2995,8 +3865,112 @@ pub(crate) fn compute_block_reason(
     None
 }
 
+/// The marker files an agent view shows, all in the agent's config directory.
+const LAST_ERROR: &str = ".anyagents-last-error.json";
+const PROFILE_ROTATED: &str = ".anyagents-profile-rotated-ms";
+const QUOTA_CLEARED: &str = ".anyagents-quota-cleared-ms";
+const NOTIFIED_PARENT: &str = ".anyagents-notified-parent-error.json";
+const BOUND_PROFILE: &str = ".anyagents-profile";
+
+/// One agent's marker files, as the view cache holds them.
+struct Markers<'a> {
+    files: &'a file_cache::FileCache,
+    cfg: &'a Path,
+}
+
+impl Markers<'_> {
+    fn read(&self, name: &str) -> Option<std::sync::Arc<str>> {
+        self.files.file(&self.cfg.join(name))
+    }
+
+    /// A millisecond timestamp an operator or rotation marker holds; 0 when
+    /// absent.
+    fn ms(&self, name: &str) -> i64 {
+        self.read(name)
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    }
+
+    /// [`create::bound_profile_name`] from the cached marker.
+    fn bound_profile(&self) -> Option<String> {
+        self.read(BOUND_PROFILE)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Whether [`create::maybe_notify_parent_on_error`] would act for this
+    /// error: the same early returns and the same episode key it compares with
+    /// the notice marker. Only then does the view call it, and it re-checks
+    /// both files before it writes or sends anything.
+    fn parent_notice_due(&self, agent: &Agent, rotated_ms: i64, err_msg: &str) -> bool {
+        let trimmed = err_msg.trim();
+        if agent.parent_id.is_none()
+            || trimmed.is_empty()
+            || crate::host_memory::is_migration_wait(trimmed)
+        {
+            return false;
+        }
+        let source_key = format!(
+            "subagent-error:{}:{rotated_ms}:{trimmed}",
+            agent.id.as_str()
+        );
+        !self
+            .read(NOTIFIED_PARENT)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .is_some_and(|val| {
+                val.get("source_key").and_then(|v| v.as_str()) == Some(source_key.as_str())
+            })
+    }
+}
+
+/// The quota reset and fault text an adapter or the launcher last persisted in
+/// `.anyagents-last-error.json`. A record from before the last profile rotation
+/// (for AGY, also before the last quota clear) is stale, and an expired reset
+/// clears its record. Claude Code persists no reset, so only its text counts.
+fn persisted_fault(
+    harness: &str,
+    markers: &Markers<'_>,
+    rotated_ms: i64,
+    now: i64,
+) -> (Option<i64>, Option<String>) {
+    let Some(record) = markers
+        .read(LAST_ERROR)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    else {
+        return (None, None);
+    };
+    let floor = if harness == "agy" {
+        rotated_ms.max(markers.ms(QUOTA_CLEARED))
+    } else {
+        rotated_ms
+    };
+    let recorded_at = record
+        .get("timestamp_ms")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    if recorded_at <= floor {
+        return (None, None);
+    }
+    let error = record
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if harness == "claude-code" {
+        return (None, error);
+    }
+    match record
+        .get("quota_reset_at_ms")
+        .and_then(serde_json::Value::as_i64)
+    {
+        Some(reset_ms) if reset_ms > now => (Some(reset_ms), error),
+        Some(_) => (None, None),
+        None => (None, error),
+    }
+}
+
 fn archived_agent_view_fast(agent: &Agent) -> AgentView {
-    let (mode, steer) = declared(&agent.harness);
+    let delivery: crate::api::DeliveryView =
+        (&crate::vendor::declared_delivery(&agent.harness)).into();
     AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -3020,8 +3994,9 @@ fn archived_agent_view_fast(agent: &Agent) -> AgentView {
         state: agent.state.clone(),
         process: "down".to_string(),
         turn_state: "idle".to_string(),
-        delivery_mode: mode_name(mode).to_string(),
-        steer_support: steer_name(steer).to_string(),
+        delivery_mode: delivery.legacy_mode(),
+        steer_support: delivery.legacy_steer(),
+        delivery,
         quota_reset_at_ms: None,
         block_reason: None,
         last_error: None,
@@ -3033,6 +4008,8 @@ fn archived_agent_view_fast(agent: &Agent) -> AgentView {
         seat_uid: None,
         seat_gid: None,
         schedules: Vec::new(),
+        turn_errors: None,
+        unsettled_outbound: Vec::new(),
     }
 }
 
@@ -3041,17 +4018,34 @@ pub(crate) fn agent_view(
     health: &HealthBoard,
     agent: &Agent,
 ) -> Result<AgentView, ApiError> {
-    agent_view_preloaded(store, health, agent, None, None)
+    let files = file_cache::cache();
+    files.catch_up();
+    agent_view_preloaded(store, health, agent, None, &view_seats(files))
 }
 
 type RosterSeats = HashMap<String, (String, u32, u32, u32)>;
+
+/// [`crate::sandbox::roster_seats`], kept by the view cache: the admitted
+/// principals come from the environment or from the registry file it names.
+fn view_seats(files: &file_cache::FileCache) -> std::sync::Arc<RosterSeats> {
+    let registry = std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY").map(PathBuf::from);
+    match registry {
+        Some(registry) if std::env::var("ANYAGENTS_PRINCIPALS").is_err() => files.fact(
+            format!("seats:{}", registry.display()),
+            file_cache::Dep::File(registry),
+            || std::sync::Arc::new(crate::sandbox::roster_seats()),
+        ),
+        // Read from the environment, or nothing to read.
+        _ => std::sync::Arc::new(crate::sandbox::roster_seats()),
+    }
+}
 
 fn agent_view_preloaded(
     store: &Store,
     health: &HealthBoard,
     agent: &Agent,
     mut metadata: Option<&mut anyagents_core::AgentQueryMetadata>,
-    seats: Option<&RosterSeats>,
+    seats: &RosterSeats,
 ) -> Result<AgentView, ApiError> {
     if agent.state == "archived" {
         let mut view = archived_agent_view_fast(agent);
@@ -3084,41 +4078,23 @@ fn agent_view_preloaded(
             .map_err(ApiError::from_store)?
     };
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-    let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(0);
-    let (session_quota, mut session_error) = if agent.state == "archived" {
-        (None, None)
-    } else if agent.harness == "claude-code" {
-        let persisted_err = crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
-        (
-            anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now),
-            persisted_err,
-        )
-    } else if agent.harness == "agy" {
-        anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
-    } else {
-        match crate::vendor::read_persisted_last_error(&cfg) {
-            Some((err, Some(reset_ms))) if reset_ms > now => (Some(reset_ms), err),
-            Some((err, None)) => (None, err),
-            _ => (None, None),
-        }
-    };
-    if agent.state != "archived" && session_error.is_none() && agent.harness == "codex" {
-        session_error = crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms);
-    }
+    let files = file_cache::cache();
+    let markers = Markers { files, cfg: &cfg };
+    let rotated_ms = markers.ms(PROFILE_ROTATED);
+    // The supervisor's board is the live state; a fault outlives its process
+    // only as the record an adapter persisted. A view never reads a vendor
+    // transcript, log or session store.
+    let (session_quota, session_error) = persisted_fault(&agent.harness, &markers, rotated_ms, now);
     let (
         process,
         mut turn_state,
-        mode,
-        steer,
-        mut quota,
+        delivery,
+        quota,
         live_harness,
         live_model,
         process_started_at_ms,
         pending_switch,
-        mut last_error,
+        last_error,
     ) = match health.get(&agent.id) {
         Some(live) if !crate::vendor::is_spiron_harness(&agent.harness) || live.process_alive => {
             let effective_quota = live.quota_reset_at_ms.or(session_quota);
@@ -3137,8 +4113,9 @@ fn agent_view_preloaded(
             (
                 if live.process_alive { "alive" } else { "down" },
                 if working { "working" } else { "idle" },
-                mode_name(live.delivery_mode),
-                steer_name(live.steer_support),
+                live.delivery
+                    .clone()
+                    .unwrap_or_else(|| crate::vendor::declared_delivery(&agent.harness)),
                 effective_quota,
                 if live.process_alive {
                     live.live_harness.clone()
@@ -3156,7 +4133,6 @@ fn agent_view_preloaded(
             )
         }
         _ => {
-            let (mode, steer) = declared(&agent.harness);
             let lock_busy = crate::vendor::is_spiron_harness(&agent.harness)
                 && matches!(
                     store.try_lock_agent(&agent.id),
@@ -3167,8 +4143,7 @@ fn agent_view_preloaded(
             (
                 proc_str,
                 turn_str,
-                mode_name(mode),
-                steer_name(steer),
+                crate::vendor::declared_delivery(&agent.harness),
                 session_quota,
                 if proc_str == "alive" {
                     Some(agent.harness.clone())
@@ -3186,12 +4161,12 @@ fn agent_view_preloaded(
             )
         }
     };
-    if let Some(reset_ms) = quota.filter(|&ms| ms > now) {
-        create::record_profile_quota_reset(store.data_dir(), agent, reset_ms);
-        if create::try_rotate_exhausted_profile(store, store.data_dir(), agent, true).is_some() {
-            quota = None;
-            last_error = None;
-        }
+    // Rotation rewrites the agent's profile markers; an agent whose creation
+    // is in flight or failed is never written to from a view.
+    if agent.state != "created"
+        && let Some(reset_ms) = quota.filter(|&ms| ms > now)
+    {
+        quota_rotation::queue(&agent.id, reset_ms);
     }
     if (agent.state == "running" || agent.state == "idle") && quota.is_none_or(|ms| ms <= now) {
         if let Some(ref err_msg) = last_error {
@@ -3200,12 +4175,40 @@ fn agent_view_preloaded(
             } else {
                 "errored"
             };
-            create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
-        } else {
-            let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
+            if markers.parent_notice_due(agent, rotated_ms, err_msg) {
+                create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
+            }
+        } else if markers.read(NOTIFIED_PARENT).is_some() {
+            let _ = std::fs::remove_file(cfg.join(NOTIFIED_PARENT));
         }
     }
-    let block_reason = compute_block_reason(quota, last_error.as_deref(), now);
+    // Turns that ended in an error, and a parking for them (docs/delivery.md).
+    let turn_errors = if let Some(metadata) = metadata.as_mut() {
+        metadata.turn_errors.remove(agent.id.as_str())
+    } else {
+        store
+            .turn_errors(&agent.id)
+            .ok()
+            .flatten()
+            .filter(anyagents_core::TurnErrors::is_current)
+    };
+    let parked = agent.state == "paused"
+        && turn_errors
+            .as_ref()
+            .is_some_and(|errors| errors.faulted_at_ms.is_some());
+    let last_error = if parked {
+        last_error.or_else(|| turn_errors.as_ref().and_then(|e| e.last_error.clone()))
+    } else {
+        last_error
+    };
+    if parked {
+        turn_state = "faulted";
+    }
+    let block_reason = if parked {
+        Some("faulted".to_string())
+    } else {
+        compute_block_reason(quota, last_error.as_deref(), now)
+    };
     let open_turn_age_ms = if has_open_turn {
         if let Some(metadata) = metadata.as_ref() {
             metadata
@@ -3240,13 +4243,9 @@ fn agent_view_preloaded(
     } else {
         store.agent_aliases(&agent.id).unwrap_or_default()
     };
-    let seat_info = if let Some(seats) = seats {
-        seats
-            .get(agent.id.as_str())
-            .map(|(user, uid, gid, _)| (user.clone(), *uid, *gid, None))
-    } else {
-        create::resolved_agent_seat_info(store, agent)
-    };
+    let seat_info = seats
+        .get(agent.id.as_str())
+        .map(|(user, uid, gid, _)| (user.clone(), *uid, *gid));
     let schedules = if let Some(metadata) = metadata.as_mut() {
         metadata
             .schedules
@@ -3263,7 +4262,7 @@ fn agent_view_preloaded(
     Ok(AgentView {
         has_open_turn,
         open_turn_age_ms,
-        profile: create::bound_profile_name(&cfg),
+        profile: markers.bound_profile(),
         id: agent.id.to_string(),
         name: agent.name.clone(),
         role: agent.role.clone(),
@@ -3283,30 +4282,143 @@ fn agent_view_preloaded(
         state: agent.state.clone(),
         process: process.to_string(),
         turn_state: turn_state.to_string(),
-        delivery_mode: mode.to_string(),
-        steer_support: steer.to_string(),
+        delivery_mode: crate::api::DeliveryView::from(&delivery).legacy_mode(),
+        steer_support: crate::api::DeliveryView::from(&delivery).legacy_steer(),
+        delivery: (&delivery).into(),
         quota_reset_at_ms: quota,
         block_reason,
         last_error,
         oldest_undelivered_age_ms,
-        install: install_state(store, agent),
+        install: install_state(store, files, agent),
         description: agent.public_description(),
         instructions: agent.instructions.clone(),
-        seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
-        seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
-        seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
+        seat_user: seat_info.as_ref().map(|(u, _, _)| u.clone()),
+        seat_uid: seat_info.as_ref().map(|(_, uid, _)| *uid),
+        seat_gid: seat_info.as_ref().map(|(_, _, gid)| *gid),
         schedules,
+        turn_errors: turn_errors.map(Into::into),
+        unsettled_outbound: outbound_history::unsettled(store)
+            .iter()
+            .filter(|held| held.agent_id == agent.id)
+            .map(unsettled_view)
+            .collect(),
     })
+}
+
+/// `GET /v1/outbound`: every sent message whose delivery could not be
+/// confirmed, held instead of resent. Operator only.
+async fn outbound_list_route(
+    principal: Principal,
+    State(state): State<AppState>,
+) -> Result<Json<crate::api::UnsettledOutboundResponse>, ApiError> {
+    require_operator(&principal)?;
+    spawn_store(move || {
+        Ok(Json(crate::api::UnsettledOutboundResponse {
+            unsettled: outbound_history::unsettled(&state.store)
+                .iter()
+                .map(unsettled_view)
+                .collect(),
+        }))
+    })
+    .await
+}
+
+/// `POST /v1/outbound/{key}/retry`: send a held message again, as its agent
+/// and to its destination, through the ordinary send path. The held record
+/// closes with the new receipt only when that send succeeds. Operator only.
+async fn outbound_retry_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+) -> Result<Json<SendResponse>, ApiError> {
+    require_operator(&principal)?;
+    spawn_store(move || {
+        let store = &state.store;
+        let mut skipped = Vec::new();
+        let deliveries = outbound_history::retry(store, &key, |held| {
+            if non_text_post(&held.body) {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "{key} was a media, location, poll, checklist or article post; its record keeps only its text. Discard it and ask the agent to post it again."
+                    ),
+                ));
+            }
+            let sender = store.agent(&held.agent_id).map_err(ApiError::from_store)?;
+            let actor = Actor::Agent(sender.name.clone());
+            let body = SendRequest {
+                to: vec![held.destination.clone()],
+                text: held.body.clone(),
+                sender: Some(actor.as_address()),
+                reply_to: held.reply_to.clone(),
+                ..SendRequest::default()
+            };
+            let plan = plan_send(store, &Principal::Operator, &actor, &body)?;
+            let response = send_sync(store, &actor, body, plan, None)?.0;
+            skipped = response.skipped;
+            Ok(response.deliveries)
+        })?;
+        Ok(Json(SendResponse {
+            deliveries,
+            skipped,
+        }))
+    })
+    .await
+}
+
+/// `POST /v1/outbound/{key}/discard`: settle a held message without sending
+/// it. Operator only.
+async fn outbound_discard_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+) -> Result<Json<crate::api::UnsettledOutboundView>, ApiError> {
+    require_operator(&principal)?;
+    spawn_store(move || {
+        outbound_history::discard(&state.store, &key)
+            .map(|held| Json(unsettled_view(&held)))
+            .map_err(ApiError::from_store)
+    })
+    .await
+}
+
+/// Whether a sent body is the text record of a post that was not plain text
+/// (`format_internal_send_text`): a retry from it would post its description.
+fn non_text_post(body: &str) -> bool {
+    [
+        "[Attachment (",
+        "[Location GPS:",
+        "[Venue: ",
+        "[Poll: \"",
+        "📰 ",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+        || body.starts_with("☑️ **")
+}
+
+/// How the API shows an outbound message whose delivery is unconfirmed.
+pub(crate) fn unsettled_view(
+    held: &outbound_history::Unsettled,
+) -> crate::api::UnsettledOutboundView {
+    crate::api::UnsettledOutboundView {
+        key: held.effect_key.clone(),
+        agent_id: held.agent_id.to_string(),
+        destination: held.destination.clone(),
+        since_ms: held.since_ms,
+        error: held.error.clone(),
+        excerpt: held.excerpt(),
+    }
 }
 
 /// `installed` once this harness is on the machine, `needed` when the reason it
 /// is not, `pending` when nothing has been recorded yet.
-fn install_state(store: &Store, agent: &Agent) -> String {
+fn install_state(store: &Store, files: &file_cache::FileCache, agent: &Agent) -> String {
     match crate::install::recorded(&agent.harness) {
         Some(Ok(())) => "installed".to_string(),
         Some(Err(reason)) => reason,
         None => {
-            if crate::install::program(store.data_dir(), &agent.harness).is_file() {
+            if installed_on_disk(files, store.data_dir(), &agent.harness) {
                 "installed".to_string()
             } else {
                 "pending".to_string()
@@ -3315,11 +4427,38 @@ fn install_state(store: &Store, agent: &Agent) -> String {
     }
 }
 
+/// Whether a harness this server has not recorded is on disk: its managed
+/// receipt or launcher, all under `<root>/harnesses/<id>/`. The deprecated
+/// `ANYAGENTS_<ID>_BIN` override names a program outside that tree, so it is
+/// checked directly.
+fn installed_on_disk(files: &file_cache::FileCache, root: &Path, harness: &str) -> bool {
+    let harness = anyagents_harness::normalize_harness_name(harness).to_string();
+    let check = {
+        let root = root.to_path_buf();
+        let harness = harness.clone();
+        move || {
+            crate::install::is_healthy(&root, &harness)
+                || crate::install::program(&root, &harness).is_file()
+        }
+    };
+    let override_var = format!("ANYAGENTS_{}_BIN", harness.to_uppercase().replace('-', "_"));
+    if std::env::var_os(override_var).is_some() {
+        return check();
+    }
+    files.fact(
+        format!("installed:{}:{harness}", root.display()),
+        file_cache::Dep::Dir(root.join("harnesses").join(&harness)),
+        check,
+    )
+}
+
 async fn create_agent_route(
     principal: Principal,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(mut body): Json<CreateAgentRequest>,
 ) -> Result<(StatusCode, Json<AgentView>), ApiError> {
+    let via_http = via_http_mcp(&headers);
     let caller_agent = match &principal {
         Principal::Operator => None,
         Principal::Agent { agent_id, name } => Some((agent_id.clone(), name.clone())),
@@ -3384,6 +4523,8 @@ async fn create_agent_route(
             body.model,
             body.profile,
         );
+        require_remote_callback(state.store.data_dir(), &harness)?;
+        refuse_host_placement_over_http(via_http, &harness)?;
         let mut agent = create::create(
             &state.store,
             state.store.data_dir(),
@@ -3608,6 +4749,7 @@ async fn archive_agent_route(
     .await
 }
 
+#[cfg(test)]
 pub(crate) fn reap_subagent_ephemeral_dirs(
     data_dir: &Path,
     agent_id: &anyagents_core::AgentId,
@@ -3615,13 +4757,33 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     let Ok(store) = Store::open(data_dir.join("state.db")) else {
         return false;
     };
-    let Ok(agents) = store.list_agents() else {
-        return false;
-    };
+    reap_subagent_ephemeral_dirs_in(&store, data_dir, agent_id)
+}
+
+fn reap_subagent_ephemeral_dirs_in(
+    store: &Store,
+    data_dir: &Path,
+    agent_id: &anyagents_core::AgentId,
+) -> bool {
     // Delete calls this after removing the row; all surviving references still
     // protect their workdirs. A failed read must never mean no shared workdirs.
-    let agent = agents.iter().find(|agent| &agent.id == agent_id);
-    let parent_id = agent.and_then(|agent| agent.parent_id.as_ref());
+    let agent = match store.agent(agent_id) {
+        Ok(agent) => Some(agent),
+        Err(Error::AgentNotFound(_)) => None,
+        Err(_) => return false,
+    };
+    let parent = match agent.as_ref().and_then(|agent| agent.parent_id.as_ref()) {
+        Some(parent_id) => match store.agent(parent_id) {
+            Ok(parent) => Some(parent),
+            Err(Error::AgentNotFound(_)) => None,
+            Err(_) => return false,
+        },
+        None => None,
+    };
+    let Ok(unarchived) = store.unarchived_workdirs() else {
+        return false;
+    };
+    let agent = agent.as_ref();
     let mut complete = true;
     let agent_root = data_dir.join("agents").join(agent_id.as_str());
     let config_dir = agent_root.join("config");
@@ -3630,17 +4792,6 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     let seat_ids = detect_seat_ids(&config_dir)
         .or_else(|| detect_seat_ids(&configured_work))
         .or_else(|| detect_seat_ids(&legacy_work));
-    // Quarantine protects recovery evidence, including build-output paths that
-    // would otherwise be removed after a failed Git cleanliness check.
-    if crate::worktree_access::reaping_blocked(data_dir, agent_id) {
-        return false;
-    }
-    // Revoke before any deletion, including dirty/externally located checkouts.
-    // A failed revoke retains the journal and makes the reap incomplete.
-    if let Err(error) = crate::worktree_access::revoke_recorded(data_dir, agent_id) {
-        eprintln!("agent {agent_id}: worktree grant revocation failed: {error}");
-        return false;
-    }
     for rel in [
         "cache-home",
         "cache",
@@ -3693,18 +4844,26 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     let mut shared_workdirs = std::collections::HashSet::new();
     #[cfg(target_os = "linux")]
     if let Some(agent) = agent {
-        crate::workstation::session::stop_in_background(data_dir, &agent.name);
+        crate::workstation::session::stop_agent_in_background(data_dir, &agent.name);
     }
-    for other in &agents {
-        let keep_protected =
-            &other.id != agent_id && (other.state != "archived" || parent_id == Some(&other.id));
-        if keep_protected && let Some(wd) = &other.workdir {
-            let wd_path = PathBuf::from(&wd);
-            if let Ok(abs) = std::path::absolute(&wd_path) {
-                shared_workdirs.insert(abs);
-            }
-            shared_workdirs.insert(wd_path);
+    // Every other agent that is not archived, and the parent even when it is,
+    // keeps its workdir.
+    let protected = unarchived
+        .iter()
+        .filter(|(id, _)| id != agent_id)
+        .map(|(_, workdir)| workdir.as_str())
+        .chain(
+            parent
+                .as_ref()
+                .filter(|parent| &parent.id != agent_id)
+                .and_then(|parent| parent.workdir.as_deref()),
+        );
+    for wd in protected {
+        let wd_path = PathBuf::from(wd);
+        if let Ok(abs) = std::path::absolute(&wd_path) {
+            shared_workdirs.insert(abs);
         }
+        shared_workdirs.insert(wd_path);
     }
     let marker_path = config_dir.join(".anyagents-managed-worktree.json");
     let marker_val = std::fs::read_to_string(&marker_path)
@@ -3726,59 +4885,49 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     // Never reap an external `explicit-worktree` (`wt_path != &work_dir`) such as `/scratch/wt/...`
     // that a parent or operator created and lent to a child agent. Only reap the agent's own
     // managed workspace directory when not shared with another agent.
-    let journaled_any = crate::worktree_access::grant_path(data_dir, agent_id)
-        .symlink_metadata()
-        .is_ok();
-    for (idx, work_dir) in managed_work_dirs.into_iter().enumerate() {
+    let seat = seat_ids.map(|(uid, gid, _)| (uid, gid));
+    for work_dir in managed_work_dirs {
         if shared_workdirs.contains(&work_dir) {
             continue;
         }
-        let journaled = journaled_any
-            && (idx == 0
-                || crate::worktree_access::RecordedWorktree::load(data_dir, agent_id, &work_dir)
-                    .is_some());
-        if journaled
-            && crate::worktree_access::RecordedWorktree::load(data_dir, agent_id, &work_dir)
-                .is_none_or(|record| !record.checkout_pointer_matches())
-        {
-            eprintln!(
-                "agent {agent_id}: preserving entire journaled checkout {}: missing or changed .git pointer",
-                work_dir.display()
-            );
-            return complete;
+        let dotgit = work_dir.join(".git");
+        if std::fs::symlink_metadata(&dotgit).is_ok_and(|meta| meta.is_file()) {
+            // A linked worktree from before per-agent repositories: convert it
+            // first, so the shared store forgets it and it is judged as one.
+            if let crate::repo::Adoption::Declined(reason) = crate::repo::adopt(&work_dir, seat) {
+                eprintln!(
+                    "agent {agent_id}: keeping checkout {}: not converted: {reason}",
+                    work_dir.display()
+                );
+                complete &= reap_build_outputs_in_worktree(&work_dir, seat_ids);
+                continue;
+            }
         }
-        if work_dir.join(".git").exists() || journaled {
-            // A missing/broken child-owned pointer cannot turn a journaled
-            // checkout into a disposable non-Git directory.
-            if is_git_worktree_safe_to_reap(data_dir, agent_id, &work_dir) {
-                complete &= reap_git_worktree_cleanly(data_dir, agent_id, &work_dir, seat_ids);
+        if dotgit.symlink_metadata().is_ok() {
+            if is_git_worktree_safe_to_reap(&work_dir, seat) {
+                crate::repo::forget(&work_dir);
+                complete &= remove_path_with_seat(&work_dir, seat_ids);
                 let _ = std::fs::remove_file(&marker_path);
             } else {
-                if crate::worktree_access::reaping_blocked(data_dir, agent_id) {
-                    return false;
-                }
                 complete &= reap_build_outputs_in_worktree(&work_dir, seat_ids);
             }
+        } else if work_dir.exists() && recorded_wt.as_ref() == Some(&work_dir) {
+            // A repository checkout that lost its `.git` is not disposable.
+            eprintln!(
+                "agent {agent_id}: preserving checkout {}: its .git is missing",
+                work_dir.display()
+            );
+            complete &= reap_build_outputs_in_worktree(&work_dir, seat_ids);
         } else {
             let mut preserved_dirty_child = false;
             if let Ok(entries) = std::fs::read_dir(&work_dir) {
                 for entry in entries.flatten() {
                     let child_path = entry.path();
+                    // A repository the agent made inside its private directory
+                    // is kept; only its build output goes.
                     if child_path.is_dir() && child_path.join(".git").exists() {
-                        if is_git_worktree_safe_to_reap(data_dir, agent_id, &child_path) {
-                            complete &= reap_git_worktree_cleanly(
-                                data_dir,
-                                agent_id,
-                                &child_path,
-                                seat_ids,
-                            );
-                        } else {
-                            if crate::worktree_access::reaping_blocked(data_dir, agent_id) {
-                                return false;
-                            }
-                            complete &= reap_build_outputs_in_worktree(&child_path, seat_ids);
-                            preserved_dirty_child = true;
-                        }
+                        complete &= reap_build_outputs_in_worktree(&child_path, seat_ids);
+                        preserved_dirty_child = true;
                     }
                 }
             }
@@ -3824,88 +4973,93 @@ fn reap_build_outputs_in_worktree(wt_path: &Path, seat_ids: Option<(u32, u32, u3
     complete
 }
 
-pub(crate) fn is_git_worktree_safe_to_reap(
-    data: &Path,
-    id: &anyagents_core::AgentId,
-    wt_path: &Path,
-) -> bool {
-    let Some(record) = crate::worktree_access::RecordedWorktree::load(data, id, wt_path) else {
-        // Legacy or arbitrary repositories lack trusted metadata provenance.
-        // Preserve them instead of letting Git follow a child-owned .git file.
-        return false;
-    };
-    if !record.checkout_pointer_matches() {
-        eprintln!(
-            "agent {id}: preserving journaled checkout {}: missing or changed .git pointer",
-            wt_path.display()
-        );
+/// A checkout may go only when it is the agent's own repository, its status
+/// is clean, and the remote holds everything else it has: no stash, no tag or
+/// note the remote lacks, and no commit (of HEAD, a branch, a tag, a note or
+/// any other ref but remote-tracking ones) that no advertised ref reaches.
+/// The proof is the remote's own answer, asked by the server; a checkout it
+/// cannot ask about stays. Git reads the checkout as the agent's seat.
+pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, seat: Option<(u32, u32)>) -> bool {
+    // Only a `.git` directory: a pointer could name any other repository.
+    let git_dir = wt_path.join(".git");
+    if !std::fs::symlink_metadata(&git_dir).is_ok_and(|meta| meta.is_dir()) {
         return false;
     }
-    record
-        .inspect(|| {
-            let output = |args: &[&str]| record.command()?.args(args).output();
-            let status_out = output(&["status", "--porcelain", "--untracked-files=normal"])?;
-            if !status_out.status.success() {
-                return Ok(false);
-            }
-            let status_text = String::from_utf8_lossy(&status_out.stdout);
-            let has_substantive_dirty = status_text.lines().any(|line| {
-                let path = line.get(3..).unwrap_or("").trim();
-                !matches!(
-                    path,
-                    "CLAUDE.md"
-                        | "AGENTS.md"
-                        | "GEMINI.md"
-                        | ".claude"
-                        | ".gemini"
-                        | "node_modules"
-                        | "target"
-                ) && !path.starts_with(".desk-worktree")
-                    && !path.starts_with(".claude/")
-                    && !path.starts_with(".gemini/")
-                    && !path.starts_with("node_modules/")
-                    && !path.starts_with("target/")
-            });
-            if has_substantive_dirty {
-                return Ok(false);
-            }
-            // Require HEAD and every local branch history to be covered by at least
-            // one recorded remote-tracking ref, including detached HEAD and branches
-            // not currently checked out. Shared refs remain the documented same-repo
-            // integrity boundary; this is not protection from forged remote refs.
-            let unpushed = output(&[
-                "rev-list",
-                "HEAD",
-                "--branches",
-                "--not",
-                "--remotes",
-                "--count",
-            ])?;
-            Ok(unpushed.status.success() && unpushed.stdout == b"0\n")
-        })
-        .unwrap_or(false)
-}
-
-fn reap_git_worktree_cleanly(
-    data: &Path,
-    id: &anyagents_core::AgentId,
-    wt_path: &Path,
-    seat_ids: Option<(u32, u32, u32)>,
-) -> bool {
-    let Some(record) = crate::worktree_access::RecordedWorktree::load(data, id, wt_path) else {
+    let git = || crate::repo::inspect_command(seat, &git_dir, Some(wt_path));
+    let output = |args: &[&str]| {
+        git().and_then(|mut cmd| cmd.args(args).stdin(std::process::Stdio::null()).output())
+    };
+    let Ok(status_out) = output(&["status", "--porcelain", "--untracked-files=normal"]) else {
         return false;
     };
-    if record.validate().is_err() {
+    if !status_out.status.success() {
         return false;
     }
-    // Git has no separate worktree registry: these two directories are the
-    // checkout and registration. Avoid `git worktree remove`, which can launch
-    // its own Git subprocesses inside the seat-controlled checkout.
-    let mut complete = remove_path_with_seat(wt_path, seat_ids);
-    // Only the journal's validated private dir is eligible, never a path read
-    // back from a child-edited pointer after the check above.
-    complete &= remove_path_with_seat(record.private(), seat_ids);
-    complete
+    let status_text = String::from_utf8_lossy(&status_out.stdout);
+    let has_substantive_dirty = status_text.lines().any(|line| {
+        let path = line.get(3..).unwrap_or("").trim();
+        !matches!(
+            path,
+            "CLAUDE.md"
+                | "AGENTS.md"
+                | "GEMINI.md"
+                | ".claude"
+                | ".gemini"
+                | "node_modules"
+                | "target"
+        ) && !path.starts_with(".desk-worktree")
+            && !path.starts_with(".claude/")
+            && !path.starts_with(".gemini/")
+            && !path.starts_with("node_modules/")
+            && !path.starts_with("target/")
+    });
+    if has_substantive_dirty {
+        return false;
+    }
+    let Ok(local) = output(&[
+        "for-each-ref",
+        "--format=%(objectname) %(refname)",
+        "refs/stash",
+        "refs/tags",
+        "refs/notes",
+    ]) else {
+        return false;
+    };
+    if !local.status.success() {
+        return false;
+    }
+    let Some(advertised) = crate::repo::published(wt_path, seat) else {
+        return false;
+    };
+    for line in String::from_utf8_lossy(&local.stdout).lines() {
+        let Some((oid, name)) = line.split_once(' ') else {
+            return false;
+        };
+        if name == "refs/stash"
+            || !advertised
+                .iter()
+                .any(|(remote_oid, remote_name)| remote_oid == oid && remote_name == name)
+        {
+            return false;
+        }
+    }
+    let covered: String = advertised
+        .iter()
+        .map(|(oid, _)| format!("^{oid}\n"))
+        .collect();
+    let Ok(mut unpublished) = git() else {
+        return false;
+    };
+    unpublished.args([
+        "rev-list",
+        "--count",
+        "--exclude=refs/remotes/*",
+        "--all",
+        "--ignore-missing",
+        "--stdin",
+    ]);
+    crate::repo::output_with_input(&mut unpublished, &covered)
+        .is_ok_and(|out| out.status.success() && out.stdout == b"0\n")
 }
 
 #[cfg(unix)]
@@ -4127,8 +5281,6 @@ async fn delete_agent_route(
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        crate::worktree_access::revoke_recorded(state.store.data_dir(), &found.id)
-            .map_err(ApiError::from_store)?;
         let deleted = state
             .store
             .delete_agent(&found.id)
@@ -4145,7 +5297,7 @@ async fn delete_agent_route(
         let seat_ids = detect_seat_ids(&agent_dir.join("config"));
         // The browser must be gone before its profile directory is removed.
         #[cfg(target_os = "linux")]
-        crate::workstation::session::stop_blocking(state.store.data_dir(), &deleted.name);
+        crate::workstation::session::stop_agent_blocking(state.store.data_dir(), &deleted.name);
         remove_path_with_seat(
             &state
                 .store
@@ -4154,7 +5306,7 @@ async fn delete_agent_route(
                 .join(&deleted.name),
             seat_ids,
         );
-        reap_subagent_ephemeral_dirs(state.store.data_dir(), &deleted.id);
+        reap_subagent_ephemeral_dirs_in(&state.store, state.store.data_dir(), &deleted.id);
         for private_tree in ["config", "memory", "skills"] {
             let tree_path = agent_dir.join(private_tree);
             remove_path_with_seat(&tree_path, seat_ids);
@@ -4177,12 +5329,20 @@ async fn wake_agent_route(
     principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<AgentView>, ApiError> {
+    let via_http = via_http_mcp(&headers);
     spawn_store(move || {
         let found = state
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
+        if via_http && !runs_off_host(state.store.data_dir(), &found) {
+            return Err(ApiError::forbidden(format!(
+                "`{}` runs on this host; a call over HTTP MCP cannot wake it",
+                found.name
+            )));
+        }
         if let Principal::Agent {
             agent_id: ref caller_id,
             name: ref caller_name,
@@ -4242,9 +5402,13 @@ fn prepare_agent_wake(store: &Store, found: &Agent) -> Result<(), ApiError> {
         create::write_profile_marker(&cfg, ".anyagents-profile-rotated-ms", &format!("{now}\n"))
             .map_err(ApiError::from_store)?;
     }
-    crate::worktree_access::restore_recorded(store.data_dir(), &found.id)
-        .map_err(ApiError::from_store)?;
     clear_explicitly_archived(store.data_dir(), &found.id);
+    // The gateway starts with routes for the live fleet only.
+    if found.state == "archived"
+        && let Err(err) = crate::gateway::add_route(store.data_dir(), found)
+    {
+        eprintln!("agent {}: gateway route not restored: {err}", found.id);
+    }
     Ok(())
 }
 
@@ -4456,34 +5620,34 @@ async fn inbox(
     // An agent's `inbox` is strictly its own incoming queue. To inspect another
     // agent's full two-way communication (`in` + `out` with users, groups, and
     // peers), agents use `/v1/agents/{name}/conversation`.
-    let agent_id = match &principal {
-        Principal::Operator => {
-            state
-                .store
-                .agent_by_name(&name)
-                .map_err(ApiError::from_store)?
-                .id
-        }
-        Principal::Agent {
-            agent_id,
-            name: own_name,
-        } => {
-            let matches_self = name == "self"
-                || name == agent_id.as_str()
-                || name == own_name.as_str()
-                || state
+    spawn_store(move || {
+        let agent_id = match &principal {
+            Principal::Operator => {
+                state
                     .store
                     .agent_by_name(&name)
-                    .is_ok_and(|a| a.id == *agent_id);
-            if !matches_self {
-                return Err(ApiError::forbidden(
-                    "a session reads its own inbox, not another agent's; use conversation to read another agent's conversation",
-                ));
+                    .map_err(ApiError::from_store)?
+                    .id
             }
-            agent_id.clone()
-        }
-    };
-    spawn_store(move || {
+            Principal::Agent {
+                agent_id,
+                name: own_name,
+            } => {
+                let matches_self = name == "self"
+                    || name == agent_id.as_str()
+                    || name == own_name.as_str()
+                    || state
+                        .store
+                        .agent_by_name(&name)
+                        .is_ok_and(|a| a.id == *agent_id);
+                if !matches_self {
+                    return Err(ApiError::forbidden(
+                        "a session reads its own inbox, not another agent's; use conversation to read another agent's conversation",
+                    ));
+                }
+                agent_id.clone()
+            }
+        };
         inbox_of(
             &state.store,
             &agent_id,
@@ -4658,6 +5822,7 @@ async fn conversation_route(
                     seq: 1,
                 };
                 return Ok(Json(ConversationResponse {
+                    retrieval: None,
                     agent: target.name.clone(),
                     agent_id: target.id.to_string(),
                     turns: vec![ConversationTurnView {
@@ -4715,6 +5880,7 @@ async fn conversation_route(
                 .store
                 .lock_agent_lifecycle(&target.id)
                 .map_err(ApiError::from_store)?;
+            memory_backlog::mark(state.store.data_dir(), &target.id);
             let agent_root = state
                 .store
                 .data_dir()
@@ -4793,6 +5959,7 @@ async fn conversation_route(
                 }
             };
             return Ok(Json(ConversationResponse {
+                retrieval: None,
                 agent: target.name,
                 agent_id: target.id.to_string(),
                 turns: vec![turn],
@@ -4834,13 +6001,7 @@ async fn conversation_route(
             }
             let authorized = match visible_agent_ids.as_ref() {
                 Some(ids) => ids.clone(),
-                None => state
-                    .store
-                    .list_agents()
-                    .map_err(ApiError::from_store)?
-                    .into_iter()
-                    .map(|a| a.id.to_string())
-                    .collect(),
+                None => every_agent_id(&state.store)?,
             };
             let (hit, bytes) = state
                 .store
@@ -4883,6 +6044,7 @@ async fn conversation_route(
                 .agent_by_name(&hit.metadata.agent_id)
                 .map_err(ApiError::from_store)?;
             return Ok(Json(ConversationResponse {
+                retrieval: None,
                 agent: agent.name,
                 agent_id: agent.id.to_string(),
                 turns: vec![ConversationTurnView {
@@ -4975,25 +6137,77 @@ async fn conversation_route(
         };
         let authorized = match visible_agent_ids.as_ref() {
             Some(ids) => ids.clone(),
-            None => state
-                .store
-                .list_agents()
-                .map_err(ApiError::from_store)?
-                .into_iter()
-                .map(|a| a.id.to_string())
-                .collect(),
+            None => every_agent_id(&state.store)?,
         };
         let should_search_host_files = has_structured_search
             || query.scope != anyagents_core::host_index::MemoryScope::All
             || std::env::var_os("ANYAGENTS_TESTS").is_some();
-        let file_hits = if should_search_host_files {
+        // A search indexes only a bounded amount of new history before it
+        // answers; the background indexer takes the rest, and the response
+        // says the history it searched was partial.
+        let (file_hits, pending) = if should_search_host_files {
             state
                 .store
-                .search_host_files(&authorized, query.scope, &file_request)
+                .search_host_files_reporting(&authorized, query.scope, &file_request)
                 .map_err(|e| ApiError::from_store(Error::Message(e.to_string())))?
         } else {
-            Vec::new()
+            (Vec::new(), Default::default())
         };
+        // A relevance search for text also ranks by meaning: dense candidates
+        // from the memory service join the lexical ones, and the fused list
+        // is reranked below. Reads in time order rank nothing.
+        let text_query = clean_q
+            .map(str::to_string)
+            .or_else(|| (!extra_queries.is_empty()).then(|| extra_queries.join(" ")));
+        let ranks_by_relevance = should_search_host_files
+            && file_request.sort == anyagents_core::HistorySort::Relevance
+            && file_request.radius == 0;
+        let mut retrieval = None;
+        let file_hits = match text_query.as_deref().filter(|_| ranks_by_relevance) {
+            Some(text) => {
+                let owners: Vec<String> = if is_all {
+                    authorized.clone()
+                } else {
+                    let selected = state
+                        .store
+                        .agent_by_name(&name)
+                        .map_err(ApiError::from_store)?
+                        .id
+                        .to_string();
+                    authorized
+                        .iter()
+                        .filter(|id| **id == selected)
+                        .cloned()
+                        .collect()
+                };
+                let hybrid = hybrid::search(
+                    &state.store,
+                    text,
+                    &owners,
+                    query.scope,
+                    &file_request,
+                    file_hits,
+                );
+                retrieval = Some(hybrid.retrieval);
+                hybrid.hits
+            }
+            None => file_hits,
+        };
+        if pending.sources > 0 {
+            let view = retrieval.get_or_insert_with(|| crate::api::RetrievalView {
+                stages: vec!["lexical".into()],
+                ..crate::api::RetrievalView::default()
+            });
+            view.degraded.push(format!(
+                "partial: {} history source(s), about {} KiB, are still being indexed in the background; hits from them may be missing",
+                pending.sources,
+                pending.bytes.div_ceil(1024)
+            ));
+            view.pending = Some(crate::api::PendingHistoryView {
+                sources: pending.sources,
+                bytes: pending.bytes,
+            });
+        }
 
         let (agent_name, agent_id_str, raw_turns) =
             if query.scope == anyagents_core::host_index::MemoryScope::Memory {
@@ -5143,6 +6357,9 @@ async fn conversation_route(
                 b.0.total_cmp(&a.0)
                     .then_with(|| b.1.timestamp_ms.cmp(&a.1.timestamp_ms))
             });
+            if let (Some(retrieval), Some(text)) = (retrieval.as_mut(), text_query.as_deref()) {
+                hybrid::rerank(state.store.data_dir(), text, &mut ranked, retrieval);
+            }
         } else {
             ranked.sort_by_key(|(_, t)| t.timestamp_ms);
             if file_request.sort == anyagents_core::HistorySort::Newest {
@@ -5162,6 +6379,7 @@ async fn conversation_route(
             agent: agent_name,
             agent_id: agent_id_str,
             turns,
+            retrieval,
         }))
     })
     .await
@@ -5199,79 +6417,84 @@ fn inbox_of(
 async fn send(
     principal: Principal,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SendRequest>,
 ) -> Result<Json<SendResponse>, ApiError> {
+    let via_http = via_http_mcp(&headers);
+    if via_http {
+        refuse_host_media_over_http(&body)?;
+    }
     // The authenticated principal decides who the message is from; a body
     // `sender` is only a check, and a disagreement is refused with no write.
     // On a machine without the boundary, its own agent route names the sender;
     // that is the one place a body chooses the author, and an inbox is still
     // only ever its own.
-    let route_named = match &principal {
-        Principal::Agent { name, .. } if state.auth.is_trusted() => body
-            .sender
-            .as_deref()
-            .and_then(|named| Actor::parse(named).ok())
-            .filter(|named| named.as_address() != Actor::Agent(name.clone()).as_address()),
-        _ => None,
-    };
-    let actor = match (&principal, route_named) {
-        (_, Some(named)) => named,
-        (Principal::Agent { agent_id, name }, None) => {
-            if let Some(named) = body.sender.as_deref() {
-                Actor::parse(named).and_then(|named| {
-                    let matches_self = named.as_address()
-                        == Actor::Agent(name.clone()).as_address()
-                        || match &named {
-                            Actor::Agent(n) => state
-                                .store
-                                .agent_by_name(n)
-                                .is_ok_and(|a| a.id == *agent_id),
-                            _ => false,
-                        };
-                    if matches_self {
-                        Ok(())
-                    } else {
-                        Err(ApiError::forbidden(
-                            "a session sends as itself, not as the sender it names",
-                        ))
-                    }
-                })?;
+    spawn_store(move || {
+        let route_named = match &principal {
+            Principal::Agent { name, .. } if state.auth.is_trusted() => body
+                .sender
+                .as_deref()
+                .and_then(|named| Actor::parse(named).ok())
+                .filter(|named| named.as_address() != Actor::Agent(name.clone()).as_address()),
+            _ => None,
+        };
+        let actor = match (&principal, route_named) {
+            (_, Some(named)) => named,
+            (Principal::Agent { agent_id, name }, None) => {
+                if let Some(named) = body.sender.as_deref() {
+                    Actor::parse(named).and_then(|named| {
+                        let matches_self = named.as_address()
+                            == Actor::Agent(name.clone()).as_address()
+                            || match &named {
+                                Actor::Agent(n) => state
+                                    .store
+                                    .agent_by_name(n)
+                                    .is_ok_and(|a| a.id == *agent_id),
+                                _ => false,
+                            };
+                        if matches_self {
+                            Ok(())
+                        } else {
+                            Err(ApiError::forbidden(
+                                "a session sends as itself, not as the sender it names",
+                            ))
+                        }
+                    })?;
+                }
+                Actor::Agent(name.clone())
             }
-            Actor::Agent(name.clone())
-        }
-        (Principal::Operator, _) => {
-            let sender = body.sender.as_deref().ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "an operator send needs an explicit sender",
-                )
-            })?;
-            Actor::parse(sender)?
-        }
-    };
-    let body = SendRequest {
-        sender: Some(actor.as_address()),
-        ..body
-    };
-    let store = Arc::clone(&state.store);
-    let principal_for_plan = principal.clone();
-    let actor_for_plan = actor.clone();
-    let body_for_plan = body.clone();
-    let plan = spawn_store(move || {
-        plan_send(&store, &principal_for_plan, &actor_for_plan, &body_for_plan)
+            (Principal::Operator, _) => {
+                let sender = body.sender.as_deref().ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "an operator send needs an explicit sender",
+                    )
+                })?;
+                Actor::parse(sender)?
+            }
+        };
+        let body = SendRequest {
+            sender: Some(actor.as_address()),
+            ..body
+        };
+        let mut plan = plan_send(&state.store, &principal, &actor, &body)?;
+        // Over HTTP MCP a send never revives an archived host agent: that
+        // would start a host process on the call's behalf. Such a send is
+        // refused for it with the reason, as any send that cannot wake an
+        // archived recipient is.
+        plan.revive_host_agents = !via_http;
+        let key_body = SendRequest {
+            sender: plan
+                .sender_id
+                .as_ref()
+                .map(|id| format!("agent:{id}"))
+                .or_else(|| body.sender.clone()),
+            ..body.clone()
+        };
+        let key = send_key(&key_body);
+        send_sync(&state.store, &actor, body, plan, key)
     })
-    .await?;
-    let key_body = SendRequest {
-        sender: plan
-            .sender_id
-            .as_ref()
-            .map(|id| format!("agent:{id}"))
-            .or_else(|| body.sender.clone()),
-        ..body.clone()
-    };
-    let key = send_key(&key_body);
-    let store = Arc::clone(&state.store);
-    spawn_store(move || send_sync(&store, &actor, body, plan, key)).await
+    .await
 }
 
 async fn interact_route(
@@ -5803,12 +7026,17 @@ struct SendPlan {
     /// Immutable identity admitted at planning; a reused display name is not authority.
     sender_id: Option<anyagents_core::AgentId>,
     principal_id: Option<anyagents_core::AgentId>,
+    /// Whether an authored send may revive an archived agent that runs on
+    /// this host. False for a call made over HTTP MCP.
+    revive_host_agents: bool,
 }
 
 #[derive(Debug)]
 enum Target {
     Agent(String),
     Room(String),
+    /// The operator's inbox: agents write, only the operator reads.
+    Operator,
     Telegram {
         address: String,
         chat: String,
@@ -5981,6 +7209,11 @@ impl SendPlan {
                         targets.push(Target::Agent(child.name));
                     }
                 }
+                Address::Agent(name) if name == "operator" => {
+                    if !targets.iter().any(|t| matches!(t, Target::Operator)) {
+                        targets.push(Target::Operator);
+                    }
+                }
                 Address::Agent(name) => targets.push(Target::Agent(name)),
                 Address::TelegramChat { chat, thread } => {
                     targets.push(Target::Telegram {
@@ -6009,6 +7242,7 @@ impl SendPlan {
             reply: None,
             sender_id: sender.as_ref().map(|agent| agent.id.clone()),
             principal_id: None,
+            revive_host_agents: true,
         })
     }
 }
@@ -6035,9 +7269,11 @@ fn can_actor_read_agent_private(
 ///   1. Itself (`sender.id == recipient.id`)
 ///   2. Its own direct Child Sub-Agents (`recipient.parent_id == Some(sender.id)`)
 ///   3. Its own direct Parent Agent (`sender.parent_id == Some(recipient.id)`)
-///   4. A Sibling Sub-Agent under the same Parent when both have `scope: "siblings"` or `"public"` (`allows_sibling_messages()`)
-///   5. Any Root Agent (when `sender.allows_sibling_messages()`) or Sub-Agent with `scope: "public"` (`recipient.is_public_subagent()`)
-///   6. Any agent with which it shares an internal virtual group (`group:<name>`) or external Telegram chat
+///   4. Any non-isolated descendant: an ancestor that may wake, pause or archive
+///      a grandchild may also message it
+///   5. A Sibling Sub-Agent under the same Parent when both have `scope: "siblings"` or `"public"` (`allows_sibling_messages()`)
+///   6. Any Root Agent (when `sender.allows_sibling_messages()`) or Sub-Agent with `scope: "public"` (`recipient.is_public_subagent()`)
+///   7. Any agent with which it shares an internal virtual group (`group:<name>`) or external Telegram chat
 fn can_actor_message_agent(
     store: &Store,
     actor: &Actor,
@@ -6057,6 +7293,24 @@ fn can_sender_message_agent(
     sender: &Agent,
     recipient: &Agent,
 ) -> Result<(), ApiError> {
+    can_sender_message_agent_with(
+        store,
+        sender,
+        recipient,
+        || store.share_any_group_or_chat(&sender.id, &recipient.id),
+        || is_self_or_ancestor(store, &sender.id, recipient),
+    )
+}
+
+/// [`can_sender_message_agent`] with the group-or-chat share and the
+/// ancestry answered by the caller, so a roster can answer them from its rows.
+fn can_sender_message_agent_with(
+    store: &Store,
+    sender: &Agent,
+    recipient: &Agent,
+    share_group_or_chat: impl FnOnce() -> bool,
+    sender_is_ancestor: impl FnOnce() -> bool,
+) -> Result<(), ApiError> {
     if sender.id == recipient.id
         || recipient.parent_id.as_ref() == Some(&sender.id)
         || sender.parent_id.as_ref() == Some(&recipient.id)
@@ -6074,9 +7328,7 @@ fn can_sender_message_agent(
             sender.name, recipient.name
         )));
     }
-    if store.share_any_group_or_chat(&sender.id, &recipient.id)
-        || store.has_messaged(recipient, sender)
-    {
+    if sender_is_ancestor() || share_group_or_chat() || store.has_messaged(recipient, sender) {
         return Ok(());
     }
     let same_parent_siblings = sender.parent_id.is_some()
@@ -6105,9 +7357,16 @@ fn can_sender_message_agent(
         .as_ref()
         .and_then(|pid| store.agent(pid).ok().map(|p| p.name))
         .unwrap_or_else(|| "parent".to_string());
+    if sender.parent_id.is_some() && sender.parent_id == recipient.parent_id {
+        return Err(ApiError::forbidden(format!(
+            "cannot message sub-agent `{}` directly: it is your sibling, and siblings message each other only when your parent `agent:{owner_label}` sets `scope: \"siblings\"` on both or puts you in one group. Send it through your parent (`to: [\"parent\"]`), or ask `agent:{owner_label}` for that scope or group",
+            recipient.name
+        )));
+    }
     Err(ApiError::forbidden(format!(
-        "cannot message sub-agent `{}` directly because it belongs to parent `agent:{owner_label}` and does not accept external messages (`public: false`); message `agent:{owner_label}` instead, ask `agent:{owner_label}` to set `public: true`, or collaborate in a shared group",
-        recipient.name
+        "cannot message sub-agent `{}` directly: it is private (`scope: \"{}\"`) to its parent `agent:{owner_label}`, and only its ancestors, its children and agents in a shared group reach it. Message `agent:{owner_label}` instead, or ask `agent:{owner_label}` to set `scope: \"public\"` on it or to put you both in a group",
+        recipient.name,
+        recipient.scope()
     )))
 }
 
@@ -6204,6 +7463,17 @@ fn check_targets(
                     reply.as_deref(),
                 )?;
             }
+            // An invalid or limited report is refused here without a write.
+            // The binding decision is the first write of `send_sync`.
+            Target::Operator => {
+                let composed = anyagents_core::quote::compose(&body.text, body.quote.as_ref());
+                let receipt = store
+                    .check_operator_report(&operator_sender(actor, plan).0, &composed)
+                    .map_err(ApiError::from_store)?;
+                if let Some(anyagents_core::OperatorReceipt::Limited { retry_after_ms }) = receipt {
+                    return Err(operator_limited(retry_after_ms));
+                }
+            }
         }
     }
     Ok(())
@@ -6275,10 +7545,26 @@ fn send_sync(
         ..body
     };
     check_targets(store, actor, &body, &plan)?;
+    let upload = media_upload(store, &body, &plan)?;
     let sender_agent_id = plan.sender_id.clone();
     let composed_body = anyagents_core::quote::compose(&body.text, body.quote.as_ref());
+    // The operator inbox decides its limits in its own write transaction, so
+    // it is written before every other target: a refusal there, even one a
+    // concurrent send caused after the check above, leaves nothing written.
+    let operator_delivery = if plan.targets.iter().any(|t| matches!(t, Target::Operator)) {
+        Some(deliver_operator(
+            store,
+            actor,
+            &plan,
+            body.reply_to.as_deref(),
+            &composed_body,
+        )?)
+    } else {
+        None
+    };
     let mut deliveries = Vec::with_capacity(plan.targets.len());
     let mut skipped = Vec::new();
+    let mut refused_archived = Vec::new();
     for (target_index, target) in plan.targets.iter().enumerate() {
         let history_key = key.as_ref().map(|key| format!("{key}:{target_index}"));
         match target {
@@ -6291,7 +7577,18 @@ fn send_sync(
                 let wake_archived = wake_archived
                     && body.to.len() == 1
                     && matches!(Address::parse(&body.to[0]), Ok(Address::Agent(ref name))
-                        if !matches!(name.as_str(), "all" | "peers" | "siblings" | "team" | "children" | "parent"));
+                        if !matches!(name.as_str(), "all" | "peers" | "siblings" | "team" | "children" | "parent"))
+                    && (plan.revive_host_agents
+                        || store
+                            .agent_by_name(name)
+                            .is_ok_and(|agent| runs_off_host(store.data_dir(), &agent)));
+                // An archived recipient this send cannot wake would never read
+                // it: refused with the reason, never stored unread.
+                if !wake_archived && let Some(refusal) = archived_refusal(store, name) {
+                    refused_archived.push(refusal.reason.clone());
+                    skipped.push(refusal);
+                    continue;
+                }
                 let sent = if let Some(sid) = &sender_agent_id {
                     outbound_history::deliver(
                         store,
@@ -6353,6 +7650,7 @@ fn send_sync(
                     }
                 }
             }
+            Target::Operator => deliveries.extend(operator_delivery.clone()),
             Target::Telegram {
                 address,
                 chat,
@@ -6368,6 +7666,7 @@ fn send_sync(
                         store,
                         &channel_actor,
                         &body,
+                        upload.as_ref(),
                         address,
                         chat,
                         thread.as_deref(),
@@ -6393,6 +7692,15 @@ fn send_sync(
             }
         }
     }
+    if deliveries.is_empty() && !refused_archived.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "nothing was sent: {}. Message a live agent instead, or wake this one by sending to it alone, by name.",
+                refused_archived.join("; ")
+            ),
+        ));
+    }
     let response = SendResponse {
         deliveries,
         skipped,
@@ -6405,6 +7713,40 @@ fn send_sync(
             .map_err(ApiError::from_store)?;
     }
     Ok(Json(response))
+}
+
+/// The bytes of a send's local media file, for its Telegram targets: read
+/// once, before any target is written, with the caller's own access and never
+/// the server's (ADR 0010 D3). A URL, a Telegram `file_id`, or a send with no
+/// Telegram target reads nothing; an agent's mailbox gets the path, which its
+/// recipient opens as itself.
+fn media_upload(
+    store: &Store,
+    body: &SendRequest,
+    plan: &SendPlan,
+) -> Result<Option<crate::telegram::MediaUpload>, ApiError> {
+    let Some(media) = &body.media else {
+        return Ok(None);
+    };
+    let source = media.source.trim();
+    if !crate::telegram::is_local_media(source)
+        || !plan
+            .targets
+            .iter()
+            .any(|target| matches!(target, Target::Telegram { .. }))
+    {
+        return Ok(None);
+    }
+    // The authenticated agent, never a sender the operator names.
+    let authority = match &plan.principal_id {
+        Some(id) => crate::agent_file::FileAuthority::of_agent_id(store, id),
+        None => crate::agent_file::FileAuthority::Own,
+    };
+    let path = Path::new(source);
+    let bytes = authority
+        .read(path, crate::agent_file::MEDIA_UPLOAD_LIMIT)
+        .map_err(|why| ApiError::forbidden(format!("media not sent: {why}")))?;
+    Ok(Some(crate::telegram::MediaUpload::new(path, bytes)))
 }
 
 /// The idempotency key of one call. The same call repeated after a lost
@@ -6495,7 +7837,7 @@ fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> 
         Err(_) => return Vec::new(),
     };
     store
-        .list_agents()
+        .list_live_agents()
         .unwrap_or_default()
         .into_iter()
         .filter(|agent| {
@@ -6517,7 +7859,7 @@ fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api
     let name = room.strip_prefix("group:").unwrap_or(room);
     if name == "all" || name == "peers" {
         return store
-            .list_agents()
+            .list_live_agents()
             .unwrap_or_default()
             .into_iter()
             .filter(|agent| agent.parent_id.is_none())
@@ -6535,12 +7877,16 @@ fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api
         Ok(Some(members)) => members,
         _ => return Vec::new(),
     };
-    store
-        .list_agents()
-        .unwrap_or_default()
-        .into_iter()
+    // One row per member name, in name order.
+    let members: std::collections::BTreeMap<_, _> = members
+        .iter()
+        .filter_map(|member| store.agent_by_name(member).ok())
+        .filter(|agent| members.contains(&agent.name))
+        .map(|agent| (agent.name.clone(), agent))
+        .collect();
+    members
+        .into_values()
         .filter(|agent| !body_author_is(body, agent))
-        .filter(|agent| members.iter().any(|m| m == &agent.name))
         .filter(|agent| agent.state != "running" && agent.state != "idle")
         .map(|agent| crate::api::SkippedDelivery {
             to: format!("agent:{}", agent.name),
@@ -6586,6 +7932,26 @@ fn deliver_room(
             }
         })
         .collect())
+}
+
+/// The refusal of a send to `name` when that agent is archived: it reads
+/// nothing until it is resumed. Names who answers for it instead.
+fn archived_refusal(store: &Store, name: &str) -> Option<crate::api::SkippedDelivery> {
+    let recipient = store.agent_by_name(name).ok()?;
+    if !is_explicitly_archived(store.data_dir(), &recipient) {
+        return None;
+    }
+    let answers = match store.live_ancestor(&recipient).ok().flatten() {
+        Some(parent) if recipient.parent_id.as_ref() == Some(&parent.id) => {
+            format!("its parent is `{}`", parent.name)
+        }
+        Some(ancestor) => format!("the nearest running agent above it is `{}`", ancestor.name),
+        None => "no running agent is above it".to_string(),
+    };
+    Some(crate::api::SkippedDelivery {
+        to: format!("agent:{}", recipient.name),
+        reason: format!("agent `{}` is archived; {answers}", recipient.name),
+    })
 }
 
 fn deliver_agent(
@@ -6653,6 +8019,71 @@ fn deliver_agent(
     }
     Ok(Delivery {
         to: format!("agent:{}", agent.name),
+        id: message.id.to_string(),
+        seq: message.seq,
+        duplicate,
+    })
+}
+
+/// Who a report to the operator is from: the admitted agent's immutable id,
+/// which keys its rate limit, and its display name; or the operator's own
+/// address.
+fn operator_sender(actor: &Actor, plan: &SendPlan) -> (String, Option<String>) {
+    match (&plan.sender_id, actor) {
+        (Some(id), Actor::Agent(name)) => (format!("agent:{id}"), Some(name.clone())),
+        (Some(id), Actor::Operator(_)) => (format!("agent:{id}"), None),
+        (None, actor) => (actor.as_address(), None),
+    }
+}
+
+fn operator_limited(retry_after_ms: i64) -> ApiError {
+    let seconds = (retry_after_ms + 999) / 1000;
+    ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "the operator inbox takes at most {} reports a minute and {} an hour from one sender, \
+             and {} a minute and {} an hour in all; nothing was sent. Retry in {seconds}s with \
+             one report that covers everything open",
+            anyagents_core::OPERATOR_BURST,
+            anyagents_core::OPERATOR_HOURLY_CAP,
+            anyagents_core::OPERATOR_FLEET_BURST,
+            anyagents_core::OPERATOR_FLEET_HOURLY_CAP,
+        ),
+    )
+}
+
+/// Store one report, or count it on the report it repeats. A new report is
+/// also recorded in its agent sender's own history.
+fn deliver_operator(
+    store: &Store,
+    actor: &Actor,
+    plan: &SendPlan,
+    reply_to: Option<&str>,
+    body: &str,
+) -> Result<Delivery, ApiError> {
+    let (sender, sender_name) = operator_sender(actor, plan);
+    let receipt = store
+        .report_to_operator(anyagents_core::OperatorReport {
+            sender,
+            sender_name,
+            body: body.to_string(),
+            received_at_ms: None,
+        })
+        .map_err(ApiError::from_store)?;
+    let (message, duplicate) = match receipt {
+        anyagents_core::OperatorReceipt::New(message) => (message, false),
+        anyagents_core::OperatorReceipt::Duplicate(message) => (message, true),
+        anyagents_core::OperatorReceipt::Limited { retry_after_ms } => {
+            return Err(operator_limited(retry_after_ms));
+        }
+    };
+    if !duplicate && let Some(sid) = &plan.sender_id {
+        store
+            .record_outbound_once(message.id.as_str(), sid, "operator", reply_to, body)
+            .map_err(ApiError::from_store)?;
+    }
+    Ok(Delivery {
+        to: "operator".to_string(),
         id: message.id.to_string(),
         seq: message.seq,
         duplicate,
@@ -6785,6 +8216,7 @@ fn deliver_telegram(
     store: &Store,
     actor: &Actor,
     body: &SendRequest,
+    upload: Option<&crate::telegram::MediaUpload>,
     address: &str,
     chat: &str,
     thread: Option<&str>,
@@ -6812,6 +8244,7 @@ fn deliver_telegram(
             chat_id,
             &media.kind,
             &media.source,
+            upload,
             caption,
             media.title.as_deref(),
             media.performer.as_deref(),
@@ -6977,6 +8410,53 @@ pub fn owner_workdir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 pub(crate) mod tests {
     #[test]
+    fn memory_backlog_follows_wakes_and_idle_consolidation_visits_nothing() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sleeper", "codex"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        let sleep_state = root.join("memory/.sleep-state.json");
+        let write_topic = |topic: &str| {
+            anyagents_core::learned_memory::upsert_memory_topic(
+                &root,
+                "sleeper",
+                None,
+                topic,
+                Some("fact"),
+                "learned",
+                anyagents_core::now_ms(),
+            )
+            .unwrap();
+        };
+        write_topic("first");
+        let backlog = memory_backlog::start(&store);
+        assert_eq!(backlog.pending(), std::slice::from_ref(&agent.id));
+        consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default(), &backlog);
+        assert!(sleep_state.exists());
+        assert!(backlog.pending().is_empty());
+
+        // Nothing woke the agent, so a pass does not look at it.
+        write_topic("second");
+        std::fs::remove_file(&sleep_state).unwrap();
+        consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default(), &backlog);
+        assert!(!sleep_state.exists(), "idle agent was visited");
+
+        store
+            .receive(&agent.id, anyagents_core::Incoming::new("new work"))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backlog.pending().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(backlog.pending(), std::slice::from_ref(&agent.id));
+        consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default(), &backlog);
+        assert!(sleep_state.exists(), "woken agent was not consolidated");
+        assert!(backlog.pending().is_empty());
+    }
+
+    #[test]
     fn idle_memory_consolidation_preserves_selected_and_disabled_session_pins() {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -7006,7 +8486,10 @@ pub(crate) mod tests {
             )
             .unwrap();
             std::fs::write(root.join("selected.md"), "changed selected").unwrap();
-            consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default());
+            let backlog = memory_backlog::MemoryBacklog::default();
+            backlog.mark(&agent.id);
+            consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default(), &backlog);
+            assert!(backlog.pending().is_empty(), "caught-up agent stays queued");
             assert_eq!(
                 anyagents_core::host_session::active(&root).unwrap(),
                 Some(pinned.clone())
@@ -7023,6 +8506,37 @@ pub(crate) mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn an_agent_view_keeps_the_fields_a_client_from_before_delivery_requires() {
+        // A CLI or MCP client from the release before `delivery` requires both.
+        #[derive(serde::Deserialize)]
+        struct OlderClientView {
+            delivery_mode: String,
+            steer_support: String,
+        }
+        let temp = crate::test_tempdir();
+        let store = Store::open(temp.path().join("state.db")).unwrap();
+        for (harness, mode, steer) in [
+            ("spiron", "steer", "yes"),
+            ("grok", "steer", "unproven"),
+            ("spiron-cloud", "followup", "no"),
+        ] {
+            let agent = store
+                .create_agent(anyagents_core::NewAgent::new(
+                    format!("view-{harness}"),
+                    harness,
+                ))
+                .unwrap();
+            let json = serde_json::to_string(&archived_agent_view_fast(&agent)).unwrap();
+            let older: OlderClientView = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                (older.delivery_mode.as_str(), older.steer_support.as_str()),
+                (mode, steer),
+                "{harness}"
+            );
+        }
+    }
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
 
@@ -7171,7 +8685,7 @@ pub(crate) mod tests {
             let views = roster_views(
                 &store,
                 &health,
-                agents,
+                &agents.iter().collect::<Vec<_>>(),
                 archived,
                 &ListAgentsQuery::default(),
             )
@@ -7207,7 +8721,199 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn agent_views_only_read_agy_logs_for_the_agy_harness() {
+    fn roster_authorization_matches_the_single_agent_checks() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let store = &state.store;
+        let make = |name: &str, parent: Option<&Agent>, scope: Option<&str>| {
+            let mut new = anyagents_core::NewAgent::new(name, "codex");
+            new.parent_id = parent.map(|p| p.id.clone());
+            new.instructions = Some(format!("{name} private instructions"));
+            let agent = store.create_agent(new).unwrap();
+            match scope {
+                Some(scope) => store.set_agent_scope(&agent.id, scope).unwrap(),
+                None => agent,
+            }
+        };
+        let root = make("root", None, None);
+        let admin = make("admin", None, None);
+        store.set_agent_admin(&admin.id, true).unwrap();
+        let peer = make("peer", None, None);
+        let lead = make("lead", Some(&root), Some("siblings"));
+        let sib = make("sib", Some(&root), Some("siblings"));
+        let worker = make("worker", Some(&lead), None);
+        let iso = make("iso", Some(&root), Some("isolated"));
+        let iso_child = make("iso-child", Some(&iso), None);
+        let public = make("public", Some(&peer), Some("public"));
+        let private = make("private", Some(&peer), None);
+        let gone = make("gone", Some(&lead), None);
+        store.set_agent_state(&gone.id, "archived").unwrap();
+        store.join_group("team", &iso.id).unwrap();
+        store.join_group("team", &private.id).unwrap();
+        store
+            .record_outbound(&private.id, "agent:worker", None, "hello")
+            .unwrap();
+        let callers = [
+            &root, &admin, &peer, &lead, &sib, &worker, &iso, &iso_child, &public, &private,
+        ];
+        for caller in callers {
+            let caller = store.agent(&caller.id).unwrap();
+            let principal = Principal::Agent {
+                agent_id: caller.id.clone(),
+                name: caller.name.clone(),
+            };
+            for filter in [None, Some("all"), Some("archived")] {
+                let query = ListAgentsQuery {
+                    state: filter.map(str::to_string),
+                    ..Default::default()
+                };
+                let Json(listed) =
+                    list_agents_sync_for_principal(&state, &principal, &query).unwrap();
+                // The isolated-scope rule, checked row by row against the store.
+                let (roster, archived) = store.roster_agents(filter).unwrap();
+                let visible: Vec<&Agent> = roster
+                    .iter()
+                    .filter(|agent| {
+                        !(caller.is_isolated()
+                            && !is_self_or_ancestor(store, &caller.id, agent)
+                            && caller.parent_id.as_ref() != Some(&agent.id)
+                            && !store.share_any_group_or_chat(&caller.id, &agent.id))
+                    })
+                    .collect();
+                let expected =
+                    roster_views(store, &state.health, &visible, archived, &query).unwrap();
+                let ids = |views: &[AgentView]| -> Vec<String> {
+                    views.iter().map(|view| view.id.clone()).collect()
+                };
+                assert_eq!(
+                    ids(&listed.agents),
+                    ids(&expected.agents),
+                    "{}",
+                    caller.name
+                );
+                for view in &listed.agents {
+                    let target = store.agent_by_name(&view.id).unwrap();
+                    let context = format!("{} -> {}", caller.name, target.name);
+                    assert_eq!(
+                        view.relationship,
+                        Some(compute_caller_relationship(store, &caller, &target)),
+                        "{context}"
+                    );
+                    assert_eq!(
+                        view.can_message,
+                        Some(
+                            can_actor_message_agent(
+                                store,
+                                &Actor::Agent(caller.name.clone()),
+                                &target
+                            )
+                            .is_ok()
+                        ),
+                        "{context}"
+                    );
+                    assert_eq!(
+                        view.instructions.is_some(),
+                        can_actor_read_agent_private(store, &principal, &target),
+                        "{context}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Who may message whom: an ancestor reaches every non-isolated
+    /// descendant, and every refusal names the route that works.
+    #[test]
+    fn ancestors_reach_descendants_and_refusals_name_the_route() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let store = &state.store;
+        let make = |name: &str, parent: Option<&Agent>, scope: Option<&str>| {
+            let mut new = anyagents_core::NewAgent::new(name, "codex");
+            new.parent_id = parent.map(|p| p.id.clone());
+            let agent = store.create_agent(new).unwrap();
+            match scope {
+                Some(scope) => store.set_agent_scope(&agent.id, scope).unwrap(),
+                None => agent,
+            }
+        };
+        let sage = make("sage", None, None);
+        let vulcan = make("vulcan", None, None);
+        let rollout = make("rollout", Some(&sage), None);
+        let bump = make("bump", Some(&rollout), None);
+        let deeper = make("deeper", Some(&bump), None);
+        let sealed = make("sealed", Some(&rollout), Some("isolated"));
+        let fix = make("fix", Some(&rollout), None);
+        let cousin = make("cousin", Some(&vulcan), None);
+
+        // A grandparent and a great-grandparent reach their descendants.
+        assert!(can_sender_message_agent(store, &sage, &bump).is_ok());
+        assert!(can_sender_message_agent(store, &sage, &deeper).is_ok());
+        assert!(can_sender_message_agent(store, &rollout, &deeper).is_ok());
+        // An isolated descendant stays 1-to-1 with its direct parent.
+        assert!(can_sender_message_agent(store, &sage, &sealed).is_err());
+        assert!(can_sender_message_agent(store, &rollout, &sealed).is_ok());
+        // Upward stays through the parent.
+        assert!(can_sender_message_agent(store, &bump, &sage).is_err());
+
+        let text = |result: Result<(), ApiError>| result.unwrap_err().message;
+        let sibling = text(can_sender_message_agent(store, &fix, &bump));
+        assert!(sibling.contains("it is your sibling"), "{sibling}");
+        assert!(sibling.contains("`to: [\"parent\"]`"), "{sibling}");
+        assert!(sibling.contains("agent:rollout"), "{sibling}");
+        let outsider = text(can_sender_message_agent(store, &vulcan, &bump));
+        assert!(
+            outsider.contains("Message `agent:rollout` instead"),
+            "{outsider}"
+        );
+        assert!(outsider.contains("scope: \"public\""), "{outsider}");
+        let cross = text(can_sender_message_agent(store, &cousin, &fix));
+        assert!(cross.contains("Message `agent:rollout` instead"), "{cross}");
+    }
+
+    /// Vendor history each harness leaves behind that the view once scanned:
+    /// a Claude Code session ending in a rate-limit rejection, an AGY CLI log
+    /// ending in an error, and Codex rollouts ending in a 401 turn fault.
+    fn write_vendor_history(cfg: &Path) {
+        let reset_s = now_ms() / 1000 + 3600;
+        let projects = cfg.join("projects/-work");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("session.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "assistant",
+                    "apiError": "usage_limit_reached",
+                    "quotaLimits": {"status": "rejected", "resetsAt": reset_s},
+                    "error": "rate_limit",
+                    "apiErrorStatus": 429
+                })
+            ),
+        )
+        .unwrap();
+        let logs = cfg.join(".gemini/antigravity-cli/log");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("cli-previous-session.log"),
+            "run ended with error and no response: previous agy session failed\n",
+        )
+        .unwrap();
+        let sessions = cfg.join("sessions/2026/11/13");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let fault = serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "error": {"message": "unauthorized (401)"}}
+        });
+        std::fs::write(
+            sessions.join("rollout-2026-11-13T00-00-00-x.jsonl"),
+            format!("{fault}\n{fault}\n{fault}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn agent_views_never_read_vendor_history() {
         let _env = env_lock();
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -7225,35 +8931,98 @@ pub(crate) mod tests {
                 .create_agent(anyagents_core::NewAgent::new(harness, harness))
                 .unwrap();
             let cfg = anyagents_core::agent_config_dir(dir.path(), &agent.id);
-            let logs = cfg.join(".gemini/antigravity-cli/log");
-            std::fs::create_dir_all(&logs).unwrap();
-            std::fs::write(
-                logs.join("cli-previous-session.log"),
-                "run ended with error and no response: previous agy session failed\n",
+            write_vendor_history(&cfg);
+            for view in [
+                agent_view(&store, &health, &agent).unwrap(),
+                crate::agent::view_named(dir.path(), &agent.name).unwrap(),
+            ] {
+                assert_eq!(view.last_error, None, "{harness}");
+                assert_eq!(view.quota_reset_at_ms, None, "{harness}");
+                assert_eq!(view.block_reason, None, "{harness}");
+            }
+            let (agents, archived) = store.roster_agents(None).unwrap();
+            let roster = roster_views(
+                &store,
+                &health,
+                &agents.iter().collect::<Vec<_>>(),
+                archived,
+                &ListAgentsQuery::default(),
             )
             .unwrap();
-            let mut view = agent_view(&store, &health, &agent).unwrap();
-            let expected = (harness == "agy").then_some("previous agy session failed");
-            assert_eq!(view.last_error.as_deref(), expected, "server: {harness}");
-            view.last_error = None;
-            view = crate::agent::view_named(dir.path(), &agent.name).unwrap();
-            assert_eq!(view.last_error.as_deref(), expected, "client: {harness}");
+            assert!(
+                roster
+                    .agents
+                    .iter()
+                    .all(|view| view.last_error.is_none() && view.quota_reset_at_ms.is_none()),
+                "{harness}"
+            );
 
+            // What the adapter persisted is what the view reports.
+            let reset_ms = now_ms() + 3_600_000;
             std::fs::write(
                 cfg.join(".anyagents-last-error.json"),
                 serde_json::json!({
-                    "timestamp_ms": anyagents_core::now_ms(),
+                    "timestamp_ms": now_ms(),
                     "error": "current harness failed",
+                    "quota_reset_at_ms": reset_ms,
                 })
                 .to_string(),
             )
             .unwrap();
-            view = agent_view(&store, &health, &agent).unwrap();
-            assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
-            view.last_error = None;
-            view = crate::agent::view_named(dir.path(), &agent.name).unwrap();
-            assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
+            let expected_quota = (harness != "claude-code").then_some(reset_ms);
+            for view in [
+                agent_view(&store, &health, &agent).unwrap(),
+                crate::agent::view_named(dir.path(), &agent.name).unwrap(),
+            ] {
+                assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
+                assert_eq!(view.quota_reset_at_ms, expected_quota, "{harness}");
+            }
+            std::fs::remove_file(cfg.join(".anyagents-last-error.json")).unwrap();
         }
+    }
+
+    #[test]
+    fn agent_view_reports_the_live_board_over_persisted_faults() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("claude", "claude-code"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "running").unwrap();
+        let agent = store.agent(&agent.id).unwrap();
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        write_vendor_history(&cfg);
+        let reset_ms = now_ms() + 3_600_000;
+        let live = |quota: Option<i64>, error: Option<&str>| anyagents_supervisor::LiveState {
+            process_alive: true,
+            turn_state: anyagents_harness::TurnState::Idle,
+            delivery: Some(crate::vendor::declared_delivery("claude-code")),
+            quota_reset_at_ms: quota,
+            restart_at_ms: None,
+            pid: Some(42),
+            live_harness: Some("claude-code".into()),
+            live_model: None,
+            process_started_at_ms: Some(1),
+            last_error: error.map(str::to_string),
+        };
+        health.publish(&agent.id, live(Some(reset_ms), None));
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.process, "alive");
+        assert_eq!(view.quota_reset_at_ms, Some(reset_ms));
+        assert_eq!(view.block_reason.as_deref(), Some("quota_exhausted"));
+        assert_eq!(view.turn_state, "idle");
+
+        health.publish(&agent.id, live(None, None));
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.quota_reset_at_ms, None);
+        assert_eq!(view.block_reason, None);
+        assert_eq!(view.turn_state, "idle");
+
+        health.publish(&agent.id, live(None, Some("not logged in")));
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.turn_state, "errored");
+        assert_eq!(view.block_reason.as_deref(), Some("sign_in_required"));
     }
 
     #[test]
@@ -7283,8 +9052,7 @@ pub(crate) mod tests {
                 anyagents_supervisor::LiveState {
                     process_alive: false,
                     turn_state: anyagents_harness::TurnState::Idle,
-                    delivery_mode: anyagents_harness::DeliveryMode::Steer,
-                    steer_support: anyagents_harness::SteerSupport::Yes,
+                    delivery: Some(crate::vendor::declared_delivery("spiron")),
                     quota_reset_at_ms: None,
                     restart_at_ms: None,
                     pid: None,
@@ -7356,12 +9124,10 @@ pub(crate) mod tests {
         let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(config.join("preserve"), "retained state").unwrap();
-        let (delivery_mode, steer_support) = declared(&agent.harness);
         let mut live = anyagents_supervisor::LiveState {
             process_alive: true,
             turn_state: anyagents_harness::TurnState::Idle,
-            delivery_mode,
-            steer_support,
+            delivery: Some(crate::vendor::declared_delivery(&agent.harness)),
             quota_reset_at_ms: None,
             restart_at_ms: None,
             pid: None,
@@ -7791,6 +9557,7 @@ pub(crate) mod tests {
                 data_dir: dir.path().into(),
             },
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
         };
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let principal = |a: &Agent| Principal::Agent {
@@ -7872,6 +9639,258 @@ pub(crate) mod tests {
         });
     }
 
+    /// A search over more new history than one request may index answers
+    /// at once from what it indexed, says the rest is pending, and queues it;
+    /// after the background indexer runs, the same history is found.
+    #[test]
+    fn a_search_past_its_index_budget_answers_partial_and_the_background_completes_it() {
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("large-history", "spiron"))
+            .unwrap();
+        let path = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("transcripts/history.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut text = String::from("{\"role\":\"user\",\"content\":\"earlyneedle\"}\n");
+        let filler = format!(
+            "{{\"role\":\"assistant\",\"content\":\"{}\"}}\n",
+            "filler ".repeat(36)
+        );
+        while (text.len() as u64) < anyagents_core::host_retrieval::REQUEST_INDEX_BYTES * 3 / 2 {
+            text.push_str(&filler);
+        }
+        text.push_str("{\"role\":\"user\",\"content\":\"lateneedle\"}\n");
+        std::fs::write(&path, &text).unwrap();
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let search = |term: &str| {
+            runtime.block_on(async {
+                let principal = Principal::Agent {
+                    agent_id: agent.id.clone(),
+                    name: agent.name.clone(),
+                };
+                let Json(response) = conversation_route(
+                    principal,
+                    State(state.clone()),
+                    AxumPath(agent.name.clone()),
+                    Query(
+                        serde_json::from_value(
+                            serde_json::json!({"scope":"transcripts","query":term}),
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{}", e.message));
+                response
+            })
+        };
+        // The first answer comes from the first 4 MiB: the late record is not
+        // indexed yet, and the response says so.
+        let first = search("lateneedle");
+        assert!(first.turns.iter().all(|t| !t.text.contains("lateneedle")));
+        let retrieval = first.retrieval.clone().unwrap();
+        let pending = retrieval.pending.clone().expect("a partial search says so");
+        assert_eq!(pending.sources, 1);
+        assert!(pending.bytes > 0);
+        assert!(
+            retrieval.degraded.iter().any(|d| d.starts_with("partial:")),
+            "{retrieval:?}"
+        );
+        assert_eq!(store.host_history_backlog(), 1);
+        while store.host_history_backlog() > 0 {
+            store.index_host_history_step(u64::MAX).unwrap();
+        }
+        let done = search("lateneedle");
+        assert!(done.turns.iter().any(|t| t.text.contains("lateneedle")));
+        assert!(done.retrieval.and_then(|r| r.pending).is_none());
+        assert!(
+            search("earlyneedle")
+                .turns
+                .iter()
+                .any(|t| t.text.contains("earlyneedle"))
+        );
+    }
+
+    #[test]
+    fn hybrid_search_fuses_cited_dense_ranges_reranks_and_never_widens_access() {
+        use anyagents_memory::protocol::{self, DenseHit, Reply, Request, Status};
+        use std::io::{BufRead, Write as _};
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("hybrid-parent", "spiron"))
+            .unwrap();
+        let peer = store
+            .create_agent(anyagents_core::NewAgent::new("hybrid-peer", "spiron"))
+            .unwrap();
+        let lexical = "{\"role\":\"user\",\"content\":\"lexicalneedle about deploys\"}\n";
+        let semantic = "{\"role\":\"assistant\",\"content\":\"完全唔同嘅講法 semantic target\"}\n";
+        let write = |agent: &Agent, text: &str| {
+            let path = dir
+                .path()
+                .join("agents")
+                .join(agent.id.as_str())
+                .join("transcripts/history.jsonl");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let parent_file = write(&parent, &format!("{lexical}{semantic}"));
+        let peer_file = write(&peer, "{\"content\":\"peer secret target\"}\n");
+        let doc = |agent: &Agent, path: &std::path::Path, seq: u64| {
+            format!(
+                "transcript:{}:{}:{seq}",
+                agent.id,
+                anyagents_core::learned_memory::sha256(path.as_os_str().as_encoded_bytes())
+            )
+        };
+        let cite = |document_id: String, agent: &Agent, offset: usize, text: &str| DenseHit {
+            document_id,
+            agent_id: agent.id.to_string(),
+            offset: offset as u64,
+            length: text.len() as u64,
+            sha256: anyagents_core::learned_memory::sha256(text.as_bytes()),
+            score: 0.9,
+        };
+        let target = semantic.find("semantic target").unwrap() + lexical.len();
+        let hits = vec![
+            cite(
+                doc(&parent, &parent_file, 2),
+                &parent,
+                target,
+                "semantic target",
+            ),
+            // Another owner's document, a range outside its document and a
+            // range whose bytes do not match: none may surface.
+            cite(doc(&peer, &peer_file, 1), &peer, 13, "peer secret"),
+            cite(doc(&parent, &parent_file, 1), &parent, 0, &"x".repeat(9999)),
+            DenseHit {
+                sha256: "0".repeat(64),
+                ..cite(doc(&parent, &parent_file, 1), &parent, 1, "\"role")
+            },
+        ];
+        let listener =
+            std::os::unix::net::UnixListener::bind(protocol::socket_path(dir.path())).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<Request>::new()));
+        let recorded = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = stream.unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .unwrap();
+                let request = protocol::decode_request(line.trim()).unwrap();
+                recorded.lock().unwrap().push(request.clone());
+                let reply = match request {
+                    Request::Search { .. } => Reply::Search {
+                        hits: hits.clone(),
+                        status: Status::default(),
+                    },
+                    // The cross-encoder prefers the semantic answer.
+                    Request::Rerank { passages, .. } => Reply::Rerank {
+                        scores: passages
+                            .iter()
+                            .map(|p| {
+                                if p.contains("semantic target") {
+                                    5.0
+                                } else {
+                                    -1.0
+                                }
+                            })
+                            .collect(),
+                    },
+                    Request::Status => Reply::Status {
+                        status: Status::default(),
+                    },
+                };
+                (&stream)
+                    .write_all(protocol::encode_reply(&Ok(reply)).as_bytes())
+                    .unwrap();
+            }
+        });
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let principal = Principal::Agent {
+                agent_id: parent.id.clone(),
+                name: parent.name.clone(),
+            };
+            let Json(response) = conversation_route(
+                principal,
+                State(state.clone()),
+                AxumPath("all".into()),
+                Query(
+                    serde_json::from_value(
+                        serde_json::json!({"scope":"transcripts","query":"lexicalneedle"}),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.message));
+            let retrieval = response.retrieval.clone().unwrap();
+            assert_eq!(
+                retrieval.stages,
+                vec!["lexical", "dense", "rerank"],
+                "{retrieval:?}"
+            );
+            assert!(retrieval.degraded.is_empty());
+            assert_eq!(
+                response.turns.len(),
+                2,
+                "{:?}",
+                response.turns.iter().map(|t| &t.text).collect::<Vec<_>>()
+            );
+            // Reranked first: the dense-only answer, cited to its exact bytes.
+            let first = &response.turns[0];
+            assert_eq!(first.text, "semantic target");
+            let window = first.window.as_ref().unwrap();
+            assert_eq!(
+                (window.offset, window.length),
+                (target as u64, "semantic target".len() as u64)
+            );
+            assert!(response.turns[1].text.contains("lexicalneedle"));
+            assert!(
+                response
+                    .turns
+                    .iter()
+                    .all(|t| !t.text.contains("peer secret"))
+            );
+        });
+        let requests = seen.lock().unwrap();
+        let Some(Request::Search { owners, .. }) = requests.first() else {
+            panic!("no dense search: {requests:?}");
+        };
+        assert_eq!(
+            owners,
+            &vec![parent.id.to_string()],
+            "only authorized owners reach the service"
+        );
+    }
+
     #[test]
     fn canonical_raw_ranges_bind_owned_digest_and_return_bounded_exact_bytes() {
         let dir = crate::test_tempdir();
@@ -7905,6 +9924,7 @@ pub(crate) mod tests {
                 data_dir: dir.path().into(),
             },
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
         };
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let principal = || Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() };
@@ -7990,6 +10010,7 @@ pub(crate) mod tests {
                 data_dir: dir.path().into(),
             },
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -8062,6 +10083,104 @@ pub(crate) mod tests {
         ENV.lock().unwrap_or_else(|err| err.into_inner())
     }
 
+    /// A send's local media is read with the sending agent's own access,
+    /// once, before any Telegram post: the operator token, a link to it and
+    /// a path outside the agent's directories are refused; the agent's own
+    /// file is read; a URL or `file_id` and an internal-only send read
+    /// nothing; the operator reads with its own access.
+    #[test]
+    fn send_media_is_read_with_the_senders_access_never_the_servers() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("ada", "opencode"))
+            .unwrap();
+        let secrets = data.join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let token = secrets.join("operator-token");
+        std::fs::write(&token, b"operator-secret").unwrap();
+        let work = anyagents_core::agent_work_dir(data, &agent.id);
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("photo.png"), b"png").unwrap();
+        std::os::unix::fs::symlink(&token, work.join("photo-link.png")).unwrap();
+        store
+            .create_agent(anyagents_core::NewAgent::new("bob", "opencode"))
+            .unwrap();
+        let plan = |principal: Option<&anyagents_core::AgentId>, to: &str| {
+            let request = SendRequest {
+                to: vec![to.into()],
+                text: "x".into(),
+                ..Default::default()
+            };
+            let mut plan = SendPlan::parse(&store, &Actor::Agent("ada".into()), &request)
+                .unwrap_or_else(|error| panic!("{}", error.message));
+            plan.principal_id = principal.cloned();
+            plan
+        };
+        let body = |source: &str| SendRequest {
+            to: vec!["telegram:chat:100".into()],
+            media: Some(crate::api::SendMedia {
+                kind: "photo".into(),
+                source: source.into(),
+                title: None,
+                performer: None,
+            }),
+            ..Default::default()
+        };
+        let as_agent = plan(Some(&agent.id), "telegram:chat:100");
+        for refused in [
+            token.clone(),
+            work.join("photo-link.png"),
+            work.join("../../../secrets/operator-token"),
+            data.join("state.db"),
+        ] {
+            let error = media_upload(&store, &body(refused.to_str().unwrap()), &as_agent)
+                .err()
+                .unwrap_or_else(|| panic!("{} must be refused", refused.display()));
+            assert_eq!(error.status, StatusCode::FORBIDDEN, "{}", error.message);
+            assert!(!error.message.contains("operator-secret"));
+        }
+        let relative = media_upload(&store, &body("./photo.png"), &as_agent)
+            .err()
+            .unwrap();
+        assert!(
+            relative.message.contains("absolute"),
+            "{}",
+            relative.message
+        );
+        let own = media_upload(
+            &store,
+            &body(work.join("photo.png").to_str().unwrap()),
+            &as_agent,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (own.file_name.as_str(), own.bytes.as_slice()),
+            ("photo.png", &b"png"[..])
+        );
+        for reference in ["https://example.test/a.png", "AgACAgUAAxkBAAIB"] {
+            assert!(
+                media_upload(&store, &body(reference), &as_agent)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let internal = plan(Some(&agent.id), "agent:bob");
+        assert!(
+            media_upload(&store, &body(token.to_str().unwrap()), &internal)
+                .unwrap()
+                .is_none()
+        );
+        let operator = plan(None, "telegram:chat:100");
+        let read = media_upload(&store, &body(token.to_str().unwrap()), &operator)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.bytes, b"operator-secret");
+    }
+
     /// Process-local environment locks do not isolate forked children or
     /// process-global PATH. Keep one-tick lifecycle assertions in one worker.
     fn single_test_worker(name: &str) -> bool {
@@ -8103,6 +10222,7 @@ pub(crate) mod tests {
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().to_path_buf(),
             },
@@ -8205,6 +10325,7 @@ pub(crate) mod tests {
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
@@ -8212,7 +10333,7 @@ pub(crate) mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             for (name, role, scope) in [("labelled", Some("Researcher"), "private"), ("task", None, "private")] {
                 let body = serde_json::from_value(serde_json::json!({"name":name,"role":role,"harness":"codex","model":"test-model","workdir":"private"})).unwrap();
-                let (_, Json(created)) = create_agent_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), Json(body)).await.unwrap_or_else(|e| panic!("{}: {}",e.status,e.message));
+                let (_, Json(created)) = create_agent_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), axum::http::HeaderMap::new(), Json(body)).await.unwrap_or_else(|e| panic!("{}: {}",e.status,e.message));
                 assert_eq!(created.scope, scope);
                 let _ = set_description_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), AxumPath(name.into()), Json(serde_json::from_value(serde_json::json!({"public":true})).unwrap())).await.unwrap_or_else(|e| panic!("{}",e.message));
                 let _ = set_description_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), AxumPath(name.into()), Json(serde_json::from_value(serde_json::json!({"public":false})).unwrap())).await.unwrap_or_else(|e| panic!("{}",e.message));
@@ -8356,6 +10477,7 @@ pub(crate) mod tests {
                     watch_baseline: None,
                 })
                 .unwrap();
+            crate::schedule::schedules_changed(store.data_dir());
             loop {
                 if owners
                     .iter()
@@ -8488,7 +10610,13 @@ pub(crate) mod tests {
         let path = data.path().to_path_buf();
         let serving = Arc::clone(&identity);
         let server = std::thread::spawn(move || {
-            run_with_identity(&path, Arc::new(Mutex::new(ProcessRunner)), stopped, serving)
+            run_with_identity(
+                &path,
+                Arc::new(Mutex::new(ProcessRunner)),
+                stopped,
+                serving,
+                HarnessHost::InProcess,
+            )
         });
         struct Stop(
             Option<tokio::sync::oneshot::Sender<()>>,
@@ -8840,7 +10968,8 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&blocked).unwrap();
         std::fs::write(blocked.join("keep"), b"partial cleanup").unwrap();
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        let failed_at = now_ms();
+        reap_archived_agents_at(&store, dir.path(), &HealthBoard::default(), failed_at);
         // Restore access before asserting so failed tests don't leak fixtures.
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
@@ -8856,12 +10985,76 @@ pub(crate) mod tests {
             other_cfg.join(".anyagents-reaped").exists(),
             "failure starved an independent archive"
         );
-        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        // A failed cleanup waits out its backoff instead of the next minute.
+        reap_archived_agents_at(
+            &store,
+            dir.path(),
+            &HealthBoard::default(),
+            failed_at + 30_000,
+        );
+        assert!(blocked.exists(), "retried before its backoff");
+        assert!(!cfg.join(".anyagents-reaped").exists());
+        reap_archived_agents_at(
+            &store,
+            dir.path(),
+            &HealthBoard::default(),
+            now_ms() + 60_000,
+        );
         assert!(!blocked.exists());
         assert_eq!(
             std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
             std::fs::read(cfg.join(".anyagents-archived")).unwrap()
         );
+    }
+
+    #[test]
+    fn reap_queue_backfills_once_and_idle_maintenance_visits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        // Finished under an earlier binary: its marker matches its archive.
+        let finished = archived_reap_fixture(&store, "finished", &parent);
+        let finished_cfg = anyagents_core::agent_config_dir(dir.path(), &finished.id);
+        std::fs::copy(
+            finished_cfg.join(".anyagents-archived"),
+            finished_cfg.join(".anyagents-reaped"),
+        )
+        .unwrap();
+        // Archived by an earlier binary that wrote no marker at all.
+        let mut new = anyagents_core::NewAgent::new("legacy", "opencode");
+        new.parent_id = Some(parent.id.clone());
+        let legacy = store.create_agent(new).unwrap();
+        store.set_agent_state(&legacy.id, "archived").unwrap();
+        let legacy_cfg = anyagents_core::agent_config_dir(dir.path(), &legacy.id);
+        // Forget what this binary queued, as if the archives predated the queue.
+        std::fs::remove_dir_all(dir.path().join("reap-pending")).unwrap();
+        for cfg in [&finished_cfg, &legacy_cfg] {
+            std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        }
+
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        assert!(
+            finished_cfg.join(".claude").exists(),
+            "finished archive revisited"
+        );
+        assert!(
+            !legacy_cfg.join(".claude").exists(),
+            "legacy archive not backfilled"
+        );
+        assert_eq!(
+            std::fs::read(legacy_cfg.join(".anyagents-reaped")).unwrap(),
+            std::fs::read(legacy_cfg.join(".anyagents-archived")).unwrap()
+        );
+
+        // Nothing is owed now, so maintenance visits no agent at all.
+        std::fs::create_dir_all(legacy_cfg.join(".claude")).unwrap();
+        std::fs::remove_file(finished_cfg.join(".anyagents-reaped")).unwrap();
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        assert!(legacy_cfg.join(".claude").exists());
+        assert!(finished_cfg.join(".claude").exists());
+        assert!(reap_queue::due(dir.path(), i64::MAX).is_empty());
     }
 
     #[test]
@@ -8877,6 +11070,7 @@ pub(crate) mod tests {
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
@@ -8938,12 +11132,10 @@ pub(crate) mod tests {
         let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
         std::fs::create_dir_all(cfg.join(".claude")).unwrap();
         let health = HealthBoard::default();
-        let (delivery_mode, steer_support) = declared(&child.harness);
         let mut live = anyagents_supervisor::LiveState {
             process_alive: true,
             turn_state: anyagents_harness::TurnState::Idle,
-            delivery_mode,
-            steer_support,
+            delivery: Some(crate::vendor::declared_delivery(&child.harness)),
             quota_reset_at_ms: None,
             restart_at_ms: None,
             pid: None,
@@ -8999,8 +11191,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn recorded_cleanup_preserves_unpushed_head_and_other_branch_then_removes_pushed() {
-        use crate::worktree::tests::git;
+    fn cleanup_preserves_unpushed_head_and_other_branch_then_removes_pushed() {
+        use crate::repo::tests::git;
         fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
             fn walk(
                 root: &Path,
@@ -9033,76 +11225,215 @@ pub(crate) mod tests {
             .unwrap();
         let child = archived_reap_fixture(&store, "worker", &parent);
         let work = anyagents_core::agent_work_dir(dir.path(), &child.id);
-        let fixture = crate::worktree::tests::Fixture::new(&dir.path().join("fixture"));
-        fixture
-            .consumer
-            .remote("SylphxAI/demo", &work, "worker", None)
+        let fixture = dir.path().join("fixture");
+        crate::repo::tests::seed_remote(&fixture);
+        crate::repo::tests::pool_checkouts(&fixture)
+            .remote("ExampleOrg/demo", &work, "worker", None)
             .unwrap();
-        crate::worktree_access::set_worktree_identity(&work).unwrap();
-        crate::worktree_access::share(
-            &work,
-            crate::sandbox::server_uid(),
-            crate::sandbox::server_gid(),
-            &crate::worktree_access::grant_path(dir.path(), &child.id),
-        )
-        .unwrap();
-        let recorded =
-            crate::worktree_access::RecordedWorktree::load(dir.path(), &child.id, &work).unwrap();
+        let commit = |args: &[&str]| {
+            let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.test"];
+            all.extend_from_slice(args);
+            git(&work, &all)
+        };
         assert!(
-            is_git_worktree_safe_to_reap(dir.path(), &child.id, &work),
+            is_git_worktree_safe_to_reap(&work, None),
             "published baseline must be eligible"
         );
         std::fs::write(work.join("src/unique"), b"unique committed source\n").unwrap();
         git(&work, &["add", "src/unique"]);
-        git(&work, &["commit", "-m", "Unpushed source"]);
+        commit(&["commit", "-m", "Unpushed source"]);
         // A child-controlled marker must not turn an unpushed HEAD into a GC proof.
         let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
         std::fs::write(cfg.join(".anyagents-managed-worktree.json"), serde_json::to_vec(&serde_json::json!({"path": work, "initial_head": git(&work, &["rev-parse", "HEAD"])})).unwrap()).unwrap();
         let before_work = snapshot(&work);
-        let before_private = snapshot(recorded.private());
-        assert!(!is_git_worktree_safe_to_reap(dir.path(), &child.id, &work));
+        assert!(!is_git_worktree_safe_to_reap(&work, None));
         assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
         assert_eq!(snapshot(&work), before_work);
-        assert_eq!(snapshot(recorded.private()), before_private);
-        let dotgit = std::fs::read(work.join(".git")).unwrap();
+        // A checkout whose .git is gone or replaced by a pointer elsewhere is
+        // never judged through it, nor treated as a plain directory.
+        let own = work.join(".git");
+        let aside = dir.path().join("aside.git");
+        std::fs::rename(&own, &aside).unwrap();
         for pointer in [None, Some(b"gitdir: /nonexistent/broken\n".as_slice())] {
-            match pointer {
-                None => std::fs::remove_file(work.join(".git")).unwrap(),
-                Some(bytes) => std::fs::write(work.join(".git"), bytes).unwrap(),
+            if let Some(bytes) = pointer {
+                std::fs::write(&own, bytes).unwrap();
             }
             std::fs::create_dir_all(work.join("target")).unwrap();
-            std::fs::write(work.join("target/uncertain-report"), b"retain every byte\n").unwrap();
+            std::fs::write(work.join("target/uncertain-report"), b"retain\n").unwrap();
             let missing_work = snapshot(&work);
-            assert!(!is_git_worktree_safe_to_reap(dir.path(), &child.id, &work));
+            assert!(!is_git_worktree_safe_to_reap(&work, None));
             assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
-            assert_eq!(snapshot(&work), missing_work, "lost pointer deleted source");
-            assert_eq!(snapshot(recorded.private()), before_private);
-            std::fs::remove_dir_all(work.join("target")).unwrap();
-            std::fs::write(work.join(".git"), &dotgit).unwrap();
+            let mut expected = missing_work;
+            expected.remove(Path::new("target/uncertain-report"));
+            assert_eq!(snapshot(&work), expected, "lost .git deleted source");
+            let _ = std::fs::remove_file(&own);
         }
-        git(&work, &["push", "origin", "HEAD:refs/heads/worker"]);
-        assert!(is_git_worktree_safe_to_reap(dir.path(), &child.id, &work));
+        std::fs::rename(&aside, &own).unwrap();
+        git(&work, &["push", "-q", "origin", "HEAD:refs/heads/worker"]);
+        assert!(is_git_worktree_safe_to_reap(&work, None));
         let pushed_head = git(&work, &["rev-parse", "HEAD"]);
-        git(&work, &["checkout", "-b", "unpublished-side"]);
-        git(
-            &work,
-            &["commit", "--allow-empty", "-m", "Side branch only"],
-        );
-        git(&work, &["checkout", "--detach", &pushed_head]);
+        git(&work, &["checkout", "-q", "-b", "unpublished-side"]);
+        commit(&["commit", "-q", "--allow-empty", "-m", "Side branch only"]);
+        git(&work, &["checkout", "-q", "--detach", &pushed_head]);
         let before_work = snapshot(&work);
-        let before_private = snapshot(recorded.private());
         assert!(
-            !is_git_worktree_safe_to_reap(dir.path(), &child.id, &work),
+            !is_git_worktree_safe_to_reap(&work, None),
             "published HEAD does not cover another unpushed local branch"
         );
         assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
         assert_eq!(snapshot(&work), before_work);
-        assert_eq!(snapshot(recorded.private()), before_private);
-        git(&work, &["push", "origin", "refs/heads/unpublished-side"]);
-        assert!(is_git_worktree_safe_to_reap(dir.path(), &child.id, &work));
+        git(
+            &work,
+            &["push", "-q", "origin", "refs/heads/unpublished-side"],
+        );
+        assert!(is_git_worktree_safe_to_reap(&work, None));
         assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
         assert!(!work.exists());
-        assert!(!recorded.private().exists());
+    }
+
+    /// Archive keeps anything only the checkout holds: a stash, a tag or a
+    /// note the remote lacks. What the remote advertises is the proof, so a
+    /// branch published by URL (no remote-tracking ref moves) is reaped.
+    #[test]
+    fn cleanup_keeps_a_stash_and_unpublished_tags_or_notes() {
+        use crate::repo::tests::git;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let work = anyagents_core::agent_work_dir(dir.path(), &child.id);
+        let fixture = dir.path().join("fixture");
+        let remote = crate::repo::tests::seed_remote(&fixture);
+        crate::repo::tests::pool_checkouts(&fixture)
+            .remote("ExampleOrg/demo", &work, "worker", None)
+            .unwrap();
+        let as_author = |args: &[&str]| {
+            let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.test"];
+            all.extend_from_slice(args);
+            git(&work, &all)
+        };
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        // A stash is the only copy of an edit.
+        std::fs::write(work.join("README.md"), "precious edit\n").unwrap();
+        as_author(&["stash", "-q"]);
+        assert!(
+            !is_git_worktree_safe_to_reap(&work, None),
+            "a stash was judged disposable"
+        );
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
+        assert_eq!(git(&work, &["stash", "list"]).lines().count(), 1);
+        git(&work, &["stash", "drop", "-q"]);
+        // A tag the remote lacks, then one it has.
+        git(&work, &["tag", "local-only"]);
+        assert!(
+            !is_git_worktree_safe_to_reap(&work, None),
+            "an unpublished tag"
+        );
+        git(&work, &["push", "-q", "origin", "refs/tags/local-only"]);
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        // A note the remote lacks, then one it has.
+        as_author(&["notes", "add", "-m", "remember this"]);
+        assert!(
+            !is_git_worktree_safe_to_reap(&work, None),
+            "an unpublished note"
+        );
+        git(&work, &["push", "-q", "origin", "refs/notes/commits"]);
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        // A commit published by URL, as a publishing tool does: no
+        // remote-tracking ref records it, the remote still has it.
+        as_author(&["commit", "-q", "--allow-empty", "-m", "Published by URL"]);
+        assert!(!is_git_worktree_safe_to_reap(&work, None));
+        git(
+            &work,
+            &[
+                "push",
+                "-q",
+                remote.to_str().unwrap(),
+                "HEAD:refs/heads/published",
+            ],
+        );
+        assert!(git(&work, &["for-each-ref", "refs/remotes/origin/published"]).is_empty());
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        // With no answer from the remote, nothing is proven.
+        git(
+            &work,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/x.git",
+            ],
+        );
+        assert!(!is_git_worktree_safe_to_reap(&work, None));
+        git(
+            &work,
+            &["remote", "set-url", "origin", remote.to_str().unwrap()],
+        );
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
+        assert!(!work.exists());
+    }
+
+    /// An archived agent's linked worktree from before per-agent repositories
+    /// is converted, then judged like any checkout: dirty work stays, and the
+    /// shared store no longer registers it.
+    #[test]
+    fn cleanup_converts_a_legacy_worktree_and_keeps_its_work() {
+        use crate::repo::tests::git;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let dirty = archived_reap_fixture(&store, "dirty", &parent);
+        let clean = archived_reap_fixture(&store, "clean", &parent);
+        let fixture = dir.path().join("fixture");
+        let remote = crate::repo::tests::seed_remote(&fixture);
+        let hub = fixture.join("hub");
+        git(
+            &fixture,
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                hub.to_str().unwrap(),
+            ],
+        );
+        git(&hub, &["config", "gc.pruneExpire", "never"]);
+        git(&hub, &["config", "gc.cruftPacks", "true"]);
+        let mut checkouts = Vec::new();
+        for agent in [&dirty, &clean] {
+            let work = anyagents_core::agent_work_dir(dir.path(), &agent.id);
+            std::fs::create_dir_all(work.parent().unwrap()).unwrap();
+            git(
+                &hub,
+                &["worktree", "add", "-q", "--detach", work.to_str().unwrap()],
+            );
+            checkouts.push(work);
+        }
+        std::fs::write(checkouts[0].join("README.md"), "work in progress\n").unwrap();
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &dirty.id));
+        assert!(checkouts[0].join(".git").is_dir(), "not converted");
+        assert_eq!(
+            std::fs::read_to_string(checkouts[0].join("README.md")).unwrap(),
+            "work in progress\n"
+        );
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &clean.id));
+        assert!(!checkouts[1].exists(), "a clean converted checkout stays");
+        let registered = git(&hub, &["worktree", "list", "--porcelain"]);
+        assert!(
+            !registered.contains(checkouts[0].to_str().unwrap())
+                && !registered.contains(checkouts[1].to_str().unwrap()),
+            "{registered}"
+        );
+        // The kept checkout's borrowed objects stay held; the reaped one's
+        // keep ref went with it.
+        let keeps = git(
+            &hub,
+            &["for-each-ref", "--format=%(refname)", "refs/anyagents/keep"],
+        );
+        assert_eq!(keeps.lines().count(), 1, "{keeps}");
     }
 
     #[test]
@@ -9144,7 +11475,7 @@ pub(crate) mod tests {
         git(&["commit", "-qm", "Initial source"]);
         std::fs::create_dir_all(work.join("target/debug")).unwrap();
         // A clean commit with no remote is not safe to delete.
-        assert!(!is_git_worktree_safe_to_reap(dir.path(), &child.id, &work,));
+        assert!(!is_git_worktree_safe_to_reap(&work, None));
         reap_archived_agents(&store, dir.path(), &HealthBoard::default());
         assert!(work.join("source.rs").exists());
         assert!(work.join(".git").exists());
@@ -9181,19 +11512,11 @@ pub(crate) mod tests {
             .unwrap();
         let child = archived_reap_fixture(&store, "slow-worker", &parent);
         let work = anyagents_core::agent_work_dir(dir.path(), &child.id);
-        let fixture = crate::worktree::tests::Fixture::new(&dir.path().join("fixture"));
-        fixture
-            .consumer
-            .remote("SylphxAI/demo", &work, "worker", None)
+        let fixture = dir.path().join("fixture");
+        crate::repo::tests::seed_remote(&fixture);
+        crate::repo::tests::pool_checkouts(&fixture)
+            .remote("ExampleOrg/demo", &work, "worker", None)
             .unwrap();
-        crate::worktree_access::set_worktree_identity(&work).unwrap();
-        crate::worktree_access::share(
-            &work,
-            crate::sandbox::server_uid(),
-            crate::sandbox::server_gid(),
-            &crate::worktree_access::grant_path(dir.path(), &child.id),
-        )
-        .unwrap();
         let recipient = store
             .create_agent(anyagents_core::NewAgent::new("recipient", "opencode"))
             .unwrap();
@@ -9216,7 +11539,7 @@ pub(crate) mod tests {
         let real_git = real_git.trim();
         assert!(Path::new(real_git).is_absolute());
         let git = bin.join("git");
-        crate::worktree::tests::write_executable(
+        crate::repo::tests::write_executable(
             &git,
             &format!(
                 r#"#!/bin/sh
@@ -9251,12 +11574,6 @@ exec '{}' "$@"
         unsafe {
             std::env::set_var("PATH", path);
         }
-        // Calibration must reach the production validator through the fake
-        // Git, not silently refuse before the status barrier under test.
-        crate::worktree_access::RecordedWorktree::load(dir.path(), &child.id, &work)
-            .unwrap()
-            .validate()
-            .expect("barrier Git cannot validate the prepared checkout");
         let worker_store = Store::open(&db).unwrap();
         let worker_data = dir.path().to_path_buf();
         let worker = std::thread::spawn(move || {
@@ -9365,6 +11682,117 @@ exec '{}' "$@"
         send_sync(store, actor, body, plan, key)
             .unwrap_or_else(|e| panic!("{}", e.message))
             .0
+    }
+
+    /// A send that cannot wake an archived recipient (through an alias, or to
+    /// several recipients) is refused for it with who answers for it, and
+    /// nothing is stored unread. A send with no live recipient fails.
+    #[test]
+    fn a_send_an_archived_agent_would_never_read_is_refused_with_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let root = store
+            .create_agent(anyagents_core::NewAgent::new("root", "opencode"))
+            .unwrap();
+        // Running, as an agent that answers for its archived child.
+        store.set_agent_state(&root.id, "running").unwrap();
+        let mut new = anyagents_core::NewAgent::new("lead", "opencode");
+        new.parent_id = Some(root.id.clone());
+        let lead = store.create_agent(new).unwrap();
+        let mut new = anyagents_core::NewAgent::new("worker", "opencode");
+        new.parent_id = Some(lead.id.clone());
+        let worker = store.create_agent(new).unwrap();
+        let peer = store
+            .create_agent(anyagents_core::NewAgent::new("peer", "opencode"))
+            .unwrap();
+        // A public sub-agent may also write to a root agent.
+        store.set_agent_scope(&worker.id, "public").unwrap();
+        mark_explicitly_archived(&store, dir.path(), &lead);
+        let actor = Actor::Agent(worker.name.clone());
+        let send = |to: Vec<&str>| {
+            let body = SendRequest {
+                sender: Some(actor.as_address()),
+                to: to.into_iter().map(str::to_string).collect(),
+                text: "status report".to_string(),
+                ..Default::default()
+            };
+            let plan = SendPlan::parse(&store, &actor, &body)?;
+            send_sync(&store, &actor, body, plan, None).map(|response| response.0)
+        };
+
+        let refused = send(vec!["parent"]).expect_err("no live recipient");
+        assert_eq!(refused.status, StatusCode::CONFLICT);
+        assert!(
+            refused
+                .message
+                .contains("agent `lead` is archived; its parent is `root`"),
+            "{}",
+            refused.message
+        );
+        assert!(
+            store.inbox(&lead.id, None).unwrap().is_empty(),
+            "nothing stored unread"
+        );
+        assert_eq!(store.agent(&lead.id).unwrap().state, "archived");
+
+        let mixed =
+            send(vec!["parent", "agent:peer"]).unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(mixed.deliveries.len(), 1);
+        assert_eq!(mixed.deliveries[0].to, "agent:peer");
+        assert_eq!(mixed.skipped.len(), 1);
+        assert_eq!(mixed.skipped[0].to, "agent:lead");
+        assert_eq!(
+            mixed.skipped[0].reason,
+            "agent `lead` is archived; its parent is `root`"
+        );
+        assert!(store.inbox(&lead.id, None).unwrap().is_empty());
+        assert_eq!(store.inbox(&peer.id, None).unwrap().len(), 1);
+    }
+
+    /// A parked agent lists as `faulted`, with its errored turns and why it
+    /// is blocked; a resume lists it as it was.
+    #[test]
+    fn a_parked_agent_is_shown_faulted_until_it_is_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("worker", "spiron"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "running").unwrap();
+        for _ in 0..anyagents_core::MAX_ERRORED_TURNS {
+            store
+                .note_turn_errored(&agent.id, "context_length_exceeded", true)
+                .unwrap();
+        }
+        assert!(store.park_faulted(&agent.id).unwrap());
+        let health = HealthBoard::default();
+        let agent = store.agent(&agent.id).unwrap();
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.state, "paused");
+        assert_eq!(view.display_state(), "faulted");
+        assert_eq!(view.turn_state, "faulted");
+        assert_eq!(view.block_reason.as_deref(), Some("faulted"));
+        assert_eq!(view.last_error.as_deref(), Some("context_length_exceeded"));
+        let errors = view.turn_errors.expect("errored turns are shown");
+        assert_eq!(errors.streak, anyagents_core::MAX_ERRORED_TURNS);
+        assert_eq!(errors.limit, anyagents_core::MAX_ERRORED_TURNS);
+        assert!(errors.faulted_at_ms.is_some());
+        let (roster, _) = store.roster_agents(None).unwrap();
+        let listed = roster_views(
+            &store,
+            &health,
+            &roster.iter().collect::<Vec<_>>(),
+            0,
+            &ListAgentsQuery::default(),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(listed.agents[0].display_state(), "faulted");
+
+        store.set_agent_state(&agent.id, "running").unwrap();
+        let agent = store.agent(&agent.id).unwrap();
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.display_state(), "running");
+        assert!(view.turn_errors.is_none());
     }
 
     #[test]
@@ -9566,16 +11994,39 @@ exec '{}' "$@"
             assert!(SendPlan::parse(&store, &actor, &body).is_err());
         }
         for from in ["telegram:user:123", "telegram:chat:-456"] {
-            authored_send(
-                &store,
-                &Actor::parse(from).unwrap_or_else(|e| panic!("{}", e.message)),
-                "worker",
-                "channel update",
-                from,
+            // A channel sender cannot wake it, so the send is refused with
+            // the reason instead of stored unread.
+            let channel = Actor::parse(from).unwrap_or_else(|e| panic!("{}", e.message));
+            let body = SendRequest {
+                sender: Some(channel.as_address()),
+                to: vec!["worker".into()],
+                text: "channel update".into(),
+                idempotency_key: Some(from.into()),
+                ..Default::default()
+            };
+            let key = send_key(&body);
+            let plan = SendPlan::parse(&store, &channel, &body)
+                .unwrap_or_else(|e| panic!("{}", e.message));
+            let refused = send_sync(&store, &channel, body, plan, key).expect_err("archived");
+            assert_eq!(refused.status, StatusCode::CONFLICT);
+            assert!(
+                refused
+                    .message
+                    .contains("agent `worker` is archived; its parent is `parent-agent`"),
+                "{}",
+                refused.message
             );
             assert_eq!(store.agent(&child.id).unwrap().state, "archived");
             assert!(has_explicit_archive_marker(dir.path(), &child.id));
         }
+        assert!(
+            store
+                .inbox(&child.id, None)
+                .unwrap()
+                .iter()
+                .all(|message| message.text != "channel update"),
+            "nothing is stored unread"
+        );
         let deleted_id = child.id.clone();
         store.delete_agent(&deleted_id).unwrap();
         let body = SendRequest {
@@ -9701,6 +12152,7 @@ exec '{}' "$@"
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
@@ -9713,6 +12165,7 @@ exec '{}' "$@"
                     name: parent.name.clone(),
                 },
                 State(state.clone()),
+                axum::http::HeaderMap::new(),
                 Json(
                     serde_json::from_value(serde_json::json!({
                         "name": "writer-sub-1",
@@ -9747,6 +12200,7 @@ exec '{}' "$@"
                     name: parent.name.clone(),
                 },
                 State(state.clone()),
+                axum::http::HeaderMap::new(),
                 Json(
                     serde_json::from_value(serde_json::json!({
                         "name": "reviewer-sub-1",
@@ -9775,6 +12229,7 @@ exec '{}' "$@"
                     name: parent.name.clone(),
                 },
                 State(state),
+                axum::http::HeaderMap::new(),
                 Json(
                     serde_json::from_value(serde_json::json!({
                         "name": "auditor-sub-1",
@@ -9820,7 +12275,7 @@ exec '{}' "$@"
                 if let Some(harness) = harness { body["harness"] = serde_json::json!(harness); }
                 if let Some(role) = role { body["role"] = serde_json::json!(role); }
                 let (status, Json(created)) = create_agent_route(
-                    Principal::Operator, State(state.clone()), Json(serde_json::from_value(body).unwrap()),
+                    Principal::Operator, State(state.clone()), axum::http::HeaderMap::new(), Json(serde_json::from_value(body).unwrap()),
                 ).await.unwrap_or_else(|e| panic!("{}", e.message));
                 assert_eq!(status, StatusCode::CREATED);
                 assert_eq!(created.harness, expected, "{name}");
@@ -9842,6 +12297,7 @@ exec '{}' "$@"
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
             identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
             auth: auth::Mode::Trusted {
                 data_dir: data.into(),
             },
@@ -9856,6 +12312,7 @@ exec '{}' "$@"
         let result = create_agent_route(
             Principal::Operator,
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             Json(serde_json::from_value(body).unwrap()),
         )
         .await;
@@ -10202,16 +12659,38 @@ exec '{}' "$@"
         let _env = env_lock();
         let dir = crate::test_tempdir();
         let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
         let cloud_agent = state
             .store
-            .create_agent(anyagents_core::NewAgent::new("cloud-worker", "claude-code"))
+            .create_agent(anyagents_core::NewAgent::new(
+                "cloud-worker",
+                "claude-cloud",
+            ))
             .unwrap();
         let spiron_agent = state
             .store
-            .create_agent(anyagents_core::NewAgent::new("spiron-worker", "spiron"))
+            .create_agent(anyagents_core::NewAgent::new(
+                "spiron-worker",
+                "spiron-cloud",
+            ))
             .unwrap();
-        let cloud_cap = state.store.issue_capability(&cloud_agent.id).unwrap();
-        let spiron_cap = state.store.issue_capability(&spiron_agent.id).unwrap();
+        // HTTP MCP takes remote session tokens only; a local capability is
+        // refused below.
+        let remote_token = |agent: &Agent| {
+            crate::remote::begin_session(&state.store, agent).unwrap();
+            crate::remote::session_token(&anyagents_core::agent_config_dir(
+                state.store.data_dir(),
+                &agent.id,
+            ))
+            .unwrap()
+        };
+        let cloud_cap = remote_token(&cloud_agent);
+        let spiron_cap = remote_token(&spiron_agent);
+        let local_cap = state.store.issue_capability(&cloud_agent.id).unwrap();
 
         // Seed a skill inside the agent's config dir so `skills` list/read works deterministically.
         let skill_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &cloud_agent.id)
@@ -10263,6 +12742,43 @@ exec '{}' "$@"
             .await
             .expect_err("invalid token must fail with 401");
             assert_eq!(bad_err.status, StatusCode::UNAUTHORIZED);
+
+            // A valid local capability is refused with 403: local agents use
+            // stdio MCP, which runs as the agent, never HTTP inside the server.
+            for header in [
+                axum::http::header::AUTHORIZATION.as_str(),
+                crate::operator::AGENT_HEADER,
+            ] {
+                let mut local_headers = axum::http::HeaderMap::new();
+                let value = if header == "authorization" {
+                    format!("Bearer {local_cap}")
+                } else {
+                    local_cap.clone()
+                };
+                local_headers.insert(
+                    axum::http::HeaderName::from_static(header),
+                    value.parse().unwrap(),
+                );
+                let refused = mcp_post_route(
+                    State(state.clone()),
+                    local_headers,
+                    Query(McpRouteQuery::default()),
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/list",
+                        "params": {}
+                    })),
+                )
+                .await
+                .expect_err("a local capability must be refused over HTTP");
+                assert_eq!(refused.status, StatusCode::FORBIDDEN, "{header}");
+                assert!(
+                    refused.message.contains("only remote session tokens"),
+                    "{}",
+                    refused.message
+                );
+            }
 
             // Helper to call `mcp_post_route` with a Bearer token and optional profile query.
             let post_mcp = |token: &str, profile: Option<&str>, body: serde_json::Value| {
@@ -10577,6 +13093,1102 @@ exec '{}' "$@"
         });
     }
 
+    /// One MCP POST with a bearer token and an optional `?profile=`.
+    async fn post_mcp_as(
+        state: &AppState,
+        token: &str,
+        profile: Option<&str>,
+        body: serde_json::Value,
+    ) -> Result<(StatusCode, serde_json::Value), ApiError> {
+        use http_body_util::BodyExt as _;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let query = McpRouteQuery {
+            profile: profile.map(str::to_string),
+        };
+        let resp = mcp_post_route(State(state.clone()), headers, Query(query), Json(body)).await?;
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        Ok((status, json))
+    }
+
+    fn listed_tools(list: &serde_json::Value) -> Vec<String> {
+        list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn tools_list() -> serde_json::Value {
+        serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} })
+    }
+
+    fn tool_call(name: &str, arguments: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        })
+    }
+
+    #[test]
+    fn remote_session_tokens_get_only_the_remote_profile() {
+        use http_body_util::BodyExt as _;
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let cloud = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new(
+                "cloud-remote",
+                "claude-cloud",
+            ))
+            .unwrap();
+        let peer = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("local-peer", "claude-code"))
+            .unwrap();
+        let peer_cap = state.store.issue_capability(&peer.id).unwrap();
+        crate::remote::begin_session(&state.store, &cloud).unwrap();
+        let cloud_cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &cloud.id);
+        let remote = crate::remote::session_token(&cloud_cfg).unwrap();
+        let expected_remote: Vec<String> = crate::mcp::REMOTE_MCP_TOOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(
+            expected_remote,
+            [
+                "send",
+                "inbox",
+                "agents",
+                "groups",
+                "schedules",
+                "conversation",
+                "memory",
+                "skills"
+            ]
+        );
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            // The default, and an explicit `remote`, list exactly the remote tools.
+            for asked in [None, Some("remote"), Some("cloud")] {
+                let (status, list) = post_mcp_as(&state, &remote, asked, tools_list())
+                    .await
+                    .unwrap();
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(listed_tools(&list), expected_remote, "{asked:?}");
+            }
+            // `coordination` narrows; `full` is refused, and so is nonsense.
+            let (_, list) = post_mcp_as(&state, &remote, Some("coordination"), tools_list())
+                .await
+                .unwrap();
+            assert_eq!(listed_tools(&list), crate::mcp::COORDINATION_MCP_TOOLS);
+            for (asked, expected) in [
+                ("full", StatusCode::FORBIDDEN),
+                ("local", StatusCode::FORBIDDEN),
+                ("everything", StatusCode::BAD_REQUEST),
+            ] {
+                let err = post_mcp_as(&state, &remote, Some(asked), tools_list())
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.status, expected, "{asked}: {}", err.message);
+            }
+            // Nothing that runs on or from the host can be called, even by an
+            // alias or the vendor-prefixed name.
+            for host_tool in [
+                "browser",
+                "computer",
+                "device",
+                "media",
+                "code",
+                "files",
+                "web",
+                "web_search",
+                "web_fetch",
+                "mcp__anyagents__browser",
+                "mcp__anyagents__computer",
+            ] {
+                let (_, refused) = post_mcp_as(
+                    &state,
+                    &remote,
+                    None,
+                    tool_call(host_tool, serde_json::json!({})),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    refused["error"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("disabled by active MCP profile `remote`"),
+                    "{host_tool}: {refused}"
+                );
+            }
+            // Coordination works, as the agent the token names.
+            let (_, sent) = post_mcp_as(
+                &state,
+                &remote,
+                None,
+                tool_call(
+                    "send",
+                    serde_json::json!({ "to": ["local-peer"], "text": "from the cloud" }),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_ne!(sent["result"]["isError"], serde_json::json!(true), "{sent}");
+            let inbox = state.store.inbox(&peer.id, None).unwrap();
+            assert_eq!(inbox.len(), 1);
+            assert_eq!(inbox[0].text, "from the cloud");
+            assert!(
+                inbox[0]
+                    .sender
+                    .as_deref()
+                    .is_some_and(|sender| sender.contains(cloud.id.as_str())),
+                "{:?}",
+                inbox[0].sender
+            );
+
+            // The GET route names the session and its expiry, and refuses `full`.
+            let get = |profile: Option<&str>| {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {remote}").parse().unwrap(),
+                );
+                headers.insert(
+                    axum::http::header::ACCEPT,
+                    "application/json".parse().unwrap(),
+                );
+                mcp_get_route(
+                    State(state.clone()),
+                    headers,
+                    Query(McpRouteQuery {
+                        profile: profile.map(str::to_string),
+                    }),
+                )
+            };
+            let described = get(None).await.unwrap();
+            let bytes = described.into_body().collect().await.unwrap().to_bytes();
+            let described: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(described["profile"], "remote");
+            assert_eq!(described["agent"], "cloud-remote");
+            let grant = state.store.authenticate_remote_session(&remote).unwrap();
+            assert_eq!(described["remote_session"]["session_id"], grant.session_id);
+            assert_eq!(
+                described["remote_session"]["expires_at_ms"],
+                grant.expires_at_ms
+            );
+            assert_eq!(
+                get(Some("full")).await.unwrap_err().status,
+                StatusCode::FORBIDDEN
+            );
+
+            // Over HTTP a local capability is refused outright.
+            for asked in [None, Some("full")] {
+                let refused = post_mcp_as(&state, &peer_cap, asked, tools_list())
+                    .await
+                    .unwrap_err();
+                assert_eq!(refused.status, StatusCode::FORBIDDEN, "{asked:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn remote_session_tokens_stop_at_expiry_revocation_relaunch_and_stop() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let cloud = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new(
+                "cloud-expiring",
+                "claude-cloud",
+            ))
+            .unwrap();
+        let cloud_cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &cloud.id);
+        let begin = || {
+            crate::remote::begin_session(&state.store, &cloud).unwrap();
+            crate::remote::session_token(&cloud_cfg).unwrap()
+        };
+        let set_expiry = |at_ms: i64| {
+            rusqlite::Connection::open(dir.path().join("state.db"))
+                .unwrap()
+                .execute(
+                    "UPDATE remote_session_tokens SET expires_at_ms = ?1",
+                    [at_ms],
+                )
+                .unwrap();
+        };
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let accepted = |token: String| {
+                let state = state.clone();
+                async move {
+                    post_mcp_as(&state, &token, None, tools_list())
+                        .await
+                        .map(|(status, _)| status)
+                        .map_err(|err| (err.status, err.message))
+                }
+            };
+            let refused = |result: Result<StatusCode, (StatusCode, String)>| {
+                let (status, message) = result.unwrap_err();
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert!(message.contains("remote session token"), "{message}");
+            };
+
+            // Expiry.
+            let first = begin();
+            assert_eq!(accepted(first.clone()).await.unwrap(), StatusCode::OK);
+            set_expiry(anyagents_core::now_ms() - 1);
+            refused(accepted(first.clone()).await);
+
+            // On demand, through the operator route.
+            let second = begin();
+            assert_eq!(accepted(second.clone()).await.unwrap(), StatusCode::OK);
+            let revoked = revoke_remote_sessions_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath("cloud-expiring".into()),
+                Json(RevokeRemoteSessionsRequest::default()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(revoked.0["revoked"], 1);
+            refused(accepted(second.clone()).await);
+            assert!(!cloud_cfg.join(crate::remote::TOKEN_FILE).exists());
+
+            // A relaunch supersedes the previous session.
+            let third = begin();
+            let fourth = begin();
+            refused(accepted(third).await);
+            assert_eq!(accepted(fourth.clone()).await.unwrap(), StatusCode::OK);
+
+            // Pausing (stop) and archiving revoke in the store commit itself.
+            state.store.set_agent_state(&cloud.id, "paused").unwrap();
+            refused(accepted(fourth.clone()).await);
+            state.store.set_agent_state(&cloud.id, "running").unwrap();
+            refused(accepted(fourth).await);
+            let fifth = begin();
+            assert_eq!(accepted(fifth.clone()).await.unwrap(), StatusCode::OK);
+            state.store.set_agent_state(&cloud.id, "archived").unwrap();
+            refused(accepted(fifth).await);
+
+            // A remote token is never a credential on the internal API.
+            state.store.set_agent_state(&cloud.id, "running").unwrap();
+            let sixth = begin();
+            let principal = state.auth.principal(&state.store, &{
+                let request = axum::http::Request::builder()
+                    .header(crate::operator::AGENT_HEADER, sixth.as_str())
+                    .body(())
+                    .unwrap();
+                let (parts, ()) = request.into_parts();
+                crate::auth::Presented::of(&parts)
+            });
+            assert!(principal.is_err(), "{principal:?}");
+        });
+    }
+
+    #[test]
+    fn the_public_listener_answers_readiness_only_and_the_socket_keeps_the_identity() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let socket_identity = state.identity.status();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let public = build_webhook_router(state.clone());
+            let served = tokio::spawn(async move {
+                let _ = axum::serve(listener, public).await;
+            });
+            for path in ["/", "/healthz", "/v1/webhooks/healthz"] {
+                let raw = tokio::task::spawn_blocking(move || {
+                    use std::io::{Read as _, Write as _};
+                    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+                    write!(
+                        stream,
+                        "GET {path} HTTP/1.1\r\nHost: public\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    let mut raw = String::new();
+                    stream.read_to_string(&mut raw).unwrap();
+                    raw
+                })
+                .await
+                .unwrap();
+                assert!(raw.starts_with("HTTP/1.1 200"), "{path}: {raw}");
+                assert!(
+                    raw.to_ascii_lowercase().contains("cache-control: no-store"),
+                    "{path}: {raw}"
+                );
+                let body: serde_json::Value =
+                    serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert_eq!(body, serde_json::json!({ "ok": true }), "{path}");
+            }
+            served.abort();
+        });
+        // The operator's socket still serves the full serving identity.
+        for field in [
+            "version",
+            "source_sha",
+            "binary_sha256",
+            "binary_sha256_state",
+        ] {
+            assert!(socket_identity.get(field).is_some(), "{field}");
+        }
+    }
+
+    #[test]
+    fn remote_agents_cannot_be_created_without_a_public_url() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let refused = create_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "cloud-unconfigured",
+                        "harness": "claude-cloud",
+                        "parent": "root",
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+            assert!(
+                refused.message.contains("public_url"),
+                "{}",
+                refused.message
+            );
+            assert!(
+                refused.message.contains(crate::remote::CONFIG_FILE),
+                "{}",
+                refused.message
+            );
+            assert!(state.store.agent_by_name("cloud-unconfigured").is_err());
+
+            // Moving an existing agent onto a remote harness is refused too.
+            state
+                .store
+                .create_agent(anyagents_core::NewAgent::new("local-first", "claude-code"))
+                .unwrap();
+            let moved = harness_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath("local-first".into()),
+                axum::http::HeaderMap::new(),
+                Json(HarnessRequest {
+                    harness: "openai-cloud".into(),
+                    model: None,
+                    profile: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(moved.status, StatusCode::BAD_REQUEST);
+            assert!(moved.message.contains("public_url"), "{}", moved.message);
+            assert_eq!(
+                state.store.agent_by_name("local-first").unwrap().harness,
+                "claude-code"
+            );
+        });
+    }
+
+    /// One HTTP/1.1 exchange with a TCP listener: the status and the JSON body
+    /// (`Null` when there is none).
+    fn raw_http(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (u16, serde_json::Value) {
+        use std::io::{Read as _, Write as _};
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: public.example\r\nConnection: close\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        if !body.is_empty() {
+            request.push_str("Content-Type: application/json\r\n");
+        }
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        request.push_str(body);
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        let (head, rest) = raw.split_once("\r\n\r\n").unwrap();
+        let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (
+            status,
+            serde_json::from_str(rest).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[test]
+    fn the_public_listener_serves_only_the_public_surface_and_remote_tokens() {
+        use anyagents_core::CredentialStore as _;
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\npublic_listen = \"127.0.0.1:0\"\n",
+        )
+        .unwrap();
+        let cloud = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new(
+                "cloud-public",
+                "claude-cloud",
+            ))
+            .unwrap();
+        let local = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("local-public", "claude-code"))
+            .unwrap();
+        let local_cap = state.store.issue_capability(&local.id).unwrap();
+        crate::remote::begin_session(&state.store, &cloud).unwrap();
+        let remote =
+            crate::remote::session_token(&anyagents_core::agent_config_dir(dir.path(), &cloud.id))
+                .unwrap();
+        // A Telegram channel, so the webhook route reaches its secret check.
+        let channel = state
+            .store
+            .create_channel(anyagents_core::NewChannel {
+                kind: "telegram".into(),
+                identity: None,
+                config: "{}".into(),
+                credential_ref: None,
+            })
+            .unwrap();
+        let cred_ref = format!("channels/{}", channel.id);
+        anyagents_core::FileCredentialStore::new(dir.path())
+            .write(&cred_ref, b"777:fake-token-not-real")
+            .unwrap();
+        state
+            .store
+            .set_credential_ref(&channel.id, &cred_ref)
+            .unwrap();
+        state.store.attach_channel(&channel.id, &local.id).unwrap();
+        let telegram_path = format!("/v1/webhooks/telegram/{}", channel.id);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let public = build_public_router(state.clone());
+            let served = tokio::spawn(async move {
+                let _ = axum::serve(listener, public).await;
+            });
+            let call = move |method: &'static str,
+                             path: String,
+                             headers: Vec<(&'static str, String)>,
+                             body: String| {
+                tokio::task::spawn_blocking(move || {
+                    let headers: Vec<(&str, &str)> =
+                        headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    raw_http(addr, method, &path, &headers, &body)
+                })
+            };
+            let list = tools_list().to_string();
+
+            for path in ["/", "/healthz", "/v1/webhooks/healthz"] {
+                let (status, body) = call("GET", path.into(), vec![], String::new())
+                    .await
+                    .unwrap();
+                assert_eq!(status, 200, "{path}");
+                assert_eq!(body, serde_json::json!({ "ok": true }), "{path}");
+            }
+
+            // Nothing of the local API, nor the MCP aliases, is reachable here,
+            // whatever credential is presented.
+            for (method, path) in [
+                ("GET", "/v1/agents"),
+                ("GET", "/v1/whoami"),
+                ("POST", "/v1/send"),
+                ("POST", "/v1/browser"),
+                ("POST", "/v1/operator/agents/local-public/capability"),
+                (
+                    "POST",
+                    "/v1/operator/agents/cloud-public/remote-sessions/revoke",
+                ),
+                ("POST", "/v1/mcp"),
+                ("POST", "/mcp"),
+                ("GET", "/v1/webhooks/unknown"),
+            ] {
+                // No body: a 404 closes without reading one, and unread bytes
+                // would turn that close into a reset on some platforms.
+                let (status, _) = call(
+                    method,
+                    path.into(),
+                    vec![("x-anyagents-agent", local_cap.clone())],
+                    String::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(status, 404, "{method} {path}");
+            }
+
+            // MCP takes remote session tokens only. A local capability is
+            // refused in either header, and no forwarding header changes that.
+            for headers in [
+                vec![("authorization", format!("Bearer {local_cap}"))],
+                vec![("x-anyagents-agent", local_cap.clone())],
+                vec![
+                    ("authorization", format!("Bearer {local_cap}")),
+                    ("x-forwarded-for", "127.0.0.1".to_string()),
+                    ("forwarded", "for=127.0.0.1".to_string()),
+                ],
+            ] {
+                let (status, body) = call("POST", "/v1/webhooks/mcp".into(), headers, list.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(status, 401, "{body}");
+                assert!(
+                    body["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("only remote session tokens"),
+                    "{body}"
+                );
+            }
+            let (status, body) = call(
+                "GET",
+                "/v1/webhooks/mcp".into(),
+                vec![("authorization", format!("Bearer {local_cap}"))],
+                String::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, 401, "{body}");
+
+            let (status, body) = call(
+                "POST",
+                "/v1/webhooks/mcp".into(),
+                vec![("authorization", format!("Bearer {remote}"))],
+                list.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(listed_tools(&body), crate::mcp::REMOTE_MCP_TOOLS);
+
+            // Telegram's webhook is verified by the channel's secret token here
+            // too: a missing or wrong secret is refused before any delivery.
+            let update = serde_json::json!({ "update_id": 1 }).to_string();
+            for headers in [
+                vec![],
+                vec![("x-telegram-bot-api-secret-token", "wrong".to_string())],
+            ] {
+                let (status, _) = call("POST", telegram_path.clone(), headers, update.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(status, 401);
+            }
+            assert!(state.store.inbox(&local.id, None).unwrap().is_empty());
+            served.abort();
+        });
+
+        // The local listener refuses a local capability too (#272), with 403
+        // there, and serves the remote token.
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let refused = post_mcp_as(&state, &local_cap, None, tools_list())
+                .await
+                .unwrap_err();
+            assert_eq!(refused.status, StatusCode::FORBIDDEN);
+            let (status, _) = post_mcp_as(&state, &remote, None, tools_list())
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::OK);
+        });
+    }
+
+    #[test]
+    fn the_local_listener_keeps_its_default_until_a_public_listener_exists() {
+        // Unset public listener: today's behaviour.
+        assert_eq!(
+            local_listen_addr(None, false, false).as_deref(),
+            Some("0.0.0.0:8788")
+        );
+        // A configured public listener moves the local default to loopback.
+        assert_eq!(
+            local_listen_addr(None, false, true).as_deref(),
+            Some("127.0.0.1:8788")
+        );
+        // An explicit address or `off` always wins; test doubles bind nothing.
+        assert_eq!(
+            local_listen_addr(Some(" 127.0.0.1:9000 "), false, true).as_deref(),
+            Some("127.0.0.1:9000")
+        );
+        assert_eq!(local_listen_addr(Some("off"), false, false), None);
+        assert_eq!(local_listen_addr(None, true, false), None);
+        assert!(binds_loopback("127.0.0.1:8788"));
+        assert!(binds_loopback("[::1]:8788"));
+        assert!(binds_loopback("localhost:8788"));
+        assert!(!binds_loopback("0.0.0.0:8788"));
+        assert!(!binds_loopback("10.0.0.5:8788"));
+    }
+
+    #[test]
+    fn a_remote_token_stops_authenticating_once_its_agent_runs_on_the_host() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let cloud = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("cloud-moved", "claude-cloud"))
+            .unwrap();
+        let sandboxed = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("sandboxed", "claude-code"))
+            .unwrap();
+        let sandbox_cfg = anyagents_core::agent_config_dir(dir.path(), &sandboxed.id);
+        anyagents_tools::SandboxConfig {
+            endpoint: "https://sandbox.example.com".into(),
+            sandbox_id: "sbx-1".into(),
+            token: None,
+            workdir: "/workspace".into(),
+            remote_spawn: true,
+        }
+        .write_to_config_dir(&sandbox_cfg)
+        .unwrap();
+        assert!(crate::remote::runs_off_host(&sandboxed, &sandbox_cfg));
+        assert!(crate::remote::runs_off_host(
+            &cloud,
+            &anyagents_core::agent_config_dir(dir.path(), &cloud.id)
+        ));
+
+        crate::remote::begin_session(&state.store, &cloud).unwrap();
+        let remote =
+            crate::remote::session_token(&anyagents_core::agent_config_dir(dir.path(), &cloud.id))
+                .unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (status, _) = post_mcp_as(&state, &remote, None, tools_list())
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::OK);
+            state
+                .store
+                .set_agent_harness(&cloud.id, "claude-code")
+                .unwrap();
+            let err = post_mcp_as(&state, &remote, None, tools_list())
+                .await
+                .unwrap_err();
+            assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        });
+    }
+
+    #[test]
+    fn http_mcp_never_serves_more_than_the_remote_profile_to_any_credential() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let local = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("seat-agent", "claude-cloud"))
+            .unwrap();
+        crate::remote::begin_session(&state.store, &local).unwrap();
+        let cap =
+            crate::remote::session_token(&anyagents_core::agent_config_dir(dir.path(), &local.id))
+                .unwrap();
+        // Neither a sandbox binding nor disabled built-in tools upgrades HTTP
+        // any more: over HTTP the tools would run as the server.
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &local.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("cloud.json"), r#"{"disable_builtin_tools":true}"#).unwrap();
+        anyagents_tools::SandboxConfig {
+            endpoint: "https://sandbox.example.com".into(),
+            sandbox_id: "sbx-1".into(),
+            token: None,
+            workdir: "/workspace".into(),
+            remote_spawn: false,
+        }
+        .write_to_config_dir(&cfg)
+        .unwrap();
+        let marker = dir.path().join("exec-ran");
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for asked in [None, Some("remote"), Some("http")] {
+                let (status, list) = post_mcp_as(&state, &cap, asked, tools_list())
+                    .await
+                    .unwrap();
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(
+                    listed_tools(&list),
+                    crate::mcp::REMOTE_MCP_TOOLS,
+                    "{asked:?}"
+                );
+            }
+            let (_, list) = post_mcp_as(&state, &cap, Some("coordination"), tools_list())
+                .await
+                .unwrap();
+            assert_eq!(listed_tools(&list), crate::mcp::COORDINATION_MCP_TOOLS);
+            for asked in ["full", "FULL", "local", "stdio"] {
+                let refused = post_mcp_as(&state, &cap, Some(asked), tools_list())
+                    .await
+                    .unwrap_err();
+                assert_eq!(refused.status, StatusCode::FORBIDDEN, "{asked}");
+                assert!(
+                    refused.message.contains("not served over HTTP"),
+                    "{}",
+                    refused.message
+                );
+            }
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {cap}").parse().unwrap(),
+            );
+            let refused = mcp_get_route(
+                State(state.clone()),
+                headers,
+                Query(McpRouteQuery {
+                    profile: Some("full".into()),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refused.status, StatusCode::FORBIDDEN);
+
+            // Nothing that executes or reads on the host is callable.
+            let exec = serde_json::json!({
+                "action": "exec",
+                "command": format!("touch {}", marker.display()),
+            });
+            for (tool, args) in [
+                ("files", exec.clone()),
+                ("mcp__anyagents__files", exec.clone()),
+                ("code", serde_json::json!({ "code": "return 1" })),
+                ("browser", serde_json::json!({ "action": "status" })),
+                ("computer", serde_json::json!({ "action": "screenshot" })),
+                ("device", serde_json::json!({ "action": "screenshot" })),
+                ("media", serde_json::json!({ "action": "speech" })),
+                ("web", serde_json::json!({ "url": "https://example.com" })),
+                ("web_search", serde_json::json!({ "query": "x" })),
+                (
+                    "web_fetch",
+                    serde_json::json!({ "url": "https://example.com" }),
+                ),
+            ] {
+                let (_, refused) = post_mcp_as(&state, &cap, None, tool_call(tool, args))
+                    .await
+                    .unwrap();
+                assert!(
+                    refused["error"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("disabled by active MCP profile"),
+                    "{tool}: {refused}"
+                );
+            }
+            assert!(!marker.exists(), "an HTTP call ran a host command");
+        });
+    }
+
+    #[test]
+    fn calls_over_http_mcp_cannot_start_or_read_on_the_host() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let local = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("http-local", "claude-code"))
+            .unwrap();
+        let local_cap = state.store.issue_capability(&local.id).unwrap();
+        let cloud = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("http-cloud", "claude-cloud"))
+            .unwrap();
+        crate::remote::begin_session(&state.store, &cloud).unwrap();
+        let remote =
+            crate::remote::session_token(&anyagents_core::agent_config_dir(dir.path(), &cloud.id))
+                .unwrap();
+        let mut children = Vec::new();
+        {
+            let parent = &cloud;
+            let child = state
+                .store
+                .create_agent(anyagents_core::NewAgent {
+                    parent_id: Some(parent.id.clone()),
+                    ..anyagents_core::NewAgent::new(
+                        format!("{}-child", parent.name),
+                        "claude-cloud",
+                    )
+                })
+                .unwrap();
+            let sleeper = state
+                .store
+                .create_agent(anyagents_core::NewAgent {
+                    parent_id: Some(parent.id.clone()),
+                    ..anyagents_core::NewAgent::new(
+                        format!("{}-sleeper", parent.name),
+                        "claude-code",
+                    )
+                })
+                .unwrap();
+            state
+                .store
+                .set_agent_state(&sleeper.id, "archived")
+                .unwrap();
+            children.push((child, sleeper));
+        }
+        let secret = dir.path().join("host-secret");
+        std::fs::write(&secret, "not for a remote caller").unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            // A local capability never reaches these tools over HTTP.
+            let refused_local = post_mcp_as(
+                &state,
+                &local_cap,
+                None,
+                tool_call("agents", serde_json::json!({ "action": "list" })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refused_local.status, StatusCode::FORBIDDEN);
+            {
+                let token = &remote;
+                let (child, sleeper) = &children[0];
+                let call = |tool: &str, args: serde_json::Value| {
+                    let state = state.clone();
+                    let token = token.to_string();
+                    let request = tool_call(tool, args);
+                    async move {
+                        post_mcp_as(&state, &token, None, request)
+                            .await
+                            .unwrap()
+                            .1
+                    }
+                };
+                let refused = |result: &serde_json::Value, why: &str| {
+                    assert_eq!(result["result"]["isError"], true, "{result}");
+                    assert!(result.to_string().contains(why), "{why}: {result}");
+                };
+
+                // Spawning a host-executed agent, through either tool.
+                let prefix = token.chars().take(6).collect::<String>();
+                let named = |n: &str| format!("host-{prefix}-{n}");
+                let attempts = vec![
+                    (
+                        "agents",
+                        serde_json::json!({ "action": "spawn", "name": named("a"), "harness": "claude-code" }),
+                        named("a"),
+                    ),
+                    (
+                        "spawn",
+                        serde_json::json!({ "name": named("c"), "harness": "codex" }),
+                        named("c"),
+                    ),
+                ];
+                for (tool, args, name) in attempts {
+                    refused(&call(tool, args).await, "only on a cloud harness");
+                    assert!(state.store.agent_by_name(&name).is_err(), "{name}");
+                }
+                // Moving a child onto a host harness.
+                refused(
+                    &call(
+                        "agents",
+                        serde_json::json!({ "action": "harness", "name": child.name, "harness": "claude-code" }),
+                    )
+                    .await,
+                    "only on a cloud harness",
+                );
+                assert_eq!(state.store.agent(&child.id).unwrap().harness, "claude-cloud");
+                // Waking an archived host agent, explicitly or by a direct send.
+                refused(
+                    &call("wake", serde_json::json!({ "agent": sleeper.name })).await,
+                    "cannot wake it",
+                );
+                let _ = call(
+                    "send",
+                    serde_json::json!({ "to": [sleeper.name], "text": "wake up" }),
+                )
+                .await;
+                assert_eq!(state.store.agent(&sleeper.id).unwrap().state, "archived");
+                // Attaching a host file as media, by path or by bare name.
+                for source in [secret.display().to_string(), "operator-token".to_string()] {
+                    refused(
+                        &call(
+                            "send",
+                            serde_json::json!({
+                                "to": [child.name],
+                                "text": "here",
+                                "media": { "kind": "document", "source": source },
+                            }),
+                        )
+                        .await,
+                        "by `https://` URL only",
+                    );
+                }
+                // A URL attachment and an ordinary send still work.
+                let sent = call(
+                    "send",
+                    serde_json::json!({
+                        "to": [child.name],
+                        "text": "with a link",
+                        "media": { "kind": "photo", "source": "https://example.com/a.png" },
+                    }),
+                )
+                .await;
+                assert_ne!(sent["result"]["isError"], true, "{sent}");
+                assert!(
+                    state
+                        .store
+                        .inbox(&child.id, None)
+                        .unwrap()
+                        .iter()
+                        .any(|message| message.text.contains("with a link"))
+                );
+            }
+        });
+    }
+
+    /// The review's probe, kept as a regression: a seat plants links in the
+    /// memory and skill directories it can write, then asks over HTTP MCP,
+    /// where the tools run as the server. A local capability is refused
+    /// outright; a remote session token's reads never follow the links.
+    #[test]
+    fn http_mcp_never_reads_a_link_a_seat_planted() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let canary = "OPERATOR-SECRET-CANARY-7731";
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let secret = secrets.join("operator-token");
+        std::fs::write(&secret, canary).unwrap();
+        // Makes the linked directory look like a skill to discovery.
+        std::fs::write(secrets.join("SKILL.md"), "---\nname: x\n---\n").unwrap();
+
+        let seat = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("mem-seat", "claude-code"))
+            .unwrap();
+        let seat_cap = state.store.issue_capability(&seat.id).unwrap();
+        let cloud = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("mem-cloud", "claude-cloud"))
+            .unwrap();
+        for agent in [&seat, &cloud] {
+            let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+            std::fs::create_dir_all(&config).unwrap();
+            let root = config.parent().unwrap().to_path_buf();
+            let memory = root.join("memory");
+            std::fs::create_dir_all(&memory).unwrap();
+            std::os::unix::fs::symlink(&secret, memory.join("MEMORY.md")).unwrap();
+            std::os::unix::fs::symlink(&secret, memory.join("leak.md")).unwrap();
+            let overlay = root.join("skills").join("leaky");
+            std::fs::create_dir_all(&overlay).unwrap();
+            std::os::unix::fs::symlink(&secret, overlay.join("SKILL.md")).unwrap();
+            let view = root.join("skills-view");
+            std::fs::create_dir_all(&view).unwrap();
+            std::os::unix::fs::symlink(&secrets, view.join("borrowed")).unwrap();
+        }
+        crate::remote::begin_session(&state.store, &cloud).unwrap();
+        let remote =
+            crate::remote::session_token(&anyagents_core::agent_config_dir(dir.path(), &cloud.id))
+                .unwrap();
+
+        let probes = [
+            ("memory", serde_json::json!({ "action": "list" })),
+            (
+                "memory",
+                serde_json::json!({ "action": "read", "topic": "leak" }),
+            ),
+            (
+                "memory",
+                serde_json::json!({ "action": "read", "topic": "MEMORY" }),
+            ),
+            ("memory", serde_json::json!({ "action": "status" })),
+            ("skills", serde_json::json!({ "action": "list" })),
+            (
+                "skills",
+                serde_json::json!({ "action": "read", "name": "leaky" }),
+            ),
+            (
+                "skills",
+                serde_json::json!({ "action": "read", "name": "borrowed", "file": "operator-token" }),
+            ),
+            (
+                "skills",
+                serde_json::json!({ "action": "search", "query": "CANARY" }),
+            ),
+        ];
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (tool, args) in &probes {
+                let refused = post_mcp_as(&state, &seat_cap, None, tool_call(tool, args.clone()))
+                    .await
+                    .unwrap_err();
+                assert_eq!(refused.status, StatusCode::FORBIDDEN, "{tool} {args}");
+                assert!(!refused.message.contains(canary));
+
+                let (status, body) =
+                    post_mcp_as(&state, &remote, None, tool_call(tool, args.clone()))
+                        .await
+                        .unwrap();
+                assert_eq!(status, StatusCode::OK, "{tool} {args}");
+                assert!(
+                    !body.to_string().contains(canary),
+                    "{tool} {args} leaked: {body}"
+                );
+            }
+        });
+    }
+
     #[test]
     fn spiron_and_sylphx_share_compatible_harnesses_and_seed_auth_json_paths() {
         let dir = crate::test_tempdir();
@@ -10692,6 +14304,449 @@ exec '{}' "$@"
         usage_report(principal, State(state), Query(q))
             .await
             .map(|Json(r)| r)
+    }
+
+    #[tokio::test]
+    async fn agents_report_to_the_operator_and_only_the_operator_reads_it() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let root = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("report-root", "opencode"))
+            .unwrap();
+        state.store.set_agent_admin(&root.id, true).unwrap();
+        let mut new = anyagents_core::NewAgent::new("report-child", "opencode");
+        new.parent_id = Some(root.id.clone());
+        let child = state.store.create_agent(new).unwrap();
+        let as_agent = |agent: &Agent| Principal::Agent {
+            agent_id: agent.id.clone(),
+            name: agent.name.clone(),
+        };
+        let report = |principal: Principal, to: &[&str], text: &str| {
+            send(
+                principal,
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(SendRequest {
+                    to: to.iter().map(|to| to.to_string()).collect(),
+                    text: text.to_string(),
+                    ..SendRequest::default()
+                }),
+            )
+        };
+        let read = |principal: Principal, since: Option<i64>| {
+            operator_reports(
+                principal,
+                State(state.clone()),
+                Query(Since {
+                    since,
+                    limit: None,
+                    unread: None,
+                    sender: None,
+                }),
+            )
+        };
+
+        // Delivery: the report lands in the operator's inbox, keyed to the
+        // sender's immutable id, and in the sender's own history.
+        let text = "worktree add failed: EACCES on .git/worktrees; tried a fresh clone";
+        let Json(sent) = report(as_agent(&child), &["operator"], text).await.unwrap();
+        assert_eq!(sent.deliveries.len(), 1);
+        let delivery = &sent.deliveries[0];
+        assert_eq!(delivery.to, "operator");
+        assert!(!delivery.duplicate);
+        let Json(inbox_view) = read(Principal::Operator, None).await.unwrap();
+        assert_eq!(inbox_view.messages.len(), 1);
+        let stored = &inbox_view.messages[0];
+        assert_eq!(stored.id, delivery.id);
+        assert_eq!(stored.text, text);
+        assert_eq!(stored.sender, format!("agent:{}", child.id));
+        assert_eq!(stored.sender_name.as_deref(), Some("report-child"));
+        let history = state
+            .store
+            .conversation(&child.id, Some("operator"), None, None)
+            .unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|turn| turn.direction == "out" && turn.text == text),
+            "{history:?}"
+        );
+        assert!(
+            read(Principal::Operator, Some(stored.seq))
+                .await
+                .unwrap()
+                .0
+                .messages
+                .is_empty()
+        );
+
+        // An agent may only write: neither the operator route nor an agent
+        // mailbox route reaches it, for a root admin too.
+        for principal in [as_agent(&child), as_agent(&root)] {
+            let err = read(principal.clone(), None).await.unwrap_err();
+            assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+            let err = inbox(
+                principal.clone(),
+                State(state.clone()),
+                AxumPath("operator".into()),
+                Query(Since {
+                    since: None,
+                    limit: None,
+                    unread: None,
+                    sender: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+            let err = operator_inbox(
+                principal,
+                State(state.clone()),
+                AxumPath("operator".into()),
+                Query(Since {
+                    since: None,
+                    limit: None,
+                    unread: None,
+                    sender: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_ne!(err.status, StatusCode::OK, "{}", err.message);
+        }
+
+        // Deduplication: the same report again is the stored one.
+        let Json(again) = report(as_agent(&child), &["operator"], text).await.unwrap();
+        assert!(again.deliveries[0].duplicate);
+        assert_eq!(again.deliveries[0].id, delivery.id);
+        let Json(counted) = read(Principal::Operator, None).await.unwrap();
+        assert_eq!(counted.messages[0].repeats, 1);
+
+        // Rate limit: after the burst the sender is refused with 429, before
+        // any other address of the same send is written.
+        for i in 1..anyagents_core::OPERATOR_BURST {
+            let Json(sent) = report(as_agent(&child), &["operator"], &format!("defect {i}"))
+                .await
+                .unwrap();
+            assert!(!sent.deliveries[0].duplicate);
+        }
+        let parent_mail = state.store.inbox(&root.id, None).unwrap().len();
+        let err = report(as_agent(&child), &["parent", "operator"], "one more")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS, "{}", err.message);
+        assert!(err.message.contains("Retry in"), "{}", err.message);
+        assert_eq!(
+            state.store.inbox(&root.id, None).unwrap().len(),
+            parent_mail
+        );
+        // Another sender has its own limit.
+        let Json(other) = report(as_agent(&root), &["operator"], "one more")
+            .await
+            .unwrap();
+        assert!(!other.deliveries[0].duplicate);
+        let Json(all) = read(Principal::Operator, None).await.unwrap();
+        assert_eq!(
+            all.messages.len(),
+            usize::try_from(anyagents_core::OPERATOR_BURST).unwrap() + 1
+        );
+    }
+
+    #[test]
+    fn concurrent_reports_never_leave_a_mixed_send_half_delivered() {
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("race-parent", "opencode"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("race-child", "opencode");
+        new.parent_id = Some(parent.id.clone());
+        store.create_agent(new).unwrap();
+        let senders = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(senders));
+        let workers: Vec<_> = (0..senders)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let actor = Actor::Agent("race-child".into());
+                    let body = SendRequest {
+                        sender: Some(actor.as_address()),
+                        to: vec!["parent".into(), "operator".into()],
+                        text: format!("defect {i}"),
+                        ..SendRequest::default()
+                    };
+                    let plan = SendPlan::parse(&store, &actor, &body).unwrap();
+                    barrier.wait();
+                    send_sync(&store, &actor, body, plan, None)
+                        .map(|_| ())
+                        .map_err(|err| err.status)
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, Ok(()) | Err(StatusCode::TOO_MANY_REQUESTS))),
+            "{results:?}"
+        );
+        let sent = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            sent,
+            usize::try_from(anyagents_core::OPERATOR_BURST).unwrap()
+        );
+        // Every refused send wrote nothing: the parent got exactly the sends
+        // the operator inbox took.
+        assert_eq!(store.operator_inbox(None, None).unwrap().len(), sent);
+        assert_eq!(store.inbox(&parent.id, None).unwrap().len(), sent);
+    }
+
+    async fn http(
+        socket: &Path,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+        capability: Option<&str>,
+        operator: Option<&str>,
+    ) -> (hyper::StatusCode, serde_json::Value) {
+        let body = body.map(|body| serde_json::to_vec(&body).unwrap());
+        let (status, bytes) = crate::mcp::request(socket, method, path, body, capability, operator)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn over_http_a_report_is_capped_at_16_kib_and_only_the_operator_token_reads_it() {
+        let dir = crate::test_tempdir();
+        let mut state = archetype_validation_state(dir.path());
+        let operator_token = "operator-token-0123456789abcdef0123456789abcdef";
+        state.auth = auth::Mode::Confined {
+            operator_digest: Some(auth::operator_digest(operator_token)),
+        };
+        let parent = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("http-parent", "opencode"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("http-child", "opencode");
+        new.parent_id = Some(parent.id.clone());
+        let child = state.store.create_agent(new).unwrap();
+        let capability = state.store.issue_capability(&child.id).unwrap();
+        let socket = dir.path().join("operator-inbox.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let app = build_router(state.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let report =
+            |text: String| serde_json::json!({ "to": ["parent", "operator"], "text": text });
+
+        // One byte over the cap is refused before any target is written.
+        let max = 16 * 1024;
+        let (status, refused) = http(
+            &socket,
+            "POST",
+            "/v1/send",
+            Some(report("x".repeat(max + 1))),
+            Some(&capability),
+            None,
+        )
+        .await;
+        assert_eq!(status, hyper::StatusCode::BAD_REQUEST, "{refused}");
+        assert!(
+            refused["error"].as_str().unwrap().contains("16 KiB"),
+            "{refused}"
+        );
+        assert!(state.store.inbox(&parent.id, None).unwrap().is_empty());
+        assert!(state.store.operator_inbox(None, None).unwrap().is_empty());
+        // Exactly the cap is delivered to both.
+        let (status, sent) = http(
+            &socket,
+            "POST",
+            "/v1/send",
+            Some(report("y".repeat(max))),
+            Some(&capability),
+            None,
+        )
+        .await;
+        assert_eq!(status, hyper::StatusCode::OK, "{sent}");
+        assert_eq!(sent["deliveries"].as_array().unwrap().len(), 2, "{sent}");
+
+        // The agent's capability, no credential and a wrong token cannot read.
+        for (capability, operator, expected) in [
+            (
+                Some(capability.as_str()),
+                None,
+                hyper::StatusCode::FORBIDDEN,
+            ),
+            (None, None, hyper::StatusCode::UNAUTHORIZED),
+            (None, Some("not-the-token"), hyper::StatusCode::UNAUTHORIZED),
+        ] {
+            let (status, body) = http(
+                &socket,
+                "GET",
+                "/v1/operator/inbox",
+                None,
+                capability,
+                operator,
+            )
+            .await;
+            assert_eq!(status, expected, "{body}");
+        }
+        let (status, read) = http(
+            &socket,
+            "GET",
+            "/v1/operator/inbox?limit=5",
+            None,
+            None,
+            Some(operator_token),
+        )
+        .await;
+        assert_eq!(status, hyper::StatusCode::OK, "{read}");
+        let messages = read["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "{read}");
+        assert_eq!(messages[0]["text"].as_str().unwrap().len(), max);
+        assert_eq!(messages[0]["sender_name"], "http-child");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn verdicts_need_an_ancestor_and_outcomes_follow_the_usage_boundary() {
+        let (_dir, state, root, child, _grandchild, sibling, other_root) = usage_fixture();
+        let as_agent = |agent: &Agent| Principal::Agent {
+            agent_id: agent.id.clone(),
+            name: agent.name.clone(),
+        };
+        let judge = |principal: Principal, target: &str, verdict: &str| {
+            verdict_route(
+                principal,
+                State(state.clone()),
+                AxumPath(target.to_string()),
+                Json(VerdictRequest {
+                    verdict: verdict.to_string(),
+                    reason: Some("checked against the brief".to_string()),
+                }),
+            )
+        };
+        // An agent never judges its own work; peers and other roots cannot.
+        for (principal, target) in [
+            (as_agent(&child), "usage-child"),
+            (as_agent(&sibling), "usage-child"),
+            (as_agent(&other_root), "usage-child"),
+        ] {
+            let err = judge(principal, target, "accepted").await.unwrap_err();
+            assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+        }
+        let err = judge(Principal::Operator, "usage-child", "pr_merged")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        // Any strict ancestor may judge; the operator may judge anyone.
+        let Json(rework) = judge(as_agent(&root), "usage-grandchild", "rework")
+            .await
+            .unwrap();
+        assert_eq!(rework.kind, anyagents_core::OutcomeKind::Rework);
+        assert_eq!(rework.actor, "agent:usage-root");
+        assert_eq!(rework.note.as_deref(), Some("checked against the brief"));
+        let Json(accepted) = judge(as_agent(&child), "usage-grandchild", "Accepted")
+            .await
+            .unwrap();
+        assert_eq!(accepted.kind, anyagents_core::OutcomeKind::Accepted);
+        let Json(rejected) = judge(Principal::Operator, "usage-sibling", "rejected")
+            .await
+            .unwrap();
+        assert_eq!(rejected.actor, "operator");
+
+        let report = |principal: Principal, query: UsageQuery| {
+            outcome_report(principal, State(state.clone()), Query(query))
+        };
+        let by_agent = || UsageQuery {
+            group_by: Some("agent".to_string()),
+            ..UsageQuery::default()
+        };
+        let Json(all) = report(Principal::Operator, by_agent()).await.unwrap();
+        let rows: Vec<(&str, u64, u64, u64)> = all
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.agent_name.as_deref().unwrap(),
+                    group.succeeded,
+                    group.failed,
+                    group.recovered,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("usage-grandchild", 1, 0, 1), ("usage-sibling", 0, 1, 0)]
+        );
+        // Each judged agent's own usage is its cost; the rest is unattributed.
+        assert_eq!(
+            all.groups
+                .iter()
+                .map(|group| group.cost.reported_cost_micros)
+                .sum::<i64>(),
+            400 + 800
+        );
+        assert_eq!(all.unattributed.reported_cost_micros, 100 + 200 + 1600);
+        // A child sees only its subtree, and cannot widen it.
+        let Json(mine) = report(as_agent(&child), by_agent()).await.unwrap();
+        assert_eq!(mine.groups.len(), 1);
+        assert_eq!(
+            mine.groups[0].agent_name.as_deref(),
+            Some("usage-grandchild")
+        );
+        assert_eq!(mine.unattributed.reported_cost_micros, 200);
+        let err = report(
+            as_agent(&child),
+            UsageQuery {
+                agent: Some("usage-sibling".to_string()),
+                ..UsageQuery::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        let err = report(
+            Principal::Operator,
+            UsageQuery {
+                group_by: Some("day".to_string()),
+                ..UsageQuery::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn skill_reads_are_recorded_only_for_the_calling_agent() {
+        let (_dir, state, root, ..) = usage_fixture();
+        let read = |principal: Principal, file: &str| {
+            skill_read_route(
+                principal,
+                State(state.clone()),
+                Json(SkillReadRequest {
+                    skill: "prove-it".to_string(),
+                    file: file.to_string(),
+                    sha256: "d".repeat(64),
+                }),
+            )
+        };
+        let as_root = || Principal::Agent {
+            agent_id: root.id.clone(),
+            name: root.name.clone(),
+        };
+        let Json(recorded) = read(as_root(), "SKILL.md").await.unwrap();
+        assert_eq!(recorded["recorded"], true);
+        let err = read(as_root(), "../escape").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        let err = read(Principal::Operator, "SKILL.md").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -10940,6 +14995,51 @@ exec '{}' "$@"
         assert_eq!(r.totals.input_tokens, 600);
         assert_eq!(r.buckets.len(), 2);
     }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn takeover_pages_are_served_under_their_key_on_the_public_listener() {
+        use axum::body::to_bytes;
+        let page = Router::new()
+            .route(
+                "/",
+                get(|uri: axum::http::Uri| async move { uri.to_string() }),
+            )
+            .route("/ws", get(|| async { "ws" }));
+        crate::workstation::takeover::mount_router("k1", page);
+        let call = |uri: &str| {
+            takeover_page_route(
+                axum::extract::Request::get(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let redirect = call("/v1/webhooks/takeover/k1?token=t").await;
+        assert_eq!(redirect.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            redirect.headers()["location"],
+            "/v1/webhooks/takeover/k1/?token=t",
+            "relative assets need a directory URL"
+        );
+        let body = |r: Response| async move {
+            String::from_utf8(to_bytes(r.into_body(), 1 << 16).await.unwrap().to_vec()).unwrap()
+        };
+        assert_eq!(
+            body(call("/v1/webhooks/takeover/k1/?token=t").await).await,
+            "/?token=t"
+        );
+        assert_eq!(body(call("/v1/webhooks/takeover/k1/ws").await).await, "ws");
+        assert_eq!(
+            call("/v1/webhooks/takeover/zz/").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        crate::workstation::takeover::unmount("k1");
+        assert_eq!(
+            call("/v1/webhooks/takeover/k1/").await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    use std::io::{Read, Write};
+    use std::sync::MutexGuard;
 }
 
 #[cfg(all(test, target_os = "linux"))]

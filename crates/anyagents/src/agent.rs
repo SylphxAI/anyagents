@@ -5,7 +5,6 @@
 use std::path::Path;
 
 use anyagents_core::{Agent, AgentId, Error, Store};
-use anyagents_supervisor::{declared, mode_name, steer_name};
 
 use crate::api::{AgentView, AgentsResponse, GroupActionRequest, GroupView, GroupsResponse};
 use crate::client;
@@ -29,6 +28,9 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
     match action {
         AgentsCommand::GrantAdmin { agent } => set_admin(data, &agent, true)?,
         AgentsCommand::RevokeAdmin { agent } => set_admin(data, &agent, false)?,
+        AgentsCommand::RevokeRemote { agent, session } => {
+            revoke_remote_cmd(data, &agent, session.as_deref())?
+        }
         AgentsCommand::Rename { agent, new_name } => rename_cmd(data, &agent, &new_name)?,
         AgentsCommand::Role { agent, role, clear } => {
             role_cmd(data, &agent, role.as_deref(), clear)?
@@ -726,6 +728,41 @@ pub fn resume_cmd(data: &Path, name: &str, prompt: Option<String>) -> Result<(),
     Ok(())
 }
 
+/// Resume every agent parked as `faulted`: each is woken as `resume` wakes
+/// one, which clears its parking. Prints one line per agent.
+pub fn resume_faulted(data: &Path) -> Result<(), Error> {
+    if client::agent_identity().is_some() {
+        return Err(Error::Message(
+            "resuming every faulted agent is the operator's".into(),
+        ));
+    }
+    let query = server::ListAgentsQuery {
+        state: Some("paused".to_string()),
+        parent: None,
+        name: None,
+    };
+    let listed = match client::get::<AgentsResponse>(data, "/v1/agents?state=paused")
+        .map_err(Error::Message)?
+    {
+        Some(listed) => listed,
+        None => offline_roster(data, &query)?,
+    };
+    let faulted: Vec<_> = listed
+        .agents
+        .iter()
+        .filter(|agent| agent.display_state() == "faulted")
+        .collect();
+    if faulted.is_empty() {
+        println!("no faulted agent");
+        return Ok(());
+    }
+    for agent in faulted {
+        let view = set_state(data, &agent.id, "running")?;
+        println!("{}\t{}\t{}", view.id, view.name, view.state);
+    }
+    Ok(())
+}
+
 pub fn peers_with_options(
     data: &Path,
     state: Option<&str>,
@@ -791,7 +828,6 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         }
     }
     if state == "running" {
-        crate::worktree_access::restore_recorded(data, &found.id)?;
         server::clear_explicitly_archived(data, &found.id);
     }
     let agent = store.set_agent_state(&found.id, state)?;
@@ -810,12 +846,13 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         }
     }
     let lag = store.lag(&agent.id, anyagents_core::now_ms())?;
-    let (mode, steer) = declared(&agent.harness);
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     let public_desc = agent.public_description();
     let scope_val = agent.scope().to_string();
     let lifecycle_val = agent.lifecycle().to_string();
+    let delivery: crate::api::DeliveryView =
+        (&crate::vendor::declared_delivery(&agent.harness)).into();
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -839,8 +876,9 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         state: agent.state,
         process: "-".to_string(),
         turn_state: "idle".to_string(),
-        delivery_mode: mode_name(mode).to_string(),
-        steer_support: steer_name(steer).to_string(),
+        delivery_mode: delivery.legacy_mode(),
+        steer_support: delivery.legacy_steer(),
+        delivery,
         quota_reset_at_ms: None,
         block_reason: None,
         last_error: None,
@@ -853,6 +891,8 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
         schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)
             .map_err(Error::Message)?,
+        turn_errors: None,
+        unsettled_outbound: Vec::new(),
     })
 }
 
@@ -904,6 +944,9 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         parsed.model,
         parsed.profile,
     );
+    if crate::vendor::is_cloud_harness(&harness) {
+        crate::remote::require_public_url(data)?;
+    }
     let mut agent = crate::create::create(
         &store,
         data,
@@ -960,12 +1003,13 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let lag = store
         .lag(&agent.id, anyagents_core::now_ms())
         .map_err(|err| err.to_string())?;
-    let (mode, steer) = declared(&agent.harness);
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     let public_desc = agent.public_description();
     let scope_val = agent.scope().to_string();
     let lifecycle_val = agent.lifecycle().to_string();
+    let delivery: crate::api::DeliveryView =
+        (&crate::vendor::declared_delivery(&agent.harness)).into();
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -989,8 +1033,9 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         state: agent.state,
         process: "-".to_string(),
         turn_state: "idle".to_string(),
-        delivery_mode: mode_name(mode).to_string(),
-        steer_support: steer_name(steer).to_string(),
+        delivery_mode: delivery.legacy_mode(),
+        steer_support: delivery.legacy_steer(),
+        delivery,
         quota_reset_at_ms: None,
         block_reason: None,
         last_error: None,
@@ -1002,7 +1047,37 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
         schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)?,
+        turn_errors: None,
+        unsettled_outbound: Vec::new(),
     })
+}
+
+/// End an agent's remote sessions: through the server when it runs, else in
+/// the store directly, which every server process reads on the next call.
+fn revoke_remote_cmd(data: &Path, agent: &str, session: Option<&str>) -> Result<(), Error> {
+    if client::can_call_server(data) {
+        let body = serde_json::json!({ "session_id": session });
+        let answered = client::call::<serde_json::Value>(
+            data,
+            "POST",
+            &format!("/v1/operator/agents/{agent}/remote-sessions/revoke"),
+            Some(body.to_string().into_bytes()),
+            &client::authority(data),
+        )
+        .map_err(Error::Message)?
+        .ok_or_else(|| Error::Message("the server answered nothing".into()))?;
+        println!("{answered}");
+        return Ok(());
+    }
+    let store = open(data)?;
+    let rec = store.agent_by_name(agent)?;
+    store.record_admin_audit("operator", "agents.revoke_remote_sessions", &rec.name)?;
+    let revoked = crate::remote::revoke(&store, &rec.id, session)?;
+    println!(
+        "{}",
+        serde_json::json!({ "agent": rec.name, "session_id": session, "revoked": revoked })
+    );
+    Ok(())
 }
 
 fn set_admin(data: &Path, agent: &str, admin: bool) -> Result<(), Error> {
@@ -1178,7 +1253,7 @@ fn list_filtered(
                     agent.parent.as_deref().unwrap_or("-"),
                     agent.harness,
                     agent.model.as_deref().unwrap_or("-"),
-                    agent.state,
+                    agent.display_state(),
                     agent.process,
                     show_optional(agent.oldest_undelivered_age_ms)
                 );
@@ -1187,10 +1262,9 @@ fn list_filtered(
                     id: &agent.id,
                     name: &agent.name,
                     harness: &agent.harness,
-                    state: &agent.state,
+                    state: agent.display_state(),
                     process: &agent.process,
-                    mode: &agent.delivery_mode,
-                    steer: &agent.steer_support,
+                    delivery: agent.delivery.label(),
                     undelivered: agent.oldest_undelivered_age_ms,
                     quota: agent.quota_reset_at_ms,
                 });
@@ -1214,7 +1288,7 @@ pub fn offline_roster(
     server::roster_views(
         &store,
         &anyagents_supervisor::HealthBoard::default(),
-        agents,
+        &agents.iter().collect::<Vec<_>>(),
         archived_count,
         query,
     )
@@ -1396,22 +1470,20 @@ struct AgentLine<'a> {
     harness: &'a str,
     state: &'a str,
     process: &'a str,
-    mode: &'a str,
-    steer: &'a str,
+    delivery: String,
     undelivered: Option<i64>,
     quota: Option<i64>,
 }
 
 fn print_agent(agent: AgentLine<'_>) {
     println!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         agent.id,
         agent.name,
         agent.harness,
         agent.state,
         agent.process,
-        agent.mode,
-        agent.steer,
+        agent.delivery,
         show_optional(agent.undelivered),
         show_optional(agent.quota),
     );
@@ -1426,6 +1498,35 @@ fn show_optional(value: Option<i64>) -> String {
 /// Hand every line the running server may have left to the harness, through the
 /// vendor's own input API. A line the harness already took is not written again:
 /// the adapter remembers the ids in the session it resumed.
+/// List an agent's parked messages, or put one back in its mailbox.
+pub fn requeue(
+    data: &Path,
+    name: &str,
+    message: Option<&str>,
+) -> Result<(), anyagents_core::Error> {
+    let store = open(data)?;
+    let agent = store.agent_by_name(name)?;
+    let Some(message) = message else {
+        for parked in store.rejected_messages(&agent.id)? {
+            println!(
+                "{}\t{}\t{}\t{}",
+                parked.message_id,
+                parked.seq,
+                parked.sender.as_deref().unwrap_or("-"),
+                parked.reason
+            );
+        }
+        return Ok(());
+    };
+    let requeued = store.requeue_rejected(&agent.id, message)?;
+    println!(
+        "{}\trequeued\t{message}\t{}",
+        agent.name,
+        requeued.id.as_str()
+    );
+    Ok(())
+}
+
 pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
     let store = open(data)?;
     let agents = if name == "all" {
@@ -1437,6 +1538,16 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
         if agent.state != "running" {
             continue;
         }
+        // One vendor process per agent: a harness a server or a keeper holds
+        // takes its own mail; this one-shot process would be a second.
+        let _process = match store.try_lock_agent(&agent.id) {
+            Ok(lock) => lock,
+            Err(anyagents_core::Error::AgentBusy) => {
+                println!("{}	skipped	its harness process is live", agent.name);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let config_dir = anyagents_core::agent_config_dir(data, &agent.id);
         let work_dir = agent
             .workdir
@@ -1449,6 +1560,7 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
             config_dir,
             work_dir,
             extra_env: Vec::new(),
+            lock: None,
         };
         let mut harness = match crate::vendor::vendor_launch_with_store(request, &store) {
             Ok(harness) => harness,
@@ -1459,6 +1571,9 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
         };
         let mut flushed = 0u32;
         let mut failure = None;
+        // The delivery loop's breaker: the same refusal twice is a vendor that
+        // refuses everything, so nothing more is parked.
+        let mut last_rejection: Option<String> = None;
         loop {
             let message = store.next_undelivered(&agent.id)?;
             let Some(message) = message else {
@@ -1473,10 +1588,50 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                 source_time_ms: message.source_time_ms,
                 context: message.context.clone(),
             };
+            // Only a message the harness provably took is delivered. A line
+            // still in flight, deferred or quota-held stays in the mailbox for
+            // the next delivery, which idempotent input makes safe to repeat.
             match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
-                Ok(_) => {
+                Ok(
+                    anyagents_harness::DeliverOutcome::Accepted { .. }
+                    | anyagents_harness::DeliverOutcome::Duplicate,
+                ) => {
                     store.note_delivered(&agent.id, message.seq)?;
                     flushed += 1;
+                    last_rejection = None;
+                }
+                Ok(anyagents_harness::DeliverOutcome::InFlight) => {
+                    failure = Some("not yet consumed by the harness; left queued".into());
+                    break;
+                }
+                Ok(anyagents_harness::DeliverOutcome::Deferred) => {
+                    failure = Some("harness deferred the message; left queued".into());
+                    break;
+                }
+                Ok(anyagents_harness::DeliverOutcome::Quota { reset_at_ms }) => {
+                    failure = Some(format!("quota until {reset_at_ms}; left queued"));
+                    break;
+                }
+                // Refused for good: parked past the cursor, its sender told.
+                Ok(anyagents_harness::DeliverOutcome::Rejected {
+                    reason,
+                    message_specific,
+                }) => {
+                    if !message_specific && last_rejection.as_deref() == Some(reason.as_str()) {
+                        failure = Some(format!(
+                            "the harness refuses message after message ({reason}); left queued"
+                        ));
+                        break;
+                    }
+                    store.reject_message(&agent.id, message.seq, &reason)?;
+                    println!(
+                        "{}\trejected\t{}\t{reason}",
+                        agent.name,
+                        message.id.as_str()
+                    );
+                    if !message_specific {
+                        last_rejection = Some(reason);
+                    }
                 }
                 Err(err) => {
                     failure = Some(err.to_string());
@@ -1530,36 +1685,7 @@ pub fn usage(data: &Path, params: &UsageParams) -> Result<(), UsageError> {
 
     // 1) Socket-first: the daemon resolves the caller from its credential
     // and enforces the causal authorization boundary server-side.
-    let mut qs: Vec<(String, String)> = Vec::new();
-    if let Some(agent) = params.agent.as_deref().filter(|a| !a.trim().is_empty()) {
-        qs.push(("agent".into(), agent.to_string()));
-    }
-    if let Some(v) = params.include_descendants {
-        qs.push(("include_descendants".into(), v.to_string()));
-    }
-    if let Some(v) = params.since_ms {
-        qs.push(("since_ms".into(), v.to_string()));
-    }
-    if let Some(v) = params.until_ms {
-        qs.push(("until_ms".into(), v.to_string()));
-    }
-    if let Some(v) = params.days {
-        qs.push(("days".into(), v.to_string()));
-    }
-    if let Some(g) = group_by {
-        qs.push(("group_by".into(), g.to_string()));
-    }
-    let path = if qs.is_empty() {
-        "/v1/usage".to_string()
-    } else {
-        let q = qs
-            .iter()
-            .map(|(k, v)| format!("{k}={}", crate::mcp::urlencoding_simple_pub(v)))
-            .collect::<Vec<_>>()
-            .join("&");
-        format!("/v1/usage?{q}")
-    };
-    match crate::client::get::<UsageReport>(data, &path) {
+    match crate::client::get::<UsageReport>(data, &usage_path("/v1/usage", params)) {
         Ok(Some(report)) => {
             print_report(&report);
             return Ok(());
@@ -1641,6 +1767,230 @@ pub fn usage(data: &Path, params: &UsageParams) -> Result<(), UsageError> {
         );
     }
     Ok(())
+}
+
+/// `route` with the target, window and grouping of `params` as its query.
+fn usage_path(route: &str, params: &UsageParams) -> String {
+    let group_by = params
+        .group_by
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty());
+    let mut qs: Vec<(&str, String)> = Vec::new();
+    if let Some(agent) = params.agent.as_deref().filter(|a| !a.trim().is_empty()) {
+        qs.push(("agent", agent.to_string()));
+    }
+    if let Some(v) = params.include_descendants {
+        qs.push(("include_descendants", v.to_string()));
+    }
+    if let Some(v) = params.since_ms {
+        qs.push(("since_ms", v.to_string()));
+    }
+    if let Some(v) = params.until_ms {
+        qs.push(("until_ms", v.to_string()));
+    }
+    if let Some(v) = params.days {
+        qs.push(("days", v.to_string()));
+    }
+    if let Some(g) = group_by {
+        qs.push(("group_by", g.to_string()));
+    }
+    if qs.is_empty() {
+        return route.to_string();
+    }
+    let q = qs
+        .iter()
+        .map(|(k, v)| format!("{k}={}", crate::mcp::urlencoding_simple_pub(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{route}?{q}")
+}
+
+/// Outcomes, recovery and cost per successful outcome (ADR 0008). Prefers
+/// the daemon socket (`GET /v1/outcomes`), which applies the caller's
+/// boundary; only the operator falls back to a read of the store when the
+/// daemon is unavailable.
+pub fn outcomes(data: &Path, params: &UsageParams) -> Result<(), UsageError> {
+    use anyagents_core::{OutcomeGroupBy, OutcomeReport, UsageFilter, UsageGroupBy};
+    let report =
+        match crate::client::get::<OutcomeReport>(data, &usage_path("/v1/outcomes", params)) {
+            Ok(Some(report)) => report,
+            // An agent reads only through the server, which applies its boundary.
+            Ok(None) if client::agent_identity().is_some() => {
+                return Err(UsageError::Refused(
+                    "the outcome report needs the running server".to_string(),
+                ));
+            }
+            Ok(None) => {
+                let store = open(data)?;
+                let agents = store.list_agents()?;
+                let ids = anyagents_core::resolve_usage_agents(
+                    None,
+                    &agents,
+                    params.agent.as_deref(),
+                    params.include_descendants,
+                )
+                .map_err(|err| UsageError::Refused(err.to_string()))?;
+                let group_by = OutcomeGroupBy::parse(params.group_by.as_deref().unwrap_or(""))
+                    .map_err(UsageError::Refused)?;
+                let now = anyagents_core::now_ms();
+                let (since, until) = UsageFilter {
+                    since_ms: params.since_ms,
+                    until_ms: params.until_ms,
+                    days: params.days,
+                    group_by: UsageGroupBy::Agent,
+                }
+                .window(now)
+                .map_err(UsageError::Refused)?;
+                store.outcome_report(&ids, since, until.unwrap_or(now), group_by)?
+            }
+            Err(err) => return Err(UsageError::Refused(err)),
+        };
+    print_outcomes(&report);
+    Ok(())
+}
+
+/// The grouping a report row stands for, as one label.
+fn outcome_label(group: &anyagents_core::OutcomeGroup) -> String {
+    let parts: Vec<&str> = [
+        group.harness.as_deref(),
+        group.model.as_deref(),
+        group.role.as_deref(),
+        group.profile.as_deref(),
+        group.agent_name.as_deref(),
+        group.skill.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+fn print_outcomes(report: &anyagents_core::OutcomeReport) {
+    let money = |micros: Option<i64>| match micros {
+        Some(micros) => format!("${:.4}", micros as f64 / 1_000_000.0),
+        None => "-".to_string(),
+    };
+    let cost = |cost: &anyagents_core::OutcomeCost| {
+        if cost.turns_with_cost == 0 {
+            "-".to_string()
+        } else if cost.turns_with_cost == cost.turns {
+            money(Some(cost.reported_cost_micros))
+        } else {
+            format!(
+                "{} ({}/{} turns)",
+                money(Some(cost.reported_cost_micros)),
+                cost.turns_with_cost,
+                cost.turns
+            )
+        }
+    };
+    let minutes = |ms: Option<i64>| ms.map_or("-".to_string(), |ms| format!("{}m", ms / 60_000));
+    if crate::ui::is_pretty() {
+        if report.groups.is_empty() {
+            println!("  {}", crate::ui::dim("No outcomes recorded."));
+        } else {
+            println!("\n  {}\n", crate::ui::bold_cyan("Outcomes"));
+            let mut table = crate::ui::Table::new(&[
+                ("GROUP", false),
+                ("AGENTS", true),
+                ("SUCCEEDED", true),
+                ("FAILED", true),
+                ("ABANDONED", true),
+                ("RECOVERED", true),
+                ("COST", true),
+                ("COST/SUCCESS", true),
+                ("TO SUCCESS", true),
+            ]);
+            for group in &report.groups {
+                table.add_row(vec![
+                    crate::ui::bold(&outcome_label(group)),
+                    group.agents.to_string(),
+                    crate::ui::green(&group.succeeded.to_string()),
+                    group.failed.to_string(),
+                    group.abandoned.to_string(),
+                    format!("{}/{}", group.recovered, group.reworked),
+                    cost(&group.cost),
+                    money(group.cost_per_success_micros),
+                    minutes(group.median_ms_to_success),
+                ]);
+            }
+            table.print();
+        }
+        println!(
+            "  {} {}\n",
+            crate::ui::dim("Unattributed usage:"),
+            cost(&report.unattributed)
+        );
+        return;
+    }
+    for group in &report.groups {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            outcome_label(group),
+            group.agents,
+            group.succeeded,
+            group.failed,
+            group.abandoned,
+            group.reworked,
+            group.recovered,
+            group.cost.turns,
+            group.cost.turns_with_cost,
+            group.cost.reported_cost_micros,
+            group
+                .cost_per_success_micros
+                .map_or("-".to_string(), |micros| micros.to_string()),
+            group
+                .median_ms_to_success
+                .map_or("-".to_string(), |ms| ms.to_string()),
+        );
+    }
+    println!(
+        "unattributed\t\t\t\t\t\t\t{}\t{}\t{}\t\t",
+        report.unattributed.turns,
+        report.unattributed.turns_with_cost,
+        report.unattributed.reported_cost_micros
+    );
+}
+
+/// Record a verdict on `agent`'s work through the server, which checks that
+/// the caller is its ancestor, a root admin or the operator.
+pub fn verdict_cmd(
+    data: &Path,
+    agent: &str,
+    verdict: &str,
+    reason: Option<&str>,
+) -> Result<(), Error> {
+    let clean_agent = agent.trim().strip_prefix("agent:").unwrap_or(agent.trim());
+    if !client::can_call_server(data) {
+        return Err(Error::Message(
+            "recording a verdict needs the running server".into(),
+        ));
+    }
+    let body = serde_json::json!({ "verdict": verdict, "reason": reason });
+    match client::call::<anyagents_core::Outcome>(
+        data,
+        "POST",
+        &format!("/v1/agents/{clean_agent}/verdict"),
+        Some(body.to_string().into_bytes()),
+        &client::authority(data),
+    ) {
+        Ok(Some(outcome)) => {
+            println!(
+                "{}\t{clean_agent}\t{}\t{}",
+                outcome.id,
+                outcome.kind.as_str(),
+                outcome.actor
+            );
+            Ok(())
+        }
+        Ok(None) => Err(Error::Message("the server answered nothing".into())),
+        Err(err) => Err(Error::Message(err)),
+    }
 }
 
 /// Render a socket `UsageReport` in the historical table/TSV shape.

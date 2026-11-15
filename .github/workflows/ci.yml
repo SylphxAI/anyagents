@@ -101,6 +101,9 @@ jobs:
       - name: Build harness helper binaries
         run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
       - name: Test
+        env:
+          # The browser jail's acceptance fails, never skips, without Landlock.
+          ANYAGENTS_REQUIRE_LANDLOCK_TEST: '1'
         run: cargo test --workspace --locked
       # A real desktop session: headless Wayland (sway), the VNC server behind
       # takeover (wayvnc) and the runner's Chrome, driven through the browser
@@ -114,9 +117,9 @@ jobs:
         env:
           ANYAGENTS_DESKTOP_HEADFUL: '1'
           ANYAGENTS_CHROMIUM_BIN: /usr/bin/google-chrome
-        run: cargo test -p anyagents --bin anyagents --locked workstation::headful -- --nocapture
+        run: cargo test -p anyagents --bin anyagents --locked workstation::headful_tests -- --nocapture
 
-      # Same public Linux sudo lane as the cross-UID worktree acceptance.
+      # Same public Linux sudo lane as the cross-seat repository acceptance.
       # This is required: missing privilege, identity change or setpriv fails.
       - name: Host memory managed-UID admission
         run: |
@@ -136,13 +139,16 @@ jobs:
             cat "$RUNNER_TEMP/host-memory-seat-receipt.json"
           fi
 
-      - name: Cross-seat worktree writes
+      - name: Cross-seat repositories
         run: |
           set -euo pipefail
           cargo test -p anyagents --bin anyagents --locked --no-run --message-format=json > "$RUNNER_TEMP/worktree-test-build.json"
           test_binary=$(python3 -c 'import json,sys; artifacts=[a for line in open(sys.argv[1]) if (a:=json.loads(line)).get("reason")=="compiler-artifact" and a.get("target",{}).get("name")=="anyagents" and a.get("profile",{}).get("test") and a.get("executable")]; assert len(artifacts)==1; print(artifacts[0]["executable"])' "$RUNNER_TEMP/worktree-test-build.json")
-          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact create::tests::privileged_cross_uid_spawn_can_create_commit_and_status --nocapture
-          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact worktree::tests::privileged_pool_seat_workflow_receipt --nocapture
+          # Two seat uids, each committing and pushing in its own repository
+          # over one pool, neither able to read the other's Git directory.
+          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact repo::tests::privileged_seats_own_their_repositories --nocapture
+          # A file the server opens for a seat is opened by that seat.
+          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact seat_tree::tests::privileged_seat_open_refuses_what_the_seat_cannot_read --nocapture
 
   # The macOS lane: the same gate on a second platform. macOS is a supported
   # host for a long-lived agent, so its build is checked before merge.

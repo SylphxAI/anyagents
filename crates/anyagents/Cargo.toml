@@ -14,12 +14,16 @@ anyagents-harness = { path = "../anyagents-harness" }
 anyagents-harness-agy = { path = "../anyagents-harness-agy" }
 anyagents-harness-omp = { path = "../anyagents-harness-omp" }
 anyagents-installer = { path = "../anyagents-installer" }
+anyagents-keeper = { path = "../anyagents-keeper" }
+anyagents-toolchain = { path = "../anyagents-toolchain" }
 anyagents-harness-claude = { path = "../anyagents-harness-claude" }
 anyagents-harness-stream = { path = "../anyagents-harness-stream" }
 anyagents-harness-muse = { path = "../anyagents-harness-muse" }
 anyagents-harness-codex = { path = "../anyagents-harness-codex" }
 anyagents-harness-opencode = { path = "../anyagents-harness-opencode" }
+anyagents-harness-spiron = { path = "../anyagents-harness-spiron" }
 anyagents-supervisor = { path = "../anyagents-supervisor" }
+anyagents-memory = { path = "../anyagents-memory", features = ["service"] }
 anyagents-tools = { path = "../anyagents-tools" }
 axum = { version = "0.8", features = ["json"] }
 bytes = "1"
@@ -45,15 +49,20 @@ serde_yaml_ng = "0.10"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-stream = "0.1"
+toml = "0.9"
 ureq = { version = "3", features = ["json"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 roxmltree = "0.21"
 
 # Desktop sessions (headless Wayland) exist on Linux only; other hosts answer
 # session calls with a typed `UNSUPPORTED` error.
+#
+# Pinned by git revision (agent-workstation 0.2.0, merged to main as #9)
+# until 0.2.0 is published; then this becomes `agent-workstation = "0.2"`.
 [target.'cfg(target_os = "linux")'.dependencies]
-agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "55a7eb216055182292a6a9304815a2104d57f38f" }
+agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "b740702cca87d2282ae827f4dc03694ae241d76e" }
 async-trait = "0.1"
+tower = { version = "0.5", features = ["util"] }
 url = "2"
 
 [dev-dependencies]
@@ -62,6 +71,8 @@ anyagents-core = { path = "../anyagents-core" }
 
 anyagents-harness-agy = { path = "../anyagents-harness-agy" }
 anyagents-harness-muse = { path = "../anyagents-harness-muse" }
+anyagents-invariants = { path = "../../tests/invariants" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rmcp = { version = "3.5", features = ["client", "transport-child-process"] }
 serde_json = "1"
 tempfile = "3"

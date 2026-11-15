@@ -4,15 +4,53 @@
 //! The Antigravity harness is one catalog entry, not a copied adapter: this
 //! crate is the thin name the supervisor starts it by. Its launch shape, closing
 //! line and usage come from `StreamSpec::for_program("agy")`.
+//!
+//! Delivery (`docs/delivery.md`): an idle agent's message is a stdin line that
+//! opens a turn, taken once the cascade shows the turn's first step. With the
+//! agent's config directory and a work directory, mail for a busy agent goes
+//! into the running cascade through the language server's
+//! `SendUserCascadeMessage` (`NEXT_INVOCATION`), which writes it to the
+//! cascade's durable mailbox and answers `{}`. That answer proves nothing: a
+//! cascade whose run fails never takes what waits in its mailbox. A message
+//! is committed only once the cascade's own record shows it took it: a
+//! `USER_INPUT` row of `transcript_full.jsonl` that opens with its marker, or
+//! its mailbox file marked in `messages/read.json`. Until then it is in
+//! flight; the cascade takes it at a later step or invocation, a process
+//! resuming the cascade finds it still held there and does not write it
+//! again, and a process on a new cascade (the old one retired) is offered it
+//! afresh. While the mailbox holds mail, new mail joins it rather than
+//! opening a turn on stdin that could run first.
+//!
+//! The level is `turn-end`: that the running turn takes its mailbox at its
+//! next step is inferred from the vendor, not yet proven against it. A
+//! resumed cascade's transcript is read before its process starts, so a
+//! message an earlier process applied is answered as a duplicate
+//! (idempotent). A refusal is not a fault: the message goes back to the
+//! mailbox. The request runs off the delivery path and waits for its answer
+//! without a timeout; an answer that never came is settled from the
+//! cascade's mailbox and transcript, never by sending again blindly. Without
+//! the language server a line written mid-turn waits for the turn to end.
 
 use std::path::{Path, PathBuf};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, SteerSupport, TurnUsage,
+    DeliverOutcome, Delivery, DeliveryLevel, DeliveryMode, Harness, HarnessError, HarnessHealth,
+    TurnUsage,
 };
 pub use anyagents_harness_stream::detect_agy_session_quota_and_error;
 use anyagents_harness_stream::{
     AgyRpcConfig, Launch, StreamHarness, StreamSpec, cancel_line, message_line,
+};
+
+/// What this adapter guarantees for mail that reaches a busy agent
+/// (`docs/delivery.md`).
+pub const DELIVERY: Delivery = Delivery {
+    level: DeliveryLevel::TurnEnd,
+    idempotent: true,
+    proof: std::borrow::Cow::Borrowed(
+        "the cascade took it: a USER_INPUT transcript row or messages/read.json",
+    ),
+    peer: None,
 };
 
 /// One long-lived Antigravity child.
@@ -52,11 +90,6 @@ impl AgyHarness {
             args.push(spec.resume_flag.to_string());
             args.push(id.to_string());
         }
-        let (mode, steer) = if work_dir.is_some() {
-            (DeliveryMode::Steer, SteerSupport::Yes)
-        } else {
-            (DeliveryMode::Followup, SteerSupport::Unproven)
-        };
         let fake_mode = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
             || environment.iter().any(|(k, _)| k == "ANYAGENTS_FAKE_MODE");
         let agy_rpc = if work_dir.is_some() && !fake_mode {
@@ -92,6 +125,16 @@ impl AgyHarness {
         } else {
             None
         };
+        // Mid-turn mail needs the language server; without it a line written
+        // mid-turn waits for the turn to end.
+        let (mode, delivery) = if agy_rpc.is_some() {
+            (DeliveryMode::Steer, DELIVERY)
+        } else {
+            (
+                DeliveryMode::Followup,
+                anyagents_harness_stream::LINE_PER_TURN,
+            )
+        };
         let inner = StreamHarness::launch_with_agy_rpc(
             Launch {
                 spec: spec.clone(),
@@ -101,7 +144,7 @@ impl AgyHarness {
                 work_dir: work_dir.map(Path::to_path_buf),
                 session_id: session_id.map(str::to_string),
                 mode,
-                steer,
+                delivery,
             },
             agy_rpc,
         )?;
@@ -146,6 +189,14 @@ impl Harness for AgyHarness {
             .deliver(message, &message_line(&self.spec, message))
     }
 
+    fn proven(&self, message_id: &str) -> Option<anyagents_harness::Proof> {
+        self.inner.proven(message_id)
+    }
+
+    fn stop(&mut self) {
+        self.inner.stop();
+    }
+
     fn background(&mut self) -> Result<(), HarnessError> {
         self.inner.background()
     }
@@ -168,10 +219,6 @@ impl Harness for AgyHarness {
 
     fn clear_quota(&mut self) {
         self.inner.clear_quota();
-    }
-
-    fn take_reclaimed_steers(&mut self) -> Vec<String> {
-        self.inner.take_reclaimed_steers()
     }
 
     fn process_id(&self) -> Option<u32> {

@@ -221,6 +221,12 @@ impl RawSegment {
 /// Open retained bytes without following a symlink at any path component.
 /// Descriptor-relative traversal closes the check/open race with a live seat.
 pub fn open_readonly(path: &Path) -> io::Result<File> {
+    open_readonly_with_metadata(path).map(|(file, _)| file)
+}
+
+fn open_readonly_with_metadata(path: &Path) -> io::Result<(File, fs::Metadata)> {
+    #[cfg(test)]
+    counters::OPENS.with(|n| n.set(n.get() + 1));
     #[cfg(unix)]
     {
         use std::{
@@ -261,7 +267,7 @@ pub fn open_readonly(path: &Path) -> io::Result<File> {
                         "raw source must be a single-link regular file",
                     ));
                 }
-                return Ok(file);
+                return Ok((file, meta));
             }
             directory = file;
         }
@@ -269,7 +275,306 @@ pub fn open_readonly(path: &Path) -> io::Result<File> {
     }
     #[cfg(not(unix))]
     {
-        File::open(path)
+        let file = File::open(path)?;
+        let meta = file.metadata()?;
+        Ok((file, meta))
+    }
+}
+
+/// One retained file opened once through [`open_readonly`]. Every read of
+/// one refresh (scan, validation, metadata, projection, hashing) is served by
+/// positioned reads on this descriptor through one read-ahead window, so a
+/// source costs one path walk and O(bytes / window) reads, not a walk or a
+/// syscall per record or per byte. Positioned reads share no file offset.
+pub(crate) struct RawSource {
+    path: PathBuf,
+    /// A file read through positioned reads, or one native store row held
+    /// whole: a row is read by one query, in one snapshot of its store.
+    backing: Backing,
+    stamp: crate::host_cursor::FileStamp,
+    window: Vec<u8>,
+    window_at: u64,
+    window_len: usize,
+}
+enum Backing {
+    File(File),
+    Row,
+}
+const MIN_WINDOW: u64 = 4 * 1024;
+const READ_AHEAD: u64 = 64 * 1024;
+const MAX_WINDOW: u64 = 1024 * 1024;
+impl RawSource {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        if let Some(row) = crate::host_sqlite::RowRef::parse(path) {
+            let bytes = row.read()?;
+            return Self::from_row(&row, bytes);
+        }
+        let (file, metadata) = open_readonly_with_metadata(path)?;
+        Ok(Self {
+            path: path.to_owned(),
+            backing: Backing::File(file),
+            stamp: crate::host_cursor::FileStamp::from_metadata(&metadata),
+            window: Vec::new(),
+            window_at: 0,
+            window_len: 0,
+        })
+    }
+    /// One store row already read in the caller's snapshot. Its stamp is the
+    /// database's, with the row's own length.
+    pub(crate) fn from_row(row: &crate::host_sqlite::RowRef, bytes: Vec<u8>) -> io::Result<Self> {
+        let (_, metadata) = open_readonly_with_metadata(&row.db)?;
+        let mut stamp = crate::host_cursor::FileStamp::from_metadata(&metadata);
+        stamp.len = bytes.len() as u64;
+        let window_len = bytes.len();
+        Ok(Self {
+            path: row.segment(),
+            backing: Backing::Row,
+            stamp,
+            window: bytes,
+            window_at: 0,
+            window_len,
+        })
+    }
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+    /// The stamp observed when the descriptor was opened.
+    pub(crate) fn stamp(&self) -> &crate::host_cursor::FileStamp {
+        &self.stamp
+    }
+    /// `[offset, offset + length)`, cut short at the end of the file.
+    pub(crate) fn range(&mut self, offset: u64, length: u64) -> SourceRange<'_> {
+        SourceRange {
+            source: self,
+            offset,
+            end: offset.saturating_add(length),
+        }
+    }
+    /// Refuse a coordinate whose bytes no longer have its length and SHA-256.
+    pub(crate) fn verify(&mut self, raw: &RawCoordinate) -> io::Result<()> {
+        let (length, sha256) = hash_all(self.range(raw.offset, raw.length))?;
+        if length != raw.length || sha256 != raw.sha256 {
+            return Err(io::Error::other("index coordinate integrity mismatch"));
+        }
+        Ok(())
+    }
+    /// The whole file, to its current end, as one document coordinate.
+    pub(crate) fn whole(&mut self) -> io::Result<RawCoordinate> {
+        let (length, sha256) = hash_all(self.range(0, u64::MAX))?;
+        Ok(RawCoordinate {
+            segment: self.path.clone(),
+            offset: 0,
+            length,
+            sha256,
+            seq: 1,
+        })
+    }
+    /// Bytes from `offset`, refilling the window there when it does not
+    /// already hold them. A refill reads ahead at least 64 KiB, so consecutive
+    /// records share one read, and at most 1 MiB or the file's size.
+    fn fill(&mut self, offset: u64, wanted: u64) -> io::Result<&[u8]> {
+        let held = self.window_at..self.window_at + self.window_len as u64;
+        let Backing::File(file) = &self.backing else {
+            // A row is held whole; past its end there is nothing.
+            let start = offset.min(self.window_len as u64) as usize;
+            return Ok(&self.window[start..self.window_len]);
+        };
+        if !held.contains(&offset) {
+            let size = wanted
+                .clamp(READ_AHEAD, MAX_WINDOW)
+                .min(self.stamp.len.max(MIN_WINDOW)) as usize;
+            if self.window.len() < size {
+                self.window.resize(size, 0);
+            }
+            #[cfg(test)]
+            counters::READS.with(|n| n.set(n.get() + 1));
+            self.window_at = offset;
+            self.window_len = 0;
+            let mut reader = ReadAt { file, offset };
+            while self.window_len < size {
+                match reader.read(&mut self.window[self.window_len..size]) {
+                    Ok(0) => break,
+                    Ok(n) => self.window_len += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        self.window_len = 0;
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        let start = (offset - self.window_at) as usize;
+        Ok(&self.window[start..self.window_len])
+    }
+}
+
+/// Buffered reader over one byte range of a [`RawSource`].
+pub(crate) struct SourceRange<'a> {
+    source: &'a mut RawSource,
+    offset: u64,
+    end: u64,
+}
+impl Read for SourceRange<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let n = available.len().min(output.len());
+        output[..n].copy_from_slice(&available[..n]);
+        self.consume(n);
+        Ok(n)
+    }
+}
+impl BufRead for SourceRange<'_> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.offset >= self.end {
+            return Ok(&[]);
+        }
+        let wanted = self.end - self.offset;
+        let bytes = self.source.fill(self.offset, wanted)?;
+        Ok(&bytes[..bytes
+            .len()
+            .min(usize::try_from(wanted).unwrap_or(usize::MAX))])
+    }
+    fn consume(&mut self, amount: usize) {
+        self.offset += amount as u64;
+    }
+}
+
+/// Positioned reads from an offset; the descriptor's own offset is untouched.
+struct ReadAt<'a> {
+    file: &'a File,
+    offset: u64,
+}
+impl Read for ReadAt<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let n = std::os::unix::fs::FileExt::read_at(self.file, output, self.offset)?;
+        self.offset += n as u64;
+        Ok(n)
+    }
+}
+
+fn hash_all(mut reader: impl BufRead) -> io::Result<(u64, String)> {
+    let mut hash = Sha256::new();
+    let mut length = 0u64;
+    loop {
+        let bytes = reader.fill_buf()?;
+        if bytes.is_empty() {
+            return Ok((length, format!("{:x}", hash.finalize())));
+        }
+        hash.update(bytes);
+        length += bytes.len() as u64;
+        let n = bytes.len();
+        reader.consume(n);
+    }
+}
+
+/// One JSONL line read from a buffered stream.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum JsonlLine {
+    /// A newline-terminated line holding an indexed raw coordinate.
+    Complete { length: u64, sha256: String },
+    /// Final bytes with no newline yet: never validated or committed.
+    Partial { length: u64 },
+}
+
+/// Read, hash and validate one line as its bytes pass. Validation streams
+/// through `IgnoredAny`, so neither a huge tool output nor the line itself is
+/// ever resident, and no byte is read twice. `None` means end of input.
+pub(crate) fn read_jsonl_line(reader: &mut impl BufRead) -> io::Result<Option<JsonlLine>> {
+    read_jsonl_line_with_policy(reader, false)
+}
+
+pub(crate) fn read_jsonl_line_with_policy(
+    reader: &mut impl BufRead,
+    tolerate_malformed: bool,
+) -> io::Result<Option<JsonlLine>> {
+    let mut line = LineState {
+        hash: Sha256::new(),
+        length: 0,
+        complete: false,
+    };
+    // serde reads byte by byte; the BufReader serves those bytes from memory.
+    let parsed = serde_json::from_reader::<_, serde::de::IgnoredAny>(BufReader::with_capacity(
+        8 * 1024,
+        Line {
+            reader: &mut *reader,
+            state: &mut line,
+        },
+    ));
+    // Whatever the parser did not consume still belongs to this line.
+    io::copy(
+        &mut Line {
+            reader: &mut *reader,
+            state: &mut line,
+        },
+        &mut io::sink(),
+    )?;
+    if line.length == 0 {
+        return Ok(None);
+    }
+    if !line.complete {
+        return Ok(Some(JsonlLine::Partial {
+            length: line.length,
+        }));
+    }
+    if let Err(e) = parsed {
+        if e.classify() == serde_json::error::Category::Io {
+            return Err(io::Error::new(
+                e.io_error_kind().unwrap_or(io::ErrorKind::Other),
+                e,
+            ));
+        }
+        if !tolerate_malformed {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+    }
+    Ok(Some(JsonlLine::Complete {
+        length: line.length,
+        sha256: format!("{:x}", line.hash.finalize()),
+    }))
+}
+struct LineState {
+    hash: Sha256,
+    length: u64,
+    complete: bool,
+}
+/// Yields bytes up to and including the first newline, hashing them.
+struct Line<'a, R> {
+    reader: &'a mut R,
+    state: &'a mut LineState,
+}
+impl<R: BufRead> Read for Line<'_, R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.state.complete || output.is_empty() {
+            return Ok(0);
+        }
+        let bytes = self.reader.fill_buf()?;
+        let bytes = &bytes[..bytes.len().min(output.len())];
+        let n = match bytes.iter().position(|b| *b == b'\n') {
+            Some(newline) => {
+                self.state.complete = true;
+                newline + 1
+            }
+            None => bytes.len(),
+        };
+        output[..n].copy_from_slice(&bytes[..n]);
+        self.state.hash.update(&bytes[..n]);
+        self.state.length += n as u64;
+        self.reader.consume(n);
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod counters {
+    use std::cell::Cell;
+    thread_local! {
+        /// Path walks through `open_readonly` on this thread.
+        pub(crate) static OPENS: Cell<usize> = const { Cell::new(0) };
+        /// Positioned window reads by `RawSource` on this thread.
+        pub(crate) static READS: Cell<usize> = const { Cell::new(0) };
+    }
+    pub(crate) fn snapshot() -> (usize, usize) {
+        (OPENS.with(Cell::get), READS.with(Cell::get))
     }
 }
 
@@ -557,41 +862,26 @@ fn scan_jsonl(
     file.seek(SeekFrom::Start(0))?;
     let mut records = Vec::new();
     let mut at = 0u64;
-    let mut length = 0u64;
-    let mut hash = Sha256::new();
     let mut reader = BufReader::with_capacity(64 * 1024, file);
-    loop {
-        let bytes = reader.fill_buf()?;
-        if bytes.is_empty() {
-            if length > 0 && !allow_partial_tail {
+    // Each line is validated from the bytes already being read and hashed.
+    while let Some(line) = read_jsonl_line(&mut reader)? {
+        match line {
+            JsonlLine::Complete { length, sha256 } => {
+                records.push(RawCoordinate {
+                    segment: path.to_owned(),
+                    offset: at,
+                    length,
+                    sha256,
+                    seq: records.len() as u64 + 1,
+                });
+                at += length;
+            }
+            // Read-only indexing leaves an active writer's tail untouched.
+            JsonlLine::Partial { .. } if allow_partial_tail => break,
+            JsonlLine::Partial { .. } => {
                 return Err(io::Error::other("incomplete legacy JSONL final line"));
             }
-            break; // read-only indexing leaves an active writer's tail untouched
         }
-        let newline = bytes.iter().position(|b| *b == b'\n');
-        let consumed = newline.map_or(bytes.len(), |end| end + 1);
-        hash.update(&bytes[..consumed]);
-        length += consumed as u64;
-        reader.consume(consumed);
-        if newline.is_none() {
-            continue;
-        }
-        // IgnoredAny validates JSON without allocating an arbitrarily large
-        // tool-output string. Use an independent descriptor, not try_clone
-        // (dup shares the reader's kernel offset on Unix).
-        let mut validation = File::open(path)?;
-        validation.seek(SeekFrom::Start(at))?;
-        serde_json::from_reader::<_, serde::de::IgnoredAny>(validation.take(length))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        records.push(RawCoordinate {
-            segment: path.to_owned(),
-            offset: at,
-            length,
-            sha256: format!("{:x}", hash.finalize_reset()),
-            seq: records.len() as u64 + 1,
-        });
-        at += length;
-        length = 0;
     }
     Ok(records)
 }
@@ -599,10 +889,22 @@ fn scan_jsonl(
 /// Exact raw bytes; callers must authorize the owning agent before using a
 /// coordinate. Coordinates come from the trusted host index, not tool arguments.
 pub fn read_raw(coordinate: &RawCoordinate) -> io::Result<Vec<u8>> {
-    let mut file = open_readonly(&coordinate.segment)?;
-    file.seek(SeekFrom::Start(coordinate.offset))?;
-    let mut bytes = Vec::new();
-    file.take(coordinate.length).read_to_end(&mut bytes)?;
+    let bytes = if let Some(row) = crate::host_sqlite::RowRef::parse(&coordinate.segment) {
+        let row = row.read()?;
+        let start = usize::try_from(coordinate.offset)
+            .unwrap_or(usize::MAX)
+            .min(row.len());
+        let end = start
+            .saturating_add(usize::try_from(coordinate.length).unwrap_or(usize::MAX))
+            .min(row.len());
+        row[start..end].to_vec()
+    } else {
+        let mut file = open_readonly(&coordinate.segment)?;
+        file.seek(SeekFrom::Start(coordinate.offset))?;
+        let mut bytes = Vec::new();
+        file.take(coordinate.length).read_to_end(&mut bytes)?;
+        bytes
+    };
     if bytes.len() as u64 != coordinate.length
         || crate::learned_memory::sha256(&bytes) != coordinate.sha256
     {
@@ -630,6 +932,36 @@ pub fn read_raw_range(
         ));
     }
     let end = offset.saturating_add(length).min(coordinate.length);
+    if let Some(row) = crate::host_sqlite::RowRef::parse(&coordinate.segment) {
+        // One query reads the whole row in one snapshot: authenticate the
+        // event, then cut the requested range from it.
+        let row = row.read()?;
+        let start = usize::try_from(coordinate.offset).unwrap_or(usize::MAX);
+        let event = start
+            .checked_add(usize::try_from(coordinate.length).unwrap_or(usize::MAX))
+            .and_then(|stop| row.get(start..stop))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "raw coordinate readback mismatch",
+                )
+            })?;
+        if crate::learned_memory::sha256(event) != coordinate.sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raw coordinate readback mismatch",
+            ));
+        }
+        let bytes = event[offset as usize..end as usize].to_vec();
+        let window = RawCoordinate {
+            segment: coordinate.segment.clone(),
+            offset: coordinate.offset + offset,
+            length: bytes.len() as u64,
+            sha256: crate::learned_memory::sha256(&bytes),
+            seq: coordinate.seq,
+        };
+        return Ok((window, bytes));
+    }
     let mut file = open_readonly(&coordinate.segment)?;
     let stamp = crate::host_cursor::FileStamp::read(&file)?;
     file.seek(SeekFrom::Start(coordinate.offset))?;
@@ -975,6 +1307,66 @@ mod tests {
         assert!(retained_jsonl_records(&absent).is_err());
         assert!(!absent.exists());
     }
+    /// The single buffered pass accepts and refuses exactly what validating
+    /// each newline-terminated line on its own did, and never commits a tail.
+    #[test]
+    fn streamed_line_validation_matches_per_line_json_validation() {
+        let huge = format!(
+            "{{\"output\":{}}}\n",
+            serde_json::json!("x\\\"☃".repeat(700_000))
+        );
+        let lines: Vec<&[u8]> = vec![
+            b"{\"a\":1}\n",
+            b"[1,2,{\"b\":null}]\r\n",
+            b"  \"padded\"  \n",
+            huge.as_bytes(),
+            b"\n",
+            b"   \n",
+            b"{\"a\":1} {\"b\":2}\n",
+            b"{\"a\":\n",
+            b"1}\n",
+            b"{\"bad\":tru}\n",
+            b"\"\\ud83d\\ude00\"\n",
+        ];
+        for line in &lines {
+            let expected = serde_json::from_slice::<serde::de::IgnoredAny>(line).is_ok();
+            let mut reader = BufReader::with_capacity(4096, *line);
+            let got = read_jsonl_line(&mut reader);
+            match got {
+                Ok(Some(JsonlLine::Complete { length, sha256 })) => {
+                    assert!(
+                        expected,
+                        "{:?}",
+                        String::from_utf8_lossy(&line[..40.min(line.len())])
+                    );
+                    assert_eq!(length, line.len() as u64);
+                    assert_eq!(sha256, crate::learned_memory::sha256(line));
+                }
+                Err(error) => {
+                    assert!(!expected);
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(read_jsonl_line(&mut reader).unwrap().is_none());
+        }
+        // Lines are delimited by the first newline only, then by the stream.
+        let stream = [lines[0], lines[1], huge.as_bytes(), b"{\"tail\":"].concat();
+        let mut reader = BufReader::with_capacity(4096, stream.as_slice());
+        let mut lengths = Vec::new();
+        while let Some(line) = read_jsonl_line(&mut reader).unwrap() {
+            lengths.push(line);
+        }
+        assert_eq!(lengths.len(), 4);
+        assert_eq!(lengths[3], JsonlLine::Partial { length: 8 });
+        // A complete value is still a tail until its newline is written.
+        let mut reader = BufReader::new(b"{\"done\":true}".as_slice());
+        assert_eq!(
+            read_jsonl_line(&mut reader).unwrap(),
+            Some(JsonlLine::Partial { length: 13 })
+        );
+    }
+
     #[test]
     fn acknowledged_payload_corruption_is_never_quarantined_or_truncated() {
         let dir = crate::test_tempdir();

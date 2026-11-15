@@ -130,7 +130,13 @@ pub fn fake_launcher(data: &Path) -> std::path::PathBuf {
 /// and managed-seat declarations. Real cross-UID admission has a required,
 /// separately privileged acceptance fixture.
 pub fn contract_server() -> std::process::Command {
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_anyagents"));
+    contract_server_at(Path::new(env!("CARGO_BIN_EXE_anyagents")))
+}
+
+/// [`contract_server`] run from `binary`: a copy of this build stands for a
+/// newer binary a deployment upgrades to.
+pub fn contract_server_at(binary: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(binary);
     for name in [
         "ANYAGENTS_AGENT_ID",
         "ANYAGENTS_AGENT_CONFIG",
@@ -149,6 +155,37 @@ pub fn contract_server() -> std::process::Command {
     }
     command.env("ANYAGENTS_TESTS", "contract-double");
     command
+}
+
+/// Ends the keepers a test server left, when dropped. A killed server
+/// leaves its harness processes running in their keepers, by design
+/// (`docs/adr/0007-process-architecture.md`); a test must not leave them.
+/// Hold it beside the server's process handle, after it, so it runs once the
+/// server is gone.
+pub struct Keepers(PathBuf);
+
+impl Keepers {
+    pub fn of(data: &Path) -> Self {
+        Self(data.to_path_buf())
+    }
+}
+
+impl Drop for Keepers {
+    fn drop(&mut self) {
+        stop_keepers(&self.0);
+    }
+}
+
+/// End every keeper under `data`, and the harness each one holds.
+pub fn stop_keepers(data: &Path) {
+    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .arg("--data")
+        .arg(data)
+        .args(["keepers", "stop", "--all"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Take the operator's environment back out of this process.
@@ -217,24 +254,53 @@ pub fn call(socket: &Path, method: &str, path: &str, body: &str) -> (String, ser
     (status, value)
 }
 
-/// A `PATH` where creating an agent installs nothing: `npm` answers a version
-/// and a no-op install, and `claude` is this binary.
-pub fn machine_path(dir: &Path) -> OsString {
+/// Declare offline, checksum-verified harness sources for integration tests.
+/// Installation still runs its normal verification and doctor. Actual harness
+/// execution uses each test's existing protocol double or explicit binary.
+pub fn managed_harnesses(dir: &Path) {
+    use sha2::{Digest, Sha256};
     use std::os::unix::fs::PermissionsExt;
+
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
+    let source = bin.join("managed-harness");
+    let script = b"#!/bin/sh\nif [ \"$1\" = --version ]; then echo 0.0.0; else exit 1; fi\n";
+    if !source.exists() {
+        std::fs::write(&source, script).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let source = std::fs::canonicalize(source).unwrap();
+    let digest = format!("{:x}", Sha256::digest(script));
+    let mut config = String::new();
+    for id in [
+        "spiron",
+        "claude-code",
+        "codex",
+        "opencode",
+        "agy",
+        "muse",
+        "omp",
+        "dsh",
+        "grok",
+    ] {
+        config.push_str(&format!(
+            "[harness.{id}]\nsource = {{ kind = \"local\", version = \"0.0.0\", path = {}, sha256 = \"{digest}\" }}\nlauncher = \"bin/harness\"\nruntime = \"\"\n\n",
+            serde_json::to_string(&source).unwrap(),
+        ));
+    }
+    let catalog = dir.join("harnesses.toml");
+    if !catalog.exists() {
+        std::fs::write(catalog, config).unwrap();
+    }
+}
+
+/// A restricted command PATH plus explicit offline managed harness sources.
+pub fn machine_path(dir: &Path) -> OsString {
+    managed_harnesses(dir);
+    let bin = dir.join("bin");
     let launcher = bin.join("claude");
     if !launcher.exists() {
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_anyagents"), &launcher).unwrap();
-    }
-    let npm = bin.join("npm");
-    if !npm.exists() {
-        std::fs::write(
-            &npm,
-            "#!/bin/sh\ncase \"$1\" in view) echo 0.0.0 ;; esac\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     std::env::join_paths([bin]).unwrap()
 }
