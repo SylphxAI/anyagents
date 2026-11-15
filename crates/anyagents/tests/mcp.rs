@@ -1171,6 +1171,22 @@ async fn mcp_tools_use_the_server_socket() {
     );
     assert_eq!(woken.state, "running");
 
+    let baseline_worker: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({
+                "action": "spawn",
+                "name": "baseline-general"
+            }),
+        )
+        .await,
+    );
+    let default_body = baseline_worker["instructions"].as_str().unwrap();
+    assert!(
+        default_body.starts_with("You are a cohesive end-to-end execution worker."),
+        "{default_body}"
+    );
     for route in ["agents", "subagents"] {
         let worker: serde_json::Value = ok_json(
             call(
@@ -1188,11 +1204,9 @@ async fn mcp_tools_use_the_server_socket() {
         assert_eq!(worker["role"], "general");
         assert_eq!(worker["scope"], "private");
         assert_eq!(worker["description"], "Public role");
-        assert!(
-            worker["instructions"]
-                .as_str()
-                .is_some_and(|text| text.ends_with("\n\nPrivate instructions")),
-            "{worker:?}"
+        assert_eq!(
+            worker["instructions"],
+            format!("{default_body}\n\nPrivate instructions")
         );
     }
     let legacy_worker: serde_json::Value = ok_json(
@@ -1210,11 +1224,9 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(legacy_worker["role"], "general");
     assert_eq!(legacy_worker["scope"], "private");
     assert_eq!(legacy_worker["description"], "Legacy instructions");
-    assert!(
-        legacy_worker["instructions"]
-            .as_str()
-            .is_some_and(|text| !text.trim().is_empty()),
-        "{legacy_worker:?}"
+    assert_eq!(
+        legacy_worker["instructions"],
+        format!("{default_body}\n\nLegacy instructions")
     );
 
     alpha.cancel().await.unwrap();
@@ -2114,6 +2126,7 @@ async fn mcp_spawn_and_create_default_to_general_and_schema_lists_general_first(
     );
 
     // Omitted, empty, and explicit `general` all resolve to built-in `general` with `private` scope.
+    let mut expected_default_body: Option<String> = None;
     for (tool_name, payload) in [
         (
             "agents",
@@ -2135,12 +2148,34 @@ async fn mcp_spawn_and_create_default_to_general_and_schema_lists_general_first(
         let created: serde_json::Value = ok_json(call(&alpha, tool_name, payload).await);
         assert_eq!(created["role"], "general", "{created:?}");
         assert_eq!(created["scope"], "private", "{created:?}");
-        assert!(
-            created["instructions"]
-                .as_str()
-                .is_some_and(|text| !text.trim().is_empty()),
-            "{created:?}"
+        let instructions = created["instructions"].as_str().unwrap();
+        if let Some(expected) = &expected_default_body {
+            assert_eq!(instructions, expected, "{created:?}");
+        } else {
+            assert!(
+                instructions.starts_with("You are a cohesive end-to-end execution worker."),
+                "{instructions}"
+            );
+            expected_default_body = Some(instructions.to_string());
+        }
+    }
+
+    // Explicit `public: true` / `public: false` without `scope` is respected on MCP spawn.
+    for (public_flag, expected_scope) in [(true, "public"), (false, "private")] {
+        let flagged: serde_json::Value = ok_json(
+            call(
+                &alpha,
+                "agents",
+                serde_json::json!({
+                    "action": "spawn",
+                    "name": format!("spawn-public-{public_flag}"),
+                    "public": public_flag
+                }),
+            )
+            .await,
         );
+        assert_eq!(flagged["role"], "general", "{flagged:?}");
+        assert_eq!(flagged["scope"], expected_scope, "{flagged:?}");
     }
 
     // Adding `.agents/agents/general.md` overrides the built-in `general` template.

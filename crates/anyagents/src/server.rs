@@ -12314,11 +12314,9 @@ exec '{}' "$@"
                 assert_eq!(status, StatusCode::CREATED, "{name}");
                 assert_eq!(agent.role.as_deref(), Some("general"), "{name}");
                 assert_eq!(agent.scope, "public", "{name}");
-                assert!(
-                    agent
-                        .instructions
-                        .as_deref()
-                        .is_some_and(|text| !text.trim().is_empty()),
+                assert_eq!(
+                    agent.instructions.as_deref(),
+                    Some(create::BUILTIN_GENERAL_ROLE_BODY),
                     "{name}"
                 );
             }
@@ -12342,6 +12340,65 @@ exec '{}' "$@"
             assert_eq!(sub_status, StatusCode::CREATED);
             assert_eq!(sub.role.as_deref(), Some("general"));
             assert_eq!(sub.scope, "private");
+            assert_eq!(
+                sub.instructions.as_deref(),
+                Some(create::BUILTIN_GENERAL_ROLE_BODY)
+            );
+
+            // Explicit `public: true` / `public: false` without `scope` on a sub-agent.
+            for (public_flag, expected_scope) in [(true, "public"), (false, "private")] {
+                let (flag_status, Json(flagged)) = create_agent_route(
+                    Principal::Operator,
+                    State(state.clone()),
+                    axum::http::HeaderMap::new(),
+                    Json(
+                        serde_json::from_value(serde_json::json!({
+                            "name": format!("http-sub-public-{public_flag}"),
+                            "parent": "http-omitted",
+                            "public": public_flag,
+                            "workdir": work,
+                        }))
+                        .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("public={public_flag}: {}: {}", e.status, e.message));
+                assert_eq!(flag_status, StatusCode::CREATED);
+                assert_eq!(flagged.role.as_deref(), Some("general"));
+                assert_eq!(flagged.scope, expected_scope);
+            }
+
+            // Caller `description` without `instructions` composes with built-in `general`.
+            let (legacy_status, Json(legacy_sub)) = create_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "http-sub-legacy-desc",
+                        "parent": "http-omitted",
+                        "description": "Legacy HTTP brief",
+                        "workdir": work,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("legacy: {}: {}", e.status, e.message));
+            assert_eq!(legacy_status, StatusCode::CREATED);
+            assert_eq!(legacy_sub.role.as_deref(), Some("general"));
+            assert_eq!(legacy_sub.scope, "private");
+            assert_eq!(
+                legacy_sub.description.as_deref(),
+                Some("Legacy HTTP brief")
+            );
+            assert_eq!(
+                legacy_sub.instructions.as_deref(),
+                Some(
+                    format!("{}\n\nLegacy HTTP brief", create::BUILTIN_GENERAL_ROLE_BODY)
+                        .as_str()
+                )
+            );
 
             // Workspace .agents/agents/general.md overrides the built-in template even for root.
             std::fs::create_dir_all(work.join(".agents/agents")).unwrap();

@@ -856,14 +856,7 @@ fn create_registers_mcp_only_in_the_agent_config() {
     let agent = store.agent_by_name("alpha").unwrap();
     assert_eq!(agent.state, "running");
     assert_eq!(agent.role.as_deref(), Some("general"));
-    assert!(
-        agent
-            .instructions
-            .as_deref()
-            .is_some_and(|text| text.ends_with("be brief")),
-        "{:?}",
-        agent.instructions
-    );
+    let alpha_instructions = agent.instructions.clone().unwrap();
     assert_eq!(agent.model.as_deref(), Some("sonnet"));
     assert_eq!(
         agent.workdir.as_deref(),
@@ -933,6 +926,15 @@ fn create_registers_mcp_only_in_the_agent_config() {
     assert!(toml.contains("[mcp_servers.anyagents]"), "{toml}");
     assert_eq!(std::fs::read(&claude_sentinel).unwrap(), b"sentinel-claude");
     assert_eq!(std::fs::read(&codex_sentinel).unwrap(), b"sentinel-codex");
+
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let beta = store.agent_by_name("beta").unwrap();
+    let default_body = beta.instructions.as_deref().unwrap();
+    assert!(
+        default_body.starts_with("You are a cohesive end-to-end execution worker."),
+        "{default_body}"
+    );
+    assert_eq!(alpha_instructions, format!("{default_body}\n\nbe brief"));
 }
 
 #[test]
@@ -1170,21 +1172,22 @@ fn cli_create_defaults_omitted_and_empty_role_to_builtin_general_and_allows_disk
 
     {
         let store = Store::open(data.join("state.db")).unwrap();
+        let omitted = store.agent_by_name("omitted-role").unwrap();
+        let default_body = omitted.instructions.as_deref().unwrap();
+        assert!(
+            default_body.starts_with("You are a cohesive end-to-end execution worker."),
+            "{default_body}"
+        );
         for name in ["omitted-role", "empty-role", "explicit-general"] {
             let agent = store.agent_by_name(name).unwrap();
             assert_eq!(agent.role.as_deref(), Some("general"), "{name}");
             assert_eq!(agent.scope(), "public", "{name}");
-            assert!(
-                agent
-                    .instructions
-                    .as_deref()
-                    .is_some_and(|text| !text.trim().is_empty()),
-                "{name}: missing built-in general instructions"
-            );
+            assert_eq!(agent.instructions.as_deref(), Some(default_body), "{name}");
         }
         let sub_agent = store.agent_by_name("sub-omitted").unwrap();
         assert_eq!(sub_agent.role.as_deref(), Some("general"));
         assert_eq!(sub_agent.scope(), "private");
+        assert_eq!(sub_agent.instructions.as_deref(), Some(default_body));
     }
 
     // Workspace .agents/agents/general.md overrides the built-in template (even root scope).

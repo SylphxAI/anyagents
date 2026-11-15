@@ -9131,22 +9131,18 @@ pub(crate) fn save_subagent_defaults(
 /// Default built-in role assigned when `role` is omitted or empty in `spawn` / `create`.
 pub(crate) const DEFAULT_AGENT_ROLE: &str = "general";
 
-const BUILTIN_GENERAL_ROLE_TEMPLATE: &str = r#"---
-name: general
-role: general
-scope: private
-description: Default general-purpose end-to-end execution worker
----
-You are a cohesive end-to-end execution worker. Own the assigned outcome from first inspection through live verification rather than stopping at partial steps or delegating your core deliverable sideways.
-
-Work from primary evidence: read the relevant files, state, and runtime behavior before changing anything, implement the simplest complete solution, and verify the result against real execution before reporting back.
-
-Split work into sub-agents only along genuine causal or independent-scope boundaries when parallel execution or distinct specialization is warranted. Keep changes minimal, clean, and honest about every verified outcome and any remaining gaps.
-"#;
+/// Standing execution instructions for the built-in `general` default role.
+pub(crate) const BUILTIN_GENERAL_ROLE_BODY: &str = "\
+You are a cohesive end-to-end execution worker. Own the assigned outcome from first inspection through live verification rather than stopping at partial steps or delegating your core deliverable sideways.\n\n\
+Work from primary evidence: read the relevant files, state, and runtime behavior before changing anything, implement the simplest complete solution, and verify the result against real execution before reporting back.\n\n\
+Split work into sub-agents only along genuine causal or independent-scope boundaries when parallel execution or distinct specialization is warranted. Keep changes minimal, clean, and honest about every verified outcome and any remaining gaps.";
 
 fn builtin_role_template(slug: &str) -> Result<Option<ArchetypeTemplate>, Error> {
     if slug == DEFAULT_AGENT_ROLE {
-        let mut tpl = parse_archetype_markdown(BUILTIN_GENERAL_ROLE_TEMPLATE)?;
+        let raw = format!(
+            "---\nname: general\nrole: general\nscope: private\ndescription: Default general-purpose end-to-end execution worker\n---\n{BUILTIN_GENERAL_ROLE_BODY}\n"
+        );
+        let mut tpl = parse_archetype_markdown(&raw)?;
         if tpl
             .role
             .as_deref()
@@ -9864,11 +9860,13 @@ pub(crate) fn apply_archetype_defaults(
         return Ok(());
     };
 
-    if body
+    let caller_description = body
         .description
         .as_deref()
         .map(str::trim)
-        .is_none_or(str::is_empty)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    if caller_description.is_none()
         && let Some(desc) = tpl.description
     {
         body.description = Some(desc);
@@ -9932,13 +9930,15 @@ pub(crate) fn apply_archetype_defaults(
         .unwrap_or(&resolved_slug)
         .to_string();
     body.role = Some(canonical_role);
+    let effective_caller_instructions = body
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or(caller_description);
     if !tpl.body.is_empty() {
-        body.instructions = match body
-            .instructions
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        body.instructions = match effective_caller_instructions {
             Some(existing) => Some(format!("{}\n\n{}", tpl.body, existing)),
             None => Some(tpl.body),
         };
@@ -12883,11 +12883,7 @@ mod archetype_tests {
             apply_archetype_defaults(None, &data, None, &mut req).unwrap();
             assert_eq!(req.role.as_deref(), Some("general"));
             assert!(req.scope.is_none());
-            assert!(
-                req.instructions
-                    .as_deref()
-                    .is_some_and(|s| s.contains("cohesive end-to-end execution worker"))
-            );
+            assert_eq!(req.instructions.as_deref(), Some(BUILTIN_GENERAL_ROLE_BODY));
         }
 
         // Explicit scope override on root is preserved.
@@ -12963,6 +12959,47 @@ mod archetype_tests {
         .unwrap();
         assert_eq!(public_sub_req.role.as_deref(), Some("general"));
         assert_eq!(public_sub_req.scope.as_deref(), Some("public"));
+
+        // Explicit `public: true` / `public: false` without `scope` on a sub-agent stays intact.
+        for public_flag in [true, false] {
+            let mut bool_sub_req: crate::api::CreateAgentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": format!("bool-subagent-{public_flag}"),
+                    "public": public_flag,
+                    "workdir": ws,
+                }))
+                .unwrap();
+            apply_archetype_defaults(Some(&store), &data, Some(&parent_agent), &mut bool_sub_req)
+                .unwrap();
+            assert_eq!(bool_sub_req.role.as_deref(), Some("general"));
+            assert!(bool_sub_req.scope.is_none());
+            assert_eq!(bool_sub_req.public, Some(public_flag));
+        }
+
+        // Caller `description` is preserved into `instructions` when `instructions` is omitted.
+        let mut legacy_sub_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "legacy-subagent",
+                "description": "Legacy subagent brief",
+                "workdir": ws,
+            }))
+            .unwrap();
+        apply_archetype_defaults(
+            Some(&store),
+            &data,
+            Some(&parent_agent),
+            &mut legacy_sub_req,
+        )
+        .unwrap();
+        assert_eq!(legacy_sub_req.role.as_deref(), Some("general"));
+        assert_eq!(
+            legacy_sub_req.description.as_deref(),
+            Some("Legacy subagent brief")
+        );
+        assert_eq!(
+            legacy_sub_req.instructions.as_deref(),
+            Some(format!("{BUILTIN_GENERAL_ROLE_BODY}\n\nLegacy subagent brief").as_str())
+        );
 
         // `.agents/agents/general.md` on disk overrides the built-in template.
         std::fs::create_dir_all(ws.join(".agents/agents")).unwrap();
