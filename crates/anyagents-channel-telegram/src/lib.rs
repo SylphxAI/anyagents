@@ -1271,8 +1271,193 @@ pub struct BotCall {
     pub body: serde_json::Value,
 }
 
+/// Tracks fenced code blocks (` ``` ` or `~~~`, three or more) line by line.
+/// A fence closes only on a line of the same character, at least as long as the
+/// opener, with nothing after it but whitespace.
+#[derive(Default)]
+struct FenceTracker {
+    open: Option<(u8, usize)>,
+}
+
+impl FenceTracker {
+    /// Feeds one line and reports whether it is a fence line or fenced content.
+    fn advance(&mut self, line: &str) -> bool {
+        let marker = fence_marker(line);
+        match (self.open, marker) {
+            (Some((ch, len)), Some((m_ch, m_len, rest)))
+                if m_ch == ch && m_len >= len && rest.trim().is_empty() =>
+            {
+                self.open = None;
+                true
+            }
+            (Some(_), _) => true,
+            (None, Some((m_ch, m_len, rest))) => {
+                // A backtick fence's info string may not contain a backtick.
+                if m_ch == b'`' && rest.contains('`') {
+                    return false;
+                }
+                self.open = Some((m_ch, m_len));
+                true
+            }
+            (None, None) => false,
+        }
+    }
+}
+
+fn fence_marker(line: &str) -> Option<(u8, usize, &str)> {
+    let mut trimmed = line;
+    loop {
+        let content = trimmed.trim_start_matches(' ');
+        if trimmed.len() - content.len() > 3 {
+            return None;
+        }
+        trimmed = content;
+        if let Some(quote) = trimmed.strip_prefix('>') {
+            trimmed = quote.strip_prefix(' ').unwrap_or(quote);
+        } else {
+            break;
+        }
+    }
+    let ch = *trimmed.as_bytes().first()?;
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let len = trimmed.bytes().take_while(|b| *b == ch).count();
+    (len >= 3).then(|| (ch, len, &trimmed[len..]))
+}
+
+/// Whether a line holds no content, counting blockquote markers as empty.
+fn is_blank_markdown_line(line: &str) -> bool {
+    line.trim_matches(|c: char| c == '>' || c.is_whitespace())
+        .is_empty()
+}
+
+/// Byte ranges of matched inline code spans. Unmatched backticks are prose.
+/// Paragraph and fenced-block boundaries prevent an opener from consuming a
+/// later, unrelated block. Backslashes only escape ticks outside code spans.
+fn inline_code_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    fn scan(text: &str, base: usize, spans: &mut Vec<std::ops::Range<usize>>) {
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] != b'`' {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i] == b'`' {
+                i += 1;
+            }
+            let width = i - start;
+            let mut j = i;
+            while j < bytes.len() {
+                if bytes[j] != b'`' {
+                    j += 1;
+                    continue;
+                }
+                let close = j;
+                while j < bytes.len() && bytes[j] == b'`' {
+                    j += 1;
+                }
+                if j - close == width {
+                    spans.push(base + start..base + j);
+                    i = j;
+                    break;
+                }
+            }
+        }
+    }
+    let mut spans = Vec::new();
+    let mut fence = FenceTracker::default();
+    let mut start = 0;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if fence.advance(line.trim_end_matches(['\r', '\n'])) || is_blank_markdown_line(line) {
+            scan(&text[start..offset], start, &mut spans);
+            start = offset + line.len();
+        }
+        offset += line.len();
+    }
+    scan(&text[start..], start, &mut spans);
+    spans
+}
+
+/// Turns each single `\n` between two content lines into a CommonMark hard
+/// break (`  \n`), so `sendRichMessage` keeps the line breaks the author wrote
+/// instead of folding them into one paragraph. CRLF is normalized to LF. Blank
+/// lines stay paragraph breaks. Fenced code blocks, table rows, the line before
+/// a table or fence, headings, lines already ending in a hard break, and
+/// indented code blocks are left as written.
+pub fn preserve_rich_markdown_line_breaks(text: &str) -> String {
+    if !text.contains('\n') {
+        return text.to_string();
+    }
+    let normalized = text.replace("\r\n", "\n");
+    let spans = inline_code_spans(&normalized);
+    let mut offset = 0;
+    let lines: Vec<&str> = normalized
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let mut out = String::with_capacity(text.len() + lines.len() * 2);
+    let mut fence = FenceTracker::default();
+    let mut in_indented_code = false;
+    let mut prev_blank = true;
+    for (idx, line) in lines.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+        let newline = offset + line.len();
+        offset = newline + 1;
+        if fence.advance(line) {
+            prev_blank = false;
+            in_indented_code = false;
+            continue;
+        }
+        let blank = is_blank_markdown_line(line);
+        let indent = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .map(|c| if c == '\t' { 4 } else { 1 })
+            .sum::<usize>();
+        if !blank {
+            in_indented_code = indent >= 4 && (prev_blank || in_indented_code);
+        }
+        prev_blank = blank;
+        let Some(next) = lines.get(idx + 1) else {
+            continue;
+        };
+        let trimmed = line.trim();
+        let keep = blank
+            || in_indented_code
+            || is_blank_markdown_line(next)
+            || line.ends_with("  ")
+            || line.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 1
+            || spans.iter().any(|span| span.contains(&newline))
+            || is_markdown_table_row(trimmed)
+            || is_markdown_table_row(next.trim())
+            || fence_marker(next).is_some()
+            || strip_markdown_heading(trimmed).is_some();
+        if !keep {
+            out.push_str("  ");
+        }
+    }
+    out
+}
+
+/// Prepares agent text for `rich_message.markdown`: keeps single line breaks,
+/// then escapes currency dollar signs.
+pub fn rich_markdown(text: &str) -> String {
+    escape_rich_markdown_dollars(&preserve_rich_markdown_line_breaks(text))
+}
+
 /// Escapes unescaped `$` characters outside inline code spans (`` `...` ``) and
-/// fenced code blocks (` ```...``` `) so Telegram Bot API 10.1+ `sendRichMessage`
+/// fenced code blocks (` ``` ` or `~~~`) so Telegram Bot API 10.1+ `sendRichMessage`
 /// (`rich_message.markdown`) never misinterprets currency pairs (e.g. `S$766.87 同 US$170`
 /// or `HK$100 and HK$200`) as a `RichTextMathematicalExpression`.
 pub fn escape_rich_markdown_dollars(text: &str) -> String {
@@ -1280,61 +1465,36 @@ pub fn escape_rich_markdown_dollars(text: &str) -> String {
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len() + 8);
-    let mut in_fence = false;
+    let mut fence = FenceTracker::default();
+    let spans = inline_code_spans(text);
+    let mut offset = 0;
     for (line_idx, line) in text.split('\n').enumerate() {
         if line_idx > 0 {
             out.push('\n');
         }
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            in_fence = !in_fence;
+        let base = offset;
+        offset += line.len() + 1;
+        if fence.advance(line) {
             out.push_str(line);
             continue;
         }
-        if in_fence {
-            out.push_str(line);
-            continue;
-        }
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
-        let mut inline_ticks: usize = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            if c == '`' {
-                let mut count = 0;
-                while i + count < chars.len() && chars[i + count] == '`' {
-                    count += 1;
-                }
-                for _ in 0..count {
-                    out.push('`');
-                }
-                if inline_ticks == 0 {
-                    inline_ticks = count;
-                } else if count == inline_ticks {
-                    inline_ticks = 0;
-                }
-                i += count;
-                continue;
-            }
-            if inline_ticks > 0 {
+        let mut chars = line.char_indices().peekable();
+        while let Some((idx, c)) = chars.next() {
+            if spans.iter().any(|span| span.contains(&(base + idx))) {
                 out.push(c);
-                i += 1;
                 continue;
             }
-            if c == '\\' && i + 1 < chars.len() {
-                out.push('\\');
-                out.push(chars[i + 1]);
-                i += 2;
+            if c == '\\' {
+                out.push(c);
+                if let Some((_, escaped)) = chars.next() {
+                    out.push(escaped);
+                }
                 continue;
             }
             if c == '$' {
                 out.push('\\');
-                out.push('$');
-                i += 1;
-                continue;
             }
             out.push(c);
-            i += 1;
         }
     }
     out
@@ -1350,7 +1510,7 @@ pub fn send_message(
     reply_to: Option<i64>,
     thread: Option<i64>,
 ) -> BotCall {
-    let markdown = escape_rich_markdown_dollars(text);
+    let markdown = rich_markdown(text);
     let mut body = serde_json::json!({
         "chat_id": chat_id,
         "rich_message": {
@@ -1492,7 +1652,7 @@ pub fn set_message_reaction(
 
 /// `editMessageText` to update the rich Markdown content of an existing message.
 pub fn edit_message_text(chat_id: i64, message_id: i64, text: &str) -> BotCall {
-    let markdown = escape_rich_markdown_dollars(text);
+    let markdown = rich_markdown(text);
     BotCall {
         method: "editMessageText".to_string(),
         body: serde_json::json!({
@@ -3109,6 +3269,146 @@ mod membership_tests {
         assert!(
             html.contains("• <b>Reason</b>: Rank <b>#1</b></blockquote>"),
             "{html}"
+        );
+    }
+
+    #[test]
+    fn single_newlines_become_hard_breaks_under_headings_and_bullets() {
+        assert_eq!(
+            preserve_rich_markdown_line_breaks("Heading\n• Bullet 1\n• Bullet 2"),
+            "Heading  \n• Bullet 1  \n• Bullet 2"
+        );
+        assert_eq!(
+            preserve_rich_markdown_line_breaks("Heading\n- Bullet 1\n- Bullet 2\n"),
+            "Heading  \n- Bullet 1  \n- Bullet 2\n"
+        );
+        assert_eq!(
+            preserve_rich_markdown_line_breaks("## Status\nline one\nline two"),
+            "## Status\nline one  \nline two"
+        );
+    }
+
+    #[test]
+    fn multi_line_prose_keeps_breaks_and_paragraphs_stay_clean() {
+        assert_eq!(
+            preserve_rich_markdown_line_breaks("one\ntwo\nthree\n\nnext\npara"),
+            "one  \ntwo  \nthree\n\nnext  \npara"
+        );
+        assert_eq!(
+            preserve_rich_markdown_line_breaks("a\n\n\nb\n   \nc"),
+            "a\n\n\nb\n   \nc"
+        );
+        assert_eq!(
+            preserve_rich_markdown_line_breaks("single line"),
+            "single line"
+        );
+    }
+
+    #[test]
+    fn crlf_is_normalized_without_stray_carriage_returns() {
+        assert_eq!(
+            preserve_rich_markdown_line_breaks("one\r\ntwo\r\n\r\nthree\r\n"),
+            "one  \ntwo\n\nthree\n"
+        );
+    }
+
+    #[test]
+    fn existing_hard_breaks_and_blockquotes_are_not_doubled() {
+        assert_eq!(
+            preserve_rich_markdown_line_breaks("a  \nb\\\nc\nd"),
+            "a  \nb\\\nc  \nd"
+        );
+        assert_eq!(
+            preserve_rich_markdown_line_breaks("> quoted one\n> quoted two\n>\n> after"),
+            "> quoted one  \n> quoted two\n>\n> after"
+        );
+    }
+
+    #[test]
+    fn fenced_code_blocks_are_untouched_inside_the_fence() {
+        let input =
+            "Run:\n```sh\necho one\necho two\n```\nDone\nok\n~~~~\nx\n~~~\ny\n~~~~\nend\nnow";
+        assert_eq!(
+            preserve_rich_markdown_line_breaks(input),
+            "Run:\n```sh\necho one\necho two\n```\nDone  \nok\n~~~~\nx\n~~~\ny\n~~~~\nend  \nnow"
+        );
+        // A backtick line with an info string does not close an open fence.
+        let input = "```\na\n```rust\nb\n```\nc\nd";
+        assert_eq!(
+            preserve_rich_markdown_line_breaks(input),
+            "```\na\n```rust\nb\n```\nc  \nd"
+        );
+        // Indented code blocks keep their exact bytes too.
+        let input = "intro\n\n    code one\n    code two\n\nafter\nmore";
+        assert_eq!(
+            preserve_rich_markdown_line_breaks(input),
+            "intro\n\n    code one\n    code two\n\nafter  \nmore"
+        );
+    }
+
+    #[test]
+    fn markdown_tables_are_untouched() {
+        let input = "Results\n| a | b |\n| --- | --- |\n| 1 | 2 |\nTotal\nshown";
+        assert_eq!(
+            preserve_rich_markdown_line_breaks(input),
+            "Results\n| a | b |\n| --- | --- |\n| 1 | 2 |\nTotal  \nshown"
+        );
+    }
+
+    #[test]
+    fn inline_code_and_backslash_boundaries_keep_their_meaning() {
+        for (input, expected) in [
+            ("Use `one\ntwo`\nnext", "Use `one\ntwo`  \nnext"),
+            ("Use ``one `\ntwo``\nnext", "Use ``one `\ntwo``  \nnext"),
+            ("unmatched ` tick\nnext", "unmatched ` tick  \nnext"),
+            ("escaped \\` tick\nnext", "escaped \\` tick  \nnext"),
+            ("two\\\\\nnext", "two\\\\  \nnext"),
+        ] {
+            assert_eq!(preserve_rich_markdown_line_breaks(input), expected);
+        }
+        let input = "Use `$ONE\n$TWO`\nPay $5 with unmatched ` $6";
+        let expected = "Use `$ONE\n$TWO`  \nPay \\$5 with unmatched ` \\$6";
+        assert_eq!(
+            send_message(100, input, None, None).body["rich_message"]["markdown"],
+            expected
+        );
+        assert_eq!(
+            edit_message_text(100, 42, input).body["rich_message"]["markdown"],
+            expected
+        );
+    }
+
+    #[test]
+    fn quoted_fences_and_indented_fence_text_do_not_leak_state() {
+        let input = "> ```sh\n> echo $HOME\n> next\n> ```\nafter\nmore";
+        assert_eq!(
+            rich_markdown(input),
+            "> ```sh\n> echo $HOME\n> next\n> ```\nafter  \nmore"
+        );
+        let input = "    ```\n    code\n\nafter\nmore";
+        assert_eq!(
+            preserve_rich_markdown_line_breaks(input),
+            "    ```\n    code\n\nafter  \nmore"
+        );
+        // A shorter or different fence cannot close the block.
+        assert_eq!(
+            rich_markdown("````\n$x\n```\n$y\n~~~~\n$z\n````\n$a"),
+            "````\n$x\n```\n$y\n~~~~\n$z\n````\n\\$a"
+        );
+    }
+
+    #[test]
+    fn send_and_edit_keep_line_breaks_and_escape_dollars() {
+        let input = "Paid\r\n• HK$100 `$PATH`\n• US$5\n```\necho $HOME\nx\n```";
+        let expected = "Paid  \n• HK\\$100 `$PATH`  \n• US\\$5\n```\necho $HOME\nx\n```";
+        let call = send_message(100, input, None, None);
+        assert_eq!(call.body["rich_message"]["markdown"], expected);
+        let edit = edit_message_text(100, 42, input);
+        assert_eq!(edit.body["rich_message"]["markdown"], expected);
+        // Dollars inside a tilde fence stay literal.
+        assert_eq!(
+            escape_rich_markdown_dollars("~~~\n$x\n~~~\n$y"),
+            "~~~\n$x\n~~~\n\\$y"
         );
     }
 
