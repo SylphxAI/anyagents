@@ -881,14 +881,22 @@ impl Store {
             }
             let cleaned = clean_rag_text(&redacted);
             tx.execute("UPDATE rag_chunks SET text = ?3, content_hash = ?4 WHERE agent_id = ?1 AND chunk_id = ?2", params![target.as_str(), id, cleaned, rag_content_hash(&cleaned)])?;
-            tx.execute(
-                "UPDATE rag_chunks_fts SET text = ?2, search_tokens = ?3 WHERE chunk_id = ?1",
-                params![
-                    id,
-                    cleaned,
-                    tokenize_hybrid_search_tokens(&cleaned).join(" ")
-                ],
-            )?;
+            // Found through the index (`MATCH` on the id's own token, `=` for
+            // the exact row): `chunk_id = ?` alone reads every row of the
+            // index with the writer held. The rebuild below still runs: it is
+            // what physically erases the old text.
+            let tokens = tokenize_hybrid_search_tokens(&cleaned).join(" ");
+            match crate::store::fts_chunk_lookup(&id) {
+                Some(lookup) => tx.execute(
+                    "UPDATE rag_chunks_fts SET text = ?2, search_tokens = ?3 \
+                     WHERE chunk_id MATCH ?4 AND chunk_id = ?1",
+                    params![id, cleaned, tokens, lookup],
+                )?,
+                None => tx.execute(
+                    "UPDATE rag_chunks_fts SET text = ?2, search_tokens = ?3 WHERE chunk_id = ?1",
+                    params![id, cleaned, tokens],
+                )?,
+            };
             // Remove pre-existing FTS tombstone segments too, not just MATCH visibility.
             tx.execute(
                 "INSERT INTO rag_chunks_fts(rag_chunks_fts) VALUES('rebuild')",

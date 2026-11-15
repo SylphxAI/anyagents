@@ -204,7 +204,15 @@ fn create_with_seat(
     // A harness is installed only if an adapter can start it.
     install::adapter(&normalized_harness)?;
     let mut new = NewAgent::new(request.name, normalized_harness.clone());
-    new.role = request.role;
+    new.role = Some(
+        request
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_AGENT_ROLE)
+            .to_string(),
+    );
     new.model = request
         .model
         .map(|m| m.trim().to_string())
@@ -1020,7 +1028,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
             .collect::<Vec<_>>()
             .join(", ");
         doc.push_str(&format!(
-            "- Available sub-agent roles (`role` in `agents`/`spawn`): {formatted_roles} (see `spawn` tool `role` schema for details).\n"
+            "- Available sub-agent roles (`role` in `agents`/`spawn`; defaults to `{DEFAULT_AGENT_ROLE}`): {formatted_roles} (see `spawn` tool `role` schema for details).\n"
         ));
     }
 
@@ -2044,12 +2052,95 @@ fn heal_mcp_config_file(path: &Path) -> bool {
     }
 }
 
-pub(crate) fn ensure_agy_mcp_config(profile_roots: &[PathBuf], target_config: &Path) {
+/// Arguments of the `anyagents mcp` server a seat's harness launches.
+pub(crate) fn mcp_server_args(data: &Path, config: &Path) -> Vec<String> {
+    vec![
+        "--data".to_string(),
+        data.display().to_string(),
+        "mcp".to_string(),
+        "--config".to_string(),
+        config.display().to_string(),
+    ]
+}
+
+fn config_writes_suppressed(data: &Path) -> bool {
+    std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
+        || data.join(".anyagents-suppress-config-write").exists()
+}
+
+/// Whether an Antigravity `mcp_config.json` registers an enabled `anyagents`
+/// server launched with exactly `args` (this seat's own `--config`).
+/// Antigravity reloads this file while it runs: the moment it names no such
+/// server, `call_mcp_tool` leaves the tool list (`unknown tool`) and
+/// `list_resources` answers `server anyagents is not allowed in this context`
+/// until the registration is written back.
+pub(crate) fn agy_mcp_registered(path: &Path, args: &[String]) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|root| root.pointer("/mcpServers/anyagents").cloned())
+        .is_some_and(|server| {
+            server
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|command| !command.trim().is_empty())
+                && server.get("disabled").and_then(serde_json::Value::as_bool) != Some(true)
+                && server
+                    .get("args")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|got| {
+                        got.len() == args.len()
+                            && got
+                                .iter()
+                                .zip(args)
+                                .all(|(g, a)| g.as_str() == Some(a.as_str()))
+                    })
+        })
+}
+
+/// Restore the `anyagents` registration of an Antigravity seat. Other
+/// servers in the file are kept; an empty or unparsable file is replaced.
+pub(crate) fn ensure_agy_mcp_registration(data: &Path, config: &Path) -> Result<bool, Error> {
+    let path = config.join(".gemini/config/mcp_config.json");
+    let args = mcp_server_args(data, config);
+    if agy_mcp_registered(&path, &args) || config_writes_suppressed(data) {
+        return Ok(false);
+    }
+    let command = crate::data::current_exe_clean()?;
+    mcp_config::write_claude(&path, &command, &args)?;
+    Ok(true)
+}
+
+/// Profiles keep a parsable MCP file for a sign-in run inside them. A seat's
+/// Antigravity file must name its `anyagents` server: a parsable but empty
+/// server map there removes every AnyAgents tool from the running cascade.
+pub(crate) fn ensure_agy_mcp_config(
+    store: &Store,
+    data: &Path,
+    agent: &Agent,
+    profile_roots: &[PathBuf],
+    target_config: &Path,
+) {
     for profile_root in profile_roots {
         let _ = heal_mcp_config_file(&profile_root.join(".gemini/config/mcp_config.json"));
         let _ = heal_mcp_config_file(&profile_root.join("mcp_config.json"));
     }
-    let _ = heal_mcp_config_file(&target_config.join(".gemini/config/mcp_config.json"));
+    let seat_agy = target_config.join(".gemini/config/mcp_config.json");
+    if normalize_harness_name(&agent.harness) == "agy" && target_config.is_dir() {
+        match ensure_agy_mcp_registration(data, target_config) {
+            // A rewrite replaces the file: give the seat's principal its
+            // access back, as every other seat config rewrite does.
+            Ok(true) => {
+                if let Some((_, uid, gid, _)) = resolved_agent_seat_info(store, agent) {
+                    crate::sandbox::share_config_with_seat_uid(target_config, uid, gid);
+                }
+            }
+            Ok(false) => {}
+            Err(err) => eprintln!("cannot restore {}: {err}", seat_agy.display()),
+        }
+    } else {
+        let _ = heal_mcp_config_file(&seat_agy);
+    }
     let _ = heal_mcp_config_file(&target_config.join("mcp_config.json"));
 }
 
@@ -2298,7 +2389,7 @@ pub(crate) fn seed_harness_credentials(
             refresh_anthropic_profile_oauth_if_due(data, &primary_profile_root)?;
         }
     }
-    ensure_agy_mcp_config(&profile_roots, target_config);
+    ensure_agy_mcp_config(store, data, agent, &profile_roots, target_config);
 
     for profile_root in &profile_roots {
         for candidate in [
@@ -2854,16 +2945,10 @@ pub(crate) fn reconcile_agent_runtime_config(
         continuity.as_deref(),
     )?;
 
-    let suppress_config_write = std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
-        || data.join(".anyagents-suppress-config-write").exists();
-    if !suppress_config_write && let Ok(command) = crate::data::current_exe_clean() {
-        let args = vec![
-            "--data".to_string(),
-            data.display().to_string(),
-            "mcp".to_string(),
-            "--config".to_string(),
-            config.display().to_string(),
-        ];
+    if !config_writes_suppressed(data)
+        && let Ok(command) = crate::data::current_exe_clean()
+    {
+        let args = mcp_server_args(data, config);
         for (other_harness, stale_file) in [
             ("opencode", "opencode.json"),
             ("codex", "config.toml"),
@@ -3282,6 +3367,85 @@ fn install_changed_harness(
 /// Declaratively update an existing agent's runtime configuration (`harness`, `model`, `profile`)
 /// in `state.db` without deleting or recreating its identity, killing an in-progress turn,
 /// replaying already-delivered messages, or reopening paused scope.
+/// Copy a provider profile's files into an agent's seat on a profile switch.
+///
+/// Vendor runtime trees stay behind. So do the files the seat owns, which the
+/// switch and its reconcile write for this agent: every `.anyagents-*` marker
+/// and stamp (the profile's describe the profile), MCP registrations (a
+/// profile's empty server map would remove every AnyAgents tool from a running
+/// Antigravity cascade), vendor settings and hooks (the seat's carry its tool
+/// guard and deny list), and instruction mirrors. Declared credential files
+/// reach the seat through seeding. An in-flight atomic write's temporary file
+/// is not copied, and a zero-byte file carries nothing: refusing it would abort
+/// the switch half-way through the tree.
+fn copy_profile_tree(source: &Path, target: &Path) -> Result<(), Error> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let fname = entry.file_name();
+        let name = fname.to_string_lossy();
+        if name.starts_with(".anyagents-") || name.ends_with(".anyagents-tmp") {
+            continue;
+        }
+        if matches!(
+            name.as_ref(),
+            "annotations"
+                | "bin"
+                | "brain"
+                | "builtin"
+                | "cache"
+                | "cache-home"
+                | "conversations"
+                | "crashes"
+                | "implicit"
+                | "log"
+                | "presence"
+                | "updater"
+                | "projects"
+                | "sessions"
+                | "session-env"
+                | "shell-snapshots"
+                | "backups"
+                | "cli.log"
+                | "conversation_summaries.db"
+                | "conversation_summaries.db-shm"
+                | "conversation_summaries.db-wal"
+                | "profile.json"
+                | "mcp_config.json"
+                | "mcp.json"
+                | ".claude.json"
+                | "mcp-capability"
+                | "settings.json"
+                | "hooks.json"
+                | "CLAUDE.md"
+                | "AGENTS.md"
+                | "GEMINI.md"
+        ) {
+            continue;
+        }
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let target = target.join(&fname);
+        if kind.is_dir() {
+            copy_profile_tree(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            let bytes = match std::fs::read(entry.path()) {
+                Ok(bytes) => bytes,
+                // Replaced or removed by a concurrent writer since the listing.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+            if !bytes.is_empty() {
+                write_required_file(&target, &bytes, 0o660)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn configure_agent_runtime(
     store: &Store,
     data: &Path,
@@ -3292,6 +3456,16 @@ pub(crate) fn configure_agent_runtime(
     profile: Option<&str>,
 ) -> Result<serde_json::Value, Error> {
     let existing = store.agent_by_name(name)?;
+    // One transition per agent at a time, across processes: a harness, model
+    // or profile switch rewrites the seat's markers and vendor configs, and
+    // pause, wake, reset and archive hold the same lock while they touch it.
+    // An automatic rotation skips a busy agent instead of queueing behind it.
+    let _transition = if actor.starts_with("system:") {
+        store.try_lock_agent_lifecycle(&existing.id)?
+    } else {
+        store.lock_agent_lifecycle(&existing.id)?
+    };
+    let existing = store.agent(&existing.id)?;
     let previous_harness = existing.harness.clone();
     let resolved_model = model
         .map(str::trim)
@@ -3387,50 +3561,7 @@ pub(crate) fn configure_agent_runtime(
     create_private_config_dir(&config)?;
     let normalized_profile = format!("{provider}/{profile_name}");
     if profile.is_some() && profile_dir.is_dir() {
-        fn copy_files(source: &Path, target: &Path) -> Result<(), Error> {
-            std::fs::create_dir_all(target)?;
-            for entry in std::fs::read_dir(source)? {
-                let entry = entry?;
-                let fname = entry.file_name();
-                let fname_s = fname.to_string_lossy();
-                if matches!(
-                    fname_s.as_ref(),
-                    "annotations"
-                        | "bin"
-                        | "brain"
-                        | "builtin"
-                        | "cache"
-                        | "cache-home"
-                        | "conversations"
-                        | "crashes"
-                        | "implicit"
-                        | "log"
-                        | "presence"
-                        | "updater"
-                        | "projects"
-                        | "sessions"
-                        | "session-env"
-                        | "shell-snapshots"
-                        | "backups"
-                        | "cli.log"
-                        | "conversation_summaries.db"
-                        | "conversation_summaries.db-shm"
-                        | "conversation_summaries.db-wal"
-                ) {
-                    continue;
-                }
-                let kind = entry.file_type()?;
-                let target = target.join(&fname);
-                if kind.is_dir() {
-                    copy_files(&entry.path(), &target)?;
-                } else if kind.is_file() && entry.file_name() != "profile.json" {
-                    let bytes = std::fs::read(entry.path())?;
-                    write_required_file(&target, &bytes, 0o660)?;
-                }
-            }
-            Ok(())
-        }
-        copy_files(&profile_dir, &config)?;
+        copy_profile_tree(&profile_dir, &config)?;
     }
     let now_rot = anyagents_core::now_ms();
     let _ = write_profile_marker(
@@ -6174,21 +6305,27 @@ pub(crate) fn sync_fresher_bound_agent_credentials_in(store: &Store, data: &Path
             if agent.state == "created" {
                 continue;
             }
+            // A harness, profile or lifecycle transition holds this lock while
+            // it rewrites the seat; the pass leaves that seat to it.
+            let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
+                continue;
+            };
             let cfg = agent_config_dir(data, &agent.id);
             let bound = bound_profile_name(&cfg);
             let seeded = seeded_profile_name(&cfg);
-            if seeded.is_some() && bound.is_some() && seeded != bound {
-                continue;
-            }
             let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
             let prof_name = bound
+                .clone()
                 .and_then(|b| {
                     let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
                     (!p.is_empty()).then_some(p)
                 })
                 .unwrap_or_else(|| "default".to_string());
             let profile_dir = profiles_root.join(&provider).join(&prof_name);
-            ensure_agy_mcp_config(std::slice::from_ref(&profile_dir), &cfg);
+            ensure_agy_mcp_config(store, data, agent, std::slice::from_ref(&profile_dir), &cfg);
+            if seeded.is_some() && bound.is_some() && seeded != bound {
+                continue;
+            }
             let rels: &[&str] = match provider.as_str() {
                 "anthropic" => &[".credentials.json", ".claude/.credentials.json"],
                 "openai" => &["auth.json", ".codex/auth.json"],
@@ -9120,6 +9257,35 @@ pub(crate) fn save_subagent_defaults(
     write_required_file(&path, format!("{text}\n").as_bytes(), 0o644)
 }
 
+/// Default built-in role assigned when `role` is omitted or empty in `spawn` / `create`.
+pub(crate) const DEFAULT_AGENT_ROLE: &str = "general";
+
+/// Standing execution instructions for the built-in `general` default role.
+pub(crate) const BUILTIN_GENERAL_ROLE_BODY: &str = "\
+You are a cohesive end-to-end execution worker. Own the assigned outcome from first inspection through live verification rather than stopping at partial steps or delegating your core deliverable sideways.\n\n\
+Work from primary evidence: read the relevant files, state, and runtime behavior before changing anything, implement the simplest complete solution, and verify the result against real execution before reporting back.\n\n\
+Split work into sub-agents only along genuine causal or independent-scope boundaries when parallel execution or distinct specialization is warranted. Keep changes minimal, clean, and honest about every verified outcome and any remaining gaps.";
+
+fn builtin_role_template(slug: &str) -> Result<Option<ArchetypeTemplate>, Error> {
+    if slug == DEFAULT_AGENT_ROLE {
+        let raw = format!(
+            "---\nname: general\nrole: general\nscope: private\ndescription: Default general-purpose end-to-end execution worker\n---\n{BUILTIN_GENERAL_ROLE_BODY}\n"
+        );
+        let mut tpl = parse_archetype_markdown(&raw)?;
+        if tpl
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| valid_template_stem(r))
+            .is_none()
+        {
+            tpl.role = Some(DEFAULT_AGENT_ROLE.to_string());
+        }
+        return Ok(Some(tpl));
+    }
+    Ok(None)
+}
+
 /// Parsed archetype template loaded from `<archetype>.md` or `<archetype>/agent.md`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ArchetypeTemplate {
@@ -9382,11 +9548,11 @@ pub(crate) fn archetype_search_roots(
     archetype_search_roots_with_ancestors(explicit_workdir, &ancestors, data_dir)
 }
 
-pub(crate) fn discover_available_archetype_slugs_with_ancestors(
+fn discover_disk_archetype_slugs_with_ancestors(
     explicit_workdir: Option<&Path>,
     ancestor_workdirs: &[PathBuf],
     data_dir: &Path,
-) -> Vec<String> {
+) -> std::collections::BTreeSet<String> {
     let mut slugs = std::collections::BTreeSet::new();
     for (base, rel_root) in
         archetype_search_roots_with_ancestors(explicit_workdir, ancestor_workdirs, data_dir)
@@ -9419,7 +9585,21 @@ pub(crate) fn discover_available_archetype_slugs_with_ancestors(
             }
         }
     }
-    slugs.into_iter().collect()
+    slugs
+}
+
+pub(crate) fn discover_available_archetype_slugs_with_ancestors(
+    explicit_workdir: Option<&Path>,
+    ancestor_workdirs: &[PathBuf],
+    data_dir: &Path,
+) -> Vec<String> {
+    let mut disk =
+        discover_disk_archetype_slugs_with_ancestors(explicit_workdir, ancestor_workdirs, data_dir);
+    disk.remove(DEFAULT_AGENT_ROLE);
+    let mut slugs = Vec::with_capacity(disk.len() + 1);
+    slugs.push(DEFAULT_AGENT_ROLE.to_string());
+    slugs.extend(disk);
+    slugs
 }
 
 pub(crate) fn discover_available_archetype_slugs(
@@ -9471,12 +9651,33 @@ pub(crate) fn resolve_archetype_template(
     resolve_archetype_template_with_ancestors(archetype, explicit_workdir, &ancestors, data_dir)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArchetypeSource {
+    Disk,
+    Builtin,
+}
+
 pub(crate) fn resolve_archetype_template_with_ancestors(
     archetype: &str,
     explicit_workdir: Option<&Path>,
     ancestor_workdirs: &[PathBuf],
     data_dir: &Path,
 ) -> Result<Option<ArchetypeTemplate>, Error> {
+    Ok(resolve_archetype_template_with_source(
+        archetype,
+        explicit_workdir,
+        ancestor_workdirs,
+        data_dir,
+    )?
+    .map(|(tpl, _)| tpl))
+}
+
+fn resolve_archetype_template_with_source(
+    archetype: &str,
+    explicit_workdir: Option<&Path>,
+    ancestor_workdirs: &[PathBuf],
+    data_dir: &Path,
+) -> Result<Option<(ArchetypeTemplate, ArchetypeSource)>, Error> {
     let slug = archetype.trim();
     if !valid_template_stem(slug) {
         return Err(Error::Message(format!(
@@ -9505,11 +9706,11 @@ pub(crate) fn resolve_archetype_template_with_ancestors(
                 {
                     tpl.role = Some(slug.to_string());
                 }
-                return Ok(Some(tpl));
+                return Ok(Some((tpl, ArchetypeSource::Disk)));
             }
         }
     }
-    Ok(None)
+    Ok(builtin_role_template(slug)?.map(|tpl| (tpl, ArchetypeSource::Builtin)))
 }
 
 /// Read a template under a trusted search root `base` while refusing any symlink
@@ -9712,95 +9913,103 @@ pub(crate) fn apply_archetype_defaults(
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
     let ancestor_wds = ancestor_archetype_workdirs(store, data_dir, parent)?;
-    let resolved = if let Some(role) = body
+    let role = body
         .role
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-    {
-        let slugified = role.to_ascii_lowercase().replace(' ', "-");
-        if !valid_template_stem(role) && !valid_template_stem(&slugified) {
-            resolve_archetype_template_with_ancestors(
+        .unwrap_or(DEFAULT_AGENT_ROLE);
+    let slugified = role.to_ascii_lowercase().replace(' ', "-");
+    let resolved = if !valid_template_stem(role) && !valid_template_stem(&slugified) {
+        resolve_archetype_template_with_source(
+            role,
+            explicit_wd.as_deref(),
+            &ancestor_wds,
+            data_dir,
+        )?;
+        None
+    } else {
+        let direct = if valid_template_stem(role) {
+            resolve_archetype_template_with_source(
                 role,
                 explicit_wd.as_deref(),
                 &ancestor_wds,
                 data_dir,
-            )?;
-            None
+            )?
+            .map(|(tpl, src)| (role.to_string(), tpl, src))
         } else {
-            let direct = if valid_template_stem(role) {
-                resolve_archetype_template_with_ancestors(
-                    role,
+            None
+        };
+        let matched = if direct.is_some() {
+            direct
+        } else if valid_template_stem(&slugified) {
+            resolve_archetype_template_with_source(
+                &slugified,
+                explicit_wd.as_deref(),
+                &ancestor_wds,
+                data_dir,
+            )?
+            .map(|(tpl, src)| (slugified, tpl, src))
+        } else {
+            None
+        };
+        if matched.is_some() {
+            matched
+        } else {
+            let disk_slugs = discover_disk_archetype_slugs_with_ancestors(
+                explicit_wd.as_deref(),
+                &ancestor_wds,
+                data_dir,
+            );
+            if !disk_slugs.is_empty()
+                || has_configured_archetype_roots_with_ancestors(
                     explicit_wd.as_deref(),
                     &ancestor_wds,
                     data_dir,
-                )?
-                .map(|tpl| (role.to_string(), tpl))
-            } else {
-                None
-            };
-            let matched = if direct.is_some() {
-                direct
-            } else if valid_template_stem(&slugified) {
-                resolve_archetype_template_with_ancestors(
-                    &slugified,
-                    explicit_wd.as_deref(),
-                    &ancestor_wds,
-                    data_dir,
-                )?
-                .map(|tpl| (slugified, tpl))
-            } else {
-                None
-            };
-            if matched.is_some() {
-                matched
-            } else {
+                )
+            {
                 let available = discover_available_archetype_slugs_with_ancestors(
                     explicit_wd.as_deref(),
                     &ancestor_wds,
                     data_dir,
                 );
-                if !available.is_empty()
-                    || has_configured_archetype_roots_with_ancestors(
-                        explicit_wd.as_deref(),
-                        &ancestor_wds,
-                        data_dir,
-                    )
-                {
-                    let suffix = if available.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" (available: {})", available.join(", "))
-                    };
-                    return Err(Error::Message(format!(
-                        "unknown archetype template {role:?}{suffix}"
-                    )));
-                }
-                None
+                let suffix = if available.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (available: {})", available.join(", "))
+                };
+                return Err(Error::Message(format!(
+                    "unknown archetype template {role:?}{suffix}"
+                )));
             }
+            None
         }
-    } else {
-        None
     };
-    let Some((resolved_slug, tpl)) = resolved else {
+    let Some((resolved_slug, tpl, source)) = resolved else {
         return Ok(());
     };
 
-    if body
+    let caller_description = body
         .description
         .as_deref()
         .map(str::trim)
-        .is_none_or(str::is_empty)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    if caller_description.is_none()
         && let Some(desc) = tpl.description
     {
         body.description = Some(desc);
     }
+    // Disk templates apply their declared `scope` unconditionally; built-in
+    // `general` defaults sub-agents (`parent.is_some()`) to `private` while
+    // letting root agents keep their default `public` scope unless overridden.
     if body
         .scope
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
         && body.public.is_none()
+        && (source == ArchetypeSource::Disk || parent.is_some())
         && let Some(scope) = tpl.scope
     {
         body.scope = Some(scope);
@@ -9850,13 +10059,15 @@ pub(crate) fn apply_archetype_defaults(
         .unwrap_or(&resolved_slug)
         .to_string();
     body.role = Some(canonical_role);
+    let effective_caller_instructions = body
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or(caller_description);
     if !tpl.body.is_empty() {
-        body.instructions = match body
-            .instructions
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        body.instructions = match effective_caller_instructions {
             Some(existing) => Some(format!("{}\n\n{}", tpl.body, existing)),
             None => Some(tpl.body),
         };
@@ -9891,8 +10102,12 @@ pub(crate) fn normalize_or_validate_agent_role(
             .filter(|r| valid_template_stem(r))
             .unwrap_or(slugified));
     }
-    let available = discover_available_archetype_slugs(agent_workdir, parent_workdir, data_dir);
-    if !available.is_empty() || configured_owner_archetype_workdir().is_some() {
+    let parent_ancestors: Vec<PathBuf> =
+        parent_workdir.map(Path::to_path_buf).into_iter().collect();
+    let disk_slugs =
+        discover_disk_archetype_slugs_with_ancestors(agent_workdir, &parent_ancestors, data_dir);
+    if !disk_slugs.is_empty() || configured_owner_archetype_workdir().is_some() {
+        let available = discover_available_archetype_slugs(agent_workdir, parent_workdir, data_dir);
         return Err(Error::Message(format!(
             "unknown role template {role:?} (available: {})",
             available.join(", ")
@@ -12753,10 +12968,205 @@ mod archetype_tests {
         let prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
         assert!(
             prompt.contains(
-                "- Available sub-agent roles (`role` in `agents`/`spawn`): `assistant`, `code-reviewer`, `director`, `engineer` (see `spawn` tool `role` schema for details)."
+                "- Available sub-agent roles (`role` in `agents`/`spawn`; defaults to `general`): `general`, `assistant`, `code-reviewer`, `director`, `engineer` (see `spawn` tool `role` schema for details)."
             ),
             "{prompt}"
         );
+    }
+
+    #[test]
+    fn builtin_general_role_resolves_private_without_disk_file_and_respects_disk_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // No .agents/agents/general.md exists anywhere on disk.
+        let tpl = resolve_archetype_template("general", Some(&ws), None, &data)
+            .unwrap()
+            .expect("built-in general role must resolve without disk file");
+        assert_eq!(tpl.role.as_deref(), Some("general"));
+        assert_eq!(tpl.scope.as_deref(), Some("private"));
+        assert!(tpl.description.as_deref().is_some_and(|d| !d.is_empty()));
+        assert!(!tpl.body.is_empty());
+        assert_eq!(
+            discover_available_archetype_slugs(Some(&ws), None, &data),
+            vec!["general".to_string()]
+        );
+
+        // Root agent (`parent: None`): built-in `general` assigns role without forcing private scope.
+        for role_val in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::json!("general"),
+        ] {
+            let mut req: crate::api::CreateAgentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": "default-root",
+                    "role": role_val,
+                    "workdir": ws,
+                }))
+                .unwrap();
+            apply_archetype_defaults(None, &data, None, &mut req).unwrap();
+            assert_eq!(req.role.as_deref(), Some("general"));
+            assert!(req.scope.is_none());
+            assert_eq!(req.instructions.as_deref(), Some(BUILTIN_GENERAL_ROLE_BODY));
+        }
+
+        // Explicit scope override on root is preserved.
+        let mut private_root_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "private-root",
+                "scope": "private",
+                "workdir": ws,
+            }))
+            .unwrap();
+        apply_archetype_defaults(None, &data, None, &mut private_root_req).unwrap();
+        assert_eq!(private_root_req.role.as_deref(), Some("general"));
+        assert_eq!(private_root_req.scope.as_deref(), Some("private"));
+
+        // Direct `create()` also defaults omitted/empty role to `general`.
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        for (name, role) in [
+            ("direct-none", None),
+            ("direct-empty", Some("".to_string())),
+        ] {
+            let agent = create(
+                &store,
+                &data,
+                CreateRequest {
+                    name: name.to_string(),
+                    role,
+                    harness: "agy".to_string(),
+                    model: None,
+                    profile: None,
+                    repo: None,
+                    branch: None,
+                    base: None,
+                    workdir: Some(ws.clone()),
+                    workdir_default: None,
+                    description: None,
+                    instructions: None,
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(agent.role.as_deref(), Some("general"));
+            assert_eq!(agent.scope(), "public");
+        }
+
+        // Sub-agent (`parent: Some`): built-in `general` defaults scope to `private` unless overridden.
+        let parent_agent = store.agent_by_name("direct-none").unwrap();
+        let mut sub_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "default-subagent",
+                "workdir": ws,
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data, Some(&parent_agent), &mut sub_req).unwrap();
+        assert_eq!(sub_req.role.as_deref(), Some("general"));
+        assert_eq!(sub_req.scope.as_deref(), Some("private"));
+
+        let mut public_sub_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "public-subagent",
+                "scope": "public",
+                "workdir": ws,
+            }))
+            .unwrap();
+        apply_archetype_defaults(
+            Some(&store),
+            &data,
+            Some(&parent_agent),
+            &mut public_sub_req,
+        )
+        .unwrap();
+        assert_eq!(public_sub_req.role.as_deref(), Some("general"));
+        assert_eq!(public_sub_req.scope.as_deref(), Some("public"));
+
+        // Explicit `public: true` / `public: false` without `scope` on a sub-agent stays intact.
+        for public_flag in [true, false] {
+            let mut bool_sub_req: crate::api::CreateAgentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": format!("bool-subagent-{public_flag}"),
+                    "public": public_flag,
+                    "workdir": ws,
+                }))
+                .unwrap();
+            apply_archetype_defaults(Some(&store), &data, Some(&parent_agent), &mut bool_sub_req)
+                .unwrap();
+            assert_eq!(bool_sub_req.role.as_deref(), Some("general"));
+            assert!(bool_sub_req.scope.is_none());
+            assert_eq!(bool_sub_req.public, Some(public_flag));
+        }
+
+        // Caller `description` is preserved into `instructions` when `instructions` is omitted.
+        let mut legacy_sub_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "legacy-subagent",
+                "description": "Legacy subagent brief",
+                "workdir": ws,
+            }))
+            .unwrap();
+        apply_archetype_defaults(
+            Some(&store),
+            &data,
+            Some(&parent_agent),
+            &mut legacy_sub_req,
+        )
+        .unwrap();
+        assert_eq!(legacy_sub_req.role.as_deref(), Some("general"));
+        assert_eq!(
+            legacy_sub_req.description.as_deref(),
+            Some("Legacy subagent brief")
+        );
+        assert_eq!(
+            legacy_sub_req.instructions.as_deref(),
+            Some(format!("{BUILTIN_GENERAL_ROLE_BODY}\n\nLegacy subagent brief").as_str())
+        );
+
+        // `.agents/agents/general.md` on disk overrides the built-in template.
+        std::fs::create_dir_all(ws.join(".agents/agents")).unwrap();
+        std::fs::write(
+            ws.join(".agents/agents/general.md"),
+            "---\nname: general\nscope: siblings\ndescription: Workspace general override\n---\nWorkspace general body.",
+        )
+        .unwrap();
+        let overridden = resolve_archetype_template("general", Some(&ws), None, &data)
+            .unwrap()
+            .unwrap();
+        assert_eq!(overridden.scope.as_deref(), Some("siblings"));
+        assert_eq!(
+            overridden.description.as_deref(),
+            Some("Workspace general override")
+        );
+        assert_eq!(overridden.body, "Workspace general body.");
+
+        let mut override_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "overridden-worker",
+                "workdir": ws,
+            }))
+            .unwrap();
+        apply_archetype_defaults(None, &data, None, &mut override_req).unwrap();
+        assert_eq!(override_req.role.as_deref(), Some("general"));
+        assert_eq!(override_req.scope.as_deref(), Some("siblings"));
+        assert_eq!(
+            override_req.instructions.as_deref(),
+            Some("Workspace general body.")
+        );
+
+        // Removing disk override reverts cleanly to built-in general.
+        std::fs::remove_file(ws.join(".agents/agents/general.md")).unwrap();
+        let reverted = resolve_archetype_template("general", Some(&ws), None, &data)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reverted.scope.as_deref(), Some("private"));
     }
 
     #[test]
@@ -13504,6 +13914,242 @@ mod runtime_config_tests {
                 .and_then(serde_json::Value::as_str)
                 .is_some()
         );
+    }
+
+    fn agy_seat_fixture() -> (tempfile::TempDir, Store, Agent, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("agy-seat", "agy"))
+            .unwrap();
+        let agent = store.set_agent_state(&agent.id, "running").unwrap();
+        let profile = dir.path().join("profiles/google-antigravity/default");
+        std::fs::create_dir_all(profile.join(".gemini/config")).unwrap();
+        std::fs::write(
+            profile.join(".gemini/config/mcp_config.json"),
+            b"{\"mcpServers\":{}}\n",
+        )
+        .unwrap();
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(cfg.join(".gemini/config")).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "google-antigravity/default\n").unwrap();
+        write_profile_marker(
+            &cfg,
+            ".anyagents-seeded-profile",
+            "google-antigravity/default\n",
+        )
+        .unwrap();
+        (dir, store, agent, cfg)
+    }
+
+    /// The live outage: a seat's `mcp_config.json` held `{"mcpServers":{}}`,
+    /// the running Antigravity process reloaded it, and `call_mcp_tool` left
+    /// its tool list (`server anyagents is not allowed in this context`) until
+    /// a restart rewrote the file. The periodic seat pass restores the
+    /// registration without a restart and keeps the seat's other servers.
+    #[test]
+    fn seat_pass_restores_a_dropped_agy_mcp_registration_without_a_restart() {
+        let (dir, store, agent, cfg) = agy_seat_fixture();
+        let seat_mcp = cfg.join(".gemini/config/mcp_config.json");
+        let args_of_seat = mcp_server_args(dir.path(), &cfg);
+        let foreign = format!(
+            r#"{{"mcpServers":{{"anyagents":{{"command":"/bin/anyagents","args":["--data","{}","mcp","--config","/elsewhere/agents/other/config"]}}}}}}"#,
+            dir.path().display()
+        );
+        for broken in [
+            foreign.as_bytes(),
+            &b"{\"mcpServers\":{}}\n"[..],
+            b"",
+            b"{truncated",
+            br#"{"mcpServers":{"other":{"command":"/bin/other"},"anyagents":{"command":"/bin/x","disabled":true}}}"#,
+        ] {
+            std::fs::write(&seat_mcp, broken).unwrap();
+            assert!(!agy_mcp_registered(&seat_mcp, &args_of_seat));
+            sync_fresher_bound_agent_credentials_in(&store, dir.path());
+            assert!(agy_mcp_registered(&seat_mcp, &args_of_seat), "not restored from {broken:?}");
+            let root: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&seat_mcp).unwrap()).unwrap();
+            let args: Vec<&str> = root
+                .pointer("/mcpServers/anyagents/args")
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            assert_eq!(args[2..4], ["mcp", "--config"]);
+            assert_eq!(args[4], cfg.display().to_string());
+            if broken.starts_with(br#"{"mcpServers":{"other""#) {
+                assert!(root.pointer("/mcpServers/other/command").is_some());
+            }
+        }
+
+        // A healthy registration is left byte-for-byte alone.
+        let before = std::fs::read(&seat_mcp).unwrap();
+        sync_fresher_bound_agent_credentials_in(&store, dir.path());
+        assert_eq!(std::fs::read(&seat_mcp).unwrap(), before);
+
+        // The seeding path every wake runs restores it as well.
+        std::fs::write(&seat_mcp, b"{\"mcpServers\":{}}\n").unwrap();
+        seed_harness_credentials(&store, dir.path(), &agent, &cfg).unwrap();
+        assert!(agy_mcp_registered(&seat_mcp, &args_of_seat));
+
+        // A transition in progress owns the seat: the pass leaves it alone.
+        std::fs::write(&seat_mcp, b"{\"mcpServers\":{}}\n").unwrap();
+        let held = store.lock_agent_lifecycle(&agent.id).unwrap();
+        sync_fresher_bound_agent_credentials_in(&store, dir.path());
+        assert!(!agy_mcp_registered(&seat_mcp, &args_of_seat));
+        drop(held);
+        sync_fresher_bound_agent_credentials_in(&store, dir.path());
+        assert!(agy_mcp_registered(&seat_mcp, &args_of_seat));
+    }
+
+    /// A profile switch copies the profile's credentials into the seat, and
+    /// nothing the seat owns: not the profile's markers and usage stamps, its
+    /// empty server map, its vendor settings or hooks (the seat's carry the
+    /// tool guard and deny list), its instruction mirrors, or a concurrent
+    /// writer's temporary file. A zero-byte file left by an older writer must
+    /// not abort the copy half-way, leaving the seat with some of the
+    /// profile's files and none of its own rewrites.
+    #[test]
+    fn profile_copy_carries_credentials_and_keeps_seat_owned_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let seat = dir.path().join("seat");
+        let write = |path: PathBuf, bytes: &[u8]| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        // Profile side.
+        write(profile.join(".anyagents-agy-tier.txt"), b"pro\n");
+        write(
+            profile.join(".anyagents-profile-meta-sync-ms"),
+            b"1800000000000\n",
+        );
+        write(
+            profile.join(".anyagents-quota-reset-ms"),
+            b"1800000000000\n",
+        );
+        write(profile.join(".anyagents-oauth-refresh-attempt-ms"), b"");
+        write(
+            profile.join(".anyagents-profile"),
+            b"google-antigravity/other\n",
+        );
+        write(
+            profile.join(".gemini/config/.config.json.4242.0.anyagents-tmp"),
+            b"{\"half\":",
+        );
+        write(
+            profile.join(".gemini/config/mcp_config.json"),
+            b"{\"mcpServers\":{}}\n",
+        );
+        write(
+            profile.join(".gemini/config/hooks.json"),
+            b"{\"hooks\":{}}\n",
+        );
+        write(profile.join(".gemini/config/GEMINI.md"), b"profile doc\n");
+        write(
+            profile.join(".gemini/antigravity-cli/settings.json"),
+            b"{\"permissions\":{}}\n",
+        );
+        write(profile.join("settings.json"), b"{\"profile\":true}\n");
+        write(profile.join(".claude.json"), b"{}\n");
+        write(profile.join("empty-cache.json"), b"");
+        write(profile.join(".gemini/config/config.json"), b"{\"k\":1}\n");
+        write(
+            profile.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            br#"{"access_token":"fixture"}"#,
+        );
+        write(profile.join("brain/state"), b"vendor runtime");
+        write(profile.join("profile.json"), b"{}");
+        // Seat side.
+        let registered = br#"{"mcpServers":{"anyagents":{"command":"/bin/anyagents"}}}"#;
+        let guarded = br#"{"permissions":{"deny":["command(*)"]}}"#;
+        write(seat.join(".gemini/config/mcp_config.json"), registered);
+        write(
+            seat.join(".gemini/config/hooks.json"),
+            b"{\"seat-guard\":1}\n",
+        );
+        write(seat.join(".gemini/antigravity-cli/settings.json"), guarded);
+        write(
+            seat.join(".anyagents-profile"),
+            b"google-antigravity/default\n",
+        );
+        write(seat.join(".anyagents-agy-tier.txt"), b"ultra\n");
+
+        copy_profile_tree(&profile, &seat).unwrap();
+
+        let read = |rel: &str| std::fs::read(seat.join(rel)).unwrap();
+        assert_eq!(read(".gemini/config/mcp_config.json"), registered);
+        assert_eq!(read(".gemini/config/hooks.json"), b"{\"seat-guard\":1}\n");
+        assert_eq!(read(".gemini/antigravity-cli/settings.json"), guarded);
+        assert_eq!(read(".anyagents-profile"), b"google-antigravity/default\n");
+        assert_eq!(read(".anyagents-agy-tier.txt"), b"ultra\n");
+        for absent in [
+            ".anyagents-profile-meta-sync-ms",
+            ".anyagents-quota-reset-ms",
+            ".anyagents-oauth-refresh-attempt-ms",
+            ".gemini/config/.config.json.4242.0.anyagents-tmp",
+            ".gemini/config/GEMINI.md",
+            "settings.json",
+            ".claude.json",
+            "empty-cache.json",
+            "brain",
+            "profile.json",
+        ] {
+            assert!(!seat.join(absent).exists(), "{absent} was copied");
+        }
+        assert_eq!(read(".gemini/config/config.json"), b"{\"k\":1}\n");
+        assert_eq!(
+            read(".gemini/antigravity-cli/antigravity-oauth-token"),
+            br#"{"access_token":"fixture"}"#
+        );
+    }
+
+    /// Transitions of one agent run one at a time across threads and
+    /// processes: an operator switch waits for the holder of the agent's
+    /// lifecycle lock; an automatic rotation skips the busy agent.
+    #[test]
+    fn harness_transitions_of_one_agent_are_serialized() {
+        let (dir, store, agent, _cfg) = agy_seat_fixture();
+        let data = dir.path().to_path_buf();
+        let held = store.lock_agent_lifecycle(&agent.id).unwrap();
+
+        let rotated = configure_agent_runtime(
+            &store,
+            &data,
+            "system:quota-rotate",
+            &agent.name,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(rotated, Err(Error::AgentBusy)), "{rotated:?}");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let name = agent.name.clone();
+        let waiter_data = data.clone();
+        let waiter = std::thread::spawn(move || {
+            let store = Store::open(waiter_data.join("state.db")).unwrap();
+            let started = std::time::Instant::now();
+            let _ =
+                configure_agent_runtime(&store, &waiter_data, "operator", &name, None, None, None);
+            tx.send(started.elapsed()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "an operator switch ran while another transition held the agent"
+        );
+        drop(held);
+        let waited = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the switch never ran after the lock was released");
+        assert!(waited >= std::time::Duration::from_millis(300));
+        waiter.join().unwrap();
+        assert!(store.try_lock_agent_lifecycle(&agent.id).is_ok());
     }
 
     fn serve_one_http_request(

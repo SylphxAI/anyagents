@@ -362,6 +362,7 @@ fn agy_rpc_steers_mid_turn_via_language_server_and_cancels_natively() {
             assert!(req.contains("x-codeium-csrf-token: test-csrf-123"));
             let (head, body) = req.split_once("\r\n\r\n").unwrap_or(("", ""));
             let first_line = head.lines().next().unwrap_or("");
+            let mut code = "200 OK";
             let resp_body = if first_line.contains("GetAllCascadeTrajectories") {
                 let status = if running_srv.load(Ordering::SeqCst) {
                     "CASCADE_RUN_STATUS_RUNNING"
@@ -388,8 +389,21 @@ fn agy_rpc_steers_mid_turn_via_language_server_and_cancels_natively() {
                 .to_string()
             } else if first_line.contains("SendUserCascadeMessage") {
                 let val: serde_json::Value = serde_json::from_str(body).unwrap();
-                steered_srv.lock().unwrap().push(val);
-                "{}".to_string()
+                // An idle cascade needs a planner config to start an
+                // invocation, and queues nothing without one.
+                if !running_srv.load(Ordering::SeqCst)
+                    && val["cascadeConfig"]["plannerConfig"].is_null()
+                {
+                    code = "500 Internal Server Error";
+                    json!({
+                        "code": "unknown",
+                        "message": "plan model not specified; you must specify a valid model"
+                    })
+                    .to_string()
+                } else {
+                    steered_srv.lock().unwrap().push(val);
+                    "{}".to_string()
+                }
             } else if first_line.contains("CancelCascadeInvocation") {
                 let val: serde_json::Value = serde_json::from_str(body).unwrap();
                 cancelled_srv.lock().unwrap().push(val);
@@ -398,7 +412,7 @@ fn agy_rpc_steers_mid_turn_via_language_server_and_cancels_natively() {
                 "{}".to_string()
             };
             let resp = format!(
-                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.0 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 resp_body.len(),
                 resp_body
             );
