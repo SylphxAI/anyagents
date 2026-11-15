@@ -2500,6 +2500,8 @@ fn is_transient_turn_fault(error: &str) -> bool {
         "status 504",
         "bad gateway",
         "service unavailable",
+        "service_unavailable",
+        "sylphx_ai_stream_no_output",
         "gateway timeout",
         "connection reset",
         "broken pipe",
@@ -2920,6 +2922,27 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use anyagents_harness::DeliveryMode;
+
+    #[test]
+    fn upstream_stream_fault_codes_are_transient_but_never_override_client_faults() {
+        for code in ["service_unavailable", "sylphx_ai_stream_no_output"] {
+            let error = format!(
+                "Sylphx AI failure Some(\"{code}\"): The model response was interrupted. Retry the request."
+            );
+            assert!(is_transient_turn_fault(&error), "{error}");
+            for client_fault in [
+                "HTTP 400",
+                "HTTP 401",
+                "HTTP 403",
+                "context limit",
+                "not signed in",
+            ] {
+                let mixed = format!("{client_fault}: {error}");
+                assert!(!is_transient_turn_fault(&mixed), "{mixed}");
+            }
+        }
+        assert!(!is_transient_turn_fault("unrecognized provider fault"));
+    }
 
     #[test]
     fn legacy_admin_files_do_not_disable_spiron_supervision() {
