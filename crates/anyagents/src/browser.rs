@@ -7076,12 +7076,16 @@ mod tests {
         let user_data = profile_dir(data, "fixture").join("user-data");
         std::fs::create_dir_all(&user_data).unwrap();
         // A launcher that starts the "browser" in its own group and exits,
-        // as xvfb-run does when Chromium outlives it.
+        // as xvfb-run does when Chromium outlives it. The member prints its
+        // own pid once it runs its script, past its last exec, and `; :`
+        // keeps a shell that execs its final command from replacing itself
+        // with `sleep`: its command line, the flag included, never changes
+        // under the reads below.
         let flag = format!("--user-data-dir={}", user_data.display());
         let mut launcher = Command::new("/bin/sh")
             .args([
                 "-c",
-                "/bin/sh -c 'sleep 60' sh \"$1\" </dev/null >/dev/null 2>&1 & echo $!",
+                "/bin/sh -c 'echo $$; sleep 60; :' sh \"$1\" </dev/null 2>/dev/null &",
                 "sh",
             ])
             .arg(&flag)
