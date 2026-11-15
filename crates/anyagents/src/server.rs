@@ -8842,7 +8842,9 @@ pub(crate) mod tests {
         let store = Store::open(temp.path().join("state.db")).unwrap();
         for (harness, mode, steer) in [
             ("spiron", "steer", "yes"),
-            ("grok", "steer", "unproven"),
+            ("grok", "steer", "yes"),
+            ("opencode", "steer", "yes"),
+            ("dsh", "steer", "yes"),
             ("spiron-cloud", "followup", "no"),
         ] {
             let agent = store
@@ -8859,6 +8861,14 @@ pub(crate) mod tests {
                 "{harness}"
             );
         }
+        let mid_turn = crate::api::DeliveryView::from(&anyagents_harness_stream::LINE_INTO_TURN);
+        assert_eq!(
+            (
+                mid_turn.legacy_mode().as_str(),
+                mid_turn.legacy_steer().as_str()
+            ),
+            ("steer", "unproven")
+        );
     }
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
