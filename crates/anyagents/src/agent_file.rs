@@ -39,7 +39,7 @@ pub(crate) enum FileAuthority {
 pub(crate) struct Beneath {
     /// Its own: read and write.
     own: Vec<PathBuf>,
-    /// Read only: inbound media, which every seat may read by name.
+    /// Read-only roots: shared channel media and recipient-private copies.
     shared: Vec<PathBuf>,
     /// Read only, `<profile>/screenshots/<file>` only: browser screenshots.
     profiles: Option<PathBuf>,
@@ -91,7 +91,10 @@ impl FileAuthority {
         }
         Self::Beneath(Beneath {
             own,
-            shared: vec![data.join(anyagents_harness::media::MEDIA_DIR)],
+            shared: vec![
+                data.join(anyagents_harness::media::MEDIA_DIR),
+                data.join("inbound-media").join(agent.id.as_str()),
+            ],
             profiles: Some(crate::browser::profiles_root(data)),
         })
     }

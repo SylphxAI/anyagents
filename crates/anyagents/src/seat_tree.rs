@@ -37,6 +37,182 @@ fn open_root(path: &Path) -> io::Result<File> {
     Ok(directory)
 }
 
+/// A private copy remains staged until its mailbox row is committed. Failed
+/// delivery (or a racing duplicate) removes it through the held directory.
+pub(crate) struct InboundMedia {
+    path: PathBuf,
+    directory: File,
+    name: CString,
+    retained: bool,
+}
+
+impl InboundMedia {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+    pub(crate) fn retain(mut self) {
+        self.retained = true;
+    }
+}
+
+impl Drop for InboundMedia {
+    fn drop(&mut self) {
+        if !self.retained {
+            unsafe {
+                libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0);
+            }
+        }
+    }
+}
+
+/// Daemon-owned inbound copies. Neither the recipient nor its supplementary
+/// groups can replace a directory or file; only the admitted uid can read it.
+pub(crate) fn persist_inbound_media(
+    data: &Path,
+    recipient: &anyagents_core::AgentId,
+    uid: Option<u32>,
+    name: &str,
+    bytes: &[u8],
+) -> io::Result<InboundMedia> {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    let data_fd = open_root(data)?;
+    let root = private_media_dir(&data_fd, OsStr::new("inbound-media"), None, true)?;
+    let dir = private_media_dir(&root, OsStr::new(recipient.as_str()), uid, false)?;
+    // Bound the generated component even for a NAME_MAX source basename.
+    let extension = Path::new(name)
+        .extension()
+        .and_then(OsStr::to_str)
+        .filter(|s| s.len() <= 16 && s.bytes().all(|b| b.is_ascii_alphanumeric()));
+    let name = match extension {
+        Some(ext) => format!("{}.{ext}", anyagents_core::MessageId::generate()),
+        None => anyagents_core::MessageId::generate().to_string(),
+    };
+    // Only the basename from MediaUpload is used; defense in depth for callers.
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(io::Error::other("invalid inbound media filename"));
+    }
+    let c_name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let result = (|| {
+        clear_private_acl(file.as_fd())?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        inbound_grant(&file, uid, false)?;
+        file.sync_all()?;
+        dir.sync_all()
+    })();
+    if let Err(error) = result {
+        unsafe {
+            libc::unlinkat(dir.as_raw_fd(), c_name.as_ptr(), 0);
+        }
+        return Err(error);
+    }
+    Ok(InboundMedia {
+        path: data
+            .join("inbound-media")
+            .join(recipient.as_str())
+            .join(name),
+        directory: dir,
+        name: c_name,
+        retained: false,
+    })
+}
+
+fn private_media_dir(
+    parent: &File,
+    name: &OsStr,
+    uid: Option<u32>,
+    traverse: bool,
+) -> io::Result<File> {
+    use std::os::fd::AsFd;
+    let c_name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), 0o700) } != 0
+        && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let dir = open_child(parent, name, true)?;
+    if dir.metadata()?.uid() != super::sandbox::server_uid() {
+        return Err(io::Error::other(
+            "inbound media directory is not daemon-owned",
+        ));
+    }
+    clear_private_acl(dir.as_fd())?;
+    if unsafe { libc::fchmod(dir.as_raw_fd(), if traverse { 0o711 } else { 0o700 }) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if !traverse {
+        inbound_grant(&dir, uid, true)?;
+    }
+    Ok(dir)
+}
+
+fn inbound_grant(file: &File, uid: Option<u32>, directory: bool) -> io::Result<()> {
+    let Some(uid) = uid else {
+        return Ok(());
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (1u16, if directory { 7u16 } else { 6 }, u32::MAX),
+            (2, if directory { 5 } else { 4 }, uid),
+            (4, 0, u32::MAX), // never grant the daemon's or socket's group
+            (16, if directory { 5 } else { 4 }, u32::MAX),
+            (32, 0, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&perm.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        if unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                c"system.posix_acl_access".as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut actual = vec![0u8; acl.len()];
+        let length = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                c"system.posix_acl_access".as_ptr(),
+                actual.as_mut_ptr().cast(),
+                actual.len(),
+            )
+        };
+        if length != acl.len() as isize || actual != acl {
+            return Err(io::Error::other("inbound media ACL read-back mismatch"));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, uid, directory);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private seat media grants require Linux ACLs",
+        ))
+    }
+}
+
 fn names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
     // fdopendir owns a duplicate; neither enumeration nor recursion reopens a
     // pathname that the seat can replace while the grant is in progress.

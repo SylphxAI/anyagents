@@ -167,6 +167,10 @@ jobs:
           "$test_binary" --ignored --exact "$test_name" --list | grep -Fx "$test_name: test"
           sudo env LC_ALL=C ANYAGENTS_REQUIRE_CONFIG_ACL_TEST=1 ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST=1 /usr/bin/setpriv --bounding-set=-dac_override,-dac_read_search -- "$test_binary" --ignored --exact "$test_name" --nocapture 2>&1 | tee "$RUNNER_TEMP/config-acl-test.log"
           grep -Fx 'CONFIG_ACL_PRIVILEGED_ACCEPTANCE_EXECUTED' "$RUNNER_TEMP/config-acl-test.log"
+          test_name=server::tests::privileged_a2a_private_media_cross_uid
+          "$test_binary" --ignored --exact "$test_name" --list | grep -Fx "$test_name: test"
+          sudo env LC_ALL=C ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST=1 /usr/bin/setpriv --bounding-set=-dac_override,-dac_read_search -- "$test_binary" --ignored --exact "$test_name" --nocapture 2>&1 | tee "$RUNNER_TEMP/a2a-media-test.log"
+          grep -Fx 'A2A_PRIVATE_MEDIA_CROSS_UID_EXECUTED' "$RUNNER_TEMP/a2a-media-test.log"
 
       - name: Cross-seat repositories
         run: |

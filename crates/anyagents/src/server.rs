@@ -7897,6 +7897,7 @@ fn send_sync(
     // The request's `reply_to` is a reference, not a Telegram id; a Telegram
     // target carries the id the reference resolved to instead.
     let reply = plan.reply.clone();
+    let authored_text = body.text.clone();
     let effective_text = format_internal_send_text(&body);
     let body = SendRequest {
         text: effective_text,
@@ -7907,6 +7908,10 @@ fn send_sync(
                 .filter(|v| crate::reply::ref_message(v).is_none())
         }),
         ..body
+    };
+    let internal_body = SendRequest {
+        text: authored_text,
+        ..body.clone()
     };
     check_targets(store, actor, &body, &plan)?;
     let upload = media_upload(store, &body, &plan)?;
@@ -7964,22 +7969,24 @@ fn send_sync(
                         history_key.as_deref(),
                         true,
                         || {
-                            Ok(vec![deliver_agent(
+                            Ok(vec![deliver_agent_with_media(
                                 store,
-                                &body,
+                                &internal_body,
                                 name,
                                 key.as_deref(),
                                 wake_archived,
+                                upload.as_ref(),
                             )?])
                         },
                     )?
                 } else {
-                    vec![deliver_agent(
+                    vec![deliver_agent_with_media(
                         store,
-                        &body,
+                        &internal_body,
                         name,
                         key.as_deref(),
                         wake_archived,
+                        upload.as_ref(),
                     )?]
                 };
                 deliveries.extend(sent);
@@ -8000,10 +8007,24 @@ fn send_sync(
                         &composed_body,
                         history_key.as_deref(),
                         true,
-                        || deliver_room(store, &body, room, key.as_deref()),
+                        || {
+                            deliver_room_with_media(
+                                store,
+                                &internal_body,
+                                room,
+                                key.as_deref(),
+                                upload.as_ref(),
+                            )
+                        },
                     )?
                 } else {
-                    deliver_room(store, &body, room, key.as_deref())?
+                    deliver_room_with_media(
+                        store,
+                        &internal_body,
+                        room,
+                        key.as_deref(),
+                        upload.as_ref(),
+                    )?
                 };
                 let mut room_skip = room_skipped(store, &body, room);
                 deliveries.append(&mut all);
@@ -8082,11 +8103,10 @@ fn send_sync(
     Ok(Json(response))
 }
 
-/// The bytes of a send's local media file, for its Telegram targets: read
-/// once, before any target is written, with the caller's own access and never
-/// the server's (ADR 0010 D3). A URL, a Telegram `file_id`, or a send with no
-/// Telegram target reads nothing; an agent's mailbox gets the path, which its
-/// recipient opens as itself.
+/// The bytes of a send's local media file: read once, before any target is
+/// written, with the caller's own access and never the server's (ADR 0010 D3).
+/// A URL or a Telegram `file_id` reads nothing; internal recipients receive
+/// daemon-owned private copies rather than a sender-private path.
 fn media_upload(
     store: &Store,
     body: &SendRequest,
@@ -8096,12 +8116,7 @@ fn media_upload(
         return Ok(None);
     };
     let source = media.source.trim();
-    if !crate::telegram::is_local_media(source)
-        || !plan
-            .targets
-            .iter()
-            .any(|target| matches!(target, Target::Telegram { .. }))
-    {
+    if !crate::telegram::is_local_media(source) {
         return Ok(None);
     }
     // The authenticated agent, never a sender the operator names.
@@ -8271,14 +8286,46 @@ fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api
 }
 
 /// One room message, one delivery per recipient.
-fn deliver_room(
+/// `upload` was read once as the authenticated principal, before any delivery
+/// effects. Each recipient gets a private copy, never a sender-private path.
+fn recipient_media_text(
+    store: &Store,
+    body: &SendRequest,
+    agent: &anyagents_core::Agent,
+    upload: Option<&crate::telegram::MediaUpload>,
+) -> Result<(String, Option<crate::seat_tree::InboundMedia>), anyagents_core::Error> {
+    let (Some(media), Some(upload)) = (&body.media, upload) else {
+        return Ok((format_internal_send_text(body), None));
+    };
+    let uid = crate::sandbox::seat_for_agent(agent.id.as_str()).map(|(_, uid, _, _)| uid);
+    if uid.is_none() && crate::sandbox::seats_configured() {
+        return Err(anyagents_core::Error::PermissionDenied(
+            "recipient has no admitted seat".into(),
+        ));
+    }
+    let staged = crate::seat_tree::persist_inbound_media(
+        store.data_dir(),
+        &agent.id,
+        uid,
+        &upload.file_name,
+        &upload.bytes,
+    )?;
+    let line = anyagents_harness::media::local_media_line(&media.kind, staged.path());
+    Ok((
+        format_internal_send_text_with_attachment(body, Some(&line)),
+        Some(staged),
+    ))
+}
+
+fn deliver_room_with_media(
     store: &Store,
     body: &SendRequest,
     room: &str,
     key: Option<&str>,
+    upload: Option<&crate::telegram::MediaUpload>,
 ) -> Result<Vec<Delivery>, ApiError> {
     let delivered = store
-        .receive_room(
+        .receive_room_with(
             room,
             Incoming {
                 text: body.text.clone(),
@@ -8289,6 +8336,17 @@ fn deliver_room(
                 quote: body.quote.clone(),
                 origin: None,
                 received_at_ms: None,
+            },
+            |agent, mut incoming| {
+                let (text, staged) = recipient_media_text(store, body, agent, upload)?;
+                incoming.text = text;
+                let outcome = store.receive(&agent.id, incoming)?;
+                if matches!(outcome, ReceiveOutcome::New(_))
+                    && let Some(staged) = staged
+                {
+                    staged.retain();
+                }
+                Ok(outcome)
             },
         )
         .map_err(ApiError::from_store)?;
@@ -8329,12 +8387,13 @@ fn archived_refusal(store: &Store, name: &str) -> Option<crate::api::SkippedDeli
     })
 }
 
-fn deliver_agent(
+fn deliver_agent_with_media(
     store: &Store,
     body: &SendRequest,
     name: &str,
     key: Option<&str>,
     wake_archived: bool,
+    upload: Option<&crate::telegram::MediaUpload>,
 ) -> Result<Delivery, ApiError> {
     let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
     let _lifecycle = store
@@ -8355,6 +8414,8 @@ fn deliver_agent(
             duplicate: true,
         });
     }
+    let (text, staged) =
+        recipient_media_text(store, body, &agent, upload).map_err(ApiError::from_store)?;
     if wake_archived && is_explicitly_archived(store.data_dir(), &agent) {
         prepare_agent_wake(store, &agent)?;
     }
@@ -8369,7 +8430,7 @@ fn deliver_agent(
         let _ = store.set_agent_state(&agent.id, "running");
     }
     let incoming = Incoming {
-        text: body.text.clone(),
+        text,
         sender: body.sender.clone(),
         source_time_ms: None,
         source_key: key.map(str::to_string),
@@ -8389,6 +8450,9 @@ fn deliver_agent(
         ReceiveOutcome::Duplicate(message) => (message, true),
     };
     if !duplicate {
+        if let Some(staged) = staged {
+            staged.retain();
+        }
         crate::create::poke_agent_wake_socket(store.data_dir(), &agent.id);
         crate::create::poke_agent_wake_socket_mail(store.data_dir(), &agent.id);
     }
@@ -8538,12 +8602,23 @@ fn telegram_reply(body: &SendRequest, reply: Option<&str>) -> Result<Option<i64>
 }
 
 fn format_internal_send_text(body: &SendRequest) -> String {
+    format_internal_send_text_with_attachment(body, None)
+}
+
+fn format_internal_send_text_with_attachment(
+    body: &SendRequest,
+    attachment: Option<&str>,
+) -> String {
     let mut parts = Vec::new();
     if !body.text.trim().is_empty() {
         parts.push(body.text.clone());
     }
     if let Some(ref media) = body.media {
-        parts.push(format!("[Attachment ({}): {}]", media.kind, media.source));
+        parts.push(
+            attachment
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("[Attachment ({}): {}]", media.kind, media.source)),
+        );
     }
     if let Some(ref loc) = body.location {
         match (&loc.title, &loc.address) {
@@ -8806,6 +8881,7 @@ pub fn owner_workdir() -> Option<std::path::PathBuf> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("a2a_media_tests.rs");
     #[test]
     fn memory_backlog_follows_wakes_and_idle_consolidation_visits_nothing() {
         let dir = crate::test_tempdir();
@@ -10509,8 +10585,8 @@ pub(crate) mod tests {
     /// A send's local media is read with the sending agent's own access,
     /// once, before any Telegram post: the operator token, a link to it and
     /// a path outside the agent's directories are refused; the agent's own
-    /// file is read; a URL or `file_id` and an internal-only send read
-    /// nothing; the operator reads with its own access.
+    /// file is read, including internal-only sends; URLs and file IDs read
+    /// nothing. The operator reads with its own access.
     #[test]
     fn send_media_is_read_with_the_senders_access_never_the_servers() {
         let _env = env_lock();
@@ -10592,11 +10668,7 @@ pub(crate) mod tests {
             );
         }
         let internal = plan(Some(&agent.id), "agent:bob");
-        assert!(
-            media_upload(&store, &body(token.to_str().unwrap()), &internal)
-                .unwrap()
-                .is_none()
-        );
+        assert!(media_upload(&store, &body(token.to_str().unwrap()), &internal).is_err());
         let operator = plan(None, "telegram:chat:100");
         let read = media_upload(&store, &body(token.to_str().unwrap()), &operator)
             .unwrap()
