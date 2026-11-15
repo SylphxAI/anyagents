@@ -46,9 +46,16 @@ impl<R: Read> MetadataReader<R> {
         let mut escaped = false;
         let mut oversized = false;
         loop {
-            let byte = self.byte()?.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "unterminated metadata string")
-            })?;
+            let Some(byte) = self.byte()? else {
+                // Preserve malformed JSON as malformed JSON, not an I/O error.
+                // The caller tolerates torn external records, but must still
+                // propagate actual source read failures. Even an oversized
+                // unterminated token must remain unterminated in the projection.
+                if oversized {
+                    self.pending.push(b'"');
+                }
+                return Ok(true);
+            };
             if !oversized {
                 if self.pending.len() < STRING_BYTES {
                     self.pending.push(byte);
@@ -353,6 +360,39 @@ impl EventHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn torn_strings_are_json_eof_not_source_io_errors() {
+        for length in [0, 1024, STRING_BYTES - 1, STRING_BYTES, STRING_BYTES * 2] {
+            for suffix in ["", "\\"] {
+                let raw = format!("{{\"content\":\"{}{suffix}", "x".repeat(length));
+                let error =
+                    serde_json::from_reader::<_, EventHeader>(MetadataReader::new(raw.as_bytes()))
+                        .err()
+                        .unwrap();
+                assert_eq!(error.classify(), serde_json::error::Category::Eof);
+            }
+        }
+    }
+
+    #[test]
+    fn source_io_errors_are_not_reclassified_as_torn_json() {
+        struct FailedSource;
+        impl Read for FailedSource {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "read denied",
+                ))
+            }
+        }
+        let source = io::Cursor::new(b"{\"content\":\"partial").chain(FailedSource);
+        let error = serde_json::from_reader::<_, EventHeader>(MetadataReader::new(source))
+            .err()
+            .unwrap();
+        assert_eq!(error.classify(), serde_json::error::Category::Io);
+        assert_eq!(error.io_error_kind(), Some(io::ErrorKind::PermissionDenied));
+    }
+
     #[test]
     fn projection_preserves_short_tokens_and_bounds_each_resident_token() {
         let short = serde_json::json!({"escaped":"\\\"☃\\", "array":["text", {"name":"browser"}], "null":null});

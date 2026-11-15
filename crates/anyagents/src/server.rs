@@ -10345,6 +10345,22 @@ pub(crate) mod tests {
                 assert!(response.turns.iter().all(|t|t.raw.is_some() && t.window.is_some()));
                 for t in &response.turns {let raw=t.raw.as_ref().unwrap();let bytes=std::fs::read(&raw.segment).unwrap();assert_eq!(anyagents_core::learned_memory::sha256(&bytes[raw.offset as usize..(raw.offset+raw.length) as usize]),raw.sha256);}
             }
+            // Torn external strings must not prevent the canonical selector
+            // from reading valid neighbors, including large escaped payloads.
+            let native = dir.path().join("agents").join(child.id.as_str()).join("config/sylphx-transcript.jsonl");
+            let payload = "largevalidneedle \" 中文 ".repeat(1000);
+            let valid = serde_json::to_string(&serde_json::json!({"role":"assistant","direction":"out","content":payload})).unwrap();
+            assert!(valid.len() > 4096);
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&valid).unwrap()["content"], payload);
+            std::fs::OpenOptions::new().append(true).open(&native).unwrap().write_all(
+                format!("{{\"content\":\"{}\n{valid}\n", "torntoken ".repeat(1000)).as_bytes()
+            ).unwrap();
+            let Json(large)=conversation_route(principal(),State(state.clone()),AxumPath(child.name.clone()),Query(serde_json::from_value(serde_json::json!({"scope":"transcripts","query":"largevalidneedle","direction":"out","limit":6})).unwrap())).await.unwrap_or_else(|e|panic!("{}", e.message));
+            assert_eq!(large.turns.len(), 1);
+            let raw = large.turns[0].raw.as_ref().unwrap();
+            let bytes = std::fs::read(&raw.segment).unwrap();
+            let record = &bytes[raw.offset as usize..(raw.offset+raw.length) as usize];
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(record).unwrap()["content"], payload);
             // Native records lacking time must remain null at the canonical
             // surface, never inherit a recent filesystem timestamp.
             let native = dir.path().join("agents").join(child.id.as_str()).join("config/sylphx-transcript.jsonl");
