@@ -18,12 +18,13 @@ use serde_json::Value;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why a stream ended.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Ended {
     /// The connection failed or closed: a new one may succeed.
     Lost,
-    /// The service answered with a status other than 200: no new connection
-    /// to the same service changes that.
+    /// The readiness gate answered 503 `service_starting` or `service_stopping`.
+    NotReady,
+    /// The service refused the stream terminally (`401`, `403`, `404`, `503 service_failed`, ...).
     Refused(u16),
 }
 
@@ -58,6 +59,7 @@ fn read(endpoint: &str, password: &str, on_event: &mut impl FnMut(Value)) -> io:
         .and_then(|status| status.parse::<u16>().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no HTTP status line"))?;
     let mut chunked = false;
+    let mut content_length: Option<usize> = None;
     loop {
         line.clear();
         if head.read_line(&mut line)? == 0 {
@@ -67,16 +69,45 @@ fn read(endpoint: &str, password: &str, on_event: &mut impl FnMut(Value)) -> io:
         if header.is_empty() {
             break;
         }
-        if let Some((name, value)) = header.split_once(':')
-            && name.trim().eq_ignore_ascii_case("transfer-encoding")
-            && value
-                .split(',')
-                .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
-        {
-            chunked = true;
+        if let Some((name, value)) = header.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && value
+                    .split(',')
+                    .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+            {
+                chunked = true;
+            } else if name.trim().eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse::<usize>().ok();
+            }
         }
     }
     if status != 200 {
+        if status == 503 {
+            let _ = head
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_secs(2)));
+            let mut raw = Vec::new();
+            if chunked {
+                let mut reader = Chunked {
+                    inner: head,
+                    left: 0,
+                    trailing_crlf: false,
+                }
+                .take(4096);
+                let _ = reader.read_to_end(&mut raw);
+            } else if content_length != Some(0) {
+                let limit = content_length.unwrap_or(4096).min(4096) as u64;
+                let _ = head.take(limit).read_to_end(&mut raw);
+            }
+            if let Ok(body) = serde_json::from_slice::<Value>(&raw)
+                && matches!(
+                    body.get("code").and_then(Value::as_str),
+                    Some("service_starting" | "service_stopping")
+                )
+            {
+                return Ok(Ended::NotReady);
+            }
+        }
         return Ok(Ended::Refused(status));
     }
     let body: Box<dyn Read> = if chunked {

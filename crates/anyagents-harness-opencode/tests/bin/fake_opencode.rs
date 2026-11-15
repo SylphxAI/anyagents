@@ -200,7 +200,10 @@ fn api(args: &[String], endpoint: &str) {
         }
         ("POST", p) if p.starts_with("/api/experimental/session/") && p.ends_with("/wait") => {
             // A turn that never ends answers only when the service stops.
-            if matches!(mode.as_str(), "hold" | "inbox" | "interrupt-failed") {
+            if matches!(
+                mode.as_str(),
+                "hold" | "inbox" | "interrupt-failed" | "undelivered"
+            ) {
                 let address = endpoint.trim_start_matches("http://");
                 while std::net::TcpStream::connect(address).is_ok() {
                     thread::sleep(Duration::from_millis(50));
@@ -218,7 +221,11 @@ fn api(args: &[String], endpoint: &str) {
                 .unwrap_or_default();
             let id = p.rsplit('/').next().unwrap_or_default();
             // `applied`, or an input the service consumed: the conversation holds it.
-            if mode == "applied" || was_delivered(endpoint, session, id) {
+            let replay_consumed = mode == "replay-consumed" && {
+                let dir = env::var("ANYAGENTS_FAKE_STATE").unwrap_or_default();
+                std::path::Path::new(&format!("{dir}/failed-once")).exists()
+            };
+            if mode == "applied" || replay_consumed || was_delivered(endpoint, session, id) {
                 print!(
                     "{{\"data\":{{\"id\":\"{id}\",\"type\":\"user\",\"text\":\"\",\"time\":{{\"created\":1}}}}}}"
                 );
@@ -336,7 +343,10 @@ fn api(args: &[String], endpoint: &str) {
             }
             // The first prompt fails once: the readiness gate turns it away,
             // or an outcome does not say whether the line was admitted.
-            if matches!(mode.as_str(), "prompt-503-once" | "prompt-502-once") {
+            if matches!(
+                mode.as_str(),
+                "prompt-503-once" | "prompt-502-once" | "replay-consumed"
+            ) {
                 let marker = format!("{dir}/failed-once");
                 if !std::path::Path::new(&marker).exists() {
                     let _ = std::fs::write(&marker, "1");
@@ -391,7 +401,14 @@ fn api(args: &[String], endpoint: &str) {
                 // event is missed and the reconnect must settle from the
                 // conversation.
                 notify_service(endpoint, &format!("/fake/missed/{session}/{prompt_id}"));
-            } else if !matches!(mode.as_str(), "undelivered" | "applied") {
+            } else if mode == "idle-unconsumed-once" {
+                let marker = format!("{dir}/idle-unconsumed-once");
+                if !std::path::Path::new(&marker).exists() {
+                    let _ = std::fs::write(&marker, "1");
+                } else {
+                    announce(endpoint, session, prompt_id);
+                }
+            } else if !matches!(mode.as_str(), "undelivered" | "applied" | "replay-consumed") {
                 announce(endpoint, session, prompt_id);
             }
             let request: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
@@ -421,7 +438,7 @@ fn api(args: &[String], endpoint: &str) {
             // The inbox record the service admitted, under the prompt's own id.
             // `applied` and `parked`: an earlier process wrote this id, so the
             // service answers with the record it already holds.
-            let created = if matches!(mode.as_str(), "applied" | "parked") {
+            let created = if matches!(mode.as_str(), "applied" | "parked" | "replay-consumed") {
                 1
             } else {
                 now_ms()
@@ -574,6 +591,31 @@ fn events(listener: std::net::TcpListener) {
                 (Some("GET"), Some("/api/event")) if mode == "event-403" => {
                     let _ = connection
                         .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n");
+                }
+                (Some("GET"), Some("/api/event")) if mode == "event-503-failed" => {
+                    let _ = connection.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: 25\r\n\r\n{\"code\":\"service_failed\"}",
+                    );
+                }
+                (Some("GET"), Some("/api/event")) if mode == "event-503-starting-once" => {
+                    let dir = env::var("ANYAGENTS_FAKE_STATE").unwrap_or_default();
+                    let marker = format!("{dir}/event-503-once");
+                    if !std::path::Path::new(&marker).exists() {
+                        let _ = std::fs::write(&marker, "1");
+                        let _ = connection.write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: 27\r\n\r\n{\"code\":\"service_starting\"}",
+                        );
+                    } else {
+                        let mut state = state.lock().unwrap();
+                        if connection
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: {\"type\":\"server.connected\",\"data\":{}}\n\n",
+                            )
+                            .is_ok()
+                        {
+                            state.0.push(connection);
+                        }
+                    }
                 }
                 (Some("GET"), Some("/api/event")) => {
                     let mut state = state.lock().unwrap();

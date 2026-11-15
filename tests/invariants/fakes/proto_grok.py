@@ -150,7 +150,15 @@ class Grok(Protocol):
             engine.queue(inp)
             self.later(self.queue_changed)
         elif method == "session/cancel":
-            pass
+            if engine.turn is not None:
+                answered = [self.running] + self.merged
+                stranded = engine.end_turn()
+                self.running, self.merged = None, []
+                self.note("x.ai/session/prompt_complete", {"sessionId": self.session,
+                                                            "stopReason": "cancelled"})
+                for inp in answered + stranded:
+                    self.reply(inp.meta["rid"], {"stopReason": "cancelled"})
+                self.queue_changed()
         elif rid is not None and method:
             self.reply(rid, {})
 

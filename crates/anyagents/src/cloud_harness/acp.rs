@@ -40,6 +40,8 @@ pub const NEXT_STEP_STEER: &str = "next_step_steer";
 const READY_WAIT: Duration = Duration::from_secs(30);
 /// How long a peer may take to say `stopped` once input ends.
 const STOP_WAIT: Duration = Duration::from_secs(5);
+/// Backoff before returning transient turn-state refusals to the host.
+const REFUSAL_BACKOFF: Duration = Duration::from_millis(250);
 
 pub const NEXT_STEP: Delivery = Delivery {
     level: DeliveryLevel::NextStep,
@@ -118,9 +120,16 @@ fn lease_path(config: &Path, harness: &str) -> PathBuf {
     config.join(format!("{harness}-acp.json"))
 }
 
-fn read_lease(config: &Path, harness: &str) -> Option<Lease> {
-    let raw = std::fs::read_to_string(lease_path(config, harness)).ok()?;
-    serde_json::from_str(&raw).ok()
+fn read_lease(config: &Path, harness: &str) -> Result<Option<Lease>, String> {
+    let path = lease_path(config, harness);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("cannot read {}: {err}", path.display())),
+    };
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|err| format!("corrupt lease {}: {err}", path.display()))
 }
 
 fn write_lease(config: &Path, harness: &str, lease: &Lease) -> Result<(), String> {
@@ -181,10 +190,17 @@ pub struct Client<H: Write, P: Write> {
     proven: HashSet<String>,
     /// The peer's running turn.
     turn: Option<String>,
-    /// At `turn-end`: a turn-opening `deliver` is out and unanswered.
+    /// True while `turn` is a synthetic `duplicate` turn awaiting its `result`.
+    duplicate_turn: bool,
+    /// A turn-opening `deliver` (`mode: "turn"`) is out and unanswered.
     opening: bool,
-    /// At `turn-end`: items waiting for the running turn to end.
+    /// The in-flight `deliver` (`(request_id, item_id)`), one at a time.
+    delivering: Option<(String, String)>,
+    /// Items waiting for the opening `accepted`, prior `steer_ack`, or turn end.
     waiting: VecDeque<String>,
+    /// Items cancelled by a transient refusal, held briefly in `drive` to avoid spin.
+    cancelled_batch: Vec<String>,
+    defer_cancel: bool,
     stopping: bool,
     cost_micros_total: Option<u64>,
     reply: String,
@@ -207,8 +223,12 @@ impl<H: Write, P: Write> Client<H, P> {
             lines: HashMap::new(),
             proven: HashSet::new(),
             turn: None,
+            duplicate_turn: false,
             opening: false,
+            delivering: None,
             waiting: VecDeque::new(),
+            cancelled_batch: Vec::new(),
+            defer_cancel: false,
             stopping: false,
             cost_micros_total: None,
             reply: String::new(),
@@ -221,7 +241,12 @@ impl<H: Write, P: Write> Client<H, P> {
     }
 
     pub fn has_work(&self) -> bool {
-        self.turn.is_some() || self.opening || !self.requests.is_empty() || !self.waiting.is_empty()
+        self.turn.is_some()
+            || self.opening
+            || self.delivering.is_some()
+            || !self.requests.is_empty()
+            || !self.waiting.is_empty()
+            || !self.cancelled_batch.is_empty()
     }
 
     fn request_id(&mut self) -> String {
@@ -319,27 +344,47 @@ impl<H: Write, P: Write> Client<H, P> {
             return self.lifecycle(&event, "refused");
         }
         self.lines.insert(id.clone(), event);
-        if self.next_step {
-            return self.deliver(&id);
+        if !self.cancelled_batch.is_empty() {
+            // A refused head item has not been returned to the host yet;
+            // pipelined arrivals behind it return in the same FIFO batch.
+            self.cancelled_batch.push(id);
+            return Ok(());
         }
         self.waiting.push_back(id);
-        self.open_next()
+        self.advance()
     }
 
-    fn deliver(&mut self, id: &str) -> Result<(), String> {
+    fn send_deliver(&mut self, id: &str, mode: &str, opening: bool) -> Result<(), String> {
         let Some(line) = self.lines.get(id) else {
             return Ok(());
         };
         let text = super::extract_user_prompt(line);
-        let mode = if self.next_step { "auto" } else { "turn" };
         let request_id = self.control(
             "deliver",
             json!({"mode": mode, "items": [{"id": id, "text": text}]}),
         )?;
-        if !self.next_step {
-            self.opening = true;
-        }
+        self.opening = opening;
+        self.delivering = Some((request_id.clone(), id.to_string()));
         self.requests.insert(request_id, id.to_string());
+        Ok(())
+    }
+
+    fn advance(&mut self) -> Result<(), String> {
+        if !self.cancelled_batch.is_empty() || self.delivering.is_some() || self.opening {
+            return Ok(());
+        }
+        if self.turn.is_none() {
+            if let Some(id) = self.waiting.pop_front() {
+                return self.send_deliver(&id, "turn", true);
+            }
+            return Ok(());
+        }
+        if self.next_step
+            && !self.duplicate_turn
+            && let Some(id) = self.waiting.pop_front()
+        {
+            return self.send_deliver(&id, "steer", false);
+        }
         Ok(())
     }
 
@@ -517,10 +562,13 @@ impl<H: Write, P: Write> Client<H, P> {
                 };
                 let item = request.and_then(|request| self.requests.remove(&request));
                 self.turn = Some(turn_id);
+                self.duplicate_turn = duplicate;
                 self.opening = false;
+                self.delivering = None;
                 if let Some(item) = item {
                     self.echo(&item, duplicate)?;
                 }
+                self.advance()?;
             }
             "steer_ack" => {
                 let turn_id = non_empty_str(frame, "turn_id")?.to_string();
@@ -528,16 +576,32 @@ impl<H: Write, P: Write> Client<H, P> {
                 if items.is_empty() {
                     return Err(format!("acp/v1 steer_ack has empty item_ids: {frame}"));
                 }
+                if let Some(request) = &request {
+                    self.requests.remove(request);
+                }
                 self.turn = Some(turn_id);
+                self.duplicate_turn = false;
+                if self.delivering.as_ref().is_some_and(|(req, item)| {
+                    Some(req.as_str()) == request.as_deref() || items.contains(item)
+                }) {
+                    self.delivering = None;
+                }
+                self.advance()?;
             }
             "steer_consumed" => {
                 let item = non_empty_str(frame, "steer_id")?.to_string();
                 let _ = non_empty_str(frame, "turn_id")?;
                 let duplicate = bool_field(frame, "duplicate")?;
-                if let Some(request) = &request {
-                    self.requests.remove(request);
+                self.requests.retain(|req, mapped| {
+                    Some(req.as_str()) != request.as_deref() && mapped != &item
+                });
+                if self.delivering.as_ref().is_some_and(|(req, mapped)| {
+                    Some(req.as_str()) == request.as_deref() || mapped == &item
+                }) {
+                    self.delivering = None;
                 }
                 self.echo(&item, duplicate)?;
+                self.advance()?;
             }
             "interrupt_ack" => {
                 let _ = non_empty_str(frame, "turn_id")?;
@@ -643,7 +707,16 @@ impl<H: Write, P: Write> Client<H, P> {
             Some(_) => return Err(format!("acp/v1 result has invalid cost_micros: {frame}")),
         };
         self.turn = None;
+        self.duplicate_turn = false;
         self.opening = false;
+        if self
+            .delivering
+            .as_ref()
+            .is_some_and(|(_, item)| raw_undelivered.contains(item) || self.proven.contains(item))
+            && let Some((req, _)) = self.delivering.take()
+        {
+            self.requests.remove(&req);
+        }
         let reply = std::mem::take(&mut self.reply);
         if !duplicate {
             let completed = status == "completed" && !is_error;
@@ -691,27 +764,20 @@ impl<H: Write, P: Write> Client<H, P> {
         // What the turn never took goes out again, first, in its order.
         let undelivered: Vec<String> = raw_undelivered
             .into_iter()
-            .filter(|id| !self.proven.contains(id))
+            .filter(|id| !self.proven.contains(id) && !self.waiting.contains(id))
             .collect();
-        if !self.next_step {
-            for id in undelivered.into_iter().rev() {
-                self.waiting.push_front(id);
-            }
-            return self.open_next();
+        for id in undelivered.into_iter().rev() {
+            self.waiting.push_front(id);
         }
-        for id in undelivered {
-            self.deliver(&id)?;
-        }
-        Ok(())
+        self.advance()
     }
 
-    /// At `turn-end`: the next waiting item opens the next turn.
-    fn open_next(&mut self) -> Result<(), String> {
-        if self.turn.is_none()
-            && !self.opening
-            && let Some(id) = self.waiting.pop_front()
-        {
-            return self.deliver(&id);
+    fn flush_cancelled(&mut self) -> Result<(), String> {
+        let batch = std::mem::take(&mut self.cancelled_batch);
+        for id in batch {
+            if let Some(line) = self.lines.remove(&id) {
+                self.lifecycle(&line, "cancelled")?;
+            }
         }
         Ok(())
     }
@@ -723,18 +789,23 @@ impl<H: Write, P: Write> Client<H, P> {
             .and_then(Value::as_str)
             .and_then(|request| self.requests.remove(request));
         match code {
-            // The running turn's state refused it: the host offers it again.
-            // At `turn-end` what waits behind it goes back too, so the host
-            // offers them again in mailbox order.
+            // The running turn's state refused it: the host offers it again,
+            // and what waits behind it goes back too so mailbox FIFO holds.
             "turn_open" | "turn_closed" | "no_active_turn" | "turn_not_started" => {
-                let Some(item) = item else { return Ok(()) };
+                if code == "turn_open" && self.turn.is_none() {
+                    self.turn = Some(String::new());
+                    self.duplicate_turn = false;
+                } else if matches!(code, "no_active_turn" | "turn_not_started") {
+                    self.turn = None;
+                    self.duplicate_turn = false;
+                }
                 self.opening = false;
-                let mut back = vec![item];
-                back.extend(self.waiting.drain(..));
-                for id in back {
-                    if let Some(line) = self.lines.get(&id).cloned() {
-                        self.lifecycle(&line, "cancelled")?;
-                    }
+                self.delivering = None;
+                let Some(item) = item else { return Ok(()) };
+                self.cancelled_batch.push(item);
+                self.cancelled_batch.extend(self.waiting.drain(..));
+                if !self.defer_cancel {
+                    self.flush_cancelled()?;
                 }
                 Ok(())
             }
@@ -850,7 +921,7 @@ pub fn serve<R: BufRead + Send + 'static, W: Write>(
     let session_id = session_id.unwrap_or_else(|| new_session_id(cloud_harness));
     super::persist_session_id(config_dir, cloud_harness, &session_id);
     let previous =
-        read_lease(config_dir, cloud_harness).filter(|lease| lease.session_id == session_id);
+        read_lease(config_dir, cloud_harness)?.filter(|lease| lease.session_id == session_id);
     let lease = Lease {
         session_id: session_id.clone(),
         lease_epoch: previous.as_ref().map_or(1, |lease| lease.lease_epoch + 1),
@@ -919,9 +990,21 @@ pub fn drive<H: Write, P: Write, R: BufRead + Send + 'static>(
             Err(_) => return Err(format!("acp/v1 peer sent no ready within {READY_WAIT:?}")),
         }
     }
+    client.defer_cancel = true;
     let mut host_closed = false;
     let mut stop_by: Option<Instant> = None;
+    let mut cancel_by: Option<Instant> = None;
     loop {
+        if let Some(deadline) = cancel_by
+            && (Instant::now() >= deadline || client.stopping || host_closed)
+        {
+            cancel_by = None;
+            client.flush_cancelled()?;
+            client.advance()?;
+        }
+        if !client.cancelled_batch.is_empty() && cancel_by.is_none() {
+            cancel_by = Some(Instant::now() + REFUSAL_BACKOFF);
+        }
         if host_closed && !client.stopping && !client.has_work() {
             // The local adapter disconnected without archiving the session:
             // leave the remote `acp/v1` session alive for the next `attach`.
@@ -930,18 +1013,28 @@ pub fn drive<H: Write, P: Write, R: BufRead + Send + 'static>(
         if client.stopping && stop_by.is_none() {
             stop_by = Some(Instant::now() + STOP_WAIT);
         }
+        let next_deadline = match (stop_by, cancel_by) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
         let event = match early.pop_front() {
             Some(event) => event,
-            None => match stop_by {
+            None => match next_deadline {
                 None => match events.recv() {
                     Ok(event) => event,
                     Err(_) => return Ok(()),
                 },
-                // The peer has until then to say `stopped`.
                 Some(deadline) => {
                     match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                         Ok(event) => event,
-                        Err(_) => return Ok(()),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if stop_by.is_some_and(|stop| Instant::now() >= stop) {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                     }
                 }
             },
@@ -1209,7 +1302,7 @@ mod tests {
         rig.client.on_host(&user("a")).unwrap();
         let deliver = rig.peer.take();
         assert_eq!(deliver[0]["type"], "deliver");
-        assert_eq!(deliver[0]["mode"], "auto");
+        assert_eq!(deliver[0]["mode"], "turn");
         assert_eq!(
             deliver[0]["items"],
             json!([{"id": "a", "text": "anyagents-message:a\nhello"}])
@@ -1227,26 +1320,29 @@ mod tests {
 
         rig.client.on_host(&user("b")).unwrap();
         rig.client.on_host(&user("c")).unwrap();
-        let requests: Vec<String> = rig
-            .peer
-            .take()
-            .iter()
-            .map(|frame| frame["request_id"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(requests.len(), 2, "one deliver per line");
+        let first_steer = rig.peer.take();
+        assert_eq!(first_steer.len(), 1, "fenced until b is acknowledged");
+        assert_eq!(first_steer[0]["mode"], "steer");
+        assert_eq!(first_steer[0]["items"][0]["id"], "b");
+        let req_b = first_steer[0]["request_id"].as_str().unwrap().to_string();
         rig.client
             .on_peer(&frame(
                 3,
                 1,
-                Some(&requests[0]),
+                Some(&req_b),
                 json!({"type": "steer_ack", "turn_id": "t1", "item_ids": ["b"]}),
             ))
             .unwrap();
+        let second_steer = rig.peer.take();
+        assert_eq!(second_steer.len(), 1);
+        assert_eq!(second_steer[0]["mode"], "steer");
+        assert_eq!(second_steer[0]["items"][0]["id"], "c");
+        let req_c = second_steer[0]["request_id"].as_str().unwrap().to_string();
         rig.client
             .on_peer(&frame(
                 4,
                 1,
-                Some(&requests[1]),
+                Some(&req_c),
                 json!({"type": "steer_ack", "turn_id": "t1", "item_ids": ["c"]}),
             ))
             .unwrap();
@@ -1289,7 +1385,10 @@ mod tests {
         for id in ["a", "b", "c"] {
             rig.client.on_host(&user(id)).unwrap();
         }
-        rig.peer.take();
+        let opening = rig.peer.take();
+        assert_eq!(opening.len(), 1);
+        assert_eq!(opening[0]["mode"], "turn");
+        assert_eq!(opening[0]["items"][0]["id"], "a");
         rig.client
             .on_peer(&frame(
                 2,
@@ -1298,18 +1397,34 @@ mod tests {
                 json!({"type": "accepted", "turn_id": "t1", "mode": "turn"}),
             ))
             .unwrap();
+        let steer_b = rig.peer.take();
+        assert_eq!(steer_b.len(), 1);
+        assert_eq!(steer_b[0]["mode"], "steer");
+        assert_eq!(steer_b[0]["items"][0]["id"], "b");
         rig.client
             .on_peer(&frame(
                 3,
                 1,
                 Some("1.3"),
-                json!({"type": "steer_ack", "turn_id": "t1", "item_ids": ["b", "c"]}),
+                json!({"type": "steer_ack", "turn_id": "t1", "item_ids": ["b"]}),
+            ))
+            .unwrap();
+        let steer_c = rig.peer.take();
+        assert_eq!(steer_c.len(), 1);
+        assert_eq!(steer_c[0]["mode"], "steer");
+        assert_eq!(steer_c[0]["items"][0]["id"], "c");
+        rig.client
+            .on_peer(&frame(
+                4,
+                1,
+                Some("1.4"),
+                json!({"type": "steer_ack", "turn_id": "t1", "item_ids": ["c"]}),
             ))
             .unwrap();
         rig.host.take();
         rig.client
             .on_peer(&frame(
-                4,
+                5,
                 1,
                 None,
                 json!({"type": "result", "turn_id": "t1", "status": "cancelled",
@@ -1321,20 +1436,44 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["type"], "result");
         assert_eq!(out[0]["is_error"], true);
+        // Only `b` opens `t2` with `mode: "turn"`; `c` waits in `waiting` so
+        // a fresh arrival `d` cannot jump ahead of `c`.
         let again = rig.peer.take();
-        let items: Vec<&Value> = again.iter().map(|frame| &frame["items"][0]["id"]).collect();
-        assert_eq!(items, [&json!("b"), &json!("c")]);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0]["mode"], "turn");
+        assert_eq!(again[0]["items"][0]["id"], "b");
         assert_eq!(again[0]["request_id"], "1.5");
-        // The new turn proves them as any other.
+        rig.client.on_host(&user("d")).unwrap();
+        assert!(
+            rig.peer.take().is_empty(),
+            "d waits behind c until t2 accepts b"
+        );
         rig.client
             .on_peer(&frame(
-                5,
+                6,
                 1,
                 Some("1.5"),
                 json!({"type": "accepted", "turn_id": "t2", "mode": "turn"}),
             ))
             .unwrap();
         assert_eq!(echoed(&rig.host.take()), ["u-b"]);
+        let next_steer = rig.peer.take();
+        assert_eq!(next_steer.len(), 1);
+        assert_eq!(next_steer[0]["mode"], "steer");
+        assert_eq!(next_steer[0]["items"][0]["id"], "c");
+        let req_c2 = next_steer[0]["request_id"].as_str().unwrap().to_string();
+        rig.client
+            .on_peer(&frame(
+                7,
+                1,
+                Some(&req_c2),
+                json!({"type": "steer_ack", "turn_id": "t2", "item_ids": ["c"]}),
+            ))
+            .unwrap();
+        let after_c = rig.peer.take();
+        assert_eq!(after_c.len(), 1);
+        assert_eq!(after_c[0]["mode"], "steer");
+        assert_eq!(after_c[0]["items"][0]["id"], "d");
     }
 
     /// A line the session already consumed is proved as a duplicate: idle,
@@ -1421,11 +1560,55 @@ mod tests {
         assert_eq!(out[0]["type"], "command_lifecycle");
         assert_eq!(out[0]["state"], "cancelled");
         assert_eq!(out[0]["uuid"], "u-a");
+        assert!(rig.client.lines.is_empty(), "cancelled line is removed");
+        // `turn_open` marks a turn active so the re-offered line steers into it.
+        let mut rig = live();
+        rig.client.on_host(&user("a")).unwrap();
+        assert_eq!(rig.peer.take()[0]["mode"], "turn");
+        let open = json!({"type": "rejected", "seq": null, "session_id": SESSION, "lease_epoch": 1,
+            "request_id": "1.2", "code": "turn_open", "error": null});
+        rig.client.on_peer(&open.to_string()).unwrap();
+        assert_eq!(rig.host.take()[0]["state"], "cancelled");
+        assert!(rig.client.lines.is_empty());
+        rig.client.on_host(&user("a")).unwrap();
+        assert_eq!(rig.peer.take()[0]["mode"], "steer");
         // An unknown code is no reason to go on.
         let mut rig = live();
         let odd = json!({"type": "rejected", "seq": null, "session_id": SESSION, "lease_epoch": 1,
             "request_id": "1.9", "code": "something_new", "error": null});
         assert!(rig.client.on_peer(&odd.to_string()).is_err());
+    }
+
+    #[test]
+    fn corrupt_lease_file_fails_closed_without_resetting_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_lease(dir.path(), "claude-cloud").unwrap().is_none());
+        std::fs::write(lease_path(dir.path(), "claude-cloud"), "{not-valid-json").unwrap();
+        let err = read_lease(dir.path(), "claude-cloud").unwrap_err();
+        assert!(err.contains("corrupt lease"), "unexpected error: {err}");
+        let acp_cfg = Config {
+            endpoint: Endpoint::Command(vec!["/bin/true".into()]),
+            harness: "claude-cloud".into(),
+        };
+        let serve_err = serve(
+            &acp_cfg,
+            dir.path(),
+            "claude-cloud",
+            Some(SESSION.into()),
+            None,
+            None,
+            std::io::Cursor::new(Vec::<u8>::new()),
+            Buf::default(),
+        )
+        .unwrap_err();
+        assert!(
+            serve_err.contains("corrupt lease"),
+            "unexpected error: {serve_err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(lease_path(dir.path(), "claude-cloud")).unwrap(),
+            "{not-valid-json"
+        );
     }
 
     /// Replayed frames are read for their seq, never forwarded; after
@@ -2011,9 +2194,9 @@ mod conformance {
     }
 
     mod next_step {
-        use anyagents_harness::DeliveryLevel;
+        use anyagents_harness::{DeliveryLevel, Harness};
         use anyagents_harness_claude::ClaudeHarness;
-        use anyagents_invariants::conformance::{Fixture, Subject, World};
+        use anyagents_invariants::conformance::{Fixture, Subject, World, ids};
 
         pub struct CloudAcp;
 
@@ -2041,6 +2224,44 @@ mod conformance {
             assert_eq!(delivery.level, DeliveryLevel::NextStep);
             assert!(delivery.idempotent);
             assert_eq!(delivery.peer.as_deref(), Some("acp/v1 claude-cloud 1.0.0"));
+        }
+
+        #[test]
+        fn refused_steer_ahead_of_fresh_mail_redelivers_in_fifo_order() {
+            let mut world = World::<CloudAcp>::new();
+            let first = world.prompt();
+            world.fixture.command("refuse");
+            let queued = world.receive(2);
+            world.drain(queued[1].seq);
+            assert_eq!(
+                ids(&world.fixture.journal()),
+                vec![
+                    first.id.to_string(),
+                    queued[0].id.to_string(),
+                    queued[1].id.to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn cancelling_a_turn_with_queued_and_fresh_mail_redelivers_in_fifo_order() {
+            let mut world = World::<CloudAcp>::new();
+            let first = world.prompt();
+            let queued = world.receive(2);
+            world.pump_until("both steers queued", |w| w.fixture.wire().len() >= 3);
+            assert_eq!(world.cursor(), first.seq);
+            let fresh = world.receive(1);
+            world.delivery.harness_mut().cancel().unwrap();
+            world.drain(fresh[0].seq);
+            assert_eq!(
+                ids(&world.fixture.journal()),
+                vec![
+                    first.id.to_string(),
+                    queued[0].id.to_string(),
+                    queued[1].id.to_string(),
+                    fresh[0].id.to_string(),
+                ]
+            );
         }
     }
 

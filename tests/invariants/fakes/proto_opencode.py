@@ -240,6 +240,11 @@ class OpenCode(Protocol):
                     self.answer(401, {"_tag": "UnauthorizedError", "message": "Unauthorized"})
                     return
                 if (method, urllib.parse.urlsplit(self.path).path) == ("GET", "/api/event"):
+                    with protocol.engine.lock:
+                        if protocol.take_refusal():
+                            err = NotReady()
+                            self.answer(err.status, err.body, err.headers)
+                            return
                     self.stream()
                     return
                 headers = None

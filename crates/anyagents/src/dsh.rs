@@ -172,6 +172,8 @@ struct Follow {
     socket: Option<TcpStream>,
     /// The current stream's reader runs.
     reading: bool,
+    /// A halted turn left mailbox items in the inbox that `clear_stranded` is removing.
+    clearing_stranded: bool,
     /// The stream ended and could not be opened again.
     fault: Option<String>,
 }
@@ -231,6 +233,7 @@ impl Follow {
         match event.get("type").and_then(Value::as_str) {
             Some("turn/start") => {
                 self.turn = true;
+                self.clearing_stranded = false;
                 Ok((false, false))
             }
             Some("turn/end") => {
@@ -262,6 +265,11 @@ impl Follow {
         } else {
             Vec::new()
         };
+        if !stranded.is_empty() {
+            self.clearing_stranded = true;
+        } else if self.clearing_stranded && self.stranded_items().is_empty() {
+            self.clearing_stranded = false;
+        }
         Ok((ended, stranded))
     }
 
@@ -325,6 +333,11 @@ impl Follow {
         } else {
             Vec::new()
         };
+        if !stranded.is_empty() {
+            self.clearing_stranded = true;
+        } else if self.turn || self.stranded_items().is_empty() {
+            self.clearing_stranded = false;
+        }
         Ok((ended, stranded))
     }
 }
@@ -687,13 +700,23 @@ impl Harness for DshHarness {
         if let Some(fault) = st.follow.fault.clone() {
             return Err(HarnessError::Failed(fault));
         }
+        if let Some(Prompt::Fault(reason)) = st.prompts.get(&message.id) {
+            let reason = reason.clone();
+            st.prompts.remove(&message.id);
+            return Err(HarnessError::Failed(reason));
+        }
+        st.settle_dropped();
+        // While a halted turn's stranded inbox items are being removed, hold
+        // every unconsumed line at the head so no later arrival jumps ahead.
+        if st.follow.clearing_stranded
+            || st.prompts.iter().any(|(other, prompt)| {
+                other != &message.id && *prompt == Prompt::Admitted && st.follow.dropped(other)
+            })
+        {
+            return Ok(DeliverOutcome::Deferred);
+        }
         let replay = match st.prompts.get(&message.id) {
             Some(Prompt::Sending) => return Ok(DeliverOutcome::InFlight),
-            Some(Prompt::Fault(reason)) => {
-                let reason = reason.clone();
-                st.prompts.remove(&message.id);
-                return Err(HarnessError::Failed(reason));
-            }
             // dsh may or may not hold it: the same `requestId` again settles
             // that, since dsh admits a request once.
             Some(Prompt::Unknown) => true,
@@ -1014,7 +1037,7 @@ fn read_follow(shared: &Mutex<State>, wake: &Condvar, generation: u64, mut socke
 /// cookie once on HTTP 401.
 fn clear_stranded(
     shared: &Mutex<State>,
-    _wake: &Condvar,
+    wake: &Condvar,
     generation: u64,
     stranded: &[String],
 ) -> Result<(), String> {
@@ -1045,6 +1068,19 @@ fn clear_stranded(
                 remove_queued(port, &cookie, &session, item_id, Some(CALL_TIMEOUT))?;
             }
             Err(err) => return Err(err),
+        }
+    }
+    if !stranded.is_empty() {
+        let mut st = lock(shared);
+        if st.follow.generation == generation
+            && st.follow.clearing_stranded
+            && (st.follow.turn || st.follow.stranded_items().is_empty())
+        {
+            st.follow.clearing_stranded = false;
+            st.settle_dropped();
+            st.changed();
+            drop(st);
+            wake.notify_all();
         }
     }
     Ok(())
@@ -2485,7 +2521,7 @@ mod tests {
 #[cfg(all(test, unix))]
 mod conformance {
     use super::DshHarness;
-    use anyagents_invariants::conformance::{Fixture, Subject};
+    use anyagents_invariants::conformance::{Fixture, Subject, World, ids};
 
     /// `dsh --profile web --no-open --port 0`, as the server starts it.
     pub struct Dsh;
@@ -2642,5 +2678,40 @@ mod conformance {
             assert!(Instant::now() < deadline, "the turn never ended");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// When a turn halts with queued steers and a fresh message behind them,
+    /// `deliver` defers while `clear_stranded` removes the halted inbox so
+    /// the fresh message never overtakes the stranded steers.
+    #[test]
+    fn cancelling_a_turn_with_queued_and_fresh_mail_redelivers_in_fifo_order() {
+        let mut world = World::<Dsh>::new();
+        let first = world.prompt();
+        let queued = world.receive(2);
+        world.pump_until("both steers queued", |w| w.fixture.wire().len() >= 3);
+        assert_eq!(world.cursor(), first.seq);
+        let fresh = world.receive(1);
+        world.delivery.harness_mut().cancel().unwrap();
+        world.drain(fresh[0].seq);
+        assert_eq!(
+            ids(&world.fixture.journal()),
+            vec![
+                first.id.to_string(),
+                queued[0].id.to_string(),
+                queued[1].id.to_string(),
+                fresh[0].id.to_string(),
+            ]
+        );
+        assert_eq!(
+            world.fixture.wire(),
+            vec![
+                first.id.to_string(),
+                queued[0].id.to_string(),
+                queued[1].id.to_string(),
+                queued[0].id.to_string(),
+                queued[1].id.to_string(),
+                fresh[0].id.to_string(),
+            ]
+        );
     }
 }

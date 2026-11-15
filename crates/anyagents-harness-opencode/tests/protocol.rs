@@ -996,6 +996,54 @@ fn a_cancelled_inbox_line_returns_to_the_mailbox_and_is_written_again() {
 }
 
 #[test]
+fn an_event_stream_at_the_readiness_gate_retries_until_connected() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "event-503-starting-once");
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+}
+
+#[test]
+fn a_failed_service_event_stream_503_fails_the_start() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log");
+    let started = OpenCodeHarness::start(
+        scripted_opencode(),
+        Some("ses_fake"),
+        &[
+            ("ANYAGENTS_FAKE_MODE", "event-503-failed"),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("ANYAGENTS_FAKE_STATE", dir.path().to_str().unwrap()),
+        ],
+    );
+    let Err(HarnessError::Failed(reason)) = started else {
+        panic!("expected start to fail on HTTP 503 service_failed event stream");
+    };
+    assert!(reason.contains("HTTP 503"), "{reason}");
+}
+
+#[test]
+fn a_same_process_replay_already_consumed_is_accepted_not_duplicate() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "replay-consumed");
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    assert_eq!(
+        harness.proven("m1"),
+        Some(Proof::Taken {
+            turn_finished: false
+        })
+    );
+}
+
+#[test]
+fn an_unconsumed_admitted_line_left_behind_at_idle_is_replayed_and_accepted() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "idle-unconsumed-once");
+    assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
+    let log = log_of(&dir);
+    assert_eq!(log.matches("\"id\":\"msg_m1\"").count(), 2, "{log}");
+}
+
+#[test]
 fn a_refused_event_stream_fails_the_start() {
     let dir = TempDir::new().unwrap();
     let log = dir.path().join("log");

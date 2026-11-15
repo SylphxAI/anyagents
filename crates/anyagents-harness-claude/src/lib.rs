@@ -1217,18 +1217,28 @@ fn note_proof(state: &mut State, value: &Value) {
                 // worker): neither entered the conversation, so it goes back.
                 // The transcript was read first: a stored line stays taken.
                 Some("cancelled" | "discarded") if !state.consumed.contains(&id) => {
+                    let opened = state.open.iter().any(|item| item == &id);
                     state.open.retain(|item| item != &id);
                     state.followups.retain(|item| item != &id);
                     state.in_flight.remove(&id);
                     state.taken.remove(&id);
                     state.seen.remove(&id);
+                    if opened && state.open.is_empty() {
+                        state.turns_started = state.turns_started.saturating_sub(1);
+                        promote_followups(state);
+                    }
                 }
                 // Claude Code's own verdict: it will never take this line.
                 Some(verdict @ "refused") if !state.consumed.contains(&id) => {
+                    let opened = state.open.iter().any(|item| item == &id);
                     state.open.retain(|item| item != &id);
                     state.followups.retain(|item| item != &id);
                     state.in_flight.remove(&id);
                     state.taken.remove(&id);
+                    if opened && state.open.is_empty() {
+                        state.turns_started = state.turns_started.saturating_sub(1);
+                        promote_followups(state);
+                    }
                     state
                         .rejected
                         .insert(id, format!("claude code {verdict} the input"));
@@ -2039,5 +2049,39 @@ mod tests {
             &serde_json::json!({"type": "command_lifecycle", "command_uuid": uuid_for("m1"), "state": "refused"}),
         );
         assert!(state.rejected.contains_key("m1"));
+    }
+
+    #[test]
+    fn cancelling_an_opening_line_resets_turns_started_and_promotes_followups() {
+        let mut state = State {
+            peer_declares: true,
+            ..State::default()
+        };
+        for id in ["m1", "m2", "m3"] {
+            state.uuid_ids.insert(uuid_for(id), id.into());
+            state.in_flight.insert(id.into());
+            accept_message(&mut state, id);
+        }
+        assert_eq!(state.turns_started, 1);
+        assert_eq!(state.open, ["m1"]);
+        assert_eq!(state.followups, ["m2", "m3"]);
+
+        note_proof(
+            &mut state,
+            &serde_json::json!({"type": "command_lifecycle", "command_uuid": uuid_for("m1"), "state": "cancelled"}),
+        );
+        assert_eq!(state.turns_started, 1, "followup m2 took over the turn");
+        assert_eq!(state.open, ["m2"]);
+        assert_eq!(state.followups, ["m3"]);
+
+        for id in ["m2", "m3"] {
+            note_proof(
+                &mut state,
+                &serde_json::json!({"type": "command_lifecycle", "command_uuid": uuid_for(id), "state": "cancelled"}),
+            );
+        }
+        assert_eq!(state.turns_started, 0, "all cancelled leaves no ghost turn");
+        assert!(state.open.is_empty());
+        assert!(state.followups.is_empty());
     }
 }
