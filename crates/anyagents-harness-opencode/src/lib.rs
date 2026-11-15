@@ -19,12 +19,21 @@
 //!   steer at its next step, in admission order, or a new turn starts with
 //!   it. Given an id it already holds, as an inbox row or as a message of the
 //!   session, the service answers with that record and admits nothing;
-//! - the admission is the proof delivery rests on (`MidTurn`): the service
-//!   reports consumption only on its event stream, which a one-shot `opencode
-//!   api` call does not read. Because the id travels with the prompt, writing
-//!   the same line again, from this process or a later one, never applies it
-//!   twice, and a record that predates the request and is already in the
-//!   conversation is answered as a duplicate;
+//! - the admission only queues the line (`InFlight`). The proof is the
+//!   service's `session.inbox.delivered` event naming the line's id as
+//!   `inboxID`, which it announces when the session takes the input: the
+//!   step that opens a turn with it, or the running turn's next step
+//!   (`NextStep`). The event stream (`GET /api/event`) is read over a direct
+//!   connection to the private service (`events`), because `opencode api`
+//!   prints nothing of a body that never ends. The start waits for its
+//!   `server.connected`, so no proof is missed before the first prompt. The
+//!   stream replays nothing: after a reconnect each line still unproven is
+//!   looked up in the conversation under its id (`GET …/message/{id}`), which
+//!   proves it as well. A line the service announces `session.inbox.cancelled`
+//!   goes back to the mailbox. Because the id travels with the prompt,
+//!   writing the same line again, from this process or a later one, never
+//!   applies it twice, and a record that predates the request and is already
+//!   in the conversation is answered as a duplicate;
 //! - prompts are written one at a time, in mailbox order, each on a thread of
 //!   its own: a slow service holds the mailbox, never the host, and no prompt
 //!   call has a timeout. What the service answers decides the line:
@@ -42,18 +51,20 @@
 //! - a turn ends when `POST /api/experimental/session/{id}/wait`, asked after
 //!   the newest admission, answers: the service's own idle signal;
 //! - before the host replaces the process (`stop`), a prompt call that is out
-//!   is waited for, up to a minute, so what it proved is known; one still
-//!   unanswered then is unknown, and the next process writes its id again.
-//!   The proofs outlive the process.
+//!   is waited for, up to a minute, then the event stream is read to its end,
+//!   so what the service proved is known; a line still unproven then is
+//!   offered to the next process, which writes its id again. The proofs
+//!   outlive the process.
 //!
 //! The mailbox id on the prompt's first line also makes the agent's own `send`
 //! (its MCP tool) the reply path, recorded against the same agent. Nothing
 //! here reads a credential: the service's address and password come from the
 //! private service this adapter starts for this agent.
 
+mod events;
 mod port;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -89,6 +100,12 @@ const TURN_POLL: Duration = Duration::from_secs(1);
 /// api` prints no header, so the service's fixed value is kept here.
 const RETRY_AFTER: Duration = Duration::from_secs(1);
 
+/// How long `stop` waits for the event stream of a stopped service to end.
+const EVENTS_DRAIN: Duration = Duration::from_secs(5);
+
+/// How long a lost event stream waits before it connects again.
+const EVENTS_RETRY: Duration = Duration::from_millis(100);
+
 /// The prefix a 1.x `opencode serve` announces its address with. A 2.x
 /// service prints `server listening on <url>` and then `server password …`.
 const LEGACY_ANNOUNCEMENT: &str = "opencode server listening on ";
@@ -96,9 +113,9 @@ const LEGACY_ANNOUNCEMENT: &str = "opencode server listening on ";
 /// What this adapter guarantees for mail that reaches a busy agent
 /// (`docs/delivery.md`).
 pub const DELIVERY: Delivery = Delivery {
-    level: DeliveryLevel::MidTurn,
+    level: DeliveryLevel::NextStep,
     idempotent: true,
-    proof: std::borrow::Cow::Borrowed("durable inbox admission, by id"),
+    proof: std::borrow::Cow::Borrowed("session.inbox.delivered, by id"),
     peer: None,
 };
 
@@ -144,7 +161,7 @@ struct PriorPrompt {
 enum Prompt {
     /// Its prompt call is out.
     Sending,
-    /// The session's inbox holds it.
+    /// The session's inbox holds it; its proof is awaited.
     Admitted,
     /// An earlier process wrote it and the session already consumed it.
     Applied,
@@ -186,6 +203,17 @@ struct State {
     sending: Option<String>,
     /// Ids the service admitted from this process, in order.
     written: Vec<String>,
+    /// Prompt ids the session took into its conversation, as its event stream
+    /// announced them or the conversation holds them.
+    consumed: HashSet<String>,
+    /// Prompt ids the service took out of its inbox unconsumed.
+    cancelled: HashSet<String>,
+    /// The event stream is read now (`server.connected` arrived).
+    events_connected: bool,
+    /// A thread reads the event stream of the running service.
+    events_reading: bool,
+    /// The service refused its event stream: nothing can be proven.
+    events_fault: Option<String>,
     /// Prior messages accepted in this adapter session, used to restore
     /// conversation context if the OpenCode session later returns HTTP 404.
     history: Vec<PriorPrompt>,
@@ -201,6 +229,9 @@ struct State {
     admissions: u64,
     /// A thread is waiting for the open turn to end.
     watching: bool,
+    /// Active `settle_unproven` passes fencing mailbox delivery until all
+    /// unproven prompts settle atomically.
+    settling: usize,
     turns_completed: u32,
     /// `turns_completed` when the session's totals were last read.
     usage_read_at: Option<u32>,
@@ -383,7 +414,13 @@ impl OpenCodeHarness {
             let port = self.port.as_ref().expect("allocated port").port;
             let (announced, collision) = self.launch_service(port)?;
             match announced {
-                Announcement::Ready => return self.resume_session(),
+                Announcement::Ready => {
+                    // The stream is read from before the first prompt, so
+                    // no proof of it can pass unread.
+                    read_events(&self.vendor)?;
+                    self.resume_session()?;
+                    return self.await_events();
+                }
                 Announcement::Legacy(line) => {
                     self.stop_child();
                     return Err(HarnessError::Failed(format!(
@@ -662,6 +699,259 @@ impl OpenCodeHarness {
     }
 }
 
+impl OpenCodeHarness {
+    /// Wait until the event stream is read, or fail the start: without it
+    /// nothing written could be proven.
+    fn await_events(&self) -> Result<(), HarnessError> {
+        let state = self.vendor.lock();
+        let (state, _) = self
+            .vendor
+            .changed
+            .wait_timeout_while(state, READY_TIMEOUT, |state| {
+                !state.events_connected && state.events_fault.is_none() && state.events_reading
+            })
+            .unwrap_or_else(|err| err.into_inner());
+        if state.events_connected {
+            return Ok(());
+        }
+        Err(HarnessError::Failed(match &state.events_fault {
+            Some(fault) => fault.clone(),
+            None => "the OpenCode event stream (GET /api/event) did not connect".into(),
+        }))
+    }
+}
+
+/// Read the running service's event stream on a thread of its own, for as long
+/// as that service runs, connecting again whenever the connection is lost.
+fn read_events(vendor: &Arc<Vendor>) -> Result<(), HarnessError> {
+    let launch = {
+        let mut state = vendor.lock();
+        state.events_connected = false;
+        state.events_fault = None;
+        state.events_reading = true;
+        state.launch
+    };
+    let reader = Arc::clone(vendor);
+    thread::Builder::new()
+        .name("anyagents-opencode-events".into())
+        .spawn(move || follow_events(&reader, launch))
+        .map(|_| ())
+        .map_err(|err| {
+            vendor.lock().events_reading = false;
+            HarnessError::Failed(format!("cannot read the OpenCode event stream: {err}"))
+        })
+}
+
+fn follow_events(vendor: &Arc<Vendor>, launch: u64) {
+    let mut connected_before = false;
+    loop {
+        let (service, password) = {
+            let state = vendor.lock();
+            if state.launch != launch || state.launch_ended || state.closing {
+                break;
+            }
+            match (state.service.clone(), state.password.clone()) {
+                (Some(service), Some(password)) => (service, password),
+                _ => break,
+            }
+        };
+        let ended = events::subscribe(&service, &password, |event| {
+            let connected = on_event(vendor, launch, &event, connected_before);
+            if connected && connected_before {
+                // Events during the gap are gone: the conversation settles
+                // every line still unproven, off this thread so the stream
+                // keeps being read.
+                let settler = Arc::clone(vendor);
+                if thread::Builder::new()
+                    .name("anyagents-opencode-settle".into())
+                    .spawn(move || settle_unproven(&settler, false))
+                    .is_err()
+                {
+                    let mut state = vendor.lock();
+                    state.settling = state.settling.saturating_sub(1);
+                    state.epoch += 1;
+                    drop(state);
+                    vendor.changed.notify_all();
+                }
+            }
+            connected_before |= connected;
+        });
+        let mut state = vendor.lock();
+        if state.launch == launch {
+            state.events_connected = false;
+            if let events::Ended::Refused(status) = ended {
+                state.events_fault = Some(format!(
+                    "the OpenCode event stream (GET /api/event) answered HTTP {status}"
+                ));
+                state.epoch += 1;
+                break;
+            }
+        }
+        drop(state);
+        thread::sleep(match ended {
+            events::Ended::NotReady => RETRY_AFTER,
+            events::Ended::Lost | events::Ended::Refused(_) => EVENTS_RETRY,
+        });
+    }
+    let mut state = vendor.lock();
+    if state.launch == launch {
+        state.events_reading = false;
+        state.events_connected = false;
+    }
+    drop(state);
+    vendor.changed.notify_all();
+}
+
+/// Record one event of the service started as `launch`. Answers whether it
+/// was `server.connected`.
+fn on_event(vendor: &Vendor, launch: u64, event: &Value, connected_before: bool) -> bool {
+    let kind = event.get("type").and_then(Value::as_str);
+    let data = event.get("data");
+    let field = |key: &str| data.and_then(|data| data.get(key)).and_then(Value::as_str);
+    let mut state = vendor.lock();
+    if state.launch != launch {
+        return false;
+    }
+    let connected = kind == Some("server.connected");
+    match kind {
+        Some("server.connected") => {
+            state.events_connected = true;
+            if connected_before {
+                state.settling += 1;
+            }
+        }
+        Some(kind @ ("session.inbox.delivered" | "session.inbox.cancelled")) => {
+            let Some(inbox) = field("inboxID") else {
+                return false;
+            };
+            if field("sessionID").is_none() || field("sessionID") != state.session.as_deref() {
+                return false;
+            }
+            let inbox = inbox.to_string();
+            if kind == "session.inbox.delivered" {
+                state.cancelled.remove(&inbox);
+                state.consumed.insert(inbox);
+            } else if !state.consumed.contains(&inbox) {
+                state.cancelled.insert(inbox);
+            }
+        }
+        _ => return false,
+    }
+    state.epoch += 1;
+    drop(state);
+    vendor.changed.notify_all();
+    connected
+}
+
+/// Look up every line this process admitted and has no proof of in the
+/// session's conversation, which holds a consumed input under its own id.
+fn downgrade_unconsumed_admitted(state: &mut State) {
+    let mut downgraded = Vec::new();
+    for (id, prompt) in &mut state.prompts {
+        let vid = vendor_message_id(id);
+        if matches!(prompt, Prompt::Admitted)
+            && !state.consumed.contains(&vid)
+            && !state.cancelled.contains(&vid)
+        {
+            *prompt = Prompt::Unknown;
+            downgraded.push(id.clone());
+        }
+    }
+    if !downgraded.is_empty() {
+        state
+            .history
+            .retain(|prior| !downgraded.iter().any(|id| id == &prior.id));
+    }
+}
+
+fn settle_unproven(vendor: &Vendor, known_idle: bool) {
+    let (session, admitted, unproven) = {
+        let mut state = vendor.lock();
+        let Some(session) = state.session.clone() else {
+            state.settling = state.settling.saturating_sub(1);
+            state.epoch += 1;
+            drop(state);
+            vendor.changed.notify_all();
+            return;
+        };
+        let unproven: Vec<(String, String, bool)> = state
+            .prompts
+            .iter()
+            .filter(|(_, prompt)| {
+                matches!(prompt, Prompt::Sending | Prompt::Admitted | Prompt::Unknown)
+            })
+            .map(|(id, prompt)| {
+                (
+                    id.clone(),
+                    vendor_message_id(id),
+                    matches!(prompt, Prompt::Admitted),
+                )
+            })
+            .filter(|(_, vid, _)| !state.consumed.contains(vid) && !state.cancelled.contains(vid))
+            .collect();
+        if unproven.is_empty() {
+            state.settling = state.settling.saturating_sub(1);
+            state.epoch += 1;
+            drop(state);
+            vendor.changed.notify_all();
+            return;
+        }
+        (session, state.admissions, unproven)
+    };
+    let mut found_ids = Vec::new();
+    let mut missing_admitted = Vec::new();
+    for (msg_id, id, was_admitted) in unproven {
+        match vendor.call(
+            "GET",
+            &format!("/api/session/{session}/message/{id}"),
+            None,
+            Some(CALL_TIMEOUT),
+        ) {
+            Ok(found) if found.pointer("/data/id").and_then(Value::as_str) == Some(id.as_str()) => {
+                found_ids.push(id);
+            }
+            Err(err) if err.status == Some(404) && was_admitted => {
+                missing_admitted.push((msg_id, id));
+            }
+            _ => {}
+        }
+    }
+    let session_idle = if known_idle || missing_admitted.is_empty() {
+        known_idle
+    } else {
+        matches!(
+            vendor.call("GET", "/api/session/active", None, Some(CALL_TIMEOUT)),
+            Ok(active) if active.get("data").and_then(|data| data.get(&session)).is_none()
+        )
+    };
+    let mut state = vendor.lock();
+    for id in found_ids {
+        state.cancelled.remove(&id);
+        state.consumed.insert(id);
+    }
+    if session_idle
+        && state.session.as_deref() == Some(session.as_str())
+        && state.admissions == admitted
+    {
+        if known_idle {
+            downgrade_unconsumed_admitted(&mut state);
+        } else {
+            for (msg_id, id) in missing_admitted {
+                if !state.consumed.contains(&id)
+                    && matches!(state.prompts.get(&msg_id), Some(Prompt::Admitted))
+                {
+                    state.prompts.insert(msg_id.clone(), Prompt::Unknown);
+                    state.history.retain(|prior| prior.id != msg_id);
+                }
+            }
+        }
+    }
+    state.settling = state.settling.saturating_sub(1);
+    state.epoch += 1;
+    drop(state);
+    vendor.changed.notify_all();
+}
+
 impl Vendor {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|err| err.into_inner())
@@ -821,6 +1111,21 @@ impl Vendor {
             let mut state = self.lock();
             if state.recovered_from_session.is_none() {
                 state.recovered_from_session = Some(stale.to_string());
+            }
+            let consumed = state.consumed.clone();
+            let mut dropped = Vec::new();
+            state.prompts.retain(|msg_id, prompt| {
+                let clear = matches!(prompt, Prompt::Admitted | Prompt::Unknown)
+                    && !consumed.contains(&vendor_message_id(msg_id));
+                if clear {
+                    dropped.push(msg_id.clone());
+                }
+                !clear
+            });
+            if !dropped.is_empty() {
+                state
+                    .history
+                    .retain(|prior| !dropped.iter().any(|id| id == &prior.id));
             }
             state.turn_open = false;
         }
@@ -1109,13 +1414,15 @@ impl Vendor {
             });
         };
         // The service answers an id it already holds with that record, created
-        // before this request. If the session already took it into its
-        // conversation, an earlier process applied the line.
+        // before this request. If the session already holds it in its
+        // conversation without announcing it on this process's event stream,
+        // an earlier process applied the line.
         let existed = record
             .pointer("/time/created")
             .and_then(Value::as_i64)
             .is_some_and(|created| created < sent_at);
-        if existed
+        if (existed || replay)
+            && !self.lock().consumed.contains(&id)
             && self
                 .call(
                     "GET",
@@ -1123,8 +1430,17 @@ impl Vendor {
                     None,
                     None,
                 )
-                .is_ok()
+                .is_ok_and(|found| {
+                    found.pointer("/data/id").and_then(Value::as_str) == Some(id.as_str())
+                })
+            && !self.lock().consumed.contains(&id)
         {
+            if replay {
+                let mut state = self.lock();
+                state.cancelled.remove(&id);
+                state.consumed.insert(id);
+                return Ok(Prompt::Admitted);
+            }
             return Ok(Prompt::Applied);
         }
         Ok(Prompt::Admitted)
@@ -1149,6 +1465,12 @@ fn carry(vendor: &Arc<Vendor>, message: &OutboundMessage, replay: bool) {
         vendor.changed.notify_all();
         return;
     }
+    let outcome =
+        if outcome == Prompt::Unknown && state.consumed.contains(&vendor_message_id(&message.id)) {
+            Prompt::Admitted
+        } else {
+            outcome
+        };
     if outcome == Prompt::Admitted {
         if state.initial_topology.is_none()
             && let Some(topo) = &message.context.topology
@@ -1156,15 +1478,19 @@ fn carry(vendor: &Arc<Vendor>, message: &OutboundMessage, replay: bool) {
             state.initial_topology = Some(topo.clone());
         }
         state.recovered_from_session = None;
-        state.history.push(PriorPrompt {
-            id: message.id.clone(),
-            sender: message
-                .sender
-                .clone()
-                .or_else(|| message.context.sender.clone()),
-            text: message.text.clone(),
-        });
-        state.written.push(message.id.clone());
+        if !state.history.iter().any(|prior| prior.id == message.id) {
+            state.history.push(PriorPrompt {
+                id: message.id.clone(),
+                sender: message
+                    .sender
+                    .clone()
+                    .or_else(|| message.context.sender.clone()),
+                text: message.text.clone(),
+            });
+        }
+        if !state.written.contains(&message.id) {
+            state.written.push(message.id.clone());
+        }
         state.admissions += 1;
         state.turn_open = true;
         watch(vendor, &mut state);
@@ -1246,6 +1572,26 @@ fn watch_turn(vendor: &Arc<Vendor>) {
         if !idle || state.admissions != admitted {
             continue;
         }
+        let has_unproven = state.prompts.iter().any(|(id, prompt)| {
+            let vid = vendor_message_id(id);
+            matches!(prompt, Prompt::Admitted)
+                && !state.consumed.contains(&vid)
+                && !state.cancelled.contains(&vid)
+        });
+        if has_unproven {
+            state.settling += 1;
+            drop(state);
+            settle_unproven(vendor, true);
+            state = vendor.lock();
+            if !state.alive || state.closing {
+                state.watching = false;
+                return;
+            }
+            if state.admissions != admitted {
+                continue;
+            }
+        }
+        downgrade_unconsumed_admitted(&mut state);
         state.watching = false;
         state.turn_open = false;
         state.turns_completed = state.turns_completed.saturating_add(1);
@@ -1258,16 +1604,12 @@ fn watch_turn(vendor: &Arc<Vendor>) {
 
 impl Harness for OpenCodeHarness {
     /// Write one mailbox line into the session's inbox as a steer that
-    /// carries the line's own id, and accept it once the service admitted it.
+    /// carries the line's own id, and accept it once the session consumed it.
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         let mut state = self.vendor.lock();
+        let vid = vendor_message_id(&message.id);
         // What the service said stands even after the process went.
         match state.prompts.get(&message.id) {
-            Some(Prompt::Admitted) => {
-                return Ok(DeliverOutcome::Accepted {
-                    turn_finished: false,
-                });
-            }
             Some(Prompt::Applied) => return Ok(DeliverOutcome::Duplicate),
             Some(Prompt::Rejected(reason)) => {
                 // A 409 names this line's id, held by another record; a size
@@ -1277,13 +1619,35 @@ impl Harness for OpenCodeHarness {
                     || anyagents_harness::names_message_size(reason);
                 return Ok(DeliverOutcome::rejected(reason.clone(), message_specific));
             }
+            // Wait for the prompt call itself to finish while the service
+            // runs, so the send slot and admission state settle before the
+            // mailbox advances to the next line.
+            Some(Prompt::Sending) if state.alive => {}
+            _ if state.consumed.contains(&vid) => {
+                return Ok(DeliverOutcome::Accepted {
+                    turn_finished: false,
+                });
+            }
             _ => {}
         }
         if !state.alive {
             return Err(HarnessError::Dead);
         }
+        if let Some(fault) = state.events_fault.clone() {
+            return Err(HarnessError::Failed(fault));
+        }
         let replay = match state.prompts.get(&message.id) {
             Some(Prompt::Sending) => return Ok(DeliverOutcome::InFlight),
+            Some(Prompt::Admitted) if state.cancelled.contains(&vid) => {
+                // The service dropped it unconsumed: it goes back to the
+                // mailbox and is written again on its next offer.
+                state.cancelled.remove(&vid);
+                state.prompts.remove(&message.id);
+                state.history.retain(|prior| prior.id != message.id);
+                return Ok(DeliverOutcome::Deferred);
+            }
+            // Written; its proof is awaited.
+            Some(Prompt::Admitted) => return Ok(DeliverOutcome::InFlight),
             Some(Prompt::Refused) => {
                 // Nothing was admitted, and the service's wait is over: the
                 // line goes back to the mailbox and is written again on its
@@ -1301,8 +1665,9 @@ impl Harness for OpenCodeHarness {
             Some(Prompt::Unknown) => true,
             _ => false,
         };
-        // One prompt call at a time keeps the inbox in mailbox order.
-        if state.sending.is_some() {
+        // One prompt call at a time — and none while unproven admissions are
+        // settling — keeps the inbox in mailbox order.
+        if state.settling > 0 || state.sending.is_some() {
             return Ok(DeliverOutcome::Deferred);
         }
         state.sending = Some(message.id.clone());
@@ -1324,24 +1689,27 @@ impl Harness for OpenCodeHarness {
         Ok(DeliverOutcome::InFlight)
     }
 
-    /// What the service admitted, by this process or (as a record already in
-    /// the conversation) by an earlier one. Read only.
+    /// What the session consumed, as this process's event stream or the
+    /// conversation proved it, or (as a record already in the conversation)
+    /// an earlier process applied. Read only.
     fn proven(&self, message_id: &str) -> Option<Proof> {
-        match self.vendor.lock().prompts.get(message_id)? {
-            Prompt::Admitted => Some(Proof::Taken {
+        let state = self.vendor.lock();
+        match state.prompts.get(message_id) {
+            Some(Prompt::Applied) => Some(Proof::Duplicate),
+            Some(Prompt::Rejected(_)) => None,
+            _ if state.consumed.contains(&vendor_message_id(message_id)) => Some(Proof::Taken {
                 turn_finished: false,
             }),
-            Prompt::Applied => Some(Proof::Duplicate),
             _ => None,
         }
     }
 
-    /// Wait for the prompt call that is out to answer or fail, so what it
-    /// proved is known, then stop the service. The proofs stay readable. A
-    /// service that does not answer within [`CALL_TIMEOUT`] is stopped
-    /// anyway, so a stuck service never holds its replacement: the call then
-    /// fails, its outcome is unknown, and the next process writes the same id
-    /// once more, which OpenCode admits once.
+    /// Wait for the prompt call that is out to answer or fail, then stop the
+    /// service and read its event stream to the end, so what it proved is
+    /// known. The proofs stay readable. A service that does not answer within
+    /// [`CALL_TIMEOUT`] is stopped anyway, so a stuck service never holds its
+    /// replacement: the call then fails, its outcome is unknown, and the next
+    /// process writes the same id once more, which OpenCode admits once.
     fn stop(&mut self) {
         {
             let state = self.vendor.lock();
@@ -1352,6 +1720,12 @@ impl Harness for OpenCodeHarness {
                 .unwrap_or_else(|err| err.into_inner());
         }
         self.stop_child();
+        let state = self.vendor.lock();
+        let _state = self
+            .vendor
+            .changed
+            .wait_timeout_while(state, EVENTS_DRAIN, |state| state.events_reading)
+            .unwrap_or_else(|err| err.into_inner());
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {
@@ -1379,7 +1753,12 @@ impl Harness for OpenCodeHarness {
                 Some(CALL_TIMEOUT),
             )
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
-        self.vendor.lock().turn_open = false;
+        let mut state = self.vendor.lock();
+        state.turn_open = false;
+        downgrade_unconsumed_admitted(&mut state);
+        state.epoch += 1;
+        drop(state);
+        self.vendor.changed.notify_all();
         Ok(())
     }
 
@@ -1563,8 +1942,8 @@ impl OpenCodeHarness {
 
     /// Stop the service. It is reported gone once it has exited (or never
     /// ran); its stdout reader says the same at end of file. Nothing it proves
-    /// arrives on stdout: a proof is a prompt call's answer, which `stop`
-    /// waits for first.
+    /// arrives on stdout: a proof is an event on its event stream, which
+    /// `stop` reads to the end after this.
     fn stop_child(&mut self) {
         if let Some(mut child) = self.child.take() {
             let environment = &self.vendor.environment;

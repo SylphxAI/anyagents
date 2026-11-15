@@ -339,7 +339,7 @@ pub enum AdapterLaunch {
         env: Vec<(String, String)>,
         work_dir: PathBuf,
         /// A cloud harness behind the Claude adapter: mail waits for the turn
-        /// to end (`docs/delivery.md`).
+        /// to end unless its `acp/v1` peer declares more (`docs/delivery.md`).
         #[serde(default)]
         cloud: bool,
     },
@@ -3884,8 +3884,8 @@ done
     }
 
     /// A cloud harness runs behind the Claude adapter at turn-end delivery
-    /// (`docs/delivery.md`). The launch the kernel hands its keeper says so,
-    /// and keeps saying so across the wire.
+    /// until its peer declares more (`docs/delivery.md`). The launch the
+    /// kernel hands its keeper says so, and keeps saying so across the wire.
     #[test]
     fn a_cloud_harness_launch_keeps_turn_end_delivery_across_its_keeper() {
         use anyagents_core::{NewAgent, Store};
