@@ -2981,6 +2981,14 @@ fn publish_telegraph_article(
         .map(str::to_string)
 }
 
+/// One message in a chat, with the forum topic it is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub thread: Option<i64>,
+}
+
 /// Set or clear an emoji reaction on a Telegram message through the agent's bot,
 /// and fan out the reaction notice to peer agents in the room.
 pub fn react_message(
@@ -2988,11 +2996,14 @@ pub fn react_message(
     data_dir: &std::path::Path,
     from: &str,
     bot: Option<&str>,
-    chat_id: i64,
-    message_id: i64,
+    target: ChatMessage,
     emoji: Option<&str>,
-    thread: Option<i64>,
 ) -> Result<(), anyagents_core::Error> {
+    let ChatMessage {
+        chat_id,
+        message_id,
+        thread,
+    } = target;
     let channel = channel_for(store, from, bot)?;
     let Some(credential_ref) = channel.credential_ref else {
         return Err(anyagents_core::Error::Message(
@@ -3039,11 +3050,14 @@ pub fn edit_message(
     data_dir: &std::path::Path,
     from: &str,
     bot: Option<&str>,
-    chat_id: i64,
-    message_id: i64,
+    target: ChatMessage,
     text: &str,
-    thread: Option<i64>,
 ) -> Result<(), anyagents_core::Error> {
+    let ChatMessage {
+        chat_id,
+        message_id,
+        thread,
+    } = target;
     let translated = translate_agent_mentions_for_telegram(store, text);
     let text = translated.as_str();
     let channel = channel_for(store, from, bot)?;

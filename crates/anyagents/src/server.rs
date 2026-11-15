@@ -6500,7 +6500,16 @@ fn interact_sync(
             let emoji = body.emoji.as_deref().map(str::trim);
             if let Some((chat_id, message_id, thread_id)) = tg_coords {
                 crate::telegram::react_message(
-                    store, data_dir, actor_name, bot, chat_id, message_id, emoji, thread_id,
+                    store,
+                    data_dir,
+                    actor_name,
+                    bot,
+                    crate::telegram::ChatMessage {
+                        chat_id,
+                        message_id,
+                        thread: thread_id,
+                    },
+                    emoji,
                 )
                 .map_err(ApiError::from_store)?;
                 Ok(Json(InteractResponse {
@@ -6567,10 +6576,12 @@ fn interact_sync(
                     data_dir,
                     actor_name,
                     bot,
-                    chat_id,
-                    message_id,
+                    crate::telegram::ChatMessage {
+                        chat_id,
+                        message_id,
+                        thread: thread_id,
+                    },
                     Some("👍"),
-                    thread_id,
                 );
                 let posted_id = crate::telegram::post_text(
                     store,
@@ -6633,7 +6644,16 @@ fn interact_sync(
                 let updated = toggle_checklist_items(&msg.text, &body.options, mark_done);
                 if let Some((chat_id, message_id, thread_id)) = tg_coords {
                     crate::telegram::edit_message(
-                        store, data_dir, actor_name, bot, chat_id, message_id, &updated, thread_id,
+                        store,
+                        data_dir,
+                        actor_name,
+                        bot,
+                        crate::telegram::ChatMessage {
+                            chat_id,
+                            message_id,
+                            thread: thread_id,
+                        },
+                        &updated,
                     )
                     .map_err(ApiError::from_store)?;
                 }
@@ -6666,7 +6686,16 @@ fn interact_sync(
                 )
             })?;
             crate::telegram::edit_message(
-                store, data_dir, actor_name, bot, chat_id, message_id, new_text, thread_id,
+                store,
+                data_dir,
+                actor_name,
+                bot,
+                crate::telegram::ChatMessage {
+                    chat_id,
+                    message_id,
+                    thread: thread_id,
+                },
+                new_text,
             )
             .map_err(ApiError::from_store)?;
             Ok(Json(InteractResponse {
