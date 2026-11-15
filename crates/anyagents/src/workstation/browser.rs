@@ -188,13 +188,61 @@ pub async fn execute(
 }
 
 #[cfg(target_os = "linux")]
-fn normalize_url(raw: &str) -> String {
-    let raw = raw.trim();
-    if raw.contains("://") || raw.starts_with("about:") || raw.starts_with("data:") {
-        raw.to_string()
-    } else {
-        format!("https://{raw}")
+fn navigable_url(raw: &str) -> Result<String, ToolError> {
+    // What Chromium's URL parser drops before it reads a scheme: leading and
+    // trailing C0 controls and spaces, and every tab or newline anywhere.
+    let url: String = raw
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    if url.is_empty() {
+        return Err(ToolError::invalid("browser navigation requires a URL"));
     }
+    if url.eq_ignore_ascii_case("about:blank") {
+        return Ok("about:blank".to_string());
+    }
+    match url_scheme(&url) {
+        // `example.com` or `localhost:8080/x`: a host, over https.
+        None => Ok(format!("https://{url}")),
+        Some(scheme) if scheme == "http" || scheme == "https" => Ok(url),
+        Some(scheme) => Err(ToolError::invalid(format!(
+            "browser navigation allows only http://, https:// and about:blank, not `{scheme}:`"
+        ))),
+    }
+}
+
+/// The lowercased scheme `url` names, if it names one: the letters before
+/// its first `:` when they form a scheme and what follows is not a port.
+#[cfg(target_os = "linux")]
+fn url_scheme(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once(':')?;
+    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    let after_port = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    let is_port = (scheme.eq_ignore_ascii_case("localhost") || scheme.contains('.'))
+        && after_port.len() < rest.len()
+        && after_port
+            .chars()
+            .next()
+            .is_none_or(|c| matches!(c, '/' | '?' | '#'));
+    (is_scheme && !is_port).then(|| scheme.to_ascii_lowercase())
+}
+
+/// Whether a page now showing `url` may be read or driven for a caller:
+/// what [`navigable_url`] admits, plus Chromium's own error page for a
+/// navigation that failed.
+#[cfg(target_os = "linux")]
+fn readable_page_url(url: &str) -> bool {
+    let url = url.trim();
+    url.is_empty()
+        || url.eq_ignore_ascii_case("about:blank")
+        || url
+            .to_ascii_lowercase()
+            .starts_with("chrome-error://chromewebdata/")
+        || matches!(url_scheme(url).as_deref(), Some("http" | "https"))
 }
 
 /// An explicit wait the agent asked for (never a default delay).
@@ -458,9 +506,22 @@ fn insert_captcha_fields(
 }
 
 #[cfg(target_os = "linux")]
+async fn require_readable_page(s: &agent_workstation::Agent<'_>) -> Result<(), ToolError> {
+    let url = s.current_url().await?;
+    if !readable_page_url(&url) {
+        let _ = s.navigate("about:blank").await;
+        return Err(ToolError::invalid(
+            "browser page access allows only http://, https:// and about:blank; attempted to reset the prohibited page to about:blank",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 async fn snapshot_json(
     s: &agent_workstation::Agent<'_>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, ToolError> {
+    require_readable_page(s).await?;
     let snap = s.snapshot().await?;
     let title = active_title(s).await;
     let mut m = serde_json::Map::new();
@@ -565,13 +626,7 @@ async fn run(
     match action.as_str() {
         "profiles" | "list" => return Ok(json!({ "profiles": list_profiles(data)? })),
         "close" | "stop" | "shutdown" => {
-            // Only the agent holding a desktop closes it.
-            if let Some(live) = session::running(data, &profile) {
-                live.session
-                    .lease(&caller.principal)
-                    .map_err(ToolError::from)?;
-            }
-            let was_running = session::stop(data, &profile).await;
+            let was_running = session::stop_authorized(data, &profile, &caller.principal).await?;
             return Ok(json!({
                 "profile": profile,
                 "status": "stopped",
@@ -579,7 +634,9 @@ async fn run(
                 "user_data_preserved": true,
             }));
         }
-        "status" | "info" | "fingerprint" => return status(data, &profile).await,
+        "status" | "info" | "fingerprint" => {
+            return status(data, &profile, &caller.principal).await;
+        }
         _ => {}
     }
 
@@ -595,7 +652,7 @@ async fn run(
                 .as_deref()
                 .filter(|u| !u.trim().is_empty())
                 .ok_or_else(|| ToolError::invalid("browser open requires `url`"))?;
-            s.navigate(&normalize_url(url)).await?;
+            s.navigate(&navigable_url(url)?).await?;
             pause(req.wait_ms).await;
             let mut m = snapshot_json(&s).await?;
             m.insert("status".into(), "running".into());
@@ -615,6 +672,7 @@ async fn run(
             with_profile(&profile, &live, m)
         }
         "read" | "text" | "content" => {
+            require_readable_page(&s).await?;
             let text = s.read().await?;
             let url = s.current_url().await?;
             with_profile(
@@ -629,6 +687,7 @@ async fn run(
                 .as_deref()
                 .map(str::trim)
                 .filter(|t| !t.is_empty());
+            require_readable_page(&s).await?;
             let (html, truncated) = bounded(s.html(target).await?);
             with_profile(
                 &profile,
@@ -642,6 +701,7 @@ async fn run(
                 .as_deref()
                 .filter(|t| !t.trim().is_empty())
                 .ok_or_else(|| ToolError::invalid("browser eval requires `script`"))?;
+            require_readable_page(&s).await?;
             let value = s.eval(script).await?;
             let text = value.to_string();
             let m = if text.len() > MAX_TEXT_RESULT {
@@ -653,6 +713,7 @@ async fn run(
             with_profile(&profile, &live, json_map(m))
         }
         "cookies" => {
+            require_readable_page(&s).await?;
             if let Some(raw) = &req.cookies {
                 let cookies: Vec<agent_workstation::Cookie> =
                     serde_json::from_value(serde_json::Value::Array(raw.clone()))
@@ -668,6 +729,7 @@ async fn run(
             )
         }
         "click" => {
+            require_readable_page(&s).await?;
             let target = required_selector(&req, "click")?;
             s.click(target).await?;
             pause(req.wait_ms).await;
@@ -680,6 +742,7 @@ async fn run(
             )
         }
         "fill" | "type" | "input" => {
+            require_readable_page(&s).await?;
             let target = required_selector(&req, "fill")?;
             let secret = req
                 .secret_ref
@@ -714,6 +777,7 @@ async fn run(
             with_profile(&profile, &live, m)
         }
         "press" | "key" | "hold" => {
+            require_readable_page(&s).await?;
             let keys = requested_keys(&req)?;
             if let Some(target) = req
                 .selector
@@ -752,6 +816,7 @@ async fn run(
             )
         }
         "key_down" | "keydown" | "key_up" | "keyup" => {
+            require_readable_page(&s).await?;
             for k in requested_keys(&req)? {
                 if action.starts_with("key_d") || action == "keydown" {
                     s.key_down(&k).await?;
@@ -766,10 +831,12 @@ async fn run(
             )
         }
         "release" | "release_keys" => {
+            require_readable_page(&s).await?;
             s.release_keys().await?;
             with_profile(&profile, &live, json_map(json!({ "held_keys": [] })))
         }
         "screenshot" | "shot" => {
+            require_readable_page(&s).await?;
             let (png, width, height, truncated) = if req.full_page.unwrap_or(false) {
                 let page = s.page_screenshot(true).await?;
                 (page.png, page.width, page.height, page.truncated)
@@ -778,7 +845,7 @@ async fn run(
                 (frame.to_png()?, frame.width, frame.height, false)
             };
             let (path, path_refused) =
-                save_screenshot(data, &profile, req.path.as_deref(), &png, files)?;
+                save_screenshot(data, caller, &profile, req.path.as_deref(), &png, files)?;
             let mut m = json_map(json!({
                 "path": path.display().to_string(),
                 "bytes": png.len(),
@@ -806,7 +873,7 @@ async fn run(
             let mut m = match sub.as_str() {
                 "list" => json_map(json!({})),
                 "new" | "open" => {
-                    let url = normalize_url(req.url.as_deref().unwrap_or("about:blank"));
+                    let url = navigable_url(req.url.as_deref().unwrap_or("about:blank"))?;
                     let id = s.new_tab(&url).await?;
                     json_map(json!({ "target_id": id, "url": url }))
                 }
@@ -841,10 +908,11 @@ async fn run(
         }
         "takeover" | "human_takeover" | "user_takeover" => {
             if let Some(url) = req.url.as_deref().filter(|u| !u.trim().is_empty()) {
-                s.navigate(&normalize_url(url)).await?;
+                s.navigate(&navigable_url(url)?).await?;
             }
+            require_readable_page(&s).await?;
             let shot = match s.screenshot().await.and_then(|f| f.to_png()) {
-                Ok(png) => save_screenshot(data, &profile, None, &png, files)
+                Ok(png) => save_screenshot(data, caller, &profile, None, &png, files)
                     .ok()
                     .map(|(p, _)| p.display().to_string()),
                 Err(_) => None,
@@ -941,7 +1009,22 @@ fn hand_back_wait(wait_ms: u64) -> std::time::Duration {
 }
 
 #[cfg(target_os = "linux")]
-async fn status(data: &Path, profile: &str) -> Result<serde_json::Value, ToolError> {
+fn add_status_takeover(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    leased: bool,
+    takeover_url: impl FnOnce() -> Option<String>,
+) {
+    if leased && let Some(url) = takeover_url() {
+        metadata.insert("takeover_url".into(), url.into());
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn status(
+    data: &Path,
+    profile: &str,
+    principal: &str,
+) -> Result<serde_json::Value, ToolError> {
     use serde_json::json;
     let Some(dir) = super::server_profile_dir(data, profile, false)
         .map_err(|e| ToolError::invalid(e.to_string()))?
@@ -952,28 +1035,26 @@ async fn status(data: &Path, profile: &str) -> Result<serde_json::Value, ToolErr
     let fingerprint = agent_workstation::Fingerprint::read(&p.fingerprint_path())?;
     match super::session::running(data, profile) {
         Some(live) => {
-            // Status is an observation: it reads tabs only for the holder.
-            let tabs = match live.leaseholder() {
-                Some(holder) => match live.session.lease(&holder) {
-                    Ok(agent) => agent.tabs().await.unwrap_or_default(),
-                    Err(_) => Vec::new(),
-                },
+            // Never impersonate the holder to observe another caller's tabs or token.
+            let agent = live.session.lease(principal).ok();
+            let tabs = match agent.as_ref() {
+                Some(agent) => agent.tabs().await.unwrap_or_default(),
                 None => Vec::new(),
             };
-            Ok(with_profile(
-                profile,
-                &live,
-                json_map(json!({
-                    "status": "running",
-                    "started_at_ms": live.started_at_ms(),
-                    "last_used_at_ms": live.last_used_ms(),
-                    "proxy_configured": live.proxy.as_deref().is_some_and(|p| !p.is_empty()),
-                    "held_by": live.leaseholder(),
-                    "desktop": { "width": live.session.size().0, "height": live.session.size().1 },
-                    "fingerprint": fingerprint,
-                    "tabs": tabs,
-                })),
-            ))
+            let mut metadata = json_map(json!({
+                "profile": profile,
+                "holder": live.holder(),
+                "status": "running",
+                "started_at_ms": live.started_at_ms(),
+                "last_used_at_ms": live.last_used_ms(),
+                "proxy_configured": live.proxy.as_deref().is_some_and(|p| !p.is_empty()),
+                "held_by": live.leaseholder(),
+                "desktop": { "width": live.session.size().0, "height": live.session.size().1 },
+                "fingerprint": fingerprint,
+                "tabs": tabs,
+            }));
+            add_status_takeover(&mut metadata, agent.is_some(), || live.takeover_url());
+            Ok(serde_json::Value::Object(metadata))
         }
         None => Ok(json!({
             "profile": profile,
@@ -984,41 +1065,116 @@ async fn status(data: &Path, profile: &str) -> Result<serde_json::Value, ToolErr
 }
 
 #[cfg(target_os = "linux")]
+fn profile_entry_metadata(
+    root: &std::fs::File,
+    c_name: &std::ffi::CStr,
+) -> std::io::Result<Option<libc::stat>> {
+    use std::os::fd::AsRawFd as _;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: root is an open directory, c_name is NUL-terminated,
+    // and stat points to storage for the metadata written on success.
+    if unsafe {
+        libc::fstatat(
+            root.as_raw_fd(),
+            c_name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        // Unlink after readdir is harmless; other metadata failures are not.
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    // SAFETY: fstatat succeeded and initialized stat.
+    Ok(Some(unsafe { stat.assume_init() }))
+}
+
+#[cfg(target_os = "linux")]
 fn list_profiles(data: &Path) -> Result<Vec<serde_json::Value>, ToolError> {
     use serde_json::json;
-    let mut names = std::collections::BTreeSet::new();
-    super::server_profile_dir(data, "default", false)
-        .map_err(|e| ToolError::invalid(e.to_string()))?;
-    if let Ok(entries) = std::fs::read_dir(super::profiles_root(data)) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str()
-                && super::server_profile_dir(data, name, false)
-                    .map_err(|e| ToolError::invalid(e.to_string()))?
-                    .is_some()
+    use std::os::fd::IntoRawFd as _;
+    let names = (|| -> std::io::Result<std::collections::BTreeSet<String>> {
+        let (data_dir, _) = super::trusted_data_dir(data)?;
+        let mut names = std::collections::BTreeSet::new();
+        let Some(root) =
+            super::owned_root_dir(&data_dir, "browser-profiles".as_ref(), 0o755, false)?
+        else {
+            return Ok(names);
+        };
+        names.insert("default".into());
+        struct Directory(*mut libc::DIR);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+        let fd = root.try_clone()?.into_raw_fd();
+        // SAFETY: fd is a live directory; fdopendir owns it only on success.
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(error);
+        }
+        let directory = Directory(stream);
+        loop {
+            // SAFETY: only this thread uses this directory stream and errno slot.
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            let entry = unsafe { libc::readdir(directory.0) };
+            if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(0) {
+                    return Err(error);
+                }
+                break;
+            }
+            // SAFETY: readdir supplies a NUL-terminated name valid until its next call.
+            let c_name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if matches!(c_name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            let Ok(name) = c_name.to_str() else { continue };
+            let Some(stat) = profile_entry_metadata(&root, c_name)? else {
+                continue;
+            };
+            if stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+                && stat.st_uid == crate::sandbox::server_uid()
             {
                 names.insert(name.to_string());
             }
         }
-    }
-    Ok(names
-        .into_iter()
-        .map(|name| match super::session::running(data, &name) {
-            Some(live) => json!({
-                "profile": name,
-                "status": "running",
-                "holder": live.holder(),
-                "held_by": live.leaseholder(),
-                "last_used_at_ms": live.last_used_ms(),
-            }),
-            None => json!({ "profile": name, "status": "stopped" }),
-        })
-        .collect())
+        Ok(names)
+    })()
+    .map_err(|e| ToolError::invalid(e.to_string()))?;
+    Ok(names.into_iter().map(|name| {
+        let summary = (|| -> Result<serde_json::Value, ToolError> {
+            if let Some(dir) = super::server_profile_dir(data, &name, false).map_err(|e| ToolError::invalid(e.to_string()))? {
+                let profile = agent_workstation::Profile::new(&name, dir);
+                agent_workstation::Fingerprint::read(&profile.fingerprint_path())?;
+            }
+            Ok(match super::session::running(data, &name) {
+                Some(live) => json!({"profile":name,"status":"running","holder":live.holder(),"held_by":live.leaseholder(),"last_used_at_ms":live.last_used_ms()}),
+                None => json!({"profile":name,"status":"stopped"}),
+            })
+        })();
+        summary.unwrap_or_else(|error| json!({"profile":name,"status":"error","error":error.to_string()}))
+    }).collect())
 }
 
-/// Write caller-selected paths only through the caller's file authority.
 #[cfg(target_os = "linux")]
 fn save_screenshot(
     data: &Path,
+    caller: &Caller,
     profile: &str,
     requested: Option<&str>,
     png: &[u8],
@@ -1033,6 +1189,31 @@ fn save_screenshot(
     } else {
         None
     };
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = format!(
+        "shot-{}-{}.png",
+        anyagents_core::now_ms(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    if matches!(files, crate::agent_file::FileAuthority::Seat { .. })
+        && let Some(agent_id) = caller.agent_id.as_deref()
+        && matches!(
+            Path::new(agent_id)
+                .components()
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [std::path::Component::Normal(_)]
+        )
+    {
+        let target = data
+            .join("agents")
+            .join(agent_id)
+            .join("sessions/screenshots")
+            .join(&name);
+        if files.write(&target, png).is_ok() {
+            return Ok((target, refused));
+        }
+    }
     // Only the validated server-owned profile receives the fallback copy.
     // Never infer the caller's identity from a target's filesystem owner.
     let dir = super::server_profile_dir(data, profile, true)
@@ -1043,8 +1224,8 @@ fn save_screenshot(
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
         // Keep the complete profile chain open; path validation followed by
         // a separate open would permit an intervening directory replacement.
-        let root = std::fs::File::open(data)?;
-        let profiles = super::owned_child_dir(
+        let (root, _) = super::trusted_data_dir(data)?;
+        let profiles = super::owned_root_dir(
             &root,
             std::ffi::OsStr::new("browser-profiles"),
             0o755,
@@ -1062,12 +1243,6 @@ fn save_screenshot(
         )?
         .ok_or_else(|| std::io::Error::other("screenshots directory disappeared"))?;
         let shots = dir.join("screenshots");
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let name = format!(
-            "shot-{}-{}.png",
-            anyagents_core::now_ms(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
         let c_name = std::ffi::CString::new(name.as_str()).expect("generated filename");
         // The descriptor fixes the directory across renames; O_EXCL refuses
         // existing entries, including symlinks. No server write follows a link.
@@ -1113,6 +1288,122 @@ fn fixture_chromium() -> Option<PathBuf> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    #[test]
+    fn web_navigation_and_page_reads_reject_privileged_schemes() {
+        for url in [
+            "https://example.com",
+            "HTTP://example.com",
+            "example.com",
+            "localhost:8080/x",
+            "127.0.0.1:9",
+            " about:blank ",
+            "\nhttps://example.com\t",
+        ] {
+            assert!(navigable_url(url).is_ok(), "{url:?}");
+        }
+        for url in [
+            "file:///etc/passwd",
+            "FILE:/etc/passwd",
+            "fi\tle:///etc/passwd",
+            "fi\nle:///etc/passwd",
+            "\u{0001}file:///etc/passwd",
+            "view-source:https://x",
+            "chrome://settings",
+            "chrome-untrusted://x",
+            "devtools://x",
+            "data:text/plain,x",
+            "javascript:123",
+            "blob:https://x/id",
+            "filesystem:https://x/file",
+            "about:config",
+            "ftp://x",
+        ] {
+            assert!(navigable_url(url).is_err(), "{url:?}");
+            assert!(!readable_page_url(url), "{url:?}");
+        }
+        assert!(navigable_url("").is_err());
+        for url in [
+            "",
+            "about:blank",
+            "chrome-error://chromewebdata/",
+            "https://example.com",
+            "http:123",
+        ] {
+            assert!(readable_page_url(url), "{url:?}");
+        }
+        assert_eq!(url_scheme("javascript:123").as_deref(), Some("javascript"));
+        assert_eq!(url_scheme("http:123").as_deref(), Some("http"));
+    }
+    #[test]
+    fn nonholder_status_omits_takeover_token() {
+        let mut metadata = json_map(serde_json::json!({"status":"running","tabs":[]}));
+        add_status_takeover(&mut metadata, false, || {
+            panic!("must not request another holder's token")
+        });
+        assert!(!metadata.contains_key("takeover_url"));
+        assert_eq!(metadata["tabs"], serde_json::json!([]));
+        add_status_takeover(&mut metadata, true, || {
+            Some("https://takeover.test/token".into())
+        });
+        assert_eq!(metadata["takeover_url"], "https://takeover.test/token");
+    }
+    #[test]
+    fn profile_listing_isolates_corruption_and_skips_links() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let data = tempfile::tempdir().unwrap();
+        assert!(list_profiles(data.path()).unwrap().is_empty());
+        let root = data.path().join("browser-profiles");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["healthy", "bad-json", "bad-schema", "insecure"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        std::fs::write(root.join("bad-json/fingerprint.json"), b"{").unwrap();
+        std::fs::write(root.join("bad-schema/fingerprint.json"), b"{}").unwrap();
+        std::fs::set_permissions(
+            root.join("insecure"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        let recovery = root.join("bad-json/recovery");
+        std::fs::write(&recovery, b"preserve me").unwrap();
+        symlink(root.join("healthy"), root.join("linked")).unwrap();
+        std::fs::write(root.join("not-a-profile"), b"x").unwrap();
+        let profiles = list_profiles(data.path()).unwrap();
+        let get = |name: &str| profiles.iter().find(|p| p["profile"] == name).unwrap();
+        assert_eq!(get("healthy")["status"], "stopped");
+        for name in ["bad-json", "bad-schema", "insecure"] {
+            assert_eq!(get(name)["status"], "error", "{name}");
+            assert!(get(name)["error"].is_string());
+        }
+        assert!(
+            !profiles
+                .iter()
+                .any(|p| p["profile"] == "linked" || p["profile"] == "not-a-profile")
+        );
+        assert_eq!(std::fs::read(recovery).unwrap(), b"preserve me");
+    }
+    #[test]
+    fn profile_listing_rejects_invalid_containers() {
+        use std::os::unix::fs::symlink;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("browser-profiles");
+        std::fs::write(&root, b"x").unwrap();
+        assert!(list_profiles(data.path()).is_err());
+        std::fs::remove_file(&root).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        symlink(elsewhere.path(), &root).unwrap();
+        assert!(list_profiles(data.path()).is_err());
+    }
+    #[test]
+    fn vanished_profile_entry_is_not_a_listing_failure() {
+        let data = tempfile::tempdir().unwrap();
+        let root = std::fs::File::open(data.path()).unwrap();
+        assert!(
+            profile_entry_metadata(&root, c"vanished")
+                .unwrap()
+                .is_none()
+        );
+    }
 
     /// Render every reference fixture in real Chromium: only visible challenges count.
     #[test]
@@ -1504,6 +1795,7 @@ mod tests {
     fn caller() -> Caller {
         Caller {
             principal: "agent-a".into(),
+            agent_id: None,
             profile: "agent-a".into(),
         }
     }
@@ -1602,6 +1894,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let caller = Caller {
             principal: "agent-a".into(),
+            agent_id: None,
             profile: "agent-a".into(),
         };
         let err = execute(

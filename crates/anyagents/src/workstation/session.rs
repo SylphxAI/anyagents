@@ -610,14 +610,20 @@ pub async fn stop_authorized(
     let Some(slot) = slot else {
         return Ok(false);
     };
-    let guard = tokio::time::timeout(SHUTDOWN_WAIT, slot.lock_owned())
+    // Slot contention and graceful close share one caller deadline.
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT;
+    let guard = tokio::time::timeout_at(deadline, slot.lock_owned())
         .await
         .map_err(|_| session_busy())?;
     if let Some(live) = guard.as_ref() {
         live.session.lease(principal).map_err(ToolError::from)?;
     }
     let closing = tokio::spawn(close_slot(guard));
-    wait_for_shutdown(closing, SHUTDOWN_WAIT).await
+    wait_for_shutdown(
+        closing,
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+    )
+    .await
 }
 
 // Dropping a JoinHandle detaches the cleanup; it never releases the writer

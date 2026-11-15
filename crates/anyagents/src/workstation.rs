@@ -183,7 +183,8 @@ fn trusted_data_dir(data: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
 fn trusted_root_directory(dir: &std::fs::File) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = dir.metadata()?;
-    if meta.uid() != crate::sandbox::server_uid()
+    if !meta.is_dir()
+        || meta.uid() != crate::sandbox::server_uid()
         || meta.mode() & 0o002 != 0
         || (meta.mode() & 0o020 != 0 && meta.mode() & 0o1000 == 0)
     {
