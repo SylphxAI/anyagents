@@ -341,9 +341,11 @@ fn create_with_seat(
         } else {
             request.workdir.clone()
         };
-        if request.workdir.is_some() && wd_str.is_empty() {
+        if let Some(path) = &request.workdir
+            && wd_str.is_empty()
+        {
             return Err(Error::WorkdirPermission {
-                path: request.workdir.as_ref().unwrap().display().to_string(),
+                path: path.display().to_string(),
                 message: "working directory must not be empty".into(),
             });
         }
@@ -3866,10 +3868,10 @@ fn propagate_credentials(
             )));
         }
         // Success markers must describe credentials that the seat can read.
-        if let Some(s) = store_opt.as_ref() {
-            if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
-                crate::sandbox::share_config_with_seat_uid_checked(&cfg, uid, gid)?;
-            }
+        if let Some(s) = store_opt.as_ref()
+            && let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec)
+        {
+            crate::sandbox::share_config_with_seat_uid_checked(&cfg, uid, gid)?;
         }
         write_profile_marker(
             &cfg,
