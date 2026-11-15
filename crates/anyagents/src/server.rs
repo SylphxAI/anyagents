@@ -20,7 +20,7 @@ use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use serde::Deserialize;
@@ -416,7 +416,8 @@ async fn serve(
                     {
                         eprintln!("anyagents-host-history: deferred full verification: {error}");
                     }
-                    crate::browser::reap_idle_browsers(&root);
+                    #[cfg(target_os = "linux")]
+                    crate::workstation::session::reap_idle(&root);
                     if let Err(error) = crate::remote::rotate_due(&store) {
                         eprintln!("anyagents-remote: session rotation deferred: {error}");
                     }
@@ -622,6 +623,7 @@ async fn serve(
                 anyagents_keeper::abandon_starts();
                 exit_after(STOP_WITHIN);
             }
+
             // A long poll ends at Telegram, not here: signal the poller to
             // stop so released long polls exit instead of re-entering a 30s
             // wait, and release every bot while the calls drain, so each
@@ -684,6 +686,8 @@ async fn serve(
             serve_result
         }
     };
+    #[cfg(target_os = "linux")]
+    crate::workstation::session::stop_all().await;
     let released = match releasing {
         Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
         None => {
@@ -733,8 +737,9 @@ pub(crate) const STOP_WITHIN: std::time::Duration = std::time::Duration::from_se
 /// ([`RESPONSE_FLUSH_WITHIN`]), the Telegram release and the joins after it
 /// finish, and the runtime abandons its blocking work. Background loops (the
 /// schedule timers and their external probes among them) already ended at the
-/// stop.
-const STOP_AFTER_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(8);
+/// stop. The budget includes response flushing, nine-second desktop session
+/// shutdown, and final cleanup.
+const STOP_AFTER_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The wait for Telegram to hand back every bot's long poll at shutdown. It
 /// runs beside the drain. A bot not released in time is polled again by the
@@ -1169,6 +1174,15 @@ async fn telegram_webhook(
 /// and MCP for every credential kind. Until a deployment configures
 /// `public_listen` it is also the public one and keeps the `0.0.0.0:8788`
 /// default; once the public listener exists it defaults to loopback.
+#[cfg(target_os = "linux")]
+pub(crate) fn public_entry_listening(data: &Path) -> bool {
+    match crate::remote::Settings::load(data) {
+        Ok(settings) if settings.public_listen.is_some() => true,
+        Ok(_) => webhook_listen_addr(false).is_some(),
+        Err(_) => false,
+    }
+}
+
 fn webhook_listen_addr(public_configured: bool) -> Option<String> {
     local_listen_addr(
         std::env::var("ANYAGENTS_WEBHOOK_LISTEN").ok().as_deref(),
@@ -1215,6 +1229,12 @@ fn binds_loopback(addr: &str) -> bool {
 /// or a forwarding header.
 pub(crate) fn build_public_router(state: AppState) -> Router {
     Router::new()
+        .route("/v1/webhooks/takeover/{key}", any(takeover_page_route))
+        .route("/v1/webhooks/takeover/{key}/", any(takeover_page_route))
+        .route(
+            "/v1/webhooks/takeover/{key}/{*rest}",
+            any(takeover_page_route),
+        )
         .route("/", get(public_healthz))
         .route("/healthz", get(public_healthz))
         .route("/v1/webhooks/healthz", get(public_healthz))
@@ -1235,8 +1255,54 @@ async fn public_not_found() -> impl IntoResponse {
     )
 }
 
-pub(crate) fn build_webhook_router(state: AppState) -> Router {
+pub(crate) async fn takeover_page_route(req: axum::extract::Request) -> Response {
+    #[cfg(target_os = "linux")]
+    {
+        use tower::ServiceExt as _;
+        let prefix = crate::workstation::takeover::MOUNT_PREFIX;
+        let path = req.uri().path().to_string();
+        let tail = path.strip_prefix(prefix).unwrap_or_default();
+        let (key, rest) = tail.split_once('/').unwrap_or((tail, ""));
+        let Some(page) = crate::workstation::takeover::mounted(key) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let query = req
+            .uri()
+            .query()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
+        if !tail.contains('/') {
+            // The page loads its assets relative to a directory URL.
+            return axum::response::Redirect::permanent(&format!("{path}/{query}")).into_response();
+        }
+        let (mut parts, body) = req.into_parts();
+        let Ok(uri) = format!("/{rest}{query}").parse() else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        parts.uri = uri;
+        match page
+            .oneshot(axum::extract::Request::from_parts(parts, body))
+            .await
+        {
+            Ok(response) => response,
+            Err(never) => match never {},
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = req;
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+fn build_webhook_router(state: AppState) -> Router {
     Router::new()
+        .route("/v1/webhooks/takeover/{key}", any(takeover_page_route))
+        .route("/v1/webhooks/takeover/{key}/", any(takeover_page_route))
+        .route(
+            "/v1/webhooks/takeover/{key}/{*rest}",
+            any(takeover_page_route),
+        )
         .route("/", get(public_healthz))
         .route("/healthz", get(public_healthz))
         .route("/v1/webhooks/healthz", get(public_healthz))
@@ -1276,6 +1342,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(get_description_route).post(set_description_route),
         )
         .route("/v1/browser", post(browser_route))
+        .route("/v1/computer", post(computer_route))
         .route("/v1/web", post(web_route))
         .route("/v1/profiles", get(profiles_route).post(set_profile_route))
         .route("/v1/profiles/models", get(profile_models_route))
@@ -3228,22 +3295,59 @@ async fn set_description_route(
     .await
 }
 
+/// Who a desktop call is for: its lease principal (an agent's name, or the
+/// operator) and that caller's own browser profile (the agent's name, or
+/// `default`).
+fn desktop_caller(principal: &Principal) -> crate::workstation::Caller {
+    match principal {
+        Principal::Agent { agent_id, name } => crate::workstation::Caller {
+            agent_id: Some(agent_id.as_str().to_string()),
+            principal: name.clone(),
+            profile: name.clone(),
+        },
+        Principal::Operator => crate::workstation::Caller {
+            agent_id: None,
+            principal: crate::workstation::OPERATOR.to_string(),
+            profile: "default".to_string(),
+        },
+    }
+}
+
 async fn browser_route(
     principal: Principal,
     State(state): State<AppState>,
-    Json(body): Json<crate::browser::BrowserRequest>,
+    Json(body): Json<crate::workstation::BrowserRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let default_profile = match &principal {
-        Principal::Agent { name, .. } => name.clone(),
-        Principal::Operator => "default".to_string(),
-    };
-    spawn_store(move || {
-        let files = crate::agent_file::FileAuthority::of(&state.store, &principal);
-        let out = crate::browser::execute(state.store.data_dir(), &default_profile, body, &files)
-            .map_err(ApiError::from_store)?;
-        Ok(Json(out))
-    })
-    .await
+    let caller = desktop_caller(&principal);
+    let files = crate::agent_file::FileAuthority::of(&state.store, &principal);
+    crate::workstation::browser::execute(state.store.data_dir(), &caller, body, &files)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_store)
+}
+
+/// Session-desktop `tools.computer` requests (host and cloud requests run in
+/// the caller's process).
+async fn computer_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    #[cfg(target_os = "linux")]
+    {
+        let caller = desktop_caller(&principal);
+        crate::workstation::desktop::execute(state.store.data_dir(), &caller, body)
+            .await
+            .map(Json)
+            .map_err(ApiError::from_store)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (principal, state, body);
+        Err(ApiError::from_store(
+            crate::workstation::unsupported_host().into(),
+        ))
+    }
 }
 
 async fn channels_route(
@@ -5137,8 +5241,9 @@ fn reap_subagent_ephemeral_dirs_in(
         );
     }
     let mut shared_workdirs = std::collections::HashSet::new();
+    #[cfg(target_os = "linux")]
     if let Some(agent) = agent {
-        let _ = crate::browser::stop_profile(data_dir, &agent.name);
+        crate::workstation::session::stop_agent_in_background(data_dir, &agent.name);
     }
     // Every other agent that is not archived, and the parent even when it is,
     // keeps its workdir.
@@ -5606,6 +5711,7 @@ async fn delete_agent_route(
         if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&config) {
             let _ = anyagents_tools::SandboxProvider::destroy(&sbx);
         }
+
         reap_subagent_ephemeral_dirs_in(&state.store, data_dir, &found.id);
         remove_agent_identity_files(data_dir, &found, &agent_dir, seat_ids);
         let deleted = state
@@ -5616,6 +5722,7 @@ async fn delete_agent_route(
             data_dir
                 .join("locks")
                 .join(format!("{}.lock", deleted.id.as_str())),
+
         );
         if !agent_dir.join("work").exists() {
             remove_path_with_seat(&agent_dir, seat_ids);
@@ -5640,7 +5747,8 @@ fn remove_agent_identity_files(
     agent_dir: &Path,
     seat_ids: Option<(u32, u32, u32)>,
 ) {
-    let _ = crate::browser::stop_profile(data_dir, &agent.name);
+    #[cfg(target_os = "linux")]
+    crate::workstation::session::stop_agent_blocking(data_dir, &agent.name);
     remove_path_with_seat(
         &data_dir.join("browser-profiles").join(&agent.name),
         seat_ids,
@@ -16103,6 +16211,50 @@ exec '{}' "$@"
         .unwrap();
         assert_eq!(r.totals.input_tokens, 600);
         assert_eq!(r.buckets.len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn takeover_pages_are_served_under_their_key_on_the_public_listener() {
+        use axum::body::to_bytes;
+        let page = Router::new()
+            .route(
+                "/",
+                get(|uri: axum::http::Uri| async move { uri.to_string() }),
+            )
+            .route("/ws", get(|| async { "ws" }));
+        crate::workstation::takeover::mount_router("k1", page);
+        let call = |uri: &str| {
+            takeover_page_route(
+                axum::extract::Request::get(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let redirect = call("/v1/webhooks/takeover/k1?token=t").await;
+        assert_eq!(redirect.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            redirect.headers()["location"],
+            "/v1/webhooks/takeover/k1/?token=t",
+            "relative assets need a directory URL"
+        );
+        let body = |r: Response| async move {
+            String::from_utf8(to_bytes(r.into_body(), 1 << 16).await.unwrap().to_vec()).unwrap()
+        };
+        assert_eq!(
+            body(call("/v1/webhooks/takeover/k1/?token=t").await).await,
+            "/?token=t"
+        );
+        assert_eq!(body(call("/v1/webhooks/takeover/k1/ws").await).await, "ws");
+        assert_eq!(
+            call("/v1/webhooks/takeover/zz/").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        crate::workstation::takeover::unmount("k1");
+        assert_eq!(
+            call("/v1/webhooks/takeover/k1/").await.status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]

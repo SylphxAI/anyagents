@@ -64,6 +64,7 @@ fn start_with_config(dir: &TempDir, mode: &str, config: &Path) -> OpenCodeHarnes
 
 /// Offer `message` until the service has answered its prompt call: the call
 /// runs on a thread of its own, and the line is in flight until it answers.
+#[track_caller]
 fn settle(
     harness: &mut OpenCodeHarness,
     message: &OutboundMessage,
@@ -74,7 +75,11 @@ fn settle(
             Ok(DeliverOutcome::InFlight) => {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "the prompt call never answered"
+                    "delivery {} stayed in flight; admitted: {:?}; proof: {:?}; health: {:?}",
+                    message.id,
+                    harness.written_ids(),
+                    harness.proven(&message.id),
+                    harness.health()
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -96,6 +101,17 @@ fn eventually(harness: &OpenCodeHarness, what: &str, done: impl Fn(&OpenCodeHarn
 fn accepted() -> DeliverOutcome {
     DeliverOutcome::Accepted {
         turn_finished: false,
+    }
+}
+
+/// Preserve the scripted service trace before teardown removes its directory.
+struct LogOnFailure<'a>(&'a TempDir);
+
+impl Drop for LogOnFailure<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("scripted OpenCode trace:\n{}", log_of(self.0));
+        }
     }
 }
 
@@ -1060,6 +1076,7 @@ fn a_same_ms_replay_already_consumed_is_accepted() {
 fn a_mid_turn_sse_reconnect_keeps_queued_steers_in_flight() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "reconnect-midturn");
+    let _trace = LogOnFailure(&dir);
     assert_eq!(settle(&mut harness, &msg("m1")).unwrap(), accepted());
     assert_eq!(harness.deliver(&msg("m2")), Ok(DeliverOutcome::InFlight));
     eventually(&harness, "m2 probed across SSE reconnect", |h| {

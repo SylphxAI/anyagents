@@ -424,7 +424,7 @@ fn helper() -> std::io::Result<(PathBuf, Vec<OsString>)> {
         std::env::current_exe()?,
         [
             "--exact",
-            "browser::jail::tests::browser_jail_worker",
+            "workstation::jail::tests::browser_jail_worker",
             "--nocapture",
             "--",
             "browser-jail",

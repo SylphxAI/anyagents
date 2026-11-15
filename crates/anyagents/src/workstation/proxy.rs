@@ -1,56 +1,86 @@
-//! Proxy selection is scoped to a browser process, never to the local CDP client.
+//! Proxy selection belongs to the browser process, not its local control client.
 
-use super::BrowserRuntimeState;
-use anyagents_core::Error;
+use super::ToolError;
+type Result<T> = std::result::Result<T, ToolError>;
 
-pub(super) fn environment_default() -> Result<Option<String>, Error> {
-    match std::env::var("ANYAGENTS_BROWSER_PROXY") {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(_) => Err(Error::Message(
-            "ANYAGENTS_BROWSER_PROXY must be valid Unicode".into(),
-        )),
-    }
+fn invalid_proxy() -> ToolError {
+    // Neither URL parser nor engine diagnostics may echo credential material.
+    ToolError::invalid(
+        "invalid browser proxy: expected a valid proxy endpoint without whitespace, paths, queries, fragments, or proxy maps",
+    )
 }
 
 pub(super) fn resolve(
     requested: Option<&str>,
-    running: Option<&BrowserRuntimeState>,
-    default: impl FnOnce() -> Result<Option<String>, Error>,
-) -> Result<Option<String>, Error> {
+    running: Option<Option<&str>>,
+    default: impl FnOnce() -> Result<Option<String>>,
+) -> Result<Option<String>> {
     let selected = if let Some(value) = requested {
         Some(value.to_string())
-    } else if let Some(state) = running {
-        state.proxy.clone()
+    } else if let Some(value) = running {
+        value.map(str::to_string)
     } else {
         default()?
     };
-    if let Some(value) = selected.as_deref() {
-        validate(value)?;
-    }
+    configure(selected.as_deref())?;
     Ok(selected)
+}
+
+/// Credentialed proxies use the engine's authentication transport. Everything
+/// else retains Chromium's endpoint syntax, including explicit direct fallback.
+pub(super) fn configure(
+    value: Option<&str>,
+) -> Result<(Option<agent_workstation::Proxy>, Option<String>)> {
+    let Some(value) = value else {
+        return Ok((None, None));
+    };
+    if !value.contains('@') {
+        validate(value)?;
+        return Ok((None, launch_argument(Some(value))));
+    }
+    let (scheme, authority) = value.split_once("://").ok_or_else(invalid_proxy)?;
+    if !matches!(scheme, "http" | "socks5")
+        || !value.is_ascii()
+        || value.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(invalid_proxy());
+    }
+    let (userinfo, endpoint) = authority.split_once('@').ok_or_else(invalid_proxy)?;
+    if userinfo.is_empty()
+        || userinfo.contains(['@', '/', '\\', '?', '#', ';', ',', '=', '\'', '"'])
+        || endpoint.contains('@')
+    {
+        return Err(invalid_proxy());
+    }
+    // Validate the raw host/port before URL normalization can discard syntax.
+    validate_endpoint(&format!("{scheme}://{endpoint}"))?;
+    let url = url::Url::parse(value).map_err(|_| invalid_proxy())?;
+    if url.username().is_empty()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid_proxy());
+    }
+    let proxy = agent_workstation::Proxy::parse(value).map_err(|_| invalid_proxy())?;
+    Ok((Some(proxy), None))
 }
 
 /// The one fallback Chromium's proxy list may end with: connect directly when
 /// every proxy before it is unreachable.
 const DIRECT_FALLBACK: &str = ",direct://";
 
-fn validate(value: &str) -> Result<(), Error> {
-    // Never echo the input: accidentally supplied userinfo may contain secrets.
-    let invalid = || {
-        Error::Message(
-        "invalid browser proxy: expected an HTTP/HTTPS/SOCKS4/SOCKS5 host with optional port and an optional `,direct://` fallback, without credentials, whitespace, paths, or proxy maps; use an empty string for direct access".into(),
-    )
-    };
+fn validate(value: &str) -> Result<()> {
     if value.is_empty() {
         return Ok(());
     }
-    let value = match value.strip_suffix(DIRECT_FALLBACK) {
-        Some("") => return Err(invalid()),
-        Some(endpoint) => endpoint,
-        None => value,
-    };
-    if !value.is_ascii()
+    validate_endpoint(value.strip_suffix(DIRECT_FALLBACK).unwrap_or(value))
+}
+
+fn validate_endpoint(value: &str) -> Result<()> {
+    let invalid = invalid_proxy;
+    if value.is_empty()
+        || !value.is_ascii()
         || value.chars().any(|c| c.is_whitespace() || c.is_control())
         || value.contains(['@', '/', '\\', '?', '#', ';', ',', '=', '\'', '"'])
             && !value.contains("://")
@@ -130,6 +160,20 @@ mod tests {
         ] {
             validate(value).unwrap();
         }
+        assert!(configure(None).unwrap().0.is_none());
+        assert_eq!(configure(None).unwrap().1, None);
+        assert_eq!(
+            configure(Some("")).unwrap().1.as_deref(),
+            Some("--no-proxy-server")
+        );
+        for value in [
+            "http://user:secret@proxy.example.test:8080",
+            "socks5://user:secret@[::1]:1080",
+        ] {
+            let (transport, argument) = configure(Some(value)).unwrap();
+            assert!(transport.is_some());
+            assert!(argument.is_none());
+        }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let value = format!("socks5://{}", listener.local_addr().unwrap());
         validate(&value).unwrap();
@@ -151,13 +195,21 @@ mod tests {
     #[test]
     fn proxy_rejects_malformed_input_without_echoing_credentials() {
         for value in [
+            "http://private:secret@extra@proxy.example.test",
+            "https://private:secret@proxy.example.test",
+            "socks4://private:secret@proxy.example.test",
+            "http://private:secret@proxy.example.test/",
+            "http://private:secret@proxy.example.test?query",
+            "http://private:secret@proxy.example.test#fragment",
+            "http://private:secret@proxy.example.test:65536",
+            "http://private:secret@proxy.example.test,direct://",
             " ",
             " http://proxy.example.test",
             "proxy.example.test\n",
             "proxy.example.test\0",
             "proxy.example.test\u{2003}",
             "--no-sandbox",
-            "http://user:private@proxy.example.test",
+            "http://user:private@proxy.example.test/path",
             "socks5://proxy.example.test/path",
             "http://proxy.example.test?query",
             "proxy.example.test#fragment",
@@ -187,11 +239,13 @@ mod tests {
             "http://user:private@proxy.example.test,direct://",
             "--no-sandbox,direct://",
         ] {
-            let error = match validate(value) {
-                Err(error) => error.to_string(),
-                Ok(()) => panic!("malformed proxy accepted: {value:?}"),
+            let error = match configure(Some(value)) {
+                Err(error) => error.message,
+                Ok(_) => panic!("malformed proxy accepted"),
             };
             assert!(!error.contains("private"));
+            assert!(!error.contains("secret"));
+            assert_eq!(error, invalid_proxy().message);
         }
     }
 
@@ -200,44 +254,43 @@ mod tests {
         let default = || Ok(Some("socks5://default.example.test".into()));
         assert_eq!(resolve(None, None, default).unwrap(), default().unwrap());
         assert_eq!(resolve(Some(""), None, default).unwrap(), Some("".into()));
-        let mut running: BrowserRuntimeState = serde_json::from_value(serde_json::json!({
-            "profile":"test", "pid":0, "cdp_port":0, "headless":true,
-            "display_mode":"test", "started_at_ms":0, "last_used_at_ms":0
-        }))
-        .unwrap();
-        assert_eq!(running.proxy, None); // older runtime metadata remains readable
         assert_eq!(
-            resolve(None, Some(&running), || panic!("must not read environment")).unwrap(),
+            resolve(None, Some(None), || panic!("must not read environment")).unwrap(),
             None
         );
-        running.proxy = Some("http://running.example.test".into());
+        let running = Some("http://running.example.test");
         assert_eq!(
-            resolve(None, Some(&running), default).unwrap(),
-            running.proxy
+            resolve(None, Some(running), default).unwrap(),
+            running.map(str::to_string)
         );
         assert_eq!(
-            resolve(Some(""), Some(&running), default).unwrap(),
+            resolve(Some(""), Some(running), || panic!(
+                "must not read environment"
+            ))
+            .unwrap(),
             Some("".into())
         );
         assert!(resolve(None, None, || Ok(Some("bad input".into()))).is_err());
-        assert!(
-            resolve(None, None, || Err(Error::Message(
-                "unreadable default".into()
-            )))
-            .is_err()
-        );
+        assert!(resolve(None, None, || Err(ToolError::invalid("unreadable default"))).is_err());
     }
 
     /// Real Chromium honors the fallback: with the proxy port closed, a page
     /// still loads directly instead of failing.
     #[test]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "needs a Chromium the toolchain resolves"
-    )]
+    #[cfg(target_os = "linux")]
     fn direct_fallback_reaches_the_page_when_the_proxy_is_down() {
-        let Some(chromium) = super::super::tests::fixture_chromium() else {
-            return;
+        use std::io::{Read, Write};
+        let chromium = match super::super::session::tool("chromium", "browser") {
+            Ok(path) => path,
+            Err(error) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "Chromium fixture missing in CI: {}",
+                    error.message
+                );
+                eprintln!("skipping direct fallback fixture: {}", error.message);
+                return;
+            }
         };
         let closed = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -245,8 +298,22 @@ mod tests {
             .unwrap();
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = server.local_addr().unwrap();
-        super::super::tests::serve_pages(server, |_| {
-            "<html><body>reached-directly</body></html>".to_string()
+        std::thread::spawn(move || {
+            for mut stream in server.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                    let mut buf = [0u8; 4096];
+                    if stream.read(&mut buf).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let body = "<html><body>reached-directly</body></html>";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
         });
         let proxy = format!("socks5://{closed},direct://");
         validate(&proxy).unwrap();
