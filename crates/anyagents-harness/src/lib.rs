@@ -937,6 +937,12 @@ pub enum HarnessError {
     Failed(String),
 }
 
+/// The longest an adapter's `stop` takes to end its process, its own grace
+/// and the TERM grace after it included. A host that waits for a stopped
+/// agent's process to be gone (to delete, archive or pause it) waits this
+/// long.
+pub const STOP_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Calls every harness adapter implements. The last calls have defaults so a
 /// scripted fake can stay a delivery double without a process.
 pub trait Harness: Send {

@@ -139,6 +139,34 @@ impl VendorHarness {
             pointer,
             selector,
         } = planned;
+        if matches!(launch, AdapterLaunch::Spiron { .. }) {
+            // An agent never has two Spiron processes: one a launch record
+            // still names (left by a server that died) ends first.
+            crate::spiron_native::end_recorded(&request.data_dir, request.agent.id.as_str());
+            // Where processes outlive this server, a v2 Spiron is its own
+            // process and needs no keeper (ADR 0011 D9).
+            if matches!(host, HarnessHost::Keeper(_)) {
+                let mut labels = std::collections::BTreeMap::new();
+                labels.insert(LABEL_SELECTOR.to_string(), selector.clone());
+                if let Some(pointer) = &pointer {
+                    labels.insert(LABEL_POINTER.to_string(), pointer.display().to_string());
+                }
+                let at = crate::spiron_native::Launching {
+                    data: &request.data_dir,
+                    agent: request.agent.id.as_str(),
+                    harness: &request.agent.harness,
+                    model: request.agent.model.as_deref(),
+                    labels,
+                };
+                if let Some(started) = launch.start_listening(at) {
+                    return Ok(Self {
+                        host: Host::Local(started?),
+                        pointer: pointer.map(SessionPointer::from),
+                        selector,
+                    });
+                }
+            }
+        }
         let host = match host {
             HarnessHost::InProcess => Host::Local(launch.start()?),
             HarnessHost::Keeper(program) => {
@@ -213,6 +241,25 @@ impl VendorHarness {
         }
     }
 
+    /// A v2 Spiron an earlier server left, attached again: the pointer and
+    /// session record follow the labels its launch recorded.
+    pub(crate) fn native(
+        harness: SpironHarness,
+        labels: &std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            host: Host::Local(LocalAdapter::Spiron(Box::new(harness))),
+            pointer: labels
+                .get(LABEL_POINTER)
+                .map(PathBuf::from)
+                .map(SessionPointer::from),
+            selector: labels
+                .get(LABEL_SELECTOR)
+                .cloned()
+                .unwrap_or_else(|| "spiron".to_string()),
+        }
+    }
+
     fn adapter(&self) -> &dyn Hosted {
         match &self.host {
             Host::Local(adapter) => adapter,
@@ -236,8 +283,11 @@ impl VendorHarness {
     /// Leave a kept harness running for the next kernel. One hosted here
     /// ends with this process anyway.
     pub(crate) fn detach(self) {
-        if let Host::Kept(remote) = self.host {
-            (*remote).detach();
+        match self.host {
+            Host::Kept(remote) => (*remote).detach(),
+            // A v2 Spiron is its own process: only the connection closes.
+            Host::Local(LocalAdapter::Spiron(harness)) if harness.listening() => harness.detach(),
+            Host::Local(_) => {}
         }
     }
 
@@ -257,10 +307,20 @@ impl VendorHarness {
 
     /// Keep `note` with a kept harness for the next kernel.
     pub(crate) fn set_note(&self, note: &str) {
-        if let Host::Kept(remote) = &self.host
-            && let Err(error) = remote.set_note(note)
-        {
-            eprintln!("anyagents-keeper: cannot keep the process note: {error}");
+        match &self.host {
+            Host::Kept(remote) => {
+                if let Err(error) = remote.set_note(note) {
+                    eprintln!("anyagents-keeper: cannot keep the process note: {error}");
+                }
+            }
+            Host::Local(LocalAdapter::Spiron(harness)) => {
+                if let Some(record) = harness.record()
+                    && let Err(error) = crate::spiron_native::set_note(record, note)
+                {
+                    eprintln!("anyagents-spiron: cannot keep the process note: {error}");
+                }
+            }
+            Host::Local(_) => {}
         }
     }
 
@@ -450,6 +510,53 @@ impl AdapterLaunch {
             | Self::Spiron { env, .. }
             | Self::OpenCode { env, .. }
             | Self::Codex { env, .. } => env,
+        }
+    }
+
+    /// Launch a Spiron that speaks `spiron.headless/v2` as a process of its
+    /// own that outlives this server (`spiron_native`). `None` when this is
+    /// no Spiron launch, or the binary speaks v1 only: it then starts as
+    /// before.
+    fn start_listening(
+        &self,
+        at: crate::spiron_native::Launching<'_>,
+    ) -> Option<Result<LocalAdapter, String>> {
+        let Self::Spiron {
+            program,
+            config_dir,
+            work_dir,
+            agent_id,
+            agent_name,
+            model,
+            session,
+            env,
+        } = self
+        else {
+            return None;
+        };
+        // A binary whose help does not name `--listen` speaks v1 only.
+        if !anyagents_harness_spiron::listens(program) {
+            return None;
+        }
+        let (launch, applied) = match spiron_launch(
+            program,
+            config_dir,
+            work_dir,
+            SpironAgent {
+                id: agent_id,
+                name: agent_name,
+                model: model.as_deref(),
+            },
+            session.as_deref(),
+            env,
+        ) {
+            Ok(launch) => launch,
+            Err(error) => return Some(Err(error)),
+        };
+        match crate::spiron_native::launch(launch, applied, at, SPIRON_READY_WAIT) {
+            Ok(harness) => Some(Ok(LocalAdapter::Spiron(Box::new(harness)))),
+            Err(anyagents_harness_spiron::ListenError::NotV2) => None,
+            Err(anyagents_harness_spiron::ListenError::Failed(error)) => Some(Err(error)),
         }
     }
 
@@ -2182,6 +2289,24 @@ fn start_spiron(
     session: Option<&str>,
     env: &[(String, String)],
 ) -> Result<SpironHarness, String> {
+    let (launch, applied) = spiron_launch(program, config_dir, work_dir, agent, session, env)?;
+    // Its `ready` says whether every input may be steered at once; nothing
+    // is offered before it, so mail starts on the right rules.
+    let harness = SpironHarness::start(launch, SPIRON_READY_WAIT).map_err(|err| err.to_string())?;
+    harness.recognise_applied(applied);
+    Ok(harness)
+}
+
+/// How one Spiron process starts, and the inputs a legacy hold shows its
+/// session already applied.
+fn spiron_launch(
+    program: &Path,
+    config_dir: &Path,
+    work_dir: &Path,
+    agent: SpironAgent<'_>,
+    session: Option<&str>,
+    env: &[(String, String)],
+) -> Result<(SpironLaunch, Vec<String>), String> {
     let mcp_config = config_dir.join("spiron-mcp.json");
     let skills = config_dir.join(".agents/skills");
     let mut args = vec![
@@ -2225,9 +2350,7 @@ fn start_spiron(
         ("SPIRON_SKILLS".to_string(), skills.display().to_string()),
     ]);
     let applied = settle_legacy_spiron_hold(config_dir)?;
-    // Its `ready` says whether every input may be steered at once; nothing
-    // is offered before it, so mail starts on the right rules.
-    let harness = SpironHarness::start(
+    Ok((
         SpironLaunch {
             program: program.to_path_buf(),
             args,
@@ -2236,11 +2359,8 @@ fn start_spiron(
             session: session.map(str::to_string),
             state_dir: config_dir.to_path_buf(),
         },
-        SPIRON_READY_WAIT,
-    )
-    .map_err(|err| err.to_string())?;
-    harness.recognise_applied(applied);
-    Ok(harness)
+        applied,
+    ))
 }
 
 /// How long a Spiron process may take to announce itself before its launch

@@ -1094,3 +1094,318 @@ fn a_spiron_adapter_in_its_keeper_never_writes_a_line_twice_across_a_restart() {
     );
     drop(server);
 }
+
+/// Local Spiron with no keeper (ADR 0011 D9), against the real binary
+/// (`SPIRON_BIN`, a Spiron with `spiron.headless/v2`): the process runs on its
+/// own behind its socket, survives a server crash in the middle of a turn
+/// with a steer in it, and the next server reattaches from the launch record
+/// and commits both messages once the turn ends; Spiron's frame journal shows
+/// each consumed exactly once. `keepers stop` then ends it. Without
+/// `SPIRON_BIN` the test says so and passes, unless `ANYAGENTS_REQUIRE_SPIRON=1`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_v2_spiron_needs_no_keeper_and_is_reattached_after_a_server_crash() {
+    let Some(real) = std::env::var_os("SPIRON_BIN") else {
+        assert!(
+            std::env::var("ANYAGENTS_REQUIRE_SPIRON").as_deref() != Ok("1"),
+            "ANYAGENTS_REQUIRE_SPIRON=1 needs SPIRON_BIN"
+        );
+        eprintln!("SPIRON_BIN is not set: the real-Spiron server test is not run");
+        return;
+    };
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let name = "native";
+    let out = bin()
+        .env("PATH", machine_path(&data))
+        .arg("--data")
+        .arg(&data)
+        .args(["agents", "create", name, "--harness", "spiron"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .split('\t')
+        .next()
+        .unwrap()
+        .to_string();
+    let config = data.join("agents").join(&id).join("config");
+    // The model runs `sleep` (the window to steer and to crash in), then answers.
+    let fixture = dir.path().join("fixture.sse");
+    std::fs::write(
+        &fixture,
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_sleep\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"sleep 12\\\"}\"}}]}}]}\n",
+            "data: [DONE]\n---\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2,\"cost\":0.000078}}\n",
+            "data: [DONE]\n",
+        ),
+    )
+    .unwrap();
+    let real = real.to_str().unwrap().to_string();
+    let fixture = fixture.to_str().unwrap().to_string();
+    let spiron_env = [
+        ("ANYAGENTS_SPIRON_BIN", real.as_str()),
+        ("SPIRON_GATEWAY_FIXTURE", fixture.as_str()),
+    ];
+    let frames = |kind: &str| -> Vec<Value> {
+        let Ok(db) = rusqlite::Connection::open_with_flags(
+            config.join("sessions.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) else {
+            return Vec::new();
+        };
+        let Ok(mut query) = db.prepare("SELECT frame FROM headless_frames ORDER BY seq") else {
+            return Vec::new();
+        };
+        query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map(|rows| {
+                rows.flatten()
+                    .filter_map(|frame| serde_json::from_str::<Value>(&frame).ok())
+                    .filter(|frame| frame["type"] == kind)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let record = data.join("detached").join(format!("{id}.json"));
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
+    let first = send(&data, name);
+    support::wait_for(
+        || {
+            frames("accepted")
+                .iter()
+                .any(|f| f["request_id"] == first.as_str())
+        },
+        "the first message did not open a turn",
+    );
+    // Steered while `sleep` runs, so it is consumed at the next step.
+    support::wait_for(
+        || !frames("tool_call").is_empty(),
+        "the turn did not reach its tool",
+    );
+    let second = send(&data, name);
+    support::wait_for(
+        || {
+            frames("steer_ack")
+                .iter()
+                .any(|f| f["request_id"] == second.as_str())
+        },
+        "the second message was not steered into the turn",
+    );
+    assert!(no_keeper(&data, &id), "a v2 Spiron runs without a keeper");
+    let launched: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    let pid = launched["process"]["pid"].as_u64().unwrap() as u32;
+
+    // The server dies mid-turn; Spiron and its turn go on.
+    server.crash();
+    assert!(alive(pid), "spiron died with the server");
+    // A clean stop leaves it running too.
+    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
+    server.terminate();
+    assert!(alive(pid), "a clean server stop ended spiron");
+    assert!(record.exists());
+    // The next server reattaches and commits both messages once consumed.
+    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
+    let store = Store::open(data.join("state.db")).unwrap();
+    let agent = anyagents_core::AgentId::parse(&id).unwrap();
+    let last = store.inbox(&agent, None).unwrap().last().unwrap().seq;
+    support::wait_for(
+        || store.delivered_cursor(&agent).unwrap() >= last,
+        "the consumed messages were not committed after the restart",
+    );
+    support::wait_for(|| !frames("result").is_empty(), "the turn did not end");
+    let again: Value =
+        serde_json::from_slice(&std::fs::read(&record).unwrap_or_default()).unwrap_or(Value::Null);
+    assert!(
+        again.is_null() || again["process"] == launched["process"],
+        "the process was restarted"
+    );
+    assert!(no_keeper(&data, &id));
+    // Each input consumed exactly once, never re-sent as new input.
+    let consumed: Vec<String> = frames("accepted")
+        .iter()
+        .filter(|f| f["mode"] == "turn")
+        .filter_map(|f| f["request_id"].as_str().map(str::to_string))
+        .chain(
+            frames("steer_consumed")
+                .iter()
+                .filter(|f| f["duplicate"] == false)
+                .filter_map(|f| f["steer_request_id"].as_str().map(str::to_string)),
+        )
+        .collect();
+    assert_eq!(consumed, [first.clone(), second.clone()]);
+    let results = frames("result");
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0]["duplicate"], false);
+    assert_eq!(results[0]["cost_micros"], 78);
+    // The agent goes idle: its process ends with its launch record.
+    support::wait_for(
+        || !alive(pid) && !record.exists(),
+        "an idle agent's spiron was not stopped",
+    );
+    drop(server);
+}
+
+/// A rollback to a server without v2 Spiron, then a roll forward, with
+/// nothing stopped in between (a guardian that skipped `keepers stop`, or a
+/// crash in the middle of a switch from a kept harness). The old server
+/// starts a v1 Spiron in a keeper beside the running v2 one; the keeper
+/// holds the agent's lock. Rolled forward, the server takes the lock from
+/// the keeper, retires it (its proofs committed) and goes on with the v2
+/// process: every message is committed and one Spiron is left. Needs
+/// `SPIRON_BIN` (v2) and `OLD_ANYAGENTS_BIN` (a server with keepers and no v2
+/// Spiron, such as the current release); without them it says so.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_roll_forward_after_a_rollback_retires_the_keeper_and_keeps_one_spiron() {
+    let (Some(real), Some(old)) = (
+        std::env::var_os("SPIRON_BIN"),
+        std::env::var_os("OLD_ANYAGENTS_BIN"),
+    ) else {
+        eprintln!("SPIRON_BIN and OLD_ANYAGENTS_BIN are not set: the rollback test is not run");
+        return;
+    };
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_for_contract(&data);
+    create_asker(&data);
+    let name = "native";
+    let out = bin()
+        .env("PATH", machine_path(&data))
+        .arg("--data")
+        .arg(&data)
+        .args(["agents", "create", name, "--harness", "spiron"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .split('\t')
+        .next()
+        .unwrap()
+        .to_string();
+    let config = data.join("agents").join(&id).join("config");
+    let fixture = dir.path().join("fixture.sse");
+    std::fs::write(
+        &fixture,
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_sleep\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"sleep 15\\\"}\"}}]}}]}\n",
+            "data: [DONE]\n---\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n",
+            "data: [DONE]\n---\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done2\"}}]}\n",
+            "data: [DONE]\n---\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done3\"}}]}\n",
+            "data: [DONE]\n",
+        ),
+    )
+    .unwrap();
+    let real = real.to_str().unwrap().to_string();
+    let fixture = fixture.to_str().unwrap().to_string();
+    let spiron_env = [
+        ("ANYAGENTS_SPIRON_BIN", real.as_str()),
+        ("SPIRON_GATEWAY_FIXTURE", fixture.as_str()),
+    ];
+    let spirons = || -> Vec<u32> {
+        let needle = config.to_str().unwrap().to_string();
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
+                cmd.contains("--headless") && cmd.contains(&needle) && !cmd.contains(" mcp ")
+            })
+            .collect()
+    };
+    let store = Store::open(data.join("state.db")).unwrap();
+    let agent = anyagents_core::AgentId::parse(&id).unwrap();
+    // Two Spiron processes share one session here, so a turn may wait for
+    // the other's session lease: longer than the usual wait.
+    let committed = |why: &str| {
+        let last = store.inbox(&agent, None).unwrap().last().unwrap().seq;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while store.delivered_cursor(&agent).unwrap() < last {
+            assert!(Instant::now() < deadline, "{why}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let record = data.join("detached").join(format!("{id}.json"));
+    let anyagents = Path::new(env!("CARGO_BIN_EXE_anyagents"));
+
+    // The new server runs a v2 Spiron, mid-turn when it stops.
+    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
+    send(&data, name);
+    support::wait_for(|| record.exists() && !spirons().is_empty(), "no v2 spiron");
+    committed("the first message was not committed");
+    let launched: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    let pid = launched["process"]["pid"].as_u64().unwrap() as u32;
+    server.terminate();
+    assert!(alive(pid));
+
+    // Rolled back with nothing stopped: the old server keeps its harness in
+    // a keeper, a second Spiron on the session.
+    let old = Path::new(&old);
+    let server = Server::start_with(&data, old, old, &spiron_env);
+    send(&data, name);
+    support::wait_for(|| !no_keeper(&data, &id), "the old server kept no harness");
+    support::wait_for(
+        || spirons().len() == 2,
+        "the old server started no second spiron",
+    );
+    server.terminate();
+    assert!(alive(pid), "the v2 spiron died with the rollback");
+    assert!(!no_keeper(&data, &id));
+
+    // Rolled forward: the keeper is retired, the v2 process goes on.
+    let server = Server::start_with(&data, anyagents, anyagents, &spiron_env);
+    send(&data, name);
+    committed("the messages were not committed after the roll forward");
+    support::wait_for(|| no_keeper(&data, &id), "the keeper was not retired");
+    // The v2 process served on (an idle agent's process may since have
+    // ended, with its record): never a new one beside or after it.
+    let left = spirons();
+    assert!(
+        left.iter().all(|other| *other == pid),
+        "spirons {left:?}, v2 {pid}"
+    );
+    if let Ok(bytes) = std::fs::read(&record) {
+        let now: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            now["process"], launched["process"],
+            "the v2 spiron was replaced"
+        );
+    }
+    assert!(
+        !shared_log(&data).contains("is busy"),
+        "{}",
+        shared_log(&data)
+    );
+    drop(server);
+    support::stop_keepers(&data);
+}

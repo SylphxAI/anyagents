@@ -18,7 +18,7 @@ tempfile = "3"
 # test target as unused in that target. Only a workspace member that is built as
 # a linker root (like `anyagents`) is checked; an empty list keeps the ignore
 # from matching every crate.
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [package.metadata.cargo-machete]

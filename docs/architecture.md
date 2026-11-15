@@ -398,7 +398,7 @@ require an authenticated server rather than an offline database fallback.
 
 After each turn the adapter reads the usage the vendor tool reports and the server writes one usage record: agent, harness, model, input, output, cache-read and cache-write tokens, the cost the vendor reported (if it reports one), the billing mode (subscription or API key), and any quota state the vendor reported. The record also has an estimated list-price cost field, which stays empty: there is no price table. The `usage` API aggregates by agent, harness, model and day.
 
-Claude Code and Muse report a cost with each turn; Spiron and AGY report tokens only. A cost on a `subscription` record is the vendor's figure for the turn, never money spent.
+Claude Code, Muse and Spiron (`result.cost_micros`, from the gateway) report a cost with each turn; AGY reports tokens only. A cost on a `subscription` record is the vendor's figure for the turn, never money spent.
 
 ## Outcomes
 

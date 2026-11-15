@@ -200,7 +200,12 @@
         "reported_window_tokens": { "type": "integer", "minimum": 1 },
         "output_reserve_tokens": { "type": "integer", "minimum": 0 },
         "request_limit_bytes": { "type": "integer", "minimum": 1 },
-        "compaction_threshold_bytes": { "type": "integer", "minimum": 0 }
+        "compaction_threshold_bytes": {
+          "description": "null under the window policy: it compacts only to fit.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "policy": { "enum": ["fixed", "window"] }
       }
     },
     "accepted": {
@@ -260,6 +265,7 @@
             "unsupported_protocol",
             "already_attached",
             "turn_open",
+            "session_in_use",
             "stopping"
           ]
         },
@@ -288,10 +294,19 @@
     },
     "host_tool_call": {
       "type": "object",
-      "required": ["type", "call_id", "name", "input"],
+      "required": ["type", "call_id", "tool_call_id", "name", "input"],
       "properties": {
         "type": { "const": "host_tool_call" },
-        "call_id": { "type": "string", "minLength": 1 },
+        "call_id": {
+          "description": "This invocation's own id, which host_tool_result names.",
+          "type": "string",
+          "minLength": 1
+        },
+        "tool_call_id": {
+          "description": "The model's tool call id: the journal's tool_call and tool_result name it.",
+          "type": "string",
+          "minLength": 1
+        },
         "name": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
         "input": {}
       }

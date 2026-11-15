@@ -1413,3 +1413,14 @@ fn an_authenticated_agent_cli_mutation_waits_for_a_restarting_server() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// The release guardian tells a binary with detached harnesses (v2 Spiron)
+/// from one without by what `keepers --help` says
+/// (`desk-anyagents-release.py`, `DETACHED_MARK`): a rollback away from them
+/// must end their processes first (ADR 0007, rollback).
+#[test]
+fn keepers_help_names_detached_harnesses_for_the_release_guardian() {
+    let out = bin().args(["keepers", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("detached harness processes"));
+}
