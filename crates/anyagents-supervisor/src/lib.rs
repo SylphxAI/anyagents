@@ -1808,16 +1808,10 @@ impl<H: Harness + 'static> Session<H> {
                     self.sleep(Some(retry_at));
                     return false;
                 }
-                // A turn that just ended in an error is followed up at once,
-                // unless a transient fault is first retried in a new process
-                // (`recoverable_mid_turn_fault`, below); the turn stays open
-                // for that, and is counted all the same.
-                if let Some(follow) = &self.errored_turn {
-                    if is_transient_turn_fault(&follow.error) && self.consecutive_turn_errors < 3 {
-                        self.errored_turn = None;
-                    } else {
-                        return false;
-                    }
+                // A terminal error already recorded by the harness uses its
+                // durable follow-up, including its systemic backoff.
+                if self.errored_turn.is_some() {
+                    return false;
                 }
                 if self.try_apply_pending_switch(&health) {
                     return false;
