@@ -8,15 +8,30 @@
 //! it as a turn; a busy one appends it to its `pending_inputs` queue and
 //! promotes it into the running turn at the next safe gap.
 //!
-//! Delivery is `mid-turn` (`docs/delivery.md`). A message is accepted once
-//! Grok shows it admitted: its marker line in an `x.ai/queue/changed` report
-//! (the running prompt or a pending entry), in a `user_message_chunk` or an
-//! `x.ai/session/interjection`, or the answer to its request. Grok names none
-//! of these by an id AnyAgents sends, so the marker line is the link, and it
-//! deduplicates nothing, so nothing is ever written to Grok twice.
+//! Delivery is `next-step` (`docs/delivery.md`). Grok shows a prompt in two
+//! stages, and the adapter tells them apart:
 //!
-//! An error answer to a prompt Grok already showed admitted ends that turn:
-//! the message was taken. An error answer before Grok showed it admitted is
+//! - admitted: its marker line in a pending entry of an `x.ai/queue/changed`
+//!   report. The prompt sits in `pending_inputs`; nothing is committed, and
+//!   the next prompt may be written behind it;
+//! - consumed: its marker line in the running turn's input, which Grok shows
+//!   as the report's `runningText` (a prompt that opened the turn) or
+//!   `runningCombinedTexts` (one the turn's next step promoted into it), as a
+//!   `user_message_chunk` (the interjection the model is given) or an
+//!   `x.ai/session/interjection`, or the answer to its request (the turn that
+//!   held it ended). This is the proof the message is committed on.
+//!
+//! Grok names none of these by an id AnyAgents sends, so the marker line is
+//! the link. A prompt Grok admitted and its turn never consumed (the process
+//! died first) is offered again to the next process: Grok keeps
+//! `pending_inputs` in the process, and a turn that ends with input pending
+//! runs it as the next turn rather than dropping it. Grok deduplicates
+//! nothing, so the adapter is not idempotent, and nothing is ever written to
+//! one Grok process twice.
+//!
+//! An error answer to a prompt Grok already showed admitted ends the turn it
+//! was queued on or running in: the message was taken. An error answer before
+//! Grok showed it admitted is
 //! parked as rejected and its sender told; it is never written again. For a
 //! request the JSON-RPC layer could not take (`-32700`, `-32600`, `-32601`,
 //! `-32602`) that is certain: Grok never ran it, and it would refuse the same
@@ -55,10 +70,11 @@ fn rpc_wait() -> Duration {
 /// What this adapter guarantees for mail that reaches a busy agent
 /// (`docs/delivery.md`).
 pub const DELIVERY: Delivery = Delivery {
-    level: DeliveryLevel::MidTurn,
+    level: DeliveryLevel::NextStep,
     idempotent: false,
     proof: std::borrow::Cow::Borrowed(
-        "marker in x.ai/queue/changed or user_message_chunk; session/prompt answer",
+        "marker in the running turn's input (x.ai/queue/changed running texts, \
+         user_message_chunk); session/prompt answer",
     ),
     peer: None,
 };
@@ -106,15 +122,17 @@ struct Prompt {
     request: Option<i64>,
     /// Grok showed it queued or in its turn.
     admitted: bool,
+    /// Grok showed it in the running turn's input: its turn consumed it.
+    consumed: bool,
     /// Grok answered its request after admitting it: the turn that took it
     /// ended, with a result or an error.
     answered: bool,
 }
 
 impl Prompt {
-    /// What Grok proved about it, or `None` while Grok has shown nothing.
+    /// What Grok proved about it: `None` until its turn consumed it.
     fn proof(&self) -> Option<Proof> {
-        (self.admitted || self.answered).then_some(Proof::Taken {
+        (self.consumed || self.answered).then_some(Proof::Taken {
             turn_finished: self.answered,
         })
     }
@@ -289,6 +307,7 @@ impl Harness for GrokHarness {
                 Prompt {
                     request: None,
                     admitted: false,
+                    consumed: false,
                     answered: false,
                 },
             );
@@ -578,7 +597,25 @@ fn on_notification(state: &mut State, value: &Value) -> NotificationEffect {
                 }
             }
         }
-        "x.ai/queue/changed" | "x.ai/session/interjection" => admit_named(state, params),
+        "x.ai/queue/changed" => {
+            // Every entry, running or pending, is admitted; only the running
+            // turn's input is consumed.
+            admit_named(state, &params.to_string(), false);
+            let running: Vec<&str> = params
+                .get("runningText")
+                .into_iter()
+                .chain(
+                    params
+                        .get("runningCombinedTexts")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten(),
+                )
+                .filter_map(Value::as_str)
+                .collect();
+            admit_named(state, &running.join("\n"), true);
+        }
+        "x.ai/session/interjection" => admit_named(state, &params.to_string(), true),
         "session/update" => {
             if params
                 .pointer("/update/sessionUpdate")
@@ -591,7 +628,7 @@ fn on_notification(state: &mut State, value: &Value) -> NotificationEffect {
                     ..NotificationEffect::default()
                 };
             }
-            admit_named(state, params);
+            admit_named(state, &params.to_string(), true);
         }
         _ => {}
     }
@@ -663,24 +700,16 @@ fn rejection(error: &Value) -> String {
     }
 }
 
-/// Grok showed a queue or a turn: every unconfirmed message whose marker line
-/// it carries is admitted.
-fn admit_named(state: &mut State, params: &Value) {
-    if state.unconfirmed.is_empty() {
-        return;
-    }
-    let text = params.to_string();
-    let named: Vec<String> = state
-        .unconfirmed
-        .iter()
-        .filter(|id| names_marker(&text, id))
-        .cloned()
-        .collect();
-    for id in named {
-        state.unconfirmed.remove(&id);
-        if let Some(prompt) = state.prompts.get_mut(&id) {
-            prompt.admitted = true;
+/// Grok showed `text`, a queue or the running turn's input: every message
+/// whose marker line it carries is admitted, and consumed when `consumed`.
+fn admit_named(state: &mut State, text: &str, consumed: bool) {
+    for (id, prompt) in state.prompts.iter_mut() {
+        if (prompt.consumed || (!consumed && prompt.admitted)) || !names_marker(text, id) {
+            continue;
         }
+        prompt.admitted = true;
+        prompt.consumed |= consumed;
+        state.unconfirmed.remove(id);
     }
 }
 
@@ -797,6 +826,7 @@ mod tests {
             Prompt {
                 request: Some(request),
                 admitted: false,
+                consumed: false,
                 answered: false,
             },
         );
@@ -823,25 +853,69 @@ mod tests {
     }
 
     #[test]
-    fn a_queue_report_admits_only_the_prompts_it_names() {
+    fn a_queue_report_admits_pending_entries_and_proves_only_the_running_input() {
         let mut state = State::default();
         written(&mut state, "m1", 1);
         written(&mut state, "m2", 2);
+        written(&mut state, "m3", 3);
+        // m1 runs; m2 waits in `pending_inputs`: admitted, not consumed.
+        on_notification(
+            &mut state,
+            &json!({"method": "x.ai/queue/changed", "params": {
+                "entries": [{"id": "q-2", "text": "anyagents-message:m2\nhello"}],
+                "runningText": "anyagents-message:m1\nhi",
+                "runningCombinedTexts": ["anyagents-message:m1\nhi"]
+            }}),
+        );
+        let taken = Some(Proof::Taken {
+            turn_finished: false,
+        });
+        assert_eq!(state.proven("m1"), taken);
+        assert_eq!(state.proven("m2"), None);
+        assert_eq!(state.proven("m3"), None);
+        assert!(state.prompts["m2"].admitted);
+        assert_eq!(
+            state.unconfirmed.iter().collect::<Vec<_>>(),
+            [&"m3".to_string()]
+        );
+        // The next step promotes m2 into the running turn.
+        on_notification(
+            &mut state,
+            &json!({"method": "x.ai/queue/changed", "params": {
+                "entries": [],
+                "runningText": "anyagents-message:m1\nhi",
+                "runningCombinedTexts": ["anyagents-message:m1\nhi", "anyagents-message:m2\nhello"]
+            }}),
+        );
+        assert_eq!(state.proven("m2"), taken);
+        // So does the interjection the model is given.
+        on_notification(
+            &mut state,
+            &json!({"method": "session/update", "params": {"update": {
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text":
+                    "The user sent a message while you were working:\n<user_query>\nanyagents-message:m3\nyo\n</user_query>"}
+            }}}),
+        );
+        assert_eq!(state.proven("m3"), taken);
+        assert!(state.unconfirmed.is_empty());
+    }
+
+    #[test]
+    fn a_prompt_admitted_and_never_consumed_proves_nothing() {
+        let mut state = State::default();
+        written(&mut state, "m1", 1);
         on_notification(
             &mut state,
             &json!({"method": "x.ai/queue/changed", "params": {
                 "entries": [{"id": "q-1", "text": "anyagents-message:m1\nhello"}],
-                "runningText": null
+                "runningText": null,
+                "runningCombinedTexts": []
             }}),
         );
-        assert_eq!(
-            state.proven("m1"),
-            Some(Proof::Taken {
-                turn_finished: false
-            })
-        );
-        assert_eq!(state.proven("m2"), None);
-        assert_eq!(state.unconfirmed.len(), 1);
+        // Admitted: the next message may be written, this one is not committed.
+        assert!(state.unconfirmed.is_empty());
+        assert_eq!(known_outcome(&state, "m1"), None);
     }
 
     #[test]

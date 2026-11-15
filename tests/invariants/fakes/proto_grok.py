@@ -1,4 +1,4 @@
-"""Grok CLI 1.0.67 `grok agent --no-leader --always-approve stdio`: ACP,
+"""Grok CLI 1.0.67 (still so in 1.0.77) `grok agent --no-leader --always-approve stdio`: ACP,
 JSON-RPC 2.0 over stdio, one object per line, with `[ui] follow_up_behavior =
 "steer"` in its config.
 
@@ -18,6 +18,12 @@ live session, and is marked where it is inferred:
   The text of an entry is the prompt as sent (inferred).
 - A promoted input reaches the model as a `user_message_chunk` whose text
   reads "The user sent a message while you were working:\\n<user_query>...".
+  The same step reports the queue again: the input has left `entries` and is
+  among `runningCombinedTexts` ("queued prompt promoted as a mid-turn
+  interjection", `merged_as_interjection`). Either is the step's proof of
+  consumption; a pending entry is only admission.
+- A process that exits loses `pending_inputs`: the queue lives in the
+  process (inferred; nothing in the binary restores it on `session/load`).
 - A turn ends with `x.ai/session/prompt_complete`, then the `session/prompt`
   answer `{stopReason}`. A prompt merged into a running turn is answered when
   that turn ends (inferred; the binary does not establish when).
