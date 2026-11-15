@@ -2546,7 +2546,7 @@ pub(crate) fn seed_harness_credentials(
         }
     }
     if crate::vendor::is_spiron_harness(&agent.harness) {
-        crate::spiron::ensure_spiron_seat_auth(target_config);
+        crate::spiron::ensure_spiron_seat_auth_for_model(target_config, agent.model.as_deref());
     }
     if let Some(ref bound) = current_bound {
         write_profile_marker(
@@ -5091,6 +5091,9 @@ pub(crate) fn finalize_agent_signin(data: &Path, agent: &Agent) -> Result<(), Er
 /// can run against that upstream provider; otherwise defaults to the native
 /// subscription provider of the agent's harness.
 pub(crate) fn upstream_provider_of(harness: &str, model: Option<&str>) -> String {
+    if let Some(provider) = crate::spiron::coding_plan_provider_for_model(model) {
+        return provider.to_string();
+    }
     if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty())
         && let Some((prefix, _)) = m.split_once('/')
     {
@@ -15398,10 +15401,42 @@ Connection: close
     }
 
     #[test]
+    fn spiron_standalone_seed_uses_model_provider_key() {
+        for (model, provider) in [
+            ("sylphx/kimi-code-plan/k3.1-pro#max", "kimi-code-plan"),
+            ("openrouter/openai/model#xhigh", "openrouter"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path();
+            let store = Store::open(data.join("state.db")).unwrap();
+            let mut spec = NewAgent::new("seed-model", "spiron");
+            spec.model = Some(model.into());
+            let agent = store.create_agent(spec).unwrap();
+            let cfg = agent_config_dir(data, &agent.id);
+            std::fs::create_dir_all(cfg.join(".config/opencode")).unwrap();
+            std::fs::write(
+                cfg.join(".config/opencode").join(format!("{provider}.key")),
+                "provider-test-key",
+            )
+            .unwrap();
+            std::fs::write(cfg.join(".config/opencode/sylphx.key"), "wrong-test-key").unwrap();
+            seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+            for mirror in [".spiron/auth.json", ".config/sylphx/auth.json"] {
+                let auth: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(cfg.join(mirror)).unwrap()).unwrap();
+                assert_eq!(auth["access_token"], "provider-test-key");
+            }
+        }
+    }
+
+    #[test]
     fn spiron_muse_profile_preserves_gateway_auth_and_normalizes_model() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let data = dir.path();
         let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
         let model = "sylphx/openai/gpt-6.1-sol#high";
         let mut spec = NewAgent::new("spiron-profile", "spiron");
         spec.model = Some(model.into());
@@ -15412,8 +15447,14 @@ Connection: close
         std::fs::create_dir_all(&profile).unwrap();
         let selector = br#"{"gateway_base_url":"https://gateway.example/v1"}"#;
         let auth = br#"{"access_token":"test-profile-token"}"#;
-        std::fs::write(profile.join("spiron-agent.json"), selector).unwrap();
+        std::fs::write(profile.join("sylphx-agent.json"), selector).unwrap();
         std::fs::write(profile.join("auth.json"), auth).unwrap();
+        std::fs::write(
+            profile.join("profile.json"),
+            br#"{"compatible_harnesses":["spiron"]}"#,
+        )
+        .unwrap();
+        std::fs::write(profile.join("config.toml"), "model = \"stale/model\"\n").unwrap();
         ensure_profile_compatible_and_mapped(
             data,
             "sylphx",
@@ -15425,22 +15466,38 @@ Connection: close
         .unwrap();
         write_profile_marker(&cfg, ".anyagents-profile", "sylphx/muse-default\n").unwrap();
         seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
-        crate::spiron::write_spiron_config(
-            &cfg,
+        let work = data.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        set_agent_harness(
+            &store,
+            data,
+            "operator",
+            &agent.name,
+            "spiron",
             Some(model),
-            Path::new("/usr/bin/anyagents"),
-            &["mcp".into()],
+            Some("sylphx/muse-default"),
         )
         .unwrap();
+        let agent = store.agent(&agent.id).unwrap();
+        reconcile_agent_runtime_config(&store, data, &agent, &cfg, &work).unwrap();
+        verify_harness_runtime_config(&cfg, "spiron", Some(model)).unwrap();
+        for mirror in [".spiron/auth.json", ".config/sylphx/auth.json"] {
+            let auth: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(cfg.join(mirror)).unwrap()).unwrap();
+            assert_eq!(auth["access_token"], "test-profile-token");
+        }
         assert_eq!(
-            std::fs::read(cfg.join("spiron-agent.json")).unwrap(),
+            std::fs::read(cfg.join("sylphx-agent.json")).unwrap(),
             selector
         );
         let seeded: serde_json::Value =
             serde_json::from_slice(&std::fs::read(cfg.join("auth.json")).unwrap()).unwrap();
         assert_eq!(seeded["access_token"], "test-profile-token");
         let config = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
-        assert!(config.contains("https://gateway.example/v1"), "{config}");
+        assert!(
+            config.contains("sylphx_ai_url = \"https://gateway.example/v1\""),
+            "{config}"
+        );
         assert!(
             config.contains("model = \"openai/gpt-6.1-sol#high\""),
             "{config}"

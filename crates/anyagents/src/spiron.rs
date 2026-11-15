@@ -48,6 +48,7 @@ pub fn write_spiron_config(
 /// retaining the provider model ID and any effort suffix. Use this for both
 /// config.toml and --model so CLI precedence cannot change routing.
 pub fn normalize_model(model: &str) -> &str {
+    let model = model.trim();
     let model = model.strip_prefix("sylphx/").unwrap_or(model);
     [
         "kimi-code-plan/",
@@ -60,8 +61,9 @@ pub fn normalize_model(model: &str) -> &str {
     .unwrap_or(model)
 }
 
-fn coding_plan_provider_for_model(model: Option<&str>) -> Option<&'static str> {
+pub(crate) fn coding_plan_provider_for_model(model: Option<&str>) -> Option<&'static str> {
     let m = model?.trim();
+    let m = m.strip_prefix("sylphx/").unwrap_or(m);
     [
         "kimi-code-plan",
         "glm-code-plan",
@@ -101,7 +103,7 @@ fn write_spiron_config_toml(config_dir: &Path, model: Option<&str>) -> Result<()
                             | "plan_mode"
                             | "compaction_threshold"
                     )
-                    || (k == "model" && model.map(str::trim).is_none_or(str::is_empty))
+                    || (k == "model" && model.map(normalize_model).is_none_or(str::is_empty))
                 {
                     preserved_lines.push(trimmed.to_string());
                 }
@@ -123,8 +125,7 @@ fn write_spiron_config_toml(config_dir: &Path, model: Option<&str>) -> Result<()
     {
         out.push_str(&format!("sylphx_ai_url = {escaped}\n"));
     }
-    if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
-        let normalized = normalize_model(m);
+    if let Some(normalized) = model.map(normalize_model).filter(|s| !s.is_empty()) {
         let escaped =
             serde_json::to_string(normalized).map_err(|e| Error::Message(e.to_string()))?;
         out.push_str(&format!("model = {escaped}\n"));
@@ -365,6 +366,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_normalized_model_preserves_existing_config() {
+        for input in [
+            "sylphx/",
+            "kimi-code-plan/",
+            "   ",
+            " sylphx/kimi-code-plan/ ",
+        ] {
+            assert_eq!(normalize_model(input), "");
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("config.toml");
+            std::fs::write(&config, "model = \"existing/model\"\n").unwrap();
+            write_spiron_config(dir.path(), Some(input), Path::new("anyagents"), &[]).unwrap();
+            let text = std::fs::read_to_string(config).unwrap();
+            assert!(text.contains("model = \"existing/model\""), "{text}");
+            assert!(!text.contains("model = \"\""), "{text}");
+        }
+        assert_eq!(
+            coding_plan_provider_for_model(Some(" sylphx/kimi-code-plan/model#max ")),
+            Some("kimi-code-plan")
+        );
+    }
+
+    #[test]
     fn config_and_cli_share_model_normalization() {
         for (selector, expected) in [
             ("sylphx/openai/gpt-6.1-sol#high", "openai/gpt-6.1-sol#high"),
@@ -464,7 +488,7 @@ mod tests {
 
         write_spiron_config(
             cfg,
-            Some("kimi-code-plan/k3.1-pro#max"),
+            Some("sylphx/kimi-code-plan/k3.1-pro#max"),
             Path::new("/usr/bin/anyagents"),
             &["mcp".to_string()],
         )
@@ -475,6 +499,11 @@ mod tests {
         let auth_kimi: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(cfg.join("auth.json")).unwrap()).unwrap();
         assert_eq!(auth_kimi["access_token"], "sk_kimi_222");
+        for mirror in [".spiron/auth.json", ".config/sylphx/auth.json"] {
+            let mirrored: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(cfg.join(mirror)).unwrap()).unwrap();
+            assert_eq!(mirrored, auth_kimi);
+        }
     }
     #[test]
     fn write_spiron_config_resolves_vendor_neutral_provider_gateway_and_key() {

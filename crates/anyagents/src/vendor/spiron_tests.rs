@@ -105,7 +105,7 @@ for line in sys.stdin:
         ("ANYAGENTS_SPIRON_BIN", probe.as_os_str()),
         ("ANYAGENTS_FAKE_MODE", std::ffi::OsStr::new("1")),
     ]);
-    for (harness_name, model, expected_model) in [
+    for (case, (harness_name, model, expected_model)) in [
         (
             "spiron",
             "sylphx/openai/gpt-6.1-sol#high",
@@ -119,8 +119,32 @@ for line in sys.stdin:
             "minimax-code-plan/MiniMax-M3",
             "MiniMax-M3",
         ),
-    ] {
-        let data = temp.path().join(harness_name.replace('/', "-"));
+        (
+            "spiron",
+            "sylphx/kimi-code-plan/k3.1-pro#max",
+            "k3.1-pro#max",
+        ),
+        ("spiron", "sylphx/openai/model#low", "openai/model#low"),
+        (
+            "spiron",
+            "sylphx/openai/model#medium",
+            "openai/model#medium",
+        ),
+        ("spiron", "sylphx/openai/model#xhigh", "openai/model#xhigh"),
+        (
+            "spiron",
+            "openrouter/openai/model#xhigh",
+            "openrouter/openai/model#xhigh",
+        ),
+        ("spiron", " sylphx/openai/model#low ", "openai/model#low"),
+        ("spiron", "sylphx/", ""),
+        ("spiron", "kimi-code-plan/", ""),
+        ("spiron", "   ", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let data = temp.path().join(format!("case-{case}"));
         std::fs::create_dir_all(&data).unwrap();
         let store = Store::open(data.join("state.db")).unwrap();
         std::fs::create_dir_all(data.join("memory")).unwrap();
@@ -304,8 +328,13 @@ for line in sys.stdin:
                 .iter()
                 .map(|v| v.as_str().unwrap())
                 .collect();
+            if expected_model.is_empty() {
+                assert!(!args.contains(&"--model"));
+            } else {
+                let index = args.iter().position(|arg| *arg == "--model").unwrap();
+                assert_eq!(args[index + 1], expected_model);
+            }
             for (flag, expected) in [
-                ("--model", expected_model.into()),
                 ("--session", "legacy-session".into()),
                 (
                     "--mcp-config",
