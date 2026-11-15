@@ -401,7 +401,7 @@ async fn existing_profile_opens_with_logins_and_every_operation_works() {
     tcp.read_to_string(&mut resp).await.unwrap();
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
 
-    // Tabs.
+    // Tabs: explicit target_id switches targets and fails closed with STALE_TARGET when absent.
     let tabs = call(
         data,
         json!({"action": "tabs", "tab_action": "new", "url": url}),
@@ -409,12 +409,21 @@ async fn existing_profile_opens_with_logins_and_every_operation_works() {
     .await;
     assert_eq!(tabs["tabs"].as_array().unwrap().len(), 2);
     let id = tabs["target_id"].as_str().unwrap().to_string();
+    let snap_explicit = call(data, json!({"action": "snapshot", "target_id": id})).await;
+    assert_eq!(snap_explicit["target_id"], id);
     let tabs = call(
         data,
         json!({"action": "tabs", "tab_action": "close", "target_id": id}),
     )
     .await;
     assert_eq!(tabs["tabs"].as_array().unwrap().len(), 1);
+    let stale_err = refused(
+        data,
+        "agent-a",
+        json!({"action": "snapshot", "target_id": id}),
+    )
+    .await;
+    assert!(stale_err.contains("STALE_TARGET"), "{stale_err}");
 
     // Close and reopen: the profile keeps its login, and the lease ends with
     // the desktop.

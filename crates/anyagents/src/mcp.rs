@@ -197,11 +197,11 @@ pub struct AgentRef {
 pub(crate) const MCP_STDIO_FRAME_CAP_BYTES: usize = 56 * 1024;
 const MCP_STDIO_FRAME_PREVIEW_CHARS: usize = 2_000;
 
-/// Write one oversize frame verbatim to a fresh `0600` file under `dir`.
-fn spill_oversize_frame(frame: &[u8], dir: &Path, seq: u64) -> std::io::Result<PathBuf> {
+/// Write one oversize response body to a fresh `0600` file under `dir`.
+fn spill_oversize_frame(body: &[u8], dir: &Path, seq: u64) -> std::io::Result<PathBuf> {
     use std::io::Write as _;
     let path = dir.join(format!(
-        "anyagents-mcp-stdio-frame-{}-{seq}.json",
+        "anyagents-mcp-stdio-frame-{}-{seq}.txt",
         std::process::id()
     ));
     let mut options = std::fs::OpenOptions::new();
@@ -211,38 +211,63 @@ fn spill_oversize_frame(frame: &[u8], dir: &Path, seq: u64) -> std::io::Result<P
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    options.open(&path)?.write_all(frame)?;
+    options.open(&path)?.write_all(body)?;
     Ok(path)
 }
 
+/// The text a model reads for a tool result: its `text` items as they are,
+/// and any other item (image, audio, resource) as one compact JSON line.
+/// `None` when the frame is not a tool result with `content`, so the frame
+/// itself is spilled.
+fn tool_result_text(value: &serde_json::Value) -> Option<String> {
+    let items = value.get("result")?.get("content")?.as_array()?;
+    let parts: Vec<String> = items
+        .iter()
+        .map(|item| match (item.get("type"), item.get("text")) {
+            (Some(kind), Some(serde_json::Value::String(text))) if kind == "text" => text.clone(),
+            _ => item.to_string(),
+        })
+        .collect();
+    Some(parts.join("\n"))
+}
+
 /// Build the bounded replacement frame (with trailing newline) for one
-/// oversize frame. The preview shrinks until the serialized, escaped frame
+/// oversize frame. A tool result is spilled as its unwrapped text; anything
+/// else as the frame. The preview shrinks until the serialized, escaped frame
 /// fits the cap, so the check runs on final bytes, not on the input size.
 fn capped_frame(frame: &[u8], dir: &Path, seq: u64) -> Vec<u8> {
-    let spill = spill_oversize_frame(frame, dir, seq)
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| dir.display().to_string());
-    let id = serde_json::from_slice::<serde_json::Value>(frame)
-        .ok()
+    let value = serde_json::from_slice::<serde_json::Value>(frame).ok();
+    let id = value
+        .as_ref()
         .and_then(|value| value.get("id").cloned())
         .unwrap_or(serde_json::Value::Null);
-    let text = String::from_utf8_lossy(frame);
+    let is_error = value
+        .as_ref()
+        .and_then(|value| value.get("result")?.get("isError")?.as_bool())
+        .unwrap_or(false);
+    let text = value
+        .as_ref()
+        .and_then(tool_result_text)
+        .unwrap_or_else(|| String::from_utf8_lossy(frame).into_owned());
+    let spill = spill_oversize_frame(text.as_bytes(), dir, seq)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| dir.display().to_string());
     let mut preview_chars = MCP_STDIO_FRAME_PREVIEW_CHARS;
     loop {
         let preview: String = text.chars().take(preview_chars).collect();
         let summary = format!(
             "This response exceeded the {MCP_STDIO_FRAME_CAP_BYTES}-byte single-line stdio frame limit \
-             (original: {} bytes) and was written in full to {spill} with file mode 0600. \
+             ({} bytes of result text) and was written in full to {spill} with file mode 0600. \
              Read that file in pages (offset/length windows) instead of requesting the whole response again.\n\n\
              Preview (first {preview_chars} characters):\n{preview}",
-            frame.len()
+            text.len()
         );
         let mut bytes = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": {
                 "content": [{"type": "text", "text": summary}],
-                "isError": false,
+                "isError": is_error,
             }
         }))
         .expect("summary frame serializes");
@@ -458,8 +483,16 @@ mod stdio_frame_cap_tests {
             .unwrap();
         let spill_path = PathBuf::from(spill);
         assert_eq!(spill_path.parent(), Some(dir.path()));
-        let spilled = std::fs::read(&spill_path).unwrap();
-        assert_eq!(spilled, frame, "spilled file must be byte-identical");
+        let spilled = std::fs::read_to_string(&spill_path).unwrap();
+        assert_eq!(
+            spilled, payload,
+            "the spill holds the unwrapped result text"
+        );
+        assert!(
+            summary.contains(&payload.chars().take(64).collect::<String>()),
+            "the preview is the result text, not the JSON-RPC envelope"
+        );
+        assert!(!summary.contains("jsonrpc"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -468,6 +501,54 @@ mod stdio_frame_cap_tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn oversize_multi_item_result_spills_text_and_keeps_other_items_compact() {
+        let big = "x".repeat(60 * 1024);
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "content": [
+                    {"type": "text", "text": "line \"one\"\n"},
+                    {"type": "image", "data": "AAAA", "mimeType": "image/png"},
+                    {"type": "text", "text": big},
+                ],
+                "isError": true,
+            }
+        }))
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = capped_frame(&frame, dir.path(), 1);
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["result"]["isError"], true);
+        let spill = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let spilled = std::fs::read_to_string(spill).unwrap();
+        assert_eq!(
+            spilled,
+            format!(
+                "line \"one\"\n\n{}\n{big}",
+                r#"{"type":"image","data":"AAAA","mimeType":"image/png"}"#
+            )
+        );
+
+        // A frame that is not a tool result is spilled as it is.
+        let other = format!(r#"{{"jsonrpc":"2.0","id":4,"result":{{"blob":"{big}"}}}}"#);
+        let dir = tempfile::tempdir().unwrap();
+        capped_frame(other.as_bytes(), dir.path(), 1);
+        let spill = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read_to_string(spill).unwrap(), other);
     }
 
     #[tokio::test]
@@ -3328,7 +3409,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Your browser: one headful browser on your own headless desktop, with a persistent login profile that one agent drives at a time (`action`: `open` | `back` | `forward` | `reload` | `snapshot` | `read` | `html` | `click` | `fill` | `press` | `hold` | `key_down` | `key_up` | `release_keys` | `eval` | `cookies` | `screenshot` | `tabs` | `takeover` | `takeover_status` | `wait_for_user` | `release_takeover` | `status` | `profiles` | `close`). Pass `action: \"open\"` with `url` to navigate and receive an accessibility snapshot whose interactive elements carry refs (`@<snapshot_id>:e1`); pass `action: \"click\"` or `\"fill\"` with `selector` set to a ref or a CSS selector (refs fail with `STALE_REF` once the page navigates; take a new snapshot). Fill credentials with `secret_ref` (`op://...`, `op-otp://...`, `secret://...`) so the value never enters your context; `submit: true` presses Enter in the field. `press`/`hold`/`key_down` act inside the page. `screenshot` captures the whole desktop (browser chrome and dialogs included), or the page with `full_page`; `tools.computer` acts on the same desktop's pixels. When a CAPTCHA or 2FA challenge needs a person, call `action: \"takeover\"` with a `reason` and send `takeover_url` (plus `screenshot_path` via `send` media) to the user: they control the whole desktop until they hand back, and you receive `[Browser Takeover Completed]`. Calls fail with `HUMAN_IN_CONTROL` while they hold it, and with `DESKTOP_IN_USE` when another agent holds the profile. `close` stops the desktop; logins stay on disk."
+        description = "Your browser: one headful browser on your own headless desktop, with a persistent login profile that one agent drives at a time (`action`: `open` | `back` | `forward` | `reload` | `snapshot` | `read` | `html` | `click` | `fill` | `press` | `hold` | `key_down` | `key_up` | `release_keys` | `eval` | `cookies` | `screenshot` | `tabs` | `takeover` | `takeover_status` | `wait_for_user` | `release_takeover` | `status` | `profiles` | `close`). Pass `action: \"open\"` with `url` to navigate and receive an accessibility snapshot whose interactive elements carry refs (`@<snapshot_id>:e1`); pass `action: \"click\"` or `\"fill\"` with `selector` set to a ref or a CSS selector (refs fail with `STALE_REF` once the page navigates; take a new snapshot). Fill credentials with `secret_ref` (`op://...`, `op-otp://...`, `secret://...`) so the value never enters your context; `submit: true` presses Enter in the field. `press`/`hold`/`key_down` act inside the page. `screenshot` captures the whole desktop (browser chrome and dialogs included), or the page with `full_page`; `tools.computer` acts on the same desktop's pixels. When a CAPTCHA or 2FA challenge needs a person, call `action: \"takeover\"` with a `reason` and send `takeover_url` (plus `screenshot_path` via `send` media) to the user: they control the whole desktop until they hand back, and you receive `[Browser Takeover Completed]`. Pass `target_id` to target a specific tab across actions; if that `target_id` no longer exists in the live browser, the call fails closed with `STALE_TARGET` rather than falling back to `about:blank` or another tab. Calls fail with `HUMAN_IN_CONTROL` while they hold it, and with `DESKTOP_IN_USE` when another agent holds the profile. `close` stops the desktop; logins stay on disk."
     )]
     async fn browser(
         &self,

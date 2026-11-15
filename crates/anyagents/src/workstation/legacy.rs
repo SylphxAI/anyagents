@@ -287,7 +287,7 @@ fn signal(p: &Process, sig: i32) -> Result<()> {
     if current.start != p.start {
         return Ok(());
     }
-    if current.group != p.group {
+    if current.group != p.group || current.cmd != p.cmd {
         return Err(invalid("legacy process ownership changed before signaling"));
     }
     // SAFETY: descriptor pins this process; null siginfo and flags zero.

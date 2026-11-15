@@ -341,6 +341,17 @@ fn create_with_seat(
         } else {
             request.workdir.clone()
         };
+        if let Some(path) = &request.workdir
+            && wd_str.is_empty()
+        {
+            return Err(Error::WorkdirPermission {
+                path: path.display().to_string(),
+                message: "working directory must not be empty".into(),
+            });
+        }
+        if let Some(path) = &explicit_workdir {
+            crate::sandbox::validate_workdir_target(path)?;
+        }
         let is_cloud_agent_mode = wd_is_cloud_keyword
             || pairs
                 .iter()
@@ -366,6 +377,19 @@ fn create_with_seat(
         let workdir_created =
             explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
         let managed_abs = std::path::absolute(&managed)?;
+        // Record the allocation before any checkout or cloud provisioning can
+        // block. This does not admit the agent to the runtime.
+        if effective_repo.is_some()
+            || wd_is_private_keyword
+            || wd_is_worktree_keyword
+            || (explicit_workdir.is_none() && !wd_is_inherit_keyword && agent.parent_id.is_some())
+        {
+            let target = match &explicit_workdir {
+                Some(path) => std::path::absolute(path)?,
+                None => managed_abs.clone(),
+            };
+            store.set_agent_workdir_if_missing(&agent.id, &target.display().to_string())?;
+        }
         let cwd = if let Some(repo_raw) = effective_repo {
             if crate::vendor::is_spiron_harness(&agent.harness)
                 && is_cloud_agent_mode
@@ -473,6 +497,7 @@ fn create_with_seat(
                 }
             }
         };
+        store.set_agent_workdir_if_missing(&agent.id, &cwd.display().to_string())?;
         if cwd == managed_abs && !managed_abs.exists() {
             create_dir_all_recorded(&managed_abs, &made)?;
         }
@@ -1243,11 +1268,12 @@ pub(crate) fn extract_file_tilde_refs(text: &str) -> Vec<String> {
 pub(crate) fn ensure_seat_environment(target_config: &Path, workdir: &Path) -> Result<(), Error> {
     for subdir in ["tmp", "data-home", "cache-home", "state-home"] {
         let dir = target_config.join(subdir);
-        let _ = std::fs::create_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777));
+            // Shared runtime trees must not permit peers to unlink each other's entries.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
         }
     }
     crate::repo::configure_seat_git(target_config, workdir)?;
@@ -2526,7 +2552,7 @@ pub(crate) fn seed_harness_credentials(
             }
         }
         if !found_in_profile
-            && !profile_roots.is_empty()
+            && profile_roots.iter().any(|p| p.is_dir())
             && dst.exists()
             && (is_seat_selector
                 || (profile_changed
@@ -2546,7 +2572,7 @@ pub(crate) fn seed_harness_credentials(
         }
     }
     if crate::vendor::is_spiron_harness(&agent.harness) {
-        crate::spiron::ensure_spiron_seat_auth(target_config);
+        crate::spiron::ensure_spiron_seat_auth_for_model(target_config, agent.model.as_deref());
     }
     if let Some(ref bound) = current_bound {
         write_profile_marker(
@@ -2852,6 +2878,28 @@ pub(crate) fn resolved_agent_seat_info(
     Some((user, uid, gid, None))
 }
 
+// Seat preparation owns the config mode and ACL mask. Never replay a mode
+// captured before preparation over the permissions it established.
+fn prepare_runtime_config_dir(config: &Path, seat: Option<(u32, u32)>) -> Result<(), Error> {
+    create_private_config_dir(config)?;
+    if let Some((uid, gid)) = seat {
+        crate::sandbox::prepare_config_with_seat_uid(config, uid, gid)?;
+    } else {
+        #[cfg(unix)]
+        repair_unseated_config_mode(config, own_mode(config)?.unwrap_or(0o0700))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn repair_unseated_config_mode(config: &Path, base_mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let group_exec = if (base_mode & 0o0060) != 0 { 0o0010 } else { 0 };
+    let other_exec = if (base_mode & 0o0006) != 0 { 0o0001 } else { 0 };
+    let safe_mode = (base_mode | 0o0700 | group_exec | other_exec) & 0o7777;
+    std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode))
+}
+
 /// Canonical, idempotent runtime reconciliation for an agent: resolves the
 /// authoritative parent from `state.db`, seeds credentials and model catalogs,
 /// ensures the mailbox capability, computes cross-harness continuity from
@@ -2871,20 +2919,10 @@ pub(crate) fn reconcile_agent_runtime_config(
             .ok()
             .map(|m| m.permissions().mode() & 0o7777)
     };
-    create_private_config_dir(config)?;
-    if let Some((_, uid, gid, _)) = resolved_agent_seat_info(store, agent) {
-        crate::sandbox::prepare_config_with_seat_uid(config, uid, gid)?;
-    }
-    #[cfg(unix)]
-    if let Some(base_mode) = pre_existing_mode {
-        use std::os::unix::fs::PermissionsExt as _;
-        let group_exec = if (base_mode & 0o0060) != 0 { 0o0010 } else { 0 };
-        let other_exec = if (base_mode & 0o0006) != 0 { 0o0001 } else { 0 };
-        let safe_mode = (base_mode | 0o0700 | group_exec | other_exec) & 0o7777;
-        if safe_mode != base_mode {
-            let _ = std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode));
-        }
-    }
+    prepare_runtime_config_dir(
+        config,
+        resolved_agent_seat_info(store, agent).map(|(_, uid, gid, _)| (uid, gid)),
+    )?;
     let parent_name = agent
         .parent_id
         .as_ref()
@@ -3022,7 +3060,7 @@ pub(crate) fn reconcile_agent_runtime_config(
         if let Some(ref spec) = spec_opt {
             ensure_seat_op_config(config, spec);
         }
-        crate::sandbox::share_config_with_seat_uid(config, uid, gid);
+        crate::sandbox::share_config_with_seat_uid_checked(config, uid, gid)?;
         // Workdir admission belongs to create, not config-only reconciliation:
         // an archived agent may already have had its managed workdir reaped.
         if agent.harness == "muse"
@@ -3049,12 +3087,7 @@ pub(crate) fn reconcile_agent_runtime_config(
     } else {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            let base_mode = pre_existing_mode.unwrap_or(0o0700);
-            let group_exec = if (base_mode & 0o0060) != 0 { 0o0010 } else { 0 };
-            let other_exec = if (base_mode & 0o0006) != 0 { 0o0001 } else { 0 };
-            let safe_mode = (base_mode | 0o0700 | group_exec | other_exec) & 0o7777;
-            let _ = std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode));
+            repair_unseated_config_mode(config, pre_existing_mode.unwrap_or(0o0700))?;
         }
     }
     verify_harness_runtime_config(config, &agent.harness, agent.model.as_deref())?;
@@ -3834,6 +3867,12 @@ fn propagate_credentials(
                 "no profile credentials installed for {dir_id}"
             )));
         }
+        // Success markers must describe credentials that the seat can read.
+        if let Some(s) = store_opt.as_ref()
+            && let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec)
+        {
+            crate::sandbox::share_config_with_seat_uid_checked(&cfg, uid, gid)?;
+        }
         write_profile_marker(
             &cfg,
             ".anyagents-seeded-profile",
@@ -3855,13 +3894,8 @@ fn propagate_credentials(
             )?;
             let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         }
-        if let Some(s) = store_opt.as_ref() {
-            if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
-                crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
-            }
-            if change == CredentialChange::Replaced {
-                poke_agent_wake_socket(data, &agent_rec.id);
-            }
+        if store_opt.is_some() && change == CredentialChange::Replaced {
+            poke_agent_wake_socket(data, &agent_rec.id);
         }
     }
     Ok(())
@@ -5091,6 +5125,9 @@ pub(crate) fn finalize_agent_signin(data: &Path, agent: &Agent) -> Result<(), Er
 /// can run against that upstream provider; otherwise defaults to the native
 /// subscription provider of the agent's harness.
 pub(crate) fn upstream_provider_of(harness: &str, model: Option<&str>) -> String {
+    if let Some(provider) = crate::spiron::coding_plan_provider_for_model(model) {
+        return provider.to_string();
+    }
     if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty())
         && let Some((prefix, _)) = m.split_once('/')
     {
@@ -10558,6 +10595,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn runtime_config_preparation_preserves_seat_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_tempdir();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        for old_mode in [0o0600, 0o0700, 0o2770] {
+            let config = dir.path().join(format!("seat-{old_mode:o}/config"));
+            create_private_config_dir(&config).unwrap();
+            std::fs::write(config.join("credential"), "retained").unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(old_mode)).unwrap();
+            prepare_runtime_config_dir(&config, Some((uid, gid))).unwrap();
+            assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o7777, 0o2770);
+            assert_eq!(
+                std::fs::read_to_string(config.join("credential")).unwrap(),
+                "retained"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_config_preparation_repairs_unseated_modes_and_propagates_failures() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_tempdir();
+        for (old_mode, expected) in [(0o0600, 0o0700), (0o0660, 0o0770), (0o2770, 0o2770)] {
+            let config = dir.path().join(format!("unseated-{old_mode:o}/config"));
+            create_private_config_dir(&config).unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(old_mode)).unwrap();
+            prepare_runtime_config_dir(&config, None).unwrap();
+            assert_eq!(
+                std::fs::metadata(&config).unwrap().mode() & 0o7777,
+                expected
+            );
+        }
+        let blocked = dir.path().join("file");
+        std::fs::write(&blocked, "retained").unwrap();
+        assert!(prepare_runtime_config_dir(&blocked, None).is_err());
+        assert!(repair_unseated_config_mode(&dir.path().join("missing"), 0o0600).is_err());
+        assert_eq!(std::fs::read_to_string(blocked).unwrap(), "retained");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn new_config_roots_are_private_and_existing_seat_grants_are_preserved() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let dir = crate::test_tempdir();
@@ -11721,6 +11801,85 @@ stderr: {}",
             instructions: None,
             parent_id: None,
         }
+    }
+
+    #[test]
+    fn invalid_explicit_workdir_is_refused_before_checkout_allocation() {
+        let tmp = crate::test_tempdir();
+        let fixture = crate::repo::tests::Fixture::new(tmp.path());
+        let store = Store::open(tmp.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        for (index, path) in ["", " ", "/", "/tmp"].iter().enumerate() {
+            let name = format!("invalid-workdir-{index}");
+            let mut request = worktree_request(&name, Some("ExampleOrg/demo".into()));
+            request.workdir = Some(PathBuf::from(*path));
+            let result = create_with_consumer(&store, tmp.path(), request, &fixture.checkouts);
+            assert!(
+                matches!(result, Err(Error::WorkdirPermission { .. })),
+                "{result:?}"
+            );
+            assert!(store.agent_by_name(&name).is_err());
+            assert!(
+                !fixture.log.exists(),
+                "invalid workdir reached the checkout provider"
+            );
+        }
+    }
+
+    #[test]
+    fn workdir_is_durable_while_checkout_provisioning_is_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let fixture = crate::repo::tests::Fixture::new(&data);
+        let entered = data.join("entered");
+        let release = data.join("release");
+        let provider = data.join("provider");
+        let script = std::fs::read_to_string(&provider).unwrap();
+        let script = script.replacen("#!/bin/sh\n", &format!(
+            "#!/bin/sh\nif [ \"$1\" = worktree ]; then touch {entered:?}; while [ ! -e {release:?} ]; do sleep 0.01; done; fi\n"
+        ), 1);
+        crate::repo::tests::write_executable(&provider, &script);
+        std::fs::write(&fixture.fail, "worktree").unwrap();
+        let db = data.join("state.db");
+        let store = Store::open(&db).unwrap();
+        let thread_data = data.clone();
+        let handle = std::thread::spawn(move || {
+            let store = Store::open(thread_data.join("state.db")).unwrap();
+            store
+                .hold_capability_key("0123456789abcdef0123456789abcdef")
+                .unwrap();
+            create_with_consumer(
+                &store,
+                &thread_data,
+                worktree_request("blocked", Some("ExampleOrg/demo".into())),
+                &fixture.checkouts,
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !entered.exists() && std::time::Instant::now() < deadline && !handle.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let observed = Store::open(&db).and_then(|store| store.agent_by_name("blocked"));
+        std::fs::write(&release, "release").unwrap();
+        let result = handle.join().unwrap();
+        assert!(
+            entered.exists(),
+            "checkout did not reach the blocking provider: {result:?}"
+        );
+        let observed = observed.unwrap();
+        assert_ne!(observed.state, "running");
+        assert_eq!(
+            observed.workdir.as_deref(),
+            Some(agent_work_dir(&data, &observed.id).to_str().unwrap())
+        );
+        assert!(result.is_err());
+        assert!(matches!(
+            store.agent_by_name("blocked"),
+            Err(Error::AgentNotFound(_))
+        ));
     }
 
     #[test]
@@ -13439,6 +13598,149 @@ mod runtime_config_tests {
         assert!(!stage.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn credential_propagation_returns_post_write_sharing_errors() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Principal admission is process-wide; isolate it from parallel tests.
+        const PROBE: &str = "ANYAGENTS_TEST_PROPAGATION_SHARING_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env(PROBE, "1")
+                .env_remove("ANYAGENTS_PRINCIPALS")
+                .env_remove("ANYAGENTS_PRINCIPAL_REGISTRY")
+                .env_remove("ANYAGENTS_AGENTS")
+                .env_remove("ANYAGENTS_AGENT_UID")
+                .env_remove("ANYAGENTS_AGENT_GID")
+                .env_remove("ANYAGENTS_SOCKET_GID")
+                .env_remove("ANYAGENTS_SEAT_LAUNCHER")
+                .args([
+                    "--exact",
+                    "create::runtime_config_tests::credential_propagation_returns_post_write_sharing_errors",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "probe failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "probe must run exactly one test: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sample", "codex"))
+            .unwrap();
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "openai/target\n").unwrap();
+        let owner = std::fs::metadata(&cfg).unwrap();
+        let uid = if owner.uid() == 42001 { 42002 } else { 42001 };
+        let gid = owner.gid();
+        unsafe {
+            std::env::set_var(
+                "ANYAGENTS_PRINCIPALS",
+                serde_json::json!({
+                    agent.id.as_str(): {
+                        "user": "registered-worker", "uid": uid,
+                        "gid": gid, "socket_gid": gid
+                    }
+                })
+                .to_string(),
+            );
+        }
+        assert!(resolved_agent_seat_info(&store, &agent).is_some());
+        let prof = dir.path().join("profiles/openai/target");
+        std::fs::create_dir_all(&prof).unwrap();
+        let credentials = br#"{"tokens":{"access_token":"fixture-only"}}"#;
+        std::fs::write(prof.join("auth.json"), credentials).unwrap();
+        let overlay = cfg.parent().unwrap().join("memory");
+        std::fs::write(&overlay, "not a directory").unwrap();
+        let markers = [
+            ".anyagents-seeded-profile",
+            ".anyagents-quota-cleared-ms",
+            ".anyagents-profile-rotated-ms",
+            ".anyagents-last-error.json",
+        ];
+        for marker in markers {
+            std::fs::write(cfg.join(marker), "previous-state\n").unwrap();
+        }
+        // Preparation must succeed: this fixture fails only in post-write sharing.
+        crate::sandbox::prepare_config_with_seat_uid(&cfg, uid, gid).unwrap();
+
+        let err = propagate_credentials(
+            dir.path(),
+            "openai",
+            "target",
+            &["auth.json"],
+            CredentialChange::Replaced,
+        )
+        .unwrap_err();
+        match err {
+            Error::WorkdirPermission { path, message } => {
+                assert_eq!(path, cfg.display().to_string());
+                assert!(
+                    message.contains("cannot share harness overlays"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("refusing non-directory host overlay"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected checked overlay sharing refusal, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(cfg.join("auth.json")).unwrap(), credentials);
+        for marker in markers {
+            assert_eq!(
+                std::fs::read_to_string(cfg.join(marker)).unwrap(),
+                "previous-state\n",
+                "marker changed after sharing failed: {marker}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&overlay).unwrap(),
+            "not a directory"
+        );
+
+        // The same real caller succeeds once the overlay is repaired.
+        std::fs::remove_file(&overlay).unwrap();
+        propagate_credentials(
+            dir.path(),
+            "openai",
+            "target",
+            &["auth.json"],
+            CredentialChange::Replaced,
+        )
+        .unwrap();
+        assert!(overlay.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(cfg.join(".anyagents-seeded-profile")).unwrap(),
+            "openai/target\n"
+        );
+        let rotated = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms")).unwrap();
+        assert!(rotated.trim().parse::<i64>().unwrap() > 0);
+        assert_eq!(
+            std::fs::read_to_string(cfg.join(".anyagents-quota-cleared-ms")).unwrap(),
+            rotated
+        );
+        assert!(!cfg.join(".anyagents-last-error.json").exists());
+        assert_eq!(std::fs::read(cfg.join("auth.json")).unwrap(), credentials);
+    }
+
     #[test]
     fn credential_propagation_does_not_seed_or_rotate_a_failed_destination() {
         let dir = tempfile::tempdir().unwrap();
@@ -13837,6 +14139,30 @@ mod runtime_config_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config");
         ensure_seat_environment(&cfg, dir.path()).unwrap();
+        #[cfg(unix)]
+        for name in ["tmp", "data-home", "cache-home", "state-home"] {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = cfg.join(name);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                0o1777
+            );
+            // A repeated preparation repairs legacy non-sticky runtime trees.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        ensure_seat_environment(&cfg, dir.path()).unwrap();
+        #[cfg(unix)]
+        for name in ["tmp", "data-home", "cache-home", "state-home"] {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(cfg.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o1777
+            );
+        }
         assert!(!cfg.join(".rustup").exists());
         assert!(!cfg.join(".cargo").exists());
         assert!(!cfg.join(".local/share/desk-claude").exists());
@@ -15395,6 +15721,130 @@ Connection: close
         .unwrap();
         let child_git_wd = PathBuf::from(child_under_git.workdir.as_deref().unwrap());
         fixture.assert_checkout(&child_git_wd);
+    }
+
+    #[test]
+    fn spiron_standalone_seed_uses_model_provider_key() {
+        for profile_layout in [false, true] {
+            for (model, provider) in [
+                ("sylphx/kimi-code-plan/k3.1-pro#max", "kimi-code-plan"),
+                ("openrouter/openai/model#xhigh", "openrouter"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let data = dir.path();
+                let store = Store::open(data.join("state.db")).unwrap();
+                let mut spec = NewAgent::new("seed-model", "spiron");
+                spec.model = Some(model.into());
+                let agent = store.create_agent(spec).unwrap();
+                let cfg = agent_config_dir(data, &agent.id);
+                let source = if profile_layout {
+                    data.join("profiles").join(provider).join("default")
+                } else {
+                    cfg.clone()
+                };
+                std::fs::create_dir_all(source.join(".config/opencode")).unwrap();
+                std::fs::write(
+                    source
+                        .join(".config/opencode")
+                        .join(format!("{provider}.key")),
+                    "provider-test-key",
+                )
+                .unwrap();
+                std::fs::write(source.join(".config/opencode/sylphx.key"), "wrong-test-key")
+                    .unwrap();
+                seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(
+                        source
+                            .join(".config/opencode")
+                            .join(format!("{provider}.key"))
+                    )
+                    .unwrap(),
+                    "provider-test-key"
+                );
+                for mirror in ["auth.json", ".spiron/auth.json", ".config/sylphx/auth.json"] {
+                    let auth: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(cfg.join(mirror)).unwrap()).unwrap();
+                    assert_eq!(auth["access_token"], "provider-test-key");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spiron_muse_profile_preserves_gateway_auth_and_normalizes_model() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let model = "sylphx/openai/gpt-6.1-sol#high";
+        let mut spec = NewAgent::new("spiron-profile", "spiron");
+        spec.model = Some(model.into());
+        let agent = store.create_agent(spec).unwrap();
+        let cfg = agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        let profile = data.join("profiles/sylphx/muse-default");
+        std::fs::create_dir_all(&profile).unwrap();
+        let selector = br#"{"gateway_base_url":"https://gateway.example/v1"}"#;
+        let auth = br#"{"access_token":"test-profile-token"}"#;
+        std::fs::write(profile.join("sylphx-agent.json"), selector).unwrap();
+        std::fs::write(profile.join("auth.json"), auth).unwrap();
+        std::fs::write(
+            profile.join("profile.json"),
+            br#"{"compatible_harnesses":["spiron"]}"#,
+        )
+        .unwrap();
+        std::fs::write(profile.join("config.toml"), "model = \"stale/model\"\n").unwrap();
+        ensure_profile_compatible_and_mapped(
+            data,
+            "sylphx",
+            "muse-default",
+            "spiron",
+            Some(model),
+            Some(&cfg),
+        )
+        .unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "sylphx/muse-default\n").unwrap();
+        seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+        let work = data.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        set_agent_harness(
+            &store,
+            data,
+            "operator",
+            &agent.name,
+            "spiron",
+            Some(model),
+            Some("sylphx/muse-default"),
+        )
+        .unwrap();
+        let agent = store.agent(&agent.id).unwrap();
+        reconcile_agent_runtime_config(&store, data, &agent, &cfg, &work).unwrap();
+        verify_harness_runtime_config(&cfg, "spiron", Some(model)).unwrap();
+        for mirror in [".spiron/auth.json", ".config/sylphx/auth.json"] {
+            let auth: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(cfg.join(mirror)).unwrap()).unwrap();
+            assert_eq!(auth["access_token"], "test-profile-token");
+        }
+        assert_eq!(
+            std::fs::read(cfg.join("sylphx-agent.json")).unwrap(),
+            selector
+        );
+        let seeded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cfg.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(seeded["access_token"], "test-profile-token");
+        let config = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+        assert!(!config.contains("stale/model"), "{config}");
+        assert!(
+            config.contains("sylphx_ai_url = \"https://gateway.example/v1\""),
+            "{config}"
+        );
+        assert!(
+            config.contains("model = \"openai/gpt-6.1-sol#high\""),
+            "{config}"
+        );
     }
 
     #[test]

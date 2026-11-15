@@ -433,10 +433,20 @@ impl ToolError {
         }
     }
 
+    /// An explicit `target_id` is absent from the live CDP target list.
+    pub fn stale_target(message: impl Into<String>) -> Self {
+        Self {
+            code: "STALE_TARGET",
+            message: message.into(),
+            hint: "Target tab no longer exists in the live browser session (closed or restarted). Call browser({action: 'tabs'}) to list live targets.",
+            retryable: false,
+        }
+    }
+
     fn disposition(&self) -> ErrorDisposition {
         let mut d = match (self.code, self.retryable) {
             ("STALE_REF", _) => ErrorDisposition::stale_ref(self.hint),
-            ("NOT_FOUND", _) => ErrorDisposition::settled_absence(self.hint),
+            ("NOT_FOUND" | "STALE_TARGET", _) => ErrorDisposition::settled_absence(self.hint),
             (_, true) => ErrorDisposition::retryable(self.hint),
             (_, false) => ErrorDisposition::terminal(self.hint),
         };

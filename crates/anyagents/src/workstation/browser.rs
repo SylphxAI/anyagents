@@ -121,7 +121,9 @@ pub struct BrowserRequest {
     /// Tab sub-action for `"tabs"`: `"list"` (default), `"new"`, `"activate"`, or `"close"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_action: Option<String>,
-    /// Tab id for `"tabs"` `activate` / `close`.
+    /// Target tab id. When supplied, the action operates only on that live
+    /// CDP target and fails closed with `STALE_TARGET` if the tab does not
+    /// exist (never falling back to `about:blank` or another tab).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_id: Option<String>,
     /// Cookies to set for `"cookies"`, in DevTools fields: `name`, `value`, and `url` or `domain`
@@ -506,7 +508,226 @@ fn insert_captcha_fields(
 }
 
 #[cfg(target_os = "linux")]
-async fn require_readable_page(s: &agent_workstation::Agent<'_>) -> Result<(), ToolError> {
+trait BrowserClient {
+    async fn current_url(&self) -> Result<String, ToolError>;
+    async fn tabs(&self) -> Result<Vec<agent_workstation::Tab>, ToolError>;
+    async fn new_tab(&self, url: &str) -> Result<String, ToolError>;
+    async fn select_tab(&self, id: &str) -> Result<(), ToolError>;
+    async fn close_tab(&self, id: &str) -> Result<(), ToolError>;
+    async fn navigate(&self, url: &str) -> Result<String, ToolError>;
+    async fn back(&self) -> Result<String, ToolError>;
+    async fn forward(&self) -> Result<String, ToolError>;
+    async fn reload(&self) -> Result<String, ToolError>;
+    async fn snapshot(&self) -> Result<agent_workstation::Snapshot, ToolError>;
+    async fn read(&self) -> Result<String, ToolError>;
+    async fn html(&self, target: Option<&str>) -> Result<String, ToolError>;
+    async fn eval(&self, script: &str) -> Result<serde_json::Value, ToolError>;
+    async fn cookies(&self, urls: &[String]) -> Result<Vec<agent_workstation::Cookie>, ToolError>;
+    async fn set_cookies(&self, cookies: &[agent_workstation::Cookie]) -> Result<(), ToolError>;
+    async fn click(&self, target: &str) -> Result<(), ToolError>;
+    async fn fill(&self, target: &str, text: &str) -> Result<(), ToolError>;
+    async fn fill_secret(&self, target: &str, secret_ref: &str) -> Result<(), ToolError>;
+    async fn focus(&self, target: &str) -> Result<(), ToolError>;
+    async fn press(&self, chord: &str) -> Result<(), ToolError>;
+    async fn press_and_hold(&self, chord: &str, hold: std::time::Duration)
+    -> Result<(), ToolError>;
+    async fn key_down(&self, chord: &str) -> Result<(), ToolError>;
+    async fn key_up(&self, chord: &str) -> Result<(), ToolError>;
+    async fn release_keys(&self) -> Result<(), ToolError>;
+    async fn held_keys(&self) -> Result<Vec<String>, ToolError>;
+    async fn page_screenshot(
+        &self,
+        full_page: bool,
+    ) -> Result<(Vec<u8>, u32, u32, bool), ToolError>;
+    fn holder(&self) -> &'static str;
+    fn takeover_url(&self) -> Option<String>;
+    async fn publish_takeover(&self);
+    fn expect_hand_back(&self);
+    async fn wait_for_hand_back(&self, wait: std::time::Duration) -> bool;
+    fn release_takeover(&self, note: String) -> bool;
+}
+
+#[cfg(target_os = "linux")]
+struct LiveBrowserClient<'a> {
+    agent: agent_workstation::Agent<'a>,
+    live: &'a super::session::Live,
+    data: &'a Path,
+}
+
+#[cfg(target_os = "linux")]
+impl BrowserClient for LiveBrowserClient<'_> {
+    async fn current_url(&self) -> Result<String, ToolError> {
+        Ok(self.agent.current_url().await?)
+    }
+    async fn tabs(&self) -> Result<Vec<agent_workstation::Tab>, ToolError> {
+        Ok(self.agent.tabs().await?)
+    }
+    async fn new_tab(&self, url: &str) -> Result<String, ToolError> {
+        Ok(self.agent.new_tab(url).await?)
+    }
+    async fn select_tab(&self, id: &str) -> Result<(), ToolError> {
+        Ok(self.agent.select_tab(id).await?)
+    }
+    async fn close_tab(&self, id: &str) -> Result<(), ToolError> {
+        Ok(self.agent.close_tab(id).await?)
+    }
+    async fn navigate(&self, url: &str) -> Result<String, ToolError> {
+        Ok(self.agent.navigate(url).await?)
+    }
+    async fn back(&self) -> Result<String, ToolError> {
+        Ok(self.agent.back().await?)
+    }
+    async fn forward(&self) -> Result<String, ToolError> {
+        Ok(self.agent.forward().await?)
+    }
+    async fn reload(&self) -> Result<String, ToolError> {
+        Ok(self.agent.reload().await?)
+    }
+    async fn snapshot(&self) -> Result<agent_workstation::Snapshot, ToolError> {
+        Ok(self.agent.snapshot().await?)
+    }
+    async fn read(&self) -> Result<String, ToolError> {
+        Ok(self.agent.read().await?)
+    }
+    async fn html(&self, target: Option<&str>) -> Result<String, ToolError> {
+        Ok(self.agent.html(target).await?)
+    }
+    async fn eval(&self, script: &str) -> Result<serde_json::Value, ToolError> {
+        Ok(self.agent.eval(script).await?)
+    }
+    async fn cookies(&self, urls: &[String]) -> Result<Vec<agent_workstation::Cookie>, ToolError> {
+        Ok(self.agent.cookies(urls).await?)
+    }
+    async fn set_cookies(&self, cookies: &[agent_workstation::Cookie]) -> Result<(), ToolError> {
+        Ok(self.agent.set_cookies(cookies).await?)
+    }
+    async fn click(&self, target: &str) -> Result<(), ToolError> {
+        Ok(self.agent.click(target).await?)
+    }
+    async fn fill(&self, target: &str, text: &str) -> Result<(), ToolError> {
+        Ok(self.agent.fill(target, text).await?)
+    }
+    async fn fill_secret(&self, target: &str, secret_ref: &str) -> Result<(), ToolError> {
+        let resolver = super::secrets::SecretRefs::new(self.data);
+        Ok(self
+            .agent
+            .fill_secret(target, secret_ref, &resolver, None)
+            .await?)
+    }
+    async fn focus(&self, target: &str) -> Result<(), ToolError> {
+        Ok(self.agent.focus(target).await?)
+    }
+    async fn press(&self, chord: &str) -> Result<(), ToolError> {
+        Ok(self.agent.press(chord).await?)
+    }
+    async fn press_and_hold(
+        &self,
+        chord: &str,
+        hold: std::time::Duration,
+    ) -> Result<(), ToolError> {
+        Ok(self.agent.press_and_hold(chord, hold).await?)
+    }
+    async fn key_down(&self, chord: &str) -> Result<(), ToolError> {
+        Ok(self.agent.key_down(chord).await?)
+    }
+    async fn key_up(&self, chord: &str) -> Result<(), ToolError> {
+        Ok(self.agent.key_up(chord).await?)
+    }
+    async fn release_keys(&self) -> Result<(), ToolError> {
+        Ok(self.agent.release_keys().await?)
+    }
+    async fn held_keys(&self) -> Result<Vec<String>, ToolError> {
+        Ok(self.agent.held_keys().await?)
+    }
+    async fn page_screenshot(
+        &self,
+        full_page: bool,
+    ) -> Result<(Vec<u8>, u32, u32, bool), ToolError> {
+        if full_page {
+            let page = self.agent.page_screenshot(true).await?;
+            Ok((page.png, page.width, page.height, page.truncated))
+        } else {
+            let frame = self.agent.screenshot().await?;
+            Ok((frame.to_png()?, frame.width, frame.height, false))
+        }
+    }
+    fn holder(&self) -> &'static str {
+        self.live.holder()
+    }
+    fn takeover_url(&self) -> Option<String> {
+        self.live.takeover_url()
+    }
+    async fn publish_takeover(&self) {
+        self.live.publish_takeover().await;
+    }
+    fn expect_hand_back(&self) {
+        self.live.expect_hand_back();
+    }
+    async fn wait_for_hand_back(&self, wait: std::time::Duration) -> bool {
+        self.live.wait_for_hand_back(wait).await
+    }
+    fn release_takeover(&self, note: String) -> bool {
+        self.live.session.gate().release(Some(note))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn live_target_summary(tabs: &[agent_workstation::Tab]) -> String {
+    if tabs.is_empty() {
+        return "none".into();
+    }
+    tabs.iter()
+        .take(5)
+        .map(|t| {
+            let url = if t.url.is_empty() {
+                "about:blank"
+            } else {
+                t.url.as_str()
+            };
+            format!("{} ({url})", t.id)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Fail closed with `STALE_TARGET` whenever an explicit `target_id` is absent
+/// from the live CDP target list; never silently fall back to another tab.
+#[cfg(target_os = "linux")]
+async fn resolve_explicit_target<C: BrowserClient>(
+    client: &C,
+    profile: &str,
+    target_id: Option<&str>,
+    activate: bool,
+) -> Result<Option<String>, ToolError> {
+    let Some(id) = target_id else {
+        return Ok(None);
+    };
+    let tabs = client.tabs().await?;
+    let Some(tab) = tabs.iter().find(|t| t.id == id) else {
+        return Err(ToolError::stale_target(format!(
+            "browser target `{id}` does not exist in profile `{profile}` (live targets: {})",
+            live_target_summary(&tabs),
+        )));
+    };
+    if activate
+        && !tab.active
+        && let Err(err) = client.select_tab(&tab.id).await
+    {
+        if let Ok(after) = client.tabs().await
+            && !after.iter().any(|t| t.id == id)
+        {
+            return Err(ToolError::stale_target(format!(
+                "browser target `{id}` disappeared in profile `{profile}` (live targets: {})",
+                live_target_summary(&after),
+            )));
+        }
+        return Err(err);
+    }
+    Ok(Some(tab.id.clone()))
+}
+
+#[cfg(target_os = "linux")]
+async fn require_readable_page<C: BrowserClient>(s: &C) -> Result<(), ToolError> {
     let url = s.current_url().await?;
     if !readable_page_url(&url) {
         let _ = s.navigate("about:blank").await;
@@ -518,15 +739,18 @@ async fn require_readable_page(s: &agent_workstation::Agent<'_>) -> Result<(), T
 }
 
 #[cfg(target_os = "linux")]
-async fn snapshot_json(
-    s: &agent_workstation::Agent<'_>,
+async fn snapshot_json<C: BrowserClient>(
+    s: &C,
 ) -> Result<serde_json::Map<String, serde_json::Value>, ToolError> {
     require_readable_page(s).await?;
     let snap = s.snapshot().await?;
-    let title = active_title(s).await;
+    let (target_id, title) = active_tab_info(s).await;
     let mut m = serde_json::Map::new();
     m.insert("url".into(), snap.url.into());
     m.insert("title".into(), title.into());
+    if let Some(id) = target_id {
+        m.insert("target_id".into(), id.into());
+    }
     m.insert("snapshot".into(), snap.text.into());
     m.insert("snapshot_id".into(), snap.id.into());
     m.insert("refs".into(), snap.refs.into());
@@ -536,23 +760,24 @@ async fn snapshot_json(
 }
 
 #[cfg(target_os = "linux")]
-async fn active_title(s: &agent_workstation::Agent<'_>) -> String {
+async fn active_tab_info<C: BrowserClient>(s: &C) -> (Option<String>, String) {
     s.tabs()
         .await
         .ok()
         .and_then(|tabs| tabs.into_iter().find(|t| t.active))
-        .map(|t| t.title)
-        .unwrap_or_default()
+        .map(|t| ((!t.id.is_empty()).then_some(t.id), t.title))
+        .unwrap_or((None, String::new()))
 }
 
 #[cfg(target_os = "linux")]
 fn with_profile(
     profile: &str,
-    live: &super::session::Live,
+    holder: &str,
+    takeover_url: Option<String>,
     mut m: serde_json::Map<String, serde_json::Value>,
 ) -> serde_json::Value {
     m.insert("profile".into(), profile.into());
-    m.insert("holder".into(), live.holder().into());
+    m.insert("holder".into(), holder.into());
     if m.get("captcha_detected")
         .and_then(serde_json::Value::as_bool)
         == Some(true)
@@ -562,7 +787,7 @@ fn with_profile(
             "Human verification / CAPTCHA detected. Call `browser({request})` and send `takeover_url` (and `screenshot_path`) to the user."
         ).into());
     }
-    if let Some(url) = live.takeover_url() {
+    if let Some(url) = takeover_url {
         m.insert("takeover_url".into(), url.into());
     }
     serde_json::Value::Object(m)
@@ -603,7 +828,6 @@ async fn run(
 ) -> Result<serde_json::Value, ToolError> {
     use super::session;
     use serde_json::json;
-    use std::time::Duration;
 
     let action = if req.action.trim().is_empty() {
         if req.url.is_some() { "open" } else { "status" }
@@ -612,6 +836,16 @@ async fn run(
     }
     .to_ascii_lowercase();
     let profile = super::sanitize_profile_name(req.profile.as_deref(), &caller.profile);
+    let explicit_target = match req.target_id.as_deref() {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(ToolError::invalid("browser `target_id` cannot be empty"));
+            }
+            Some(trimmed.to_string())
+        }
+        None => None,
+    };
     if req.proxy.is_some()
         && matches!(
             action.as_str(),
@@ -635,51 +869,103 @@ async fn run(
             }));
         }
         "status" | "info" | "fingerprint" => {
-            return status(data, &profile, &caller.principal).await;
+            return status(
+                data,
+                &profile,
+                &caller.principal,
+                explicit_target.as_deref(),
+            )
+            .await;
         }
         _ => {}
     }
 
     let live = session::acquire(data, &profile, &caller.principal, req.proxy.as_deref()).await?;
-    let s = live
+    let agent = live
         .session
         .lease(&caller.principal)
         .map_err(ToolError::from)?;
-    let out = match action.as_str() {
+    let client = LiveBrowserClient {
+        agent,
+        live: &live,
+        data,
+    };
+    let out = dispatch_action(
+        &client,
+        data,
+        caller,
+        &profile,
+        &action,
+        explicit_target.as_deref(),
+        req,
+        files,
+    )
+    .await?;
+    live.touch();
+    Ok(out)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_action<C: BrowserClient>(
+    s: &C,
+    data: &Path,
+    caller: &Caller,
+    profile: &str,
+    action: &str,
+    explicit_target: Option<&str>,
+    req: BrowserRequest,
+    files: &crate::agent_file::FileAuthority,
+) -> Result<serde_json::Value, ToolError> {
+    use serde_json::json;
+    use std::time::Duration;
+
+    match action {
         "open" | "goto" | "navigate" => {
             let url = req
                 .url
                 .as_deref()
                 .filter(|u| !u.trim().is_empty())
                 .ok_or_else(|| ToolError::invalid("browser open requires `url`"))?;
-            s.navigate(&navigable_url(url)?).await?;
+            let nav_url = navigable_url(url)?;
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            s.navigate(&nav_url).await?;
             pause(req.wait_ms).await;
-            let mut m = snapshot_json(&s).await?;
+            let mut m = snapshot_json(s).await?;
             m.insert("status".into(), "running".into());
-            with_profile(&profile, &live, m)
+            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
         }
         "back" | "forward" | "reload" => {
-            let url = match action.as_str() {
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            let url = match action {
                 "back" => s.back().await?,
                 "forward" => s.forward().await?,
                 _ => s.reload().await?,
             };
             pause(req.wait_ms).await;
-            with_profile(&profile, &live, json_map(json!({ "url": url })))
+            Ok(with_profile(
+                profile,
+                s.holder(),
+                s.takeover_url(),
+                json_map(json!({ "url": url })),
+            ))
         }
         "snapshot" | "dom" => {
-            let m = snapshot_json(&s).await?;
-            with_profile(&profile, &live, m)
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            let m = snapshot_json(s).await?;
+            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
         }
         "read" | "text" | "content" => {
-            require_readable_page(&s).await?;
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            require_readable_page(s).await?;
             let text = s.read().await?;
             let url = s.current_url().await?;
-            with_profile(
-                &profile,
-                &live,
+            Ok(with_profile(
+                profile,
+                s.holder(),
+                s.takeover_url(),
                 json_map(json!({ "url": url, "text": text })),
-            )
+            ))
         }
         "html" => {
             let target = req
@@ -687,13 +973,15 @@ async fn run(
                 .as_deref()
                 .map(str::trim)
                 .filter(|t| !t.is_empty());
-            require_readable_page(&s).await?;
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            require_readable_page(s).await?;
             let (html, truncated) = bounded(s.html(target).await?);
-            with_profile(
-                &profile,
-                &live,
+            Ok(with_profile(
+                profile,
+                s.holder(),
+                s.takeover_url(),
                 json_map(json!({ "html": html, "truncated": truncated })),
-            )
+            ))
         }
         "eval" | "evaluate" | "js" => {
             let script = req
@@ -701,7 +989,8 @@ async fn run(
                 .as_deref()
                 .filter(|t| !t.trim().is_empty())
                 .ok_or_else(|| ToolError::invalid("browser eval requires `script`"))?;
-            require_readable_page(&s).await?;
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            require_readable_page(s).await?;
             let value = s.eval(script).await?;
             let text = value.to_string();
             let m = if text.len() > MAX_TEXT_RESULT {
@@ -710,39 +999,54 @@ async fn run(
             } else {
                 json!({ "result": value })
             };
-            with_profile(&profile, &live, json_map(m))
+            Ok(with_profile(
+                profile,
+                s.holder(),
+                s.takeover_url(),
+                json_map(m),
+            ))
         }
         "cookies" => {
-            require_readable_page(&s).await?;
-            if let Some(raw) = &req.cookies {
-                let cookies: Vec<agent_workstation::Cookie> =
-                    serde_json::from_value(serde_json::Value::Array(raw.clone()))
-                        .map_err(|e| ToolError::invalid(format!("invalid `cookies`: {e}")))?;
+            let parsed_cookies = if let Some(raw) = &req.cookies {
+                Some(
+                    serde_json::from_value::<Vec<agent_workstation::Cookie>>(
+                        serde_json::Value::Array(raw.clone()),
+                    )
+                    .map_err(|e| ToolError::invalid(format!("invalid `cookies`: {e}")))?,
+                )
+            } else {
+                None
+            };
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            require_readable_page(s).await?;
+            if let Some(cookies) = parsed_cookies {
                 s.set_cookies(&cookies).await?;
             }
             let cookies: Vec<serde_json::Value> =
                 s.cookies(&[]).await?.into_iter().map(cookie_json).collect();
-            with_profile(
-                &profile,
-                &live,
+            Ok(with_profile(
+                profile,
+                s.holder(),
+                s.takeover_url(),
                 json_map(json!({ "count": cookies.len(), "cookies": cookies })),
-            )
+            ))
         }
         "click" => {
-            require_readable_page(&s).await?;
             let target = required_selector(&req, "click")?;
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            require_readable_page(s).await?;
             s.click(target).await?;
             pause(req.wait_ms).await;
             let url = s.current_url().await?;
-            let title = active_title(&s).await;
-            with_profile(
-                &profile,
-                &live,
+            let (_, title) = active_tab_info(s).await;
+            Ok(with_profile(
+                profile,
+                s.holder(),
+                s.takeover_url(),
                 json_map(json!({ "clicked": target, "url": url, "title": title })),
-            )
+            ))
         }
         "fill" | "type" | "input" => {
-            require_readable_page(&s).await?;
             let target = required_selector(&req, "fill")?;
             let secret = req
                 .secret_ref
@@ -755,11 +1059,10 @@ async fn run(
                         .filter(|t| super::secrets::is_secret_reference(t))
                         .map(str::trim)
                 });
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            require_readable_page(s).await?;
             match secret {
-                Some(secret_ref) => {
-                    let resolver = super::secrets::SecretRefs::new(data);
-                    s.fill_secret(target, secret_ref, &resolver, None).await?;
-                }
+                Some(secret_ref) => s.fill_secret(target, secret_ref).await?,
                 None => s.fill(target, req.text.as_deref().unwrap_or("")).await?,
             }
             if req.submit.unwrap_or(false) {
@@ -774,19 +1077,10 @@ async fn run(
             if req.submit.unwrap_or(false) {
                 m.insert("submitted".into(), true.into());
             }
-            with_profile(&profile, &live, m)
+            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
         }
         "press" | "key" | "hold" => {
-            require_readable_page(&s).await?;
             let keys = requested_keys(&req)?;
-            if let Some(target) = req
-                .selector
-                .as_deref()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-            {
-                s.focus(target).await?;
-            }
             let hold = req
                 .hold_ms
                 .or(req.duration_ms)
@@ -794,6 +1088,16 @@ async fn run(
             let hold = Duration::from_millis(hold);
             if hold > agent_workstation::MAX_HOLD {
                 return Err(ToolError::invalid("a key is held for at most 10 s"));
+            }
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            require_readable_page(s).await?;
+            if let Some(target) = req
+                .selector
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                s.focus(target).await?;
             }
             match keys.as_slice() {
                 [chord] if hold.is_zero() => s.press(chord).await?,
@@ -809,43 +1113,49 @@ async fn run(
                 }
             }
             pause(req.wait_ms).await;
-            with_profile(
-                &profile,
-                &live,
+            Ok(with_profile(
+                profile,
+                s.holder(),
+                s.takeover_url(),
                 json_map(json!({ "pressed": keys, "held_ms": hold.as_millis() as u64 })),
-            )
+            ))
         }
         "key_down" | "keydown" | "key_up" | "keyup" => {
-            require_readable_page(&s).await?;
-            for k in requested_keys(&req)? {
+            let keys = requested_keys(&req)?;
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            require_readable_page(s).await?;
+            for k in keys {
                 if action.starts_with("key_d") || action == "keydown" {
                     s.key_down(&k).await?;
                 } else {
                     s.key_up(&k).await?;
                 }
             }
-            with_profile(
-                &profile,
-                &live,
+            Ok(with_profile(
+                profile,
+                s.holder(),
+                s.takeover_url(),
                 json_map(json!({ "held_keys": s.held_keys().await? })),
-            )
+            ))
         }
         "release" | "release_keys" => {
-            require_readable_page(&s).await?;
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            require_readable_page(s).await?;
             s.release_keys().await?;
-            with_profile(&profile, &live, json_map(json!({ "held_keys": [] })))
+            Ok(with_profile(
+                profile,
+                s.holder(),
+                s.takeover_url(),
+                json_map(json!({ "held_keys": [] })),
+            ))
         }
         "screenshot" | "shot" => {
-            require_readable_page(&s).await?;
-            let (png, width, height, truncated) = if req.full_page.unwrap_or(false) {
-                let page = s.page_screenshot(true).await?;
-                (page.png, page.width, page.height, page.truncated)
-            } else {
-                let frame = s.screenshot().await?;
-                (frame.to_png()?, frame.width, frame.height, false)
-            };
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            require_readable_page(s).await?;
+            let (png, width, height, truncated) =
+                s.page_screenshot(req.full_page.unwrap_or(false)).await?;
             let (path, path_refused) =
-                save_screenshot(data, caller, &profile, req.path.as_deref(), &png, files)?;
+                save_screenshot(data, caller, profile, req.path.as_deref(), &png, files)?;
             let mut m = json_map(json!({
                 "path": path.display().to_string(),
                 "bytes": png.len(),
@@ -860,7 +1170,7 @@ async fn run(
             if truncated {
                 m.insert("truncated".into(), true.into());
             }
-            with_profile(&profile, &live, m)
+            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
         }
         "tabs" => {
             let sub = req
@@ -871,23 +1181,32 @@ async fn run(
                 .unwrap_or("list")
                 .to_ascii_lowercase();
             let mut m = match sub.as_str() {
-                "list" => json_map(json!({})),
+                "list" => {
+                    resolve_explicit_target(s, profile, explicit_target, false).await?;
+                    json_map(json!({}))
+                }
                 "new" | "open" => {
+                    if explicit_target.is_some() {
+                        return Err(ToolError::invalid(
+                            "tabs new creates a new tab and does not accept `target_id`",
+                        ));
+                    }
                     let url = navigable_url(req.url.as_deref().unwrap_or("about:blank"))?;
                     let id = s.new_tab(&url).await?;
                     json_map(json!({ "target_id": id, "url": url }))
                 }
                 "activate" | "switch" => {
-                    let id = req
-                        .target_id
-                        .as_deref()
+                    let id = explicit_target
                         .ok_or_else(|| ToolError::invalid("tabs activate requires target_id"))?;
-                    s.select_tab(id).await?;
+                    resolve_explicit_target(s, profile, Some(id), true).await?;
                     json_map(json!({ "active_target_id": id }))
                 }
                 "close" => {
-                    let id = match req.target_id.as_deref() {
-                        Some(id) => id.to_string(),
+                    let id = match explicit_target {
+                        Some(id) => {
+                            resolve_explicit_target(s, profile, Some(id), false).await?;
+                            id.to_string()
+                        }
                         None => s
                             .tabs()
                             .await?
@@ -903,16 +1222,29 @@ async fn run(
                     return Err(ToolError::invalid(format!("unknown tab_action `{other}`")));
                 }
             };
-            m.insert("tabs".into(), json!(s.tabs().await?));
-            with_profile(&profile, &live, m)
+            let tabs = s.tabs().await?;
+            if let Some(active) = tabs.iter().find(|t| t.active)
+                && !active.id.is_empty()
+            {
+                m.insert("active_target_id".into(), active.id.clone().into());
+            }
+            m.insert("tabs".into(), json!(tabs));
+            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
         }
         "takeover" | "human_takeover" | "user_takeover" => {
-            if let Some(url) = req.url.as_deref().filter(|u| !u.trim().is_empty()) {
-                s.navigate(&navigable_url(url)?).await?;
+            let nav_url = req
+                .url
+                .as_deref()
+                .filter(|u| !u.trim().is_empty())
+                .map(navigable_url)
+                .transpose()?;
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
+            if let Some(url) = nav_url {
+                s.navigate(&url).await?;
             }
-            require_readable_page(&s).await?;
-            let shot = match s.screenshot().await.and_then(|f| f.to_png()) {
-                Ok(png) => save_screenshot(data, caller, &profile, None, &png, files)
+            require_readable_page(s).await?;
+            let shot = match s.page_screenshot(false).await {
+                Ok((png, _, _, _)) => save_screenshot(data, caller, profile, None, &png, files)
                     .ok()
                     .map(|(p, _)| p.display().to_string()),
                 Err(_) => None,
@@ -921,9 +1253,9 @@ async fn run(
             // Observe before handing control to the person; evaluation must not
             // turn an otherwise available takeover into an error.
             let captcha = s.eval(&detect_captcha_expression()).await.ok();
-            live.publish_takeover().await;
-            live.expect_hand_back();
-            if live.takeover_url().is_none() {
+            s.publish_takeover().await;
+            s.expect_hand_back();
+            if s.takeover_url().is_none() {
                 return Err(ToolError::unsupported(
                     "this desktop session has no takeover page",
                 ));
@@ -938,7 +1270,7 @@ async fn run(
             }));
             insert_captcha_fields(&mut m, captcha.as_ref());
             if let Some(ms) = req.wait_ms.filter(|ms| *ms > 0) {
-                let completed = live.wait_for_hand_back(hand_back_wait(ms)).await;
+                let completed = s.wait_for_hand_back(hand_back_wait(ms)).await;
                 m.insert("completed".into(), completed.into());
                 m.insert(
                     "status".into(),
@@ -950,22 +1282,23 @@ async fn run(
                     .into(),
                 );
             }
-            with_profile(&profile, &live, m)
+            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
         }
         "takeover_status" | "wait_for_user" | "wait_takeover" => {
-            let wait = matches!(action.as_str(), "wait_for_user" | "wait_takeover")
+            let wait = matches!(action, "wait_for_user" | "wait_takeover")
                 || req.wait_ms.is_some_and(|w| w > 0);
             let completed = if wait {
-                live.wait_for_hand_back(hand_back_wait(req.wait_ms.unwrap_or(60_000)))
+                s.wait_for_hand_back(hand_back_wait(req.wait_ms.unwrap_or(60_000)))
                     .await
             } else {
-                live.holder() == "agent"
+                s.holder() == "agent"
             };
             let mut m = json_map(json!({ "completed": completed }));
-            if live.holder() == "agent" {
+            if s.holder() == "agent" {
+                resolve_explicit_target(s, profile, explicit_target, true).await?;
                 m.insert("url".into(), s.current_url().await?.into());
             }
-            with_profile(&profile, &live, m)
+            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
         }
         "release_takeover" | "end_takeover" | "resume_agent" => {
             let note = req
@@ -973,25 +1306,23 @@ async fn run(
                 .as_deref()
                 .or(req.text.as_deref())
                 .unwrap_or("released by agent");
-            let released = live.session.gate().release(Some(note.to_string()));
+            let released = s.release_takeover(note.to_string());
+            resolve_explicit_target(s, profile, explicit_target, true).await?;
             let url = s.current_url().await?;
-            with_profile(
-                &profile,
-                &live,
+            Ok(with_profile(
+                profile,
+                s.holder(),
+                s.takeover_url(),
                 json_map(json!({ "released_takeover": released, "url": url })),
-            )
+            ))
         }
-        other => {
-            return Err(ToolError::invalid(format!(
-                "unknown browser action `{other}`; expected `open`, `back`, `forward`, `reload`, \
-                 `snapshot`, `read`, `html`, `click`, `fill`, `press`, `hold`, `key_down`, `key_up`, \
-                 `release_keys`, `eval`, `cookies`, `screenshot`, `tabs`, `takeover`, \
-                 `takeover_status`, `wait_for_user`, `release_takeover`, `status`, `profiles`, or `close`"
-            )));
-        }
-    };
-    live.touch();
-    Ok(out)
+        other => Err(ToolError::invalid(format!(
+            "unknown browser action `{other}`; expected `open`, `back`, `forward`, `reload`, \
+             `snapshot`, `read`, `html`, `click`, `fill`, `press`, `hold`, `key_down`, `key_up`, \
+             `release_keys`, `eval`, `cookies`, `screenshot`, `tabs`, `takeover`, \
+             `takeover_status`, `wait_for_user`, `release_takeover`, `status`, `profiles`, or `close`"
+        ))),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1024,23 +1355,41 @@ async fn status(
     data: &Path,
     profile: &str,
     principal: &str,
+    explicit_target: Option<&str>,
 ) -> Result<serde_json::Value, ToolError> {
     use serde_json::json;
     let Some(dir) = super::server_profile_dir(data, profile, false)
         .map_err(|e| ToolError::invalid(e.to_string()))?
     else {
+        if let Some(id) = explicit_target {
+            return Err(ToolError::stale_target(format!(
+                "browser target `{id}` does not exist in stopped profile `{profile}`",
+            )));
+        }
         return Ok(json!({"profile": profile, "status": "stopped", "fingerprint": null}));
     };
     let p = agent_workstation::Profile::new(profile, dir);
     let fingerprint = agent_workstation::Fingerprint::read(&p.fingerprint_path())?;
     match super::session::running(data, profile) {
         Some(live) => {
-            // Never impersonate the holder to observe another caller's tabs or token.
-            let agent = live.session.lease(principal).ok();
+            // Never impersonate or acquire another caller's session to read tabs or token.
+            let is_holder = live.leaseholder().as_deref() == Some(principal);
+            let agent = is_holder
+                .then(|| live.session.lease(principal).ok())
+                .flatten();
             let tabs = match agent.as_ref() {
                 Some(agent) => agent.tabs().await.unwrap_or_default(),
                 None => Vec::new(),
             };
+            if is_holder
+                && let Some(id) = explicit_target
+                && !tabs.iter().any(|t| t.id == id)
+            {
+                return Err(ToolError::stale_target(format!(
+                    "browser target `{id}` does not exist in profile `{profile}` (live targets: {})",
+                    live_target_summary(&tabs),
+                )));
+            }
             let mut metadata = json_map(json!({
                 "profile": profile,
                 "holder": live.holder(),
@@ -1056,11 +1405,18 @@ async fn status(
             add_status_takeover(&mut metadata, agent.is_some(), || live.takeover_url());
             Ok(serde_json::Value::Object(metadata))
         }
-        None => Ok(json!({
-            "profile": profile,
-            "status": "stopped",
-            "fingerprint": fingerprint,
-        })),
+        None => {
+            if let Some(id) = explicit_target {
+                return Err(ToolError::stale_target(format!(
+                    "browser target `{id}` does not exist in stopped profile `{profile}`",
+                )));
+            }
+            Ok(json!({
+                "profile": profile,
+                "status": "stopped",
+                "fingerprint": fingerprint,
+            }))
+        }
     }
 }
 
@@ -1867,6 +2223,10 @@ mod tests {
         for (req, code) in [
             (json!({"action": "close", "proxy": "x:1"}), "INVALID_INPUT"),
             (json!({"action": "status", "proxy": ""}), "INVALID_INPUT"),
+            (
+                json!({"action": "snapshot", "target_id": "   "}),
+                "INVALID_INPUT",
+            ),
         ] {
             let req: BrowserRequest = serde_json::from_value(req).unwrap();
             let err = execute(
@@ -1882,7 +2242,551 @@ mod tests {
         }
         assert!(super::super::session::running(dir.path(), "agent-a").is_none());
     }
-    use serde_json::json;
+
+    #[derive(Clone, Debug)]
+    struct FakeTab {
+        id: String,
+        url: String,
+        title: String,
+        active: bool,
+        text: String,
+    }
+
+    struct FakeBrowserState {
+        tabs: Vec<FakeTab>,
+        actions_on_tab: Vec<(String, String)>,
+        gate: std::sync::Arc<agent_workstation::ControlGate>,
+        takeover_url: Option<String>,
+    }
+
+    impl FakeBrowserState {
+        fn new(tabs: Vec<FakeTab>) -> Self {
+            Self {
+                tabs,
+                actions_on_tab: Vec::new(),
+                gate: agent_workstation::ControlGate::new(),
+                takeover_url: Some("https://takeover.test/?token=secret".into()),
+            }
+        }
+
+        fn active_id(&self) -> String {
+            self.tabs
+                .iter()
+                .find(|t| t.active)
+                .map(|t| t.id.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    struct FakeBrowserClient {
+        principal: String,
+        state: std::sync::Arc<std::sync::Mutex<FakeBrowserState>>,
+    }
+
+    impl FakeBrowserClient {
+        fn check_lease(&self) -> Result<(), ToolError> {
+            self.state
+                .lock()
+                .unwrap()
+                .gate
+                .check(&self.principal)
+                .map_err(ToolError::from)
+        }
+
+        fn record(&self, op: &str) -> String {
+            let mut st = self.state.lock().unwrap();
+            let id = st.active_id();
+            st.actions_on_tab.push((op.to_string(), id.clone()));
+            id
+        }
+    }
+
+    impl BrowserClient for FakeBrowserClient {
+        async fn current_url(&self) -> Result<String, ToolError> {
+            self.check_lease()?;
+            let st = self.state.lock().unwrap();
+            Ok(st
+                .tabs
+                .iter()
+                .find(|t| t.active)
+                .map(|t| t.url.clone())
+                .unwrap_or_default())
+        }
+        async fn tabs(&self) -> Result<Vec<agent_workstation::Tab>, ToolError> {
+            self.check_lease()?;
+            let st = self.state.lock().unwrap();
+            Ok(st
+                .tabs
+                .iter()
+                .map(|t| agent_workstation::Tab {
+                    id: t.id.clone(),
+                    url: t.url.clone(),
+                    title: t.title.clone(),
+                    active: t.active,
+                })
+                .collect())
+        }
+        async fn new_tab(&self, url: &str) -> Result<String, ToolError> {
+            self.check_lease()?;
+            let mut st = self.state.lock().unwrap();
+            for t in &mut st.tabs {
+                t.active = false;
+            }
+            let id = format!("T{}", st.tabs.len() + 1);
+            st.tabs.push(FakeTab {
+                id: id.clone(),
+                url: url.to_string(),
+                title: id.clone(),
+                active: true,
+                text: format!("body:{url}"),
+            });
+            Ok(id)
+        }
+        async fn select_tab(&self, id: &str) -> Result<(), ToolError> {
+            self.check_lease()?;
+            let mut st = self.state.lock().unwrap();
+            if !st.tabs.iter().any(|t| t.id == id) {
+                return Err(ToolError::from(agent_workstation::Error::Protocol(
+                    format!("unknown target {id}"),
+                )));
+            }
+            for t in &mut st.tabs {
+                t.active = t.id == id;
+            }
+            st.actions_on_tab.push(("select_tab".into(), id.into()));
+            Ok(())
+        }
+        async fn close_tab(&self, id: &str) -> Result<(), ToolError> {
+            self.check_lease()?;
+            let mut st = self.state.lock().unwrap();
+            let pos =
+                st.tabs.iter().position(|t| t.id == id).ok_or_else(|| {
+                    ToolError::from(agent_workstation::Error::NotFound(id.into()))
+                })?;
+            let was_active = st.tabs[pos].active;
+            st.tabs.remove(pos);
+            if was_active && let Some(first) = st.tabs.first_mut() {
+                first.active = true;
+            }
+            st.actions_on_tab.push(("close_tab".into(), id.into()));
+            Ok(())
+        }
+        async fn navigate(&self, url: &str) -> Result<String, ToolError> {
+            self.check_lease()?;
+            let mut st = self.state.lock().unwrap();
+            let id = st.active_id();
+            if let Some(tab) = st.tabs.iter_mut().find(|t| t.active) {
+                tab.url = url.to_string();
+            }
+            st.actions_on_tab.push(("navigate".into(), id));
+            Ok(url.to_string())
+        }
+        async fn back(&self) -> Result<String, ToolError> {
+            self.check_lease()?;
+            self.record("back");
+            self.current_url().await
+        }
+        async fn forward(&self) -> Result<String, ToolError> {
+            self.check_lease()?;
+            self.record("forward");
+            self.current_url().await
+        }
+        async fn reload(&self) -> Result<String, ToolError> {
+            self.check_lease()?;
+            self.record("reload");
+            self.current_url().await
+        }
+        async fn snapshot(&self) -> Result<agent_workstation::Snapshot, ToolError> {
+            self.check_lease()?;
+            let id = self.record("snapshot");
+            let st = self.state.lock().unwrap();
+            let tab = st.tabs.iter().find(|t| t.id == id).unwrap();
+            Ok(agent_workstation::Snapshot {
+                id: format!("snap-{id}"),
+                url: tab.url.clone(),
+                text: format!("- heading \"{}\"", tab.title),
+                refs: 1,
+            })
+        }
+        async fn read(&self) -> Result<String, ToolError> {
+            self.check_lease()?;
+            let id = self.record("read");
+            let st = self.state.lock().unwrap();
+            Ok(st.tabs.iter().find(|t| t.id == id).unwrap().text.clone())
+        }
+        async fn html(&self, _target: Option<&str>) -> Result<String, ToolError> {
+            self.check_lease()?;
+            let id = self.record("html");
+            Ok(format!("<main data-tab=\"{id}\"></main>"))
+        }
+        async fn eval(&self, _script: &str) -> Result<serde_json::Value, ToolError> {
+            self.check_lease()?;
+            let id = self.record("eval");
+            Ok(serde_json::json!({ "detected": false, "tab": id }))
+        }
+        async fn cookies(
+            &self,
+            _urls: &[String],
+        ) -> Result<Vec<agent_workstation::Cookie>, ToolError> {
+            self.check_lease()?;
+            self.record("cookies");
+            Ok(Vec::new())
+        }
+        async fn set_cookies(
+            &self,
+            _cookies: &[agent_workstation::Cookie],
+        ) -> Result<(), ToolError> {
+            self.check_lease()?;
+            self.record("set_cookies");
+            Ok(())
+        }
+        async fn click(&self, _target: &str) -> Result<(), ToolError> {
+            self.check_lease()?;
+            self.record("click");
+            Ok(())
+        }
+        async fn fill(&self, _target: &str, _text: &str) -> Result<(), ToolError> {
+            self.check_lease()?;
+            self.record("fill");
+            Ok(())
+        }
+        async fn fill_secret(&self, _target: &str, _secret_ref: &str) -> Result<(), ToolError> {
+            self.check_lease()?;
+            self.record("fill_secret");
+            Ok(())
+        }
+        async fn focus(&self, _target: &str) -> Result<(), ToolError> {
+            self.check_lease()?;
+            self.record("focus");
+            Ok(())
+        }
+        async fn press(&self, _chord: &str) -> Result<(), ToolError> {
+            self.check_lease()?;
+            self.record("press");
+            Ok(())
+        }
+        async fn press_and_hold(
+            &self,
+            _chord: &str,
+            _hold: std::time::Duration,
+        ) -> Result<(), ToolError> {
+            self.check_lease()?;
+            self.record("press_and_hold");
+            Ok(())
+        }
+        async fn key_down(&self, _chord: &str) -> Result<(), ToolError> {
+            self.check_lease()?;
+            self.record("key_down");
+            Ok(())
+        }
+        async fn key_up(&self, _chord: &str) -> Result<(), ToolError> {
+            self.check_lease()?;
+            self.record("key_up");
+            Ok(())
+        }
+        async fn release_keys(&self) -> Result<(), ToolError> {
+            self.check_lease()?;
+            self.record("release_keys");
+            Ok(())
+        }
+        async fn held_keys(&self) -> Result<Vec<String>, ToolError> {
+            self.check_lease()?;
+            Ok(Vec::new())
+        }
+        async fn page_screenshot(
+            &self,
+            _full_page: bool,
+        ) -> Result<(Vec<u8>, u32, u32, bool), ToolError> {
+            self.check_lease()?;
+            self.record("screenshot");
+            Ok((vec![137, 80, 78, 71], 100, 100, false))
+        }
+        fn holder(&self) -> &'static str {
+            match self.state.lock().unwrap().gate.holder() {
+                agent_workstation::Holder::Agent => "agent",
+                agent_workstation::Holder::Human { .. } => "human",
+            }
+        }
+        fn takeover_url(&self) -> Option<String> {
+            self.state.lock().unwrap().takeover_url.clone()
+        }
+        async fn publish_takeover(&self) {}
+        fn expect_hand_back(&self) {}
+        async fn wait_for_hand_back(&self, _wait: std::time::Duration) -> bool {
+            false
+        }
+        fn release_takeover(&self, note: String) -> bool {
+            self.state.lock().unwrap().gate.release(Some(note))
+        }
+    }
+
+    async fn dispatch_fake(
+        client: &FakeBrowserClient,
+        data: &Path,
+        caller: &Caller,
+        profile: &str,
+        req: Value,
+    ) -> Result<Value, Error> {
+        let req: BrowserRequest = serde_json::from_value(req).unwrap();
+        let redact = req.carries_secret();
+        let mutating = request_mutates(&req);
+        let action = req.action.trim().to_ascii_lowercase();
+        let target_id = req.target_id.clone();
+        dispatch_action(
+            client,
+            data,
+            caller,
+            profile,
+            &action,
+            target_id.as_deref().map(str::trim),
+            req,
+            &crate::agent_file::FileAuthority::Own,
+        )
+        .await
+        .map_err(|e| e.into_action_error(redact, mutating))
+    }
+
+    #[tokio::test]
+    async fn explicit_target_id_selects_matching_tab_and_preserves_other_tabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(FakeBrowserState::new(vec![
+            FakeTab {
+                id: "7B4E44C4".into(),
+                url: "https://a.example/".into(),
+                title: "Tab A".into(),
+                active: true,
+                text: "alpha".into(),
+            },
+            FakeTab {
+                id: "2689D04D".into(),
+                url: "https://b.example/".into(),
+                title: "Tab B".into(),
+                active: false,
+                text: "beta".into(),
+            },
+        ])));
+        state.lock().unwrap().gate.acquire("fortuna").unwrap();
+        let fortuna = Caller {
+            agent_id: Some("agt_fortuna".into()),
+            principal: "fortuna".into(),
+            profile: "sylphx-ga4-agent".into(),
+        };
+        let client = FakeBrowserClient {
+            principal: "fortuna".into(),
+            state: state.clone(),
+        };
+
+        let snap = dispatch_fake(
+            &client,
+            dir.path(),
+            &fortuna,
+            "sylphx-ga4-agent",
+            json!({"action": "snapshot", "target_id": "2689D04D"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snap["target_id"], "2689D04D");
+        assert_eq!(snap["url"], "https://b.example/");
+        assert_eq!(snap["title"], "Tab B");
+
+        let closed = dispatch_fake(
+            &client,
+            dir.path(),
+            &fortuna,
+            "sylphx-ga4-agent",
+            json!({"action": "tabs", "tab_action": "close", "target_id": "2689D04D"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(closed["closed_target_id"], "2689D04D");
+        assert_eq!(closed["active_target_id"], "7B4E44C4");
+        assert_eq!(closed["tabs"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_target_id_fails_closed_with_stale_target_never_falling_back_to_about_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(FakeBrowserState::new(vec![
+            FakeTab {
+                id: "C2D59D53".into(),
+                url: "about:blank".into(),
+                title: String::new(),
+                active: true,
+                text: String::new(),
+            },
+        ])));
+        state.lock().unwrap().gate.acquire("fortuna").unwrap();
+        let fortuna = Caller {
+            agent_id: Some("agt_fortuna".into()),
+            principal: "fortuna".into(),
+            profile: "sylphx-ga4-agent".into(),
+        };
+        let client = FakeBrowserClient {
+            principal: "fortuna".into(),
+            state: state.clone(),
+        };
+
+        let stale = "7B4E44C4";
+        let requests = vec![
+            json!({"action": "snapshot", "target_id": stale}),
+            json!({"action": "open", "url": "https://analytics.google.com", "target_id": stale}),
+            json!({"action": "navigate", "url": "https://analytics.google.com", "target_id": stale}),
+            json!({"action": "back", "target_id": stale}),
+            json!({"action": "forward", "target_id": stale}),
+            json!({"action": "reload", "target_id": stale}),
+            json!({"action": "read", "target_id": stale}),
+            json!({"action": "html", "target_id": stale}),
+            json!({"action": "eval", "script": "location.href", "target_id": stale}),
+            json!({"action": "cookies", "target_id": stale}),
+            json!({"action": "click", "selector": "#btn", "target_id": stale}),
+            json!({"action": "fill", "selector": "#q", "text": "x", "target_id": stale}),
+            json!({"action": "type", "selector": "#q", "text": "x", "target_id": stale}),
+            json!({"action": "press", "key": "Enter", "target_id": stale}),
+            json!({"action": "hold", "key": "Shift", "hold_ms": 10, "target_id": stale}),
+            json!({"action": "key_down", "key": "Shift", "target_id": stale}),
+            json!({"action": "key_up", "key": "Shift", "target_id": stale}),
+            json!({"action": "release_keys", "target_id": stale}),
+            json!({"action": "screenshot", "target_id": stale}),
+            json!({"action": "takeover", "reason": "captcha", "target_id": stale}),
+            json!({"action": "release_takeover", "target_id": stale}),
+            json!({"action": "tabs", "tab_action": "list", "target_id": stale}),
+            json!({"action": "tabs", "tab_action": "activate", "target_id": stale}),
+            json!({"action": "tabs", "tab_action": "close", "target_id": stale}),
+        ];
+
+        for req in requests {
+            let action = req["action"].as_str().unwrap().to_string();
+            let err = dispatch_fake(&client, dir.path(), &fortuna, "sylphx-ga4-agent", req)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("\"code\":\"STALE_TARGET\"")
+                    && err.contains("\"retry\":\"never\"")
+                    && err.contains(stale),
+                "action {action} must fail closed with STALE_TARGET: {err}"
+            );
+        }
+
+        let st = state.lock().unwrap();
+        assert!(
+            st.actions_on_tab.is_empty(),
+            "stale target_id must never touch fallback tab: {:?}",
+            st.actions_on_tab
+        );
+        assert_eq!(st.tabs.len(), 1);
+        assert_eq!(st.tabs[0].id, "C2D59D53");
+        assert_eq!(st.tabs[0].url, "about:blank");
+    }
+
+    #[tokio::test]
+    async fn shared_profile_isolates_concurrent_callers_with_desktop_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(FakeBrowserState::new(vec![
+            FakeTab {
+                id: "T_FORTUNA".into(),
+                url: "https://analytics.google.com/".into(),
+                title: "GA4".into(),
+                active: true,
+                text: "ga4-dashboard".into(),
+            },
+        ])));
+        state.lock().unwrap().gate.acquire("fortuna").unwrap();
+        let fortuna = Caller {
+            agent_id: Some("agt_fortuna".into()),
+            principal: "fortuna".into(),
+            profile: "sylphx-ga4-agent".into(),
+        };
+        let argus = Caller {
+            agent_id: Some("agt_argus".into()),
+            principal: "argus".into(),
+            profile: "sylphx-ga4-agent".into(),
+        };
+
+        let fortuna_client = FakeBrowserClient {
+            principal: "fortuna".into(),
+            state: state.clone(),
+        };
+        let snap = dispatch_fake(
+            &fortuna_client,
+            dir.path(),
+            &fortuna,
+            "sylphx-ga4-agent",
+            json!({"action": "snapshot", "target_id": "T_FORTUNA"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snap["target_id"], "T_FORTUNA");
+        let recorded_before = state.lock().unwrap().actions_on_tab.len();
+
+        for action in [
+            json!({"action": "open", "url": "https://other.test", "profile": "sylphx-ga4-agent"}),
+            json!({"action": "snapshot", "profile": "sylphx-ga4-agent"}),
+            json!({"action": "tabs", "tab_action": "close", "target_id": "T_FORTUNA", "profile": "sylphx-ga4-agent"}),
+            json!({"action": "takeover", "profile": "sylphx-ga4-agent"}),
+        ] {
+            let err = {
+                let gate_err = state
+                    .lock()
+                    .unwrap()
+                    .gate
+                    .acquire(&argus.principal)
+                    .unwrap_err();
+                super::super::session::in_use("sylphx-ga4-agent", gate_err)
+                    .into_action_error(false, true)
+                    .to_string()
+            };
+            assert!(
+                err.contains("\"code\":\"DESKTOP_IN_USE\"")
+                    && err.contains("sylphx-ga4-agent")
+                    && err.contains("fortuna"),
+                "unexpected error for {action}: {err}"
+            );
+            let argus_client = FakeBrowserClient {
+                principal: argus.principal.clone(),
+                state: state.clone(),
+            };
+            let direct_err = dispatch_fake(
+                &argus_client,
+                dir.path(),
+                &argus,
+                "sylphx-ga4-agent",
+                action,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                direct_err.contains("\"code\":\"DESKTOP_IN_USE\""),
+                "{direct_err}"
+            );
+        }
+
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.actions_on_tab.len(), recorded_before);
+            assert_eq!(st.tabs[0].url, "https://analytics.google.com/");
+        }
+
+        assert!(state.lock().unwrap().gate.release_lease("fortuna"));
+        state.lock().unwrap().gate.acquire("argus").unwrap();
+        let argus_client = FakeBrowserClient {
+            principal: "argus".into(),
+            state: state.clone(),
+        };
+        let argus_snap = dispatch_fake(
+            &argus_client,
+            dir.path(),
+            &argus,
+            "sylphx-ga4-agent",
+            json!({"action": "snapshot"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(argus_snap["target_id"], "T_FORTUNA");
+    }
+
+    use serde_json::{Value, json};
 }
 
 #[cfg(all(test, not(target_os = "linux")))]

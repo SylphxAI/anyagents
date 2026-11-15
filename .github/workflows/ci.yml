@@ -139,6 +139,17 @@ jobs:
             cat "$RUNNER_TEMP/host-memory-seat-receipt.json"
           fi
 
+      - name: Privileged config ACL acceptance
+        run: |
+          set -euo pipefail
+          cargo test -p anyagents --bin anyagents --locked --no-run --message-format=json > "$RUNNER_TEMP/config-acl-build.json"
+          test_binary=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/config-acl-build.json")
+          test_name=seat_tree::privileged_config_tests::privileged_config_acl_cross_uid
+          # A missing module/test must not become a successful zero-test run.
+          "$test_binary" --ignored --exact "$test_name" --list | grep -Fx "$test_name: test"
+          sudo env LC_ALL=C ANYAGENTS_REQUIRE_CONFIG_ACL_TEST=1 ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST=1 /usr/bin/setpriv --bounding-set=-dac_override,-dac_read_search -- "$test_binary" --ignored --exact "$test_name" --nocapture 2>&1 | tee "$RUNNER_TEMP/config-acl-test.log"
+          grep -Fx 'CONFIG_ACL_PRIVILEGED_ACCEPTANCE_EXECUTED' "$RUNNER_TEMP/config-acl-test.log"
+
       - name: Cross-seat repositories
         run: |
           set -euo pipefail

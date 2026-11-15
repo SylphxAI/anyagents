@@ -324,7 +324,7 @@ async fn transport_healthy(runtime_dir: &Path, dir: &Path) -> Result<bool, ToolE
 }
 
 /// A clear refusal for an agent whose profile another agent holds.
-fn in_use(profile: &str, e: agent_workstation::Error) -> ToolError {
+pub(super) fn in_use(profile: &str, e: agent_workstation::Error) -> ToolError {
     match e {
         agent_workstation::Error::Leased { principal, since } => ToolError {
             code: "DESKTOP_IN_USE",
@@ -387,6 +387,27 @@ fn refuse_file_access_flags(args: &[String]) -> Result<(), ToolError> {
     Ok(())
 }
 
+/// Mesa llvmpipe's rasterizer thread count. On a virtual X display with GLX
+/// (Xvfb) Chromium's GPU process renders through llvmpipe, which otherwise
+/// starts one thread per core up to 32; a page that animates without end
+/// then holds every one of them busy at 60 fps.
+const LLVMPIPE_THREADS_ENV: &str = "LP_NUM_THREADS";
+
+/// Default rasterizer thread count: a software-rendered browser costs about
+/// two cores at most, while WebGL, screenshots and takeover keep rendering.
+/// The server's own `LP_NUM_THREADS` overrides it only when it is a whole
+/// number: Mesa reads anything else as unset, one thread per core.
+const LLVMPIPE_THREADS: &str = "2";
+
+/// The rasterizer thread count Chromium is given: the server's own when it
+/// is a whole number, else [`LLVMPIPE_THREADS`].
+fn llvmpipe_threads() -> String {
+    std::env::var(LLVMPIPE_THREADS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .map_or_else(|| LLVMPIPE_THREADS.to_string(), |count| count.to_string())
+}
+
 /// Chromium never inherits the server's credentials or configuration.
 fn chromium_environment(home: &Path, tmp: &Path) -> Result<Vec<(String, String)>, ToolError> {
     let text = |p: PathBuf| {
@@ -419,6 +440,7 @@ fn chromium_environment(home: &Path, tmp: &Path) -> Result<Vec<(String, String)>
             ));
         }
     }
+    env.push((LLVMPIPE_THREADS_ENV.into(), llvmpipe_threads()));
     Ok(env)
 }
 
@@ -616,7 +638,9 @@ pub async fn stop_authorized(
         .await
         .map_err(|_| session_busy())?;
     if let Some(live) = guard.as_ref() {
-        live.session.lease(principal).map_err(ToolError::from)?;
+        live.session
+            .lease(principal)
+            .map_err(|e| in_use(profile, e))?;
     }
     let closing = tokio::spawn(close_slot(guard));
     wait_for_shutdown(
@@ -874,5 +898,38 @@ mod tests {
             .unwrap();
         assert!(slot.try_lock().is_ok());
         assert!(SHUTDOWN_WAIT <= std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn chromium_software_rendering_is_bounded_to_a_few_threads() {
+        let _env = crate::server::tests::env_lock();
+        struct Reset(Option<std::ffi::OsString>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => unsafe { std::env::set_var(LLVMPIPE_THREADS_ENV, value) },
+                    None => unsafe { std::env::remove_var(LLVMPIPE_THREADS_ENV) },
+                }
+            }
+        }
+        let _reset = Reset(std::env::var_os(LLVMPIPE_THREADS_ENV));
+        let counts = |server: Option<&str>| {
+            match server {
+                Some(value) => unsafe { std::env::set_var(LLVMPIPE_THREADS_ENV, value) },
+                None => unsafe { std::env::remove_var(LLVMPIPE_THREADS_ENV) },
+            }
+            chromium_environment(Path::new("/profile/home"), Path::new("/profile/tmp"))
+                .unwrap()
+                .into_iter()
+                .filter(|(name, _)| name == LLVMPIPE_THREADS_ENV)
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(counts(None), vec!["2"]);
+        assert_eq!(counts(Some("4")), vec!["4"]);
+        assert_eq!(counts(Some(" 0 ")), vec!["0"]);
+        for unreadable in ["", "-1", "abc", "2.5"] {
+            assert_eq!(counts(Some(unreadable)), vec!["2"], "{unreadable:?}");
+        }
     }
 }
