@@ -4444,13 +4444,7 @@ async fn outbound_retry_route(
             }
             let sender = store.agent(&held.agent_id).map_err(ApiError::from_store)?;
             let actor = Actor::Agent(sender.name.clone());
-            let body = SendRequest {
-                to: vec![held.destination.clone()],
-                text: held.body.clone(),
-                sender: Some(actor.as_address()),
-                reply_to: held.reply_to.clone(),
-                ..SendRequest::default()
-            };
+            let body = held_send(held, &actor);
             let plan = plan_send(store, &Principal::Operator, &actor, &body)?;
             let response = send_sync(store, &actor, body, plan, None)?.0;
             skipped = response.skipped;
@@ -4462,6 +4456,19 @@ async fn outbound_retry_route(
         }))
     })
     .await
+}
+
+/// The send a retry of `held` makes: the same text to the same destination,
+/// as its agent and through the bot it named.
+fn held_send(held: &outbound_history::Unsettled, actor: &Actor) -> SendRequest {
+    SendRequest {
+        to: vec![held.destination.clone()],
+        text: held.body.clone(),
+        sender: Some(actor.as_address()),
+        reply_to: held.reply_to.clone(),
+        bot: held.bot.clone(),
+        ..SendRequest::default()
+    }
 }
 
 /// `POST /v1/outbound/{key}/discard`: settle a held message without sending
@@ -4503,6 +4510,7 @@ pub(crate) fn unsettled_view(
         key: held.effect_key.clone(),
         agent_id: held.agent_id.to_string(),
         destination: held.destination.clone(),
+        bot: held.bot.clone(),
         since_ms: held.since_ms,
         error: held.error.clone(),
         excerpt: held.excerpt(),
@@ -4819,6 +4827,7 @@ fn finish_spawn(
             store,
             caller_id,
             &format!("agent:{}", agent.name),
+            None,
             None,
             prompt,
             Some(&key),
@@ -6781,6 +6790,8 @@ fn interact_sync(
         ));
     }
     let actor = Actor::Agent(actor_name.to_string());
+    let bot = body.bot.clone();
+    let bot = bot.as_deref();
     // Resolve target into optional (chat_id, message_id, thread_id, stored_message).
     let mut tg_coords: Option<(i64, i64, Option<i64>)> = None;
     let mut stored_msg: Option<anyagents_core::Message> = None;
@@ -6830,7 +6841,16 @@ fn interact_sync(
             let emoji = body.emoji.as_deref().map(str::trim);
             if let Some((chat_id, message_id, thread_id)) = tg_coords {
                 crate::telegram::react_message(
-                    store, data_dir, actor_name, chat_id, message_id, emoji, thread_id,
+                    store,
+                    data_dir,
+                    actor_name,
+                    bot,
+                    crate::telegram::ChatMessage {
+                        chat_id,
+                        message_id,
+                        thread: thread_id,
+                    },
+                    emoji,
                 )
                 .map_err(ApiError::from_store)?;
                 Ok(Json(InteractResponse {
@@ -6896,15 +6916,19 @@ fn interact_sync(
                     store,
                     data_dir,
                     actor_name,
-                    chat_id,
-                    message_id,
+                    bot,
+                    crate::telegram::ChatMessage {
+                        chat_id,
+                        message_id,
+                        thread: thread_id,
+                    },
                     Some("👍"),
-                    thread_id,
                 );
                 let posted_id = crate::telegram::post_text(
                     store,
                     data_dir,
                     actor_name,
+                    bot,
                     chat_id,
                     &ballot,
                     Some(message_id),
@@ -6961,7 +6985,16 @@ fn interact_sync(
                 let updated = toggle_checklist_items(&msg.text, &body.options, mark_done);
                 if let Some((chat_id, message_id, thread_id)) = tg_coords {
                     crate::telegram::edit_message(
-                        store, data_dir, actor_name, chat_id, message_id, &updated, thread_id,
+                        store,
+                        data_dir,
+                        actor_name,
+                        bot,
+                        crate::telegram::ChatMessage {
+                            chat_id,
+                            message_id,
+                            thread: thread_id,
+                        },
+                        &updated,
                     )
                     .map_err(ApiError::from_store)?;
                 }
@@ -6994,7 +7027,16 @@ fn interact_sync(
                 )
             })?;
             crate::telegram::edit_message(
-                store, data_dir, actor_name, chat_id, message_id, new_text, thread_id,
+                store,
+                data_dir,
+                actor_name,
+                bot,
+                crate::telegram::ChatMessage {
+                    chat_id,
+                    message_id,
+                    thread: thread_id,
+                },
+                new_text,
             )
             .map_err(ApiError::from_store)?;
             Ok(Json(InteractResponse {
@@ -7011,8 +7053,10 @@ fn interact_sync(
                     "delete target must resolve to a Telegram message",
                 )
             })?;
-            crate::telegram::delete_chat_message(store, data_dir, actor_name, chat_id, message_id)
-                .map_err(ApiError::from_store)?;
+            crate::telegram::delete_chat_message(
+                store, data_dir, actor_name, bot, chat_id, message_id,
+            )
+            .map_err(ApiError::from_store)?;
             Ok(Json(InteractResponse {
                 ok: true,
                 action,
@@ -7028,8 +7072,10 @@ fn interact_sync(
                 )
             })?;
             let pin = action == "pin";
-            crate::telegram::pin_message(store, data_dir, actor_name, chat_id, message_id, pin)
-                .map_err(ApiError::from_store)?;
+            crate::telegram::pin_message(
+                store, data_dir, actor_name, bot, chat_id, message_id, pin,
+            )
+            .map_err(ApiError::from_store)?;
             Ok(Json(InteractResponse {
                 ok: true,
                 action,
@@ -7047,7 +7093,7 @@ fn interact_sync(
                     "stop_poll target must resolve to a Telegram poll message",
                 )
             })?;
-            crate::telegram::close_poll(store, data_dir, actor_name, chat_id, message_id)
+            crate::telegram::close_poll(store, data_dir, actor_name, bot, chat_id, message_id)
                 .map_err(ApiError::from_store)?;
             Ok(Json(InteractResponse {
                 ok: true,
@@ -7838,6 +7884,7 @@ fn send_sync(
                         store,
                         sid,
                         &format!("agent:{name}"),
+                        None,
                         body.reply_to.as_deref(),
                         &composed_body,
                         history_key.as_deref(),
@@ -7874,6 +7921,7 @@ fn send_sync(
                         store,
                         sid,
                         &dest,
+                        None,
                         body.reply_to.as_deref(),
                         &composed_body,
                         history_key.as_deref(),
@@ -7923,6 +7971,7 @@ fn send_sync(
                         store,
                         sid,
                         address,
+                        body.bot.as_deref(),
                         body.reply_to.as_deref(),
                         &composed_body,
                         history_key.as_deref(),
@@ -8015,6 +8064,14 @@ fn send_key(body: &SendRequest) -> Option<String> {
         body.text.as_str(),
     ] {
         bytes.extend_from_slice(part.as_bytes());
+        bytes.push(0);
+    }
+    // A named bot is part of the send: the same key through another bot is
+    // another send, resolved and authorized on its own. A send that names no
+    // bot keeps the key it always had.
+    if let Some(bot) = body.bot.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        bytes.extend_from_slice(b"bot\0");
+        bytes.extend_from_slice(bot.to_ascii_lowercase().as_bytes());
         bytes.push(0);
     }
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -8346,8 +8403,16 @@ fn prepare_telegram(
 ) -> Result<(), ApiError> {
     let from = telegram_sender(actor)?;
     let (chat_id, thread_id, reply_to) = telegram_target(chat, thread, reply, body)?;
-    crate::telegram::outbound_call(store, from, chat_id, &body.text, reply_to, thread_id)
-        .map_err(ApiError::from_store)?;
+    crate::telegram::outbound_call(
+        store,
+        from,
+        body.bot.as_deref(),
+        chat_id,
+        &body.text,
+        reply_to,
+        thread_id,
+    )
+    .map_err(ApiError::from_store)?;
     Ok(())
 }
 
@@ -8485,6 +8550,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &media.kind,
             &media.source,
@@ -8501,6 +8567,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             loc.latitude,
             loc.longitude,
@@ -8515,6 +8582,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &poll.question,
             &poll.options,
@@ -8529,6 +8597,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &cl.title,
             &cl.tasks,
@@ -8542,6 +8611,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &art.title,
             art.content.as_deref(),
@@ -8557,6 +8627,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &body.text,
             reply_to,
@@ -8564,9 +8635,9 @@ fn deliver_telegram(
         )
         .map_err(ApiError::from_store)?
     };
-    // Remember the chat this agent answers in, so a post it makes there reaches
-    // the other agents on that chat as a mailbox message.
-    crate::telegram::record_chat(store, from, chat_id).map_err(ApiError::from_store)?;
+    // The post itself remembered the chat on the bot it went through
+    // (`deliver_locally_with_metadata`), so later posts there reach the other
+    // agents on that chat as mailbox messages.
     Ok(Delivery {
         to: address.to_string(),
         id: message_id.to_string(),
@@ -12311,6 +12382,27 @@ exec '{}' "$@"
         send_sync(store, actor, body, plan, key)
             .unwrap_or_else(|e| panic!("{}", e.message))
             .0
+    }
+
+    #[test]
+    fn a_named_bot_is_part_of_the_send_key() {
+        let body = |bot: Option<&str>| SendRequest {
+            sender: Some("agent:ada".into()),
+            to: vec!["telegram:chat:-1007".into()],
+            text: "hello".into(),
+            bot: bot.map(str::to_string),
+            idempotency_key: Some("call-1".into()),
+            ..Default::default()
+        };
+        let unnamed = send_key(&body(None)).unwrap();
+        assert_eq!(send_key(&body(Some("  "))).unwrap(), unnamed);
+        let desk = send_key(&body(Some("@ada_desk_bot"))).unwrap();
+        assert_eq!(send_key(&body(Some("@ADA_DESK_BOT"))).unwrap(), desk);
+        for other in ["@ada_promo_bot", "@bea_bot", "@nobody"] {
+            let key = send_key(&body(Some(other))).unwrap();
+            assert_ne!(key, desk, "{other}");
+            assert_ne!(key, unnamed, "{other}");
+        }
     }
 
     /// A send that cannot wake an archived recipient (through an alias, or to

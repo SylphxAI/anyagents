@@ -2870,6 +2870,48 @@ mod tests {
     }
 
     #[test]
+    fn due_at_wakes_a_root_agent_scaled_to_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let owner = store
+            .create_agent(NewAgent::new("idle-root", "codex"))
+            .unwrap();
+        assert!(owner.parent_id.is_none());
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        store.set_agent_state(&owner.id, "idle").unwrap();
+        let now = anyagents_core::now_ms();
+        store
+            .create_schedule(NewSchedule {
+                agent_id: owner.id.clone(),
+                kind: "at".into(),
+                spec: "in 1m".into(),
+                prompt: "scheduled wake".into(),
+                interval_ms: None,
+                next_fire_at_ms: Some(now + 60_000),
+                watch_baseline: None,
+            })
+            .unwrap();
+        let health = HealthBoard::default();
+        let wakes = store.subscribe();
+        let mut timer = Timer::local();
+        // Not yet due: the idle root stays released and is not woken.
+        assert_eq!(timer.step(&store, &health, 0, now).fired, 0);
+        assert_eq!(store.agent(&owner.id).unwrap().state, "idle");
+        // Due: the wake is in its mailbox, and the row change the supervisor
+        // starts a worker on is published with it.
+        assert_eq!(timer.step(&store, &health, 0, now + 60_000).fired, 1);
+        assert_eq!(store.agent(&owner.id).unwrap().state, "running");
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "scheduled wake");
+        let woke: Vec<_> = wakes.try_iter().collect();
+        assert!(
+            woke.iter().any(|wake| matches!(wake, anyagents_core::Wake::Agent { agent_id } if agent_id == &owner.id)),
+            "{woke:?}"
+        );
+    }
+
+    #[test]
     fn overdue_at_enters_mailbox_while_owner_busy_or_paused() {
         for reason in ["busy", "paused"] {
             let dir = tempfile::tempdir().unwrap();

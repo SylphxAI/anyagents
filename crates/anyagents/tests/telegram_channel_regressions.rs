@@ -204,6 +204,7 @@ fn offline_provider_errors() {
             &store,
             dir.path(),
             "ada",
+            None,
             -1007,
             "private outbound text",
             Some(55),
@@ -217,7 +218,7 @@ fn offline_provider_errors() {
         assert_eq!(details["class"], class);
         assert_eq!(
             details["channel_id"],
-            telegram::outbound_call(&store, "ada", -1007, "", None, None)
+            telegram::outbound_call(&store, "ada", None, -1007, "", None, None)
                 .unwrap()
                 .channel_id
                 .as_str()
@@ -267,6 +268,7 @@ fn offline_provider_errors() {
         &store,
         dir.path(),
         "ada",
+        None,
         -1007,
         "private outbound text",
         None,
@@ -305,6 +307,7 @@ fn offline_topic_quote_delivery_survives_restart_and_replay() {
             &store,
             dir.path(),
             "ada",
+            None,
             -1007,
             "topic answer",
             Some(55),
@@ -361,7 +364,7 @@ fn offline_lost_or_invalid_acknowledgement_is_uncertain_and_never_retried() {
     ] {
         let (address, task) = fake_wire(wire);
         unsafe { std::env::set_var("ANYAGENTS_TELEGRAM_API", address); }
-        let err = telegram::post_text(&store, dir.path(), "ada", -1007,
+        let err = telegram::post_text(&store, dir.path(), "ada", None, -1007,
             "private outbound text", Some(55), Some(3)).unwrap_err().to_string();
         let request = task.join().unwrap();
         assert_eq!(request["rich_message"]["markdown"], "private outbound text");
@@ -409,6 +412,7 @@ fn offline_unknown_fields_and_redirect_do_not_expose_or_forward_secrets() {
         &store,
         dir.path(),
         "ada",
+        None,
         -1007,
         "private outbound text",
         None,
