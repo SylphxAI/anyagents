@@ -178,12 +178,12 @@ fn members(group: i32) -> Result<Vec<Process>> {
             }
             let stat = std::fs::read_to_string(entry.path().join("stat"))?;
             let (alive, _, g, _) = parse_stat(&stat)?;
-            if alive && g == group {
-                if let Some(p) = process(pid)? {
-                    if p.group == group {
-                        out.push(p);
-                    }
-                }
+            if alive
+                && g == group
+                && let Some(p) = process(pid)?
+                && p.group == group
+            {
+                out.push(p);
             }
             Ok(())
         };
@@ -292,14 +292,14 @@ fn signal(p: &Process, sig: i32) -> Result<()> {
     Ok(())
 }
 fn stop_members(all: Vec<Process>, dir: &Path, asked: bool) -> Result<()> {
-    if let Some(browser) = browser_member(&all, dir) {
-        if !(asked && wait_gone(browser, Duration::from_secs(10))?) {
-            signal(browser, libc::SIGTERM)?;
+    if let Some(browser) = browser_member(&all, dir)
+        && !(asked && wait_gone(browser, Duration::from_secs(10))?)
+    {
+        signal(browser, libc::SIGTERM)?;
+        if !wait_gone(browser, Duration::from_secs(5))? {
+            signal(browser, libc::SIGKILL)?;
             if !wait_gone(browser, Duration::from_secs(5))? {
-                signal(browser, libc::SIGKILL)?;
-                if !wait_gone(browser, Duration::from_secs(5))? {
-                    return Err(invalid("legacy browser did not exit"));
-                }
+                return Err(invalid("legacy browser did not exit"));
             }
         }
     }

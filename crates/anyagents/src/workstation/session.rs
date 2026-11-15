@@ -584,10 +584,10 @@ pub async fn stop(data: &Path, profile: &str) -> bool {
     // Detach, do not cancel, on timeout: close may be flushing the profile.
     // Retain the registry slot until it finishes, excluding every new writer.
     let closing = tokio::spawn(async move { close_slot(slot.lock_owned().await).await });
-    match wait_for_shutdown(closing, SHUTDOWN_WAIT).await {
-        Ok(was_running) => was_running,
-        _ => true, // shutdown requested; completion can outlive the caller budget
-    }
+    // Shutdown requested; completion can outlive the caller budget.
+    wait_for_shutdown(closing, SHUTDOWN_WAIT)
+        .await
+        .unwrap_or(true)
 }
 
 // Dropping a JoinHandle detaches the cleanup; it never releases the writer
