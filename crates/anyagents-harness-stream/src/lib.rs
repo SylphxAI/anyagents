@@ -322,6 +322,9 @@ struct State {
     /// Whether the currently open Antigravity turn has shown meaningful
     /// progress (model response text, planner step, or tool execution).
     agy_turn_has_work: bool,
+    /// The message whose turn closed on a stray syntax fragment and was told
+    /// once to continue: a turn is continued at most once.
+    agy_continued: Option<String>,
     /// The session's cascade was retired (its record is poisoned): no later
     /// line names it again.
     session_retired: bool,
@@ -1348,9 +1351,10 @@ impl StreamHarness {
         let wake = Arc::clone(&self.wake);
         let spec = self.spec.clone();
         let agy_rpc = self.agy_rpc.clone();
+        let stdin = Arc::clone(&self.stdin);
         match thread::Builder::new()
             .name(spec.name.clone())
-            .spawn(move || read_stdout(stdout, shared, wake, spec, agy_rpc, generation))
+            .spawn(move || read_stdout(stdout, stdin, shared, wake, spec, agy_rpc, generation))
         {
             Ok(handle) => self.reader = Some(handle),
             Err(err) => {
@@ -1670,6 +1674,7 @@ impl State {
             agy_queued: Vec::new(),
             agy_taken: HashSet::new(),
             agy_turn_has_work: false,
+            agy_continued: None,
             session_retired: false,
             stdin_broken: false,
             finished: HashSet::new(),
@@ -1698,6 +1703,7 @@ impl State {
 
 fn read_stdout(
     stdout: ChildStdout,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     shared: Arc<Mutex<State>>,
     wake: Arc<Condvar>,
     spec: StreamSpec,
@@ -1806,11 +1812,37 @@ fn read_stdout(
         {
             agy_settle(&shared, &wake, rpc, generation);
         }
+        // A turn that closed on a stray syntax fragment, with no tool call,
+        // stopped short: the cascade's own record shows it.
+        let fragment = match &agy_rpc {
+            Some(rpc) if kind == Some("result") && effect.finishes_turn && error.is_none() => {
+                let session = lock(&shared).session_id.clone();
+                session
+                    .and_then(|session| agy_conversation_dir(rpc, &session))
+                    .and_then(|dir| agy_last_response(&dir.join("logs/transcript_full.jsonl")))
+                    .filter(|content| agy_stray_fragment(content))
+            }
+            _ => None,
+        };
+        let mut continue_turn = None;
         let mut retry_after = None;
         {
             let mut state = lock(&shared);
             if state.generation != generation {
                 return;
+            }
+            if let Some(content) = &fragment {
+                state.agy_turn_has_work = true;
+                if let Some(id) = state.open.first().cloned()
+                    && state.agy_continued.as_ref() != Some(&id)
+                {
+                    state.agy_continued = Some(id);
+                    effect.finishes_turn = false;
+                    continue_turn = Some((
+                        agy_continue_line(&spec, content),
+                        effect.usage.take().unwrap_or_else(|| spec.usage_of(&value)),
+                    ));
+                }
             }
             let before = state.observed();
             state.idle_since = None;
@@ -2019,6 +2051,17 @@ fn read_stdout(
             }
             state.last_line_at = Some(Instant::now());
             state.epoch = state.epoch.wrapping_add(1);
+        }
+        // Never hold shared state across pipe I/O. A continuation that cannot
+        // be written closes the turn as the cascade did.
+        if let Some((line, usage)) = continue_turn
+            && write_stdin(&stdin, &line).is_err()
+        {
+            let mut state = lock(&shared);
+            if state.generation == generation {
+                finish_open(&mut state, usage);
+                state.touch();
+            }
         }
         wake.notify_all();
         // A turn the peer could not start opens again with time alone.
@@ -3733,6 +3776,69 @@ fn agy_row_marker(line: &[u8]) -> Option<String> {
     agy_plain_id(&rest[..rest.find("\\n")?])
 }
 
+/// How much of a transcript's end is read for its last model response.
+const AGY_TRANSCRIPT_TAIL: u64 = 256 * 1024;
+
+/// The text of the last row of `transcript` when it is a `PLANNER_RESPONSE`
+/// that made no tool call and lies whole in the transcript's last
+/// [`AGY_TRANSCRIPT_TAIL`] bytes.
+fn agy_last_response(transcript: &Path) -> Option<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(transcript).ok()?;
+    let len = file.metadata().ok()?.len();
+    let from = len.saturating_sub(AGY_TRANSCRIPT_TAIL);
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut tail = Vec::new();
+    file.take(AGY_TRANSCRIPT_TAIL).read_to_end(&mut tail).ok()?;
+    let mut rows: Vec<&[u8]> = tail.split(|byte| *byte == b'\n').collect();
+    // A row still being written, and one cut by the window, are not read.
+    rows.pop();
+    if from > 0 && !rows.is_empty() {
+        rows.remove(0);
+    }
+    let row: Value = serde_json::from_slice(rows.last()?).ok()?;
+    if row.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE") {
+        return None;
+    }
+    let no_tool = row
+        .get("tool_calls")
+        .is_none_or(|calls| calls.is_null() || calls.as_array().is_some_and(Vec::is_empty));
+    no_tool
+        .then(|| {
+            row.get("content")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten()
+}
+
+/// A response that is only a stray piece of syntax, such as `}` or `"]}`:
+/// brackets, quotes and separators, and nothing a reader could take as an
+/// answer. A word, a number or `NO_REPLY` is never one.
+fn agy_stray_fragment(content: &str) -> bool {
+    let content = content.trim();
+    !content.is_empty()
+        && content.chars().all(|ch| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '{' | '}' | '[' | ']' | '(' | ')' | '"' | '\'' | '`' | ',' | ';' | ':'
+                )
+        })
+}
+
+/// The line that tells a cascade its turn closed on a stray fragment.
+fn agy_continue_line(spec: &StreamSpec, content: &str) -> Value {
+    user_line(
+        spec,
+        &format!(
+            "Your last response was only `{}`, a stray syntax fragment with no tool call, and it \
+             ended your turn early. Continue the task from where it stopped.",
+            content.trim()
+        ),
+    )
+}
+
 /// The message whose marker line opens the user input of a mailbox
 /// `CortexStep`.
 fn agy_marker_id(step: &[u8]) -> Option<String> {
@@ -4455,7 +4561,14 @@ pub fn message_line(spec: &StreamSpec, message: &OutboundMessage) -> Value {
     // The trusted header the server wrote, then the body: one composition
     // for every harness. Carries both top-level `type`/`text` and the
     // `event`/`message` envelope that `agy --input-format stream-json` decodes.
-    let text = compose_message(&message.id, &message.context, &message.text);
+    user_line(
+        spec,
+        &compose_message(&message.id, &message.context, &message.text),
+    )
+}
+
+/// A user line carrying `text`.
+fn user_line(spec: &StreamSpec, text: &str) -> Value {
     json!({
         "type": spec.start_line,
         "event": spec.start_line,

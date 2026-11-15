@@ -1,10 +1,47 @@
 # Desktop and mobile control
 
-`tools.computer` supports `platform` (or `os`) overrides: `linux`, `macos`,
-`windows`, and `chromeos`/`chromebook`. Otherwise it uses the host OS, with
-`SOMMELIER_VERSION` or `CHROMEOS_RELEASE_NAME` identifying Crostini. An override
-selects a local backend; it does not connect to a remote desktop. Cloud
-`session_id`/`provider: "cloud"` requests are forwarded before local execution.
+## Session desktop (browser and computer)
+
+Each browser profile runs on its own desktop: a headless Wayland compositor
+(`sway`) with one headful Chromium-family browser, served by the AnyAgents
+server through the [`agent-workstation`](https://github.com/SylphxAI/agent-workstation)
+crate. `tools.browser` drives that browser's pages (navigation, accessibility
+snapshots with refs, clicks, fills, tabs); `tools.computer` without a host
+target drives the same desktop's pixels (screenshots of the whole desktop,
+pointer, keyboard). A person takes over the whole desktop through a noVNC page
+(`browser({action: "takeover"})`); agent calls return `HUMAN_IN_CONTROL` until
+they hand back. Sessions start on first use and stop on `close`, after
+`ANYAGENTS_BROWSER_IDLE_SECS` (default 900) without calls, or when the agent is
+deleted. Profiles keep the existing layout,
+`<data>/browser-profiles/<profile>/{user-data/,fingerprint.json}`, so logins
+survive the upgrade.
+
+Session desktops need Linux with `sway`, `wayvnc` and a Chromium-family browser
+(`ANYAGENTS_CHROMIUM_BIN`; `ANYAGENTS_BROWSER_SEED_FLAG=--fingerprint` passes
+the profile's fingerprint seed to builds that take one). Other environment
+settings are listed in `crates/anyagents/src/workstation/session.rs`. On macOS
+and Windows hosts, browser calls return `UNSUPPORTED` and name
+`ANYAGENTS_WORKSTATION_URL`, the setting that will route them to a Linux
+workstation; this release does not route yet.
+
+Credentials are filled by reference (`secret_ref`: `op://...`, `op-otp://...`,
+`secret://...`) and never returned. Browser actions support `eval`, `cookies`,
+key holding (`hold`, `key_down`, `key_up`, `release_keys`), `fill` with `submit`,
+and refs or CSS selectors. Screenshots capture the whole desktop by default;
+`full_page: true` captures the scrollable page without browser chrome. Session
+computer actions support `clipboard_get`/`clipboard_set`, `cursor_position`,
+`hold_key`, modifier-held pointer input, and back/forward mouse buttons.
+`cursor_position` requires the pointer to have been placed on the desktop first.
+
+## Host desktop
+
+`tools.computer` drives the host machine's own desktop when the request names
+one: `platform` (or `os`): `linux`, `macos`, `windows`, `chromeos`/`chromebook`;
+or `display` / `wayland_display`. On a non-Linux host, and in ChromeOS Crostini
+(`SOMMELIER_VERSION` or `CHROMEOS_RELEASE_NAME`), the host desktop is the
+default. An override selects a local backend; it does not connect to a remote
+desktop. Cloud `session_id`/`provider: "cloud"` requests are forwarded before
+local execution.
 
 | Desktop | Dependencies and scope |
 | --- | --- |
@@ -21,26 +58,22 @@ OS; Linux Rust tests do not prove macOS/Windows GUI permissions or runtime APIs.
 ## Semantic snapshots
 
 ```javascript
-const snapshot = await tools.computer.snapshot({ interactive_only: true });
-await tools.computer.click({ ref: snapshot.elements[0].ref_id });
+const snapshot = await tools.computer.snapshot({ platform: "linux", interactive_only: true });
+await tools.computer.click({ platform: "linux", ref: snapshot.elements[0].ref_id });
 ```
 
 Snapshots prune unnamed, noninteractive layout wrappers and return
 `@<snapshot_id>:e<N>` refs. Desktop and mobile refs require the qualified form.
 Each new snapshot replaces the active ref map. Old refs fail with `STALE_REF`;
 take a fresh snapshot instead of retrying them. Errors include a disposition:
-`settled_absence`, `retryable_failure`, `delivery_uncertain`, `stale_ref`, or
-`terminal_failure`. A read that timed out is `retryable_failure`. A click,
-keystroke, scroll, drag, navigation or other mutating action that timed out
-may already have been delivered, so it is `delivery_uncertain` (`retry:
-"verify_first"`): take a snapshot and verify the state before repeating it.
-Only a mutating action refused before dispatch (429 or 503 at admission) is
-`retryable_failure`.
+`settled_absence`, `retryable_failure`, `stale_ref`, or `terminal_failure`.
 
-Browser snapshots additionally expose `snapshot_id` and each element's
-`qualified_ref`. Existing short `@e<N>` refs resolve against the active browser
-snapshot for compatibility. Prefer qualified refs to detect stale snapshots.
-Browser errors use the same dispositions and redact secret input details.
+Browser snapshots return an outline whose interactive elements carry `@eN`
+refs, plus a `snapshot_id`; `@<snapshot_id>:eN` fails with `STALE_REF` once a
+newer snapshot or a navigation replaced it, and short `@eN` refs resolve against
+the latest snapshot. Browser errors carry a stable `code` (for example
+`STALE_REF`, `HUMAN_IN_CONTROL`, `UNSUPPORTED`) with the same dispositions, and
+redact secret input details.
 
 ## Android and iOS
 

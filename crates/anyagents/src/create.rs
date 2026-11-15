@@ -227,13 +227,29 @@ fn create_with_seat(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let template_description = new.role.as_deref().and_then(|role| {
+        let parent = request
+            .parent_id
+            .as_ref()
+            .and_then(|pid| store.agent(pid).ok());
+        let ancestor_wds = ancestor_archetype_workdirs(Some(store), data, parent.as_ref()).ok()?;
+        resolve_role_template_with_ancestors(role, request.workdir.as_deref(), &ancestor_wds, data)
+            .ok()
+            .flatten()
+            .and_then(|(_, tpl, _)| tpl.description)
+    });
     new.instructions = request
         .instructions
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .or_else(|| new.description.clone());
+        .or_else(|| {
+            new.description
+                .as_deref()
+                .filter(|desc| Some(*desc) != template_description.as_deref())
+                .map(str::to_string)
+        });
     new.parent_id = request.parent_id;
     let agent = store.create_agent(new)?;
     let data = std::path::absolute(data)?;
@@ -341,6 +357,17 @@ fn create_with_seat(
         } else {
             request.workdir.clone()
         };
+        if let Some(path) = &request.workdir
+            && wd_str.is_empty()
+        {
+            return Err(Error::WorkdirPermission {
+                path: path.display().to_string(),
+                message: "working directory must not be empty".into(),
+            });
+        }
+        if let Some(path) = &explicit_workdir {
+            crate::sandbox::validate_workdir_target(path)?;
+        }
         let is_cloud_agent_mode = wd_is_cloud_keyword
             || pairs
                 .iter()
@@ -366,6 +393,19 @@ fn create_with_seat(
         let workdir_created =
             explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
         let managed_abs = std::path::absolute(&managed)?;
+        // Record the allocation before any checkout or cloud provisioning can
+        // block. This does not admit the agent to the runtime.
+        if effective_repo.is_some()
+            || wd_is_private_keyword
+            || wd_is_worktree_keyword
+            || (explicit_workdir.is_none() && !wd_is_inherit_keyword && agent.parent_id.is_some())
+        {
+            let target = match &explicit_workdir {
+                Some(path) => std::path::absolute(path)?,
+                None => managed_abs.clone(),
+            };
+            store.set_agent_workdir_if_missing(&agent.id, &target.display().to_string())?;
+        }
         let cwd = if let Some(repo_raw) = effective_repo {
             if crate::vendor::is_spiron_harness(&agent.harness)
                 && is_cloud_agent_mode
@@ -473,6 +513,7 @@ fn create_with_seat(
                 }
             }
         };
+        store.set_agent_workdir_if_missing(&agent.id, &cwd.display().to_string())?;
         if cwd == managed_abs && !managed_abs.exists() {
             create_dir_all_recorded(&managed_abs, &made)?;
         }
@@ -896,6 +937,7 @@ fn record_managed_worktree_marker(
 }
 
 pub(crate) fn sync_all_agent_instructions(store: &Store, data: &Path) -> Result<(), Error> {
+    backfill_historical_agent_roles(store, data)?;
     let agents = store.list_agents()?;
     for agent in &agents {
         if agent.state == "archived" {
@@ -954,6 +996,16 @@ pub(crate) fn write_agent_instructions_with_continuity(
     parent_name: Option<&str>,
     continuity: Option<&str>,
 ) -> Result<(), Error> {
+    write_agent_instructions_with_continuity_and_store(config, agent, parent_name, continuity, None)
+}
+
+pub(crate) fn write_agent_instructions_with_continuity_and_store(
+    config: &Path,
+    agent: &Agent,
+    parent_name: Option<&str>,
+    continuity: Option<&str>,
+    store: Option<&Store>,
+) -> Result<(), Error> {
     // Launch preparation and description/config updates can render concurrently,
     // including from different server processes. Hold a host-owned lock through
     // all mirrors and their readbacks so writers cannot replace each other's
@@ -986,25 +1038,6 @@ pub(crate) fn write_agent_instructions_with_continuity(
 
     doc.push_str("- **Lifecycle**: Role templates may declare `lifecycle: standing | task`. Sub-agents never archive themselves; the spawning parent records its verdict on the deliverable (`action: \"verdict\"`) and closes/archives a task sub-agent (`action: \"archive\"`) once it is accepted. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
 
-    if let Some(custom) = agent
-        .instructions
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        doc.push_str("\n## 2. Instructions\n\n");
-        doc.push_str(custom);
-        doc.push('\n');
-    }
-
-    doc.push_str(
-        "\n## 3. Hierarchy, Topology & Communication Rules\n\n         - `description` is public; `instructions` are private. Supervision is downward-only; role labels impose no preset persona or lifecycle policy.\n         - Stdout never reaches peers or channels. Reply via `send` (`to`, `reply_to`, `text`) using `<message ... answer_to=\"...\">`; emit `NO_REPLY` in non-matching group turns.\n         - Never poll: `<message>`, child completions, and `schedule` watches wake you reactively.\n         - Any agent may call `agents` (`spawn`/`archive`) or `code` (`anyagents.*`, `workspace.*`, `web.*`, `computer.*`) instead of vendor sub-agent/timer tools; pass `secret_ref: \"op://...\"` to `browser` without reading secrets, and use `action: \"takeover\"` on `captcha_detected: true`.\n",
-    );
-    if let Some(parent) = parent_name {
-        doc.push_str(&format!(
-            "- Direct parent: `agent:{parent}`; report via `send` to `parent`.\n"
-        ));
-    }
     let data_dir_guess = config
         .parent()
         .and_then(|agent_dir| {
@@ -1016,10 +1049,25 @@ pub(crate) fn write_agent_instructions_with_continuity(
             }
         })
         .unwrap_or(config);
+    let data_dir = store.map(Store::data_dir).unwrap_or(data_dir_guess);
+    if let Some(effective) = effective_agent_instructions(store, data_dir, agent) {
+        doc.push_str("\n## 2. Instructions\n\n");
+        doc.push_str(&effective);
+        doc.push('\n');
+    }
+
+    doc.push_str(
+        "\n## 3. Hierarchy, Topology & Communication Rules\n\n         - `description` is public; `instructions` are private. Supervision is downward-only; role labels impose no preset persona or lifecycle policy.\n         - Stdout never reaches peers or channels. Reply via `send` (`to`, `reply_to`, `text`) using `<message ... answer_to=\"...\">`; emit `NO_REPLY` in non-matching group turns.\n         - Never poll: `<message>`, child completions, and `schedule` watches wake you reactively.\n         - Any agent may call `agents` (`spawn`/`archive`) or `code` (`anyagents.*`, `workspace.*`, `web.*`, `computer.*`) instead of vendor sub-agent/timer tools; pass `secret_ref: \"op://...\"` to `browser` without reading secrets, and use `action: \"takeover\"` on `captcha_detected: true`.\n",
+    );
+    if let Some(parent) = parent_name {
+        doc.push_str(&format!(
+            "- Direct parent: `agent:{parent}`; report via `send` to `parent`.\n"
+        ));
+    }
     let available_roles = discover_available_archetype_slugs(
         agent.workdir.as_deref().map(Path::new),
         config.parent(),
-        data_dir_guess,
+        data_dir,
     );
     if !available_roles.is_empty() {
         let formatted_roles = available_roles
@@ -1162,6 +1210,15 @@ pub(crate) fn sync_agent_description_files(
     agent: &Agent,
     config: &Path,
 ) -> Result<(), Error> {
+    sync_agent_description_files_for_live(store, agent, config, None)
+}
+
+pub(crate) fn sync_agent_description_files_for_live(
+    store: &Store,
+    agent: &Agent,
+    config: &Path,
+    min_started_ms: Option<i64>,
+) -> Result<(), Error> {
     #[cfg(unix)]
     let pre_existing_mode = {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1192,12 +1249,21 @@ pub(crate) fn sync_agent_description_files(
                 .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
                 .map(|(_, v)| v.clone())
         });
+    let before_prompt = std::fs::read(config.join("SYSTEM_PROMPT.md")).ok();
     let continuity = compute_live_session_continuity(store, agent, config);
-    write_agent_instructions_with_continuity(
+    write_agent_instructions_with_continuity_and_store(
         config,
         agent,
         parent_name.as_deref(),
         continuity.as_deref(),
+        Some(store),
+    )?;
+    mark_instructions_rotated_if_changed(
+        store,
+        config,
+        agent,
+        before_prompt.as_deref(),
+        min_started_ms,
     )?;
     if agent.harness == "codex" {
         let codex_toml = config.join("config.toml");
@@ -1243,11 +1309,12 @@ pub(crate) fn extract_file_tilde_refs(text: &str) -> Vec<String> {
 pub(crate) fn ensure_seat_environment(target_config: &Path, workdir: &Path) -> Result<(), Error> {
     for subdir in ["tmp", "data-home", "cache-home", "state-home"] {
         let dir = target_config.join(subdir);
-        let _ = std::fs::create_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777));
+            // Shared runtime trees must not permit peers to unlink each other's entries.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
         }
     }
     crate::repo::configure_seat_git(target_config, workdir)?;
@@ -2852,6 +2919,28 @@ pub(crate) fn resolved_agent_seat_info(
     Some((user, uid, gid, None))
 }
 
+// Seat preparation owns the config mode and ACL mask. Never replay a mode
+// captured before preparation over the permissions it established.
+fn prepare_runtime_config_dir(config: &Path, seat: Option<(u32, u32)>) -> Result<(), Error> {
+    create_private_config_dir(config)?;
+    if let Some((uid, gid)) = seat {
+        crate::sandbox::prepare_config_with_seat_uid(config, uid, gid)?;
+    } else {
+        #[cfg(unix)]
+        repair_unseated_config_mode(config, own_mode(config)?.unwrap_or(0o0700))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn repair_unseated_config_mode(config: &Path, base_mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let group_exec = if (base_mode & 0o0060) != 0 { 0o0010 } else { 0 };
+    let other_exec = if (base_mode & 0o0006) != 0 { 0o0001 } else { 0 };
+    let safe_mode = (base_mode | 0o0700 | group_exec | other_exec) & 0o7777;
+    std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode))
+}
+
 /// Canonical, idempotent runtime reconciliation for an agent: resolves the
 /// authoritative parent from `state.db`, seeds credentials and model catalogs,
 /// ensures the mailbox capability, computes cross-harness continuity from
@@ -2864,6 +2953,39 @@ pub(crate) fn reconcile_agent_runtime_config(
     config: &Path,
     work_dir: &Path,
 ) -> Result<Option<String>, Error> {
+    reconcile_agent_runtime_config_inner(store, data, agent, config, work_dir, true, None)
+}
+
+pub(crate) fn reconcile_agent_runtime_config_for_live(
+    store: &Store,
+    data: &Path,
+    agent: &Agent,
+    config: &Path,
+    work_dir: &Path,
+    min_started_ms: Option<i64>,
+) -> Result<Option<String>, Error> {
+    reconcile_agent_runtime_config_inner(store, data, agent, config, work_dir, true, min_started_ms)
+}
+
+pub(crate) fn reconcile_agent_runtime_config_for_launch(
+    store: &Store,
+    data: &Path,
+    agent: &Agent,
+    config: &Path,
+    work_dir: &Path,
+) -> Result<Option<String>, Error> {
+    reconcile_agent_runtime_config_inner(store, data, agent, config, work_dir, false, None)
+}
+
+fn reconcile_agent_runtime_config_inner(
+    store: &Store,
+    data: &Path,
+    agent: &Agent,
+    config: &Path,
+    work_dir: &Path,
+    mark_instruction_rotation: bool,
+    min_started_ms: Option<i64>,
+) -> Result<Option<String>, Error> {
     #[cfg(unix)]
     let pre_existing_mode = {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2871,20 +2993,10 @@ pub(crate) fn reconcile_agent_runtime_config(
             .ok()
             .map(|m| m.permissions().mode() & 0o7777)
     };
-    create_private_config_dir(config)?;
-    if let Some((_, uid, gid, _)) = resolved_agent_seat_info(store, agent) {
-        crate::sandbox::prepare_config_with_seat_uid(config, uid, gid)?;
-    }
-    #[cfg(unix)]
-    if let Some(base_mode) = pre_existing_mode {
-        use std::os::unix::fs::PermissionsExt as _;
-        let group_exec = if (base_mode & 0o0060) != 0 { 0o0010 } else { 0 };
-        let other_exec = if (base_mode & 0o0006) != 0 { 0o0001 } else { 0 };
-        let safe_mode = (base_mode | 0o0700 | group_exec | other_exec) & 0o7777;
-        if safe_mode != base_mode {
-            let _ = std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode));
-        }
-    }
+    prepare_runtime_config_dir(
+        config,
+        resolved_agent_seat_info(store, agent).map(|(_, uid, gid, _)| (uid, gid)),
+    )?;
     let parent_name = agent
         .parent_id
         .as_ref()
@@ -2937,13 +3049,26 @@ pub(crate) fn reconcile_agent_runtime_config(
         )));
     }
 
+    let before_prompt = mark_instruction_rotation
+        .then(|| std::fs::read(config.join("SYSTEM_PROMPT.md")).ok())
+        .flatten();
     let continuity = compute_live_session_continuity(store, agent, config);
-    write_agent_instructions_with_continuity(
+    write_agent_instructions_with_continuity_and_store(
         config,
         agent,
         parent_name.as_deref(),
         continuity.as_deref(),
+        Some(store),
     )?;
+    if mark_instruction_rotation {
+        mark_instructions_rotated_if_changed(
+            store,
+            config,
+            agent,
+            before_prompt.as_deref(),
+            min_started_ms,
+        )?;
+    }
 
     if !config_writes_suppressed(data)
         && let Ok(command) = crate::data::current_exe_clean()
@@ -3022,7 +3147,7 @@ pub(crate) fn reconcile_agent_runtime_config(
         if let Some(ref spec) = spec_opt {
             ensure_seat_op_config(config, spec);
         }
-        crate::sandbox::share_config_with_seat_uid(config, uid, gid);
+        crate::sandbox::share_config_with_seat_uid_checked(config, uid, gid)?;
         // Workdir admission belongs to create, not config-only reconciliation:
         // an archived agent may already have had its managed workdir reaped.
         if agent.harness == "muse"
@@ -3049,12 +3174,7 @@ pub(crate) fn reconcile_agent_runtime_config(
     } else {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            let base_mode = pre_existing_mode.unwrap_or(0o0700);
-            let group_exec = if (base_mode & 0o0060) != 0 { 0o0010 } else { 0 };
-            let other_exec = if (base_mode & 0o0006) != 0 { 0o0001 } else { 0 };
-            let safe_mode = (base_mode | 0o0700 | group_exec | other_exec) & 0o7777;
-            let _ = std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode));
+            repair_unseated_config_mode(config, pre_existing_mode.unwrap_or(0o0700))?;
         }
     }
     verify_harness_runtime_config(config, &agent.harness, agent.model.as_deref())?;
@@ -3834,6 +3954,12 @@ fn propagate_credentials(
                 "no profile credentials installed for {dir_id}"
             )));
         }
+        // Success markers must describe credentials that the seat can read.
+        if let Some(s) = store_opt.as_ref()
+            && let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec)
+        {
+            crate::sandbox::share_config_with_seat_uid_checked(&cfg, uid, gid)?;
+        }
         write_profile_marker(
             &cfg,
             ".anyagents-seeded-profile",
@@ -3855,13 +3981,8 @@ fn propagate_credentials(
             )?;
             let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         }
-        if let Some(s) = store_opt.as_ref() {
-            if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
-                crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
-            }
-            if change == CredentialChange::Replaced {
-                poke_agent_wake_socket(data, &agent_rec.id);
-            }
+        if store_opt.is_some() && change == CredentialChange::Replaced {
+            poke_agent_wake_socket(data, &agent_rec.id);
         }
     }
     Ok(())
@@ -9903,6 +10024,265 @@ fn open_archetype_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
 /// in-place before agent creation. Unifies `role` and `archetype`: resolving a template sets
 /// `body.role` to the canonical template stem `<slug>`, and when templates are configured in
 /// `.agents/agents/`, unknown `role` names are rejected before persistence.
+pub(crate) const INSTRUCTIONS_ROTATED_MARKER: &str = ".anyagents-instructions-rotated-ms";
+
+pub(crate) fn mark_instructions_rotated_if_changed(
+    store: &Store,
+    config: &Path,
+    agent: &Agent,
+    before_prompt: Option<&[u8]>,
+    min_started_ms: Option<i64>,
+) -> Result<(), Error> {
+    if agent.state != "running" || !crate::vendor::is_spiron_harness(&agent.harness) {
+        return Ok(());
+    }
+    let after_prompt = std::fs::read(config.join("SYSTEM_PROMPT.md")).ok();
+    if before_prompt == after_prompt.as_deref() {
+        return Ok(());
+    }
+    let marker_path = config.join(INSTRUCTIONS_ROTATED_MARKER);
+    let prev = std::fs::read_to_string(&marker_path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let mut ts = anyagents_core::now_ms().max(prev.saturating_add(1));
+    if let Some(started) = min_started_ms {
+        ts = ts.max(started.saturating_add(1));
+    }
+    write_profile_marker(config, INSTRUCTIONS_ROTATED_MARKER, &format!("{ts}\n"))?;
+    store.poke(anyagents_core::Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    poke_agent_wake_socket(store.data_dir(), &agent.id);
+    Ok(())
+}
+
+fn resolve_role_template_with_ancestors(
+    raw_role: &str,
+    agent_workdir: Option<&Path>,
+    ancestor_wds: &[PathBuf],
+    data_dir: &Path,
+) -> Result<Option<(String, ArchetypeTemplate, ArchetypeSource)>, Error> {
+    let role = raw_role.trim();
+    if role.is_empty() {
+        return Ok(None);
+    }
+    let slugified = role.to_ascii_lowercase().replace(' ', "-");
+    if !valid_template_stem(role) && !valid_template_stem(&slugified) {
+        resolve_archetype_template_with_source(role, agent_workdir, ancestor_wds, data_dir)?;
+        return Ok(None);
+    }
+    if valid_template_stem(role)
+        && let Some((tpl, src)) =
+            resolve_archetype_template_with_source(role, agent_workdir, ancestor_wds, data_dir)?
+    {
+        return Ok(Some((role.to_string(), tpl, src)));
+    }
+    if slugified != role
+        && valid_template_stem(&slugified)
+        && let Some((tpl, src)) = resolve_archetype_template_with_source(
+            &slugified,
+            agent_workdir,
+            ancestor_wds,
+            data_dir,
+        )?
+    {
+        return Ok(Some((slugified, tpl, src)));
+    }
+    Ok(None)
+}
+
+fn canonical_template_role(slug: &str, tpl: &ArchetypeTemplate) -> String {
+    tpl.role
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| valid_template_stem(r))
+        .unwrap_or(slug)
+        .to_string()
+}
+
+pub(crate) fn resolve_role_template_for_agent(
+    store: Option<&Store>,
+    data_dir: &Path,
+    agent: &Agent,
+) -> Option<(String, ArchetypeTemplate)> {
+    let raw_role = agent
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let parent = store.and_then(|s| agent.parent_id.as_ref().and_then(|pid| s.agent(pid).ok()));
+    let ancestor_wds =
+        ancestor_archetype_workdirs(store, data_dir, parent.as_ref()).unwrap_or_default();
+    let agent_wd = agent.workdir.as_deref().map(Path::new);
+    resolve_role_template_with_ancestors(raw_role, agent_wd, &ancestor_wds, data_dir)
+        .ok()
+        .flatten()
+        .map(|(slug, tpl, _)| (canonical_template_role(&slug, &tpl), tpl))
+}
+
+fn strip_role_prefix_match(instructions: &str, prefix: &str) -> Option<Option<String>> {
+    let inst = instructions.trim();
+    let pref = prefix.trim();
+    if inst.is_empty() || pref.is_empty() {
+        return None;
+    }
+    if inst == pref {
+        return Some(None);
+    }
+    if let Some(rest) = inst.strip_prefix(pref)
+        && rest.starts_with(['\n', '\r'])
+    {
+        let cleaned = rest.trim();
+        return Some((!cleaned.is_empty()).then(|| cleaned.to_string()));
+    }
+    None
+}
+
+fn strip_known_baked_role_prefixes<'a>(
+    raw_instructions: Option<&str>,
+    candidate_bodies: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let trimmed = raw_instructions.map(str::trim).filter(|s| !s.is_empty())?;
+    for body in candidate_bodies {
+        if let Some(stripped) = strip_role_prefix_match(trimmed, body) {
+            return stripped;
+        }
+    }
+    if let Some(stripped) = strip_role_prefix_match(trimmed, BUILTIN_GENERAL_ROLE_BODY) {
+        return stripped;
+    }
+    Some(trimmed.to_string())
+}
+
+pub(crate) fn effective_agent_instructions(
+    store: Option<&Store>,
+    data_dir: &Path,
+    agent: &Agent,
+) -> Option<String> {
+    let resolved = resolve_role_template_for_agent(store, data_dir, agent);
+    let role_body = resolved
+        .as_ref()
+        .map(|(_, tpl)| tpl.body.trim())
+        .filter(|s| !s.is_empty());
+    let custom = strip_known_baked_role_prefixes(agent.instructions.as_deref(), role_body);
+    match (role_body, custom.as_deref()) {
+        (Some(role), Some(custom)) => Some(format!("{role}\n\n{custom}")),
+        (Some(role), None) => Some(role.to_string()),
+        (None, Some(custom)) => Some(custom.to_string()),
+        (None, None) => None,
+    }
+}
+
+pub(crate) fn backfill_historical_agent_roles(
+    store: &Store,
+    data_dir: &Path,
+) -> Result<usize, Error> {
+    let agents = store.list_agents()?;
+    let mut updated_count = 0usize;
+    for agent in agents {
+        let parent = agent
+            .parent_id
+            .as_ref()
+            .and_then(|pid| store.agent(pid).ok());
+        let ancestor_wds =
+            ancestor_archetype_workdirs(store_opt(store), data_dir, parent.as_ref())?;
+        let agent_wd = agent.workdir.as_deref().map(Path::new);
+        let raw_role = agent
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let mut candidate_bodies: Vec<String> = Vec::new();
+        let target_role = match raw_role {
+            None => DEFAULT_AGENT_ROLE.to_string(),
+            Some(raw) => {
+                let underscore_slug = raw.to_ascii_lowercase().replace([' ', '_'], "-");
+                let matched =
+                    resolve_role_template_with_ancestors(raw, agent_wd, &ancestor_wds, data_dir)?
+                        .or_else(|| {
+                            valid_template_stem(&underscore_slug)
+                                .then(|| {
+                                    resolve_role_template_with_ancestors(
+                                        &underscore_slug,
+                                        agent_wd,
+                                        &ancestor_wds,
+                                        data_dir,
+                                    )
+                                    .ok()
+                                    .flatten()
+                                })
+                                .flatten()
+                        });
+                if let Some((slug, tpl, _)) = matched {
+                    if !tpl.body.trim().is_empty() {
+                        candidate_bodies.push(tpl.body.clone());
+                    }
+                    canonical_template_role(&slug, &tpl)
+                } else {
+                    let disk_slugs = discover_disk_archetype_slugs_with_ancestors(
+                        agent_wd,
+                        &ancestor_wds,
+                        data_dir,
+                    );
+                    if !disk_slugs.is_empty()
+                        || has_configured_archetype_roots_with_ancestors(
+                            agent_wd,
+                            &ancestor_wds,
+                            data_dir,
+                        )
+                    {
+                        DEFAULT_AGENT_ROLE.to_string()
+                    } else {
+                        raw.to_string()
+                    }
+                }
+            }
+        };
+        if target_role != DEFAULT_AGENT_ROLE
+            && let Some((_, tpl, _)) = resolve_role_template_with_ancestors(
+                &target_role,
+                agent_wd,
+                &ancestor_wds,
+                data_dir,
+            )?
+            && !tpl.body.trim().is_empty()
+        {
+            candidate_bodies.push(tpl.body);
+        }
+
+        let mut current = agent;
+        let mut row_changed = false;
+        if current.role.as_deref() != Some(target_role.as_str()) {
+            current = store.set_agent_role(&current.id, Some(&target_role))?;
+            row_changed = true;
+        }
+        let stripped = strip_known_baked_role_prefixes(
+            current.instructions.as_deref(),
+            candidate_bodies.iter().map(String::as_str),
+        );
+        if stripped != current.instructions {
+            current = store.set_agent_instructions(&current.id, stripped.as_deref())?;
+            row_changed = true;
+        }
+        if row_changed {
+            updated_count += 1;
+            if current.state != "archived" {
+                let cfg = agent_config_dir(data_dir, &current.id);
+                if cfg.is_dir() {
+                    sync_agent_description_files(store, &current, &cfg)?;
+                }
+            }
+        }
+    }
+    Ok(updated_count)
+}
+
+#[inline]
+fn store_opt(store: &Store) -> Option<&Store> {
+    Some(store)
+}
+
 pub(crate) fn apply_archetype_defaults(
     store: Option<&Store>,
     data_dir: &Path,
@@ -9922,43 +10302,14 @@ pub(crate) fn apply_archetype_defaults(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_AGENT_ROLE);
-    let slugified = role.to_ascii_lowercase().replace(' ', "-");
-    let resolved = if !valid_template_stem(role) && !valid_template_stem(&slugified) {
-        resolve_archetype_template_with_source(
-            role,
-            explicit_wd.as_deref(),
-            &ancestor_wds,
-            data_dir,
-        )?;
-        None
-    } else {
-        let direct = if valid_template_stem(role) {
-            resolve_archetype_template_with_source(
-                role,
-                explicit_wd.as_deref(),
-                &ancestor_wds,
-                data_dir,
-            )?
-            .map(|(tpl, src)| (role.to_string(), tpl, src))
-        } else {
-            None
-        };
-        let matched = if direct.is_some() {
-            direct
-        } else if valid_template_stem(&slugified) {
-            resolve_archetype_template_with_source(
-                &slugified,
-                explicit_wd.as_deref(),
-                &ancestor_wds,
-                data_dir,
-            )?
-            .map(|(tpl, src)| (slugified, tpl, src))
-        } else {
-            None
-        };
-        if matched.is_some() {
-            matched
-        } else {
+    let resolved = match resolve_role_template_with_ancestors(
+        role,
+        explicit_wd.as_deref(),
+        &ancestor_wds,
+        data_dir,
+    )? {
+        Some(matched) => Some(matched),
+        None => {
             let disk_slugs = discover_disk_archetype_slugs_with_ancestors(
                 explicit_wd.as_deref(),
                 &ancestor_wds,
@@ -10062,19 +10413,13 @@ pub(crate) fn apply_archetype_defaults(
         .unwrap_or(&resolved_slug)
         .to_string();
     body.role = Some(canonical_role);
-    let effective_caller_instructions = body
+    body.instructions = body
         .instructions
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .or(caller_description);
-    if !tpl.body.is_empty() {
-        body.instructions = match effective_caller_instructions {
-            Some(existing) => Some(format!("{}\n\n{}", tpl.body, existing)),
-            None => Some(tpl.body),
-        };
-    }
     Ok(())
 }
 
@@ -10085,28 +10430,13 @@ pub(crate) fn normalize_or_validate_agent_role(
     data_dir: &Path,
 ) -> Result<String, Error> {
     let role = raw_role.trim();
-    let slugified = role.to_ascii_lowercase().replace(' ', "-");
-    if valid_template_stem(role)
-        && let Some(tpl) =
-            resolve_archetype_template(role, agent_workdir, parent_workdir, data_dir)?
-    {
-        return Ok(tpl
-            .role
-            .filter(|r| valid_template_stem(r))
-            .unwrap_or_else(|| role.to_string()));
-    }
-    if slugified != role
-        && valid_template_stem(&slugified)
-        && let Some(tpl) =
-            resolve_archetype_template(&slugified, agent_workdir, parent_workdir, data_dir)?
-    {
-        return Ok(tpl
-            .role
-            .filter(|r| valid_template_stem(r))
-            .unwrap_or(slugified));
-    }
     let parent_ancestors: Vec<PathBuf> =
         parent_workdir.map(Path::to_path_buf).into_iter().collect();
+    if let Some((slug, tpl, _)) =
+        resolve_role_template_with_ancestors(role, agent_workdir, &parent_ancestors, data_dir)?
+    {
+        return Ok(canonical_template_role(&slug, &tpl));
+    }
     let disk_slugs =
         discover_disk_archetype_slugs_with_ancestors(agent_workdir, &parent_ancestors, data_dir);
     if !disk_slugs.is_empty() || configured_owner_archetype_workdir().is_some() {
@@ -10557,6 +10887,49 @@ mod tests {
         std::fs::write(target.join("late.txt"), "kept").unwrap();
         remove_made_dirs(&made.into_inner(), None, &AgentId::generate());
         assert!(target.join("late.txt").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_config_preparation_preserves_seat_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_tempdir();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        for old_mode in [0o0600, 0o0700, 0o2770] {
+            let config = dir.path().join(format!("seat-{old_mode:o}/config"));
+            create_private_config_dir(&config).unwrap();
+            std::fs::write(config.join("credential"), "retained").unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(old_mode)).unwrap();
+            prepare_runtime_config_dir(&config, Some((uid, gid))).unwrap();
+            assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o7777, 0o2770);
+            assert_eq!(
+                std::fs::read_to_string(config.join("credential")).unwrap(),
+                "retained"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_config_preparation_repairs_unseated_modes_and_propagates_failures() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_tempdir();
+        for (old_mode, expected) in [(0o0600, 0o0700), (0o0660, 0o0770), (0o2770, 0o2770)] {
+            let config = dir.path().join(format!("unseated-{old_mode:o}/config"));
+            create_private_config_dir(&config).unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(old_mode)).unwrap();
+            prepare_runtime_config_dir(&config, None).unwrap();
+            assert_eq!(
+                std::fs::metadata(&config).unwrap().mode() & 0o7777,
+                expected
+            );
+        }
+        let blocked = dir.path().join("file");
+        std::fs::write(&blocked, "retained").unwrap();
+        assert!(prepare_runtime_config_dir(&blocked, None).is_err());
+        assert!(repair_unseated_config_mode(&dir.path().join("missing"), 0o0600).is_err());
+        assert_eq!(std::fs::read_to_string(blocked).unwrap(), "retained");
     }
 
     #[cfg(unix)]
@@ -11724,6 +12097,85 @@ stderr: {}",
             instructions: None,
             parent_id: None,
         }
+    }
+
+    #[test]
+    fn invalid_explicit_workdir_is_refused_before_checkout_allocation() {
+        let tmp = crate::test_tempdir();
+        let fixture = crate::repo::tests::Fixture::new(tmp.path());
+        let store = Store::open(tmp.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        for (index, path) in ["", " ", "/", "/tmp"].iter().enumerate() {
+            let name = format!("invalid-workdir-{index}");
+            let mut request = worktree_request(&name, Some("ExampleOrg/demo".into()));
+            request.workdir = Some(PathBuf::from(*path));
+            let result = create_with_consumer(&store, tmp.path(), request, &fixture.checkouts);
+            assert!(
+                matches!(result, Err(Error::WorkdirPermission { .. })),
+                "{result:?}"
+            );
+            assert!(store.agent_by_name(&name).is_err());
+            assert!(
+                !fixture.log.exists(),
+                "invalid workdir reached the checkout provider"
+            );
+        }
+    }
+
+    #[test]
+    fn workdir_is_durable_while_checkout_provisioning_is_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let fixture = crate::repo::tests::Fixture::new(&data);
+        let entered = data.join("entered");
+        let release = data.join("release");
+        let provider = data.join("provider");
+        let script = std::fs::read_to_string(&provider).unwrap();
+        let script = script.replacen("#!/bin/sh\n", &format!(
+            "#!/bin/sh\nif [ \"$1\" = worktree ]; then touch {entered:?}; while [ ! -e {release:?} ]; do sleep 0.01; done; fi\n"
+        ), 1);
+        crate::repo::tests::write_executable(&provider, &script);
+        std::fs::write(&fixture.fail, "worktree").unwrap();
+        let db = data.join("state.db");
+        let store = Store::open(&db).unwrap();
+        let thread_data = data.clone();
+        let handle = std::thread::spawn(move || {
+            let store = Store::open(thread_data.join("state.db")).unwrap();
+            store
+                .hold_capability_key("0123456789abcdef0123456789abcdef")
+                .unwrap();
+            create_with_consumer(
+                &store,
+                &thread_data,
+                worktree_request("blocked", Some("ExampleOrg/demo".into())),
+                &fixture.checkouts,
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !entered.exists() && std::time::Instant::now() < deadline && !handle.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let observed = Store::open(&db).and_then(|store| store.agent_by_name("blocked"));
+        std::fs::write(&release, "release").unwrap();
+        let result = handle.join().unwrap();
+        assert!(
+            entered.exists(),
+            "checkout did not reach the blocking provider: {result:?}"
+        );
+        let observed = observed.unwrap();
+        assert_ne!(observed.state, "running");
+        assert_eq!(
+            observed.workdir.as_deref(),
+            Some(agent_work_dir(&data, &observed.id).to_str().unwrap())
+        );
+        assert!(result.is_err());
+        assert!(matches!(
+            store.agent_by_name("blocked"),
+            Err(Error::AgentNotFound(_))
+        ));
     }
 
     #[test]
@@ -12940,6 +13392,14 @@ mod archetype_tests {
             assert_eq!(req.model.as_deref(), Some("gpt-6.1-sol#high"));
             assert_eq!(
                 req.instructions.as_deref(),
+                Some("Custom assignment instructions.")
+            );
+            let mut preview_agent = parent_agent.clone();
+            preview_agent.role = req.role.clone();
+            preview_agent.instructions = req.instructions.clone();
+            preview_agent.workdir = Some(dir.path().display().to_string());
+            assert_eq!(
+                effective_agent_instructions(None, dir.path(), &preview_agent).as_deref(),
                 Some(format!("{expected_body}\n\nCustom assignment instructions.").as_str())
             );
         }
@@ -13015,7 +13475,7 @@ mod archetype_tests {
             apply_archetype_defaults(None, &data, None, &mut req).unwrap();
             assert_eq!(req.role.as_deref(), Some("general"));
             assert!(req.scope.is_none());
-            assert_eq!(req.instructions.as_deref(), Some(BUILTIN_GENERAL_ROLE_BODY));
+            assert!(req.instructions.is_none());
         }
 
         // Explicit scope override on root is preserved.
@@ -13130,7 +13590,7 @@ mod archetype_tests {
         );
         assert_eq!(
             legacy_sub_req.instructions.as_deref(),
-            Some(format!("{BUILTIN_GENERAL_ROLE_BODY}\n\nLegacy subagent brief").as_str())
+            Some("Legacy subagent brief")
         );
 
         // `.agents/agents/general.md` on disk overrides the built-in template.
@@ -13159,10 +13619,7 @@ mod archetype_tests {
         apply_archetype_defaults(None, &data, None, &mut override_req).unwrap();
         assert_eq!(override_req.role.as_deref(), Some("general"));
         assert_eq!(override_req.scope.as_deref(), Some("siblings"));
-        assert_eq!(
-            override_req.instructions.as_deref(),
-            Some("Workspace general body.")
-        );
+        assert!(override_req.instructions.is_none());
 
         // Removing disk override reverts cleanly to built-in general.
         std::fs::remove_file(ws.join(".agents/agents/general.md")).unwrap();
@@ -13266,6 +13723,229 @@ mod archetype_tests {
             matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)),
             "{error}"
         );
+    }
+
+    #[test]
+    fn dynamic_role_ssot_updates_rendered_prompts_on_disk_edit_without_baked_sqlite_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let ws = dir.path().join("workspace");
+        let roles_dir = ws.join(".agents/agents");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&roles_dir).unwrap();
+        let role_file = roles_dir.join("specialist.md");
+        std::fs::write(
+            &role_file,
+            "---\nname: specialist\ndescription: Initial specialist summary\nscope: siblings\n---\nRole SSOT v1 instructions.",
+        )
+        .unwrap();
+
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let mut req: crate::api::CreateAgentRequest = serde_json::from_value(serde_json::json!({
+            "name": "dyn-specialist",
+            "role": "specialist",
+            "harness": "spiron",
+            "workdir": ws,
+            "instructions": "Keep only custom task assignment."
+        }))
+        .unwrap();
+        apply_archetype_defaults(None, &data, None, &mut req).unwrap();
+        assert_eq!(
+            req.instructions.as_deref(),
+            Some("Keep only custom task assignment.")
+        );
+
+        let agent = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: req.name,
+                role: req.role,
+                harness: "spiron".to_string(),
+                model: None,
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: Some(ws.clone()),
+                workdir_default: None,
+                description: req.description,
+                instructions: req.instructions,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            agent.instructions.as_deref(),
+            Some("Keep only custom task assignment.")
+        );
+        assert_eq!(
+            effective_agent_instructions(Some(&store), &data, &agent).as_deref(),
+            Some("Role SSOT v1 instructions.\n\nKeep only custom task assignment.")
+        );
+        let cfg = agent_config_dir(&data, &agent.id);
+        let prompt_v1 = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(prompt_v1.contains("Role SSOT v1 instructions."));
+        assert!(prompt_v1.contains("Keep only custom task assignment."));
+        assert!(!cfg.join(INSTRUCTIONS_ROTATED_MARKER).exists());
+
+        let mut empty_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "dyn-default-only",
+                "role": "specialist",
+                "harness": "claude-code",
+                "workdir": ws,
+            }))
+            .unwrap();
+        apply_archetype_defaults(None, &data, None, &mut empty_req).unwrap();
+        let default_only = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: empty_req.name,
+                role: empty_req.role,
+                harness: "claude-code".to_string(),
+                model: None,
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: Some(ws.clone()),
+                workdir_default: None,
+                description: empty_req.description,
+                instructions: empty_req.instructions,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            default_only.instructions.is_none(),
+            "template description/body must not leak into sqlite instructions: {:?}",
+            default_only.instructions
+        );
+
+        let running = store
+            .set_agent_running(&agent.id, &ws.display().to_string())
+            .unwrap();
+        assert_eq!(running.state, "running");
+        std::fs::write(
+            &role_file,
+            "---\nname: specialist\ndescription: Initial specialist summary\nscope: siblings\n---\nRole SSOT v2 live reload.",
+        )
+        .unwrap();
+        sync_all_agent_instructions(&store, &data).unwrap();
+
+        let prompt_v2 = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(prompt_v2.contains("Role SSOT v2 live reload."));
+        assert!(!prompt_v2.contains("Role SSOT v1 instructions."));
+        assert!(prompt_v2.contains("Keep only custom task assignment."));
+        let agents_md_v2 = std::fs::read_to_string(cfg.join("AGENTS.md")).unwrap();
+        assert!(agents_md_v2.contains("Role SSOT v2 live reload."));
+        assert!(
+            cfg.join(INSTRUCTIONS_ROTATED_MARKER).is_file(),
+            "spiron running agent must get instruction-rotation marker on prompt drift"
+        );
+        let first_marker = std::fs::read_to_string(cfg.join(INSTRUCTIONS_ROTATED_MARKER)).unwrap();
+
+        sync_all_agent_instructions(&store, &data).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cfg.join(INSTRUCTIONS_ROTATED_MARKER)).unwrap(),
+            first_marker
+        );
+    }
+
+    #[test]
+    fn backfill_historical_agent_roles_losslessly_normalizes_roles_and_strips_baked_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let ws = dir.path().join("workspace");
+        let roles_dir = ws.join(".agents/agents");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&roles_dir).unwrap();
+        std::fs::write(
+            roles_dir.join("code-reviewer.md"),
+            "---\nname: code-reviewer\ndescription: Code reviewer\n---\nReview carefully.",
+        )
+        .unwrap();
+
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+
+        let mut null_role = NewAgent::new("hist-null", "claude-code");
+        null_role.role = None;
+        null_role.description = Some("Preserve historical desc".into());
+        null_role.instructions = Some(format!(
+            "{BUILTIN_GENERAL_ROLE_BODY}\n\nKeep this historical custom prompt."
+        ));
+        null_role.workdir = Some(ws.display().to_string());
+        let a_null = store.create_agent(null_role).unwrap();
+
+        let mut baked_only = NewAgent::new("hist-blank", "claude-code");
+        baked_only.role = Some("   ".into());
+        baked_only.instructions = Some(BUILTIN_GENERAL_ROLE_BODY.to_string());
+        baked_only.workdir = Some(ws.display().to_string());
+        let a_blank = store.create_agent(baked_only).unwrap();
+
+        let mut mixed_case = NewAgent::new("hist-mixed", "claude-code");
+        mixed_case.role = Some("Code Reviewer".into());
+        mixed_case.instructions = Some("Review carefully.\n\nCheck PR #123.".into());
+        mixed_case.workdir = Some(ws.display().to_string());
+        let a_mixed = store.create_agent(mixed_case).unwrap();
+
+        let mut retired = NewAgent::new("hist-retired", "claude-code");
+        retired.role = Some("retired_legacy_role".into());
+        retired.instructions = Some("Explicit task stays intact.".into());
+        retired.workdir = Some(ws.display().to_string());
+        let a_retired = store.create_agent(retired).unwrap();
+
+        let cfg = agent_config_dir(&data, &a_mixed.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let changed = backfill_historical_agent_roles(&store, &data).unwrap();
+        assert_eq!(changed, 4);
+
+        let r_null = store.agent(&a_null.id).unwrap();
+        assert_eq!(r_null.role.as_deref(), Some("general"));
+        assert_eq!(
+            r_null.description.as_deref(),
+            Some("Preserve historical desc")
+        );
+        assert_eq!(
+            r_null.instructions.as_deref(),
+            Some("Keep this historical custom prompt.")
+        );
+        assert_eq!(
+            effective_agent_instructions(Some(&store), &data, &r_null).as_deref(),
+            Some(
+                format!("{BUILTIN_GENERAL_ROLE_BODY}\n\nKeep this historical custom prompt.")
+                    .as_str()
+            )
+        );
+
+        let r_blank = store.agent(&a_blank.id).unwrap();
+        assert_eq!(r_blank.role.as_deref(), Some("general"));
+        assert!(r_blank.instructions.is_none());
+
+        let r_mixed = store.agent(&a_mixed.id).unwrap();
+        assert_eq!(r_mixed.role.as_deref(), Some("code-reviewer"));
+        assert_eq!(r_mixed.instructions.as_deref(), Some("Check PR #123."));
+        let rendered_prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(rendered_prompt.contains("Review carefully."));
+        assert!(rendered_prompt.contains("Check PR #123."));
+
+        let r_retired = store.agent(&a_retired.id).unwrap();
+        assert_eq!(r_retired.role.as_deref(), Some("general"));
+        assert_eq!(
+            r_retired.instructions.as_deref(),
+            Some("Explicit task stays intact.")
+        );
+
+        assert_eq!(backfill_historical_agent_roles(&store, &data).unwrap(), 0);
     }
 }
 
@@ -13440,6 +14120,149 @@ mod runtime_config_tests {
         assert_eq!(name, "target");
         assert_eq!(std::fs::read(destination.join("auth.json")).unwrap(), bytes);
         assert!(!stage.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_propagation_returns_post_write_sharing_errors() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Principal admission is process-wide; isolate it from parallel tests.
+        const PROBE: &str = "ANYAGENTS_TEST_PROPAGATION_SHARING_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env(PROBE, "1")
+                .env_remove("ANYAGENTS_PRINCIPALS")
+                .env_remove("ANYAGENTS_PRINCIPAL_REGISTRY")
+                .env_remove("ANYAGENTS_AGENTS")
+                .env_remove("ANYAGENTS_AGENT_UID")
+                .env_remove("ANYAGENTS_AGENT_GID")
+                .env_remove("ANYAGENTS_SOCKET_GID")
+                .env_remove("ANYAGENTS_SEAT_LAUNCHER")
+                .args([
+                    "--exact",
+                    "create::runtime_config_tests::credential_propagation_returns_post_write_sharing_errors",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "probe failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "probe must run exactly one test: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sample", "codex"))
+            .unwrap();
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "openai/target\n").unwrap();
+        let owner = std::fs::metadata(&cfg).unwrap();
+        let uid = if owner.uid() == 42001 { 42002 } else { 42001 };
+        let gid = owner.gid();
+        unsafe {
+            std::env::set_var(
+                "ANYAGENTS_PRINCIPALS",
+                serde_json::json!({
+                    agent.id.as_str(): {
+                        "user": "registered-worker", "uid": uid,
+                        "gid": gid, "socket_gid": gid
+                    }
+                })
+                .to_string(),
+            );
+        }
+        assert!(resolved_agent_seat_info(&store, &agent).is_some());
+        let prof = dir.path().join("profiles/openai/target");
+        std::fs::create_dir_all(&prof).unwrap();
+        let credentials = br#"{"tokens":{"access_token":"fixture-only"}}"#;
+        std::fs::write(prof.join("auth.json"), credentials).unwrap();
+        let overlay = cfg.parent().unwrap().join("memory");
+        std::fs::write(&overlay, "not a directory").unwrap();
+        let markers = [
+            ".anyagents-seeded-profile",
+            ".anyagents-quota-cleared-ms",
+            ".anyagents-profile-rotated-ms",
+            ".anyagents-last-error.json",
+        ];
+        for marker in markers {
+            std::fs::write(cfg.join(marker), "previous-state\n").unwrap();
+        }
+        // Preparation must succeed: this fixture fails only in post-write sharing.
+        crate::sandbox::prepare_config_with_seat_uid(&cfg, uid, gid).unwrap();
+
+        let err = propagate_credentials(
+            dir.path(),
+            "openai",
+            "target",
+            &["auth.json"],
+            CredentialChange::Replaced,
+        )
+        .unwrap_err();
+        match err {
+            Error::WorkdirPermission { path, message } => {
+                assert_eq!(path, cfg.display().to_string());
+                assert!(
+                    message.contains("cannot share harness overlays"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("refusing non-directory host overlay"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected checked overlay sharing refusal, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(cfg.join("auth.json")).unwrap(), credentials);
+        for marker in markers {
+            assert_eq!(
+                std::fs::read_to_string(cfg.join(marker)).unwrap(),
+                "previous-state\n",
+                "marker changed after sharing failed: {marker}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&overlay).unwrap(),
+            "not a directory"
+        );
+
+        // The same real caller succeeds once the overlay is repaired.
+        std::fs::remove_file(&overlay).unwrap();
+        propagate_credentials(
+            dir.path(),
+            "openai",
+            "target",
+            &["auth.json"],
+            CredentialChange::Replaced,
+        )
+        .unwrap();
+        assert!(overlay.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(cfg.join(".anyagents-seeded-profile")).unwrap(),
+            "openai/target\n"
+        );
+        let rotated = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms")).unwrap();
+        assert!(rotated.trim().parse::<i64>().unwrap() > 0);
+        assert_eq!(
+            std::fs::read_to_string(cfg.join(".anyagents-quota-cleared-ms")).unwrap(),
+            rotated
+        );
+        assert!(!cfg.join(".anyagents-last-error.json").exists());
+        assert_eq!(std::fs::read(cfg.join("auth.json")).unwrap(), credentials);
     }
 
     #[test]
@@ -13840,6 +14663,30 @@ mod runtime_config_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config");
         ensure_seat_environment(&cfg, dir.path()).unwrap();
+        #[cfg(unix)]
+        for name in ["tmp", "data-home", "cache-home", "state-home"] {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = cfg.join(name);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                0o1777
+            );
+            // A repeated preparation repairs legacy non-sticky runtime trees.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        ensure_seat_environment(&cfg, dir.path()).unwrap();
+        #[cfg(unix)]
+        for name in ["tmp", "data-home", "cache-home", "state-home"] {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(cfg.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o1777
+            );
+        }
         assert!(!cfg.join(".rustup").exists());
         assert!(!cfg.join(".cargo").exists());
         assert!(!cfg.join(".local/share/desk-claude").exists());
@@ -15005,7 +15852,15 @@ Connection: close
                 .unwrap();
             apply_archetype_defaults(Some(&store), &data_dir, Some(&l1), &mut req).unwrap();
             assert_eq!(req.scope.as_deref(), Some(expected_scope));
-            assert_eq!(req.instructions.as_deref(), Some(expected_body));
+            assert!(req.instructions.is_none());
+            let mut probe = l1.clone();
+            probe.role = req.role.clone();
+            probe.instructions = req.instructions.clone();
+            probe.workdir = None;
+            assert_eq!(
+                effective_agent_instructions(Some(&store), &data_dir, &probe).as_deref(),
+                Some(expected_body)
+            );
         }
 
         // A role deleted/retired in the authoritative workspace .agents/agents must NOT fall back
@@ -15058,8 +15913,14 @@ Connection: close
             }))
             .unwrap();
         apply_archetype_defaults(Some(&store), &data_dir, Some(&l1), &mut override_req).unwrap();
+        assert!(override_req.instructions.is_none());
+        let mut override_probe = l1.clone();
+        override_probe.parent_id = Some(l1.id.clone());
+        override_probe.role = override_req.role.clone();
+        override_probe.instructions = override_req.instructions.clone();
+        override_probe.workdir = None;
         assert_eq!(
-            override_req.instructions.as_deref(),
+            effective_agent_instructions(Some(&store), &data_dir, &override_probe).as_deref(),
             Some("L1 local writer override.")
         );
 

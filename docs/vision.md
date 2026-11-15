@@ -32,6 +32,8 @@ People and teams who already use one or more agent harnesses and want them runni
 6. **Cost and usage.** Tokens, reported cost and quota state per agent, harness, model and day.
 7. **Outcomes.** Merged, closed and review-failed pull requests from an agent's watches, and verdicts from its ancestors or the operator, recorded beside usage. Successes, recovery after rework and cost per successful outcome are reported per harness and model, role, profile, agent or skill.
 
+7. **Computer use, browser included.** Each agent can have its own isolated desktop: one headless Wayland desktop with one headful browser, worked through the page (DevTools, with refs bound to their document) and through the pixels (screenshots, pointer, keyboard, clipboard), one agent at a time. A person can take over the whole desktop from any device, for a CAPTCHA or a sign-in, and hand it back. One open-source engine ([`agent-workstation`](https://github.com/SylphxAI/agent-workstation)) does this: Spiron embeds it and AnyAgents serves it to every other harness over MCP. No script changes what a site sees, and agents never bypass a CAPTCHA.
+
 ## Boundaries
 
 - Server first. `anyagents serve` is the product. The CLI, the MCP server, a future TUI or GUI, and every channel are clients of the same API.
@@ -49,6 +51,7 @@ People and teams who already use one or more agent harnesses and want them runni
 - Channels other than Telegram.
 - A TUI or GUI (the API is designed for them).
 - Several hosts sharing one server.
+- Session desktops on macOS or Windows hosts (they need Linux), and a device app for controlling a person's own computer through its accessibility APIs; host desktop control works as it does today until that app replaces it.
 - An internal credential broker or custom container runtime: container (`docker`) and cluster (`k8s`) sandboxes use standard OCI and Kubernetes primitives ([ADR 0002](adr/0002-runtime-drivers-and-capability-identity.md)).
 
 ## Target metrics

@@ -3148,6 +3148,177 @@ for line in sys.stdin:
         }
     );
 }
+#[test]
+fn a_stray_fragment_is_syntax_alone_and_never_a_short_answer() {
+    for stray in ["}", " } ", "\"}", "]}", "}}\n", "`", "\")"] {
+        assert!(super::agy_stray_fragment(stray), "{stray:?}");
+    }
+    for answer in [
+        "",
+        "  ",
+        "ok",
+        "NO_REPLY",
+        "yes",
+        "42",
+        "done.",
+        "...",
+        "{\"a\":1}",
+        "👍",
+    ] {
+        assert!(!super::agy_stray_fragment(answer), "{answer:?}");
+    }
+}
+
+#[test]
+fn the_last_response_is_read_only_from_a_whole_tool_free_planner_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("transcript_full.jsonl");
+    let rows = |rows: &[serde_json::Value], tail: &str| {
+        let mut body = String::new();
+        for row in rows {
+            body.push_str(&row.to_string());
+            body.push('\n');
+        }
+        body.push_str(tail);
+        std::fs::write(&transcript, body).unwrap();
+    };
+    let user = json!({"type": "USER_INPUT", "content": "go"});
+    rows(
+        &[
+            user.clone(),
+            json!({"type": "PLANNER_RESPONSE", "content": "}"}),
+        ],
+        "",
+    );
+    assert_eq!(super::agy_last_response(&transcript).as_deref(), Some("}"));
+    rows(
+        &[
+            user.clone(),
+            json!({"type": "PLANNER_RESPONSE", "content": "}", "tool_calls": []}),
+        ],
+        "",
+    );
+    assert_eq!(super::agy_last_response(&transcript).as_deref(), Some("}"));
+    // A response that called a tool, a later row of another kind, and a
+    // row still being written are not the turn's last response.
+    rows(
+        &[
+            user.clone(),
+            json!({"type": "PLANNER_RESPONSE", "content": "}", "tool_calls": [{"name": "send"}]}),
+        ],
+        "",
+    );
+    assert_eq!(super::agy_last_response(&transcript), None);
+    rows(
+        &[
+            json!({"type": "PLANNER_RESPONSE", "content": "}"}),
+            json!({"type": "SYSTEM_MESSAGE", "content": "x"}),
+        ],
+        "",
+    );
+    assert_eq!(super::agy_last_response(&transcript), None);
+    rows(&[user], r#"{"type":"PLANNER_RESPONSE","content":"}"#);
+    assert_eq!(super::agy_last_response(&transcript), None);
+}
+
+/// A turn that closes on a stray `}` with no tool call is told once to
+/// continue, and closes with the continued turn; a second fragment closes it.
+#[test]
+#[cfg(target_os = "linux")]
+fn an_agy_turn_closed_on_a_stray_fragment_is_continued_once() {
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let logs = dir
+        .path()
+        .join(".gemini/antigravity-cli/brain/sess-frag/.system_generated/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let transcript = logs.join("transcript_full.jsonl");
+    let seen = dir.path().join("continuation.txt");
+    // Nothing listens on the language server's port.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let spec = StreamSpec::for_program("agy");
+    let mut harness = super::StreamHarness::launch_with_agy_rpc(
+        super::Launch {
+            spec: spec.clone(),
+            program: "/usr/bin/python3".into(),
+            args: vec![
+                "-u".into(),
+                "-c".into(),
+                r#"
+import json, sys, time
+transcript, seen = sys.argv[1], sys.argv[2]
+def step(kind):
+    print(json.dumps({"event":"step_update","step_update":{"conversation_id":"sess-frag","state":"DONE","step_type":kind}}), flush=True)
+def row(kind, content):
+    with open(transcript, "a") as f:
+        f.write(json.dumps({"type":kind,"source":"MODEL","content":content}) + "\n")
+def result():
+    print(json.dumps({"event":"result","session_id":"sess-frag","usage":{"input_tokens":1,"output_tokens":1}}), flush=True)
+print(json.dumps({"event":"init","session_id":"sess-frag"}), flush=True)
+sys.stdin.readline()
+step("user_input")
+row("PLANNER_RESPONSE", "}")
+result()
+line = sys.stdin.readline()
+with open(seen, "w") as f:
+    f.write(line)
+time.sleep(0.3)
+step("user_input")
+row("PLANNER_RESPONSE", "}")
+result()
+sys.stdin.read()
+"#
+                .into(),
+                transcript.display().to_string(),
+                seen.display().to_string(),
+            ],
+            environment: vec![],
+            work_dir: Some(dir.path().to_path_buf()),
+            session_id: None,
+            mode: anyagents_harness::DeliveryMode::Steer,
+            delivery: crate::LINE_INTO_TURN,
+        },
+        Some(super::AgyRpcConfig {
+            config_dir: dir.path().to_path_buf(),
+            csrf_token: "csrf-frag".into(),
+            port_override: Some(port),
+        }),
+    )
+    .unwrap();
+    assert!(harness.wait_pred(Duration::from_secs(5), |state| state.session_id.is_some()));
+    let message = plain_message("m1");
+    let line = super::message_line(&spec, &message);
+    harness.deliver(&message, &line).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_to_string(&seen)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "the turn was never continued");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let continuation: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+    assert!(
+        continuation["text"]
+            .as_str()
+            .unwrap()
+            .contains("only `}`, a stray syntax fragment")
+    );
+    assert!(
+        !harness.wait_finished("m1", Duration::ZERO),
+        "the fragment did not close the turn"
+    );
+    assert!(harness.wait_finished("m1", Duration::from_secs(5)));
+    assert_eq!(
+        harness.health().turn_state,
+        anyagents_harness::TurnState::Idle
+    );
+}
 
 // A completed pipe write and a successful empty result prove neither work
 // nor consumption. Hold the writer until stdout closes to exercise the race.

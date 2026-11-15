@@ -310,6 +310,58 @@ AnyAgents selects the exposed MCP tool profile according to the execution bounda
 
 A remote session (a cloud harness or a remote sandbox) never holds the agent's local capability. Each launch begins a remote session: the server issues a token bound to that agent and session, stores only its SHA-256 digest, writes it with `<public_url>/v1/webhooks/mcp` into the agent's config directory, rotates it at half its lifetime (`remote_session_ttl_secs`, default one hour), and revokes it on pause, archive, relaunch, deletion or `anyagents agents revoke-remote`. `public_url` lives under `[server]` in `<data>/anyagents.toml`; without it a remote agent is neither created nor started. `public_listen` in the same table binds the public listener, which accepts remote session tokens only ([serving identity](serving-identity.md#listeners)). A remote session token authenticates only while its agent runs off this host.
 
+## Desktop sessions: browser and computer use
+
+Browser use is one view of computer use, and one engine serves both: the
+open-source [`agent-workstation`](https://github.com/SylphxAI/agent-workstation)
+crate. Spiron embeds it natively; AnyAgents runs it in the server and exposes
+it to every third-party harness through the MCP `browser` and `computer`
+tools ([computer-and-device.md](computer-and-device.md) has the tool surface).
+
+- **One isolated desktop per session.** A session is one headless Wayland
+  compositor (`sway`, software rendering, a private runtime directory, no X
+  server and no TCP listener) running exactly one headful Chromium-family
+  browser with its native chrome. The server keeps at most one session per
+  browser profile directory and starts it on the first call for that profile.
+- **Two views of one state.** Web actions go over the browser's loopback
+  DevTools endpoint, with accessibility snapshots whose `@eN` refs are bound to
+  the document they read: any navigation of that document, and any newer
+  snapshot, invalidates them deterministically (`STALE_REF`). Desktop actions
+  go through Wayland screencopy and virtual pointer and keyboard devices, so
+  they reach browser chrome, file dialogs, native bubbles and every window. A
+  DevTools navigation hands keyboard focus to the page, so both views agree on
+  where keys go.
+- **One agent principal per session.** The engine leases a session to one
+  agent at a time; every other agent's call fails with a typed error
+  (`DESKTOP_IN_USE` on the tool surface) until the session stops.
+- **Human takeover of the whole desktop.** wayvnc behind a token-protected
+  WebSocket and a noVNC page. While a person holds control, every agent action
+  and observation returns `HUMAN_IN_CONTROL`, until they hand back or after
+  five idle minutes. The server mounts each session's page on its public
+  listener under `/v1/webhooks/takeover/<key>/`, reached at
+  `ANYAGENTS_WEBHOOK_URL` (the deployment's stable public entry); without one
+  it falls back to a quick tunnel started at the first takeover, or loopback.
+  CAPTCHAs and 2FA challenges go to a person this way; agents never bypass
+  them.
+- **No fingerprint spoofing.** Nothing is injected into pages to change what a
+  site sees. A profile's fingerprint seed fixes its desktop size, timezone and
+  locale at launch. Residential egress goes through an authorized proxy the
+  caller names.
+- **Caller-held state.** Profiles, proxy tunnels and secrets belong to the
+  caller; the engine holds no global state. A `secret_ref` is resolved at the
+  moment of insertion, bound to the selected field and its frame's origin,
+  and never logged or returned to the model.
+- **Lifecycle.** A session stops on `close` by its holder, after
+  `ANYAGENTS_BROWSER_IDLE_SECS` without calls (never while a person holds
+  control), when its holder is deleted or archived, and on server shutdown;
+  the browser always closes gracefully so the profile is flushed.
+
+Host desktop control (`tools.computer` with `platform`, `display` or
+`wayland_display`: macOS JXA, Windows PowerShell, X11 tools) stays in
+`crates/anyagents/src/computer/` as it is. It moves to a future device app
+built on the same engine with the platform accessibility APIs (macOS AX,
+Windows UI Automation), and is not being extended here.
+
 ## Identity: one authenticated connection per agent session
 
 A capability is 32 random bytes the server mints for one agent instance. The server keeps only its hash, beside the agent's immutable id and a generation: minting a new one revokes the last, so a replaced session stops working at once. The capability is written `0600` into the agent's own config directory (`agents/<id>/config/mcp-capability`), or `0640` in that agent's own OS group when OS seats are configured, so its harness reads it and no other seat can. It is never an argument, a tool argument, an environment value or a log line.
