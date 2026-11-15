@@ -835,6 +835,10 @@ fn grant_config_acl(file: &File, uid: u32, gid: u32, mode: u32) -> io::Result<()
     }
 }
 
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "mode_t is u16 on macOS and u32 on Linux"
+)]
 fn grant(file: &File, uid: u32, gid: u32, capability: bool, daemon_access: bool) -> io::Result<()> {
     let meta = file.metadata()?;
     if !meta.is_dir() && (!meta.is_file() || meta.nlink() != 1) {
