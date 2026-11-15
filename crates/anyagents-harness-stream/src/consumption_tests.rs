@@ -31,8 +31,13 @@ fn fake_spiron(dir: &Path, capable: bool) -> StreamHarness {
             dir.display().to_string(),
         ],
         environment: vec![(
-            "FAKE_SPIRON_CAPABLE".into(),
-            if capable { "1" } else { "0" }.into(),
+            "FAKE_SPIRON_PROTOCOL".into(),
+            if capable {
+                "spiron.headless/v2"
+            } else {
+                "spiron.headless/v1"
+            }
+            .into(),
         )],
         work_dir: None,
         session_id: None,
@@ -40,7 +45,9 @@ fn fake_spiron(dir: &Path, capable: bool) -> StreamHarness {
         delivery: super::SPIRON,
     })
     .unwrap();
-    harness.wait_ready(Duration::from_secs(15)).unwrap();
+    if capable {
+        harness.wait_ready(Duration::from_secs(15)).unwrap();
+    }
     harness
 }
 
@@ -147,7 +154,7 @@ fn nothing_is_written_before_the_peer_says_what_it_can_do() {
     let error = harness.wait_ready(Duration::from_millis(50)).unwrap_err();
     assert!(error.to_string().contains("no ready frame"), "{error}");
     drop(harness);
-    // An older peer announces no capabilities and keeps the older rules.
+    // A legacy peer is refused before it receives input.
     let old = fake_spiron(dir.path(), false);
     assert!(!old.proves_consumption());
     let capable = fake_spiron(dir.path(), true);
@@ -458,41 +465,18 @@ fn a_turn_the_peer_could_not_start_is_offered_again_and_is_no_fault() {
 }
 
 #[test]
-fn an_older_peer_is_given_nothing_while_its_turn_runs() {
+fn a_legacy_ready_fails_closed_without_writing_input() {
     let dir = tempfile::tempdir().unwrap();
     let mut harness = fake_spiron(dir.path(), false);
-    assert_eq!(
-        harness.health().delivery.level,
-        anyagents_harness::DeliveryLevel::TurnEnd
+    let error = harness.wait_ready(Duration::from_secs(15)).unwrap_err();
+    assert!(
+        error.to_string().contains("unsupported_protocol"),
+        "{error}"
     );
-    until(
-        &mut harness,
-        "m1",
-        Accepted {
-            turn_finished: false,
-        },
+    assert!(
+        harness
+            .deliver(&message("m1"), &json!({"type":"prompt","request_id":"m1"}))
+            .is_err()
     );
-    // Mail for a busy older peer stays in the mailbox: nothing would prove
-    // the running turn took it.
-    assert_eq!(deliver(&mut harness, "m2"), Deferred);
-    act(dir.path(), "step");
-    assert_eq!(deliver(&mut harness, "m2"), Deferred);
-    assert_eq!(wire(dir.path()).len(), 1);
-    act(dir.path(), "finish");
-    until(
-        &mut harness,
-        "m2",
-        Accepted {
-            turn_finished: false,
-        },
-    );
-    let written: Vec<_> = wire(dir.path())
-        .into_iter()
-        .map(|(_, kind, id)| (kind, id))
-        .collect();
-    assert_eq!(
-        written,
-        [("user".into(), "m1".into()), ("user".into(), "m2".into())]
-    );
-    assert!(!dir.path().join("spiron-unconfirmed-steers.json").exists());
+    assert!(harness.written_ids().is_empty());
 }

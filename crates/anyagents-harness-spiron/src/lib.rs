@@ -7,15 +7,8 @@
 //!   [`SpironHarness::reattach`] attaches again after a server restart with
 //!   `after_seq`, and the replay rebuilds what the adapter knew. `stop` ends
 //!   the process; [`SpironHarness::detach`] leaves it running.
-//! - `spiron.headless/v1`, over the child's stdin and stdout, for a binary
-//!   that does not speak v2 and for a host that keeps no process past itself.
 //!
-//! The process announces itself with a `ready` frame before it is given
-//! anything. A peer that names `steer_consumed` and `idempotent_input` gets
-//! the whole inbox at once (`prompt` when no turn is open, `steer` into the
-//! running one) and proves each input consumed; it deduplicates a replay by
-//! its `request_id`. A peer that names neither is given one input per turn,
-//! never one while a turn runs. `docs/delivery.md` states both levels.
+//! Inputs are journaled and deduplicated by request_id; only v2 is accepted.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -25,7 +18,7 @@ use anyagents_harness::{
     DeliverOutcome, Delivery, Harness, HarnessError, HarnessHealth, OutboundMessage, TurnUsage,
     compose_message,
 };
-use anyagents_harness_stream::{Connect, Launch, LineProtocol, StreamHarness, StreamSpec};
+use anyagents_harness_stream::{Connect, LineProtocol, StreamHarness, StreamSpec};
 use serde_json::json;
 
 /// What this adapter guarantees once a capable peer announced itself.
@@ -73,8 +66,6 @@ struct Listening {
 /// Why a v2 launch did not happen.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ListenError {
-    /// The binary does not know `--listen`: it speaks v1 only.
-    NotV2,
     Failed(String),
 }
 
@@ -98,68 +89,10 @@ fn spec(args: Vec<String>) -> StreamSpec {
         name: "anyagents-spiron".to_string(),
         args,
         resume_flag: "--session",
-        start_line: "user",
+        start_line: "prompt",
         cancel: "cancel",
         protocol: LineProtocol::AcknowledgedResult,
     }
-}
-
-/// How long `spiron --help` may take to say whether it knows `--listen`.
-const PROBE_WAIT: Duration = Duration::from_secs(5);
-
-/// Whether `program` speaks `spiron.headless/v2` as a listening process:
-/// its `--help` names `--listen`. An answer is kept per binary (path, size
-/// and modification time). A program that does not answer in time is taken
-/// as v1 for this launch only: no answer is kept, and the next launch asks
-/// again.
-pub fn listens(program: &Path) -> bool {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    type Key = (PathBuf, u64, Option<std::time::SystemTime>);
-    static SEEN: OnceLock<Mutex<HashMap<Key, bool>>> = OnceLock::new();
-    let Ok(meta) = std::fs::metadata(program) else {
-        return false;
-    };
-    let key = (program.to_path_buf(), meta.len(), meta.modified().ok());
-    let seen = SEEN.get_or_init(Default::default);
-    if let Some(known) = seen.lock().unwrap_or_else(|err| err.into_inner()).get(&key) {
-        return *known;
-    }
-    let answer = (|| {
-        let mut child = std::process::Command::new(program)
-            .arg("--help")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let mut stdout = child.stdout.take()?;
-        let reader = std::thread::spawn(move || {
-            let mut help = String::new();
-            let _ = std::io::Read::read_to_string(&mut stdout, &mut help);
-            help
-        });
-        let deadline = Instant::now() + PROBE_WAIT;
-        loop {
-            if child.try_wait().ok()?.is_some() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        Some(reader.join().ok()?.contains("--listen"))
-    })();
-    let Some(answer) = answer else {
-        return false;
-    };
-    seen.lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .insert(key, answer);
-    answer
 }
 
 /// A request id no other input of this process carries.
@@ -171,36 +104,8 @@ fn control_id(kind: &str) -> String {
 }
 
 impl SpironHarness {
-    /// Start the process and wait for its `ready` frame, which decides the
-    /// custody rules every input follows. A process that exits first fails
-    /// the wait at once; one that says nothing within `patience` is refused.
-    pub fn start(launch: SpironLaunch, patience: Duration) -> Result<Self, HarnessError> {
-        let spec = spec(launch.args.clone());
-        let mut args = launch.args;
-        if let Some(session) = &launch.session {
-            args.extend(["--session".to_string(), session.clone()]);
-        }
-        let inner = StreamHarness::launch(Launch {
-            spec,
-            program: launch.program,
-            args,
-            environment: launch.environment,
-            work_dir: Some(launch.work_dir),
-            session_id: launch.session,
-            mode: anyagents_harness::DeliveryMode::Steer,
-            delivery: DELIVERY,
-        })?;
-        inner.set_state_dir(&launch.state_dir);
-        inner.wait_ready(patience)?;
-        Ok(Self {
-            inner,
-            process: None,
-        })
-    }
-
     /// Start a v2 process that listens on `socket` and outlives this server,
-    /// and attach to it. Its output goes to `log`. A binary that exits with a
-    /// usage error naming `--listen` speaks v1 only: [`ListenError::NotV2`].
+    /// and attach to it. Its output goes to `log`; launch errors fail closed.
     ///
     /// `spawned` is told the process's pid as soon as it exists, before it
     /// listens, so the host can record it: a host that dies before the
@@ -242,10 +147,6 @@ impl SpironHarness {
         loop {
             if let Ok(Some(status)) = child.try_wait() {
                 let said = std::fs::read_to_string(log).unwrap_or_default();
-                // clap's usage error: the binary predates `--listen`.
-                if status.code() == Some(2) && said.contains("--listen") {
-                    return Err(ListenError::NotV2);
-                }
                 let said = anyagents_harness::masking::mask_known_secrets(said.trim());
                 let tail: String = said
                     .chars()
@@ -338,7 +239,7 @@ impl SpironHarness {
     }
 
     /// The seq before this connection's `ready`: where a later attach
-    /// replays from to rebuild this adapter. `None` for v1.
+    /// replays from to rebuild this adapter. `None` for stdio.
     pub fn attach_after_seq(&self) -> Option<u64> {
         self.process.as_ref()?;
         self.inner.attached_seq().map(|seq| seq.saturating_sub(1))
@@ -362,7 +263,7 @@ impl SpironHarness {
     }
 
     /// Close the connection and leave a v2 process running, for the next
-    /// server to attach to. A v1 process ends as the harness drops.
+    /// server to attach to. A stdio process ends as the harness drops.
     pub fn detach(mut self) {
         if let Some(process) = &mut self.process {
             process.released = true;
@@ -430,7 +331,7 @@ impl SpironHarness {
 impl Harness for SpironHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         let line = json!({
-            "type": "user",
+            "type": "prompt",
             "request_id": message.id,
             "text": compose_message(&message.id, &message.context, &message.text),
         });
@@ -455,12 +356,8 @@ impl Harness for SpironHarness {
     }
 
     fn cancel(&mut self) -> Result<(), HarnessError> {
-        if self.inner.speaks_v2() {
-            return self
-                .inner
-                .cancel(&json!({"type": "cancel", "request_id": control_id("cancel")}));
-        }
-        self.inner.cancel(&json!({"type": "cancel"}))
+        self.inner
+            .cancel(&json!({"type": "cancel", "request_id": control_id("cancel")}))
     }
 
     fn health(&self) -> HarnessHealth {
@@ -494,7 +391,7 @@ impl Harness for SpironHarness {
 
 impl Drop for SpironHarness {
     /// A v2 process the host neither stopped nor detached ends with the
-    /// adapter, as a v1 child does.
+    /// adapter, as a stdio child does.
     fn drop(&mut self) {
         self.end_listening();
     }

@@ -286,3 +286,51 @@ fn a_refused_attach_fails_the_wait() {
     );
     peer.join().unwrap();
 }
+
+#[test]
+fn an_old_or_unnamed_ready_cannot_complete_a_v2_attach() {
+    for protocol in [Some("spiron.headless/v1"), None] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let attach: Value = serde_json::from_str(&line).unwrap();
+            // Even naming both old capabilities cannot admit the old protocol.
+            let ready = json!({"type":"ready", "protocol":protocol,
+                "capabilities":["steer_consumed","idempotent_input"]});
+            stream
+                .write_all(frame(1, attach["request_id"].as_str().unwrap(), ready).as_bytes())
+                .unwrap();
+            line.clear();
+            assert_eq!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "no input after refusal"
+            );
+        });
+        let mut harness = StreamHarness::connect(Connect {
+            spec: spec(),
+            program: "spiron".into(),
+            socket: path,
+            pid: None,
+            after_seq: None,
+            session_id: None,
+            environment: Vec::new(),
+            delivery: SPIRON,
+        })
+        .unwrap();
+        let error = harness.wait_ready(Duration::from_secs(10)).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported_protocol"),
+            "{error}"
+        );
+        assert!(!harness.input_ready());
+        assert!(harness.written_ids().is_empty());
+        harness.stop();
+        peer.join().unwrap();
+    }
+}

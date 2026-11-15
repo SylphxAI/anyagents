@@ -215,19 +215,7 @@ pub const LINE_INTO_TURN: Delivery = Delivery {
     peer: None,
 };
 
-/// A Spiron peer whose `ready` names no consumption proof: it is given one
-/// input per turn, never one while a turn runs, and `accepted` commits it.
-/// Gated on the capability for peers built before it; it goes when no such
-/// Spiron is installed.
-const OLDER_SPIRON: Delivery = Delivery {
-    level: DeliveryLevel::TurnEnd,
-    idempotent: false,
-    proof: std::borrow::Cow::Borrowed("accepted (one input per turn)"),
-    peer: None,
-};
-
-/// Spiron's headless peer when its `ready` frame names `steer_consumed` and
-/// `idempotent_input`.
+/// Spiron v2's journal-backed consumption and request-id deduplication.
 pub const SPIRON: Delivery = Delivery {
     level: DeliveryLevel::NextStep,
     idempotent: true,
@@ -900,17 +888,9 @@ impl StreamHarness {
         }
     }
 
-    /// What this child guarantees as it announced itself. A Spiron peer whose
-    /// `ready` names no consumption proof keeps the older custody rules.
+    /// The negotiated delivery contract.
     fn delivery_now(&self, state: &State) -> Delivery {
-        let delivery = if self.spec.protocol == LineProtocol::AcknowledgedResult
-            && state.ready == Some(false)
-        {
-            OLDER_SPIRON
-        } else {
-            self.delivery.clone()
-        };
-        delivery.with_peer(state.peer.clone())
+        self.delivery.clone().with_peer(state.peer.clone())
     }
 
     pub fn clear_quota(&self) {
@@ -946,8 +926,10 @@ impl StreamHarness {
         }
         if self.spec.protocol == LineProtocol::AcknowledgedResult {
             let state = lock(&self.shared);
-            // The peer says what it can do before it is given anything: its
-            // `ready` decides which custody rules every input follows.
+            if let Some(error) = &state.attach_refused {
+                return Err(HarnessError::Failed(error.clone()));
+            }
+            // No input is written before v2 negotiation and replay complete.
             if (state.ready.is_none() || (state.v2_attach.is_some() && !state.attached))
                 && state.alive
             {
@@ -957,12 +939,9 @@ impl StreamHarness {
                 drop(state);
                 return self.deliver_consumed(message, line);
             }
-            // An older peer proves nothing about input it takes mid-turn: it
-            // is given the next input only once the running turn has ended.
-            let unwritten = self.pending.as_ref().is_none_or(|p| p.id != id);
-            if unwritten && !state.seen.contains(id) && !state.open.is_empty() {
-                return Ok(DeliverOutcome::Deferred);
-            }
+            return Err(HarnessError::Failed(
+                "spiron requires spiron.headless/v2".into(),
+            ));
         }
         if self.agy_rpc.is_some() {
             let mut state = lock(&self.shared);
@@ -1011,8 +990,7 @@ impl StreamHarness {
                 if let Some(reset_at_ms) = state.quota_reset_at_ms {
                     return Ok(DeliverOutcome::Quota { reset_at_ms });
                 }
-                // Written and not proven yet: an Antigravity prompt until its
-                // cascade shows the turn, an older Spiron's until `accepted`.
+                // An Antigravity prompt waits until its cascade shows the turn.
                 if state.seen.contains(id) {
                     return Ok(if self.agy_rpc.is_some() {
                         DeliverOutcome::InFlight
@@ -1290,18 +1268,18 @@ impl StreamHarness {
     /// Wait until the peer's `ready` frame is read or the process exits.
     /// A peer that says nothing within `patience` is refused.
     pub fn wait_ready(&self, patience: Duration) -> Result<(), HarnessError> {
-        if self.speaks_v2() {
+        if lock(&self.shared).v2_attach.is_some() {
             // The `ready` that answers the attach, after the replay.
             let done = self.wait_pred(patience, |state| {
                 state.attached || state.attach_refused.is_some() || !state.alive
             });
             let state = lock(&self.shared);
-            return if state.attached {
-                Ok(())
-            } else if let Some(code) = &state.attach_refused {
+            return if let Some(code) = &state.attach_refused {
                 Err(HarnessError::Failed(format!(
                     "spiron refused the attach: {code}"
                 )))
+            } else if state.attached {
+                Ok(())
             } else if !done {
                 Err(HarnessError::Failed(format!(
                     "{} sent no ready frame within {}s",
@@ -1315,7 +1293,20 @@ impl StreamHarness {
             };
         }
         if self.wait_pred(patience, |state| state.ready.is_some() || !state.alive) {
-            return Ok(());
+            if self.spec.protocol != LineProtocol::AcknowledgedResult {
+                return Ok(());
+            }
+            let state = lock(&self.shared);
+            return if state.ready == Some(true) && state.attach_refused.is_none() {
+                Ok(())
+            } else {
+                Err(HarnessError::Failed(
+                    state
+                        .attach_refused
+                        .clone()
+                        .unwrap_or_else(|| "spiron exited before its v2 ready frame".into()),
+                ))
+            };
         }
         Err(HarnessError::Failed(format!(
             "{} sent no ready frame within {}s",
@@ -1336,7 +1327,8 @@ impl StreamHarness {
             return false;
         }
         if self.spec.protocol == LineProtocol::AcknowledgedResult
-            && (state.ready.is_none()
+            && (state.ready != Some(true)
+                || state.attach_refused.is_some()
                 || (state.v2_attach.is_some() && !state.attached)
                 || (state.open.is_empty()
                     && state
@@ -1782,7 +1774,6 @@ impl State {
     /// - Every protocol: the session's own record shows an earlier process
     ///   applied it (`applied_before`).
     /// - Spiron that proves consumption: `accepted` or `steer_consumed`.
-    /// - An older Spiron: `accepted`.
     /// - Antigravity with its language server: the cascade took it (its
     ///   transcript or mailbox says so, or its turn showed a step or closed).
     /// - A line-per-turn child: the whole line was written.
@@ -1800,7 +1791,6 @@ impl State {
                 } else {
                     taken()
                 }),
-                Some(false) if self.acknowledged.contains(id) => Some(taken()),
                 _ => None,
             },
             _ if agy => self.agy_taken.contains(id).then(taken),
@@ -2093,75 +2083,43 @@ fn read_stdout(
             if let Some(seq) = value.get("seq").and_then(Value::as_u64) {
                 state.last_seq = state.last_seq.max(seq);
             }
-            // The answer to this connection's own `attach`: its `ready`
-            // closes the replay; a refusal ends the attach.
-            if let Some(attach) = state.v2_attach.clone()
-                && value.get("request_id").and_then(Value::as_str) == Some(attach.as_str())
-            {
-                match kind {
-                    Some("ready") => {
-                        state.attached = true;
-                        state.attached_seq = value.get("seq").and_then(Value::as_u64);
-                        state.peer = Some(announced_peer(&value));
-                    }
-                    Some("rejected") => {
-                        state.attach_refused = Some(
-                            value
-                                .get("code")
-                                .and_then(Value::as_str)
-                                .unwrap_or("no code")
-                                .to_string(),
-                        );
-                    }
-                    _ => {}
+            if spec.protocol == LineProtocol::AcknowledgedResult && state.attach_refused.is_some() {
+                continue;
+            }
+            if spec.protocol == LineProtocol::AcknowledgedResult && kind == Some("ready") {
+                if value.get("protocol").and_then(Value::as_str) != Some(SPIRON_V2) {
+                    state.attach_refused =
+                        Some("unsupported_protocol: spiron requires spiron.headless/v2".into());
+                    state.ready = Some(false);
+                    state.touch();
+                    wake.notify_all();
+                    continue;
+                }
+                state.ready = Some(true);
+                state.peer = Some(announced_peer(&value));
+                if let Some(attach) = &state.v2_attach
+                    && value.get("request_id").and_then(Value::as_str) == Some(attach.as_str())
+                {
+                    state.attached = true;
+                    state.attached_seq = value.get("seq").and_then(Value::as_u64);
                 }
             }
-            if spec.protocol == LineProtocol::AcknowledgedResult
-                && kind == Some("ready")
-                && state.ready.is_none()
+            if let Some(attach) = &state.v2_attach
+                && kind == Some("rejected")
+                && value.get("request_id").and_then(Value::as_str) == Some(attach.as_str())
             {
-                state.ready = Some(announces_consumption(&value));
-                state.peer = Some(announced_peer(&value));
+                state.attach_refused = Some(
+                    value
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("no code")
+                        .to_string(),
+                );
             }
-            // A peer that proves consumption is read by its own rules; the
-            // receipts below are the older peer's.
             let consumption =
                 spec.protocol == LineProtocol::AcknowledgedResult && state.ready == Some(true);
             if consumption {
                 retry_after = note_consumption_receipt(&mut state, kind, &value);
-            } else if spec.protocol == LineProtocol::AcknowledgedResult
-                && let Some(id) = value.get("request_id").and_then(Value::as_str)
-                && state
-                    .open
-                    .iter()
-                    .chain(&state.followups)
-                    .any(|open| open == id)
-            {
-                match kind {
-                    Some("accepted") => {
-                        state.acknowledged.insert(id.to_string());
-                        state.input_turns.insert(id.to_string(), id.to_string());
-                    }
-                    Some("rejected") => match spiron_refusal(&value) {
-                        // Never taken: it is offered again once the turn
-                        // that refused it is gone.
-                        SpironRefusal::NotStarted
-                        | SpironRefusal::TurnClosed
-                        | SpironRefusal::Unknown(_) => {
-                            let id = id.to_string();
-                            state.open.retain(|open| *open != id);
-                            state.followups.retain(|open| *open != id);
-                            state.seen.remove(&id);
-                        }
-                        SpironRefusal::ForGood(reason) => {
-                            let id = id.to_string();
-                            state.open.retain(|open| *open != id);
-                            state.followups.retain(|open| *open != id);
-                            state.rejected.insert(id, reason);
-                        }
-                    },
-                    _ => {}
-                }
             }
             if let Some(step_type) = value
                 .pointer("/step_update/step_type")
@@ -2254,8 +2212,6 @@ fn read_stdout(
                         usage,
                         &value,
                     );
-                } else if spec.protocol == LineProtocol::AcknowledgedResult {
-                    finish_correlated(&mut state, value["request_id"].as_str().unwrap(), usage);
                 } else {
                     finish_open(&mut state, usage);
                 }
@@ -2490,31 +2446,6 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
         state.turns_started += 1;
         state.open.append(&mut state.followups);
     }
-}
-
-/// The result that closes an older Spiron's turn: its one input is finished.
-fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage) {
-    if !state.open.iter().any(|id| id == turn) {
-        return;
-    }
-    state.open.retain(|id| id != turn);
-    state.finished.insert(turn.to_string());
-    state.usages.push((turn.to_string(), usage));
-    state.turn_user_inputs = 0;
-    state.last_turn_step_type = None;
-    state.idle_since = None;
-}
-
-/// The `ready` frame names both capabilities the pipelined path relies on:
-/// a per-input consumption signal and request-id deduplication.
-fn announces_consumption(value: &Value) -> bool {
-    let named = |capability: &str| {
-        value
-            .get("capabilities")
-            .and_then(Value::as_array)
-            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(capability)))
-    };
-    named("steer_consumed") && named("idempotent_input")
 }
 
 /// What a `ready` frame says about the peer: its protocol and capabilities.

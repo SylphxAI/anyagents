@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{Context, DeliverOutcome, Harness, OutboundMessage, Proof, TurnState};
-use anyagents_harness_spiron::{ListenError, Reattach, SpironHarness, SpironLaunch, listens};
+use anyagents_harness_spiron::{ListenError, Reattach, SpironHarness, SpironLaunch};
 
 const WAIT: Duration = Duration::from_secs(60);
 
@@ -112,7 +112,6 @@ fn pid_alive(pid: u32) -> bool {
 #[test]
 fn the_adapter_reattaches_after_its_server_goes_and_rebuilds_what_it_knew() {
     let Some(bin) = spiron_bin() else { return };
-    assert!(listens(&bin), "a v2 Spiron names --listen in its help");
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("s.sock");
     let log = root.path().join("spiron.log");
@@ -242,7 +241,7 @@ fn the_adapter_reattaches_after_its_server_goes_and_rebuilds_what_it_knew() {
 }
 
 #[test]
-fn a_binary_without_v2_is_reported_so_and_launched_as_before() {
+fn a_binary_without_listen_fails_closed() {
     let root = tempfile::tempdir().unwrap();
     // A v1-only Spiron rejects `--listen` as clap does: status 2, naming it.
     let fake = root.path().join("spiron");
@@ -253,7 +252,6 @@ fn a_binary_without_v2_is_reported_so_and_launched_as_before() {
     .unwrap();
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(!listens(&fake));
     let launch = SpironLaunch {
         program: fake,
         args: vec!["--headless".to_string(), "--json".to_string()],
@@ -269,26 +267,8 @@ fn a_binary_without_v2_is_reported_so_and_launched_as_before() {
         WAIT,
         |_| Ok(()),
     );
-    assert_eq!(result.err(), Some(ListenError::NotV2));
-}
-
-#[test]
-fn a_probe_that_runs_out_of_time_is_asked_again() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let root = tempfile::tempdir().unwrap();
-    // Slow the first time it is asked (a cold disk, a busy host), then a v2
-    // binary's help.
-    let marker = root.path().join("asked");
-    let slow = root.path().join("spiron");
-    std::fs::write(
-        &slow,
-        format!(
-            "#!/bin/sh\nif [ ! -e {m} ]; then touch {m}; exec sleep 30; fi\necho '      --listen <LISTEN>'\n",
-            m = marker.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(!listens(&slow), "no answer in time");
-    assert!(listens(&slow), "the timeout was not kept as an answer");
+    let Some(ListenError::Failed(error)) = result.err() else {
+        panic!("launch must fail")
+    };
+    assert!(error.contains("--listen"), "{error}");
 }
