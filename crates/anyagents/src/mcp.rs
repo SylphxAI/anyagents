@@ -590,6 +590,10 @@ pub(crate) struct Client {
     /// process: every call it makes carries [`HTTP_MCP_HEADER`], so routes
     /// that would start or read something on the host refuse it.
     via_http: bool,
+    /// The router of the server process that owns this HTTP MCP tool server:
+    /// calls go straight through it instead of dialing the external socket,
+    /// which closes at the start of a stop while admitted calls still drain.
+    in_process: Option<axum::Router>,
     /// What every clone of this client shares: idle connections to the
     /// server and the capability file as last read.
     link: Arc<ServerLink>,
@@ -643,13 +647,23 @@ impl Client {
             config,
             capability,
             via_http: false,
+            in_process: None,
             link: Arc::default(),
         }
     }
 
     /// The client of a tool server that answers MCP over HTTP.
+    #[cfg(test)]
     fn over_http(mut self) -> Self {
         self.via_http = true;
+        self
+    }
+
+    /// The client of an HTTP MCP tool server running inside `router`'s own
+    /// server process.
+    fn over_http_router(mut self, router: axum::Router) -> Self {
+        self.via_http = true;
+        self.in_process = Some(router);
         self
     }
 
@@ -702,14 +716,30 @@ impl Client {
                 self.via_http,
             )
         };
+        if let Some(router) = &self.in_process {
+            use hyper::service::Service as _;
+            if call_cancelled() {
+                return Err("the tool call was cancelled".into());
+            }
+            let service = hyper_util::service::TowerToHyperService::new(router.clone());
+            let Ok(response) = service.call(fresh()?).await;
+            let status = response.status();
+            let collected = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok((status, collected.to_bytes().to_vec()));
+        }
         let mut request = fresh()?;
         let mut reads_repeated = false;
+        let wait = self.restart_wait();
         loop {
             let (mut sender, reused) = match self.idle_connection().await {
                 Some(sender) => (sender, true),
                 // A tool call made while the server restarts waits for it,
                 // within what is left of the call's own wait.
-                None => (connect_waiting(&self.socket, &call_wait()).await?, false),
+                None => (connect_waiting(&self.socket, &wait).await?, false),
             };
             // A call its harness gave up on while it waited is not sent.
             if call_cancelled() {
@@ -725,8 +755,7 @@ impl Client {
                         // that pause counts against the call's wait.
                         request = unsent;
                         if !reused {
-                            pause_for_restart(&call_wait(), &error.into_error().to_string())
-                                .await?;
+                            pause_for_restart(&wait, &error.into_error().to_string()).await?;
                         }
                         continue;
                     }
@@ -756,6 +785,20 @@ impl Client {
                 idle.push(sender);
             }
             return Ok((status, bytes));
+        }
+    }
+
+    /// How long this client's calls wait for a server that is not listening:
+    /// one wait for the whole call, so a call outside any tool call's scope
+    /// still ends. A tool server inside the server process (over HTTP) never
+    /// waits: the socket it calls is its own process's, so a refusal means
+    /// that server is stopping, no other server will answer this process, and
+    /// waiting would only hold the stop open.
+    fn restart_wait(&self) -> SocketWait {
+        if self.via_http {
+            SocketWait::new(std::time::Duration::ZERO)
+        } else {
+            call_wait()
         }
     }
 
@@ -3442,7 +3485,7 @@ impl AgentMcp {
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
         let data_dir = self.client.socket.parent().map(Path::to_path_buf);
         let local_has_keys = !crate::web::load_web_keys(data_dir.as_deref()).is_empty();
-        let server_available = self.client.socket.exists();
+        let server_available = self.client.via_http || self.client.socket.exists();
         if !local_has_keys && server_available {
             let body = serde_json::to_vec(&args).map_err(|e| e.to_string())?;
             if let Ok(val) = self
@@ -4754,10 +4797,11 @@ impl AgentMcp {
         config: PathBuf,
         capability: String,
         profile: McpProfile,
+        router: axum::Router,
     ) -> Self {
         Self {
             agent,
-            client: Client::new(socket, config, capability).over_http(),
+            client: Client::new(socket, config, capability).over_http_router(router),
             profile,
         }
     }
@@ -8788,14 +8832,29 @@ pub(crate) async fn request(
         capability,
         operator,
         std::time::Duration::ZERO,
+        std::time::Duration::from_secs(180),
     )
     .await
+}
+
+/// What one exchange on a connection came to.
+enum Exchange {
+    Answered(hyper::StatusCode, Vec<u8>),
+    /// Handed back unsent: nothing reached the server.
+    Unsent(String),
+    /// Lost after the request went out: it may have applied.
+    Lost(String),
 }
 
 /// [`request`], waiting up to `within` for a server that is restarting (its
 /// socket missing or refusing: nothing was sent). A connection lost after the
 /// request went out is retried once for a read; any other call ends in
 /// [`interrupted_call`], since it may have applied.
+///
+/// `answer_within` bounds the server's answer once a connection is open; it
+/// never counts the wait for a server, so a long wait does not eat the time
+/// the call itself needs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn request_waiting(
     socket: &Path,
     method: &str,
@@ -8804,6 +8863,7 @@ pub(crate) async fn request_waiting(
     capability: Option<&str>,
     operator: Option<&str>,
     within: std::time::Duration,
+    answer_within: std::time::Duration,
 ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
     let payload = body.unwrap_or_default();
     let wait = SocketWait::new(within);
@@ -8819,28 +8879,47 @@ pub(crate) async fn request_waiting(
             false,
         )?;
         let mut sender = connect_waiting(socket, &wait).await?;
-        let response = match sender.try_send_request(request).await {
-            Ok(response) => response,
-            Err(mut error) => {
-                if error.take_message().is_some() {
-                    pause_for_restart(&wait, &error.into_error().to_string()).await?;
-                    continue;
+        let exchange = async {
+            match sender.try_send_request(request).await {
+                Err(mut error) => {
+                    let unsent = error.take_message().is_some();
+                    let error = error.into_error().to_string();
+                    if unsent {
+                        Exchange::Unsent(error)
+                    } else {
+                        Exchange::Lost(error)
+                    }
                 }
-                let error = error.into_error().to_string();
-                if after_lost_connection(method, &mut repeated).is_some() {
-                    continue;
+                Ok(response) => {
+                    let status = response.status();
+                    match response.into_body().collect().await {
+                        Ok(collected) => Exchange::Answered(status, collected.to_bytes().to_vec()),
+                        Err(error) => Exchange::Lost(error.to_string()),
+                    }
                 }
-                return Err(interrupted_call(method, path, &error));
             }
         };
-        let status = response.status();
-        match response.into_body().collect().await {
-            Ok(collected) => return Ok((status, collected.to_bytes().to_vec())),
-            Err(error) => {
-                if after_lost_connection(method, &mut repeated).is_some() {
-                    continue;
+        let Ok(exchange) = tokio::time::timeout(answer_within, exchange).await else {
+            let waited = format!(
+                "the server did not answer within {}s",
+                answer_within.as_secs()
+            );
+            return Err(if method.eq_ignore_ascii_case("GET") {
+                waited
+            } else {
+                format!(
+                    "{waited} ({method} {path}); it may or may not have applied. Check with a \
+                     read of what it changes before trying it again"
+                )
+            });
+        };
+        match exchange {
+            Exchange::Answered(status, bytes) => return Ok((status, bytes)),
+            Exchange::Unsent(error) => pause_for_restart(&wait, &error).await?,
+            Exchange::Lost(error) => {
+                if after_lost_connection(method, &mut repeated).is_none() {
+                    return Err(interrupted_call(method, path, &error));
                 }
-                return Err(interrupted_call(method, path, &error.to_string()));
             }
         }
     }
@@ -8896,8 +8975,7 @@ fn build_request(
 /// A restart is bounded on the server's side: a stopping server lets its
 /// running mutations finish (seconds normally, at most a minute) and exits
 /// within `server::STOP_WITHIN`, and a new server binds its socket within
-/// about a second of starting (measured 2026-11-14: started 17:51:07Z,
-/// serving 17:51:08Z). Two minutes covers that with room for a slow start (a
+/// about a second of starting. Two minutes covers that with room for a slow start (a
 /// migration), and is further cut to what the harness allows
 /// ([`harness_patience`]).
 const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -9517,6 +9595,7 @@ mod reconnect_tests {
                 Some("cap"),
                 None,
                 std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(10),
             )
             .await
         });
@@ -9579,6 +9658,7 @@ mod reconnect_tests {
             Some("cap"),
             None,
             std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
         )
         .await
         .expect_err("a change was answered by a dropped connection");
@@ -9591,6 +9671,7 @@ mod reconnect_tests {
             Some("cap"),
             None,
             std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -9600,6 +9681,154 @@ mod reconnect_tests {
         let posts = heads.iter().filter(|h| h.starts_with("POST ")).count();
         let gets = heads.iter().filter(|h| h.starts_with("GET ")).count();
         assert_eq!((posts, gets), (1, 2), "{heads:?}");
+    }
+
+    /// The tool server inside the server process (MCP over HTTP) calls its
+    /// own process's socket: a refusal there is that server stopping, so the
+    /// call fails at once instead of holding the stop open while it waits.
+    #[tokio::test]
+    async fn a_tool_server_inside_the_server_never_waits_for_its_own_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        // Bound and closed: the file stays and every connection is refused,
+        // as for a server whose listener closed at its stop.
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let client = super::Client::new(socket.clone(), dir.path().into(), "cap".into());
+        let started = std::time::Instant::now();
+        let error = client
+            .clone()
+            .over_http()
+            .send("POST", "/v1/send", Some(b"{}".to_vec()), "cap", None)
+            .await
+            .expect_err("a refusing socket answered");
+        assert!(error.contains("cannot reach the server"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "waited {:?}",
+            started.elapsed()
+        );
+        // A server that takes each connection and closes it unused (one
+        // stopping) ends the call as well: one wait for the whole call.
+        let _ = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let closer = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                drop(stream);
+            }
+        });
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client
+                .over_http()
+                .send("POST", "/v1/send", Some(b"{}".to_vec()), "cap", None),
+        )
+        .await
+        .expect("the call kept retrying a server that closes every connection")
+        .expect_err("a closing server answered");
+        assert!(
+            error.contains("not sent") || error.contains("restarted during this call"),
+            "{error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        closer.abort();
+    }
+
+    /// The bound on the server's answer does not count the wait for the
+    /// server: a call that waited out a restart still has its whole answer
+    /// time.
+    #[tokio::test]
+    async fn a_restart_wait_does_not_eat_the_answer_time() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let listening = socket.clone();
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            let listener = tokio::net::UnixListener::bind(&listening).unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_head(&mut stream).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            // A second server that never answers.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_head(&mut stream).await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let (status, body) = super::request_waiting(
+            &socket,
+            "POST",
+            "/v1/send",
+            Some(b"{}".to_vec()),
+            Some("cap"),
+            None,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("the wait for the server was counted against the answer");
+        assert_eq!(status, hyper::StatusCode::OK);
+        assert_eq!(body, b"ok");
+        let started = std::time::Instant::now();
+        let error = super::request_waiting(
+            &socket,
+            "POST",
+            "/v1/send",
+            Some(b"{}".to_vec()),
+            Some("cap"),
+            None,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(400),
+        )
+        .await
+        .expect_err("a server that never answers answered");
+        assert!(error.starts_with("the server did not answer"), "{error}");
+        assert!(error.contains("may or may not have applied"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        server.abort();
+    }
+
+    /// Outside a `CALL` scope (such as stdio startup `whoami_with_harness`),
+    /// `Client::send` hoists a single `SocketWait` before its retry loop so a
+    /// retry shares what is left of `RECONNECT_WITHIN` instead of starting a
+    /// fresh 45 s wait on every iteration.
+    #[tokio::test(start_paused = true)]
+    async fn client_send_outside_a_call_scope_bounds_its_wait_across_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let listening = socket.clone();
+        let server = tokio::spawn(async move {
+            // Spend 30 s of the 45 s budget waiting for the first server.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let listener = tokio::net::UnixListener::bind(&listening).unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_head(&mut stream).await;
+            // The server restarts again mid-read: unlink and drop without answering.
+            let _ = std::fs::remove_file(&listening);
+            drop(listener);
+            drop(stream);
+        });
+        let client = super::Client::new(socket, dir.path().into(), "cap".into());
+        let started = tokio::time::Instant::now();
+        let error = client
+            .send("GET", "/v1/whoami", None, "cap", None)
+            .await
+            .expect_err("an unanswered retry succeeded");
+        assert!(error.contains("not sent"), "{error}");
+        let elapsed = started.elapsed();
+        // Shared wait: 30 s + remaining 15 s = 45 s (not 30 s + fresh 45 s = 75 s).
+        assert!(
+            elapsed >= super::RECONNECT_WITHIN
+                && elapsed < super::RECONNECT_WITHIN + std::time::Duration::from_secs(5),
+            "elapsed {elapsed:?}"
+        );
+        server.abort();
     }
 }
 

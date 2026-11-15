@@ -472,6 +472,10 @@ async fn serve(
         });
         start_schedule_loops(Arc::clone(&store), state.health.clone());
     }
+    // Set once a stop is requested: every listener (the socket and both TCP
+    // listeners) stops taking connections at once, and calls running on any
+    // of them drain together.
+    let (stopping, _) = tokio::sync::watch::channel(false);
     // `public_listen` decides whether the local TCP listener is also the
     // public one. A configuration file that cannot be read fails closed: no
     // public listener, and the local listener defaults to loopback.
@@ -487,6 +491,7 @@ async fn serve(
     if public_listen.is_none() {
         let _ = std::fs::remove_file(data.join("public.addr"));
     }
+    let mut public_listener = None;
     if let Some(addr) = public_listen {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(tcp_listener) => {
@@ -500,16 +505,14 @@ async fn serve(
                         eprintln!("cannot persist {}: {err}", addr_path.display());
                     }
                 }
-                let public_app = build_public_router(state.clone());
-                tokio::spawn(async move {
-                    let _ = axum::serve(tcp_listener, public_app).await;
-                });
+                public_listener = Some(tcp_listener);
             }
             Err(err) => {
                 eprintln!("warning: public TCP listener ({addr}) did not bind: {err}");
             }
         }
     }
+    let mut webhook_listener = None;
     if let Some(addr) = webhook_listen_addr(public_configured) {
         if public_configured && !binds_loopback(&addr) {
             eprintln!(
@@ -529,10 +532,7 @@ async fn serve(
                         eprintln!("cannot persist {}: {err}", addr_path.display());
                     }
                 }
-                let webhook_app = build_webhook_router(state.clone());
-                tokio::spawn(async move {
-                    let _ = axum::serve(tcp_listener, webhook_app).await;
-                });
+                webhook_listener = Some(tcp_listener);
             }
             Err(err) => {
                 eprintln!("warning: webhook TCP listener ({addr}) did not bind: {err}");
@@ -540,20 +540,37 @@ async fn serve(
         }
     }
     {
-        // A spawn the last server stopped part way gets its prompt now; the
-        // socket is already bound, so this never delays serving.
+        // A spawn the last server stopped part way gets the rest of it (most
+        // often its prompt) before any call is answered on any listener: a call
+        // to list, inspect or delete that agent then sees it whole. Every
+        // listener is already bound, so a client connecting meanwhile waits in
+        // the kernel listen backlog rather than finding no server.
         let store = Arc::clone(&store);
         let data = data.to_path_buf();
-        tokio::task::spawn_blocking(move || finish_interrupted_spawns(&store, &data));
+        let _ = tokio::task::spawn_blocking(move || finish_interrupted_spawns(&store, &data)).await;
     }
+    let public_task = public_listener.map(|tcp_listener| {
+        let public_app = build_public_router(state.clone());
+        let stop = stopped(&stopping);
+        tokio::spawn(async move {
+            let _ = axum::serve(tcp_listener, public_app)
+                .with_graceful_shutdown(stop)
+                .await;
+        })
+    });
+    let webhook_task = webhook_listener.map(|tcp_listener| {
+        let webhook_app = build_webhook_router(state.clone());
+        let stop = stopped(&stopping);
+        tokio::spawn(async move {
+            let _ = axum::serve(tcp_listener, webhook_app)
+                .with_graceful_shutdown(stop)
+                .await;
+        })
+    });
     let app = build_router(state);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let stopping = Arc::new(tokio::sync::Notify::new());
     let serving = axum::serve(listener, app)
-        .with_graceful_shutdown({
-            let stopping = Arc::clone(&stopping);
-            async move { stopping.notified().await }
-        })
+        .with_graceful_shutdown(stopped(&stopping))
         .into_future();
     tokio::pin!(serving);
     let mut releasing = None;
@@ -596,26 +613,47 @@ async fn serve(
                     TELEGRAM_RELEASE_WITHIN,
                 )
             }));
-            stopping.notify_one();
-            // `serving` is polled throughout, so the listener closes at once.
-            tokio::select! {
-                result = &mut serving => result,
-                left = in_flight::MUTATIONS.settle(MUTATION_DRAIN_WITHIN) => {
-                    if left > 0 {
-                        eprintln!(
-                            "anyagents: {left} mutating call(s) still running after {}s end with \
-                             the process; each caller is told its call may or may not have \
-                             applied",
-                            MUTATION_DRAIN_WITHIN.as_secs()
-                        );
+            let _ = stopping.send(true);
+            // `serving` is polled first so the Unix listener closes at once,
+            // while `settling` keeps waiting even after `serving` has no open
+            // socket connections (for TCP mutations and detached blocking work).
+            let settling = in_flight::MUTATIONS.settle(MUTATION_DRAIN_WITHIN);
+            tokio::pin!(settling);
+            let mut serving_done = false;
+            let mut serve_result = Ok(());
+            let left = loop {
+                tokio::select! {
+                    biased;
+                    result = &mut serving, if !serving_done => {
+                        serving_done = true;
+                        serve_result = result;
                     }
-                    // Answers of calls that just finished are written out;
-                    // reads still running end with the process.
-                    tokio::time::timeout(RESPONSE_FLUSH_WITHIN, &mut serving)
-                        .await
-                        .unwrap_or(Ok(()))
+                    left = &mut settling => break left,
                 }
+            };
+            if left > 0 {
+                eprintln!(
+                    "anyagents: {left} mutating call(s) still running after {}s end with \
+                     the process; each caller is told its call may or may not have \
+                     applied",
+                    MUTATION_DRAIN_WITHIN.as_secs()
+                );
             }
+            // Answers of calls that just finished are written out across every
+            // listener; reads still running end with the process.
+            let flush = async {
+                if !serving_done {
+                    serve_result = (&mut serving).await;
+                }
+                if let Some(task) = public_task {
+                    let _ = task.await;
+                }
+                if let Some(task) = webhook_task {
+                    let _ = task.await;
+                }
+            };
+            let _ = tokio::time::timeout(RESPONSE_FLUSH_WITHIN, flush).await;
+            serve_result
         }
     };
     let released = match releasing {
@@ -645,10 +683,9 @@ async fn serve(
 /// ends with the process, and its caller is told the call may or may not have
 /// applied.
 ///
-/// Sized from the fleet's own spawns (2026-11-11..14, 208 successful): the
-/// median took 4.3 s; most longer ones waited behind the store stalls fixed in
-/// #289. A minute covers a spawn that provisions a large checkout, and keeps a
-/// restart well inside agy's three-minute tool deadline.
+/// A spawn, the longest common mutation, typically takes a few seconds; a
+/// minute covers one that provisions a large checkout, and keeps a restart
+/// well inside the shortest long tool deadline a harness sets (three minutes).
 const MUTATION_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Once the mutations are done, how long their answers get to be written out
@@ -668,6 +705,17 @@ pub(crate) const STOP_WITHIN: std::time::Duration = std::time::Duration::from_se
 /// next server from its last written offset; the store deduplicates updates
 /// by their source key.
 const TELEGRAM_RELEASE_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolves once the server is told to stop (`stopping` set), or when the
+/// server is gone: every listener stops taking connections then.
+fn stopped(
+    stopping: &tokio::sync::watch::Sender<bool>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let mut told = stopping.subscribe();
+    async move {
+        let _ = told.wait_for(|stop| *stop).await;
+    }
+}
 
 /// SIGINT or SIGTERM.
 async fn stop_requested(terminate: &mut tokio::signal::unix::Signal) {
@@ -1151,6 +1199,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
         )
         .fallback(public_not_found)
         .with_state(state)
+        .layer(axum::middleware::from_fn(in_flight::track))
 }
 
 async fn public_not_found() -> impl IntoResponse {
@@ -1389,20 +1438,6 @@ fn authenticate_mcp_request(
     ))
 }
 
-fn ensure_internal_socket_listener(state: &AppState) -> PathBuf {
-    let data_dir = state.store.data_dir();
-    let sock = socket_path(data_dir);
-    if !sock.exists()
-        && let Ok(listener) = tokio::net::UnixListener::bind(&sock)
-    {
-        let app = build_router(state.clone());
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-    }
-    sock
-}
-
 async fn mcp_get_route(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1510,8 +1545,10 @@ async fn mcp_post(
             internal_token: token,
             ..
         } = caller;
-        let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-        let sock = ensure_internal_socket_listener(&state);
+        let data_dir = state.store.data_dir();
+        let config_dir = anyagents_core::agent_config_dir(data_dir, &agent.id);
+        let sock = socket_path(data_dir);
+        let router = build_router(state.clone());
         let _ = std::fs::create_dir_all(&config_dir);
         Ok(crate::mcp::AgentMcp::new_for_http(
             crate::mcp::AgentRef {
@@ -1523,6 +1560,7 @@ async fn mcp_post(
             config_dir,
             token,
             profile,
+            router,
         ))
     })
     .await?;
@@ -3467,7 +3505,11 @@ async fn sign_in_route(
     let runner = Arc::clone(&state.sign_in);
     let root = state.store.data_dir().to_path_buf();
     let mark = capability_mark(Arc::clone(&state.store));
+    // The response streams while the sign-in runs, so the call's future ends
+    // before its work: the work holds the call open for a stop (`in_flight`).
+    let call = in_flight::carry();
     let spawned = tokio::task::spawn_blocking(move || {
+        let _call = call;
         let mut sink = ChannelSink { tx };
         let mut guard = runner.lock().unwrap_or_else(|err| err.into_inner());
         let result = sign_in(
@@ -4791,7 +4833,8 @@ fn finish_spawn(
 
 /// Finish the spawns a stopped server left part way: each live agent whose
 /// config still holds [`SPAWN_FINISH_FILE`] gets the rest of its spawn (most
-/// often its first prompt). Run once at start, off the serving path.
+/// often its first prompt). Run once at start, before any call is answered;
+/// a spawn that cannot be finished keeps its record for the next start.
 fn finish_interrupted_spawns(store: &Store, data_dir: &Path) -> usize {
     let Ok(agents) = store.list_live_agents() else {
         return 0;
@@ -4809,6 +4852,7 @@ fn finish_interrupted_spawns(store: &Store, data_dir: &Path) -> usize {
             .and_then(|finish| finish_spawn(store, data_dir, agent, &finish))
         {
             Ok((_, has_prompt)) => {
+                let _ = std::fs::remove_file(&marker);
                 eprintln!("anyagents: finished the interrupted spawn of {name}");
                 if has_prompt {
                     create::poke_agent_wake_socket_mail(data_dir, &id);
@@ -4817,12 +4861,14 @@ fn finish_interrupted_spawns(store: &Store, data_dir: &Path) -> usize {
                 }
                 finished += 1;
             }
+            // Kept: the next start tries again (every step is idempotent),
+            // so a passing failure (a busy store) never loses the spawn.
             Err(error) => eprintln!(
-                "anyagents: the interrupted spawn of {name} could not be finished: {}",
+                "anyagents: the interrupted spawn of {name} could not be finished (kept for the \
+                 next start): {}",
                 error.message
             ),
         }
-        let _ = std::fs::remove_file(&marker);
     }
     finished
 }
@@ -10441,6 +10487,292 @@ pub(crate) mod tests {
         assert_eq!(finish_interrupted_spawns(&store, data), 1);
         assert_eq!(store.inbox(&child.id, None).unwrap().len(), 1);
         assert_eq!(finish_interrupted_spawns(&store, data), 0);
+    }
+
+    #[test]
+    fn an_interrupted_spawn_that_cannot_finish_keeps_its_record_for_the_next_start() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        let child = store
+            .create_agent(anyagents_core::NewAgent::new("child", "codex"))
+            .unwrap();
+        let mut finish = SpawnFinish {
+            actor: "operator".into(),
+            caller: None,
+            scope: None,
+            public: None,
+            // Refused by the store: this start cannot finish the spawn.
+            lifecycle: Some("not-a-lifecycle".into()),
+            groups: Vec::new(),
+            prompt: Some("build the thing".into()),
+        };
+        let marker = spawn_finish_marker(data, &child.id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        record_spawn_finish(&marker, &finish).unwrap();
+
+        assert_eq!(finish_interrupted_spawns(&store, data), 0);
+        assert!(
+            marker.exists(),
+            "a failed finish dropped the spawn's record"
+        );
+        assert!(store.inbox(&child.id, None).unwrap().is_empty());
+
+        // The next start can: the prompt lands and only then the record goes.
+        finish.lifecycle = Some("task".into());
+        record_spawn_finish(&marker, &finish).unwrap();
+        assert_eq!(finish_interrupted_spawns(&store, data), 1);
+        assert!(!marker.exists());
+        assert_eq!(store.inbox(&child.id, None).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_listener_stops_taking_calls_when_the_server_is_told_to_stop() {
+        let (stopping, _) = tokio::sync::watch::channel(false);
+        let socket = stopped(&stopping);
+        let public = stopped(&stopping);
+        tokio::pin!(socket, public);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut socket)
+                .await
+                .is_err(),
+            "stopped before the stop"
+        );
+        let _ = stopping.send(true);
+        tokio::time::timeout(std::time::Duration::from_secs(1), socket)
+            .await
+            .expect("the socket listener kept taking calls");
+        tokio::time::timeout(std::time::Duration::from_secs(1), public)
+            .await
+            .expect("a TCP listener kept taking calls");
+        // A listener started after the stop stops at once; so does one whose
+        // server is gone.
+        tokio::time::timeout(std::time::Duration::from_secs(1), stopped(&stopping))
+            .await
+            .unwrap();
+        let (gone, _) = tokio::sync::watch::channel(false);
+        let orphan = stopped(&gone);
+        drop(gone);
+        tokio::time::timeout(std::time::Duration::from_secs(1), orphan)
+            .await
+            .unwrap();
+    }
+
+    /// A write arriving on either TCP listener (public or local webhook)
+    /// counts toward the stop until it is done, as on the socket.
+    #[test]
+    fn writes_on_the_tcp_listeners_hold_the_stop() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let state = AppState {
+            store,
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use tokio::io::AsyncWriteExt;
+            for (name, router) in [
+                ("public", build_public_router(state.clone())),
+                ("webhook", build_webhook_router(state.clone())),
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let served = tokio::spawn(async move {
+                    let _ = axum::serve(listener, router).await;
+                });
+                // A webhook whose body is still arriving: the call is running.
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                stream
+                    .write_all(
+                        b"POST /v1/webhooks/telegram/some-channel HTTP/1.1\r\nhost: x\r\n\
+                          content-type: application/json\r\ncontent-length: 100\r\n\r\n{",
+                    )
+                    .await
+                    .unwrap();
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while in_flight::MUTATIONS.running() == 0 && std::time::Instant::now() < until {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                assert!(
+                    in_flight::MUTATIONS.running() > 0,
+                    "a write on the {name} listener does not hold the stop"
+                );
+                drop(stream);
+                served.abort();
+                in_flight::MUTATIONS
+                    .settle(std::time::Duration::from_secs(5))
+                    .await;
+            }
+        });
+    }
+
+    /// A streaming sign-in returns its response headers before the blocking
+    /// vendor command finishes, so its carried `in_flight` token must keep the
+    /// stop waiting until the blocking work and capability rotation return.
+    #[test]
+    fn sign_in_route_carries_in_flight_token_until_blocking_work_finishes() {
+        struct HeldSignIn {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl CommandRunner for HeldSignIn {
+            fn run(
+                &mut self,
+                _program: &str,
+                _args: &[String],
+                _dir: &Path,
+                _env: &[(&str, &str)],
+                on_line: &mut dyn LineSink,
+            ) -> Result<(), InstallError> {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+                on_line.line("SIGNED_IN ada@example");
+                Ok(())
+            }
+        }
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let state = AppState {
+            store,
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(HeldSignIn {
+                entered: entered_tx,
+                release: release_rx,
+            })),
+            auth: auth::Mode::Confined {
+                operator_digest: Some(auth::operator_digest("test-op-token")),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use hyper::service::Service as _;
+            let router = build_router(state);
+            let service = hyper_util::service::TowerToHyperService::new(router);
+            let req = hyper::Request::builder()
+                .method("POST")
+                .uri("http://localhost/v1/harnesses/codex/sign-in")
+                .header(crate::operator::HEADER, "test-op-token")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .unwrap();
+            let response = service.call(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            tokio::task::spawn_blocking(move || {
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("blocking sign-in started");
+            })
+            .await
+            .unwrap();
+            // Even after the handler future returned its streaming response
+            // (and even if the caller drops the body), the blocking task still
+            // holds its carried `in_flight` token until `sign_in` finishes.
+            drop(response);
+            assert!(
+                in_flight::MUTATIONS.running() > 0,
+                "streaming sign-in dropped its in_flight token before blocking work finished"
+            );
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                in_flight::MUTATIONS
+                    .settle(std::time::Duration::from_secs(5))
+                    .await,
+                0
+            );
+        });
+    }
+
+    /// An admitted HTTP MCP call runs against the server's in-process router
+    /// instead of dialing `anyagents.sock`: when `stopping` has already closed
+    /// the external socket listener (leaving a refusing socket file on disk),
+    /// an in-flight `POST /v1/webhooks/mcp` finishes at once instead of
+    /// self-deadlocking the mutation drain on `ECONNREFUSED`.
+    #[test]
+    fn http_mcp_post_completes_in_process_while_external_socket_refuses() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let cloud = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("cloud-drain", "claude-cloud"))
+            .unwrap();
+        let peer = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("peer-drain", "claude-code"))
+            .unwrap();
+        crate::remote::begin_session(&state.store, &cloud).unwrap();
+        let cloud_cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &cloud.id);
+        let remote = crate::remote::session_token(&cloud_cfg).unwrap();
+
+        // Simulate shutdown after `stopping`: `anyagents.sock` stays on disk
+        // while its external listener is closed (`ECONNREFUSED`).
+        let sock = socket_path(dir.path());
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        assert!(sock.exists());
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use http_body_util::BodyExt as _;
+            use hyper::service::Service as _;
+            let public = build_public_router(state.clone());
+            let service = hyper_util::service::TowerToHyperService::new(public);
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "send",
+                    "arguments": {
+                        "to": ["peer-drain"],
+                        "text": "draining cleanly"
+                    }
+                }
+            });
+            let req = hyper::Request::builder()
+                .method("POST")
+                .uri("http://localhost/v1/webhooks/mcp")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {remote}"),
+                )
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(http_body_util::Full::new(bytes::Bytes::from(
+                    serde_json::to_vec(&payload).unwrap(),
+                )))
+                .unwrap();
+            let started = std::time::Instant::now();
+            let response = service.call(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "HTTP MCP call stalled on closed external socket: {:?}",
+                started.elapsed()
+            );
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_ne!(body["result"]["isError"], serde_json::json!(true), "{body}");
+            let messages = state.store.inbox(&peer.id, None).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].text, "draining cleanly");
+        });
     }
 
     #[test]
