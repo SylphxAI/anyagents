@@ -984,8 +984,7 @@ fn chromium_home(profile_dir: &Path) -> PathBuf {
 /// The only `PATH` Chromium (and `xvfb-run`) sees.
 const CHROMIUM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
-/// Variables passed through from the server when set: locale, fonts, and
-/// the software rasterizer's thread count.
+/// Variables passed through from the server when set: locale and fonts.
 const CHROMIUM_PASSED_ENV: &[&str] = &[
     "LANG",
     "LANGUAGE",
@@ -993,7 +992,6 @@ const CHROMIUM_PASSED_ENV: &[&str] = &[
     "LC_CTYPE",
     "FONTCONFIG_FILE",
     "FONTCONFIG_PATH",
-    LLVMPIPE_THREADS_ENV,
 ];
 
 /// Mesa llvmpipe's rasterizer thread count. On a virtual X display with GLX
@@ -1005,8 +1003,19 @@ const LLVMPIPE_THREADS_ENV: &str = "LP_NUM_THREADS";
 
 /// The default rasterizer thread count: a software-rendered browser costs
 /// about two cores at most, still drawing WebGL, screenshots and the
-/// takeover view. The server's own `LP_NUM_THREADS` overrides it.
+/// takeover view. The server's own `LP_NUM_THREADS` overrides it only when
+/// it is a whole number: Mesa reads anything else as unset, one thread per
+/// core.
 const LLVMPIPE_THREADS: &str = "2";
+
+/// The rasterizer thread count Chromium is given: the server's own when it
+/// is a whole number, else [`LLVMPIPE_THREADS`].
+fn llvmpipe_threads() -> String {
+    std::env::var(LLVMPIPE_THREADS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .map_or_else(|| LLVMPIPE_THREADS.to_string(), |count| count.to_string())
+}
 
 /// Chromium's whole environment: its home and XDG directories under `home`,
 /// its private `tmp`, the fingerprint's time zone, a fixed `PATH`, the
@@ -1042,9 +1051,7 @@ fn chromium_environment(
             env.push(((*name).into(), value));
         }
     }
-    if !env.iter().any(|(name, _)| name == LLVMPIPE_THREADS_ENV) {
-        env.push((LLVMPIPE_THREADS_ENV.into(), LLVMPIPE_THREADS.into()));
-    }
+    env.push((LLVMPIPE_THREADS_ENV.into(), llvmpipe_threads().into()));
     env
 }
 
@@ -10371,21 +10378,38 @@ esac
     }
 
     /// Chromium's software rasterizer runs a bounded number of threads, not
-    /// one per core, unless the server itself names a count.
+    /// one per core: the server's own count when it is a whole number, and
+    /// the default for anything Mesa would read as unset.
     #[test]
     fn chromium_software_rendering_is_bounded_to_a_few_threads() {
-        let home = Path::new("/profile/home");
-        let env = chromium_environment(home, None, "UTC", None);
-        let counts: Vec<_> = env
-            .iter()
-            .filter(|(name, _)| name == LLVMPIPE_THREADS_ENV)
-            .map(|(_, value)| value.clone())
-            .collect();
-        let expected =
-            std::env::var_os(LLVMPIPE_THREADS_ENV).unwrap_or_else(|| LLVMPIPE_THREADS.into());
-        assert_eq!(counts, vec![expected]);
-        let default: usize = LLVMPIPE_THREADS.parse().unwrap();
-        assert!((1..=4).contains(&default), "{default}");
+        let _env = crate::server::tests::env_lock();
+        struct Reset(Option<std::ffi::OsString>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => unsafe { std::env::set_var(LLVMPIPE_THREADS_ENV, value) },
+                    None => unsafe { std::env::remove_var(LLVMPIPE_THREADS_ENV) },
+                }
+            }
+        }
+        let _reset = Reset(std::env::var_os(LLVMPIPE_THREADS_ENV));
+        let counts = |server: Option<&str>| {
+            match server {
+                Some(value) => unsafe { std::env::set_var(LLVMPIPE_THREADS_ENV, value) },
+                None => unsafe { std::env::remove_var(LLVMPIPE_THREADS_ENV) },
+            }
+            chromium_environment(Path::new("/profile/home"), None, "UTC", None)
+                .into_iter()
+                .filter(|(name, _)| name == LLVMPIPE_THREADS_ENV)
+                .map(|(_, value)| value.into_string().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(counts(None), vec!["2"]);
+        assert_eq!(counts(Some("4")), vec!["4"]);
+        assert_eq!(counts(Some(" 0 ")), vec!["0"]);
+        for unreadable in ["", "-1", "abc", "2.5"] {
+            assert_eq!(counts(Some(unreadable)), vec!["2"], "{unreadable:?}");
+        }
     }
 
     /// Real Chromium, headless and on Xvfb as the server starts it: a page
@@ -10560,6 +10584,7 @@ esac
             "__CF_USER_TEXT_ENCODING",
         ];
         allowed.extend(CHROMIUM_PASSED_ENV);
+        allowed.push(LLVMPIPE_THREADS_ENV);
         for line in dump.lines() {
             let name = line.split('=').next().unwrap_or_default();
             assert!(allowed.contains(&name), "unexpected `{line}` in\n{dump}");
