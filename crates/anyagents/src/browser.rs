@@ -5076,8 +5076,36 @@ fn resolve_request_key_specs(req: &BrowserRequest) -> Result<Vec<KeySpec>, Error
     Ok(out)
 }
 
-pub fn list_profiles(data: &Path) -> Result<Vec<BrowserProfileSummary>, Error> {
+fn profile_entry_metadata(
+    root: &std::fs::File,
+    c_name: &std::ffi::CStr,
+) -> std::io::Result<Option<libc::stat>> {
     use std::os::fd::AsRawFd as _;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: root is an open directory, c_name is NUL-terminated,
+    // and stat points to storage for the metadata written on success.
+    if unsafe {
+        libc::fstatat(
+            root.as_raw_fd(),
+            c_name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        // Unlink after readdir is harmless; other metadata failures are not.
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    // SAFETY: fstatat succeeded and initialized stat.
+    Ok(Some(unsafe { stat.assume_init() }))
+}
+
+pub fn list_profiles(data: &Path) -> Result<Vec<BrowserProfileSummary>, Error> {
+    use std::os::fd::IntoRawFd as _;
 
     let data_dir = std::fs::File::open(data)?;
     let root = owned_child_dir(&data_dir, "browser-profiles".as_ref(), 0o755, false)?;
@@ -5092,11 +5120,9 @@ pub fn list_profiles(data: &Path) -> Result<Vec<BrowserProfileSummary>, Error> {
                 unsafe { libc::closedir(self.0) };
             }
         }
-        // SAFETY: root owns a valid descriptor; dup returns a new owned descriptor.
-        let fd = unsafe { libc::dup(root.as_raw_fd()) };
-        if fd == -1 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        // Clone atomically with close-on-exec, so concurrent child spawns
+        // cannot inherit the directory descriptor before fdopendir owns it.
+        let fd = root.try_clone()?.into_raw_fd();
         // SAFETY: fd is an open directory descriptor. On success the stream owns it.
         let stream = unsafe { libc::fdopendir(fd) };
         if stream.is_null() {
@@ -5133,22 +5159,9 @@ pub fn list_profiles(data: &Path) -> Result<Vec<BrowserProfileSummary>, Error> {
                 continue;
             }
             let Ok(name) = c_name.to_str() else { continue };
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: root is an open directory, c_name is NUL-terminated,
-            // and stat points to storage for the metadata written on success.
-            if unsafe {
-                libc::fstatat(
-                    root.as_raw_fd(),
-                    c_name.as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } != 0
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            // SAFETY: fstatat succeeded and initialized stat.
-            let stat = unsafe { stat.assume_init() };
+            let Some(stat) = profile_entry_metadata(&root, c_name)? else {
+                continue;
+            };
             if stat.st_mode & libc::S_IFMT == libc::S_IFDIR
                 && stat.st_uid == crate::sandbox::server_uid()
             {
@@ -7036,6 +7049,30 @@ mod tests {
             );
             assert_eq!(std::fs::read(&healthy_path).unwrap(), healthy_bytes);
         }
+    }
+
+    #[test]
+    fn profile_entry_metadata_skips_vanished_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::File::open(dir.path()).unwrap();
+        let path = dir.path().join("vanished");
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            profile_entry_metadata(&root, c"vanished")
+                .unwrap()
+                .is_some()
+        );
+        // Model unlink after readdir supplied a name but before fstatat.
+        std::fs::remove_dir(&path).unwrap();
+        assert!(
+            profile_entry_metadata(&root, c"vanished")
+                .unwrap()
+                .is_none()
+        );
+        std::fs::create_dir(dir.path().join("healthy")).unwrap();
+        assert!(profile_entry_metadata(&root, c"healthy").unwrap().is_some());
+        let not_directory = std::fs::File::create(dir.path().join("file")).unwrap();
+        assert!(profile_entry_metadata(&not_directory, c"child").is_err());
     }
 
     #[test]
