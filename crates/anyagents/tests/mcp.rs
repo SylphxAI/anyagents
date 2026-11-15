@@ -316,11 +316,16 @@ async fn configured_owner_catalog_controls_mcp_discovery_after_removal() {
         for tool in role_tools {
             let description = tool.description.as_deref().unwrap_or_default();
             assert!(!description.contains("`retired`"), "{state}: {description}");
-            assert_eq!(
-                description.contains("`worker`"),
-                state == "populated",
-                "{state}: {description}"
-            );
+            assert!(description.contains("`general`"), "{state}: {description}");
+            if state == "populated" {
+                assert!(description.contains("`worker`"), "{state}: {description}");
+                assert!(
+                    description.find("`general`").unwrap() < description.find("`worker`").unwrap(),
+                    "{state}: {description}"
+                );
+            } else {
+                assert!(!description.contains("`worker`"), "{state}: {description}");
+            }
         }
     }
 }
@@ -1180,8 +1185,15 @@ async fn mcp_tools_use_the_server_socket() {
             )
             .await,
         );
+        assert_eq!(worker["role"], "general");
+        assert_eq!(worker["scope"], "private");
         assert_eq!(worker["description"], "Public role");
-        assert_eq!(worker["instructions"], "Private instructions");
+        assert!(
+            worker["instructions"]
+                .as_str()
+                .is_some_and(|text| text.ends_with("\n\nPrivate instructions")),
+            "{worker:?}"
+        );
     }
     let legacy_worker: serde_json::Value = ok_json(
         call(
@@ -1195,8 +1207,15 @@ async fn mcp_tools_use_the_server_socket() {
         )
         .await,
     );
+    assert_eq!(legacy_worker["role"], "general");
+    assert_eq!(legacy_worker["scope"], "private");
     assert_eq!(legacy_worker["description"], "Legacy instructions");
-    assert_eq!(legacy_worker["instructions"], "Legacy instructions");
+    assert!(
+        legacy_worker["instructions"]
+            .as_str()
+            .is_some_and(|text| !text.trim().is_empty()),
+        "{legacy_worker:?}"
+    );
 
     alpha.cancel().await.unwrap();
     beta.cancel().await.unwrap();
@@ -2037,4 +2056,105 @@ async fn code_limits_come_from_the_server_environment() {
     );
     alpha.cancel().await.unwrap();
     drop(server);
+}
+
+#[tokio::test]
+async fn mcp_spawn_and_create_default_to_general_and_schema_lists_general_first() {
+    let dir = support::physical_tempdir();
+    let owner = dir.path().join("owner");
+    std::fs::create_dir_all(owner.join(".agents/agents")).unwrap();
+    // Alphabetically earlier roles on disk must still appear after built-in `general`.
+    std::fs::write(
+        owner.join(".agents/agents/assistant.md"),
+        "---\nname: assistant\ndescription: Assistant role\n---\nAssistant body.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        owner.join(".agents/agents/counsel.md"),
+        "---\nname: counsel\ndescription: Counsel role\n---\nCounsel body.\n",
+    )
+    .unwrap();
+
+    let _server = start_server(dir.path());
+    let alpha = connect_with_owner(dir.path(), "alpha", Some(&owner)).await;
+
+    let tools = alpha.list_all_tools().await.unwrap();
+    let agents_tool = tools.iter().find(|t| t.name == "agents").unwrap();
+    let tool_desc = agents_tool.description.as_deref().unwrap_or_default();
+    let general_pos = tool_desc
+        .find("`general`")
+        .unwrap_or_else(|| panic!("{tool_desc}"));
+    let assistant_pos = tool_desc
+        .find("`assistant`")
+        .unwrap_or_else(|| panic!("{tool_desc}"));
+    let counsel_pos = tool_desc
+        .find("`counsel`")
+        .unwrap_or_else(|| panic!("{tool_desc}"));
+    assert!(
+        general_pos < assistant_pos && general_pos < counsel_pos,
+        "{tool_desc}"
+    );
+    let role_schema_desc = agents_tool.input_schema["properties"]["role"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        role_schema_desc.find("general").unwrap() < role_schema_desc.find("planner").unwrap(),
+        "{role_schema_desc}"
+    );
+
+    // Omitted, empty, and explicit `general` all resolve to built-in `general` with `private` scope.
+    for (tool_name, payload) in [
+        (
+            "agents",
+            serde_json::json!({"action": "spawn", "name": "spawn-omitted"}),
+        ),
+        (
+            "agents",
+            serde_json::json!({"action": "spawn", "name": "spawn-empty", "role": ""}),
+        ),
+        (
+            "agents",
+            serde_json::json!({"action": "spawn", "name": "spawn-explicit", "role": "general"}),
+        ),
+        (
+            "spawn",
+            serde_json::json!({"name": "legacy-spawn-empty", "role": ""}),
+        ),
+    ] {
+        let created: serde_json::Value = ok_json(call(&alpha, tool_name, payload).await);
+        assert_eq!(created["role"], "general", "{created:?}");
+        assert_eq!(created["scope"], "private", "{created:?}");
+        assert!(
+            created["instructions"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty()),
+            "{created:?}"
+        );
+    }
+
+    // Adding `.agents/agents/general.md` overrides the built-in `general` template.
+    std::fs::write(
+        owner.join(".agents/agents/general.md"),
+        "---\nname: general\ndescription: Owner General Override\nscope: public\n---\nOwner general override body.\n",
+    )
+    .unwrap();
+    let overridden: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({"action": "spawn", "name": "spawn-overridden"}),
+        )
+        .await,
+    );
+    assert_eq!(overridden["role"], "general");
+    assert_eq!(overridden["scope"], "public");
+    assert_eq!(overridden["description"], "Owner General Override");
+    assert!(
+        overridden["instructions"]
+            .as_str()
+            .is_some_and(|text| text.contains("Owner general override body.")),
+        "{overridden:?}"
+    );
+
+    alpha.cancel().await.unwrap();
 }
