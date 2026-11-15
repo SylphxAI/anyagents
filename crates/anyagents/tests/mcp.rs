@@ -2099,11 +2099,15 @@ async fn mcp_spawn_and_create_default_to_general_and_schema_lists_general_first(
     );
     let catalog_start = tool_desc.find("Available roles (").unwrap();
     let catalog = &tool_desc[catalog_start..];
-    let general_pos = catalog.find("`general`").unwrap_or_else(|| panic!("{catalog}"));
+    let general_pos = catalog
+        .find("`general`")
+        .unwrap_or_else(|| panic!("{catalog}"));
     let assistant_pos = catalog
         .find("`assistant`")
         .unwrap_or_else(|| panic!("{catalog}"));
-    let counsel_pos = catalog.find("`counsel`").unwrap_or_else(|| panic!("{catalog}"));
+    let counsel_pos = catalog
+        .find("`counsel`")
+        .unwrap_or_else(|| panic!("{catalog}"));
     assert!(
         general_pos < assistant_pos && general_pos < counsel_pos,
         "{catalog}"
