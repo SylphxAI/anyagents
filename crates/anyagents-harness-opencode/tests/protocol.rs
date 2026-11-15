@@ -1106,10 +1106,16 @@ fn a_mid_turn_sse_reconnect_keeps_queued_steers_in_flight() {
 
 #[test]
 fn repeated_mid_turn_sse_reconnects_keep_queued_steers_in_flight() {
-    for attempt in 1..=50 {
-        eprintln!("mid-turn reconnect attempt {attempt}/50");
-        a_mid_turn_sse_reconnect_keeps_queued_steers_in_flight();
-    }
+    std::thread::scope(|scope| {
+        for worker in 1..=4 {
+            scope.spawn(move || {
+                for attempt in 1..=25 {
+                    eprintln!("mid-turn reconnect worker {worker}/4, attempt {attempt}/25");
+                    a_mid_turn_sse_reconnect_keeps_queued_steers_in_flight();
+                }
+            });
+        }
+    });
 }
 
 #[test]
