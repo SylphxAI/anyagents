@@ -984,7 +984,8 @@ fn chromium_home(profile_dir: &Path) -> PathBuf {
 /// The only `PATH` Chromium (and `xvfb-run`) sees.
 const CHROMIUM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
-/// Variables passed through from the server when set: locale and fonts.
+/// Variables passed through from the server when set: locale, fonts, and
+/// the software rasterizer's thread count.
 const CHROMIUM_PASSED_ENV: &[&str] = &[
     "LANG",
     "LANGUAGE",
@@ -992,7 +993,20 @@ const CHROMIUM_PASSED_ENV: &[&str] = &[
     "LC_CTYPE",
     "FONTCONFIG_FILE",
     "FONTCONFIG_PATH",
+    LLVMPIPE_THREADS_ENV,
 ];
+
+/// Mesa llvmpipe's rasterizer thread count. On a virtual X display with GLX
+/// (Xvfb) Chromium's GPU process renders through llvmpipe, which otherwise
+/// starts one thread per core up to 32; a page that animates without end (a
+/// full-viewport WebGL background) then holds every one of them busy at
+/// 60 fps, since no window here is ever hidden or throttled.
+const LLVMPIPE_THREADS_ENV: &str = "LP_NUM_THREADS";
+
+/// The default rasterizer thread count: a software-rendered browser costs
+/// about two cores at most, still drawing WebGL, screenshots and the
+/// takeover view. The server's own `LP_NUM_THREADS` overrides it.
+const LLVMPIPE_THREADS: &str = "2";
 
 /// Chromium's whole environment: its home and XDG directories under `home`,
 /// its private `tmp`, the fingerprint's time zone, a fixed `PATH`, the
@@ -1027,6 +1041,9 @@ fn chromium_environment(
         if let Some(value) = std::env::var_os(name) {
             env.push(((*name).into(), value));
         }
+    }
+    if !env.iter().any(|(name, _)| name == LLVMPIPE_THREADS_ENV) {
+        env.push((LLVMPIPE_THREADS_ENV.into(), LLVMPIPE_THREADS.into()));
     }
     env
 }
@@ -10349,6 +10366,24 @@ esac
         }
     }
 
+    /// Chromium's software rasterizer runs a bounded number of threads, not
+    /// one per core, unless the server itself names a count.
+    #[test]
+    fn chromium_software_rendering_is_bounded_to_a_few_threads() {
+        let home = Path::new("/profile/home");
+        let env = chromium_environment(home, None, "UTC", None);
+        let counts: Vec<_> = env
+            .iter()
+            .filter(|(name, _)| name == LLVMPIPE_THREADS_ENV)
+            .map(|(_, value)| value.clone())
+            .collect();
+        let expected =
+            std::env::var_os(LLVMPIPE_THREADS_ENV).unwrap_or_else(|| LLVMPIPE_THREADS.into());
+        assert_eq!(counts, vec![expected]);
+        let default: usize = LLVMPIPE_THREADS.parse().unwrap();
+        assert!((1..=4).contains(&default), "{default}");
+    }
+
     /// Real Chromium, headless and on Xvfb as the server starts it: a page
     /// still loads over http, and even a raw DevTools client (any process on
     /// the host can reach the port) cannot make it read a file outside its
@@ -10532,6 +10567,11 @@ esac
         );
         assert!(
             dump.lines().any(|l| l == format!("PATH={CHROMIUM_PATH}")),
+            "{dump}"
+        );
+        assert!(
+            dump.lines()
+                .any(|l| l.starts_with(&format!("{LLVMPIPE_THREADS_ENV}="))),
             "{dump}"
         );
         if cfg!(target_os = "linux") {
