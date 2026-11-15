@@ -3,6 +3,10 @@
 fn a2a_media_fixture(data: &Path, native: bool) {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let store = Store::open(data.join("state.db")).unwrap();
+    if native {
+        std::fs::set_permissions(data.join("state.db"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
     let agents: Vec<_> = ["author", "reader", "bystander"]
         .into_iter()
         .map(|name| {
@@ -53,12 +57,14 @@ fn a2a_media_fixture(data: &Path, native: bool) {
                 serde_json::Value::Object(registry).to_string(),
             );
         }
-        for path in [&work, &source] {
-            let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
-            assert_eq!(unsafe { libc::chown(path.as_ptr(), 24211, 24220) }, 0);
-        }
-        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Restrict and chown the file before locking its parent directory,
+        // so root without DAC override/read-search can still traverse `work`.
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let source_c = std::ffi::CString::new(source.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(source_c.as_ptr(), 24211, 24220) }, 0);
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let work_c = std::ffi::CString::new(work.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(work_c.as_ptr(), 24211, 24220) }, 0);
         // Known path is readable only by the sender before send.
         assert_eq!(
             crate::agent_file::FileAuthority::of_agent_id(&store, &author.id)
@@ -175,6 +181,7 @@ fn a2a_media_fixture(data: &Path, native: bool) {
     );
     std::fs::write(&source, bytes).unwrap();
     if native {
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
         let p = std::ffi::CString::new(source.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::chown(p.as_ptr(), 24211, 24220) }, 0);
         let p = std::ffi::CString::new(work.as_os_str().as_encoded_bytes()).unwrap();
