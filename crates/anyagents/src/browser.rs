@@ -215,6 +215,8 @@ pub struct BrowserRequest {
     /// `socks4://host[:port]`, `socks5://host[:port]`, or `host[:port]` (HTTP).
     /// Omitted: keep a running profile's proxy, otherwise use `ANYAGENTS_BROWSER_PROXY`.
     /// Empty string: direct connection, overriding environment/system proxies.
+    /// A trailing `,direct://` (e.g. `socks5://host:port,direct://`) connects
+    /// directly whenever the proxy is unreachable instead of failing every request.
     /// Credentials, whitespace, paths, and proxy maps are rejected. Close a running
     /// profile before changing its proxy; cookies and login state stay on disk.
     /// Applies to actions that start/use the browser, not status/list/close.
@@ -2601,70 +2603,202 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-const DETECT_CAPTCHA_JS: &str = r#"(() => {
-  const title = (document.title || '').toLowerCase();
-  const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
-  const iframes = Array.from(document.querySelectorAll('iframe')).map(f => (f.src || f.getAttribute('src') || '').toLowerCase());
-  const hasSel = (s) => {
-    try { return Boolean(document.querySelector(s)); } catch (_) { return false; }
+/// The smallest box, in CSS pixels per side, a human can see and act on as a
+/// challenge. A background widget mounted at 0x0 or 1x1 never reaches it; the
+/// smallest real challenge checkbox does.
+const CAPTCHA_MIN_SIDE_PX: u32 = 40;
+
+/// `(el, min, box?) => bool`: whether `el` is rendered to a human with at
+/// least `min` CSS pixels per side. `box` replaces `el`'s own rectangle (a
+/// text node's range). The element must not be `display: none`, hidden by
+/// `visibility`, or transparent through any ancestor, and its rectangle,
+/// clipped by every ancestor that clips it (`overflow`, `clip`) and by the
+/// scrollable page or, for fixed content, the viewport, must keep the size.
+const CAPTCHA_VISIBLE_JS: &str = r#"(el, min, box) => {
+  if (!el || !el.isConnected) return false;
+  const doc = el.ownerDocument;
+  const view = doc.defaultView;
+  const r = box || el.getBoundingClientRect();
+  let left = r.left, top = r.top, right = r.right, bottom = r.bottom;
+  const clipTo = (l, t, rr, b) => {
+    left = Math.max(left, l); top = Math.max(top, t);
+    right = Math.min(right, rr); bottom = Math.min(bottom, b);
   };
+  const parentOf = (n) => n.parentElement || (n.parentNode && n.parentNode.host) || null;
+  let pos = null;
+  for (let n = el; n; n = parentOf(n)) {
+    const s = view.getComputedStyle(n);
+    if (s.display === 'none') return false;
+    if (n === el && (s.visibility === 'hidden' || s.visibility === 'collapse')) return false;
+    if (parseFloat(s.opacity) <= 0.01) return false;
+    if (n !== el) {
+      const clips = pos === 'fixed' ? s.transform !== 'none'
+        : pos === 'absolute' ? (s.position !== 'static' || s.transform !== 'none')
+        : true;
+      if (!clips) continue;
+    }
+    pos = s.position;
+    if (n === doc.documentElement || n === doc.body) continue;
+    const c = n.getBoundingClientRect();
+    if (n !== el && (s.overflowX !== 'visible' || s.overflowY !== 'visible')) {
+      const l = c.left + n.clientLeft, t = c.top + n.clientTop;
+      clipTo(
+        s.overflowX !== 'visible' ? l : -Infinity,
+        s.overflowY !== 'visible' ? t : -Infinity,
+        s.overflowX !== 'visible' ? l + n.clientWidth : Infinity,
+        s.overflowY !== 'visible' ? t + n.clientHeight : Infinity,
+      );
+    }
+    if ((s.position === 'absolute' || s.position === 'fixed') && s.clip.startsWith('rect(')) {
+      const v = s.clip.slice(5, -1).split(/[\s,]+/);
+      const at = (i, base, edge) => v[i] === 'auto' ? edge : base + parseFloat(v[i]);
+      clipTo(at(3, c.left, c.left), at(0, c.top, c.top), at(1, c.left, c.right), at(2, c.top, c.bottom));
+    }
+  }
+  if (pos === 'fixed') clipTo(0, 0, view.innerWidth, view.innerHeight);
+  else clipTo(-view.scrollX, -view.scrollY, Infinity, Infinity);
+  return right - left >= min && bottom - top >= min;
+}"#;
+
+/// `(visible, min) => detection`, applied to [`CAPTCHA_VISIBLE_JS`]: a challenge
+/// counts only when a human can see it. A widget, container or challenge
+/// iframe matches when it is visible at [`CAPTCHA_MIN_SIDE_PX`]; challenge
+/// wording matches only in rendered text.
+const DETECT_CAPTCHA_JS: &str = r#"((visible, MIN) => {
+  const shown = (el) => !el.closest('.grecaptcha-badge') && visible(el, MIN);
+  const hasSel = (s) => {
+    try { return Array.from(document.querySelectorAll(s)).some(shown); } catch (_) { return false; }
+  };
+  const iframes = Array.from(document.querySelectorAll('iframe'));
+  const hasFrame = (pred) => iframes.some(f => pred((f.src || f.getAttribute('src') || '').toLowerCase()) && shown(f));
+  const renderedText = () => {
+    if (!document.body) return '';
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const range = document.createRange();
+    const parts = [];
+    let len = 0;
+    for (let n = walker.nextNode(), seen = 0; n && seen < 5000 && len < 20000; n = walker.nextNode(), seen++) {
+      const t = n.nodeValue.trim();
+      if (!t || !n.parentElement) continue;
+      range.selectNodeContents(n);
+      if (!visible(n.parentElement, 1, range.getBoundingClientRect())) continue;
+      parts.push(t);
+      len += t.length + 1;
+    }
+    return parts.join(' ').toLowerCase();
+  };
+  const title = (document.title || '').toLowerCase();
+  let text = null;
+  const bodyText = () => (text === null ? (text = renderedText()) : text);
   if (
-    hasSel('#cf-chl-widget') ||
-    hasSel('.cf-turnstile') ||
-    hasSel('[data-sitekey].cf-turnstile') ||
-    hasSel('#challenge-running') ||
-    hasSel('#challenge-stage') ||
-    hasSel('input[name="cf-turnstile-response"]') ||
-    iframes.some(u => u.includes('challenges.cloudflare.com') || u.includes('turnstile')) ||
-    (title.includes('just a moment') && (bodyText.includes('verify you are human') || bodyText.includes('cloudflare'))) ||
+    hasSel('#cf-chl-widget, .cf-turnstile, #challenge-running, #challenge-stage') ||
+    hasFrame(u => u.includes('challenges.cloudflare.com') || u.includes('turnstile')) ||
+    (title.includes('just a moment') && (bodyText().includes('verify you are human') || bodyText().includes('cloudflare'))) ||
     title.includes('attention required! | cloudflare')
   ) {
     return { detected: true, kind: 'cloudflare_turnstile', summary: 'Cloudflare Turnstile / human verification challenge' };
   }
   if (
-    hasSel('.g-recaptcha') ||
-    hasSel('#g-recaptcha') ||
-    hasSel('textarea[name="g-recaptcha-response"]') ||
-    iframes.some(u => u.includes('google.com/recaptcha') || u.includes('recaptcha/api2') || u.includes('recaptcha/enterprise'))
+    hasSel('.g-recaptcha, #g-recaptcha') ||
+    hasFrame(u => u.includes('google.com/recaptcha') || u.includes('recaptcha/api2') || u.includes('recaptcha/enterprise'))
   ) {
     return { detected: true, kind: 'recaptcha', summary: 'Google reCAPTCHA verification challenge' };
   }
-  if (
-    hasSel('.h-captcha') ||
-    hasSel('textarea[name="h-captcha-response"]') ||
-    iframes.some(u => u.includes('hcaptcha.com'))
-  ) {
+  if (hasSel('.h-captcha') || hasFrame(u => u.includes('hcaptcha.com'))) {
     return { detected: true, kind: 'hcaptcha', summary: 'hCaptcha verification challenge' };
   }
-  if (
-    hasSel('#arkose') ||
-    hasSel('[data-arkose]') ||
-    iframes.some(u => u.includes('arkoselabs.com') || u.includes('funcaptcha.com'))
-  ) {
+  if (hasSel('#arkose, [data-arkose]') || hasFrame(u => u.includes('arkoselabs.com') || u.includes('funcaptcha.com'))) {
     return { detected: true, kind: 'arkose_funcaptcha', summary: 'Arkose Labs / FunCaptcha challenge' };
   }
-  if (
-    hasSel('.geetest_panel') ||
-    hasSel('.geetest_holder') ||
-    hasSel('.nc_scale') ||
-    hasSel('#nc_1_n1z')
-  ) {
+  if (hasSel('.geetest_panel, .geetest_holder, .nc_scale, #nc_1_n1z')) {
     return { detected: true, kind: 'slider_captcha', summary: 'Slider / Geetest verification challenge' };
   }
   if (
-    hasSel('[data-captcha]') ||
-    hasSel('#captcha-box') ||
+    hasSel('[data-captcha], #captcha-box') ||
     title === 'robot check' ||
     title === 'security check' ||
-    (bodyText.includes('verify you are human') && bodyText.length < 1500)
+    (bodyText().includes('verify you are human') && bodyText().length < 1500)
   ) {
     return { detected: true, kind: 'generic_captcha', summary: 'Human verification / CAPTCHA challenge' };
   }
   return { detected: false };
-})()"#;
+})"#;
+
+/// The page expression that runs [`DETECT_CAPTCHA_JS`].
+fn detect_captcha_expression() -> String {
+    format!("{DETECT_CAPTCHA_JS}({CAPTCHA_VISIBLE_JS}, {CAPTCHA_MIN_SIDE_PX})")
+}
+
+/// The challenge a child frame's URL names, as `(kind, summary)`.
+fn captcha_frame_kind(url: &str) -> Option<(&'static str, &'static str)> {
+    let url = url.to_ascii_lowercase();
+    if url.contains("challenges.cloudflare.com") || url.contains("turnstile") {
+        Some((
+            "cloudflare_turnstile",
+            "Cloudflare Turnstile iframe challenge",
+        ))
+    } else if url.contains("google.com/recaptcha") || url.contains("recaptcha/api2") {
+        Some(("recaptcha", "Google reCAPTCHA iframe challenge"))
+    } else if url.contains("hcaptcha.com") {
+        Some(("hcaptcha", "hCaptcha iframe challenge"))
+    } else if url.contains("arkoselabs.com") || url.contains("funcaptcha.com") {
+        Some(("arkose_funcaptcha", "Arkose / FunCaptcha iframe challenge"))
+    } else {
+        None
+    }
+}
+
+/// Whether the element that owns `frame_id` is visible at
+/// [`CAPTCHA_MIN_SIDE_PX`]. It reaches iframes a page script cannot see (a
+/// closed shadow root); an owner it cannot resolve is not shown.
+fn frame_owner_visible(cdp: &mut CdpSession, frame_id: &str) -> bool {
+    let Some(backend) = cdp
+        .call(
+            "DOM.getFrameOwner",
+            serde_json::json!({ "frameId": frame_id }),
+        )
+        .ok()
+        .and_then(|v| v.get("backendNodeId").and_then(|v| v.as_i64()))
+    else {
+        return false;
+    };
+    let Some(object_id) = cdp
+        .call(
+            "DOM.resolveNode",
+            serde_json::json!({ "backendNodeId": backend }),
+        )
+        .ok()
+        .and_then(|v| {
+            v.pointer("/object/objectId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+    else {
+        return false;
+    };
+    let shown = cdp
+        .call(
+            "Runtime.callFunctionOn",
+            serde_json::json!({
+                "objectId": object_id,
+                "functionDeclaration": format!(
+                    "function() {{ return ({CAPTCHA_VISIBLE_JS})(this, {CAPTCHA_MIN_SIDE_PX}); }}"
+                ),
+                "returnByValue": true,
+            }),
+        )
+        .ok()
+        .and_then(|v| v.pointer("/result/value").and_then(|v| v.as_bool()))
+        == Some(true);
+    let _ = cdp.call(
+        "Runtime.releaseObject",
+        serde_json::json!({ "objectId": object_id }),
+    );
+    shown
+}
 
 fn detect_captcha(cdp: &mut CdpSession) -> CaptchaDetection {
-    if let Ok(val) = eval_js(cdp, DETECT_CAPTCHA_JS)
+    if let Ok(val) = eval_js(cdp, &detect_captcha_expression())
         && val.get("detected").and_then(|v| v.as_bool()) == Some(true)
     {
         return CaptchaDetection {
@@ -2677,33 +2811,13 @@ fn detect_captcha(cdp: &mut CdpSession) -> CaptchaDetection {
         };
     }
     for cf in discover_child_frames(cdp) {
-        let lower_url = cf.url.to_ascii_lowercase();
-        if lower_url.contains("challenges.cloudflare.com") || lower_url.contains("turnstile") {
+        if let Some((kind, summary)) = captcha_frame_kind(&cf.url)
+            && frame_owner_visible(cdp, &cf.frame_id)
+        {
             return CaptchaDetection {
                 detected: true,
-                kind: Some("cloudflare_turnstile".to_string()),
-                summary: Some("Cloudflare Turnstile iframe challenge".to_string()),
-            };
-        }
-        if lower_url.contains("google.com/recaptcha") || lower_url.contains("recaptcha/api2") {
-            return CaptchaDetection {
-                detected: true,
-                kind: Some("recaptcha".to_string()),
-                summary: Some("Google reCAPTCHA iframe challenge".to_string()),
-            };
-        }
-        if lower_url.contains("hcaptcha.com") {
-            return CaptchaDetection {
-                detected: true,
-                kind: Some("hcaptcha".to_string()),
-                summary: Some("hCaptcha iframe challenge".to_string()),
-            };
-        }
-        if lower_url.contains("arkoselabs.com") || lower_url.contains("funcaptcha.com") {
-            return CaptchaDetection {
-                detected: true,
-                kind: Some("arkose_funcaptcha".to_string()),
-                summary: Some("Arkose / FunCaptcha iframe challenge".to_string()),
+                kind: Some(kind.to_string()),
+                summary: Some(summary.to_string()),
             };
         }
     }
@@ -10406,5 +10520,251 @@ esac
                 & 0o777,
             0o755
         );
+    }
+
+    /// Renders each fixture in real headless Chromium and runs the page
+    /// detection on it: a challenge counts only when a human can see it.
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "needs a Chromium the toolchain resolves"
+    )]
+    fn captcha_detection_requires_a_rendered_challenge() {
+        use super::*;
+        const TS: &str = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2/av0/rcv0/0/abc/light/normal";
+        const RC: &str = "https://www.google.com/recaptcha/api2/anchor?k=site";
+        const RC_IMG: &str = "https://www.google.com/recaptcha/api2/bframe?k=site";
+        const HC: &str =
+            "https://newassets.hcaptcha.com/captcha/v1/abc/static/hcaptcha.html#frame=checkbox";
+        const HC_IMG: &str =
+            "https://newassets.hcaptcha.com/captcha/v1/abc/static/hcaptcha.html#frame=challenge";
+        let frame = |src: &str, w: u32, h: u32, style: &str| {
+            format!(
+                r#"<iframe src="{src}" width="{w}" height="{h}" style="border:0;{style}"></iframe>"#
+            )
+        };
+        let login =
+            r#"<form><label>Email <input name="email"></label><button>Continue</button></form>"#;
+        let cases: Vec<(String, &str, String, Option<&str>)> = vec![
+            ("turnstile 0x0".into(), "Sign in", frame(TS, 0, 0, ""), None),
+            ("turnstile 1x1".into(), "Sign in", frame(TS, 1, 1, ""), None),
+            ("hcaptcha 1x1".into(), "Sign in", frame(HC, 1, 1, ""), None),
+            ("recaptcha 0x0".into(), "Sign in", frame(RC, 0, 0, ""), None),
+            ("recaptcha 1x1".into(), "Sign in", frame(RC, 1, 1, ""), None),
+            ("turnstile display none".into(), "Sign in", frame(TS, 300, 65, "display:none"), None),
+            ("turnstile visibility hidden".into(), "Sign in", frame(TS, 300, 65, "visibility:hidden"), None),
+            ("turnstile opacity 0".into(), "Sign in", frame(TS, 300, 65, "opacity:0"), None),
+            ("turnstile offscreen".into(), "Sign in", frame(TS, 300, 65, "position:absolute;left:-9999px;top:0"), None),
+            ("turnstile fixed offscreen".into(), "Sign in", frame(TS, 300, 65, "position:fixed;top:-9999px;left:0"), None),
+            ("turnstile scale 0".into(), "Sign in", frame(TS, 300, 65, "transform:scale(0)"), None),
+            (
+                "turnstile in 0x0 overflow wrapper".into(),
+                "Sign in",
+                format!(r#"<div style="width:0;height:0;overflow:hidden">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in display none wrapper".into(),
+                "Sign in",
+                format!(r#"<div style="display:none">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in hidden attribute wrapper".into(),
+                "Sign in",
+                format!(r#"<div hidden aria-hidden="true">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in visibility hidden wrapper".into(),
+                "Sign in",
+                format!(r#"<div style="visibility:hidden">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in transparent wrapper".into(),
+                "Sign in",
+                format!(r#"<div style="opacity:0">{}</div>"#, frame(TS, 300, 65, "")),
+                None,
+            ),
+            (
+                "turnstile in clip rect wrapper".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="position:absolute;clip:rect(0,0,0,0)">{}</div>"#,
+                    frame(TS, 300, 65, "")
+                ),
+                None,
+            ),
+            (
+                "turnstile in offscreen wrapper".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="position:absolute;left:-9999px">{}</div>"#,
+                    frame(TS, 300, 65, "")
+                ),
+                None,
+            ),
+            (
+                "empty managed turnstile container".into(),
+                "Sign in",
+                format!(r#"{login}<div class="cf-turnstile" data-sitekey="x"></div><input type="hidden" name="cf-turnstile-response">"#),
+                None,
+            ),
+            (
+                "parked recaptcha image challenge".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="visibility:hidden;position:absolute;top:-10000px">{}</div>"#,
+                    frame(RC_IMG, 400, 580, "")
+                ),
+                None,
+            ),
+            (
+                "invisible recaptcha badge".into(),
+                "Sign in",
+                format!(
+                    r#"<div class="grecaptcha-badge" style="position:fixed;right:0;bottom:14px;width:256px;height:60px">{}</div>"#,
+                    frame(RC, 256, 60, "")
+                ),
+                None,
+            ),
+            (
+                "hidden interstitial wording".into(),
+                "Just a moment...",
+                format!(r#"{login}<div style="display:none">Verify you are human. Cloudflare</div>"#),
+                None,
+            ),
+            (
+                "transparent and offscreen challenge wording".into(),
+                "Sign in",
+                format!(
+                    r#"{login}<p style="opacity:0">Verify you are human</p><p style="position:absolute;left:-9999px">Verify you are human</p>"#
+                ),
+                None,
+            ),
+            (
+                "visible turnstile widget".into(),
+                "Sign in",
+                format!(r#"{login}<div class="cf-turnstile" style="width:300px;height:65px">{}</div>"#, frame(TS, 300, 65, "")),
+                Some("cloudflare_turnstile"),
+            ),
+            (
+                "visible bare turnstile iframe".into(),
+                "Sign in",
+                format!("{login}{}", frame(TS, 300, 65, "")),
+                Some("cloudflare_turnstile"),
+            ),
+            (
+                "visible turnstile below the fold".into(),
+                "Sign in",
+                format!(r#"<div style="height:2000px"></div>{}"#, frame(TS, 300, 65, "")),
+                Some("cloudflare_turnstile"),
+            ),
+            (
+                "visible turnstile in scroll container".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="width:400px;height:200px;overflow:auto">{}</div>"#,
+                    frame(TS, 300, 65, "")
+                ),
+                Some("cloudflare_turnstile"),
+            ),
+            (
+                "visible recaptcha checkbox".into(),
+                "Sign in",
+                format!(r#"{login}<div class="g-recaptcha">{}</div>"#, frame(RC, 304, 78, "")),
+                Some("recaptcha"),
+            ),
+            (
+                "visible recaptcha image challenge".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="position:absolute;top:10px;left:10px">{}</div>"#,
+                    frame(RC_IMG, 400, 580, "")
+                ),
+                Some("recaptcha"),
+            ),
+            (
+                "visible hcaptcha checkbox".into(),
+                "Sign in",
+                format!("{login}{}", frame(HC, 303, 78, "")),
+                Some("hcaptcha"),
+            ),
+            (
+                "visible hcaptcha image challenge".into(),
+                "Sign in",
+                format!(
+                    r#"<div style="position:fixed;top:50px;left:100px">{}</div>"#,
+                    frame(HC_IMG, 400, 600, "")
+                ),
+                Some("hcaptcha"),
+            ),
+            (
+                "visible full-page interstitial".into(),
+                "Just a moment...",
+                r#"<h1>www.example.com</h1><p>Verify you are human by completing the action below.</p><p>www.example.com needs to review the security of your connection before proceeding.</p>"#.into(),
+                Some("cloudflare_turnstile"),
+            ),
+        ];
+        let fixtures: Vec<serde_json::Value> = cases
+            .iter()
+            .map(|(name, title, html, _)| serde_json::json!({ "name": name, "title": title, "html": html }))
+            .collect();
+        let script = format!(
+            "const cases = {};\nconst results = {{}};\nfor (const c of cases) {{\n  document.title = c.title;\n  document.body.innerHTML = c.html;\n  window.scrollTo(0, 0);\n  const r = {};\n  results[c.name] = r.detected ? r.kind : null;\n}}\ndocument.title = 'done';\ndocument.body.innerHTML = '';\nconst out = document.createElement('pre');\nout.id = 'results';\nout.textContent = JSON.stringify(results);\ndocument.body.appendChild(out);",
+            serde_json::Value::Array(fixtures),
+            detect_captcha_expression()
+        )
+        .replace("</", "<\\/");
+        let dir = tempfile::tempdir().unwrap();
+        let page = dir.path().join("captcha.html");
+        std::fs::write(
+            &page,
+            format!(
+                "<!doctype html><html><head><title>t</title></head><body style=\"margin:0\"><script>{script}</script></body></html>"
+            ),
+        )
+        .unwrap();
+        let out = Command::new(chromium_binary().expect("Chromium for the fixture"))
+            .arg("--headless=new")
+            .arg("--no-sandbox")
+            .arg("--disable-gpu")
+            .arg("--no-first-run")
+            .arg("--hide-scrollbars")
+            .arg("--window-size=1280,800")
+            .arg("--host-resolver-rules=MAP * ~NOTFOUND")
+            .arg("--timeout=20000")
+            .arg(format!(
+                "--user-data-dir={}",
+                dir.path().join("profile").display()
+            ))
+            .arg("--dump-dom")
+            .arg(format!("file://{}", page.display()))
+            .stdin(Stdio::null())
+            .output()
+            .expect("run Chromium");
+        let dom = String::from_utf8_lossy(&out.stdout);
+        let json = dom
+            .split_once("<pre id=\"results\">")
+            .and_then(|(_, rest)| rest.split_once("</pre>"))
+            .map(|(json, _)| json)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no results in the dumped page: {dom}\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+        let results: serde_json::Value = serde_json::from_str(json).expect("results JSON");
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(name, _, _, want)| {
+                results.get(name.as_str()).and_then(|v| v.as_str()) != *want
+            })
+            .map(|(name, _, _, want)| {
+                format!("{name}: want {want:?}, got {}", results[name.as_str()])
+            })
+            .collect();
+        assert!(wrong.is_empty(), "wrong detections:\n{}", wrong.join("\n"));
     }
 }

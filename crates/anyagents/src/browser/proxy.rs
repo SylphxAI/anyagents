@@ -31,16 +31,25 @@ pub(super) fn resolve(
     Ok(selected)
 }
 
+/// The one fallback Chromium's proxy list may end with: connect directly when
+/// every proxy before it is unreachable.
+const DIRECT_FALLBACK: &str = ",direct://";
+
 fn validate(value: &str) -> Result<(), Error> {
     // Never echo the input: accidentally supplied userinfo may contain secrets.
     let invalid = || {
         Error::Message(
-        "invalid browser proxy: expected an HTTP/HTTPS/SOCKS4/SOCKS5 host with optional port, without credentials, whitespace, paths, or proxy maps; use an empty string for direct access".into(),
+        "invalid browser proxy: expected an HTTP/HTTPS/SOCKS4/SOCKS5 host with optional port and an optional `,direct://` fallback, without credentials, whitespace, paths, or proxy maps; use an empty string for direct access".into(),
     )
     };
     if value.is_empty() {
         return Ok(());
     }
+    let value = match value.strip_suffix(DIRECT_FALLBACK) {
+        Some("") => return Err(invalid()),
+        Some(endpoint) => endpoint,
+        None => value,
+    };
     if !value.is_ascii()
         || value.chars().any(|c| c.is_whitespace() || c.is_control())
         || value.contains(['@', '/', '\\', '?', '#', ';', ',', '=', '\'', '"'])
@@ -128,6 +137,13 @@ mod tests {
             launch_argument(Some(&value)),
             Some(format!("--proxy-server={value}"))
         );
+        let fallback = format!("{value},direct://");
+        validate(&fallback).unwrap();
+        validate("proxy.example.test:1080,direct://").unwrap();
+        assert_eq!(
+            launch_argument(Some(&fallback)),
+            Some(format!("--proxy-server={value},direct://"))
+        );
         assert_eq!(launch_argument(Some("")), Some("--no-proxy-server".into()));
         assert_eq!(launch_argument(None), None);
     }
@@ -161,6 +177,15 @@ mod tests {
             "http://proxy.example.test\\path",
             "\"proxy.example.test\"",
             "http://proxy.example.test,other.example.test",
+            ",direct://",
+            "direct://,direct://",
+            "proxy.example.test,direct://,direct://",
+            "proxy.example.test;direct://,direct://",
+            "proxy.example.test,direct:// ",
+            "proxy.example.test, direct://",
+            "proxy.example.test,DIRECT",
+            "http://user:private@proxy.example.test,direct://",
+            "--no-sandbox,direct://",
         ] {
             let error = match validate(value) {
                 Err(error) => error.to_string(),
@@ -200,6 +225,58 @@ mod tests {
                 "unreadable default".into()
             )))
             .is_err()
+        );
+    }
+
+    /// Real Chromium honors the fallback: with the proxy port closed, a page
+    /// still loads directly instead of failing.
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "needs a Chromium the toolchain resolves"
+    )]
+    fn direct_fallback_reaches_the_page_when_the_proxy_is_down() {
+        use std::io::{Read, Write};
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut stream in server.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = "<html><body>reached-directly</body></html>";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let proxy = format!("socks5://{closed},direct://");
+        validate(&proxy).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(super::super::chromium_binary().expect("Chromium"))
+            .arg("--headless=new")
+            .arg("--no-sandbox")
+            .arg("--disable-gpu")
+            .arg("--no-first-run")
+            .arg("--timeout=20000")
+            .arg(launch_argument(Some(&proxy)).unwrap())
+            // Loopback bypasses proxies by default; route it through the list.
+            .arg("--proxy-bypass-list=<-loopback>")
+            .arg(format!("--user-data-dir={}", dir.path().display()))
+            .arg("--dump-dom")
+            .arg(format!("http://{addr}/"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run Chromium");
+        let dom = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            dom.contains("reached-directly"),
+            "page did not load through the direct fallback: {dom}"
         );
     }
 }
