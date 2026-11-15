@@ -50,7 +50,7 @@ fn allowed(uid: u32, gid: u32, script: &str, path: &Path) {
 }
 
 fn denied(uid: u32, gid: u32, path: &Path) {
-    let output = seat_command(uid, gid, "cat -- \"$1\"", path);
+    let output = seat_command(uid, gid, r#"cat -- "$1""#, path);
     assert!(
         !output.status.success(),
         "unexpected read of {}",
@@ -208,12 +208,17 @@ fn privileged_config_acl_cross_uid() {
             "daemon cannot read {}",
             path.display()
         );
-        allowed(SEAT, GROUP, "test -r \"$1\" && test -w \"$1\"", &path);
+        allowed(SEAT, GROUP, r#"test -r "$1" && test -w "$1""#, &path);
         denied(PEER, PEER_GROUP, &path);
     }
-    allowed(SEAT, GROUP, "\"$1\"", &root.join("profiles/node"));
+    allowed(SEAT, GROUP, r#""$1""#, &root.join("profiles/node"));
     let generated = root.join("brain/task/.system_generated/steps/future.json");
-    allowed(SEAT, GROUP, "umask 077; printf future > \"$1\"", &generated);
+    allowed(
+        SEAT,
+        GROUP,
+        r#"umask 077; printf future > "$1""#,
+        &generated,
+    );
     assert_eq!(fs::read(&generated).unwrap(), b"future");
     fs::write(&generated, b"daemon-update").unwrap();
     denied(PEER, PEER_GROUP, &generated);
@@ -221,7 +226,7 @@ fn privileged_config_acl_cross_uid() {
     allowed(
         SEAT,
         GROUP,
-        "printf later > \"$1\"; chmod 600 \"$1\"",
+        r#"printf later > "$1"; chmod 600 "$1""#,
         &later,
     );
     assert_eq!(
@@ -236,11 +241,11 @@ fn privileged_config_acl_cross_uid() {
     allowed(
         SEAT,
         GROUP,
-        "test -r \"$1\" && test ! -w \"$1\"",
+        r#"test -r "$1" && test ! -w "$1""#,
         &capability,
     );
     assert!(
-        !seat_command(SEAT, GROUP, "printf forged >> \"$1\"", &capability)
+        !seat_command(SEAT, GROUP, r#"printf forged >> "$1""#, &capability)
             .status
             .success()
     );
@@ -251,7 +256,7 @@ fn privileged_config_acl_cross_uid() {
     denied(PEER, PEER_GROUP, &private);
     let future = op.join("future-token");
     // Deliberately use a permissive mode: a stale default ACL would expose it.
-    allowed(SEAT, GROUP, "umask 000; printf private > \"$1\"", &future);
+    allowed(SEAT, GROUP, r#"umask 000; printf private > "$1""#, &future);
     denied(0, 0, &future);
     denied(PEER, PEER_GROUP, &future);
     let daemon_future = daemon_op.join("future-token");
