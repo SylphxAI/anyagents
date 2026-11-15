@@ -124,6 +124,7 @@ impl FileAuthority {
     }
 
     /// Write `bytes` as the regular file `path`, created or truncated.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), String> {
         let shown = path.display();
         let mut file = self

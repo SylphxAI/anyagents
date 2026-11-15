@@ -155,17 +155,27 @@ async fn write_legacy_profile(user_data: &Path, url: &str, seen: &Arc<Mutex<Seen
 async fn call(data: &Path, req: Value) -> Value {
     let req: BrowserRequest = serde_json::from_value(req).unwrap();
     let action = req.action.clone();
-    execute(data, &agent("agent-a"), req)
-        .await
-        .unwrap_or_else(|e| panic!("{action}: {e}"))
+    execute(
+        data,
+        &agent("agent-a"),
+        req,
+        &crate::agent_file::FileAuthority::Own,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{action}: {e}"))
 }
 
 async fn refused(data: &Path, who: &str, req: Value) -> String {
     let req: BrowserRequest = serde_json::from_value(req).unwrap();
-    execute(data, &agent(who), req)
-        .await
-        .unwrap_err()
-        .to_string()
+    execute(
+        data,
+        &agent(who),
+        req,
+        &crate::agent_file::FileAuthority::Own,
+    )
+    .await
+    .unwrap_err()
+    .to_string()
 }
 
 /// Observe a condition the desktop reaches on its own; never repeat input.
@@ -340,9 +350,14 @@ async fn existing_profile_opens_with_logins_and_every_operation_works() {
 
     // The session desktop's pointer, clipboard and held keys.
     let desk = async |req: Value| {
-        super::desktop::execute(data, &agent("agent-a"), req)
-            .await
-            .unwrap()
+        super::desktop::execute(
+            data,
+            &agent("agent-a"),
+            req,
+            &crate::agent_file::FileAuthority::Own,
+        )
+        .await
+        .unwrap()
     };
     desk(json!({"action": "mouse_move", "coordinate": [10, 20]})).await;
     let pos = desk(json!({"action": "cursor_position"})).await;
