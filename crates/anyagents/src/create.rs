@@ -2526,7 +2526,7 @@ pub(crate) fn seed_harness_credentials(
             }
         }
         if !found_in_profile
-            && !profile_roots.is_empty()
+            && profile_roots.iter().any(|p| p.is_dir())
             && dst.exists()
             && (is_seat_selector
                 || (profile_changed
@@ -15402,29 +15402,48 @@ Connection: close
 
     #[test]
     fn spiron_standalone_seed_uses_model_provider_key() {
-        for (model, provider) in [
-            ("sylphx/kimi-code-plan/k3.1-pro#max", "kimi-code-plan"),
-            ("openrouter/openai/model#xhigh", "openrouter"),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let data = dir.path();
-            let store = Store::open(data.join("state.db")).unwrap();
-            let mut spec = NewAgent::new("seed-model", "spiron");
-            spec.model = Some(model.into());
-            let agent = store.create_agent(spec).unwrap();
-            let cfg = agent_config_dir(data, &agent.id);
-            std::fs::create_dir_all(cfg.join(".config/opencode")).unwrap();
-            std::fs::write(
-                cfg.join(".config/opencode").join(format!("{provider}.key")),
-                "provider-test-key",
-            )
-            .unwrap();
-            std::fs::write(cfg.join(".config/opencode/sylphx.key"), "wrong-test-key").unwrap();
-            seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
-            for mirror in [".spiron/auth.json", ".config/sylphx/auth.json"] {
-                let auth: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(cfg.join(mirror)).unwrap()).unwrap();
-                assert_eq!(auth["access_token"], "provider-test-key");
+        for profile_layout in [false, true] {
+            for (model, provider) in [
+                ("sylphx/kimi-code-plan/k3.1-pro#max", "kimi-code-plan"),
+                ("openrouter/openai/model#xhigh", "openrouter"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let data = dir.path();
+                let store = Store::open(data.join("state.db")).unwrap();
+                let mut spec = NewAgent::new("seed-model", "spiron");
+                spec.model = Some(model.into());
+                let agent = store.create_agent(spec).unwrap();
+                let cfg = agent_config_dir(data, &agent.id);
+                let source = if profile_layout {
+                    data.join("profiles").join(provider).join("default")
+                } else {
+                    cfg.clone()
+                };
+                std::fs::create_dir_all(source.join(".config/opencode")).unwrap();
+                std::fs::write(
+                    source
+                        .join(".config/opencode")
+                        .join(format!("{provider}.key")),
+                    "provider-test-key",
+                )
+                .unwrap();
+                std::fs::write(source.join(".config/opencode/sylphx.key"), "wrong-test-key")
+                    .unwrap();
+                seed_harness_credentials(&store, data, &agent, &cfg).unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(
+                        source
+                            .join(".config/opencode")
+                            .join(format!("{provider}.key"))
+                    )
+                    .unwrap(),
+                    "provider-test-key"
+                );
+                for mirror in ["auth.json", ".spiron/auth.json", ".config/sylphx/auth.json"] {
+                    let auth: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(cfg.join(mirror)).unwrap()).unwrap();
+                    assert_eq!(auth["access_token"], "provider-test-key");
+                }
             }
         }
     }
@@ -15494,6 +15513,7 @@ Connection: close
             serde_json::from_slice(&std::fs::read(cfg.join("auth.json")).unwrap()).unwrap();
         assert_eq!(seeded["access_token"], "test-profile-token");
         let config = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+        assert!(!config.contains("stale/model"), "{config}");
         assert!(
             config.contains("sylphx_ai_url = \"https://gateway.example/v1\""),
             "{config}"

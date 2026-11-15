@@ -193,7 +193,14 @@ for line in sys.stdin:
         )
         .unwrap();
         let config_toml = std::fs::read_to_string(config.join("config.toml")).unwrap();
-        assert!(config_toml.contains(&format!("model = {expected_model:?}")));
+        if expected_model.is_empty() {
+            assert!(!config_toml.contains("model ="), "{config_toml}");
+        } else {
+            assert!(
+                config_toml.contains(&format!("model = {expected_model:?}")),
+                "{config_toml}"
+            );
+        }
         let retained = [
             "sylphx-window.json",
             "sylphx-goal.json",

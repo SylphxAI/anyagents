@@ -73,7 +73,8 @@ pub(crate) fn coding_plan_provider_for_model(model: Option<&str>) -> Option<&'st
     .into_iter()
     .find(|&provider| {
         m.strip_prefix(provider)
-            .is_some_and(|rest| rest.starts_with('/'))
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|id| !id.trim().is_empty())
     })
 }
 
@@ -138,7 +139,8 @@ fn write_spiron_config_toml(config_dir: &Path, model: Option<&str>) -> Result<()
 fn model_provider_prefix(model: Option<&str>) -> Option<&str> {
     let m = model?.trim();
     let (prefix, rest) = m.split_once('/')?;
-    (!prefix.is_empty() && !rest.is_empty()).then_some(prefix)
+    (!prefix.is_empty() && !rest.trim().is_empty() && !normalize_model(m).is_empty())
+        .then_some(prefix)
 }
 
 fn discover_seat_gateway_url_for_model(config_dir: &Path, model: Option<&str>) -> Option<String> {
@@ -376,9 +378,26 @@ mod tests {
             assert_eq!(normalize_model(input), "");
             let dir = tempfile::tempdir().unwrap();
             let config = dir.path().join("config.toml");
-            std::fs::write(&config, "model = \"existing/model\"\n").unwrap();
+            assert_eq!(coding_plan_provider_for_model(Some(input)), None);
+            std::fs::write(
+                &config,
+                "model = \"existing/model\"\nsylphx_ai_url = \"https://existing.example/v1\"\n",
+            )
+            .unwrap();
+            let auth = br#"{"access_token":"existing-token"}"#;
+            std::fs::write(dir.path().join("auth.json"), auth).unwrap();
+            std::fs::write(dir.path().join("opencode.json"), br#"{"provider":{"kimi-code-plan":{"options":{"baseURL":"https://other.example/v1"}}}}"#).unwrap();
+            std::fs::create_dir_all(dir.path().join(".config/opencode")).unwrap();
+            std::fs::write(
+                dir.path().join(".config/opencode/kimi-code-plan.key"),
+                "other-token",
+            )
+            .unwrap();
             write_spiron_config(dir.path(), Some(input), Path::new("anyagents"), &[]).unwrap();
+            assert_eq!(std::fs::read(dir.path().join("auth.json")).unwrap(), auth);
             let text = std::fs::read_to_string(config).unwrap();
+            assert!(text.contains("https://existing.example/v1"), "{text}");
+            assert!(!text.contains("https://other.example/v1"), "{text}");
             assert!(text.contains("model = \"existing/model\""), "{text}");
             assert!(!text.contains("model = \"\""), "{text}");
         }
