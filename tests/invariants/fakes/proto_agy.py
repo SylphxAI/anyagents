@@ -435,6 +435,8 @@ class Agy(Protocol):
         if self.once("drop-request"):
             return DROP
         engine.received(inp)
+        if self.once("finish-on-send") and engine.turn is not None:
+            self.finish()
         cascade = request.get("cascadeId")
         if not self.exists or cascade != self.session:
             return self.refuse("cascade not found: %s" % cascade)
