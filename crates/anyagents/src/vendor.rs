@@ -1347,6 +1347,7 @@ fn vendor_launch_inner(
         });
         if let Some((_, uid, gid, _)) = effective_seat.as_ref() {
             let (uid, gid) = (*uid, *gid);
+            crate::sandbox::share_config_with_seat_uid(&request.config_dir, uid, gid);
             let managed_work = anyagents_core::agent_work_dir(&request.data_dir, &request.agent.id);
             if request.work_dir == managed_work && !managed_work.exists() {
                 let _ = crate::sandbox::ensure_seat_dir_as_owner(&managed_work, uid, gid, 0o2770);
@@ -1359,11 +1360,6 @@ fn vendor_launch_inner(
             }
         }
         crate::create::ensure_seat_op_config(&request.config_dir, seat_launch);
-        // Op setup can create private config entries; admit the completed tree.
-        if let Some((_, uid, gid, _)) = effective_seat.as_ref() {
-            crate::sandbox::share_config_with_seat_uid_checked(&request.config_dir, *uid, *gid)
-                .map_err(|err| err.to_string())?;
-        }
         env.push(("HOME".to_string(), request.config_dir.display().to_string()));
         env.push(("USER".to_string(), seat_user.clone()));
         env.push(("LOGNAME".to_string(), seat_user.clone()));
@@ -2062,7 +2058,7 @@ pub(crate) fn ensure_agy_steering_settings(
 }
 
 /// The deny reason the guard gives the model for a native tool.
-const AGY_GUARD_DENY: &str = "Native built-in tools are disabled under AnyAgents. Invoke AnyAgents MCP tools via call_mcp_tool with ServerName=\"anyagents\" (read schemas in ~/.gemini/antigravity-cli/mcp/anyagents/*.json if needed): e.g. ToolName=\"code\" with Arguments={\"code\":\"return await workspace.read({ path: \\\"...\\\" });\"} for workspace/web/anyagents operations, ToolName=\"send\" with Arguments={\"to\":[\"parent\"],\"text\":\"...\"} to reply, ToolName=\"agents\", ToolName=\"schedules\", or ToolName=\"skills\". read_file stays for an image, PDF or audio file in the workspace or the AnyAgents media directory, for media this CLI offloaded from a tool result ([Resource offloaded to file://...]), and for an oversize AnyAgents response spilled to anyagents-mcp-stdio-frame-*.txt in the temp dir.";
+const AGY_GUARD_DENY: &str = "Native built-in tools are disabled under AnyAgents. Invoke AnyAgents MCP tools via call_mcp_tool with ServerName=\"anyagents\" (read schemas in ~/.gemini/antigravity-cli/mcp/anyagents/*.json if needed): e.g. ToolName=\"code\" with Arguments={\"code\":\"return await workspace.read({ path: \\\"...\\\" });\"} for workspace/web/anyagents operations, ToolName=\"send\" with Arguments={\"to\":[\"parent\"],\"text\":\"...\"} to reply, ToolName=\"agents\", ToolName=\"schedules\", or ToolName=\"skills\". read_file stays for an image, PDF or audio file in the workspace or the AnyAgents media directory, and for media this CLI offloaded from a tool result ([Resource offloaded to file://...]).";
 
 /// The `PreToolUse` command that holds AGY's native tools: every one is
 /// denied, except `read_file` of an MCP tool schema under
@@ -2070,9 +2066,7 @@ const AGY_GUARD_DENY: &str = "Native built-in tools are disabled under AnyAgents
 /// of a media file (an image, a PDF or audio, told by its bytes) whose real
 /// path is in one of `roots` (the workspace and `<data>/media`) or is media
 /// AGY itself offloaded under `~/.gemini/antigravity-cli/brain/
-/// */.system_generated/steps/`, and `read_file` of a response the tool
-/// server spilled past the stdio frame cap: a `0600` file of this user named
-/// `anyagents-mcp-stdio-frame-<pid>-<seq>.txt` directly in the temp dir.
+/// */.system_generated/steps/`.
 ///
 /// AGY gives its model an MCP image only when its bytes fit the tool output
 /// limit (10,240 bytes by default, `tool_config.mcp.max_output_bytes`); a
@@ -2088,7 +2082,7 @@ fn agy_tool_guard_command(roots: &[&Path]) -> String {
     let roots = serde_json::to_string(&roots).unwrap_or_else(|_| "[]".to_string());
     let deny = serde_json::to_string(AGY_GUARD_DENY).unwrap_or_default();
     let program = format!(
-        r#"import json,os,re,stat,sys,tempfile
+        r#"import json,os,sys
 deny={deny}
 home=os.path.expanduser("~/.gemini/antigravity-cli")
 roots=[os.path.realpath(r) for r in {roots}]
@@ -2109,9 +2103,7 @@ try:
   steps=os.path.realpath(os.path.join(home,"brain"))
   schema=under(rp,mcp) and rp.endswith(".json")
   offloaded=under(rp,steps) and "/.system_generated/steps/" in rp
-  st=os.stat(rp) if rp and os.path.isfile(rp) else None
-  spilled=st is not None and os.path.dirname(rp)==os.path.realpath(tempfile.gettempdir()) and re.fullmatch(r"anyagents-mcp-stdio-frame-[0-9]+-[0-9]+\.txt",os.path.basename(rp)) is not None and st.st_uid==os.getuid() and stat.S_IMODE(st.st_mode)==0o600
-  if rp and os.path.isfile(rp) and (schema or spilled or (media(rp) and (offloaded or any(under(rp,r) for r in roots)))):
+  if rp and os.path.isfile(rp) and (schema or (media(rp) and (offloaded or any(under(rp,r) for r in roots)))):
    print(json.dumps({{"decision":"allow","permissionOverrides":["read_file(*)","read_file","view_file"]}}));sys.exit(0)
 except Exception:
  pass
@@ -4299,16 +4291,6 @@ done
     /// The guard's answer for one native tool call, as AGY runs the hook:
     /// the call on stdin, `HOME` the agent's config directory.
     fn agy_guard(cmd: &str, home: &Path, tool: &str, path: &Path) -> serde_json::Value {
-        agy_guard_in(cmd, home, &std::env::temp_dir(), tool, path)
-    }
-
-    fn agy_guard_in(
-        cmd: &str,
-        home: &Path,
-        tmp: &Path,
-        tool: &str,
-        path: &Path,
-    ) -> serde_json::Value {
         use std::io::Write as _;
         let payload = serde_json::json!({
             "toolCall": { "name": tool, "args": { "Path": path.display().to_string() } }
@@ -4317,7 +4299,7 @@ done
             .arg("-c")
             .arg(cmd)
             .env("HOME", home)
-            .env("TMPDIR", tmp)
+            .env("TMPDIR", home.join("tmp"))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -4333,54 +4315,38 @@ done
         serde_json::from_slice(&out.stdout).unwrap()
     }
 
-    /// A response the tool server spilled past the stdio frame cap is read
-    /// with native `read_file`: only a `0600` file of this user, named as the
-    /// spill is named, directly in the temp dir, and not through a symlink
-    /// to anything else.
-    #[cfg(unix)]
     #[test]
-    fn agy_native_read_opens_only_a_spilled_stdio_frame() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn agy_artifacts_use_code_reader_not_native_path_exemptions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
         let dir = crate::test_tempdir();
-        let config_dir = dir.path().join("config");
-        let work_dir = dir.path().join("work");
-        let media_dir = dir.path().join(anyagents_harness::media::MEDIA_DIR);
         let tmp = dir.path().join("tmp");
-        let nested = tmp.join("nested");
-        for path in [&config_dir, &work_dir, &media_dir, &nested] {
-            std::fs::create_dir_all(path).unwrap();
+        std::fs::create_dir(&tmp).unwrap();
+        let cmd = agy_tool_guard_command(&[&tmp]);
+        let good = tmp.join("anyagents-mcp-stdio-frame-123-4.json");
+        std::fs::write(&good, "{}").unwrap();
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for tool in ["read_file", "view_file"] {
+            assert_eq!(agy_guard(&cmd, dir.path(), tool, &good)["decision"], "deny");
         }
-        ensure_agy_steering_settings(&config_dir, &work_dir, &media_dir).unwrap();
-        let hooks: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(config_dir.join(".gemini/config/hooks.json")).unwrap(),
-        )
-        .unwrap();
-        let cmd = hooks["anyagents-native-tool-guard"]["PreToolUse"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap();
-        let write = |path: &Path, mode: u32| {
-            std::fs::write(path, "result text").unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-        };
-        let spilled = tmp.join("anyagents-mcp-stdio-frame-12-3.txt");
-        write(&spilled, 0o600);
-        let decide = |path: &Path| agy_guard_in(cmd, &config_dir, &tmp, "read_file", path);
-        assert_eq!(decide(&spilled)["decision"], "allow");
-
-        let loose = tmp.join("anyagents-mcp-stdio-frame-12-4.txt");
-        write(&loose, 0o644);
-        let deep = nested.join("anyagents-mcp-stdio-frame-12-5.txt");
-        write(&deep, 0o600);
-        let other = tmp.join("notes.txt");
-        write(&other, 0o600);
-        let secret = work_dir.join("secret.txt");
-        write(&secret, 0o600);
-        let link = tmp.join("anyagents-mcp-stdio-frame-12-6.txt");
-        std::os::unix::fs::symlink(&secret, &link).unwrap();
-        let traversal = nested.join("../../work/secret.txt");
-        for path in [&loose, &deep, &other, &link, &traversal] {
-            assert_eq!(decide(path)["decision"], "deny", "{}", path.display());
+        let link = tmp.join("anyagents-mcp-stdio-frame-123-5.json");
+        symlink(&good, &link).unwrap();
+        let alias = tmp.join(".").join(good.file_name().unwrap());
+        let traversal = tmp.join("../tmp").join(good.file_name().unwrap());
+        let lookalike = tmp.join("anyagents-mcp-stdio-frame-123-4.json.bak");
+        std::fs::write(&lookalike, "{}").unwrap();
+        for path in [link, alias, traversal, lookalike] {
+            assert_eq!(
+                agy_guard(&cmd, dir.path(), "read_file", &path)["decision"],
+                "deny",
+                "{}",
+                path.display()
+            );
         }
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            agy_guard(&cmd, dir.path(), "read_file", &good)["decision"],
+            "deny"
+        );
     }
 
     /// AGY gives its model an MCP image only up to 10,240 bytes and offloads

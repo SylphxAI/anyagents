@@ -288,8 +288,10 @@ pub(super) fn diagnose(code: &str, error: &str, compile: bool) -> Option<String>
     if error.contains("in JSON at position") && code.contains("workspace.read") {
         return Some(
             "`workspace.read` returns at most `max_bytes` (default 46080) per call and sets \
-             `truncated: true`; pass `max_bytes` (up to 262144) or read on with `byte_offset`, \
-             or extract fields with `workspace.exec({cmd: \"jq ...\"})`."
+             `truncated: true`. For exact artifacts, read 4096-byte pages using `byte_offset`, \
+             return only content/byte_offset/bytes_read/total_bytes/sha256/truncated, \
+             advance by bytes_read and verify the concatenated byte count and SHA-256 before parsing. \
+             For field extraction, use `workspace.exec({cmd: \"jq ...\"})`."
                 .to_string(),
         );
     }
