@@ -636,6 +636,38 @@ fn deleted_immutable_sender_refuses_receive_before_wake_mail_or_index_mutation()
     );
 }
 
+#[test]
+fn a_deleted_messages_identities_and_aliases_are_found_by_index() {
+    // Deleting an agent deletes its messages, and each message cascades to
+    // the rows naming it. Without an index on the child key every deleted
+    // message scanned these tables with the writer held.
+    let (_dir, store, _agent) = setup();
+    let conn = store.conn();
+    for (table, column) in [
+        ("message_identities", "identity_id"),
+        ("message_identities", "target_id"),
+        ("message_origin_aliases", "identity_id"),
+        ("message_source_aliases", "identity_id"),
+    ] {
+        let mut plan = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM {table} WHERE {column} = ?1"
+            ))
+            .unwrap();
+        let details: Vec<String> = plan
+            .query_map([rusqlite::types::Null], |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.starts_with("SEARCH") && d.contains("INDEX")),
+            "{table}.{column}: {details:?}"
+        );
+    }
+}
+
 /// Search rows filed under `name`, found through the index.
 fn fts_rows_named(store: &Store, name: &str) -> i64 {
     ix(store)
