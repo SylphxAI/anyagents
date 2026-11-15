@@ -469,7 +469,7 @@ mod stdio_frame_cap_tests {
             .split(|b| *b == b'\n')
             .filter(|line| !line.is_empty())
             .map(|line| {
-                assert!(line.len() + 1 <= MCP_TEXT_SPILL_BYTES);
+                assert!(line.len() < MCP_TEXT_SPILL_BYTES);
                 serde_json::from_slice(line).unwrap()
             })
             .collect();
@@ -11313,7 +11313,7 @@ mod spawn_args_tests {
                 "jsonrpc":"2.0", "id":offset,
                 "result":{"content":[{"type":"text","text":serde_json::to_string(&page).unwrap()}],"isError":false}
             })).unwrap();
-                assert!(frame.len() + 1 <= MCP_TEXT_SPILL_BYTES);
+                assert!(frame.len() < MCP_TEXT_SPILL_BYTES);
                 let mut gate = FrameArtifactStdout::with_spill_dir(Vec::new(), workdir.clone());
                 use tokio::io::AsyncWriteExt as _;
                 gate.write_all(&frame).await.unwrap();

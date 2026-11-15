@@ -1347,7 +1347,6 @@ fn vendor_launch_inner(
         });
         if let Some((_, uid, gid, _)) = effective_seat.as_ref() {
             let (uid, gid) = (*uid, *gid);
-            crate::sandbox::share_config_with_seat_uid(&request.config_dir, uid, gid);
             let managed_work = anyagents_core::agent_work_dir(&request.data_dir, &request.agent.id);
             if request.work_dir == managed_work && !managed_work.exists() {
                 let _ = crate::sandbox::ensure_seat_dir_as_owner(&managed_work, uid, gid, 0o2770);
@@ -1360,6 +1359,11 @@ fn vendor_launch_inner(
             }
         }
         crate::create::ensure_seat_op_config(&request.config_dir, seat_launch);
+        // Op setup can create private config entries; admit the completed tree.
+        if let Some((_, uid, gid, _)) = effective_seat.as_ref() {
+            crate::sandbox::share_config_with_seat_uid_checked(&request.config_dir, *uid, *gid)
+                .map_err(|err| err.to_string())?;
+        }
         env.push(("HOME".to_string(), request.config_dir.display().to_string()));
         env.push(("USER".to_string(), seat_user.clone()));
         env.push(("LOGNAME".to_string(), seat_user.clone()));
@@ -4327,6 +4331,15 @@ done
         std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o600)).unwrap();
         for tool in ["read_file", "view_file"] {
             assert_eq!(agy_guard(&cmd, dir.path(), tool, &good)["decision"], "deny");
+        }
+        let legacy = tmp.join("anyagents-mcp-stdio-frame-123-4.txt");
+        std::fs::write(&legacy, "result text").unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for tool in ["read_file", "view_file"] {
+            assert_eq!(
+                agy_guard(&cmd, dir.path(), tool, &legacy)["decision"],
+                "deny"
+            );
         }
         let link = tmp.join("anyagents-mcp-stdio-frame-123-5.json");
         symlink(&good, &link).unwrap();
