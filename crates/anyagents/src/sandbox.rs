@@ -608,17 +608,37 @@ pub(crate) fn prepare_config_with_seat_uid(config: &Path, uid: u32, gid: u32) ->
 /// group. A protected shared root or failed permission change is a typed
 /// refusal.
 pub fn share_worktree_with_seat(path: &Path, gid: u32) -> Result<(), Error> {
-    let canon = std::fs::canonicalize(path).map_err(|error| Error::WorkdirPermission {
+    // Sharing still requires an existing directory.
+    std::fs::canonicalize(path).map_err(|error| Error::WorkdirPermission {
         path: path.display().to_string(),
         message: error.to_string(),
     })?;
+    validate_workdir_target(path)?;
+    crate::repo::share(path, gid)
+}
+
+/// Validate before allocating a checkout or persisting its target. Resolve
+/// existing ancestors so missing leaves cannot hide protected symlink targets.
+pub(crate) fn validate_workdir_target(path: &Path) -> Result<(), Error> {
+    validate_workdir_target_with_roots(path, &protected_roots())
+}
+
+fn validate_workdir_target_with_roots(path: &Path, roots: &[PathBuf]) -> Result<(), Error> {
+    let refuse = |message: String| Error::WorkdirPermission {
+        path: path.display().to_string(),
+        message,
+    };
+    if path.as_os_str().is_empty() || path.to_str().is_some_and(|p| p.trim().is_empty()) {
+        return Err(refuse("working directory must not be empty".into()));
+    }
+    let canon = resolve_workdir_target(path).map_err(|error| refuse(error.to_string()))?;
     let depth = canon
         .components()
         .filter(|c| matches!(c, std::path::Component::Normal(_)))
         .count();
     if depth < 3
         || host_home_dir().is_some_and(|h| canon == h || canon == h.join("workspace"))
-        || protected_roots()
+        || roots
             .iter()
             .any(|root| canon == *root || canon.starts_with(root))
     {
@@ -627,7 +647,40 @@ pub fn share_worktree_with_seat(path: &Path, gid: u32) -> Result<(), Error> {
             message: "refusing recursive permission changes to a shared root".into(),
         });
     }
-    crate::repo::share(path, gid)
+    Ok(())
+}
+
+fn resolve_workdir_target(path: &Path) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+    let absolute = std::path::absolute(path)?;
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            other => {
+                resolved.push(other.as_os_str());
+                match std::fs::canonicalize(&resolved) {
+                    Ok(physical) => {
+                        if !physical.is_dir() {
+                            return Err(std::io::Error::from(std::io::ErrorKind::NotADirectory));
+                        }
+                        resolved = physical;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // A dangling symlink is not a new directory allocation.
+                        if std::fs::symlink_metadata(&resolved).is_ok() {
+                            return Err(error);
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 fn protected_roots() -> Vec<PathBuf> {
@@ -635,9 +688,9 @@ fn protected_roots() -> Vec<PathBuf> {
         .map(|raw| {
             std::env::split_paths(&raw)
                 // Match the canonical target against the canonical protected
-                // tree, including macOS /var and /tmp aliases. Missing roots
-                // retain their declared path until they can be resolved.
-                .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
+                // tree, including macOS /var and /tmp aliases. Missing leaves
+                // retain their names after resolving existing ancestors.
+                .map(|root| resolve_workdir_target(&root).unwrap_or(root))
                 .collect()
         })
         .unwrap_or_default()
@@ -1028,6 +1081,47 @@ fn unadmitted(boundary: &Boundary, why: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn workdir_validation_handles_missing_targets_and_physical_aliases() {
+        let tmp = crate::test_tempdir();
+        let protected = tmp.path().join("protected");
+        std::fs::create_dir(&protected).unwrap();
+        let roots = vec![protected.clone()];
+        for path in [
+            PathBuf::new(),
+            PathBuf::from(" "),
+            PathBuf::from("/"),
+            PathBuf::from("/tmp"),
+            protected.clone(),
+            protected.join("missing/child"),
+        ] {
+            assert!(
+                validate_workdir_target_with_roots(&path, &roots).is_err(),
+                "{path:?}"
+            );
+        }
+        let allowed = tmp.path().join("allowed/missing");
+        validate_workdir_target_with_roots(&allowed, &roots).unwrap();
+        assert!(
+            !allowed.exists(),
+            "validation must not provision the target"
+        );
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&protected, &alias).unwrap();
+        assert!(validate_workdir_target_with_roots(&alias.join("missing"), &roots).is_err());
+        assert!(
+            validate_workdir_target_with_roots(&alias.join("../protected/missing"), &roots)
+                .is_err()
+        );
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        assert!(validate_workdir_target_with_roots(&file.join("missing"), &[]).is_err());
+        let dangling = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("absent"), &dangling).unwrap();
+        assert!(validate_workdir_target_with_roots(&dangling.join("missing"), &[]).is_err());
+    }
 
     #[test]
     fn a_seat_spec_names_its_uid_and_every_gid_once() {

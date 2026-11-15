@@ -341,6 +341,15 @@ fn create_with_seat(
         } else {
             request.workdir.clone()
         };
+        if request.workdir.is_some() && wd_str.is_empty() {
+            return Err(Error::WorkdirPermission {
+                path: request.workdir.as_ref().unwrap().display().to_string(),
+                message: "working directory must not be empty".into(),
+            });
+        }
+        if let Some(path) = &explicit_workdir {
+            crate::sandbox::validate_workdir_target(path)?;
+        }
         let is_cloud_agent_mode = wd_is_cloud_keyword
             || pairs
                 .iter()
@@ -1257,11 +1266,12 @@ pub(crate) fn extract_file_tilde_refs(text: &str) -> Vec<String> {
 pub(crate) fn ensure_seat_environment(target_config: &Path, workdir: &Path) -> Result<(), Error> {
     for subdir in ["tmp", "data-home", "cache-home", "state-home"] {
         let dir = target_config.join(subdir);
-        let _ = std::fs::create_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777));
+            // Shared runtime trees must not permit peers to unlink each other's entries.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
         }
     }
     crate::repo::configure_seat_git(target_config, workdir)?;
@@ -3855,6 +3865,12 @@ fn propagate_credentials(
                 "no profile credentials installed for {dir_id}"
             )));
         }
+        // Success markers must describe credentials that the seat can read.
+        if let Some(s) = store_opt.as_ref() {
+            if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
+                crate::sandbox::share_config_with_seat_uid_checked(&cfg, uid, gid)?;
+            }
+        }
         write_profile_marker(
             &cfg,
             ".anyagents-seeded-profile",
@@ -3876,10 +3892,7 @@ fn propagate_credentials(
             )?;
             let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         }
-        if let Some(s) = store_opt.as_ref() {
-            if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
-                crate::sandbox::share_config_with_seat_uid_checked(&cfg, uid, gid)?;
-            }
+        if store_opt.is_some() {
             if change == CredentialChange::Replaced {
                 poke_agent_wake_socket(data, &agent_rec.id);
             }
@@ -11788,6 +11801,31 @@ stderr: {}",
     }
 
     #[test]
+    fn invalid_explicit_workdir_is_refused_before_checkout_allocation() {
+        let tmp = crate::test_tempdir();
+        let fixture = crate::repo::tests::Fixture::new(tmp.path());
+        let store = Store::open(tmp.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        for (index, path) in ["", " ", "/", "/tmp"].iter().enumerate() {
+            let name = format!("invalid-workdir-{index}");
+            let mut request = worktree_request(&name, Some("ExampleOrg/demo".into()));
+            request.workdir = Some(PathBuf::from(*path));
+            let result = create_with_consumer(&store, tmp.path(), request, &fixture.checkouts);
+            assert!(
+                matches!(result, Err(Error::WorkdirPermission { .. })),
+                "{result:?}"
+            );
+            assert!(store.agent_by_name(&name).is_err());
+            assert!(
+                !fixture.log.exists(),
+                "invalid workdir reached the checkout provider"
+            );
+        }
+    }
+
+    #[test]
     fn workdir_is_durable_while_checkout_provisioning_is_blocked() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
@@ -13595,7 +13633,7 @@ mod runtime_config_tests {
             return;
         }
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         store
             .hold_capability_key("0123456789abcdef0123456789abcdef")
@@ -13628,6 +13666,15 @@ mod runtime_config_tests {
         std::fs::write(prof.join("auth.json"), credentials).unwrap();
         let overlay = cfg.parent().unwrap().join("memory");
         std::fs::write(&overlay, "not a directory").unwrap();
+        let markers = [
+            ".anyagents-seeded-profile",
+            ".anyagents-quota-cleared-ms",
+            ".anyagents-profile-rotated-ms",
+            ".anyagents-last-error.json",
+        ];
+        for marker in markers {
+            std::fs::write(cfg.join(marker), "previous-state\n").unwrap();
+        }
         // Preparation must succeed: this fixture fails only in post-write sharing.
         crate::sandbox::prepare_config_with_seat_uid(&cfg, uid, gid).unwrap();
 
@@ -13636,7 +13683,7 @@ mod runtime_config_tests {
             "openai",
             "target",
             &["auth.json"],
-            CredentialChange::Renewed,
+            CredentialChange::Replaced,
         )
         .unwrap_err();
         match err {
@@ -13654,15 +13701,17 @@ mod runtime_config_tests {
             other => panic!("expected checked overlay sharing refusal, got {other:?}"),
         }
         assert_eq!(std::fs::read(cfg.join("auth.json")).unwrap(), credentials);
-        assert_eq!(
-            std::fs::read_to_string(cfg.join(".anyagents-seeded-profile")).unwrap(),
-            "openai/target\n"
-        );
+        for marker in markers {
+            assert_eq!(
+                std::fs::read_to_string(cfg.join(marker)).unwrap(),
+                "previous-state\n",
+                "marker changed after sharing failed: {marker}"
+            );
+        }
         assert_eq!(
             std::fs::read_to_string(&overlay).unwrap(),
             "not a directory"
         );
-        assert!(!cfg.join(".anyagents-profile-rotated-ms").exists());
 
         // The same real caller succeeds once the overlay is repaired.
         std::fs::remove_file(&overlay).unwrap();
@@ -13671,10 +13720,21 @@ mod runtime_config_tests {
             "openai",
             "target",
             &["auth.json"],
-            CredentialChange::Renewed,
+            CredentialChange::Replaced,
         )
         .unwrap();
         assert!(overlay.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(cfg.join(".anyagents-seeded-profile")).unwrap(),
+            "openai/target\n"
+        );
+        let rotated = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms")).unwrap();
+        assert!(rotated.trim().parse::<i64>().unwrap() > 0);
+        assert_eq!(
+            std::fs::read_to_string(cfg.join(".anyagents-quota-cleared-ms")).unwrap(),
+            rotated
+        );
+        assert!(!cfg.join(".anyagents-last-error.json").exists());
         assert_eq!(std::fs::read(cfg.join("auth.json")).unwrap(), credentials);
     }
 
@@ -14076,6 +14136,30 @@ mod runtime_config_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config");
         ensure_seat_environment(&cfg, dir.path()).unwrap();
+        #[cfg(unix)]
+        for name in ["tmp", "data-home", "cache-home", "state-home"] {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = cfg.join(name);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                0o1777
+            );
+            // A repeated preparation repairs legacy non-sticky runtime trees.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        ensure_seat_environment(&cfg, dir.path()).unwrap();
+        #[cfg(unix)]
+        for name in ["tmp", "data-home", "cache-home", "state-home"] {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(cfg.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o1777
+            );
+        }
         assert!(!cfg.join(".rustup").exists());
         assert!(!cfg.join(".cargo").exists());
         assert!(!cfg.join(".local/share/desk-claude").exists());
