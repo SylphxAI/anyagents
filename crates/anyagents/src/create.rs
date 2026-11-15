@@ -13557,6 +13557,127 @@ mod runtime_config_tests {
         assert!(!stage.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn credential_propagation_returns_post_write_sharing_errors() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Principal admission is process-wide; isolate it from parallel tests.
+        const PROBE: &str = "ANYAGENTS_TEST_PROPAGATION_SHARING_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env(PROBE, "1")
+                .env_remove("ANYAGENTS_PRINCIPALS")
+                .env_remove("ANYAGENTS_PRINCIPAL_REGISTRY")
+                .env_remove("ANYAGENTS_AGENTS")
+                .env_remove("ANYAGENTS_AGENT_UID")
+                .env_remove("ANYAGENTS_AGENT_GID")
+                .env_remove("ANYAGENTS_SOCKET_GID")
+                .env_remove("ANYAGENTS_SEAT_LAUNCHER")
+                .args([
+                    "--exact",
+                    "create::runtime_config_tests::credential_propagation_returns_post_write_sharing_errors",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "probe failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "probe must run exactly one test: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sample", "codex"))
+            .unwrap();
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "openai/target\n").unwrap();
+        let owner = std::fs::metadata(&cfg).unwrap();
+        let uid = if owner.uid() == 42001 { 42002 } else { 42001 };
+        let gid = owner.gid();
+        unsafe {
+            std::env::set_var(
+                "ANYAGENTS_PRINCIPALS",
+                serde_json::json!({
+                    agent.id.as_str(): {
+                        "user": "registered-worker", "uid": uid,
+                        "gid": gid, "socket_gid": gid
+                    }
+                })
+                .to_string(),
+            );
+        }
+        assert!(resolved_agent_seat_info(&store, &agent).is_some());
+        let prof = dir.path().join("profiles/openai/target");
+        std::fs::create_dir_all(&prof).unwrap();
+        let credentials = br#"{"tokens":{"access_token":"fixture-only"}}"#;
+        std::fs::write(prof.join("auth.json"), credentials).unwrap();
+        let overlay = cfg.parent().unwrap().join("memory");
+        std::fs::write(&overlay, "not a directory").unwrap();
+        // Preparation must succeed: this fixture fails only in post-write sharing.
+        crate::sandbox::prepare_config_with_seat_uid(&cfg, uid, gid).unwrap();
+
+        let err = propagate_credentials(
+            dir.path(),
+            "openai",
+            "target",
+            &["auth.json"],
+            CredentialChange::Renewed,
+        )
+        .unwrap_err();
+        match err {
+            Error::WorkdirPermission { path, message } => {
+                assert_eq!(path, cfg.display().to_string());
+                assert!(
+                    message.contains("cannot share harness overlays"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("refusing non-directory host overlay"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected checked overlay sharing refusal, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(cfg.join("auth.json")).unwrap(), credentials);
+        assert_eq!(
+            std::fs::read_to_string(cfg.join(".anyagents-seeded-profile")).unwrap(),
+            "openai/target\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&overlay).unwrap(),
+            "not a directory"
+        );
+        assert!(!cfg.join(".anyagents-profile-rotated-ms").exists());
+
+        // The same real caller succeeds once the overlay is repaired.
+        std::fs::remove_file(&overlay).unwrap();
+        propagate_credentials(
+            dir.path(),
+            "openai",
+            "target",
+            &["auth.json"],
+            CredentialChange::Renewed,
+        )
+        .unwrap();
+        assert!(overlay.is_dir());
+        assert_eq!(std::fs::read(cfg.join("auth.json")).unwrap(), credentials);
+    }
+
     #[test]
     fn credential_propagation_does_not_seed_or_rotate_a_failed_destination() {
         let dir = tempfile::tempdir().unwrap();
