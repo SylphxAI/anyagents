@@ -310,6 +310,58 @@ AnyAgents selects the exposed MCP tool profile according to the execution bounda
 
 A remote session (a cloud harness or a remote sandbox) never holds the agent's local capability. Each launch begins a remote session: the server issues a token bound to that agent and session, stores only its SHA-256 digest, writes it with `<public_url>/v1/webhooks/mcp` into the agent's config directory, rotates it at half its lifetime (`remote_session_ttl_secs`, default one hour), and revokes it on pause, archive, relaunch, deletion or `anyagents agents revoke-remote`. `public_url` lives under `[server]` in `<data>/anyagents.toml`; without it a remote agent is neither created nor started. `public_listen` in the same table binds the public listener, which accepts remote session tokens only ([serving identity](serving-identity.md#listeners)). A remote session token authenticates only while its agent runs off this host.
 
+## Desktop sessions: browser and computer use
+
+Browser use is one view of computer use, and one engine serves both: the
+open-source [`agent-workstation`](https://github.com/SylphxAI/agent-workstation)
+crate. Spiron embeds it natively; AnyAgents runs it in the server and exposes
+it to every third-party harness through the MCP `browser` and `computer`
+tools ([computer-and-device.md](computer-and-device.md) has the tool surface).
+
+- **One isolated desktop per session.** A session is one headless Wayland
+  compositor (`sway`, software rendering, a private runtime directory, no X
+  server and no TCP listener) running exactly one headful Chromium-family
+  browser with its native chrome. The server keeps at most one session per
+  browser profile directory and starts it on the first call for that profile.
+- **Two views of one state.** Web actions go over the browser's loopback
+  DevTools endpoint, with accessibility snapshots whose `@eN` refs are bound to
+  the document they read: any navigation of that document, and any newer
+  snapshot, invalidates them deterministically (`STALE_REF`). Desktop actions
+  go through Wayland screencopy and virtual pointer and keyboard devices, so
+  they reach browser chrome, file dialogs, native bubbles and every window. A
+  DevTools navigation hands keyboard focus to the page, so both views agree on
+  where keys go.
+- **One agent principal per session.** The engine leases a session to one
+  agent at a time; every other agent's call fails with a typed error
+  (`DESKTOP_IN_USE` on the tool surface) until the session stops.
+- **Human takeover of the whole desktop.** wayvnc behind a token-protected
+  WebSocket and a noVNC page. While a person holds control, every agent action
+  and observation returns `HUMAN_IN_CONTROL`, until they hand back or after
+  five idle minutes. The server mounts each session's page on its public
+  listener under `/v1/webhooks/takeover/<key>/`, reached at
+  `ANYAGENTS_WEBHOOK_URL` (the deployment's stable public entry); without one
+  it falls back to a quick tunnel started at the first takeover, or loopback.
+  CAPTCHAs and 2FA challenges go to a person this way; agents never bypass
+  them.
+- **No fingerprint spoofing.** Nothing is injected into pages to change what a
+  site sees. A profile's fingerprint seed fixes its desktop size, timezone and
+  locale at launch. Residential egress goes through an authorized proxy the
+  caller names.
+- **Caller-held state.** Profiles, proxy tunnels and secrets belong to the
+  caller; the engine holds no global state. A `secret_ref` is resolved at the
+  moment of insertion, bound to the selected field and its frame's origin,
+  and never logged or returned to the model.
+- **Lifecycle.** A session stops on `close` by its holder, after
+  `ANYAGENTS_BROWSER_IDLE_SECS` without calls (never while a person holds
+  control), when its holder is deleted or archived, and on server shutdown;
+  the browser always closes gracefully so the profile is flushed.
+
+Host desktop control (`tools.computer` with `platform`, `display` or
+`wayland_display`: macOS JXA, Windows PowerShell, X11 tools) stays in
+`crates/anyagents/src/computer/` as it is. It moves to a future device app
+built on the same engine with the platform accessibility APIs (macOS AX,
+Windows UI Automation), and is not being extended here.
+
 ## Identity: one authenticated connection per agent session
 
 A capability is 32 random bytes the server mints for one agent instance. The server keeps only its hash, beside the agent's immutable id and a generation: minting a new one revokes the last, so a replaced session stops working at once. The capability is written `0600` into the agent's own config directory (`agents/<id>/config/mcp-capability`), or `0640` in that agent's own OS group when OS seats are configured, so its harness reads it and no other seat can. It is never an argument, a tool argument, an environment value or a log line.
@@ -386,7 +438,7 @@ require an authenticated server rather than an offline database fallback.
 - `inbox(since?)` reads this agent's own mailbox. It never sends.
 - `conversation(...)` / `search(...)` run **hybrid retrieval over raw history (`Raw-RAG`)**: BM25 over the host index, dense candidates from the memory service fused by reciprocal rank, and a cross-encoder rerank of the fused head. Every result cites its raw record: a raw coordinate (segment, offset, length, SHA-256) for native history and memory, the message id for mailbox rows. The response's `retrieval` names the stages that ran and why any did not:
   - **Read authorization:** Non-admin agents read only their own and descendant mailboxes/transcripts. `agent: "all"` and `"*"` mean that authorized tree, not the workspace. Messaging scope, public reachability and shared groups do not grant private history access; explicit parent/sibling/peer reads return forbidden. `with`, sender, range and radius can only narrow the authorized rows. Operator and explicitly privileged root-admin reads are unrestricted and audited. Agent CLI reads require the authenticated server, without an offline SQLite fallback.
-  - **Raw history is the source of truth; no model rewrites it:** History stays lossless in each harness's own files and stores and in the mailbox; the lexical indexes (`rag_chunks_fts` for the mailbox, the host index for native history: `unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams) and the dense index are rebuildable projections. By default embedding and reranking run locally on CPU with pinned open models and no network call; the operator can bind either to a remote model through an AnyAgents profile ([providers](host-memory.md#embedding-and-rerank-providers)). Exceptional erasure uses the permissioned, audited [redaction operation](redaction.md), preserving ids/order and replacing only explicitly selected content; ordinary coordinator history reads remain lossless.
+  - **Raw history is the source of truth; no model rewrites it:** History stays lossless in each harness's own files and stores and in the mailbox; the lexical indexes (`rag_chunks_fts` for the mailbox, kept in `memory-index.db` beside `state.db` so no index work holds the state writer; the host index for native history: `unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams) and the dense index are rebuildable projections. By default embedding and reranking run locally on CPU with pinned open models and no network call; the operator can bind either to a remote model through an AnyAgents profile ([providers](host-memory.md#embedding-and-rerank-providers)). Exceptional erasure uses the permissioned, audited [redaction operation](redaction.md), preserving ids/order and replacing only explicitly selected content; ordinary coordinator history reads remain lossless.
   - **Multi-query & negative filtering:** `query` plus `queries: [...]` (OR-combined keyword/synonym sets) and `exclude: [...]` (negative filters).
   - **Tool history toggles:** `include_tools` (default `true`; `false` restricts search to messages without tool/system noise), `only_tools` (`true` restricts search to tool calls and outputs), and `tool_name` (filters tool history to a specific tool such as `"bash"`, `"browser"`, `"agents"`, `"schedule"`, `"send"`).
   - **Structured filters & ordering:** Filter by `with` (peer/channel/group), `direction` (`"in"` / `"out"`), `sender`, `role` (`"user"` / `"assistant"` / `"tool"`), `since_ms` / `until_ms`, and order by `sort = "relevance"` (hybrid: BM25 and dense fused, then reranked; filters apply to dense candidates exactly as to lexical ones), `"newest"` (`timestamp DESC`), or `"oldest"` (`timestamp ASC`).

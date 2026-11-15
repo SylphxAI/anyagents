@@ -302,8 +302,9 @@ struct State {
     /// The one Antigravity steer under way, and once the language server
     /// settled it, whether it queued the message.
     agy_steer: Option<AgySteer>,
-    /// The Antigravity turn (its `turns_started`) whose cascade refused a
-    /// steer: it is given no more, and the next input waits for its end.
+    /// The Antigravity turn (its `turns_started`) whose cascade, held open
+    /// past it with an empty mailbox, refused a steer: the next input opens
+    /// a turn on stdin. A refusal while a turn runs is asked again instead.
     agy_refused_turn: Option<usize>,
     /// Messages a cascade's durable mailbox holds that the cascade has not
     /// shown taking: the language server queued them for this process, or a
@@ -316,6 +317,9 @@ struct State {
     /// stdin showed its first step or closed. A proof about the session, so
     /// a new process keeps it.
     agy_taken: HashSet<String>,
+    /// The message whose turn closed on a stray syntax fragment and was told
+    /// once to continue: a turn is continued at most once.
+    agy_continued: Option<String>,
     /// The session's cascade was retired (its record is poisoned): no later
     /// line names it again.
     session_retired: bool,
@@ -761,13 +765,15 @@ impl StreamHarness {
         if self.agy_rpc.is_some() {
             let mut state = lock(&self.shared);
             // A settled steer is judged by what the cascade holds or took
-            // (queued), or afresh (returned).
-            if state
-                .agy_steer
-                .as_ref()
-                .is_some_and(|steer| steer.outcome.is_some())
-            {
+            // (queued), or afresh (returned). A returned steer never entered
+            // the cascade's mailbox, so later mail yields the pass and lets
+            // the head message go first.
+            if let Some(outcome) = state.agy_steer.as_ref().and_then(|steer| steer.outcome) {
+                let other = state.agy_steer.as_ref().is_some_and(|steer| steer.id != id);
                 state.agy_steer = None;
+                if outcome == AgySteered::Returned && other {
+                    return Ok(DeliverOutcome::Deferred);
+                }
             }
             // A steer under way is in flight until the language server
             // settles it; one its cascade holds, until the cascade takes it.
@@ -845,6 +851,7 @@ impl StreamHarness {
                         child_pid: state.child.as_ref().map(Child::id),
                         cached_port: state.http_port,
                         planner_config: state.planner_config.clone(),
+                        running: agy_known_running(&state),
                         generation: state.generation,
                     });
                 } else {
@@ -1336,9 +1343,10 @@ impl StreamHarness {
         let wake = Arc::clone(&self.wake);
         let spec = self.spec.clone();
         let agy_rpc = self.agy_rpc.clone();
+        let stdin = Arc::clone(&self.stdin);
         match thread::Builder::new()
             .name(spec.name.clone())
-            .spawn(move || read_stdout(stdout, shared, wake, spec, agy_rpc, generation))
+            .spawn(move || read_stdout(stdout, stdin, shared, wake, spec, agy_rpc, generation))
         {
             Ok(handle) => self.reader = Some(handle),
             Err(err) => {
@@ -1670,6 +1678,7 @@ impl State {
             agy_refused_turn: None,
             agy_queued: Vec::new(),
             agy_taken: HashSet::new(),
+            agy_continued: None,
             session_retired: false,
             stdin_broken: false,
             finished: HashSet::new(),
@@ -1698,6 +1707,7 @@ impl State {
 
 fn read_stdout(
     stdout: ChildStdout,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     shared: Arc<Mutex<State>>,
     wake: Arc<Condvar>,
     spec: StreamSpec,
@@ -1828,11 +1838,43 @@ fn read_stdout(
                 let _ = std::fs::remove_file(rpc.config_dir.join(".anyagents-last-error.json"));
             }
         }
+        // Settle what the closing turn took before `finish_open` judges `open`,
+        // so taken steers finish with this turn and untaken in-flight steers do
+        // not.
+        if let Some(rpc) = &agy_rpc
+            && kind == Some("result")
+        {
+            agy_settle(&shared, &wake, rpc, generation);
+        }
+        // A turn that closed on a stray syntax fragment, with no tool call,
+        // stopped short: the cascade's own record shows it.
+        let fragment = match &agy_rpc {
+            Some(rpc) if kind == Some("result") && effect.finishes_turn && error.is_none() => {
+                let session = lock(&shared).session_id.clone();
+                session
+                    .and_then(|session| agy_conversation_dir(rpc, &session))
+                    .and_then(|dir| agy_last_response(&dir.join("logs/transcript_full.jsonl")))
+                    .filter(|content| agy_stray_fragment(content))
+            }
+            _ => None,
+        };
+        let mut continue_turn = None;
         let mut retry_after = None;
         {
             let mut state = lock(&shared);
             if state.generation != generation {
                 return;
+            }
+            if let Some(content) = &fragment
+                && let Some(id) = state.open.first().cloned()
+                && state.agy_continued.as_ref() != Some(&id)
+            {
+                state.agy_continued = Some(id);
+                effect.finishes_turn = false;
+                continue_turn = Some((
+                    agy_continue_line(&spec, content),
+                    effect.usage.take().unwrap_or_else(|| spec.usage_of(&value)),
+                ));
             }
             let before = state.observed();
             state.idle_since = None;
@@ -2029,6 +2071,17 @@ fn read_stdout(
             state.last_line_at = Some(Instant::now());
             state.epoch = state.epoch.wrapping_add(1);
         }
+        // Never hold shared state across pipe I/O. A continuation that cannot
+        // be written closes the turn as the cascade did.
+        if let Some((line, usage)) = continue_turn
+            && write_stdin(&stdin, &line).is_err()
+        {
+            let mut state = lock(&shared);
+            if state.generation == generation {
+                finish_open(&mut state, usage);
+                state.touch();
+            }
+        }
         wake.notify_all();
         // A turn the peer could not start opens again with time alone.
         if let Some(wait) = retry_after {
@@ -2187,7 +2240,13 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     }
     let mut usage = Some(usage);
     for id in std::mem::take(&mut state.open) {
-        if state.agy_queued.iter().any(|queued| queued.id == id) {
+        if state.agy_queued.iter().any(|queued| queued.id == id)
+            || (state
+                .agy_steer
+                .as_ref()
+                .is_some_and(|steer| steer.id == id && steer.outcome.is_none())
+                && !state.agy_taken.contains(&id))
+        {
             continue;
         }
         if state.seen.contains(&id) {
@@ -2840,7 +2899,6 @@ const AGY_STEER_PROBE_GAP: Duration = Duration::from_millis(400);
 /// `Some(Some(d))` for `d`.
 ///
 /// - A steer under way: its settling wakes the host.
-/// - A turn whose cascade refused a steer takes no more: its end does.
 /// - A steer goes through the language server, while the turn it joins was
 ///   started on stdin, and nothing orders the two. A known cascade that has
 ///   not shown the turn's first step may still be idle; a steer sent now
@@ -2859,7 +2917,7 @@ const AGY_STEER_PROBE_GAP: Duration = Duration::from_millis(400);
 /// is steered at once: the message joins the mail and starts the invocation
 /// that takes all of it, in order.
 fn agy_input_gate(state: &State) -> Option<Option<Duration>> {
-    if agy_steer_running(state) || (agy_held(state) && !state.open.is_empty()) {
+    if agy_steer_running(state) {
         return Some(None);
     }
     if let Some(idle) = state.idle_since
@@ -2914,7 +2972,7 @@ fn agy_note_opener_taken(state: &mut State) {
     }
 }
 
-/// The running turn's cascade refused a steer.
+/// The cascade held open past the last turn refused a steer.
 fn agy_held(state: &State) -> bool {
     state.agy_refused_turn == Some(state.turns_started)
 }
@@ -2973,7 +3031,25 @@ struct AgySteerJob {
     child_pid: Option<u32>,
     cached_port: Option<u16>,
     planner_config: Option<Value>,
+    /// The cascade is known to run this process's turn: no probe is asked.
+    running: bool,
     generation: u64,
+}
+
+/// The cascade runs a turn of this process: the turn showed a step, and the
+/// cascade has not been seen idle since. A steer goes straight to
+/// `SendUserCascadeMessage`, which the running cascade takes at its next
+/// step; one that went idle meanwhile refuses it for want of a planner
+/// config, and the next steer waits out the turn's close and asks for its
+/// run status.
+fn agy_known_running(state: &State) -> bool {
+    !state.open.is_empty()
+        && state.turn_user_inputs > 0
+        && state.idle_since.is_none()
+        && state
+            .session_id
+            .as_deref()
+            .is_some_and(|sid| !sid.is_empty())
 }
 
 /// Run `job` off the delivery path; its message is in flight until the steer
@@ -3036,7 +3112,8 @@ const AGY_REFUSALS: [&str; 3] = [
 ];
 
 /// One steer: ask the language server whether the cascade runs (and for its
-/// planner config when it does not), then `SendUserCascadeMessage` with
+/// planner config when it does not), unless a step of the running turn
+/// already showed it ([`agy_known_running`]), then `SendUserCascadeMessage` with
 /// `NEXT_INVOCATION`, which queues the message in the cascade's durable
 /// mailbox and answers `{}`. The answer is waited for without a timeout. A
 /// probe that fails, or a refusal, returns the message; an answer that
@@ -3056,15 +3133,27 @@ fn agy_steer_attempt(
         child_pid,
         cached_port,
         mut planner_config,
+        running: known_running,
         generation,
     } = job;
     let Some(port) = agy_port(shared, &rpc, cached_port, child_pid, generation) else {
         return agy_back_off(shared, wake, generation);
     };
-    let Ok((resolved_sid, running)) = agy_rpc_is_running(port, &rpc.csrf_token, &session_id) else {
+    // A steer for a running cascade carries no planner config: a cascade that
+    // went idle meanwhile refuses it rather than starting an invocation whose
+    // turn a late `result` would close.
+    let probed = if known_running {
+        Ok((session_id.clone(), true))
+    } else {
+        agy_rpc_is_running(port, &rpc.csrf_token, &session_id)
+    };
+    let Ok((resolved_sid, running)) = probed else {
         agy_forget_port(shared, &rpc, generation);
         return agy_back_off(shared, wake, generation);
     };
+    if running {
+        planner_config = None;
+    }
     if resolved_sid.is_empty() {
         return agy_back_off(shared, wake, generation);
     }
@@ -3076,6 +3165,11 @@ fn agy_steer_attempt(
         if resolved_sid != session_id {
             session_id = resolved_sid;
             state.session_id = Some(session_id.clone());
+        }
+        // The turn ended while it was asked: the message opens the next one
+        // on stdin, unless the mailbox holds mail it must follow.
+        if state.open.is_empty() && state.turn_user_inputs == 0 && state.agy_queued.is_empty() {
+            return AgySteered::Returned;
         }
         if running {
             state.idle_since = None;
@@ -3113,6 +3207,9 @@ fn agy_steer_attempt(
         if state.generation == generation && planner_config.is_some() {
             state.planner_config = planner_config.clone();
         }
+    }
+    if !running {
+        agy_settle(shared, wake, &rpc, generation);
     }
     {
         let mut state = lock(shared);
@@ -3189,8 +3286,10 @@ fn agy_steer_attempt(
         return AgySteered::Returned;
     }
     if let Some((held, taken)) = held {
-        state.idle_since = None;
-        state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
+        if !state.open.is_empty() {
+            state.idle_since = None;
+            state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
+        }
         state.written.push(id.clone());
         if taken {
             state.agy_taken.insert(id);
@@ -3202,8 +3301,9 @@ fn agy_steer_attempt(
     state.open.retain(|open| open != &id);
     match sent {
         // The cascade went idle after it was asked, and a new invocation
-        // needs the planner config: the next steer waits out the turn's
-        // close and sends it.
+        // needs the planner config: wait out an open turn's close, back off
+        // when the cascade still steers with no open turn, or hand back at
+        // once when the next pass opens a turn on stdin.
         Err(AgyRpcError::Refused(reason))
             if reason.contains("plan model not specified")
                 && running
@@ -3211,20 +3311,27 @@ fn agy_steer_attempt(
         {
             if !state.open.is_empty() {
                 state.idle_since = Some(Instant::now());
+                drop(state);
+                nudge_after(shared, wake, generation, AGY_TURN_CLOSE_GRACE);
+                AgySteered::Returned
+            } else if agy_steers(&state) {
+                drop(state);
+                agy_back_off(shared, wake, generation)
+            } else {
+                AgySteered::Returned
             }
-            drop(state);
-            nudge_after(shared, wake, generation, AGY_TURN_CLOSE_GRACE);
-            AgySteered::Returned
         }
-        // The cascade refused it while no turn of this process runs and its
-        // mailbox holds mail: no turn's end will reopen the way, so it is
-        // asked again after a pause.
-        Err(AgyRpcError::Refused(_)) if state.open.is_empty() && !state.agy_queued.is_empty() => {
+        // The cascade refused it while a turn of this process runs (a step
+        // under way at the boundary it reached), or while its mailbox holds
+        // mail no turn's end will take: the refusal queued nothing, so it is
+        // asked again after a pause and the running turn takes it at a later
+        // step.
+        Err(AgyRpcError::Refused(_)) if !state.open.is_empty() || !state.agy_queued.is_empty() => {
             drop(state);
             agy_back_off(shared, wake, generation)
         }
-        // The cascade refused it: the turn takes no more steers, and the
-        // message waits for its end.
+        // A cascade held open past its turn refused it, and nothing waits in
+        // its mailbox: the message opens the next turn on stdin.
         Err(AgyRpcError::Refused(_)) => {
             state.agy_refused_turn = Some(state.turns_started);
             AgySteered::Returned
@@ -3586,6 +3693,69 @@ fn agy_row_marker(line: &[u8]) -> Option<String> {
     agy_plain_id(&rest[..rest.find("\\n")?])
 }
 
+/// How much of a transcript's end is read for its last model response.
+const AGY_TRANSCRIPT_TAIL: u64 = 256 * 1024;
+
+/// The text of the last row of `transcript` when it is a `PLANNER_RESPONSE`
+/// that made no tool call and lies whole in the transcript's last
+/// [`AGY_TRANSCRIPT_TAIL`] bytes.
+fn agy_last_response(transcript: &Path) -> Option<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(transcript).ok()?;
+    let len = file.metadata().ok()?.len();
+    let from = len.saturating_sub(AGY_TRANSCRIPT_TAIL);
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut tail = Vec::new();
+    file.take(AGY_TRANSCRIPT_TAIL).read_to_end(&mut tail).ok()?;
+    let mut rows: Vec<&[u8]> = tail.split(|byte| *byte == b'\n').collect();
+    // A row still being written, and one cut by the window, are not read.
+    rows.pop();
+    if from > 0 && !rows.is_empty() {
+        rows.remove(0);
+    }
+    let row: Value = serde_json::from_slice(rows.last()?).ok()?;
+    if row.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE") {
+        return None;
+    }
+    let no_tool = row
+        .get("tool_calls")
+        .is_none_or(|calls| calls.is_null() || calls.as_array().is_some_and(Vec::is_empty));
+    no_tool
+        .then(|| {
+            row.get("content")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten()
+}
+
+/// A response that is only a stray piece of syntax, such as `}` or `"]}`:
+/// brackets, quotes and separators, and nothing a reader could take as an
+/// answer. A word, a number or `NO_REPLY` is never one.
+fn agy_stray_fragment(content: &str) -> bool {
+    let content = content.trim();
+    !content.is_empty()
+        && content.chars().all(|ch| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '{' | '}' | '[' | ']' | '(' | ')' | '"' | '\'' | '`' | ',' | ';' | ':'
+                )
+        })
+}
+
+/// The line that tells a cascade its turn closed on a stray fragment.
+fn agy_continue_line(spec: &StreamSpec, content: &str) -> Value {
+    user_line(
+        spec,
+        &format!(
+            "Your last response was only `{}`, a stray syntax fragment with no tool call, and it \
+             ended your turn early. Continue the task from where it stopped.",
+            content.trim()
+        ),
+    )
+}
+
 /// The message whose marker line opens the user input of a mailbox
 /// `CortexStep`.
 fn agy_marker_id(step: &[u8]) -> Option<String> {
@@ -3739,6 +3909,9 @@ fn watch_agy_cascade(
         else {
             continue;
         };
+        if !running {
+            agy_settle(&shared, &wake, &rpc, generation);
+        }
         let mut state = lock(&shared);
         if state.generation != generation || !state.alive || state.open.is_empty() {
             continue;
@@ -4299,7 +4472,14 @@ pub fn message_line(spec: &StreamSpec, message: &OutboundMessage) -> Value {
     // The trusted header the server wrote, then the body: one composition
     // for every harness. Carries both top-level `type`/`text` and the
     // `event`/`message` envelope that `agy --input-format stream-json` decodes.
-    let text = compose_message(&message.id, &message.context, &message.text);
+    user_line(
+        spec,
+        &compose_message(&message.id, &message.context, &message.text),
+    )
+}
+
+/// A user line carrying `text`.
+fn user_line(spec: &StreamSpec, text: &str) -> Value {
     json!({
         "type": spec.start_line,
         "event": spec.start_line,

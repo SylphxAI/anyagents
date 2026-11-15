@@ -20,7 +20,6 @@ use crate::api::{
     SendLocation, SendMedia, SendPoll, SendRequest, SendResponse,
 };
 use crate::client;
-use crate::server;
 use crate::telegram;
 
 pub struct SendOptions {
@@ -67,7 +66,7 @@ pub fn send_with_options(data: &Path, opts: SendOptions) -> Result<(), Error> {
             text: t.to_string(),
             ..Quote::default()
         });
-    if server::socket_path(data).exists() {
+    if client::sends_through_server(data) {
         let auth = client::authority(data);
         let sender = match (&opts.from, &auth) {
             (Some(f), _) => Some(f.clone()),
@@ -101,6 +100,7 @@ pub fn send_with_options(data: &Path, opts: SendOptions) -> Result<(), Error> {
             poll: opts.poll.clone(),
             checklist: opts.checklist.clone(),
             article: opts.article.clone(),
+            bot: None,
             idempotency_key: opts.source_key.clone(),
         };
         let sent = client::call::<SendResponse>(
@@ -292,7 +292,8 @@ fn send_telegram(
         Error::Message("a telegram post needs an explicit sender, an agent's own bot".into())
     })?;
     let store = open(data)?;
-    let message_id = telegram::post_text(&store, data, from, chat_id, text, reply_to, thread_id)?;
+    let message_id =
+        telegram::post_text(&store, data, from, None, chat_id, text, reply_to, thread_id)?;
     println!("{message_id}");
     Ok(())
 }

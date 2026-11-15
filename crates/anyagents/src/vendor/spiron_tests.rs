@@ -105,14 +105,46 @@ for line in sys.stdin:
         ("ANYAGENTS_SPIRON_BIN", probe.as_os_str()),
         ("ANYAGENTS_FAKE_MODE", std::ffi::OsStr::new("1")),
     ]);
-    for harness_name in [
-        "spiron",
-        "sylphx",
-        "sylphx-agent",
-        "sylphx_agent",
-        "sylphx/default",
-    ] {
-        let data = temp.path().join(harness_name.replace('/', "-"));
+    for (case, (harness_name, model, expected_model)) in [
+        (
+            "spiron",
+            "sylphx/openai/gpt-6.1-sol#high",
+            "openai/gpt-6.1-sol#high",
+        ),
+        ("sylphx", "kimi-code-plan/k3.1-pro#max", "k3.1-pro#max"),
+        ("sylphx-agent", "glm-code-plan/glm-5#high", "glm-5#high"),
+        ("sylphx_agent", "qwen-token-plan/qwen3-coder", "qwen3-coder"),
+        (
+            "sylphx/default",
+            "minimax-code-plan/MiniMax-M3",
+            "MiniMax-M3",
+        ),
+        (
+            "spiron",
+            "sylphx/kimi-code-plan/k3.1-pro#max",
+            "k3.1-pro#max",
+        ),
+        ("spiron", "sylphx/openai/model#low", "openai/model#low"),
+        (
+            "spiron",
+            "sylphx/openai/model#medium",
+            "openai/model#medium",
+        ),
+        ("spiron", "sylphx/openai/model#xhigh", "openai/model#xhigh"),
+        (
+            "spiron",
+            "openrouter/openai/model#xhigh",
+            "openrouter/openai/model#xhigh",
+        ),
+        ("spiron", " sylphx/openai/model#low ", "openai/model#low"),
+        ("spiron", "sylphx/", ""),
+        ("spiron", "kimi-code-plan/", ""),
+        ("spiron", "   ", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let data = temp.path().join(format!("case-{case}"));
         std::fs::create_dir_all(&data).unwrap();
         let store = Store::open(data.join("state.db")).unwrap();
         std::fs::create_dir_all(data.join("memory")).unwrap();
@@ -124,7 +156,7 @@ for line in sys.stdin:
         std::fs::create_dir_all(&real_work).unwrap();
         std::os::unix::fs::symlink(&real_work, &work).unwrap();
         let mut spec = NewAgent::new("protocol-probe", harness_name);
-        spec.model = Some("sylphx/openai/gpt-6.1-sol#xhigh".into());
+        spec.model = Some(model.into());
         spec.workdir = Some(work.display().to_string());
         spec.instructions = Some("preserve this identity".into());
         let agent = store.create_agent(spec).unwrap();
@@ -160,6 +192,15 @@ for line in sys.stdin:
             &["mcp".into(), "--agent".into(), agent.id.to_string()],
         )
         .unwrap();
+        let config_toml = std::fs::read_to_string(config.join("config.toml")).unwrap();
+        if expected_model.is_empty() {
+            assert!(!config_toml.contains("model ="), "{config_toml}");
+        } else {
+            assert!(
+                config_toml.contains(&format!("model = {expected_model:?}")),
+                "{config_toml}"
+            );
+        }
         let retained = [
             "sylphx-window.json",
             "sylphx-goal.json",
@@ -294,8 +335,13 @@ for line in sys.stdin:
                 .iter()
                 .map(|v| v.as_str().unwrap())
                 .collect();
+            if expected_model.is_empty() {
+                assert!(!args.contains(&"--model"));
+            } else {
+                let index = args.iter().position(|arg| *arg == "--model").unwrap();
+                assert_eq!(args[index + 1], expected_model);
+            }
             for (flag, expected) in [
-                ("--model", agent.model.clone().unwrap()),
                 ("--session", "legacy-session".into()),
                 (
                     "--mcp-config",
@@ -555,8 +601,35 @@ fn spiron_runtime_config_writes_always_approve_and_materializes_seat_auth() {
 
 #[test]
 fn spiron_supervisor_recovers_from_transient_mid_turn_server_error_via_recovery() {
-    use anyagents_supervisor::{Supervisor, SystemClock};
-    use std::sync::Arc;
+    use anyagents_supervisor::{Clock, ManualClock, Supervisor};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+
+    // Observe the installed wait, not error persistence, which precedes
+    // installation of the in-memory follow-up and its not_before deadline.
+    struct RecordingClock {
+        inner: ManualClock,
+        waits: Mutex<Vec<(i64, Option<i64>)>>,
+    }
+    impl Clock for RecordingClock {
+        fn now_ms(&self) -> i64 {
+            self.inner.now_ms()
+        }
+        fn wait(&self, deadline: Option<i64>, woken: &Arc<AtomicBool>) -> bool {
+            self.waits.lock().unwrap().push((self.now_ms(), deadline));
+            self.inner.wait(deadline, woken)
+        }
+        fn poke(&self) {
+            self.inner.poke();
+        }
+    }
+    const START: i64 = 1_700_000_000_000;
+    const ERROR: &str =
+        "Sylphx AI failure Some(\"server_error\"): The model failed to generate a response.";
+    let clock = ManualClock::new(START);
+    let recorded = Arc::new(RecordingClock {
+        inner: clock.clone(),
+        waits: Mutex::new(Vec::new()),
+    });
 
     let _lock = crate::server::tests::env_lock();
     let temp = crate::test_tempdir();
@@ -578,13 +651,13 @@ def emit(kind, req_id=None, **fields):
     print(json.dumps(payload), flush=True)
 
 emit("ready")
-for raw in sys.stdin:
+for request_num, raw in enumerate(sys.stdin, 1):
     msg = json.loads(raw)
     with (cfg / "wire.jsonl").open("a") as out:
         out.write(json.dumps({"launch": launch_num, "msg": msg}) + "\n")
     req_id = msg.get("request_id")
     emit("accepted", req_id, mode="turn")
-    if launch_num == 1:
+    if request_num == 1:
         emit(
             "result",
             req_id,
@@ -632,7 +705,7 @@ for raw in sys.stdin:
     let probe_launch = probe.clone();
     let supervisor = Supervisor::<VendorHarness>::start(
         Arc::clone(&store),
-        Arc::new(SystemClock::new()),
+        recorded.clone(),
         Arc::new(move |req| {
             anyagents_core::host_session::ensure_active(req.config_dir.parent().unwrap(), "spiron")
                 .map_err(|e| e.to_string())?;
@@ -657,28 +730,119 @@ for raw in sys.stdin:
     )
     .unwrap();
 
-    eventually(|| {
-        cfg.join("launch_count").exists()
-            && std::fs::read_to_string(cfg.join("launch_count"))
-                .unwrap_or_default()
-                .trim()
-                == "2"
-            && !store.has_open_turn(&agent.id).unwrap()
-    });
-    assert!(!cfg.join(".anyagents-last-error.json").exists());
-    let wire_lines: Vec<serde_json::Value> = std::fs::read_to_string(cfg.join("wire.jsonl"))
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(wire_lines.len(), 2);
-    assert!(
-        wire_lines[1]["msg"]["text"]
-            .as_str()
+    let read_wire = || -> Vec<serde_json::Value> {
+        std::fs::read_to_string(cfg.join("wire.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eventually(|| read_wire().len() == 1);
+        clock.set_ms(START + 1_000);
+        eventually(|| {
+            store
+                .turn_errors(&agent.id)
+                .unwrap()
+                .is_some_and(|errors| errors.last_error.as_deref() == Some(ERROR))
+        });
+        eventually(|| {
+            recorded.waits.lock().unwrap().iter().any(|(_, deadline)| {
+                deadline.is_some_and(|at| (START + 15_000..=START + 16_000).contains(&at))
+            }) || read_wire().len() > 1
+        });
+        assert_eq!(
+            read_wire().len(),
+            1,
+            "terminal failure must not trigger replay"
+        );
+        let deadline = recorded
+            .waits
+            .lock()
             .unwrap()
-            .contains("[Recovery] Your previous turn was interrupted")
-    );
-    drop(supervisor);
+            .iter()
+            .find_map(|(_, deadline)| {
+                deadline.filter(|at| (START + 15_000..=START + 16_000).contains(at))
+            })
+            .expect("the systemic follow-up must install its backoff");
+        let observed = recorded.waits.lock().unwrap().len();
+        store
+            .receive(&agent.id, Incoming::new("mail during backoff"))
+            .unwrap();
+        clock.set_ms(deadline - 1);
+        eventually(|| {
+            recorded.waits.lock().unwrap()[observed..].contains(&(deadline - 1, Some(deadline)))
+        });
+        assert_eq!(read_wire().len(), 1, "mail cannot bypass not_before");
+        assert!(store.has_open_turn(&agent.id).unwrap());
+        assert_eq!(store.agent(&agent.id).unwrap().state, "running");
+        assert_eq!(
+            std::fs::read_to_string(cfg.join("launch_count")).unwrap(),
+            "1"
+        );
+        clock.set_ms(deadline);
+        eventually(|| read_wire().len() == 3 && !store.has_open_turn(&agent.id).unwrap());
+        assert!(!cfg.join(".anyagents-last-error.json").exists());
+        let wire: Vec<serde_json::Value> = std::fs::read_to_string(cfg.join("wire.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(wire.len(), 3);
+        assert!(wire.iter().all(|line| line["launch"] == 1));
+        assert_eq!(
+            std::fs::read_to_string(cfg.join("launch_count")).unwrap(),
+            "1"
+        );
+        let original_id = &wire[0]["msg"]["request_id"];
+        assert!(original_id.is_string());
+        assert_eq!(
+            wire.iter()
+                .filter(|line| &line["msg"]["request_id"] == original_id)
+                .count(),
+            1
+        );
+        let recovery: Vec<_> = wire
+            .iter()
+            .filter(|line| {
+                line["msg"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("[Recovery] Your previous turn ended with an error")
+            })
+            .collect();
+        assert_eq!(recovery.len(), 1);
+        assert_ne!(&recovery[0]["msg"]["request_id"], original_id);
+        assert!(recovery[0]["msg"]["text"].as_str().unwrap().contains(ERROR));
+        assert!(wire.iter().any(|line| {
+            line["msg"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("mail during backoff")
+        }));
+        let ids: std::collections::HashSet<_> = wire
+            .iter()
+            .map(|line| line["msg"]["request_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "every input, including Recovery, has a distinct ID"
+        );
+    }));
+    let (done, stopped) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(supervisor);
+        let _ = done.send(());
+    });
+    let shutdown = stopped.recv_timeout(Duration::from_secs(30));
+    if let Err(error) = result {
+        if shutdown.is_err() {
+            eprintln!("supervisor shutdown timed out after test failure");
+        }
+        std::panic::resume_unwind(error);
+    }
+    assert!(shutdown.is_ok(), "supervisor shutdown timed out");
 }
 
 /// The fake Spiron of the stream harness tests, launched the way AnyAgents

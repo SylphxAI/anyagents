@@ -1,18 +1,6 @@
 //! Native backends keep scripts and user text on stdin, never in process argv.
 use super::*;
 
-pub(super) fn checked_output(out: std::process::Output, backend: &str) -> Result<Vec<u8>, String> {
-    if out.status.success() {
-        Ok(out.stdout)
-    } else {
-        // Native scripts may contain secret text; do not echo script diagnostics.
-        Err(format!(
-            "{backend} failed (exit {}); check screen recording/accessibility permissions and backend availability",
-            out.status
-        ))
-    }
-}
-
 async fn script(platform: DesktopPlatform, req: &Value) -> Result<Value, String> {
     let (program, args, source) = script_command(platform, req)?;
     // Permission prompts (notably macOS TCC) can wait forever on headless hosts.

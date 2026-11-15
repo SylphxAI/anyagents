@@ -113,12 +113,10 @@ fn canonical_history_latency() {
             ));
             let id = format!("bench-{}-{n}", a.name);
             tx.execute("INSERT INTO messages(id,agent_id,seq,sender,body,received_at_ms) VALUES(?1,?2,?3,'agent:synthetic',?4,?3)",rusqlite::params![id,a.id.as_str(),n+1,body]).unwrap();
-            // Deliberately reproduce pre-upgrade derived prefixes. Authoritative
-            // mailbox bodies are complete; only production backfill repairs FTS.
-            tx.execute("INSERT INTO rag_chunks(chunk_id,agent_id,agent_name,direction,sender,destination,timestamp_ms,content_hash,text,kind,tool_name,seq,text_format) VALUES(?1,?2,?3,'in','agent:synthetic',?3,?4,?1,?5,'message','',?4,1)",rusqlite::params![id,a.id.as_str(),a.name,n+1,&body[..2400]]).unwrap();
+            // Written behind the store's back: the first search projects
+            // these rows into the search index.
         }
     }
-    tx.execute("INSERT INTO rag_chunks_fts(chunk_id,agent_name,sender,destination,kind,tool_name,text,search_tokens) SELECT chunk_id,agent_name,sender,destination,kind,tool_name,text,text FROM rag_chunks",[]).unwrap();
     tx.commit().unwrap();
     let corpus_sha = anyagents_core::learned_memory::sha256(manifest.join("\n").as_bytes());
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -183,22 +181,6 @@ fn canonical_history_latency() {
         );
         measurements.push(serde_json::json!({"phase":phase,"query":format!("benchneedle{n:04}"),"wall_ms":wall_ms,"user_ms":after.0-before.0,"system_ms":after.1-before.1,"peak_rss_kib":after.2,"result_count":result.0.turns.len(),"response_bytes":encoded.len()}));
     }
-    let hidden_old: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM rag_chunks WHERE agent_id=?1 AND text_format=1",
-            [hidden.id.as_str()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(hidden_old, 32, "unrelated owner's body not upgraded");
-    let visible_old: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM rag_chunks WHERE agent_id<>?1 AND text_format=1",
-            [hidden.id.as_str()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(visible_old, 0);
     let mut warm: Vec<f64> = measurements
         .iter()
         .filter(|m| m["phase"] == "steady")
@@ -217,12 +199,12 @@ fn canonical_history_latency() {
         serde_json::json!({
             "source_sha":source,"corpus_sha256":corpus_sha,"corpus":"synthetic-v1:3owners/96mailbox/384native/3memory;parent+child visible,peer hidden",
             "mailbox_bytes":mailbox_bytes,"native_bytes":native_bytes,"memory_bytes":memory_bytes,
-            "cold_definition":"first canonical call: pre-upgrade mailbox prefixes and absent host index; OS page cache uncontrolled",
+            "cold_definition":"first canonical call: unprojected mailbox rows and absent host index; OS page cache uncontrolled",
             "warm_definition":"20 canonical calls on unchanged corpus with 20 distinct query strings, persisted index; no result cache",
-            "entrypoint":"conversation_route including ACL, host refresh, IMMEDIATE mailbox backfill, retrieval and JSON encoding; no HTTP/socket overhead",
+            "entrypoint":"conversation_route including ACL, host refresh, mailbox index sync, retrieval and JSON encoding; no HTTP/socket overhead",
             "profile":if cfg!(debug_assertions) {"debug"} else {"release"},"os":std::env::consts::OS,"arch":std::env::consts::ARCH,
             "cpu_affinity":cpu,"cpu_max":std::fs::read_to_string("/sys/fs/cgroup/cpu.max").unwrap_or_default().trim(),
-            "state_db_bytes":sizes(&db),"host_index_bytes":sizes(&dir.path().join("host-history-index-v1.db")),
+            "state_db_bytes":sizes(&db),"memory_index_bytes":sizes(&dir.path().join("memory-index.db")),"host_index_bytes":sizes(&dir.path().join("host-history-index-v1.db")),
             "steady_p50_ms":warm[9],"steady_p95_ms":warm[18],"steady_max_ms":warm[19],"measurements":measurements,
             "relevance_claim":"none; finite synthetic result/ACL/tail assertions only"
         })

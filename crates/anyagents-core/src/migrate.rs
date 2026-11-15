@@ -63,7 +63,24 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (31, include_str!("../migrations/032_operator_inbox.sql")),
     (32, include_str!("../migrations/033_turn_errors.sql")),
+    (
+        33,
+        include_str!("../migrations/034_message_alias_indexes.sql"),
+    ),
+    (
+        MEMORY_INDEX_SPLIT,
+        include_str!("../migrations/035_memory_index_split.sql"),
+    ),
+    (
+        35,
+        include_str!("../migrations/036_normalize_agent_roles.sql"),
+    ),
 ];
+
+/// The version that moves the mailbox search index out of the state
+/// database. Opening an older database first copies what only its search
+/// tables hold into the index (`store/memory_index.rs`).
+pub const MEMORY_INDEX_SPLIT: i64 = 34;
 
 /// Apply pending migrations. Each migration commits on its own, in order.
 pub fn migrate(conn: &mut Connection) -> Result<(), Error> {
@@ -141,7 +158,9 @@ mod tests {
             conn.prepare("SELECT before_scope, after_scope, source FROM admin_audit")
                 .unwrap();
             conn.prepare("SELECT owner_agent_id FROM groups").unwrap();
-            conn.prepare("SELECT text_format FROM rag_chunks").unwrap();
+            conn.prepare("SELECT seq FROM outbound_messages").unwrap();
+            assert!(conn.prepare("SELECT 1 FROM rag_chunks").is_err());
+            assert!(conn.prepare("SELECT 1 FROM rag_chunks_fts").is_err());
             conn.prepare("SELECT id, target_id, receipt FROM conversation_redactions")
                 .unwrap();
             conn.prepare(
@@ -155,5 +174,67 @@ mod tests {
             migrate(&mut conn).unwrap();
             assert_eq!(current_version(&conn).unwrap(), latest);
         }
+    }
+
+    #[test]
+    fn normalize_agent_roles_migration_backfills_null_and_blank_without_data_loss() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);",
+        )
+        .unwrap();
+        for (version, sql) in MIGRATIONS
+            .iter()
+            .filter(|(version, _)| *version <= MEMORY_INDEX_SPLIT)
+        {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_migrations VALUES (?1, 0)", [version])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO agents (id, name, role, harness, workdir, instructions, state, created_at_ms)
+             VALUES (?1, ?2, ?3, 'claude-code', '/tmp/w', ?4, 'stopped', 100)",
+            rusqlite::params!["agt_null", "null-role", Option::<String>::None, "Keep custom prompt"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, name, role, harness, workdir, instructions, state, created_at_ms)
+             VALUES (?1, ?2, ?3, 'claude-code', '/tmp/w', ?4, 'stopped', 100)",
+            rusqlite::params!["agt_blank", "blank-role", "   ", "Keep blank-role prompt"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, name, role, harness, workdir, instructions, state, created_at_ms)
+             VALUES (?1, ?2, ?3, 'claude-code', '/tmp/w', ?4, 'stopped', 100)",
+            rusqlite::params!["agt_keep", "named-role", "engineer", "Keep engineer prompt"],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 35);
+
+        let fetch = |id: &str| -> (Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT role, instructions FROM agents WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            fetch("agt_null"),
+            (Some("general".into()), Some("Keep custom prompt".into()))
+        );
+        assert_eq!(
+            fetch("agt_blank"),
+            (
+                Some("general".into()),
+                Some("Keep blank-role prompt".into())
+            )
+        );
+        assert_eq!(
+            fetch("agt_keep"),
+            (Some("engineer".into()), Some("Keep engineer prompt".into()))
+        );
     }
 }

@@ -54,7 +54,9 @@ pub const DELIVERY: Delivery = Delivery {
 };
 
 /// `anyagents cloud-harness`, which speaks this protocol for a cloud agent:
-/// it runs one turn per line and echoes a line when its turn starts.
+/// it runs one turn per line and echoes a line when its turn starts. A
+/// cloud harness whose peer offers more says so in its `system` `init` line
+/// (`delivery`), and that is what the running process reports.
 pub const CLOUD_DELIVERY: Delivery = Delivery {
     level: DeliveryLevel::TurnEnd,
     idempotent: false,
@@ -155,6 +157,16 @@ struct State {
     commit_on_take: bool,
     /// What the child's `system` `init` named: version and capabilities.
     peer: Option<String>,
+    /// The child is not Claude Code but a peer that speaks its protocol
+    /// (`with_delivery`): its `init` may declare the delivery it offers.
+    peer_declares: bool,
+    /// The peer name and delivery the running child's `init` carried, exposed
+    /// only when `peer_declares` is set (recorded on `init` so an `init` that
+    /// precedes `with_delivery` is kept).
+    declared_peer: Option<String>,
+    declared: Option<Delivery>,
+    /// Ids a declaring peer proved an earlier process already consumed.
+    duplicates: HashSet<String>,
     /// For each written id, whether no turn was open when it was written.
     phases: std::collections::HashMap<String, &'static str>,
 }
@@ -168,15 +180,28 @@ struct Observed {
     seen: usize,
     in_flight: usize,
     consumed: usize,
+    duplicates: usize,
     finished: usize,
     failures: usize,
     usages: usize,
+    declared: Option<Delivery>,
     quota_reset_at_ms: Option<i64>,
     sign_in_fault: Option<String>,
     session_id: Option<String>,
 }
 
 impl State {
+    fn effective_delivery(&self, fallback: &Delivery) -> Delivery {
+        if self.peer_declares {
+            self.declared
+                .clone()
+                .unwrap_or_else(|| fallback.clone())
+                .with_peer(self.declared_peer.clone().or_else(|| self.peer.clone()))
+        } else {
+            fallback.clone().with_peer(self.peer.clone())
+        }
+    }
+
     fn observed(&self) -> Observed {
         Observed {
             alive: self.alive,
@@ -185,9 +210,11 @@ impl State {
             seen: self.seen.len(),
             in_flight: self.in_flight.len(),
             consumed: self.consumed.len(),
+            duplicates: self.duplicates.len(),
             finished: self.finished.len(),
             failures: self.failures.len(),
             usages: self.usages.len(),
+            declared: self.peer_declares.then(|| self.declared.clone()).flatten(),
             quota_reset_at_ms: self.quota_reset_at_ms,
             sign_in_fault: self.sign_in_fault.clone(),
             session_id: self.session_id.clone(),
@@ -251,9 +278,12 @@ impl ClaudeHarness {
     pub fn with_delivery(mut self, delivery: Delivery) -> Self {
         // A turn-end harness starts a turn with the line it echoes, and keeps
         // no transcript to read: the take is the proof.
+        let mut state = lock(&self.shared);
         if delivery.level == DeliveryLevel::TurnEnd {
-            lock(&self.shared).commit_on_take = true;
+            state.commit_on_take = true;
         }
+        state.peer_declares = true;
+        drop(state);
         self.delivery = delivery;
         self
     }
@@ -476,6 +506,8 @@ impl ClaudeHarness {
             state.config_dir = config_dir;
             state.tail = scan.tail;
             state.peer = None;
+            state.declared_peer = None;
+            state.declared = None;
             if initial_quota.is_some() {
                 state.quota_reset_at_ms = initial_quota;
             }
@@ -561,6 +593,9 @@ impl Harness for ClaudeHarness {
             let mut state = lock(&self.shared);
             // A proof the reader committed after `proven` answered: the line
             // is in, and is never written again.
+            if state.duplicates.contains(id) {
+                return Ok(DeliverOutcome::Duplicate);
+            }
             if state.consumed.contains(id) {
                 return Ok(DeliverOutcome::Accepted {
                     turn_finished: state.finished.contains(id),
@@ -607,7 +642,9 @@ impl Harness for ClaudeHarness {
             return Ok(DeliverOutcome::Deferred);
         }
         // A proof can beat this lock.
-        Ok(if state.consumed.contains(id) {
+        Ok(if state.duplicates.contains(id) {
+            DeliverOutcome::Duplicate
+        } else if state.consumed.contains(id) {
             DeliverOutcome::Accepted {
                 turn_finished: state.finished.contains(id),
             }
@@ -621,6 +658,9 @@ impl Harness for ClaudeHarness {
             refresh_transcript(&self.shared);
         }
         let state = lock(&self.shared);
+        if state.duplicates.contains(message_id) {
+            return Some(Proof::Duplicate);
+        }
         if state.consumed.contains(message_id) {
             return Some(Proof::Taken {
                 turn_finished: state.finished.contains(message_id),
@@ -706,7 +746,7 @@ impl Harness for ClaudeHarness {
             } else {
                 TurnState::InTurn
             },
-            delivery: self.delivery.clone().with_peer(state.peer.clone()),
+            delivery: state.effective_delivery(&self.delivery),
             quota_reset_at_ms: state.quota_reset_at_ms,
             sign_in_fault: state.sign_in_fault.clone(),
         }
@@ -824,10 +864,16 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
 }
 
 /// Messages written while a turn was open start the next turn when it ends.
+/// Claude Code merges every queued followup into one prompt; a cloud peer
+/// opens the next turn with the first and folds or queues the rest in turn.
 fn promote_followups(state: &mut State) {
     if !state.followups.is_empty() {
         state.turns_started += 1;
-        state.open.append(&mut state.followups);
+        if state.peer_declares {
+            state.open.push(state.followups.remove(0));
+        } else {
+            state.open.append(&mut state.followups);
+        }
     }
 }
 
@@ -1142,6 +1188,15 @@ fn note_proof(state: &mut State, value: &Value) {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown version");
             state.peer = Some(format!("claude-code {version}"));
+            // Recorded unconditionally so an `init` read before `with_delivery`
+            // is kept; `effective_delivery` exposes them only for a declaring peer.
+            state.declared_peer = value
+                .get("peer")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            state.declared = value
+                .get("delivery")
+                .and_then(|delivery| serde_json::from_value(delivery.clone()).ok());
             if let Some(session) = value
                 .get("session_id")
                 .and_then(Value::as_str)
@@ -1162,18 +1217,28 @@ fn note_proof(state: &mut State, value: &Value) {
                 // worker): neither entered the conversation, so it goes back.
                 // The transcript was read first: a stored line stays taken.
                 Some("cancelled" | "discarded") if !state.consumed.contains(&id) => {
+                    let opened = state.open.iter().any(|item| item == &id);
                     state.open.retain(|item| item != &id);
                     state.followups.retain(|item| item != &id);
                     state.in_flight.remove(&id);
                     state.taken.remove(&id);
                     state.seen.remove(&id);
+                    if opened && state.open.is_empty() {
+                        state.turns_started = state.turns_started.saturating_sub(1);
+                        promote_followups(state);
+                    }
                 }
                 // Claude Code's own verdict: it will never take this line.
                 Some(verdict @ "refused") if !state.consumed.contains(&id) => {
+                    let opened = state.open.iter().any(|item| item == &id);
                     state.open.retain(|item| item != &id);
                     state.followups.retain(|item| item != &id);
                     state.in_flight.remove(&id);
                     state.taken.remove(&id);
+                    if opened && state.open.is_empty() {
+                        state.turns_started = state.turns_started.saturating_sub(1);
+                        promote_followups(state);
+                    }
                     state
                         .rejected
                         .insert(id, format!("claude code {verdict} the input"));
@@ -1188,7 +1253,13 @@ fn note_proof(state: &mut State, value: &Value) {
                 ids.into_iter().find(|id| state.in_flight.contains(id))
             });
             if let Some(id) = id {
-                take(state, &id);
+                if state.peer_declares
+                    && value.get("duplicate").and_then(Value::as_bool) == Some(true)
+                {
+                    note_duplicate(state, &id);
+                } else {
+                    take(state, &id);
+                }
             }
         }
         // With the eager flush, a result follows the appends of every row
@@ -1229,6 +1300,21 @@ fn take(state: &mut State, id: &str) {
     if state.commit_on_take {
         persist(state, id);
     }
+}
+
+/// A declaring peer proved an earlier process already consumed `id`.
+fn note_duplicate(state: &mut State, id: &str) {
+    state.in_flight.remove(id);
+    state.taken.remove(id);
+    state.failures.retain(|(item, _)| item != id);
+    state.followups.retain(|item| item != id);
+    let opened = state.open.iter().any(|item| item == id);
+    state.open.retain(|item| item != id);
+    if opened && state.open.is_empty() {
+        state.turns_started = state.turns_started.saturating_sub(1);
+        promote_followups(state);
+    }
+    state.duplicates.insert(id.to_string());
 }
 
 /// `id` is in the session as Claude Code stores it: committed.
@@ -1770,6 +1856,38 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    /// A peer behind the Claude adapter (the cloud harness) declares the
+    /// delivery it offers in its `init`; Claude Code's own `init` cannot
+    /// change what the adapter reports.
+    #[test]
+    fn only_a_declaring_peer_sets_the_delivery_from_its_init() {
+        let init = json!({
+            "type": "system", "subtype": "init", "session_id": "s",
+            "peer": "acp/v1 runner 1.0",
+            "delivery": {"level": "next-step", "idempotent": true, "proof": "p", "peer": null},
+        });
+        let mut claude = State::default();
+        note_proof(&mut claude, &init);
+        let plain = claude.effective_delivery(&DELIVERY);
+        assert_eq!(plain.level, DELIVERY.level);
+        assert_eq!(plain.peer.as_deref(), Some("claude-code unknown version"));
+
+        // Even when `init` arrived before `with_delivery` set `peer_declares`,
+        // flipping `peer_declares` exposes the peer's declaration at once.
+        claude.peer_declares = true;
+        let declared = claude.effective_delivery(&CLOUD_DELIVERY);
+        assert_eq!(declared.level, DeliveryLevel::NextStep);
+        assert!(declared.idempotent);
+        assert_eq!(declared.peer.as_deref(), Some("acp/v1 runner 1.0"));
+
+        // An init that declares nothing leaves the adapter's own constant.
+        note_proof(&mut claude, &json!({"type": "system", "subtype": "init"}));
+        assert_eq!(
+            claude.effective_delivery(&CLOUD_DELIVERY).level,
+            CLOUD_DELIVERY.level
+        );
+    }
+
     /// `total_cost_usd` is the session's running total: each turn is
     /// charged what it added, so the served total is the last running total,
     /// never the sum of every running total seen.
@@ -1931,5 +2049,39 @@ mod tests {
             &serde_json::json!({"type": "command_lifecycle", "command_uuid": uuid_for("m1"), "state": "refused"}),
         );
         assert!(state.rejected.contains_key("m1"));
+    }
+
+    #[test]
+    fn cancelling_an_opening_line_resets_turns_started_and_promotes_followups() {
+        let mut state = State {
+            peer_declares: true,
+            ..State::default()
+        };
+        for id in ["m1", "m2", "m3"] {
+            state.uuid_ids.insert(uuid_for(id), id.into());
+            state.in_flight.insert(id.into());
+            accept_message(&mut state, id);
+        }
+        assert_eq!(state.turns_started, 1);
+        assert_eq!(state.open, ["m1"]);
+        assert_eq!(state.followups, ["m2", "m3"]);
+
+        note_proof(
+            &mut state,
+            &serde_json::json!({"type": "command_lifecycle", "command_uuid": uuid_for("m1"), "state": "cancelled"}),
+        );
+        assert_eq!(state.turns_started, 1, "followup m2 took over the turn");
+        assert_eq!(state.open, ["m2"]);
+        assert_eq!(state.followups, ["m3"]);
+
+        for id in ["m2", "m3"] {
+            note_proof(
+                &mut state,
+                &serde_json::json!({"type": "command_lifecycle", "command_uuid": uuid_for(id), "state": "cancelled"}),
+            );
+        }
+        assert_eq!(state.turns_started, 0, "all cancelled leaves no ghost turn");
+        assert!(state.open.is_empty());
+        assert!(state.followups.is_empty());
     }
 }

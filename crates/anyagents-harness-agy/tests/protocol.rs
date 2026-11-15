@@ -153,5 +153,8 @@ fn with_the_language_server_mail_reaches_the_running_turn() {
         Some(dir.path()),
     )
     .expect("start");
-    assert_eq!(harness.health().delivery, anyagents_harness_agy::DELIVERY);
+    let delivery = harness.health().delivery;
+    assert_eq!(delivery, anyagents_harness_agy::DELIVERY);
+    assert_eq!(delivery.level, DeliveryLevel::NextStep);
+    assert!(delivery.idempotent);
 }

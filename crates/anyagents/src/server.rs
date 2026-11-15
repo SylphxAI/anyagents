@@ -20,7 +20,7 @@ use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use serde::Deserialize;
@@ -38,6 +38,7 @@ use crate::vendor::{self, HarnessHost, VendorHarness};
 
 mod file_cache;
 mod hybrid;
+mod in_flight;
 #[cfg(test)]
 mod latency_tests;
 mod memory_backlog;
@@ -99,13 +100,21 @@ fn run_with_identity(
     host: HarnessHost,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         tokio::select! {
             result = serve(data, runner, identity, host) => result,
             _ = &mut stop => Ok(()),
         }
-    })
+    });
+    // Dropping a runtime waits for every blocking task without end: a call
+    // dropped at the end of the drain may still be in one (a store write
+    // waiting for the writer). Those are abandoned with the process.
+    runtime.shutdown_timeout(RUNTIME_STOP_WITHIN);
+    result
 }
+
+/// What a stopped server's runtime waits for its blocking tasks.
+const RUNTIME_STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The supervisor of a serving kernel. However the kernel stops (a signal, an
 /// error, a test dropping it), its harness processes are left to the next
@@ -350,6 +359,10 @@ async fn serve(
     let listener = api_listener;
     let poller = crate::telegram::Poller::start(Arc::clone(&store), data.to_path_buf())
         .map_err(Error::Message)?;
+    // Set once a stop is requested: every listener (the socket and both TCP
+    // listeners) stops taking connections at once, calls running on any of
+    // them drain together, and every background loop ends at once.
+    let (stopping, _) = tokio::sync::watch::channel(false);
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
         quota_rotation::start(Arc::clone(&store));
@@ -358,11 +371,16 @@ async fn serve(
         let reaper_root = data.to_path_buf();
         let reaper_store = Arc::clone(&store);
         let reaper_health = state.health.clone();
+        let mut reaper_stop = stopping.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             let mut tick_count = 0u64;
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    biased;
+                    _ = reaper_stop.wait_for(|stop| *stop) => break,
+                    _ = interval.tick() => {}
+                }
                 tick_count = tick_count.wrapping_add(1);
                 let run_verify = tick_count.is_multiple_of(15);
                 let first_pass = tick_count == 1;
@@ -398,7 +416,8 @@ async fn serve(
                     {
                         eprintln!("anyagents-host-history: deferred full verification: {error}");
                     }
-                    crate::browser::reap_idle_browsers(&root);
+                    #[cfg(target_os = "linux")]
+                    crate::workstation::session::reap_idle(&root);
                     if let Err(error) = crate::remote::rotate_due(&store) {
                         eprintln!("anyagents-remote: session rotation deferred: {error}");
                     }
@@ -412,11 +431,18 @@ async fn serve(
         });
         let updater_root = data.to_path_buf();
         let updater_store = Arc::clone(&store);
+        let mut updater_stop = stopping.subscribe();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(6 * 3600),
+            );
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    biased;
+                    _ = updater_stop.wait_for(|stop| *stop) => break,
+                    _ = interval.tick() => {}
+                }
                 let root = updater_root.clone();
                 let store_for_update = Arc::clone(&updater_store);
                 let _ = tokio::task::spawn_blocking(move || {
@@ -461,7 +487,11 @@ async fn serve(
                 .await;
             }
         });
-        start_schedule_loops(Arc::clone(&store), state.health.clone());
+        crate::schedule::start_loops(
+            Arc::clone(&store),
+            state.health.clone(),
+            stopping.subscribe(),
+        );
     }
     // `public_listen` decides whether the local TCP listener is also the
     // public one. A configuration file that cannot be read fails closed: no
@@ -478,6 +508,7 @@ async fn serve(
     if public_listen.is_none() {
         let _ = std::fs::remove_file(data.join("public.addr"));
     }
+    let mut public_listener = None;
     if let Some(addr) = public_listen {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(tcp_listener) => {
@@ -491,16 +522,14 @@ async fn serve(
                         eprintln!("cannot persist {}: {err}", addr_path.display());
                     }
                 }
-                let public_app = build_public_router(state.clone());
-                tokio::spawn(async move {
-                    let _ = axum::serve(tcp_listener, public_app).await;
-                });
+                public_listener = Some(tcp_listener);
             }
             Err(err) => {
                 eprintln!("warning: public TCP listener ({addr}) did not bind: {err}");
             }
         }
     }
+    let mut webhook_listener = None;
     if let Some(addr) = webhook_listen_addr(public_configured) {
         if public_configured && !binds_loopback(&addr) {
             eprintln!(
@@ -520,41 +549,239 @@ async fn serve(
                         eprintln!("cannot persist {}: {err}", addr_path.display());
                     }
                 }
-                let webhook_app = build_webhook_router(state.clone());
-                tokio::spawn(async move {
-                    let _ = axum::serve(tcp_listener, webhook_app).await;
-                });
+                webhook_listener = Some(tcp_listener);
             }
             Err(err) => {
                 eprintln!("warning: webhook TCP listener ({addr}) did not bind: {err}");
             }
         }
     }
-    let app = build_router(state);
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = terminate.recv() => {}
+    {
+        // A spawn the last server stopped part way gets the rest of it (most
+        // often its prompt) before any call is answered on any listener: a call
+        // to list, inspect or delete that agent then sees it whole. Every
+        // listener is already bound, so a client connecting meanwhile waits in
+        // the kernel listen backlog rather than finding no server.
+        let store = Arc::clone(&store);
+        let data = data.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(err) = create::backfill_historical_agent_roles(&store, &data) {
+                eprintln!("anyagents: historical role backfill warning: {err}");
             }
+            finish_interrupted_spawns(&store, &data);
         })
         .await;
-    // A long poll ends at Telegram, not here: signal the poller to stop first
-    // so released long polls exit instead of re-entering a 30s wait, then
-    // release every bot so each bot's last offset is written before shutdown.
-    poller.signal_stop();
-    if let Err(reason) = crate::telegram::poller::release_every_bot(
-        &store,
-        store.data_dir(),
-        std::time::Duration::from_secs(30),
-    ) {
+    }
+    let public_task = public_listener.map(|tcp_listener| {
+        let public_app = build_public_router(state.clone());
+        let stop = stopped(&stopping);
+        tokio::spawn(async move {
+            let _ = axum::serve(tcp_listener, public_app)
+                .with_graceful_shutdown(stop)
+                .await;
+        })
+    });
+    let webhook_task = webhook_listener.map(|tcp_listener| {
+        let webhook_app = build_webhook_router(state.clone());
+        let stop = stopped(&stopping);
+        tokio::spawn(async move {
+            let _ = axum::serve(tcp_listener, webhook_app)
+                .with_graceful_shutdown(stop)
+                .await;
+        })
+    });
+    let app = build_router(state);
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let serving = axum::serve(listener, app)
+        .with_graceful_shutdown(stopped(&stopping))
+        .into_future();
+    tokio::pin!(serving);
+    let mut releasing = None;
+    let result = tokio::select! {
+        result = &mut serving => result,
+        () = stop_requested(&mut terminate) => {
+            // From here no new connection is taken: a call made now waits on
+            // the agent's side for the next server (`mcp::RESTART_WAIT`).
+            // Calls already running finish first: dropping a call's future
+            // does not stop its blocking work, and what does stop it is the
+            // process exiting, which can cut a mutation between its steps.
+            eprintln!(
+                "anyagents: stopping; no new calls are taken; waiting up to {}s for {} mutating \
+                 call(s) still running to finish (reads end with the process){}",
+                MUTATION_DRAIN_WITHIN.as_secs(),
+                in_flight::MUTATIONS.running(),
+                if kept {
+                    format!("; this process exits within {}s", STOP_WITHIN.as_secs())
+                } else {
+                    String::new()
+                }
+            );
+            if kept {
+                // A keeper still starting is the next server's to take over:
+                // a call waiting for its `ready` (up to three minutes) returns
+                // now instead of holding the stop.
+                anyagents_keeper::abandon_starts();
+                exit_after(STOP_WITHIN);
+            }
+
+            // A long poll ends at Telegram, not here: signal the poller to
+            // stop so released long polls exit instead of re-entering a 30s
+            // wait, and release every bot while the calls drain, so each
+            // bot's last offset is written before shutdown.
+            poller.signal_stop();
+            let release_store = Arc::clone(&store);
+            releasing = Some(tokio::task::spawn_blocking(move || {
+                crate::telegram::poller::release_every_bot(
+                    &release_store,
+                    release_store.data_dir(),
+                    TELEGRAM_RELEASE_WITHIN,
+                )
+            }));
+            let _ = stopping.send(true);
+            // `serving` is polled first so the Unix listener closes at once,
+            // while `settling` keeps waiting even after `serving` has no open
+            // socket connections (for TCP mutations and detached blocking work).
+            let settling = in_flight::MUTATIONS.settle(MUTATION_DRAIN_WITHIN);
+            tokio::pin!(settling);
+            let mut serving_done = false;
+            let mut serve_result = Ok(());
+            let left = loop {
+                tokio::select! {
+                    biased;
+                    result = &mut serving, if !serving_done => {
+                        serving_done = true;
+                        serve_result = result;
+                    }
+                    left = &mut settling => break left,
+                }
+            };
+            if kept {
+                // Nothing left to wait for once the mutations are done: the
+                // answers, the Telegram release and the joins after it get a
+                // few seconds, then the process exits whatever still runs.
+                exit_after(STOP_AFTER_DRAIN_WITHIN);
+            }
+            if left > 0 {
+                eprintln!(
+                    "anyagents: {left} mutating call(s) still running after {}s end with \
+                     the process; each caller is told its call may or may not have \
+                     applied",
+                    MUTATION_DRAIN_WITHIN.as_secs()
+                );
+            }
+            // Answers of calls that just finished are written out across every
+            // listener; reads still running end with the process.
+            let flush = async {
+                if !serving_done {
+                    serve_result = (&mut serving).await;
+                }
+                if let Some(task) = public_task {
+                    let _ = task.await;
+                }
+                if let Some(task) = webhook_task {
+                    let _ = task.await;
+                }
+            };
+            let _ = tokio::time::timeout(RESPONSE_FLUSH_WITHIN, flush).await;
+            serve_result
+        }
+    };
+    #[cfg(target_os = "linux")]
+    crate::workstation::session::stop_all().await;
+    let released = match releasing {
+        Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
+        None => {
+            poller.signal_stop();
+            crate::telegram::poller::release_every_bot(
+                &store,
+                store.data_dir(),
+                TELEGRAM_RELEASE_WITHIN,
+            )
+        }
+    };
+    if let Err(reason) = released {
         eprintln!("anyagents-telegram: shutdown did not release every bot: {reason}");
     }
     poller.stop();
     drop(supervisor);
     let _ = std::fs::remove_file(&path);
     result.map_err(Error::from)
+}
+
+/// How long a stopping server waits for the mutating calls it is running
+/// (spawn, delete, send, schedules, any call but a read) to finish before it
+/// exits. No connection is taken meanwhile; the agents' tool servers wait for
+/// the next server (`mcp::RESTART_WAIT`). A mutation still running after it
+/// ends with the process, and its caller is told the call may or may not have
+/// applied.
+///
+/// A spawn, the longest common mutation, typically takes a few seconds; a
+/// minute covers one that provisions a large checkout, and keeps a restart
+/// well inside the shortest long tool deadline a harness sets (three minutes).
+const MUTATION_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Once the mutations are done, how long their answers get to be written out
+/// before the server stops serving; reads still running end with the process.
+const RESPONSE_FLUSH_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The longest a server whose harnesses live in keepers takes to exit once
+/// told to stop. Past it the process exits at once: its harnesses stay with
+/// their keepers for the next server, exactly as after a crash, and its store
+/// writes are transactions, so a write cut short is not half made.
+pub(crate) const STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(
+    MUTATION_DRAIN_WITHIN.as_secs() + STOP_AFTER_DRAIN_WITHIN.as_secs(),
+);
+
+/// Once the mutations are done (or their wait is over), the longest a server
+/// whose harnesses live in keepers takes to exit: the answers are written out
+/// ([`RESPONSE_FLUSH_WITHIN`]), the Telegram release and the joins after it
+/// finish, and the runtime abandons its blocking work. Background loops (the
+/// schedule timers and their external probes among them) already ended at the
+/// stop. The budget includes response flushing, nine-second desktop session
+/// shutdown, and final cleanup.
+const STOP_AFTER_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The wait for Telegram to hand back every bot's long poll at shutdown. It
+/// runs beside the drain. A bot not released in time is polled again by the
+/// next server from its last written offset; the store deduplicates updates
+/// by their source key.
+const TELEGRAM_RELEASE_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolves once the server is told to stop (`stopping` set), or when the
+/// server is gone: every listener stops taking connections then.
+fn stopped(
+    stopping: &tokio::sync::watch::Sender<bool>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let mut told = stopping.subscribe();
+    async move {
+        let _ = told.wait_for(|stop| *stop).await;
+    }
+}
+
+/// SIGINT or SIGTERM.
+async fn stop_requested(terminate: &mut tokio::signal::unix::Signal) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+/// End the process after `within`, however its stop is going: a worker in a
+/// call to a keeper that does not answer, a store write waiting for the
+/// writer, or a poller join cannot keep it alive. Only for a server whose
+/// harnesses live in keepers, which outlive it by design.
+fn exit_after(within: std::time::Duration) {
+    let _ = std::thread::Builder::new()
+        .name("anyagents-stop-deadline".into())
+        .spawn(move || {
+            std::thread::sleep(within);
+            eprintln!(
+                "anyagents: stop still running after {}s; exiting now (harnesses stay with \
+                 their keepers for the next server)",
+                within.as_secs()
+            );
+            std::process::exit(0);
+        });
 }
 
 pub(crate) fn has_explicit_archive_marker(
@@ -768,16 +995,6 @@ pub(crate) fn clear_explicitly_archived(data_dir: &Path, agent_id: &anyagents_co
     reap_queue::dequeue(data_dir, agent_id);
 }
 
-/// Local timers and network watches run on separate timers, so an in-flight
-/// external request cannot hold a local tick. Each sleeps until its next due
-/// time or a schedule change.
-fn start_schedule_loops(
-    store: Arc<Store>,
-    health: HealthBoard,
-) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
-    crate::schedule::start_loops(store, health)
-}
-
 /// How this server authenticates. A machine started without an operator token
 /// serves the agents on its own machine, and names them by the route it serves:
 /// its data directory, as a start script exports it to every harness. With an
@@ -957,6 +1174,15 @@ async fn telegram_webhook(
 /// and MCP for every credential kind. Until a deployment configures
 /// `public_listen` it is also the public one and keeps the `0.0.0.0:8788`
 /// default; once the public listener exists it defaults to loopback.
+#[cfg(target_os = "linux")]
+pub(crate) fn public_entry_listening(data: &Path) -> bool {
+    match crate::remote::Settings::load(data) {
+        Ok(settings) if settings.public_listen.is_some() => true,
+        Ok(_) => webhook_listen_addr(false).is_some(),
+        Err(_) => false,
+    }
+}
+
 fn webhook_listen_addr(public_configured: bool) -> Option<String> {
     local_listen_addr(
         std::env::var("ANYAGENTS_WEBHOOK_LISTEN").ok().as_deref(),
@@ -1003,6 +1229,12 @@ fn binds_loopback(addr: &str) -> bool {
 /// or a forwarding header.
 pub(crate) fn build_public_router(state: AppState) -> Router {
     Router::new()
+        .route("/v1/webhooks/takeover/{key}", any(takeover_page_route))
+        .route("/v1/webhooks/takeover/{key}/", any(takeover_page_route))
+        .route(
+            "/v1/webhooks/takeover/{key}/{*rest}",
+            any(takeover_page_route),
+        )
         .route("/", get(public_healthz))
         .route("/healthz", get(public_healthz))
         .route("/v1/webhooks/healthz", get(public_healthz))
@@ -1013,6 +1245,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
         )
         .fallback(public_not_found)
         .with_state(state)
+        .layer(axum::middleware::from_fn(in_flight::track))
 }
 
 async fn public_not_found() -> impl IntoResponse {
@@ -1022,8 +1255,54 @@ async fn public_not_found() -> impl IntoResponse {
     )
 }
 
-pub(crate) fn build_webhook_router(state: AppState) -> Router {
+pub(crate) async fn takeover_page_route(req: axum::extract::Request) -> Response {
+    #[cfg(target_os = "linux")]
+    {
+        use tower::ServiceExt as _;
+        let prefix = crate::workstation::takeover::MOUNT_PREFIX;
+        let path = req.uri().path().to_string();
+        let tail = path.strip_prefix(prefix).unwrap_or_default();
+        let (key, rest) = tail.split_once('/').unwrap_or((tail, ""));
+        let Some(page) = crate::workstation::takeover::mounted(key) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let query = req
+            .uri()
+            .query()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
+        if !tail.contains('/') {
+            // The page loads its assets relative to a directory URL.
+            return axum::response::Redirect::permanent(&format!("{path}/{query}")).into_response();
+        }
+        let (mut parts, body) = req.into_parts();
+        let Ok(uri) = format!("/{rest}{query}").parse() else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        parts.uri = uri;
+        match page
+            .oneshot(axum::extract::Request::from_parts(parts, body))
+            .await
+        {
+            Ok(response) => response,
+            Err(never) => match never {},
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = req;
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+fn build_webhook_router(state: AppState) -> Router {
     Router::new()
+        .route("/v1/webhooks/takeover/{key}", any(takeover_page_route))
+        .route("/v1/webhooks/takeover/{key}/", any(takeover_page_route))
+        .route(
+            "/v1/webhooks/takeover/{key}/{*rest}",
+            any(takeover_page_route),
+        )
         .route("/", get(public_healthz))
         .route("/healthz", get(public_healthz))
         .route("/v1/webhooks/healthz", get(public_healthz))
@@ -1032,6 +1311,7 @@ pub(crate) fn build_webhook_router(state: AppState) -> Router {
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
         .with_state(state)
+        .layer(axum::middleware::from_fn(in_flight::track))
 }
 
 pub(crate) fn build_router(state: AppState) -> Router {
@@ -1062,6 +1342,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(get_description_route).post(set_description_route),
         )
         .route("/v1/browser", post(browser_route))
+        .route("/v1/computer", post(computer_route))
         .route("/v1/web", post(web_route))
         .route("/v1/profiles", get(profiles_route).post(set_profile_route))
         .route("/v1/profiles/models", get(profile_models_route))
@@ -1114,6 +1395,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
         .with_state(state)
+        .layer(axum::middleware::from_fn(in_flight::track))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1249,20 +1531,6 @@ fn authenticate_mcp_request(
     ))
 }
 
-fn ensure_internal_socket_listener(state: &AppState) -> PathBuf {
-    let data_dir = state.store.data_dir();
-    let sock = socket_path(data_dir);
-    if !sock.exists()
-        && let Ok(listener) = tokio::net::UnixListener::bind(&sock)
-    {
-        let app = build_router(state.clone());
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-    }
-    sock
-}
-
 async fn mcp_get_route(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1370,8 +1638,10 @@ async fn mcp_post(
             internal_token: token,
             ..
         } = caller;
-        let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-        let sock = ensure_internal_socket_listener(&state);
+        let data_dir = state.store.data_dir();
+        let config_dir = anyagents_core::agent_config_dir(data_dir, &agent.id);
+        let sock = socket_path(data_dir);
+        let router = build_router(state.clone());
         let _ = std::fs::create_dir_all(&config_dir);
         Ok(crate::mcp::AgentMcp::new_for_http(
             crate::mcp::AgentRef {
@@ -1383,6 +1653,7 @@ async fn mcp_post(
             config_dir,
             token,
             profile,
+            router,
         ))
     })
     .await?;
@@ -1390,10 +1661,13 @@ async fn mcp_post(
     // (`crate::mcp`), so the whole call is driven from a blocking-pool thread:
     // whatever it waits on holds that thread, never an async worker.
     let runtime = tokio::runtime::Handle::current();
-    let answered =
-        tokio::task::spawn_blocking(move || runtime.block_on(mcp.handle_jsonrpc_request(payload)))
-            .await
-            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let call = in_flight::carry();
+    let answered = tokio::task::spawn_blocking(move || {
+        let _call = call;
+        runtime.block_on(mcp.handle_jsonrpc_request(payload))
+    })
+    .await
+    .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     match answered {
         Some(response_json) => Ok(axum::response::IntoResponse::into_response((
             StatusCode::OK,
@@ -2071,12 +2345,17 @@ async fn transfer_agent_route(
                     .join(updated.id.as_str())
                     .join("work")
             });
-        create::reconcile_agent_runtime_config(
+        let started_ms = state
+            .health
+            .get(&updated.id)
+            .and_then(|h| h.process_started_at_ms);
+        create::reconcile_agent_runtime_config_for_live(
             &state.store,
             state.store.data_dir(),
             &updated,
             &config,
             &work_dir,
+            started_ms,
         ).map_err(ApiError::from_store)?;
 
         let reason_suffix = body
@@ -2503,8 +2782,19 @@ async fn rename_agent_route(
             .as_deref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| anyagents_core::agent_work_dir(data_dir, &updated.id));
-        create::reconcile_agent_runtime_config(&state.store, data_dir, &updated, &cfg, &work_dir)
-            .map_err(ApiError::from_store)?;
+        let started_ms = state
+            .health
+            .get(&updated.id)
+            .and_then(|h| h.process_started_at_ms);
+        create::reconcile_agent_runtime_config_for_live(
+            &state.store,
+            data_dir,
+            &updated,
+            &cfg,
+            &work_dir,
+            started_ms,
+        )
+        .map_err(ApiError::from_store)?;
         crate::telegram::sync_agent_telegram_bot_name(&state.store, data_dir, &updated);
         Ok(Json(agent_view(&state.store, &state.health, &updated)?))
     })
@@ -2575,8 +2865,19 @@ async fn role_agent_route(
             .as_deref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| anyagents_core::agent_work_dir(data_dir, &updated.id));
-        create::reconcile_agent_runtime_config(&state.store, data_dir, &updated, &cfg, &work_dir)
-            .map_err(ApiError::from_store)?;
+        let started_ms = state
+            .health
+            .get(&updated.id)
+            .and_then(|h| h.process_started_at_ms);
+        create::reconcile_agent_runtime_config_for_live(
+            &state.store,
+            data_dir,
+            &updated,
+            &cfg,
+            &work_dir,
+            started_ms,
+        )
+        .map_err(ApiError::from_store)?;
         crate::telegram::sync_agent_telegram_bot_name(&state.store, data_dir, &updated);
         Ok(Json(agent_view(&state.store, &state.health, &updated)?))
     })
@@ -2969,8 +3270,14 @@ async fn set_description_route(
             }
         }
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
-        create::sync_agent_description_files(&state.store, &rec, &cfg)
+        let started_ms = state
+            .health
+            .get(&rec.id)
+            .and_then(|h| h.process_started_at_ms);
+        create::sync_agent_description_files_for_live(&state.store, &rec, &cfg, started_ms)
             .map_err(ApiError::from_store)?;
+        let effective_instructions =
+            create::effective_agent_instructions(Some(&state.store), state.store.data_dir(), &rec);
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         Ok(Json(serde_json::json!({
             "id": rec.id.as_str(),
@@ -2981,29 +3288,66 @@ async fn set_description_route(
             "public": rec.is_public(),
             "aliases": aliases,
             "description": rec.public_description(),
-            "instructions": rec.instructions,
+            "instructions": effective_instructions,
             "system_prompt_synced": true,
         })))
     })
     .await
 }
 
+/// Who a desktop call is for: its lease principal (an agent's name, or the
+/// operator) and that caller's own browser profile (the agent's name, or
+/// `default`).
+fn desktop_caller(principal: &Principal) -> crate::workstation::Caller {
+    match principal {
+        Principal::Agent { agent_id, name } => crate::workstation::Caller {
+            agent_id: Some(agent_id.as_str().to_string()),
+            principal: name.clone(),
+            profile: name.clone(),
+        },
+        Principal::Operator => crate::workstation::Caller {
+            agent_id: None,
+            principal: crate::workstation::OPERATOR.to_string(),
+            profile: "default".to_string(),
+        },
+    }
+}
+
 async fn browser_route(
     principal: Principal,
     State(state): State<AppState>,
-    Json(body): Json<crate::browser::BrowserRequest>,
+    Json(body): Json<crate::workstation::BrowserRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let default_profile = match &principal {
-        Principal::Agent { name, .. } => name.clone(),
-        Principal::Operator => "default".to_string(),
-    };
-    spawn_store(move || {
-        let files = crate::agent_file::FileAuthority::of(&state.store, &principal);
-        let out = crate::browser::execute(state.store.data_dir(), &default_profile, body, &files)
-            .map_err(ApiError::from_store)?;
-        Ok(Json(out))
-    })
-    .await
+    let caller = desktop_caller(&principal);
+    let files = crate::agent_file::FileAuthority::of(&state.store, &principal);
+    crate::workstation::browser::execute(state.store.data_dir(), &caller, body, &files)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_store)
+}
+
+/// Session-desktop `tools.computer` requests (host and cloud requests run in
+/// the caller's process).
+async fn computer_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    #[cfg(target_os = "linux")]
+    {
+        let caller = desktop_caller(&principal);
+        crate::workstation::desktop::execute(state.store.data_dir(), &caller, body)
+            .await
+            .map(Json)
+            .map_err(ApiError::from_store)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (principal, state, body);
+        Err(ApiError::from_store(
+            crate::workstation::unsupported_host().into(),
+        ))
+    }
 }
 
 async fn channels_route(
@@ -3324,7 +3668,11 @@ async fn sign_in_route(
     let runner = Arc::clone(&state.sign_in);
     let root = state.store.data_dir().to_path_buf();
     let mark = capability_mark(Arc::clone(&state.store));
+    // The response streams while the sign-in runs, so the call's future ends
+    // before its work: the work holds the call open for a stop (`in_flight`).
+    let call = in_flight::carry();
     let spawned = tokio::task::spawn_blocking(move || {
+        let _call = call;
         let mut sink = ChannelSink { tx };
         let mut guard = runner.lock().unwrap_or_else(|err| err.into_inner());
         let result = sign_in(
@@ -3781,6 +4129,7 @@ pub(crate) fn compute_block_reason(
 /// The marker files an agent view shows, all in the agent's config directory.
 const LAST_ERROR: &str = ".anyagents-last-error.json";
 const PROFILE_ROTATED: &str = ".anyagents-profile-rotated-ms";
+const INSTRUCTIONS_ROTATED: &str = ".anyagents-instructions-rotated-ms";
 const QUOTA_CLEARED: &str = ".anyagents-quota-cleared-ms";
 const NOTIFIED_PARENT: &str = ".anyagents-notified-parent-error.json";
 const BOUND_PROFILE: &str = ".anyagents-profile";
@@ -3970,6 +4319,8 @@ fn agent_view_preloaded(
         } else {
             view.aliases = store.agent_aliases(&agent.id).unwrap_or_default();
         }
+        view.instructions =
+            create::effective_agent_instructions(Some(store), store.data_dir(), agent);
         return Ok(view);
     }
     let now = now_ms();
@@ -3994,6 +4345,7 @@ fn agent_view_preloaded(
     let files = file_cache::cache();
     let markers = Markers { files, cfg: &cfg };
     let rotated_ms = markers.ms(PROFILE_ROTATED);
+    let instructions_rotated_ms = markers.ms(INSTRUCTIONS_ROTATED);
     // The supervisor's board is the live state; a fault outlives its process
     // only as the record an adapter persisted. A view never reads a vendor
     // transcript, log or session store.
@@ -4022,7 +4374,9 @@ fn agent_view_preloaded(
                     .as_deref()
                     .is_some_and(|h| h != agent.harness)
                     || live.live_model != agent.model
-                    || live.process_started_at_ms.is_some_and(|s| rotated_ms > s));
+                    || live
+                        .process_started_at_ms
+                        .is_some_and(|s| rotated_ms > s || instructions_rotated_ms > s));
             (
                 if live.process_alive { "alive" } else { "down" },
                 if working { "working" } else { "idle" },
@@ -4204,7 +4558,7 @@ fn agent_view_preloaded(
         oldest_undelivered_age_ms,
         install: install_state(store, files, agent),
         description: agent.public_description(),
-        instructions: agent.instructions.clone(),
+        instructions: create::effective_agent_instructions(Some(store), store.data_dir(), agent),
         seat_user: seat_info.as_ref().map(|(u, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid)| *gid),
@@ -4259,13 +4613,7 @@ async fn outbound_retry_route(
             }
             let sender = store.agent(&held.agent_id).map_err(ApiError::from_store)?;
             let actor = Actor::Agent(sender.name.clone());
-            let body = SendRequest {
-                to: vec![held.destination.clone()],
-                text: held.body.clone(),
-                sender: Some(actor.as_address()),
-                reply_to: held.reply_to.clone(),
-                ..SendRequest::default()
-            };
+            let body = held_send(held, &actor);
             let plan = plan_send(store, &Principal::Operator, &actor, &body)?;
             let response = send_sync(store, &actor, body, plan, None)?.0;
             skipped = response.skipped;
@@ -4277,6 +4625,19 @@ async fn outbound_retry_route(
         }))
     })
     .await
+}
+
+/// The send a retry of `held` makes: the same text to the same destination,
+/// as its agent and through the bot it named.
+fn held_send(held: &outbound_history::Unsettled, actor: &Actor) -> SendRequest {
+    SendRequest {
+        to: vec![held.destination.clone()],
+        text: held.body.clone(),
+        sender: Some(actor.as_address()),
+        reply_to: held.reply_to.clone(),
+        bot: held.bot.clone(),
+        ..SendRequest::default()
+    }
 }
 
 /// `POST /v1/outbound/{key}/discard`: settle a held message without sending
@@ -4318,6 +4679,7 @@ pub(crate) fn unsettled_view(
         key: held.effect_key.clone(),
         agent_id: held.agent_id.to_string(),
         destination: held.destination.clone(),
+        bot: held.bot.clone(),
         since_ms: held.since_ms,
         error: held.error.clone(),
         excerpt: held.excerpt(),
@@ -4438,12 +4800,19 @@ async fn create_agent_route(
         );
         require_remote_callback(state.store.data_dir(), &harness)?;
         refuse_host_placement_over_http(via_http, &harness)?;
-        let mut agent = create::create(
+        let agent = create::create(
             &state.store,
             state.store.data_dir(),
             CreateRequest {
                 name: body.name,
-                role: body.role,
+                role: Some(
+                    body.role
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(create::DEFAULT_AGENT_ROLE)
+                        .to_string(),
+                ),
                 harness,
                 model,
                 profile,
@@ -4462,108 +4831,36 @@ async fn create_agent_route(
             Principal::Operator => "operator".to_string(),
             Principal::Agent { name, .. } => format!("agent:{name}"),
         };
-        let mut scope_changed = false;
-        if let Some(ref scope_val) = body.scope {
-            agent = state
-                .store
-                .set_agent_scope_as(&agent.id, scope_val, &actor)
-                .map_err(ApiError::from_store)?;
-            scope_changed = true;
-        } else if body.public == Some(true) {
-            agent = state
-                .store
-                .set_agent_public_as(&agent.id, true, &actor)
-                .map_err(ApiError::from_store)?;
-            scope_changed = true;
-        } else if body.public == Some(false) {
-            agent = state
-                .store
-                .set_agent_public_as(&agent.id, false, &actor)
-                .map_err(ApiError::from_store)?;
-            scope_changed = true;
+        let finish = SpawnFinish {
+            workdir: agent.workdir.clone(),
+            actor,
+            caller: caller_agent.as_ref().map(|(id, _)| id.to_string()),
+            scope: body.scope,
+            public: body.public,
+            lifecycle: body.lifecycle,
+            groups: requested_groups,
+            prompt: body
+                .prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        };
+        // The agent is admitted. What the spawn still does is recorded beside
+        // it first, so a server stopped part way finishes it at its next start
+        // (`finish_interrupted_spawns`) instead of leaving an agent without its
+        // prompt and a parent waiting for it.
+        let marker = spawn_finish_marker(state.store.data_dir(), &agent.id);
+        if let Err(error) = record_spawn_finish(&marker, &finish) {
+            eprintln!(
+                "warning: spawn of {} not recorded for recovery ({error}); finishing it now",
+                agent.name
+            );
         }
-        if let Some(ref lifecycle_val) = body.lifecycle {
-            agent = state
-                .store
-                .set_agent_lifecycle_as(&agent.id, lifecycle_val, &actor)
-                .map_err(ApiError::from_store)?;
-        }
-        if scope_changed {
-            let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-            create::sync_agent_description_files(&state.store, &agent, &cfg)
-                .map_err(ApiError::from_store)?;
-        }
-        if !requested_group_names.is_empty() {
-            let mut targets = vec![agent.id.clone()];
-            if let Some((caller_id, _)) = &caller_agent {
-                targets.push(caller_id.clone());
-            }
-            state
-                .store
-                .join_groups_as(&group_actor, &requested_group_names, &targets)
-                .map_err(ApiError::from_store)?;
-        }
-        if !anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id)
-            .join("mcp-capability")
-            .is_file()
-        {
-            operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
-        }
-        let mut has_prompt = false;
-        if let Some(prompt) = body
-            .prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            has_prompt = true;
-            let sender = caller_agent
-                .as_ref()
-                .map(|(id, _)| format!("agent:{id}"))
-                .unwrap_or_else(|| "operator".to_string());
-            let enqueue = || {
-                let message = state
-                    .store
-                    .receive(
-                        &agent.id,
-                        Incoming {
-                            text: prompt.to_string(),
-                            sender: Some(sender),
-                            source_time_ms: None,
-                            source_key: None,
-                            reply_to: None,
-                            quote: None,
-                            origin: None,
-                            received_at_ms: None,
-                        },
-                    )
-                    .map_err(ApiError::from_store)?;
-                let (message, duplicate) = match message {
-                    ReceiveOutcome::New(message) => (message, false),
-                    ReceiveOutcome::Duplicate(message) => (message, true),
-                };
-                Ok(vec![Delivery {
-                    to: format!("agent:{}", agent.name),
-                    id: message.id.to_string(),
-                    seq: message.seq,
-                    duplicate,
-                }])
-            };
-            if let Some((ref caller_id, _)) = caller_agent {
-                outbound_history::deliver(
-                    &state.store,
-                    caller_id,
-                    &format!("agent:{}", agent.name),
-                    None,
-                    prompt,
-                    None,
-                    false,
-                    enqueue,
-                )?;
-            } else {
-                enqueue()?;
-            }
-        }
+        let finished = finish_spawn(&state.store, state.store.data_dir(), agent, &finish);
+        // Done, or refused: either way nothing is left for a restart to redo.
+        let _ = std::fs::remove_file(&marker);
+        let (agent, has_prompt) = finished?;
         if has_prompt {
             create::poke_agent_wake_socket_mail(state.store.data_dir(), &agent.id);
         } else {
@@ -4573,6 +4870,194 @@ async fn create_agent_route(
         Ok((StatusCode::CREATED, Json(view)))
     })
     .await
+}
+
+/// What a spawn does once its agent is admitted: scope, lifecycle, groups,
+/// capability and the first prompt. Recorded in the agent's config directory
+/// while it runs ([`SPAWN_FINISH_FILE`]); every step is idempotent, so it can
+/// be run again after a stop.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, Deserialize)]
+struct SpawnFinish {
+    /// Allocated workdir, for recovery of rows missing the allocation.
+    #[serde(default)]
+    workdir: Option<String>,
+    /// Who spawned: `operator` or `agent:<name>`, for the audit.
+    actor: String,
+    /// The spawning agent's id: the prompt's sender and a group member.
+    caller: Option<String>,
+    scope: Option<String>,
+    public: Option<bool>,
+    lifecycle: Option<String>,
+    groups: Vec<String>,
+    prompt: Option<String>,
+}
+
+/// The record of a spawn still finishing, beside the agent's config.
+const SPAWN_FINISH_FILE: &str = ".anyagents-spawn-finish.json";
+
+fn spawn_finish_marker(data_dir: &Path, agent_id: &anyagents_core::AgentId) -> PathBuf {
+    anyagents_core::agent_config_dir(data_dir, agent_id).join(SPAWN_FINISH_FILE)
+}
+
+fn record_spawn_finish(marker: &Path, finish: &SpawnFinish) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(finish).map_err(std::io::Error::other)?;
+    anyagents_harness::atomic_write_nonempty_file(marker, &bytes, 0o600)
+}
+
+/// Run what a spawn does after admission. The prompt carries a source key of
+/// its own, so a second run delivers it once.
+fn finish_spawn(
+    store: &Store,
+    data_dir: &Path,
+    mut agent: Agent,
+    finish: &SpawnFinish,
+) -> Result<(Agent, bool), ApiError> {
+    let caller = finish
+        .caller
+        .as_deref()
+        .map(anyagents_core::AgentId::parse)
+        .transpose()
+        .map_err(ApiError::from_store)?;
+    if let Some(workdir) = finish.workdir.as_deref() {
+        agent = store
+            .set_agent_workdir_if_missing(&agent.id, workdir)
+            .map_err(ApiError::from_store)?;
+    }
+    let actor = finish.actor.as_str();
+    let mut scope_changed = false;
+    if let Some(ref scope_val) = finish.scope {
+        agent = store
+            .set_agent_scope_as(&agent.id, scope_val, actor)
+            .map_err(ApiError::from_store)?;
+        scope_changed = true;
+    } else if let Some(public) = finish.public {
+        agent = store
+            .set_agent_public_as(&agent.id, public, actor)
+            .map_err(ApiError::from_store)?;
+        scope_changed = true;
+    }
+    if let Some(ref lifecycle_val) = finish.lifecycle {
+        agent = store
+            .set_agent_lifecycle_as(&agent.id, lifecycle_val, actor)
+            .map_err(ApiError::from_store)?;
+    }
+    if scope_changed {
+        let cfg = anyagents_core::agent_config_dir(data_dir, &agent.id);
+        create::sync_agent_description_files(store, &agent, &cfg).map_err(ApiError::from_store)?;
+    }
+    if !finish.groups.is_empty() {
+        let names: Vec<&str> = finish.groups.iter().map(String::as_str).collect();
+        let mut targets = vec![agent.id.clone()];
+        let group_actor = match &caller {
+            Some(caller_id) => {
+                targets.push(caller_id.clone());
+                anyagents_core::GroupActor::Agent(caller_id.clone())
+            }
+            None => anyagents_core::GroupActor::Operator,
+        };
+        store
+            .join_groups_as(&group_actor, &names, &targets)
+            .map_err(ApiError::from_store)?;
+    }
+    if !anyagents_core::agent_config_dir(data_dir, &agent.id)
+        .join("mcp-capability")
+        .is_file()
+    {
+        operator::mint(store, &agent.id).map_err(ApiError::from_store)?;
+    }
+    let Some(prompt) = finish.prompt.as_deref() else {
+        return Ok((agent, false));
+    };
+    let sender = caller
+        .as_ref()
+        .map(|id| format!("agent:{id}"))
+        .unwrap_or_else(|| "operator".to_string());
+    let key = format!("spawn-prompt:{}", agent.id);
+    let enqueue = || {
+        let message = store
+            .receive(
+                &agent.id,
+                Incoming {
+                    text: prompt.to_string(),
+                    sender: Some(sender),
+                    source_time_ms: None,
+                    source_key: Some(key.clone()),
+                    reply_to: None,
+                    quote: None,
+                    origin: None,
+                    received_at_ms: None,
+                },
+            )
+            .map_err(ApiError::from_store)?;
+        let (message, duplicate) = match message {
+            ReceiveOutcome::New(message) => (message, false),
+            ReceiveOutcome::Duplicate(message) => (message, true),
+        };
+        Ok(vec![Delivery {
+            to: format!("agent:{}", agent.name),
+            id: message.id.to_string(),
+            seq: message.seq,
+            duplicate,
+        }])
+    };
+    if let Some(ref caller_id) = caller {
+        outbound_history::deliver(
+            store,
+            caller_id,
+            &format!("agent:{}", agent.name),
+            None,
+            None,
+            prompt,
+            Some(&key),
+            true,
+            enqueue,
+        )?;
+    } else {
+        enqueue()?;
+    }
+    Ok((agent, true))
+}
+
+/// Finish the spawns a stopped server left part way: each live agent whose
+/// config still holds [`SPAWN_FINISH_FILE`] gets the rest of its spawn (most
+/// often its first prompt). Run once at start, before any call is answered;
+/// a spawn that cannot be finished keeps its record for the next start.
+fn finish_interrupted_spawns(store: &Store, data_dir: &Path) -> usize {
+    let Ok(agents) = store.list_live_agents() else {
+        return 0;
+    };
+    let mut finished = 0;
+    for agent in agents {
+        let marker = spawn_finish_marker(data_dir, &agent.id);
+        let Ok(bytes) = std::fs::read(&marker) else {
+            continue;
+        };
+        let name = agent.name.clone();
+        let id = agent.id.clone();
+        match serde_json::from_slice::<SpawnFinish>(&bytes)
+            .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))
+            .and_then(|finish| finish_spawn(store, data_dir, agent, &finish))
+        {
+            Ok((_, has_prompt)) => {
+                let _ = std::fs::remove_file(&marker);
+                eprintln!("anyagents: finished the interrupted spawn of {name}");
+                if has_prompt {
+                    create::poke_agent_wake_socket_mail(data_dir, &id);
+                } else {
+                    create::poke_agent_wake_socket(data_dir, &id);
+                }
+                finished += 1;
+            }
+            // Kept: the next start tries again (every step is idempotent),
+            // so a passing failure (a busy store) never loses the spawn.
+            Err(error) => eprintln!(
+                "anyagents: the interrupted spawn of {name} could not be finished (kept for the \
+                 next start): {}",
+                error.message
+            ),
+        }
+    }
+    finished
 }
 
 async fn archive_agent_route(
@@ -4678,8 +5163,9 @@ fn reap_subagent_ephemeral_dirs_in(
     data_dir: &Path,
     agent_id: &anyagents_core::AgentId,
 ) -> bool {
-    // Delete calls this after removing the row; all surviving references still
-    // protect their workdirs. A failed read must never mean no shared workdirs.
+    // Archive reaping calls this with the row archived, and delete before it
+    // removes the row; all surviving references still protect their
+    // workdirs. A failed read must never mean no shared workdirs.
     let agent = match store.agent(agent_id) {
         Ok(agent) => Some(agent),
         Err(Error::AgentNotFound(_)) => None,
@@ -4755,8 +5241,9 @@ fn reap_subagent_ephemeral_dirs_in(
         );
     }
     let mut shared_workdirs = std::collections::HashSet::new();
+    #[cfg(target_os = "linux")]
     if let Some(agent) = agent {
-        let _ = crate::browser::stop_profile(data_dir, &agent.name);
+        crate::workstation::session::stop_agent_in_background(data_dir, &agent.name);
     }
     // Every other agent that is not archived, and the parent even when it is,
     // keeps its workdir.
@@ -5169,6 +5656,21 @@ async fn pause_agent_route(
         ) {
             require_admin_or_operator(&state.store, &principal, "agents.pause", &found.name)?;
         }
+        // Serialized with this agent's harness, profile, wake and archive
+        // transitions, as the command-line pause is.
+        let lifecycle = state
+            .store
+            .lock_agent_lifecycle(&found.id)
+            .map_err(ApiError::from_store)?;
+        // Read again under the lock: an archive may have completed meanwhile,
+        // and a pause must not bring an archived agent back as paused.
+        let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
+        if found.state == "archived" {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("agent {} is archived; wake it to resume", found.name),
+            ));
+        }
         let agent = state
             .store
             .set_agent_state(&found.id, "paused")
@@ -5178,6 +5680,7 @@ async fn pause_agent_route(
         ) {
             let _ = anyagents_tools::SandboxProvider::pause(&sbx);
         }
+        drop(lifecycle);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
             if state
@@ -5253,35 +5756,34 @@ async fn delete_agent_route(
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        let deleted = state
-            .store
-            .delete_agent(&found.id)
-            .map_err(ApiError::from_store)?;
+        // Everything the agent's name or identity keys on disk goes before its
+        // row: a stop between the two then leaves an archived row that holds
+        // the name and a delete that can be run again, never a free name
+        // whose next agent inherits the old browser profile or config.
         let agent_dir = state
             .store
             .data_dir()
             .join("agents")
-            .join(deleted.id.as_str());
-        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&agent_dir.join("config"))
-        {
+            .join(found.id.as_str());
+        let data_dir = state.store.data_dir();
+        let config = agent_dir.join("config");
+        let seat_ids = detect_seat_ids(&config);
+        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&config) {
             let _ = anyagents_tools::SandboxProvider::destroy(&sbx);
         }
-        let seat_ids = detect_seat_ids(&agent_dir.join("config"));
-        let _ = crate::browser::stop_profile(state.store.data_dir(), &deleted.name);
-        remove_path_with_seat(
-            &state
-                .store
-                .data_dir()
-                .join("browser-profiles")
-                .join(&deleted.name),
-            seat_ids,
+
+        reap_subagent_ephemeral_dirs_in(&state.store, data_dir, &found.id);
+        remove_agent_identity_files(data_dir, &found, &agent_dir, seat_ids);
+        let deleted = state
+            .store
+            .delete_agent(&found.id)
+            .map_err(ApiError::from_store)?;
+        let _ = std::fs::remove_file(
+            data_dir
+                .join("locks")
+                .join(format!("{}.lock", deleted.id.as_str())),
+
         );
-        reap_subagent_ephemeral_dirs_in(&state.store, state.store.data_dir(), &deleted.id);
-        for private_tree in ["config", "memory", "skills"] {
-            let tree_path = agent_dir.join(private_tree);
-            remove_path_with_seat(&tree_path, seat_ids);
-            let _ = std::fs::remove_dir_all(&tree_path);
-        }
         if !agent_dir.join("work").exists() {
             remove_path_with_seat(&agent_dir, seat_ids);
             let _ = std::fs::remove_dir_all(&agent_dir);
@@ -5293,6 +5795,29 @@ async fn delete_agent_route(
         })))
     })
     .await
+}
+
+/// Remove what an agent being deleted keeps under its identity: its browser
+/// profile (keyed by name, so a later agent of the same name would inherit
+/// it) and its private config, memory and skills trees. Idempotent: a delete
+/// stopped part way runs it again.
+fn remove_agent_identity_files(
+    data_dir: &Path,
+    agent: &Agent,
+    agent_dir: &Path,
+    seat_ids: Option<(u32, u32, u32)>,
+) {
+    #[cfg(target_os = "linux")]
+    crate::workstation::session::stop_agent_blocking(data_dir, &agent.name);
+    remove_path_with_seat(
+        &data_dir.join("browser-profiles").join(&agent.name),
+        seat_ids,
+    );
+    for private_tree in ["config", "memory", "skills"] {
+        let tree_path = agent_dir.join(private_tree);
+        remove_path_with_seat(&tree_path, seat_ids);
+        let _ = std::fs::remove_dir_all(&tree_path);
+    }
 }
 
 async fn wake_agent_route(
@@ -6507,6 +7032,8 @@ fn interact_sync(
         ));
     }
     let actor = Actor::Agent(actor_name.to_string());
+    let bot = body.bot.clone();
+    let bot = bot.as_deref();
     // Resolve target into optional (chat_id, message_id, thread_id, stored_message).
     let mut tg_coords: Option<(i64, i64, Option<i64>)> = None;
     let mut stored_msg: Option<anyagents_core::Message> = None;
@@ -6556,7 +7083,16 @@ fn interact_sync(
             let emoji = body.emoji.as_deref().map(str::trim);
             if let Some((chat_id, message_id, thread_id)) = tg_coords {
                 crate::telegram::react_message(
-                    store, data_dir, actor_name, chat_id, message_id, emoji, thread_id,
+                    store,
+                    data_dir,
+                    actor_name,
+                    bot,
+                    crate::telegram::ChatMessage {
+                        chat_id,
+                        message_id,
+                        thread: thread_id,
+                    },
+                    emoji,
                 )
                 .map_err(ApiError::from_store)?;
                 Ok(Json(InteractResponse {
@@ -6622,15 +7158,19 @@ fn interact_sync(
                     store,
                     data_dir,
                     actor_name,
-                    chat_id,
-                    message_id,
+                    bot,
+                    crate::telegram::ChatMessage {
+                        chat_id,
+                        message_id,
+                        thread: thread_id,
+                    },
                     Some("👍"),
-                    thread_id,
                 );
                 let posted_id = crate::telegram::post_text(
                     store,
                     data_dir,
                     actor_name,
+                    bot,
                     chat_id,
                     &ballot,
                     Some(message_id),
@@ -6687,7 +7227,16 @@ fn interact_sync(
                 let updated = toggle_checklist_items(&msg.text, &body.options, mark_done);
                 if let Some((chat_id, message_id, thread_id)) = tg_coords {
                     crate::telegram::edit_message(
-                        store, data_dir, actor_name, chat_id, message_id, &updated, thread_id,
+                        store,
+                        data_dir,
+                        actor_name,
+                        bot,
+                        crate::telegram::ChatMessage {
+                            chat_id,
+                            message_id,
+                            thread: thread_id,
+                        },
+                        &updated,
                     )
                     .map_err(ApiError::from_store)?;
                 }
@@ -6720,7 +7269,16 @@ fn interact_sync(
                 )
             })?;
             crate::telegram::edit_message(
-                store, data_dir, actor_name, chat_id, message_id, new_text, thread_id,
+                store,
+                data_dir,
+                actor_name,
+                bot,
+                crate::telegram::ChatMessage {
+                    chat_id,
+                    message_id,
+                    thread: thread_id,
+                },
+                new_text,
             )
             .map_err(ApiError::from_store)?;
             Ok(Json(InteractResponse {
@@ -6737,8 +7295,10 @@ fn interact_sync(
                     "delete target must resolve to a Telegram message",
                 )
             })?;
-            crate::telegram::delete_chat_message(store, data_dir, actor_name, chat_id, message_id)
-                .map_err(ApiError::from_store)?;
+            crate::telegram::delete_chat_message(
+                store, data_dir, actor_name, bot, chat_id, message_id,
+            )
+            .map_err(ApiError::from_store)?;
             Ok(Json(InteractResponse {
                 ok: true,
                 action,
@@ -6754,8 +7314,10 @@ fn interact_sync(
                 )
             })?;
             let pin = action == "pin";
-            crate::telegram::pin_message(store, data_dir, actor_name, chat_id, message_id, pin)
-                .map_err(ApiError::from_store)?;
+            crate::telegram::pin_message(
+                store, data_dir, actor_name, bot, chat_id, message_id, pin,
+            )
+            .map_err(ApiError::from_store)?;
             Ok(Json(InteractResponse {
                 ok: true,
                 action,
@@ -6773,7 +7335,7 @@ fn interact_sync(
                     "stop_poll target must resolve to a Telegram poll message",
                 )
             })?;
-            crate::telegram::close_poll(store, data_dir, actor_name, chat_id, message_id)
+            crate::telegram::close_poll(store, data_dir, actor_name, bot, chat_id, message_id)
                 .map_err(ApiError::from_store)?;
             Ok(Json(InteractResponse {
                 ok: true,
@@ -7564,6 +8126,7 @@ fn send_sync(
                         store,
                         sid,
                         &format!("agent:{name}"),
+                        None,
                         body.reply_to.as_deref(),
                         &composed_body,
                         history_key.as_deref(),
@@ -7600,6 +8163,7 @@ fn send_sync(
                         store,
                         sid,
                         &dest,
+                        None,
                         body.reply_to.as_deref(),
                         &composed_body,
                         history_key.as_deref(),
@@ -7649,6 +8213,7 @@ fn send_sync(
                         store,
                         sid,
                         address,
+                        body.bot.as_deref(),
                         body.reply_to.as_deref(),
                         &composed_body,
                         history_key.as_deref(),
@@ -7741,6 +8306,14 @@ fn send_key(body: &SendRequest) -> Option<String> {
         body.text.as_str(),
     ] {
         bytes.extend_from_slice(part.as_bytes());
+        bytes.push(0);
+    }
+    // A named bot is part of the send: the same key through another bot is
+    // another send, resolved and authorized on its own. A send that names no
+    // bot keeps the key it always had.
+    if let Some(bot) = body.bot.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        bytes.extend_from_slice(b"bot\0");
+        bytes.extend_from_slice(bot.to_ascii_lowercase().as_bytes());
         bytes.push(0);
     }
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -8072,8 +8645,16 @@ fn prepare_telegram(
 ) -> Result<(), ApiError> {
     let from = telegram_sender(actor)?;
     let (chat_id, thread_id, reply_to) = telegram_target(chat, thread, reply, body)?;
-    crate::telegram::outbound_call(store, from, chat_id, &body.text, reply_to, thread_id)
-        .map_err(ApiError::from_store)?;
+    crate::telegram::outbound_call(
+        store,
+        from,
+        body.bot.as_deref(),
+        chat_id,
+        &body.text,
+        reply_to,
+        thread_id,
+    )
+    .map_err(ApiError::from_store)?;
     Ok(())
 }
 
@@ -8211,6 +8792,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &media.kind,
             &media.source,
@@ -8227,6 +8809,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             loc.latitude,
             loc.longitude,
@@ -8241,6 +8824,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &poll.question,
             &poll.options,
@@ -8255,6 +8839,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &cl.title,
             &cl.tasks,
@@ -8268,6 +8853,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &art.title,
             art.content.as_deref(),
@@ -8283,6 +8869,7 @@ fn deliver_telegram(
             store,
             store.data_dir(),
             from,
+            body.bot.as_deref(),
             chat_id,
             &body.text,
             reply_to,
@@ -8290,9 +8877,9 @@ fn deliver_telegram(
         )
         .map_err(ApiError::from_store)?
     };
-    // Remember the chat this agent answers in, so a post it makes there reaches
-    // the other agents on that chat as a mailbox message.
-    crate::telegram::record_chat(store, from, chat_id).map_err(ApiError::from_store)?;
+    // The post itself remembered the chat on the bot it went through
+    // (`deliver_locally_with_metadata`), so later posts there reach the other
+    // agents on that chat as mailbox messages.
     Ok(Delivery {
         to: address.to_string(),
         id: message_id.to_string(),
@@ -8317,7 +8904,15 @@ async fn web_route(
 async fn spawn_store<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    match tokio::task::spawn_blocking(work).await {
+    // The call counts toward a stop until this work returns, even if the
+    // call's future is dropped first (`in_flight`).
+    let call = in_flight::carry();
+    match tokio::task::spawn_blocking(move || {
+        let _call = call;
+        work()
+    })
+    .await
+    {
         Ok(result) => result,
         Err(err) => Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -8489,7 +9084,9 @@ pub(crate) mod tests {
         let store = Store::open(temp.path().join("state.db")).unwrap();
         for (harness, mode, steer) in [
             ("spiron", "steer", "yes"),
-            ("grok", "steer", "unproven"),
+            ("grok", "steer", "yes"),
+            ("opencode", "steer", "yes"),
+            ("dsh", "steer", "yes"),
             ("spiron-cloud", "followup", "no"),
         ] {
             let agent = store
@@ -8506,6 +9103,14 @@ pub(crate) mod tests {
                 "{harness}"
             );
         }
+        let mid_turn = crate::api::DeliveryView::from(&anyagents_harness_stream::LINE_INTO_TURN);
+        assert_eq!(
+            (
+                mid_turn.legacy_mode().as_str(),
+                mid_turn.legacy_steer().as_str()
+            ),
+            ("steer", "unproven")
+        );
     }
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
@@ -9992,6 +10597,22 @@ pub(crate) mod tests {
                 assert!(response.turns.iter().all(|t|t.raw.is_some() && t.window.is_some()));
                 for t in &response.turns {let raw=t.raw.as_ref().unwrap();let bytes=std::fs::read(&raw.segment).unwrap();assert_eq!(anyagents_core::learned_memory::sha256(&bytes[raw.offset as usize..(raw.offset+raw.length) as usize]),raw.sha256);}
             }
+            // Torn external strings must not prevent the canonical selector
+            // from reading valid neighbors, including large escaped payloads.
+            let native = dir.path().join("agents").join(child.id.as_str()).join("config/sylphx-transcript.jsonl");
+            let payload = "largevalidneedle \" 中文 ".repeat(1000);
+            let valid = serde_json::to_string(&serde_json::json!({"role":"assistant","direction":"out","content":payload})).unwrap();
+            assert!(valid.len() > 4096);
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&valid).unwrap()["content"], payload);
+            std::fs::OpenOptions::new().append(true).open(&native).unwrap().write_all(
+                format!("{{\"content\":\"{}\n{valid}\n", "torntoken ".repeat(1000)).as_bytes()
+            ).unwrap();
+            let Json(large)=conversation_route(principal(),State(state.clone()),AxumPath(child.name.clone()),Query(serde_json::from_value(serde_json::json!({"scope":"transcripts","query":"largevalidneedle","direction":"out","limit":6})).unwrap())).await.unwrap_or_else(|e|panic!("{}", e.message));
+            assert_eq!(large.turns.len(), 1);
+            let raw = large.turns[0].raw.as_ref().unwrap();
+            let bytes = std::fs::read(&raw.segment).unwrap();
+            let record = &bytes[raw.offset as usize..(raw.offset+raw.length) as usize];
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(record).unwrap()["content"], payload);
             // Native records lacking time must remain null at the canonical
             // surface, never inherit a recent filesystem timestamp.
             let native = dir.path().join("agents").join(child.id.as_str()).join("config/sylphx-transcript.jsonl");
@@ -10170,6 +10791,408 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         true
+    }
+
+    #[test]
+    fn an_interrupted_spawn_gets_its_prompt_once_at_the_next_start() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("child", "codex");
+        new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new).unwrap();
+        let finish = SpawnFinish {
+            workdir: Some("/allocated/worktree".into()),
+            actor: "agent:parent".into(),
+            caller: Some(parent.id.to_string()),
+            scope: None,
+            public: None,
+            lifecycle: Some("task".into()),
+            groups: Vec::new(),
+            prompt: Some("build the thing".into()),
+        };
+        // The server stopped after admitting the child, before its prompt.
+        let marker = spawn_finish_marker(data, &child.id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        record_spawn_finish(&marker, &finish).unwrap();
+
+        assert_eq!(finish_interrupted_spawns(&store, data), 1);
+        assert!(!marker.exists());
+        let inbox = store.inbox(&child.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "build the thing");
+        assert_eq!(
+            inbox[0].sender.as_deref(),
+            Some(format!("agent:{}", parent.id).as_str())
+        );
+        assert_eq!(
+            store.agent(&child.id).unwrap().lifecycle().to_string(),
+            "task"
+        );
+
+        assert_eq!(
+            store.agent(&child.id).unwrap().workdir.as_deref(),
+            Some("/allocated/worktree")
+        );
+        // A later authoritative assignment must survive a stale finish record.
+        store
+            .set_agent_running(&child.id, "/current/worktree")
+            .unwrap();
+        // Stopped again after the prompt landed but before the record went:
+        // the next start finishes without a second prompt.
+        record_spawn_finish(&marker, &finish).unwrap();
+        assert_eq!(finish_interrupted_spawns(&store, data), 1);
+        assert_eq!(store.inbox(&child.id, None).unwrap().len(), 1);
+        assert_eq!(finish_interrupted_spawns(&store, data), 0);
+        assert_eq!(
+            store.agent(&child.id).unwrap().workdir.as_deref(),
+            Some("/current/worktree")
+        );
+        // Records written before workdir snapshots remain readable.
+        let mut legacy = serde_json::to_value(&finish).unwrap();
+        legacy.as_object_mut().unwrap().remove("workdir");
+        let legacy: SpawnFinish = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.workdir.is_none());
+        record_spawn_finish(&marker, &legacy).unwrap();
+        assert_eq!(finish_interrupted_spawns(&store, data), 1);
+        assert_eq!(
+            store.agent(&child.id).unwrap().workdir.as_deref(),
+            Some("/current/worktree")
+        );
+    }
+
+    #[test]
+    fn an_interrupted_spawn_that_cannot_finish_keeps_its_record_for_the_next_start() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        let child = store
+            .create_agent(anyagents_core::NewAgent::new("child", "codex"))
+            .unwrap();
+        let mut finish = SpawnFinish {
+            workdir: None,
+            actor: "operator".into(),
+            caller: None,
+            scope: None,
+            public: None,
+            // Refused by the store: this start cannot finish the spawn.
+            lifecycle: Some("not-a-lifecycle".into()),
+            groups: Vec::new(),
+            prompt: Some("build the thing".into()),
+        };
+        let marker = spawn_finish_marker(data, &child.id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        record_spawn_finish(&marker, &finish).unwrap();
+
+        assert_eq!(finish_interrupted_spawns(&store, data), 0);
+        assert!(
+            marker.exists(),
+            "a failed finish dropped the spawn's record"
+        );
+        assert!(store.inbox(&child.id, None).unwrap().is_empty());
+
+        // The next start can: the prompt lands and only then the record goes.
+        finish.lifecycle = Some("task".into());
+        record_spawn_finish(&marker, &finish).unwrap();
+        assert_eq!(finish_interrupted_spawns(&store, data), 1);
+        assert!(!marker.exists());
+        assert_eq!(store.inbox(&child.id, None).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_listener_stops_taking_calls_when_the_server_is_told_to_stop() {
+        let (stopping, _) = tokio::sync::watch::channel(false);
+        let socket = stopped(&stopping);
+        let public = stopped(&stopping);
+        tokio::pin!(socket, public);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut socket)
+                .await
+                .is_err(),
+            "stopped before the stop"
+        );
+        let _ = stopping.send(true);
+        tokio::time::timeout(std::time::Duration::from_secs(1), socket)
+            .await
+            .expect("the socket listener kept taking calls");
+        tokio::time::timeout(std::time::Duration::from_secs(1), public)
+            .await
+            .expect("a TCP listener kept taking calls");
+        // A listener started after the stop stops at once; so does one whose
+        // server is gone.
+        tokio::time::timeout(std::time::Duration::from_secs(1), stopped(&stopping))
+            .await
+            .unwrap();
+        let (gone, _) = tokio::sync::watch::channel(false);
+        let orphan = stopped(&gone);
+        drop(gone);
+        tokio::time::timeout(std::time::Duration::from_secs(1), orphan)
+            .await
+            .unwrap();
+    }
+
+    /// A write arriving on either TCP listener (public or local webhook)
+    /// counts toward the stop until it is done, as on the socket.
+    #[test]
+    fn writes_on_the_tcp_listeners_hold_the_stop() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let state = AppState {
+            store,
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use tokio::io::AsyncWriteExt;
+            for (name, router) in [
+                ("public", build_public_router(state.clone())),
+                ("webhook", build_webhook_router(state.clone())),
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let served = tokio::spawn(async move {
+                    let _ = axum::serve(listener, router).await;
+                });
+                // A webhook whose body is still arriving: the call is running.
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                stream
+                    .write_all(
+                        b"POST /v1/webhooks/telegram/some-channel HTTP/1.1\r\nhost: x\r\n\
+                          content-type: application/json\r\ncontent-length: 100\r\n\r\n{",
+                    )
+                    .await
+                    .unwrap();
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while in_flight::MUTATIONS.running() == 0 && std::time::Instant::now() < until {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                assert!(
+                    in_flight::MUTATIONS.running() > 0,
+                    "a write on the {name} listener does not hold the stop"
+                );
+                drop(stream);
+                served.abort();
+                in_flight::MUTATIONS
+                    .settle(std::time::Duration::from_secs(5))
+                    .await;
+            }
+        });
+    }
+
+    /// A streaming sign-in returns its response headers before the blocking
+    /// vendor command finishes, so its carried `in_flight` token must keep the
+    /// stop waiting until the blocking work and capability rotation return.
+    #[test]
+    fn sign_in_route_carries_in_flight_token_until_blocking_work_finishes() {
+        struct HeldSignIn {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl CommandRunner for HeldSignIn {
+            fn run(
+                &mut self,
+                _program: &str,
+                _args: &[String],
+                _dir: &Path,
+                _env: &[(&str, &str)],
+                on_line: &mut dyn LineSink,
+            ) -> Result<(), InstallError> {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+                on_line.line("SIGNED_IN ada@example");
+                Ok(())
+            }
+        }
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let state = AppState {
+            store,
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(HeldSignIn {
+                entered: entered_tx,
+                release: release_rx,
+            })),
+            auth: auth::Mode::Confined {
+                operator_digest: Some(auth::operator_digest("test-op-token")),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use hyper::service::Service as _;
+            let router = build_router(state);
+            let service = hyper_util::service::TowerToHyperService::new(router);
+            let req = hyper::Request::builder()
+                .method("POST")
+                .uri("http://localhost/v1/harnesses/codex/sign-in")
+                .header(crate::operator::HEADER, "test-op-token")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .unwrap();
+            let response = service.call(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            tokio::task::spawn_blocking(move || {
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("blocking sign-in started");
+            })
+            .await
+            .unwrap();
+            // Even after the handler future returned its streaming response
+            // (and even if the caller drops the body), the blocking task still
+            // holds its carried `in_flight` token until `sign_in` finishes.
+            drop(response);
+            assert!(
+                in_flight::MUTATIONS.running() > 0,
+                "streaming sign-in dropped its in_flight token before blocking work finished"
+            );
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                in_flight::MUTATIONS
+                    .settle(std::time::Duration::from_secs(5))
+                    .await,
+                0
+            );
+        });
+    }
+
+    /// An admitted HTTP MCP call runs against the server's in-process router
+    /// instead of dialing `anyagents.sock`: when `stopping` has already closed
+    /// the external socket listener (leaving a refusing socket file on disk),
+    /// an in-flight `POST /v1/webhooks/mcp` finishes at once instead of
+    /// self-deadlocking the mutation drain on `ECONNREFUSED`.
+    #[test]
+    fn http_mcp_post_completes_in_process_while_external_socket_refuses() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let cloud = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("cloud-drain", "claude-cloud"))
+            .unwrap();
+        let peer = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("peer-drain", "claude-code"))
+            .unwrap();
+        crate::remote::begin_session(&state.store, &cloud).unwrap();
+        let cloud_cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &cloud.id);
+        let remote = crate::remote::session_token(&cloud_cfg).unwrap();
+
+        // Simulate shutdown after `stopping`: `anyagents.sock` stays on disk
+        // while its external listener is closed (`ECONNREFUSED`).
+        let sock = socket_path(dir.path());
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        assert!(sock.exists());
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use http_body_util::BodyExt as _;
+            use hyper::service::Service as _;
+            let public = build_public_router(state.clone());
+            let service = hyper_util::service::TowerToHyperService::new(public);
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "send",
+                    "arguments": {
+                        "to": ["peer-drain"],
+                        "text": "draining cleanly"
+                    }
+                }
+            });
+            let req = hyper::Request::builder()
+                .method("POST")
+                .uri("http://localhost/v1/webhooks/mcp")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {remote}"),
+                )
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(http_body_util::Full::new(bytes::Bytes::from(
+                    serde_json::to_vec(&payload).unwrap(),
+                )))
+                .unwrap();
+            let started = std::time::Instant::now();
+            let response = service.call(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "HTTP MCP call stalled on closed external socket: {:?}",
+                started.elapsed()
+            );
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_ne!(body["result"]["isError"], serde_json::json!(true), "{body}");
+            let messages = state.store.inbox(&peer.id, None).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].text, "draining cleanly");
+        });
+    }
+
+    #[test]
+    fn a_deleted_agents_name_frees_only_after_its_profile_and_config_are_gone() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("shopper", "codex"))
+            .unwrap();
+        let agent_dir = data.join("agents").join(agent.id.as_str());
+        let profile = data.join("browser-profiles").join("shopper");
+        for path in [
+            agent_dir.join("config"),
+            agent_dir.join("memory"),
+            profile.join("user-data"),
+        ] {
+            std::fs::create_dir_all(&path).unwrap();
+        }
+        std::fs::write(profile.join("user-data").join("Cookies"), b"logged-in").unwrap();
+        // The delete route removes these before the row; the row still holds
+        // the name, so no agent can take it while they exist.
+        remove_agent_identity_files(data, &agent, &agent_dir, None);
+        assert!(!profile.exists());
+        assert!(!agent_dir.join("config").exists());
+        assert!(!agent_dir.join("memory").exists());
+        assert!(
+            store
+                .create_agent(anyagents_core::NewAgent::new("shopper", "codex"))
+                .is_err()
+        );
+        // Run again after a stop part way: nothing left, nothing fails.
+        remove_agent_identity_files(data, &agent, &agent_dir, None);
+        store.delete_agent(&agent.id).unwrap();
+        let reused = store
+            .create_agent(anyagents_core::NewAgent::new("shopper", "codex"))
+            .unwrap();
+        assert_ne!(reused.id, agent.id);
+        assert!(!profile.join("user-data").join("Cookies").exists());
     }
 
     #[test]
@@ -10384,7 +11407,9 @@ pub(crate) mod tests {
         }
         let release = Release(Some(release));
         runtime.block_on(async {
-            let (local, network) = start_schedule_loops(Arc::clone(&store), HealthBoard::default());
+            let (stop, stopping) = tokio::sync::watch::channel(false);
+            let (local, network) =
+                crate::schedule::start_loops(Arc::clone(&store), HealthBoard::default(), stopping);
             let deadline = Instant::now() + Duration::from_secs(8);
             loop {
                 match received.try_recv() {
@@ -10467,8 +11492,15 @@ pub(crate) mod tests {
             assert_eq!(active[0].id, watch.id);
             assert_eq!(active[0].last_observed, watch.last_observed);
             // All five admissions are proven before releasing the external response.
-            local.abort();
-            network.abort();
+            // A stop ends both timers at once, though the external probe is
+            // still waiting for its answer.
+            stop.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                local.await.unwrap();
+                network.await.unwrap();
+            })
+            .await
+            .expect("a stop ends both schedule timers while a probe is in flight");
         });
         drop(release);
         peer.join().unwrap();
@@ -11888,6 +12920,27 @@ exec '{}' "$@"
             .0
     }
 
+    #[test]
+    fn a_named_bot_is_part_of_the_send_key() {
+        let body = |bot: Option<&str>| SendRequest {
+            sender: Some("agent:ada".into()),
+            to: vec!["telegram:chat:-1007".into()],
+            text: "hello".into(),
+            bot: bot.map(str::to_string),
+            idempotency_key: Some("call-1".into()),
+            ..Default::default()
+        };
+        let unnamed = send_key(&body(None)).unwrap();
+        assert_eq!(send_key(&body(Some("  "))).unwrap(), unnamed);
+        let desk = send_key(&body(Some("@ada_desk_bot"))).unwrap();
+        assert_eq!(send_key(&body(Some("@ADA_DESK_BOT"))).unwrap(), desk);
+        for other in ["@ada_promo_bot", "@bea_bot", "@nobody"] {
+            let key = send_key(&body(Some(other))).unwrap();
+            assert_ne!(key, desk, "{other}");
+            assert_ne!(key, unnamed, "{other}");
+        }
+    }
+
     /// A send that cannot wake an archived recipient (through an alias, or to
     /// several recipients) is refused for it with who answers for it, and
     /// nothing is stored unread. A send with no live recipient fails.
@@ -12391,13 +13444,14 @@ exec '{}' "$@"
             assert_eq!(created.harness, "opencode");
             assert_eq!(created.model.as_deref(), Some("gpt-5.4-mini"));
             let stored = store.agent_by_name("writer-sub-1").unwrap();
+            assert_eq!(stored.instructions.as_deref(), Some("Fix issue #42."));
             assert_eq!(
-                stored.instructions.as_deref(),
+                created.instructions.as_deref(),
                 Some("Always run cargo test before opening a PR.\n\nFix issue #42.")
             );
 
             // Role matching a template slug (`role: "code-reviewer"`) applies template defaults
-            // when `archetype` is omitted.
+            // when `archetype` is omitted, projecting template instructions dynamically.
             let (_, Json(reviewer)) = create_agent_route(
                 Principal::Agent {
                     agent_id: parent.id.clone(),
@@ -12421,8 +13475,13 @@ exec '{}' "$@"
             );
             assert_eq!(reviewer.scope, "siblings");
             let reviewer_stored = store.agent_by_name("reviewer-sub-1").unwrap();
+            assert!(
+                reviewer_stored.instructions.is_none(),
+                "template body must not be baked into sqlite: {:?}",
+                reviewer_stored.instructions
+            );
             assert_eq!(
-                reviewer_stored.instructions.as_deref(),
+                reviewer.instructions.as_deref(),
                 Some("Verify all invariants before approving.")
             );
 
@@ -12557,6 +13616,182 @@ exec '{}' "$@"
             !agents_dir.exists() || std::fs::read_dir(agents_dir).unwrap().next().is_none(),
             "a rejected template must not leave a SYSTEM_PROMPT.md or agent directory"
         );
+    }
+
+    #[test]
+    fn create_agent_route_defaults_omitted_and_empty_role_to_builtin_general() {
+        let _env = env_lock();
+        let prev_home = std::env::var_os("HOME");
+        let prev_owner = std::env::var_os("ANYAGENTS_OWNER_WORKDIR");
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("ANYAGENTS_OWNER_WORKDIR");
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let state = archetype_validation_state(dir.path());
+            for (name, extra) in [
+                ("http-omitted", serde_json::json!({})),
+                ("http-empty", serde_json::json!({ "role": "" })),
+                ("http-general", serde_json::json!({ "role": "general" })),
+            ] {
+                let mut body = serde_json::json!({
+                    "name": name,
+                    "workdir": work,
+                });
+                if let Some(obj) = extra.as_object() {
+                    for (k, v) in obj {
+                        body[k] = v.clone();
+                    }
+                }
+                let (status, Json(agent)) = create_agent_route(
+                    Principal::Operator,
+                    State(state.clone()),
+                    axum::http::HeaderMap::new(),
+                    Json(serde_json::from_value(body).unwrap()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {}: {}", e.status, e.message));
+                assert_eq!(status, StatusCode::CREATED, "{name}");
+                assert_eq!(agent.role.as_deref(), Some("general"), "{name}");
+                assert_eq!(agent.scope, "public", "{name}");
+                assert_eq!(
+                    agent.instructions.as_deref(),
+                    Some(create::BUILTIN_GENERAL_ROLE_BODY),
+                    "{name}"
+                );
+            }
+
+            // Sub-agent with omitted role gets built-in `general` with `private` scope.
+            let (sub_status, Json(sub)) = create_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "http-subagent",
+                        "parent": "http-omitted",
+                        "workdir": work,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("subagent: {}: {}", e.status, e.message));
+            assert_eq!(sub_status, StatusCode::CREATED);
+            assert_eq!(sub.role.as_deref(), Some("general"));
+            assert_eq!(sub.scope, "private");
+            assert_eq!(
+                sub.instructions.as_deref(),
+                Some(create::BUILTIN_GENERAL_ROLE_BODY)
+            );
+
+            // Explicit `public: true` / `public: false` without `scope` on a sub-agent.
+            for (public_flag, expected_scope) in [(true, "public"), (false, "private")] {
+                let (flag_status, Json(flagged)) = create_agent_route(
+                    Principal::Operator,
+                    State(state.clone()),
+                    axum::http::HeaderMap::new(),
+                    Json(
+                        serde_json::from_value(serde_json::json!({
+                            "name": format!("http-sub-public-{public_flag}"),
+                            "parent": "http-omitted",
+                            "public": public_flag,
+                            "workdir": work,
+                        }))
+                        .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("public={public_flag}: {}: {}", e.status, e.message));
+                assert_eq!(flag_status, StatusCode::CREATED);
+                assert_eq!(flagged.role.as_deref(), Some("general"));
+                assert_eq!(flagged.scope, expected_scope);
+            }
+
+            // Caller `description` without `instructions` composes with built-in `general`.
+            let (legacy_status, Json(legacy_sub)) = create_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "http-sub-legacy-desc",
+                        "parent": "http-omitted",
+                        "description": "Legacy HTTP brief",
+                        "workdir": work,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("legacy: {}: {}", e.status, e.message));
+            assert_eq!(legacy_status, StatusCode::CREATED);
+            assert_eq!(legacy_sub.role.as_deref(), Some("general"));
+            assert_eq!(legacy_sub.scope, "private");
+            assert_eq!(
+                legacy_sub.description.as_deref(),
+                Some("Legacy HTTP brief")
+            );
+            assert_eq!(
+                legacy_sub.instructions.as_deref(),
+                Some(
+                    format!("{}\n\nLegacy HTTP brief", create::BUILTIN_GENERAL_ROLE_BODY)
+                        .as_str()
+                )
+            );
+
+            // Workspace .agents/agents/general.md overrides the built-in template even for root.
+            std::fs::create_dir_all(work.join(".agents/agents")).unwrap();
+            std::fs::write(
+                work.join(".agents/agents/general.md"),
+                "---\nname: general\ndescription: HTTP General Override\nscope: private\n---\nHTTP general override body.\n",
+            )
+            .unwrap();
+            let (status, Json(overridden)) = create_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "http-overridden",
+                        "workdir": work,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("override: {}: {}", e.status, e.message));
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(overridden.role.as_deref(), Some("general"));
+            assert_eq!(overridden.scope, "private");
+            assert_eq!(
+                overridden.description.as_deref(),
+                Some("HTTP General Override")
+            );
+            assert!(
+                overridden
+                    .instructions
+                    .as_deref()
+                    .is_some_and(|text| text.contains("HTTP general override body."))
+            );
+        });
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_owner {
+                Some(v) => std::env::set_var("ANYAGENTS_OWNER_WORKDIR", v),
+                None => std::env::remove_var("ANYAGENTS_OWNER_WORKDIR"),
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -15198,6 +16433,183 @@ exec '{}' "$@"
         .unwrap();
         assert_eq!(r.totals.input_tokens, 600);
         assert_eq!(r.buckets.len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn takeover_pages_are_served_under_their_key_on_the_public_listener() {
+        use axum::body::to_bytes;
+        let page = Router::new()
+            .route(
+                "/",
+                get(|uri: axum::http::Uri| async move { uri.to_string() }),
+            )
+            .route("/ws", get(|| async { "ws" }));
+        crate::workstation::takeover::mount_router("k1", page);
+        let call = |uri: &str| {
+            takeover_page_route(
+                axum::extract::Request::get(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let redirect = call("/v1/webhooks/takeover/k1?token=t").await;
+        assert_eq!(redirect.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            redirect.headers()["location"],
+            "/v1/webhooks/takeover/k1/?token=t",
+            "relative assets need a directory URL"
+        );
+        let body = |r: Response| async move {
+            String::from_utf8(to_bytes(r.into_body(), 1 << 16).await.unwrap().to_vec()).unwrap()
+        };
+        assert_eq!(
+            body(call("/v1/webhooks/takeover/k1/?token=t").await).await,
+            "/?token=t"
+        );
+        assert_eq!(body(call("/v1/webhooks/takeover/k1/ws").await).await, "ws");
+        assert_eq!(
+            call("/v1/webhooks/takeover/zz/").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        crate::workstation::takeover::unmount("k1");
+        assert_eq!(
+            call("/v1/webhooks/takeover/k1/").await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_agent_route_waits_on_lifecycle_and_rejects_archived() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let live = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("pause-live", "opencode"))
+            .unwrap();
+        let Json(paused) = pause_agent_route(
+            Principal::Operator,
+            State(state.clone()),
+            AxumPath(live.name.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(paused.state, "paused");
+
+        let archived = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("pause-archived", "opencode"))
+            .unwrap();
+        let held = state.store.lock_agent_lifecycle(&archived.id).unwrap();
+        let route_state = state.clone();
+        let route_name = archived.name.clone();
+        let pending = tokio::spawn(async move {
+            pause_agent_route(
+                Principal::Operator,
+                State(route_state),
+                AxumPath(route_name),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            !pending.is_finished(),
+            "pause ran while lifecycle lock was held"
+        );
+        state
+            .store
+            .set_agent_state(&archived.id, "archived")
+            .unwrap();
+        drop(held);
+        let err = pending.await.unwrap().unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(
+            state.store.agent(&archived.id).unwrap().state,
+            "archived",
+            "pause overwrote archived state"
+        );
+    }
+
+    #[test]
+    fn describe_instruction_update_marks_rotation_and_sets_pending_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = archetype_validation_state(dir.path());
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(ws.join(".agents/agents")).unwrap();
+        std::fs::write(
+            ws.join(".agents/agents/specialist.md"),
+            "---\nname: specialist\ndescription: Role summary\n---\nRole SSOT instructions.",
+        )
+        .unwrap();
+        let mut new = anyagents_core::NewAgent::new("spiron-worker", "spiron");
+        new.role = Some("specialist".into());
+        new.workdir = Some(ws.display().to_string());
+        let created = state.store.create_agent(new).unwrap();
+        let running = state
+            .store
+            .set_agent_running(&created.id, &ws.display().to_string())
+            .unwrap();
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &running.id);
+        create::sync_agent_description_files(&state.store, &running, &cfg).unwrap();
+        let started_ms = now_ms();
+        state.health.publish(
+            &running.id,
+            anyagents_supervisor::LiveState {
+                process_alive: true,
+                turn_state: anyagents_harness::TurnState::Idle,
+                delivery: Some(crate::vendor::declared_delivery("spiron")),
+                quota_reset_at_ms: None,
+                restart_at_ms: None,
+                pid: Some(4242),
+                live_harness: Some("spiron".to_string()),
+                live_model: running.model.clone(),
+                process_started_at_ms: Some(started_ms),
+                last_error: None,
+            },
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let Json(resp) = rt
+            .block_on(set_description_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath("spiron-worker".to_string()),
+                Json(DescriptionRequest {
+                    description: None,
+                    instructions: Some("Custom task v2.".to_string()),
+                    role: None,
+                    scope: None,
+                    lifecycle: None,
+                    public: None,
+                    clear: None,
+                }),
+            ))
+            .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+        assert_eq!(
+            resp["instructions"].as_str(),
+            Some("Role SSOT instructions.\n\nCustom task v2.")
+        );
+        let prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(prompt.contains("Role SSOT instructions."));
+        assert!(prompt.contains("Custom task v2."));
+        let marker: i64 = std::fs::read_to_string(cfg.join(create::INSTRUCTIONS_ROTATED_MARKER))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(marker > started_ms, "marker={marker} started={started_ms}");
+        let updated = state.store.agent(&running.id).unwrap();
+        assert_eq!(updated.instructions.as_deref(), Some("Custom task v2."));
+        file_cache::cache().catch_up();
+        let view = agent_view(&state.store, &state.health, &updated).unwrap();
+        assert!(view.pending_switch);
+        assert_eq!(
+            view.instructions.as_deref(),
+            Some("Role SSOT instructions.\n\nCustom task v2.")
+        );
     }
 }
 

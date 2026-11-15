@@ -3821,9 +3821,20 @@ mod tests {
             "invalid complete JSON record\n",
             "{\"role\":\"assistant\",\"content\":\"validbeta88\"}\n",
         );
-        fs::write(&session, torn).unwrap();
+        // Truncated inside a string used to become an I/O error from
+        // MetadataReader, bypassing the malformed-record fallback entirely.
+        let torn = format!(
+            "{torn}{{\"content\":\"shorttornneedle\n{{\"content\":\"{}longtornneedle\n",
+            "x ".repeat(5000)
+        );
+        fs::write(&session, &torn).unwrap();
         let ids = [agent.id.to_string()];
-        for needle in ["tornalpha99", "validbeta88"] {
+        for needle in [
+            "tornalpha99",
+            "validbeta88",
+            "shorttornneedle",
+            "longtornneedle",
+        ] {
             let q = HistorySearchQuery {
                 query: Some(needle.into()),
                 ..Default::default()
