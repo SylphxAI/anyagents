@@ -38,6 +38,7 @@ use crate::vendor::{self, HarnessHost, VendorHarness};
 
 mod file_cache;
 mod hybrid;
+mod in_flight;
 #[cfg(test)]
 mod latency_tests;
 mod memory_backlog;
@@ -99,13 +100,21 @@ fn run_with_identity(
     host: HarnessHost,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         tokio::select! {
             result = serve(data, runner, identity, host) => result,
             _ = &mut stop => Ok(()),
         }
-    })
+    });
+    // Dropping a runtime waits for every blocking task without end: a call
+    // dropped at the end of the drain may still be in one (a store write
+    // waiting for the writer). Those are abandoned with the process.
+    runtime.shutdown_timeout(RUNTIME_STOP_WITHIN);
+    result
 }
+
+/// What a stopped server's runtime waits for its blocking tasks.
+const RUNTIME_STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The supervisor of a serving kernel. However the kernel stops (a signal, an
 /// error, a test dropping it), its harness processes are left to the next
@@ -463,6 +472,10 @@ async fn serve(
         });
         start_schedule_loops(Arc::clone(&store), state.health.clone());
     }
+    // Set once a stop is requested: every listener (the socket and both TCP
+    // listeners) stops taking connections at once, and calls running on any
+    // of them drain together.
+    let (stopping, _) = tokio::sync::watch::channel(false);
     // `public_listen` decides whether the local TCP listener is also the
     // public one. A configuration file that cannot be read fails closed: no
     // public listener, and the local listener defaults to loopback.
@@ -478,6 +491,7 @@ async fn serve(
     if public_listen.is_none() {
         let _ = std::fs::remove_file(data.join("public.addr"));
     }
+    let mut public_listener = None;
     if let Some(addr) = public_listen {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(tcp_listener) => {
@@ -491,16 +505,14 @@ async fn serve(
                         eprintln!("cannot persist {}: {err}", addr_path.display());
                     }
                 }
-                let public_app = build_public_router(state.clone());
-                tokio::spawn(async move {
-                    let _ = axum::serve(tcp_listener, public_app).await;
-                });
+                public_listener = Some(tcp_listener);
             }
             Err(err) => {
                 eprintln!("warning: public TCP listener ({addr}) did not bind: {err}");
             }
         }
     }
+    let mut webhook_listener = None;
     if let Some(addr) = webhook_listen_addr(public_configured) {
         if public_configured && !binds_loopback(&addr) {
             eprintln!(
@@ -520,41 +532,215 @@ async fn serve(
                         eprintln!("cannot persist {}: {err}", addr_path.display());
                     }
                 }
-                let webhook_app = build_webhook_router(state.clone());
-                tokio::spawn(async move {
-                    let _ = axum::serve(tcp_listener, webhook_app).await;
-                });
+                webhook_listener = Some(tcp_listener);
             }
             Err(err) => {
                 eprintln!("warning: webhook TCP listener ({addr}) did not bind: {err}");
             }
         }
     }
+    {
+        // A spawn the last server stopped part way gets the rest of it (most
+        // often its prompt) before any call is answered on any listener: a call
+        // to list, inspect or delete that agent then sees it whole. Every
+        // listener is already bound, so a client connecting meanwhile waits in
+        // the kernel listen backlog rather than finding no server.
+        let store = Arc::clone(&store);
+        let data = data.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || finish_interrupted_spawns(&store, &data)).await;
+    }
+    let public_task = public_listener.map(|tcp_listener| {
+        let public_app = build_public_router(state.clone());
+        let stop = stopped(&stopping);
+        tokio::spawn(async move {
+            let _ = axum::serve(tcp_listener, public_app)
+                .with_graceful_shutdown(stop)
+                .await;
+        })
+    });
+    let webhook_task = webhook_listener.map(|tcp_listener| {
+        let webhook_app = build_webhook_router(state.clone());
+        let stop = stopped(&stopping);
+        tokio::spawn(async move {
+            let _ = axum::serve(tcp_listener, webhook_app)
+                .with_graceful_shutdown(stop)
+                .await;
+        })
+    });
     let app = build_router(state);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = terminate.recv() => {}
+    let serving = axum::serve(listener, app)
+        .with_graceful_shutdown(stopped(&stopping))
+        .into_future();
+    tokio::pin!(serving);
+    let mut releasing = None;
+    let result = tokio::select! {
+        result = &mut serving => result,
+        () = stop_requested(&mut terminate) => {
+            // From here no new connection is taken: a call made now waits on
+            // the agent's side for the next server (`mcp::RESTART_WAIT`).
+            // Calls already running finish first: dropping a call's future
+            // does not stop its blocking work, and what does stop it is the
+            // process exiting, which can cut a mutation between its steps.
+            eprintln!(
+                "anyagents: stopping; no new calls are taken; waiting up to {}s for {} mutating \
+                 call(s) still running to finish (reads end with the process){}",
+                MUTATION_DRAIN_WITHIN.as_secs(),
+                in_flight::MUTATIONS.running(),
+                if kept {
+                    format!("; this process exits within {}s", STOP_WITHIN.as_secs())
+                } else {
+                    String::new()
+                }
+            );
+            if kept {
+                // A keeper still starting is the next server's to take over:
+                // a call waiting for its `ready` (up to three minutes) returns
+                // now instead of holding the stop.
+                anyagents_keeper::abandon_starts();
+                exit_after(STOP_WITHIN);
             }
-        })
-        .await;
-    // A long poll ends at Telegram, not here: signal the poller to stop first
-    // so released long polls exit instead of re-entering a 30s wait, then
-    // release every bot so each bot's last offset is written before shutdown.
-    poller.signal_stop();
-    if let Err(reason) = crate::telegram::poller::release_every_bot(
-        &store,
-        store.data_dir(),
-        std::time::Duration::from_secs(30),
-    ) {
+            // A long poll ends at Telegram, not here: signal the poller to
+            // stop so released long polls exit instead of re-entering a 30s
+            // wait, and release every bot while the calls drain, so each
+            // bot's last offset is written before shutdown.
+            poller.signal_stop();
+            let release_store = Arc::clone(&store);
+            releasing = Some(tokio::task::spawn_blocking(move || {
+                crate::telegram::poller::release_every_bot(
+                    &release_store,
+                    release_store.data_dir(),
+                    TELEGRAM_RELEASE_WITHIN,
+                )
+            }));
+            let _ = stopping.send(true);
+            // `serving` is polled first so the Unix listener closes at once,
+            // while `settling` keeps waiting even after `serving` has no open
+            // socket connections (for TCP mutations and detached blocking work).
+            let settling = in_flight::MUTATIONS.settle(MUTATION_DRAIN_WITHIN);
+            tokio::pin!(settling);
+            let mut serving_done = false;
+            let mut serve_result = Ok(());
+            let left = loop {
+                tokio::select! {
+                    biased;
+                    result = &mut serving, if !serving_done => {
+                        serving_done = true;
+                        serve_result = result;
+                    }
+                    left = &mut settling => break left,
+                }
+            };
+            if left > 0 {
+                eprintln!(
+                    "anyagents: {left} mutating call(s) still running after {}s end with \
+                     the process; each caller is told its call may or may not have \
+                     applied",
+                    MUTATION_DRAIN_WITHIN.as_secs()
+                );
+            }
+            // Answers of calls that just finished are written out across every
+            // listener; reads still running end with the process.
+            let flush = async {
+                if !serving_done {
+                    serve_result = (&mut serving).await;
+                }
+                if let Some(task) = public_task {
+                    let _ = task.await;
+                }
+                if let Some(task) = webhook_task {
+                    let _ = task.await;
+                }
+            };
+            let _ = tokio::time::timeout(RESPONSE_FLUSH_WITHIN, flush).await;
+            serve_result
+        }
+    };
+    let released = match releasing {
+        Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
+        None => {
+            poller.signal_stop();
+            crate::telegram::poller::release_every_bot(
+                &store,
+                store.data_dir(),
+                TELEGRAM_RELEASE_WITHIN,
+            )
+        }
+    };
+    if let Err(reason) = released {
         eprintln!("anyagents-telegram: shutdown did not release every bot: {reason}");
     }
     poller.stop();
     drop(supervisor);
     let _ = std::fs::remove_file(&path);
     result.map_err(Error::from)
+}
+
+/// How long a stopping server waits for the mutating calls it is running
+/// (spawn, delete, send, schedules, any call but a read) to finish before it
+/// exits. No connection is taken meanwhile; the agents' tool servers wait for
+/// the next server (`mcp::RESTART_WAIT`). A mutation still running after it
+/// ends with the process, and its caller is told the call may or may not have
+/// applied.
+///
+/// A spawn, the longest common mutation, typically takes a few seconds; a
+/// minute covers one that provisions a large checkout, and keeps a restart
+/// well inside the shortest long tool deadline a harness sets (three minutes).
+const MUTATION_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Once the mutations are done, how long their answers get to be written out
+/// before the server stops serving; reads still running end with the process.
+const RESPONSE_FLUSH_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The longest a server whose harnesses live in keepers takes to exit once
+/// told to stop. Past it the process exits at once: its harnesses stay with
+/// their keepers for the next server, exactly as after a crash, and its store
+/// writes are transactions, so a write cut short is not half made.
+pub(crate) const STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(
+    MUTATION_DRAIN_WITHIN.as_secs() + RESPONSE_FLUSH_WITHIN.as_secs() + 13,
+);
+
+/// The wait for Telegram to hand back every bot's long poll at shutdown. It
+/// runs beside the drain. A bot not released in time is polled again by the
+/// next server from its last written offset; the store deduplicates updates
+/// by their source key.
+const TELEGRAM_RELEASE_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolves once the server is told to stop (`stopping` set), or when the
+/// server is gone: every listener stops taking connections then.
+fn stopped(
+    stopping: &tokio::sync::watch::Sender<bool>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let mut told = stopping.subscribe();
+    async move {
+        let _ = told.wait_for(|stop| *stop).await;
+    }
+}
+
+/// SIGINT or SIGTERM.
+async fn stop_requested(terminate: &mut tokio::signal::unix::Signal) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+/// End the process after `within`, however its stop is going: a worker in a
+/// call to a keeper that does not answer, a store write waiting for the
+/// writer, or a poller join cannot keep it alive. Only for a server whose
+/// harnesses live in keepers, which outlive it by design.
+fn exit_after(within: std::time::Duration) {
+    let _ = std::thread::Builder::new()
+        .name("anyagents-stop-deadline".into())
+        .spawn(move || {
+            std::thread::sleep(within);
+            eprintln!(
+                "anyagents: stop still running after {}s; exiting now (harnesses stay with \
+                 their keepers for the next server)",
+                within.as_secs()
+            );
+            std::process::exit(0);
+        });
 }
 
 pub(crate) fn has_explicit_archive_marker(
@@ -1013,6 +1199,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
         )
         .fallback(public_not_found)
         .with_state(state)
+        .layer(axum::middleware::from_fn(in_flight::track))
 }
 
 async fn public_not_found() -> impl IntoResponse {
@@ -1032,6 +1219,7 @@ pub(crate) fn build_webhook_router(state: AppState) -> Router {
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
         .with_state(state)
+        .layer(axum::middleware::from_fn(in_flight::track))
 }
 
 pub(crate) fn build_router(state: AppState) -> Router {
@@ -1114,6 +1302,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
         .with_state(state)
+        .layer(axum::middleware::from_fn(in_flight::track))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1249,20 +1438,6 @@ fn authenticate_mcp_request(
     ))
 }
 
-fn ensure_internal_socket_listener(state: &AppState) -> PathBuf {
-    let data_dir = state.store.data_dir();
-    let sock = socket_path(data_dir);
-    if !sock.exists()
-        && let Ok(listener) = tokio::net::UnixListener::bind(&sock)
-    {
-        let app = build_router(state.clone());
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-    }
-    sock
-}
-
 async fn mcp_get_route(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1370,8 +1545,10 @@ async fn mcp_post(
             internal_token: token,
             ..
         } = caller;
-        let config_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-        let sock = ensure_internal_socket_listener(&state);
+        let data_dir = state.store.data_dir();
+        let config_dir = anyagents_core::agent_config_dir(data_dir, &agent.id);
+        let sock = socket_path(data_dir);
+        let router = build_router(state.clone());
         let _ = std::fs::create_dir_all(&config_dir);
         Ok(crate::mcp::AgentMcp::new_for_http(
             crate::mcp::AgentRef {
@@ -1383,6 +1560,7 @@ async fn mcp_post(
             config_dir,
             token,
             profile,
+            router,
         ))
     })
     .await?;
@@ -1390,10 +1568,13 @@ async fn mcp_post(
     // (`crate::mcp`), so the whole call is driven from a blocking-pool thread:
     // whatever it waits on holds that thread, never an async worker.
     let runtime = tokio::runtime::Handle::current();
-    let answered =
-        tokio::task::spawn_blocking(move || runtime.block_on(mcp.handle_jsonrpc_request(payload)))
-            .await
-            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let call = in_flight::carry();
+    let answered = tokio::task::spawn_blocking(move || {
+        let _call = call;
+        runtime.block_on(mcp.handle_jsonrpc_request(payload))
+    })
+    .await
+    .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     match answered {
         Some(response_json) => Ok(axum::response::IntoResponse::into_response((
             StatusCode::OK,
@@ -3324,7 +3505,11 @@ async fn sign_in_route(
     let runner = Arc::clone(&state.sign_in);
     let root = state.store.data_dir().to_path_buf();
     let mark = capability_mark(Arc::clone(&state.store));
+    // The response streams while the sign-in runs, so the call's future ends
+    // before its work: the work holds the call open for a stop (`in_flight`).
+    let call = in_flight::carry();
     let spawned = tokio::task::spawn_blocking(move || {
+        let _call = call;
         let mut sink = ChannelSink { tx };
         let mut guard = runner.lock().unwrap_or_else(|err| err.into_inner());
         let result = sign_in(
@@ -4438,7 +4623,7 @@ async fn create_agent_route(
         );
         require_remote_callback(state.store.data_dir(), &harness)?;
         refuse_host_placement_over_http(via_http, &harness)?;
-        let mut agent = create::create(
+        let agent = create::create(
             &state.store,
             state.store.data_dir(),
             CreateRequest {
@@ -4469,108 +4654,35 @@ async fn create_agent_route(
             Principal::Operator => "operator".to_string(),
             Principal::Agent { name, .. } => format!("agent:{name}"),
         };
-        let mut scope_changed = false;
-        if let Some(ref scope_val) = body.scope {
-            agent = state
-                .store
-                .set_agent_scope_as(&agent.id, scope_val, &actor)
-                .map_err(ApiError::from_store)?;
-            scope_changed = true;
-        } else if body.public == Some(true) {
-            agent = state
-                .store
-                .set_agent_public_as(&agent.id, true, &actor)
-                .map_err(ApiError::from_store)?;
-            scope_changed = true;
-        } else if body.public == Some(false) {
-            agent = state
-                .store
-                .set_agent_public_as(&agent.id, false, &actor)
-                .map_err(ApiError::from_store)?;
-            scope_changed = true;
+        let finish = SpawnFinish {
+            actor,
+            caller: caller_agent.as_ref().map(|(id, _)| id.to_string()),
+            scope: body.scope,
+            public: body.public,
+            lifecycle: body.lifecycle,
+            groups: requested_groups,
+            prompt: body
+                .prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        };
+        // The agent is admitted. What the spawn still does is recorded beside
+        // it first, so a server stopped part way finishes it at its next start
+        // (`finish_interrupted_spawns`) instead of leaving an agent without its
+        // prompt and a parent waiting for it.
+        let marker = spawn_finish_marker(state.store.data_dir(), &agent.id);
+        if let Err(error) = record_spawn_finish(&marker, &finish) {
+            eprintln!(
+                "warning: spawn of {} not recorded for recovery ({error}); finishing it now",
+                agent.name
+            );
         }
-        if let Some(ref lifecycle_val) = body.lifecycle {
-            agent = state
-                .store
-                .set_agent_lifecycle_as(&agent.id, lifecycle_val, &actor)
-                .map_err(ApiError::from_store)?;
-        }
-        if scope_changed {
-            let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-            create::sync_agent_description_files(&state.store, &agent, &cfg)
-                .map_err(ApiError::from_store)?;
-        }
-        if !requested_group_names.is_empty() {
-            let mut targets = vec![agent.id.clone()];
-            if let Some((caller_id, _)) = &caller_agent {
-                targets.push(caller_id.clone());
-            }
-            state
-                .store
-                .join_groups_as(&group_actor, &requested_group_names, &targets)
-                .map_err(ApiError::from_store)?;
-        }
-        if !anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id)
-            .join("mcp-capability")
-            .is_file()
-        {
-            operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
-        }
-        let mut has_prompt = false;
-        if let Some(prompt) = body
-            .prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            has_prompt = true;
-            let sender = caller_agent
-                .as_ref()
-                .map(|(id, _)| format!("agent:{id}"))
-                .unwrap_or_else(|| "operator".to_string());
-            let enqueue = || {
-                let message = state
-                    .store
-                    .receive(
-                        &agent.id,
-                        Incoming {
-                            text: prompt.to_string(),
-                            sender: Some(sender),
-                            source_time_ms: None,
-                            source_key: None,
-                            reply_to: None,
-                            quote: None,
-                            origin: None,
-                            received_at_ms: None,
-                        },
-                    )
-                    .map_err(ApiError::from_store)?;
-                let (message, duplicate) = match message {
-                    ReceiveOutcome::New(message) => (message, false),
-                    ReceiveOutcome::Duplicate(message) => (message, true),
-                };
-                Ok(vec![Delivery {
-                    to: format!("agent:{}", agent.name),
-                    id: message.id.to_string(),
-                    seq: message.seq,
-                    duplicate,
-                }])
-            };
-            if let Some((ref caller_id, _)) = caller_agent {
-                outbound_history::deliver(
-                    &state.store,
-                    caller_id,
-                    &format!("agent:{}", agent.name),
-                    None,
-                    prompt,
-                    None,
-                    false,
-                    enqueue,
-                )?;
-            } else {
-                enqueue()?;
-            }
-        }
+        let finished = finish_spawn(&state.store, state.store.data_dir(), agent, &finish);
+        // Done, or refused: either way nothing is left for a restart to redo.
+        let _ = std::fs::remove_file(&marker);
+        let (agent, has_prompt) = finished?;
         if has_prompt {
             create::poke_agent_wake_socket_mail(state.store.data_dir(), &agent.id);
         } else {
@@ -4580,6 +4692,185 @@ async fn create_agent_route(
         Ok((StatusCode::CREATED, Json(view)))
     })
     .await
+}
+
+/// What a spawn does once its agent is admitted: scope, lifecycle, groups,
+/// capability and the first prompt. Recorded in the agent's config directory
+/// while it runs ([`SPAWN_FINISH_FILE`]); every step is idempotent, so it can
+/// be run again after a stop.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, Deserialize)]
+struct SpawnFinish {
+    /// Who spawned: `operator` or `agent:<name>`, for the audit.
+    actor: String,
+    /// The spawning agent's id: the prompt's sender and a group member.
+    caller: Option<String>,
+    scope: Option<String>,
+    public: Option<bool>,
+    lifecycle: Option<String>,
+    groups: Vec<String>,
+    prompt: Option<String>,
+}
+
+/// The record of a spawn still finishing, beside the agent's config.
+const SPAWN_FINISH_FILE: &str = ".anyagents-spawn-finish.json";
+
+fn spawn_finish_marker(data_dir: &Path, agent_id: &anyagents_core::AgentId) -> PathBuf {
+    anyagents_core::agent_config_dir(data_dir, agent_id).join(SPAWN_FINISH_FILE)
+}
+
+fn record_spawn_finish(marker: &Path, finish: &SpawnFinish) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(finish).map_err(std::io::Error::other)?;
+    anyagents_harness::atomic_write_nonempty_file(marker, &bytes, 0o600)
+}
+
+/// Run what a spawn does after admission. The prompt carries a source key of
+/// its own, so a second run delivers it once.
+fn finish_spawn(
+    store: &Store,
+    data_dir: &Path,
+    mut agent: Agent,
+    finish: &SpawnFinish,
+) -> Result<(Agent, bool), ApiError> {
+    let caller = finish
+        .caller
+        .as_deref()
+        .map(anyagents_core::AgentId::parse)
+        .transpose()
+        .map_err(ApiError::from_store)?;
+    let actor = finish.actor.as_str();
+    let mut scope_changed = false;
+    if let Some(ref scope_val) = finish.scope {
+        agent = store
+            .set_agent_scope_as(&agent.id, scope_val, actor)
+            .map_err(ApiError::from_store)?;
+        scope_changed = true;
+    } else if let Some(public) = finish.public {
+        agent = store
+            .set_agent_public_as(&agent.id, public, actor)
+            .map_err(ApiError::from_store)?;
+        scope_changed = true;
+    }
+    if let Some(ref lifecycle_val) = finish.lifecycle {
+        agent = store
+            .set_agent_lifecycle_as(&agent.id, lifecycle_val, actor)
+            .map_err(ApiError::from_store)?;
+    }
+    if scope_changed {
+        let cfg = anyagents_core::agent_config_dir(data_dir, &agent.id);
+        create::sync_agent_description_files(store, &agent, &cfg).map_err(ApiError::from_store)?;
+    }
+    if !finish.groups.is_empty() {
+        let names: Vec<&str> = finish.groups.iter().map(String::as_str).collect();
+        let mut targets = vec![agent.id.clone()];
+        let group_actor = match &caller {
+            Some(caller_id) => {
+                targets.push(caller_id.clone());
+                anyagents_core::GroupActor::Agent(caller_id.clone())
+            }
+            None => anyagents_core::GroupActor::Operator,
+        };
+        store
+            .join_groups_as(&group_actor, &names, &targets)
+            .map_err(ApiError::from_store)?;
+    }
+    if !anyagents_core::agent_config_dir(data_dir, &agent.id)
+        .join("mcp-capability")
+        .is_file()
+    {
+        operator::mint(store, &agent.id).map_err(ApiError::from_store)?;
+    }
+    let Some(prompt) = finish.prompt.as_deref() else {
+        return Ok((agent, false));
+    };
+    let sender = caller
+        .as_ref()
+        .map(|id| format!("agent:{id}"))
+        .unwrap_or_else(|| "operator".to_string());
+    let key = format!("spawn-prompt:{}", agent.id);
+    let enqueue = || {
+        let message = store
+            .receive(
+                &agent.id,
+                Incoming {
+                    text: prompt.to_string(),
+                    sender: Some(sender),
+                    source_time_ms: None,
+                    source_key: Some(key.clone()),
+                    reply_to: None,
+                    quote: None,
+                    origin: None,
+                    received_at_ms: None,
+                },
+            )
+            .map_err(ApiError::from_store)?;
+        let (message, duplicate) = match message {
+            ReceiveOutcome::New(message) => (message, false),
+            ReceiveOutcome::Duplicate(message) => (message, true),
+        };
+        Ok(vec![Delivery {
+            to: format!("agent:{}", agent.name),
+            id: message.id.to_string(),
+            seq: message.seq,
+            duplicate,
+        }])
+    };
+    if let Some(ref caller_id) = caller {
+        outbound_history::deliver(
+            store,
+            caller_id,
+            &format!("agent:{}", agent.name),
+            None,
+            prompt,
+            Some(&key),
+            true,
+            enqueue,
+        )?;
+    } else {
+        enqueue()?;
+    }
+    Ok((agent, true))
+}
+
+/// Finish the spawns a stopped server left part way: each live agent whose
+/// config still holds [`SPAWN_FINISH_FILE`] gets the rest of its spawn (most
+/// often its first prompt). Run once at start, before any call is answered;
+/// a spawn that cannot be finished keeps its record for the next start.
+fn finish_interrupted_spawns(store: &Store, data_dir: &Path) -> usize {
+    let Ok(agents) = store.list_live_agents() else {
+        return 0;
+    };
+    let mut finished = 0;
+    for agent in agents {
+        let marker = spawn_finish_marker(data_dir, &agent.id);
+        let Ok(bytes) = std::fs::read(&marker) else {
+            continue;
+        };
+        let name = agent.name.clone();
+        let id = agent.id.clone();
+        match serde_json::from_slice::<SpawnFinish>(&bytes)
+            .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))
+            .and_then(|finish| finish_spawn(store, data_dir, agent, &finish))
+        {
+            Ok((_, has_prompt)) => {
+                let _ = std::fs::remove_file(&marker);
+                eprintln!("anyagents: finished the interrupted spawn of {name}");
+                if has_prompt {
+                    create::poke_agent_wake_socket_mail(data_dir, &id);
+                } else {
+                    create::poke_agent_wake_socket(data_dir, &id);
+                }
+                finished += 1;
+            }
+            // Kept: the next start tries again (every step is idempotent),
+            // so a passing failure (a busy store) never loses the spawn.
+            Err(error) => eprintln!(
+                "anyagents: the interrupted spawn of {name} could not be finished (kept for the \
+                 next start): {}",
+                error.message
+            ),
+        }
+    }
+    finished
 }
 
 async fn archive_agent_route(
@@ -4685,8 +4976,9 @@ fn reap_subagent_ephemeral_dirs_in(
     data_dir: &Path,
     agent_id: &anyagents_core::AgentId,
 ) -> bool {
-    // Delete calls this after removing the row; all surviving references still
-    // protect their workdirs. A failed read must never mean no shared workdirs.
+    // Archive reaping calls this with the row archived, and delete before it
+    // removes the row; all surviving references still protect their
+    // workdirs. A failed read must never mean no shared workdirs.
     let agent = match store.agent(agent_id) {
         Ok(agent) => Some(agent),
         Err(Error::AgentNotFound(_)) => None,
@@ -5216,35 +5508,32 @@ async fn delete_agent_route(
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        let deleted = state
-            .store
-            .delete_agent(&found.id)
-            .map_err(ApiError::from_store)?;
+        // Everything the agent's name or identity keys on disk goes before its
+        // row: a stop between the two then leaves an archived row that holds
+        // the name and a delete that can be run again, never a free name
+        // whose next agent inherits the old browser profile or config.
         let agent_dir = state
             .store
             .data_dir()
             .join("agents")
-            .join(deleted.id.as_str());
-        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&agent_dir.join("config"))
-        {
+            .join(found.id.as_str());
+        let data_dir = state.store.data_dir();
+        let config = agent_dir.join("config");
+        let seat_ids = detect_seat_ids(&config);
+        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&config) {
             let _ = anyagents_tools::SandboxProvider::destroy(&sbx);
         }
-        let seat_ids = detect_seat_ids(&agent_dir.join("config"));
-        let _ = crate::browser::stop_profile(state.store.data_dir(), &deleted.name);
-        remove_path_with_seat(
-            &state
-                .store
-                .data_dir()
-                .join("browser-profiles")
-                .join(&deleted.name),
-            seat_ids,
+        reap_subagent_ephemeral_dirs_in(&state.store, data_dir, &found.id);
+        remove_agent_identity_files(data_dir, &found, &agent_dir, seat_ids);
+        let deleted = state
+            .store
+            .delete_agent(&found.id)
+            .map_err(ApiError::from_store)?;
+        let _ = std::fs::remove_file(
+            data_dir
+                .join("locks")
+                .join(format!("{}.lock", deleted.id.as_str())),
         );
-        reap_subagent_ephemeral_dirs_in(&state.store, state.store.data_dir(), &deleted.id);
-        for private_tree in ["config", "memory", "skills"] {
-            let tree_path = agent_dir.join(private_tree);
-            remove_path_with_seat(&tree_path, seat_ids);
-            let _ = std::fs::remove_dir_all(&tree_path);
-        }
         if !agent_dir.join("work").exists() {
             remove_path_with_seat(&agent_dir, seat_ids);
             let _ = std::fs::remove_dir_all(&agent_dir);
@@ -5256,6 +5545,28 @@ async fn delete_agent_route(
         })))
     })
     .await
+}
+
+/// Remove what an agent being deleted keeps under its identity: its browser
+/// profile (keyed by name, so a later agent of the same name would inherit
+/// it) and its private config, memory and skills trees. Idempotent: a delete
+/// stopped part way runs it again.
+fn remove_agent_identity_files(
+    data_dir: &Path,
+    agent: &Agent,
+    agent_dir: &Path,
+    seat_ids: Option<(u32, u32, u32)>,
+) {
+    let _ = crate::browser::stop_profile(data_dir, &agent.name);
+    remove_path_with_seat(
+        &data_dir.join("browser-profiles").join(&agent.name),
+        seat_ids,
+    );
+    for private_tree in ["config", "memory", "skills"] {
+        let tree_path = agent_dir.join(private_tree);
+        remove_path_with_seat(&tree_path, seat_ids);
+        let _ = std::fs::remove_dir_all(&tree_path);
+    }
 }
 
 async fn wake_agent_route(
@@ -8280,7 +8591,15 @@ async fn web_route(
 async fn spawn_store<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    match tokio::task::spawn_blocking(work).await {
+    // The call counts toward a stop until this work returns, even if the
+    // call's future is dropped first (`in_flight`).
+    let call = in_flight::carry();
+    match tokio::task::spawn_blocking(move || {
+        let _call = call;
+        work()
+    })
+    .await
+    {
         Ok(result) => result,
         Err(err) => Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -10133,6 +10452,383 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         true
+    }
+
+    #[test]
+    fn an_interrupted_spawn_gets_its_prompt_once_at_the_next_start() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("child", "codex");
+        new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new).unwrap();
+        let finish = SpawnFinish {
+            actor: "agent:parent".into(),
+            caller: Some(parent.id.to_string()),
+            scope: None,
+            public: None,
+            lifecycle: Some("task".into()),
+            groups: Vec::new(),
+            prompt: Some("build the thing".into()),
+        };
+        // The server stopped after admitting the child, before its prompt.
+        let marker = spawn_finish_marker(data, &child.id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        record_spawn_finish(&marker, &finish).unwrap();
+
+        assert_eq!(finish_interrupted_spawns(&store, data), 1);
+        assert!(!marker.exists());
+        let inbox = store.inbox(&child.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "build the thing");
+        assert_eq!(
+            inbox[0].sender.as_deref(),
+            Some(format!("agent:{}", parent.id).as_str())
+        );
+        assert_eq!(
+            store.agent(&child.id).unwrap().lifecycle().to_string(),
+            "task"
+        );
+
+        // Stopped again after the prompt landed but before the record went:
+        // the next start finishes without a second prompt.
+        record_spawn_finish(&marker, &finish).unwrap();
+        assert_eq!(finish_interrupted_spawns(&store, data), 1);
+        assert_eq!(store.inbox(&child.id, None).unwrap().len(), 1);
+        assert_eq!(finish_interrupted_spawns(&store, data), 0);
+    }
+
+    #[test]
+    fn an_interrupted_spawn_that_cannot_finish_keeps_its_record_for_the_next_start() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        let child = store
+            .create_agent(anyagents_core::NewAgent::new("child", "codex"))
+            .unwrap();
+        let mut finish = SpawnFinish {
+            actor: "operator".into(),
+            caller: None,
+            scope: None,
+            public: None,
+            // Refused by the store: this start cannot finish the spawn.
+            lifecycle: Some("not-a-lifecycle".into()),
+            groups: Vec::new(),
+            prompt: Some("build the thing".into()),
+        };
+        let marker = spawn_finish_marker(data, &child.id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        record_spawn_finish(&marker, &finish).unwrap();
+
+        assert_eq!(finish_interrupted_spawns(&store, data), 0);
+        assert!(
+            marker.exists(),
+            "a failed finish dropped the spawn's record"
+        );
+        assert!(store.inbox(&child.id, None).unwrap().is_empty());
+
+        // The next start can: the prompt lands and only then the record goes.
+        finish.lifecycle = Some("task".into());
+        record_spawn_finish(&marker, &finish).unwrap();
+        assert_eq!(finish_interrupted_spawns(&store, data), 1);
+        assert!(!marker.exists());
+        assert_eq!(store.inbox(&child.id, None).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_listener_stops_taking_calls_when_the_server_is_told_to_stop() {
+        let (stopping, _) = tokio::sync::watch::channel(false);
+        let socket = stopped(&stopping);
+        let public = stopped(&stopping);
+        tokio::pin!(socket, public);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut socket)
+                .await
+                .is_err(),
+            "stopped before the stop"
+        );
+        let _ = stopping.send(true);
+        tokio::time::timeout(std::time::Duration::from_secs(1), socket)
+            .await
+            .expect("the socket listener kept taking calls");
+        tokio::time::timeout(std::time::Duration::from_secs(1), public)
+            .await
+            .expect("a TCP listener kept taking calls");
+        // A listener started after the stop stops at once; so does one whose
+        // server is gone.
+        tokio::time::timeout(std::time::Duration::from_secs(1), stopped(&stopping))
+            .await
+            .unwrap();
+        let (gone, _) = tokio::sync::watch::channel(false);
+        let orphan = stopped(&gone);
+        drop(gone);
+        tokio::time::timeout(std::time::Duration::from_secs(1), orphan)
+            .await
+            .unwrap();
+    }
+
+    /// A write arriving on either TCP listener (public or local webhook)
+    /// counts toward the stop until it is done, as on the socket.
+    #[test]
+    fn writes_on_the_tcp_listeners_hold_the_stop() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let state = AppState {
+            store,
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use tokio::io::AsyncWriteExt;
+            for (name, router) in [
+                ("public", build_public_router(state.clone())),
+                ("webhook", build_webhook_router(state.clone())),
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let served = tokio::spawn(async move {
+                    let _ = axum::serve(listener, router).await;
+                });
+                // A webhook whose body is still arriving: the call is running.
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                stream
+                    .write_all(
+                        b"POST /v1/webhooks/telegram/some-channel HTTP/1.1\r\nhost: x\r\n\
+                          content-type: application/json\r\ncontent-length: 100\r\n\r\n{",
+                    )
+                    .await
+                    .unwrap();
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while in_flight::MUTATIONS.running() == 0 && std::time::Instant::now() < until {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                assert!(
+                    in_flight::MUTATIONS.running() > 0,
+                    "a write on the {name} listener does not hold the stop"
+                );
+                drop(stream);
+                served.abort();
+                in_flight::MUTATIONS
+                    .settle(std::time::Duration::from_secs(5))
+                    .await;
+            }
+        });
+    }
+
+    /// A streaming sign-in returns its response headers before the blocking
+    /// vendor command finishes, so its carried `in_flight` token must keep the
+    /// stop waiting until the blocking work and capability rotation return.
+    #[test]
+    fn sign_in_route_carries_in_flight_token_until_blocking_work_finishes() {
+        struct HeldSignIn {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl CommandRunner for HeldSignIn {
+            fn run(
+                &mut self,
+                _program: &str,
+                _args: &[String],
+                _dir: &Path,
+                _env: &[(&str, &str)],
+                on_line: &mut dyn LineSink,
+            ) -> Result<(), InstallError> {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+                on_line.line("SIGNED_IN ada@example");
+                Ok(())
+            }
+        }
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let state = AppState {
+            store,
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(HeldSignIn {
+                entered: entered_tx,
+                release: release_rx,
+            })),
+            auth: auth::Mode::Confined {
+                operator_digest: Some(auth::operator_digest("test-op-token")),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use hyper::service::Service as _;
+            let router = build_router(state);
+            let service = hyper_util::service::TowerToHyperService::new(router);
+            let req = hyper::Request::builder()
+                .method("POST")
+                .uri("http://localhost/v1/harnesses/codex/sign-in")
+                .header(crate::operator::HEADER, "test-op-token")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .unwrap();
+            let response = service.call(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            tokio::task::spawn_blocking(move || {
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("blocking sign-in started");
+            })
+            .await
+            .unwrap();
+            // Even after the handler future returned its streaming response
+            // (and even if the caller drops the body), the blocking task still
+            // holds its carried `in_flight` token until `sign_in` finishes.
+            drop(response);
+            assert!(
+                in_flight::MUTATIONS.running() > 0,
+                "streaming sign-in dropped its in_flight token before blocking work finished"
+            );
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                in_flight::MUTATIONS
+                    .settle(std::time::Duration::from_secs(5))
+                    .await,
+                0
+            );
+        });
+    }
+
+    /// An admitted HTTP MCP call runs against the server's in-process router
+    /// instead of dialing `anyagents.sock`: when `stopping` has already closed
+    /// the external socket listener (leaving a refusing socket file on disk),
+    /// an in-flight `POST /v1/webhooks/mcp` finishes at once instead of
+    /// self-deadlocking the mutation drain on `ECONNREFUSED`.
+    #[test]
+    fn http_mcp_post_completes_in_process_while_external_socket_refuses() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let cloud = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("cloud-drain", "claude-cloud"))
+            .unwrap();
+        let peer = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("peer-drain", "claude-code"))
+            .unwrap();
+        crate::remote::begin_session(&state.store, &cloud).unwrap();
+        let cloud_cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &cloud.id);
+        let remote = crate::remote::session_token(&cloud_cfg).unwrap();
+
+        // Simulate shutdown after `stopping`: `anyagents.sock` stays on disk
+        // while its external listener is closed (`ECONNREFUSED`).
+        let sock = socket_path(dir.path());
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        assert!(sock.exists());
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use http_body_util::BodyExt as _;
+            use hyper::service::Service as _;
+            let public = build_public_router(state.clone());
+            let service = hyper_util::service::TowerToHyperService::new(public);
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "send",
+                    "arguments": {
+                        "to": ["peer-drain"],
+                        "text": "draining cleanly"
+                    }
+                }
+            });
+            let req = hyper::Request::builder()
+                .method("POST")
+                .uri("http://localhost/v1/webhooks/mcp")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {remote}"),
+                )
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(http_body_util::Full::new(bytes::Bytes::from(
+                    serde_json::to_vec(&payload).unwrap(),
+                )))
+                .unwrap();
+            let started = std::time::Instant::now();
+            let response = service.call(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "HTTP MCP call stalled on closed external socket: {:?}",
+                started.elapsed()
+            );
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_ne!(body["result"]["isError"], serde_json::json!(true), "{body}");
+            let messages = state.store.inbox(&peer.id, None).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].text, "draining cleanly");
+        });
+    }
+
+    #[test]
+    fn a_deleted_agents_name_frees_only_after_its_profile_and_config_are_gone() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("shopper", "codex"))
+            .unwrap();
+        let agent_dir = data.join("agents").join(agent.id.as_str());
+        let profile = data.join("browser-profiles").join("shopper");
+        for path in [
+            agent_dir.join("config"),
+            agent_dir.join("memory"),
+            profile.join("user-data"),
+        ] {
+            std::fs::create_dir_all(&path).unwrap();
+        }
+        std::fs::write(profile.join("user-data").join("Cookies"), b"logged-in").unwrap();
+        // The delete route removes these before the row; the row still holds
+        // the name, so no agent can take it while they exist.
+        remove_agent_identity_files(data, &agent, &agent_dir, None);
+        assert!(!profile.exists());
+        assert!(!agent_dir.join("config").exists());
+        assert!(!agent_dir.join("memory").exists());
+        assert!(
+            store
+                .create_agent(anyagents_core::NewAgent::new("shopper", "codex"))
+                .is_err()
+        );
+        // Run again after a stop part way: nothing left, nothing fails.
+        remove_agent_identity_files(data, &agent, &agent_dir, None);
+        store.delete_agent(&agent.id).unwrap();
+        let reused = store
+            .create_agent(anyagents_core::NewAgent::new("shopper", "codex"))
+            .unwrap();
+        assert_ne!(reused.id, agent.id);
+        assert!(!profile.join("user-data").join("Cookies").exists());
     }
 
     #[test]
