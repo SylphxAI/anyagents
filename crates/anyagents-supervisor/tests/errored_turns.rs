@@ -5,7 +5,7 @@
 
 mod support;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use std::time::{Duration, Instant};
 
 use anyagents_core::{Incoming, MAX_ERRORED_TURNS, NewAgent, SYSTEM_SENDER, Store};
@@ -22,13 +22,15 @@ const UNAVAILABLE: &str = "Sylphx AI failure Some(\"service_unavailable\"): The 
 
 /// A vendor whose turns end at once: the next `fail` of them with `error`
 /// (as Spiron reports a turn the model refused), the rest completed.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Vendor {
     fail: usize,
     error: Option<&'static str>,
     served: u32,
     fault: Option<String>,
     given: Vec<(String, String)>,
+    attempts: Vec<String>,
+    launches: usize,
 }
 
 struct ErroringHarness {
@@ -38,15 +40,15 @@ struct ErroringHarness {
 impl Harness for ErroringHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         let mut vendor = self.vendor.lock().unwrap();
+        vendor.attempts.push(message.id.clone());
         if vendor.given.iter().any(|(id, _)| id == &message.id) {
-            return Ok(DeliverOutcome::Accepted {
-                turn_finished: true,
-            });
+            return Ok(DeliverOutcome::Duplicate);
         }
         vendor
             .given
             .push((message.id.clone(), message.text.clone()));
-        // Each input is one turn, and its result comes back at once.
+        // Each new input is consumed and finished before returning. No input
+        // remains outstanding; duplicates never advance the terminal counter.
         vendor.served += 1;
         vendor.fault = if vendor.fail > 0 {
             vendor.fail -= 1;
@@ -143,6 +145,7 @@ fn start_with(fail: usize, error: Option<&'static str>, clock: Arc<dyn Clock>) -
                 if request.agent.name != "worker" {
                     return Err("not under test".to_string());
                 }
+                vendor.lock().unwrap().launches += 1;
                 Ok(ErroringHarness {
                     vendor: Arc::clone(&vendor),
                 })
@@ -299,6 +302,146 @@ fn turns_that_keep_erroring_park_the_agent_and_tell_its_parent() {
         .has_open_turn(&fx.worker.id)
         .unwrap()));
     support::stop(fx.supervisor);
+}
+
+// Record the actual installed deadline, rather than racing durable error
+// persistence (which precedes installation of the in-memory follow-up).
+struct RecordingClock {
+    inner: ManualClock,
+    waits: Mutex<Vec<(i64, Option<i64>)>>,
+}
+
+impl Clock for RecordingClock {
+    fn now_ms(&self) -> i64 {
+        self.inner.now_ms()
+    }
+    fn wait(&self, deadline: Option<i64>, woken: &Arc<AtomicBool>) -> bool {
+        self.waits.lock().unwrap().push((self.now_ms(), deadline));
+        self.inner.wait(deadline, woken)
+    }
+    fn poke(&self) {
+        self.inner.poke();
+    }
+}
+
+// This fixture proves terminal consumption using a new, nonduplicate served
+// counter and Idle with no outstanding inputs. It does not infer a terminal
+// result from an arbitrary provider error or authorise replay of partial work.
+fn terminal_systemic_fault_keeps_backoff_and_queued_mail(error: &'static str) {
+    let clock = ManualClock::new(1_700_000_000_000);
+    let recorded = Arc::new(RecordingClock {
+        inner: clock.clone(),
+        waits: Mutex::new(Vec::new()),
+    });
+    let fx = start_with(1, Some(error), recorded.clone());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fx.store
+            .receive(&fx.worker.id, Incoming::new("original task"))
+            .unwrap();
+        assert!(wait_until(|| fx.vendor.lock().unwrap().given.len() == 1));
+        clock.set_ms(clock.now_ms() + 1_000);
+        assert!(wait_until(|| fx
+            .store
+            .turn_errors(&fx.worker.id)
+            .unwrap()
+            .is_some_and(
+                |errors| errors.last_error.as_deref() == Some(error)
+            )));
+        assert!(wait_until(|| {
+            recorded.waits.lock().unwrap().iter().any(|(_, deadline)| {
+                deadline.is_some_and(|at| (1_700_000_015_000..=1_700_000_016_000).contains(&at))
+            }) || fx.vendor.lock().unwrap().attempts.len() > 1
+        }));
+        let (original_id, attempts) = {
+            let vendor = fx.vendor.lock().unwrap();
+            (vendor.given[0].0.clone(), vendor.attempts.clone())
+        };
+        assert_eq!(attempts.as_slice(), std::slice::from_ref(&original_id));
+        let deadline = recorded
+            .waits
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|(_, deadline)| {
+                deadline.filter(|at| (1_700_000_015_000..=1_700_000_016_000).contains(at))
+            })
+            .unwrap();
+        let observed = recorded.waits.lock().unwrap().len();
+        fx.store
+            .receive(&fx.worker.id, Incoming::new("mail during backoff"))
+            .unwrap();
+        // A mailbox wake must neither erase the terminal follow-up nor bypass its
+        // deadline. Process replacement must not turn it into an open-turn replay.
+        clock.set_ms(deadline - 1);
+        assert!(wait_until(
+            || recorded.waits.lock().unwrap()[observed..].contains(&(deadline - 1, Some(deadline)))
+        ));
+        {
+            let vendor = fx.vendor.lock().unwrap().clone();
+            assert_eq!(
+                vendor.attempts.as_slice(),
+                std::slice::from_ref(&original_id)
+            );
+            assert_eq!(vendor.launches, 1);
+        }
+        assert!(fx.store.has_open_turn(&fx.worker.id).unwrap());
+        assert_eq!(fx.store.agent(&fx.worker.id).unwrap().state, "running");
+        clock.set_ms(deadline);
+        assert!(wait_until(|| fx.vendor.lock().unwrap().given.len() == 3));
+        assert!(wait_until(|| !fx
+            .store
+            .has_open_turn(&fx.worker.id)
+            .unwrap()));
+        {
+            let vendor = fx.vendor.lock().unwrap().clone();
+            assert_eq!(
+                vendor.launches, 1,
+                "a proven terminal fault needs no replacement"
+            );
+            assert_eq!(
+                vendor.attempts.len(),
+                3,
+                "count duplicate attempts, not just effects"
+            );
+            assert_eq!(
+                vendor
+                    .attempts
+                    .iter()
+                    .filter(|id| *id == &original_id)
+                    .count(),
+                1
+            );
+            assert!(
+                vendor
+                    .given
+                    .iter()
+                    .any(|(_, text)| text == "mail during backoff")
+            );
+            assert_eq!(
+                vendor
+                    .given
+                    .iter()
+                    .filter(|(id, text)| id != &original_id && text.contains("[Recovery]"))
+                    .count(),
+                1
+            );
+        }
+        assert!(notices(&fx.store, &fx.lead).is_empty());
+    }));
+    support::stop(fx.supervisor);
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[test]
+fn exact_unavailable_receipt_preserves_terminal_backoff_and_mail() {
+    terminal_systemic_fault_keeps_backoff_and_queued_mail(UNAVAILABLE);
+}
+
+#[test]
+fn transient_text_cannot_discard_proven_terminal_backoff_and_mail() {
+    terminal_systemic_fault_keeps_backoff_and_queued_mail("HTTP 503: service unavailable");
 }
 
 /// A provider that is unavailable is the fleet's trouble, not the agent's:
