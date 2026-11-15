@@ -243,22 +243,26 @@ fn a_failed_probe_costs_no_restart() {
 }
 
 /// A cascade that refuses a steer at a step boundary (a step under way)
-/// queued nothing: the message is sent again after a pause and the running
-/// turn takes it at its next step, not at its end. Nothing is applied twice.
+/// queued nothing: later mail waiting behind it yields rather than overtaking
+/// it, the head message is sent again after a pause, and the running turn
+/// takes both in order at its next step. Nothing is applied twice.
 #[test]
 fn a_refused_steer_is_sent_again_into_the_running_turn() {
     let mut world = World::<Agy>::new();
     let first = world.prompt();
     world.fixture.command("refuse");
-    let second = world.receive(1).remove(0);
-    world.pump_until("the refused steer is sent again", |w| {
-        sends(&w.fixture, second.id.as_str()) == 2
+    let mut two = world.receive(2);
+    let third = two.pop().unwrap();
+    let second = two.pop().unwrap();
+    world.pump_until("both messages are queued after the refusal", |w| {
+        let held = queued(&w.fixture);
+        held.contains(&second.id.to_string()) && held.contains(&third.id.to_string())
     });
-    commit_queued(&mut world, &second);
     assert!(world.fixture.in_turn(), "waited for the turn to end");
-    // A later message is not held behind the refusal either.
-    let third = world.receive(1).remove(0);
-    commit_queued(&mut world, &third);
+    world.fixture.command("step");
+    world.pump_until("the step commits both in order", |w| {
+        w.cursor() == third.seq
+    });
     assert!(world.fixture.in_turn(), "waited for the turn to end");
     world.drain(third.seq);
     assert_eq!(sends(&world.fixture, second.id.as_str()), 2);
@@ -278,6 +282,41 @@ fn a_refused_steer_is_sent_again_into_the_running_turn() {
             .iter()
             .all(|seen| seen.kind == "steer" && seen.turn == journal[0].turn),
         "not taken by the running turn: {journal:?}"
+    );
+    assert_eq!(world.fixture.launches(), 1, "restarted");
+}
+
+/// A steer sent into a turn that finishes before the language server sees it
+/// is refused for want of a planner config and returned to the mailbox: a
+/// second message waiting behind it never overtakes it onto stdin, and both
+/// are delivered in order on the next turn.
+#[test]
+fn a_steer_refused_as_the_turn_ends_keeps_mail_in_order() {
+    let mut world = World::<Agy>::new();
+    let first = world.prompt();
+    world.fixture.set_slow(40);
+    arm(&world.fixture, "finish-on-send");
+    let mut two = world.receive(2);
+    let third = two.pop().unwrap();
+    let second = two.pop().unwrap();
+    world.pump_until("the refused steer reaches the vendor", |w| {
+        sends(&w.fixture, second.id.as_str()) >= 1
+    });
+    world.fixture.clear_slow();
+    world.pump_until("the head message opens the next turn", |w| {
+        w.cursor() == second.seq
+    });
+    commit_queued(&mut world, &third);
+    world.drain(third.seq);
+    let journal = world.fixture.journal();
+    assert_eq!(
+        ids(&journal),
+        [
+            first.id.to_string(),
+            second.id.to_string(),
+            third.id.to_string()
+        ],
+        "{journal:?}"
     );
     assert_eq!(world.fixture.launches(), 1, "restarted");
 }
