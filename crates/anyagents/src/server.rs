@@ -563,7 +563,13 @@ async fn serve(
         // the kernel listen backlog rather than finding no server.
         let store = Arc::clone(&store);
         let data = data.to_path_buf();
-        let _ = tokio::task::spawn_blocking(move || finish_interrupted_spawns(&store, &data)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(err) = create::backfill_historical_agent_roles(&store, &data) {
+                eprintln!("anyagents: historical role backfill warning: {err}");
+            }
+            finish_interrupted_spawns(&store, &data);
+        })
+        .await;
     }
     let public_task = public_listener.map(|tcp_listener| {
         let public_app = build_public_router(state.clone());
@@ -2272,12 +2278,17 @@ async fn transfer_agent_route(
                     .join(updated.id.as_str())
                     .join("work")
             });
-        create::reconcile_agent_runtime_config(
+        let started_ms = state
+            .health
+            .get(&updated.id)
+            .and_then(|h| h.process_started_at_ms);
+        create::reconcile_agent_runtime_config_for_live(
             &state.store,
             state.store.data_dir(),
             &updated,
             &config,
             &work_dir,
+            started_ms,
         ).map_err(ApiError::from_store)?;
 
         let reason_suffix = body
@@ -2704,8 +2715,19 @@ async fn rename_agent_route(
             .as_deref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| anyagents_core::agent_work_dir(data_dir, &updated.id));
-        create::reconcile_agent_runtime_config(&state.store, data_dir, &updated, &cfg, &work_dir)
-            .map_err(ApiError::from_store)?;
+        let started_ms = state
+            .health
+            .get(&updated.id)
+            .and_then(|h| h.process_started_at_ms);
+        create::reconcile_agent_runtime_config_for_live(
+            &state.store,
+            data_dir,
+            &updated,
+            &cfg,
+            &work_dir,
+            started_ms,
+        )
+        .map_err(ApiError::from_store)?;
         crate::telegram::sync_agent_telegram_bot_name(&state.store, data_dir, &updated);
         Ok(Json(agent_view(&state.store, &state.health, &updated)?))
     })
@@ -2776,8 +2798,19 @@ async fn role_agent_route(
             .as_deref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| anyagents_core::agent_work_dir(data_dir, &updated.id));
-        create::reconcile_agent_runtime_config(&state.store, data_dir, &updated, &cfg, &work_dir)
-            .map_err(ApiError::from_store)?;
+        let started_ms = state
+            .health
+            .get(&updated.id)
+            .and_then(|h| h.process_started_at_ms);
+        create::reconcile_agent_runtime_config_for_live(
+            &state.store,
+            data_dir,
+            &updated,
+            &cfg,
+            &work_dir,
+            started_ms,
+        )
+        .map_err(ApiError::from_store)?;
         crate::telegram::sync_agent_telegram_bot_name(&state.store, data_dir, &updated);
         Ok(Json(agent_view(&state.store, &state.health, &updated)?))
     })
@@ -3170,8 +3203,14 @@ async fn set_description_route(
             }
         }
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
-        create::sync_agent_description_files(&state.store, &rec, &cfg)
+        let started_ms = state
+            .health
+            .get(&rec.id)
+            .and_then(|h| h.process_started_at_ms);
+        create::sync_agent_description_files_for_live(&state.store, &rec, &cfg, started_ms)
             .map_err(ApiError::from_store)?;
+        let effective_instructions =
+            create::effective_agent_instructions(Some(&state.store), state.store.data_dir(), &rec);
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         Ok(Json(serde_json::json!({
             "id": rec.id.as_str(),
@@ -3182,7 +3221,7 @@ async fn set_description_route(
             "public": rec.is_public(),
             "aliases": aliases,
             "description": rec.public_description(),
-            "instructions": rec.instructions,
+            "instructions": effective_instructions,
             "system_prompt_synced": true,
         })))
     })
@@ -3986,6 +4025,7 @@ pub(crate) fn compute_block_reason(
 /// The marker files an agent view shows, all in the agent's config directory.
 const LAST_ERROR: &str = ".anyagents-last-error.json";
 const PROFILE_ROTATED: &str = ".anyagents-profile-rotated-ms";
+const INSTRUCTIONS_ROTATED: &str = ".anyagents-instructions-rotated-ms";
 const QUOTA_CLEARED: &str = ".anyagents-quota-cleared-ms";
 const NOTIFIED_PARENT: &str = ".anyagents-notified-parent-error.json";
 const BOUND_PROFILE: &str = ".anyagents-profile";
@@ -4175,6 +4215,8 @@ fn agent_view_preloaded(
         } else {
             view.aliases = store.agent_aliases(&agent.id).unwrap_or_default();
         }
+        view.instructions =
+            create::effective_agent_instructions(Some(store), store.data_dir(), agent);
         return Ok(view);
     }
     let now = now_ms();
@@ -4199,6 +4241,7 @@ fn agent_view_preloaded(
     let files = file_cache::cache();
     let markers = Markers { files, cfg: &cfg };
     let rotated_ms = markers.ms(PROFILE_ROTATED);
+    let instructions_rotated_ms = markers.ms(INSTRUCTIONS_ROTATED);
     // The supervisor's board is the live state; a fault outlives its process
     // only as the record an adapter persisted. A view never reads a vendor
     // transcript, log or session store.
@@ -4227,7 +4270,9 @@ fn agent_view_preloaded(
                     .as_deref()
                     .is_some_and(|h| h != agent.harness)
                     || live.live_model != agent.model
-                    || live.process_started_at_ms.is_some_and(|s| rotated_ms > s));
+                    || live
+                        .process_started_at_ms
+                        .is_some_and(|s| rotated_ms > s || instructions_rotated_ms > s));
             (
                 if live.process_alive { "alive" } else { "down" },
                 if working { "working" } else { "idle" },
@@ -4409,7 +4454,7 @@ fn agent_view_preloaded(
         oldest_undelivered_age_ms,
         install: install_state(store, files, agent),
         description: agent.public_description(),
-        instructions: agent.instructions.clone(),
+        instructions: create::effective_agent_instructions(Some(store), store.data_dir(), agent),
         seat_user: seat_info.as_ref().map(|(u, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid)| *gid),
@@ -12997,13 +13042,14 @@ exec '{}' "$@"
             assert_eq!(created.harness, "opencode");
             assert_eq!(created.model.as_deref(), Some("gpt-5.4-mini"));
             let stored = store.agent_by_name("writer-sub-1").unwrap();
+            assert_eq!(stored.instructions.as_deref(), Some("Fix issue #42."));
             assert_eq!(
-                stored.instructions.as_deref(),
+                created.instructions.as_deref(),
                 Some("Always run cargo test before opening a PR.\n\nFix issue #42.")
             );
 
             // Role matching a template slug (`role: "code-reviewer"`) applies template defaults
-            // when `archetype` is omitted.
+            // when `archetype` is omitted, projecting template instructions dynamically.
             let (_, Json(reviewer)) = create_agent_route(
                 Principal::Agent {
                     agent_id: parent.id.clone(),
@@ -13027,8 +13073,13 @@ exec '{}' "$@"
             );
             assert_eq!(reviewer.scope, "siblings");
             let reviewer_stored = store.agent_by_name("reviewer-sub-1").unwrap();
+            assert!(
+                reviewer_stored.instructions.is_none(),
+                "template body must not be baked into sqlite: {:?}",
+                reviewer_stored.instructions
+            );
             assert_eq!(
-                reviewer_stored.instructions.as_deref(),
+                reviewer.instructions.as_deref(),
                 Some("Verify all invariants before approving.")
             );
 
@@ -16030,6 +16081,88 @@ exec '{}' "$@"
             state.store.agent(&archived.id).unwrap().state,
             "archived",
             "pause overwrote archived state"
+        );
+    }
+
+    #[test]
+    fn describe_instruction_update_marks_rotation_and_sets_pending_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = archetype_validation_state(dir.path());
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(ws.join(".agents/agents")).unwrap();
+        std::fs::write(
+            ws.join(".agents/agents/specialist.md"),
+            "---\nname: specialist\ndescription: Role summary\n---\nRole SSOT instructions.",
+        )
+        .unwrap();
+        let mut new = anyagents_core::NewAgent::new("spiron-worker", "spiron");
+        new.role = Some("specialist".into());
+        new.workdir = Some(ws.display().to_string());
+        let created = state.store.create_agent(new).unwrap();
+        let running = state
+            .store
+            .set_agent_running(&created.id, &ws.display().to_string())
+            .unwrap();
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &running.id);
+        create::sync_agent_description_files(&state.store, &running, &cfg).unwrap();
+        let started_ms = now_ms();
+        state.health.publish(
+            &running.id,
+            anyagents_supervisor::LiveState {
+                process_alive: true,
+                turn_state: anyagents_harness::TurnState::Idle,
+                delivery: Some(crate::vendor::declared_delivery("spiron")),
+                quota_reset_at_ms: None,
+                restart_at_ms: None,
+                pid: Some(4242),
+                live_harness: Some("spiron".to_string()),
+                live_model: running.model.clone(),
+                process_started_at_ms: Some(started_ms),
+                last_error: None,
+            },
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let Json(resp) = rt
+            .block_on(set_description_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath("spiron-worker".to_string()),
+                Json(DescriptionRequest {
+                    description: None,
+                    instructions: Some("Custom task v2.".to_string()),
+                    role: None,
+                    scope: None,
+                    lifecycle: None,
+                    public: None,
+                    clear: None,
+                }),
+            ))
+            .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+        assert_eq!(
+            resp["instructions"].as_str(),
+            Some("Role SSOT instructions.\n\nCustom task v2.")
+        );
+        let prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(prompt.contains("Role SSOT instructions."));
+        assert!(prompt.contains("Custom task v2."));
+        let marker: i64 = std::fs::read_to_string(cfg.join(create::INSTRUCTIONS_ROTATED_MARKER))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(marker > started_ms, "marker={marker} started={started_ms}");
+        let updated = state.store.agent(&running.id).unwrap();
+        assert_eq!(updated.instructions.as_deref(), Some("Custom task v2."));
+        file_cache::cache().catch_up();
+        let view = agent_view(&state.store, &state.health, &updated).unwrap();
+        assert!(view.pending_switch);
+        assert_eq!(
+            view.instructions.as_deref(),
+            Some("Role SSOT instructions.\n\nCustom task v2.")
         );
     }
 }

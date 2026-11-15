@@ -37,6 +37,7 @@ const SWITCH_RETRY_MS: i64 = 5_000;
 /// Operator markers in an agent's config directory: the time its provider
 /// profile was replaced, and the time its quota hold was cleared.
 const PROFILE_ROTATED: &str = ".anyagents-profile-rotated-ms";
+const INSTRUCTIONS_ROTATED: &str = ".anyagents-instructions-rotated-ms";
 const QUOTA_CLEARED: &str = ".anyagents-quota-cleared-ms";
 
 /// Time source. Production uses the wall clock. Tests advance a manual clock.
@@ -347,6 +348,8 @@ struct ProcessNote {
     turns_recorded: u32,
     written: u32,
     profile_rotated_ms: i64,
+    #[serde(default)]
+    instructions_rotated_ms: i64,
     completed_turn: bool,
     #[serde(default)]
     pending_recovery: bool,
@@ -963,6 +966,7 @@ struct Session<H: Harness> {
     switch_retry_at: i64,
     process_started_at: Option<i64>,
     process_profile_rotated_ms: i64,
+    process_instructions_rotated_ms: i64,
     last_error: Option<String>,
     consecutive_turn_errors: u32,
     /// A turn the harness saw end with an error, counted in the store and
@@ -1026,6 +1030,7 @@ impl<H: Harness + 'static> Session<H> {
             switch_retry_at: 0,
             process_started_at: None,
             process_profile_rotated_ms: 0,
+            process_instructions_rotated_ms: 0,
             last_error: None,
             consecutive_turn_errors: 0,
             errored_turn: None,
@@ -1190,6 +1195,7 @@ impl<H: Harness + 'static> Session<H> {
             turns_recorded: self.turns_recorded,
             written: self.written,
             profile_rotated_ms: self.process_profile_rotated_ms,
+            instructions_rotated_ms: self.process_instructions_rotated_ms,
             completed_turn: self.completed_turn_in_session,
             pending_recovery: self.pending_recovery,
         };
@@ -1259,6 +1265,7 @@ impl<H: Harness + 'static> Session<H> {
             .and_then(|text| serde_json::from_str(text).ok())
             .unwrap_or_else(|| ProcessNote {
                 profile_rotated_ms: self.marker_ms(PROFILE_ROTATED).unwrap_or(0),
+                instructions_rotated_ms: self.marker_ms(INSTRUCTIONS_ROTATED).unwrap_or(0),
                 ..ProcessNote::default()
             });
         let mut delivery = DeliveryLoop::adopted(store, lock, self.id.clone(), harness);
@@ -1303,6 +1310,7 @@ impl<H: Harness + 'static> Session<H> {
         self.turns_recorded = note.turns_recorded;
         self.written = note.written;
         self.process_profile_rotated_ms = note.profile_rotated_ms;
+        self.process_instructions_rotated_ms = note.instructions_rotated_ms;
         self.completed_turn_in_session = note.completed_turn;
         self.process_started_at = Some(started_at_ms.unwrap_or_else(|| self.inner.clock.now_ms()));
         self.host_lock = Some(host_lock);
@@ -1389,6 +1397,7 @@ impl<H: Harness + 'static> Session<H> {
         let _ = fs::create_dir_all(&self.paths.managed_work);
         let _ = fs::create_dir_all(&self.paths.work_dir);
         let rotated_ms = self.marker_ms(PROFILE_ROTATED).unwrap_or(0);
+        let instructions_rotated_ms = self.marker_ms(INSTRUCTIONS_ROTATED).unwrap_or(0);
         let res = (self.inner.launch)(LaunchRequest {
             agent: self.agent.clone(),
             data_dir: self.inner.store.data_dir().to_path_buf(),
@@ -1403,6 +1412,7 @@ impl<H: Harness + 'static> Session<H> {
                 self.pending_switch_started_at = None;
                 self.process_started_at = Some(self.inner.clock.now_ms());
                 self.process_profile_rotated_ms = rotated_ms;
+                self.process_instructions_rotated_ms = instructions_rotated_ms;
                 if rotated_advanced || self.consecutive_turn_errors == 0 {
                     self.last_error = None;
                     if rotated_advanced {
@@ -1550,10 +1560,19 @@ impl<H: Harness + 'static> Session<H> {
             .is_some_and(|ms| ms > self.process_profile_rotated_ms)
     }
 
-    fn profile_rotation_waits_for_turn(&self, health: &HarnessHealth) -> bool {
+    fn instructions_rotation_pending(&self) -> bool {
+        self.marker_ms(INSTRUCTIONS_ROTATED)
+            .is_some_and(|ms| ms > self.process_instructions_rotated_ms)
+    }
+
+    fn marker_rotation_pending(&self) -> bool {
+        self.profile_rotation_pending() || self.instructions_rotation_pending()
+    }
+
+    fn marker_rotation_waits_for_turn(&self, health: &HarnessHealth) -> bool {
         health.process_alive
             && health.turn_state == TurnState::InTurn
-            && self.profile_rotation_pending()
+            && self.marker_rotation_pending()
     }
 
     /// The harness or model this agent is configured for differs from the one
@@ -1572,7 +1591,7 @@ impl<H: Harness + 'static> Session<H> {
         // switch has already had its bounded drain.
         if self
             .harness_health()
-            .is_some_and(|health| self.profile_rotation_waits_for_turn(&health))
+            .is_some_and(|health| self.marker_rotation_waits_for_turn(&health))
             && self.runtime_switch_pending() != Some(true)
         {
             return false;
@@ -1594,6 +1613,9 @@ impl<H: Harness + 'static> Session<H> {
         // leaves a dead process, which the dead-process backoff replaces. A
         // switch to another harness starts another session: the old process
         // keeps serving until the new one is up.
+        let instructions_only_reload = self.runtime_switch_pending() != Some(true)
+            && !self.profile_rotation_pending()
+            && self.instructions_rotation_pending();
         let running = self.agent.harness.clone();
         let same_session = self
             .configured()
@@ -1607,8 +1629,12 @@ impl<H: Harness + 'static> Session<H> {
         match self.launch_harness() {
             Ok(mut harness) => {
                 harness.watch_activity(Arc::clone(&self.notify));
-                // A quota wait belonged to the process that is gone.
-                harness.clear_quota();
+                // A quota wait belonged to the swapped harness/profile, EXCEPT an
+                // instruction-only reload keeps the same harness/model/profile and
+                // must preserve quota and backoff state.
+                if !instructions_only_reload {
+                    harness.clear_quota();
+                }
                 if let Some(delivery) = self.delivery.as_mut() {
                     if !same_session && let Err(err) = delivery.retire_harness() {
                         self.last_error = Some(format!("commit proven mail: {err}"));
@@ -1651,7 +1677,10 @@ impl<H: Harness + 'static> Session<H> {
                 delivery.clear_quota();
             }
             // A new process makes this pass's snapshot stale: start over.
-            return (rotated_after_start || config_switched) && self.replace_process();
+            return (rotated_after_start
+                || config_switched
+                || self.instructions_rotation_pending())
+                && self.replace_process();
         }
         self.commit_proven();
         // What the harness served before the hold is recorded on the day it
@@ -1916,9 +1945,19 @@ impl<H: Harness + 'static> Session<H> {
         }
         if !runtime_changed {
             self.pending_switch_started_at = None;
+            let profile_pending = self.profile_rotation_pending();
+            let instructions_pending = self.instructions_rotation_pending();
+            let instructions_only_superseded = !profile_pending
+                && instructions_pending
+                && (health.quota_reset_at_ms.is_some()
+                    || !health.process_alive
+                    || self.errored_turn.is_some()
+                    || self.restart_at.is_some()
+                    || health.sign_in_fault.is_some());
             if !replaceable
-                || !self.profile_rotation_pending()
-                || self.profile_rotation_waits_for_turn(health)
+                || (!profile_pending && !instructions_pending)
+                || instructions_only_superseded
+                || self.marker_rotation_waits_for_turn(health)
             {
                 return false;
             }

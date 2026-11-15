@@ -181,11 +181,9 @@ fn configured_owner_catalog_is_authoritative_for_create_discovery_and_updates() 
     let agent = store.agent_by_name("current").unwrap();
     assert_eq!(agent.role.as_deref(), Some("worker"));
     assert!(
-        agent
-            .instructions
-            .as_deref()
-            .unwrap()
-            .contains("Authoritative template.")
+        agent.instructions.is_none(),
+        "template body must not be baked into sqlite: {:?}",
+        agent.instructions
     );
     let prompt = std::fs::read_to_string(
         data.join("agents")
@@ -193,6 +191,34 @@ fn configured_owner_catalog_is_authoritative_for_create_discovery_and_updates() 
             .join("config/AGENTS.md"),
     )
     .unwrap();
+    assert!(prompt.contains("Authoritative template."), "{prompt}");
+
+    // Editing worker.md on disk updates existing agents dynamically after sync.
+    std::fs::write(
+        owner.join(".agents/agents/worker.md"),
+        "---\nname: worker\nscope: private\n---\nUpdated authoritative template v2.\n",
+    )
+    .unwrap();
+    let sync = run(&["agents", "describe", "all"]);
+    assert!(
+        sync.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    let prompt_v2 = std::fs::read_to_string(
+        data.join("agents")
+            .join(agent.id.as_str())
+            .join("config/SYSTEM_PROMPT.md"),
+    )
+    .unwrap();
+    assert!(
+        prompt_v2.contains("Updated authoritative template v2."),
+        "{prompt_v2}"
+    );
+    assert!(
+        !prompt_v2.contains("Authoritative template."),
+        "{prompt_v2}"
+    );
     let catalog = prompt
         .lines()
         .find(|line| line.contains("Available sub-agent roles"))
@@ -928,13 +954,35 @@ fn create_registers_mcp_only_in_the_agent_config() {
     assert_eq!(std::fs::read(&codex_sentinel).unwrap(), b"sentinel-codex");
 
     let store = Store::open(dir.path().join("state.db")).unwrap();
+    let alpha = store.agent_by_name("alpha").unwrap();
     let beta = store.agent_by_name("beta").unwrap();
-    let default_body = beta.instructions.as_deref().unwrap();
+    assert!(beta.instructions.is_none());
+    assert_eq!(alpha_instructions, "be brief");
+    let beta_prompt = std::fs::read_to_string(
+        dir.path()
+            .join("agents")
+            .join(beta.id.as_str())
+            .join("config")
+            .join("SYSTEM_PROMPT.md"),
+    )
+    .unwrap();
     assert!(
-        default_body.starts_with("You are a cohesive end-to-end execution worker."),
-        "{default_body}"
+        beta_prompt.contains("You are a cohesive end-to-end execution worker."),
+        "{beta_prompt}"
     );
-    assert_eq!(alpha_instructions, format!("{default_body}\n\nbe brief"));
+    let alpha_prompt = std::fs::read_to_string(
+        dir.path()
+            .join("agents")
+            .join(alpha.id.as_str())
+            .join("config")
+            .join("SYSTEM_PROMPT.md"),
+    )
+    .unwrap();
+    assert!(
+        alpha_prompt.contains("You are a cohesive end-to-end execution worker."),
+        "{alpha_prompt}"
+    );
+    assert!(alpha_prompt.contains("be brief"), "{alpha_prompt}");
 }
 
 #[test]
@@ -1172,22 +1220,26 @@ fn cli_create_defaults_omitted_and_empty_role_to_builtin_general_and_allows_disk
 
     {
         let store = Store::open(data.join("state.db")).unwrap();
-        let omitted = store.agent_by_name("omitted-role").unwrap();
-        let default_body = omitted.instructions.as_deref().unwrap();
-        assert!(
-            default_body.starts_with("You are a cohesive end-to-end execution worker."),
-            "{default_body}"
-        );
         for name in ["omitted-role", "empty-role", "explicit-general"] {
             let agent = store.agent_by_name(name).unwrap();
             assert_eq!(agent.role.as_deref(), Some("general"), "{name}");
             assert_eq!(agent.scope(), "public", "{name}");
-            assert_eq!(agent.instructions.as_deref(), Some(default_body), "{name}");
+            assert!(agent.instructions.is_none(), "{name}");
+            let prompt = std::fs::read_to_string(
+                data.join("agents")
+                    .join(agent.id.as_str())
+                    .join("config/SYSTEM_PROMPT.md"),
+            )
+            .unwrap();
+            assert!(
+                prompt.contains("You are a cohesive end-to-end execution worker."),
+                "{name}: {prompt}"
+            );
         }
         let sub_agent = store.agent_by_name("sub-omitted").unwrap();
         assert_eq!(sub_agent.role.as_deref(), Some("general"));
         assert_eq!(sub_agent.scope(), "private");
-        assert_eq!(sub_agent.instructions.as_deref(), Some(default_body));
+        assert!(sub_agent.instructions.is_none());
     }
 
     // Workspace .agents/agents/general.md overrides the built-in template (even root scope).
@@ -1197,12 +1249,40 @@ fn cli_create_defaults_omitted_and_empty_role_to_builtin_general_and_allows_disk
         "---\nname: general\ndescription: Workspace General Override\nscope: private\n---\nWorkspace general override body.\n",
     )
     .unwrap();
+    std::fs::write(
+        workspace.join(".agents/agents/reviewer.md"),
+        "---\nname: reviewer\ndescription: Workspace Reviewer\nscope: siblings\n---\nReviewer dynamic SSOT body.\n",
+    )
+    .unwrap();
     let overridden = run(&["agents", "create", "disk-general", "--workdir", ws_str]);
     assert!(
         overridden.status.success(),
         "{}",
         String::from_utf8_lossy(&overridden.stderr)
     );
+    let spawned_role = run(&[
+        "spawn",
+        "spawned-reviewer",
+        "--role",
+        "reviewer",
+        "--workdir",
+        ws_str,
+    ]);
+    assert!(
+        spawned_role.status.success(),
+        "{}",
+        String::from_utf8_lossy(&spawned_role.stderr)
+    );
+    let spawned_bad_role = run(&[
+        "spawn",
+        "spawned-invalid",
+        "--role",
+        "nonexistent-role",
+        "--workdir",
+        ws_str,
+    ]);
+    assert!(!spawned_bad_role.status.success());
+
     let store = Store::open(data.join("state.db")).unwrap();
     let agent = store.agent_by_name("disk-general").unwrap();
     assert_eq!(agent.role.as_deref(), Some("general"));
@@ -1211,13 +1291,31 @@ fn cli_create_defaults_omitted_and_empty_role_to_builtin_general_and_allows_disk
         agent.description.as_deref(),
         Some("Workspace General Override")
     );
+    assert!(agent.instructions.is_none());
+    let agent_prompt = std::fs::read_to_string(
+        data.join("agents")
+            .join(agent.id.as_str())
+            .join("config/SYSTEM_PROMPT.md"),
+    )
+    .unwrap();
     assert!(
-        agent
-            .instructions
-            .as_deref()
-            .is_some_and(|text| text.contains("Workspace general override body.")),
-        "{:?}",
-        agent.instructions
+        agent_prompt.contains("Workspace general override body."),
+        "{agent_prompt}"
+    );
+
+    let spawned = store.agent_by_name("spawned-reviewer").unwrap();
+    assert_eq!(spawned.role.as_deref(), Some("reviewer"));
+    assert_eq!(spawned.scope(), "siblings");
+    assert!(spawned.instructions.is_none());
+    let spawned_prompt = std::fs::read_to_string(
+        data.join("agents")
+            .join(spawned.id.as_str())
+            .join("config/SYSTEM_PROMPT.md"),
+    )
+    .unwrap();
+    assert!(
+        spawned_prompt.contains("Reviewer dynamic SSOT body."),
+        "{spawned_prompt}"
     );
 }
 
