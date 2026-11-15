@@ -55,13 +55,16 @@ JSONL files is scrubbed at the equivalent decoded span, including JSON escaping,
 nested serialized JSON and envelope prefixes. Unrelated lines retain their exact
 serialized bytes. Exact identical full-body occurrences are treated as copies.
 
-Canonical inbound/outbound bodies, the corresponding RAG chunk, its content hash,
-FTS content/tokens and every bound Telegram edit baseline are updated. A
-whole-body erasure (including an explicit span covering the entire body)
-unconditionally tombstones every account-bound baseline, even if a later quote,
-envelope or edit made its text differ from the current body. Each baseline is
-read back and verified before success is claimed. FTS is rebuilt with secure
-deletion, SQLite secure deletion is enabled before the rewrite and the WAL is
+Canonical inbound/outbound bodies and every bound Telegram edit baseline are
+updated. The body's search chunk and FTS row in `memory-index.db` leave the
+index before the state rewrite and are re-projected from the committed body
+after it (a standalone tool summary, which has no mailbox row, is rewritten in
+the index). A whole-body erasure (including an explicit span covering the
+entire body) unconditionally tombstones every account-bound baseline, even if a
+later quote, envelope or edit made its text differ from the current body. Each
+baseline is read back and verified before success is claimed. The index is
+created with FTS5 secure deletion and SQLite secure deletion, SQLite secure
+deletion is enabled on the state writer before the rewrite, and both WALs are
 checkpointed/truncated. The audit records actor, time, permission, reason, target,
 span, removed byte/character counts and copy outcomes—**never original text or a
 hash of it**. Replay of the original target/span, including equivalent mailbox

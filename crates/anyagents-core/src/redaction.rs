@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentId, Error, MessageId, Store, agent_config_dir, clean_rag_text, now_ms, rag_content_hash,
-    tokenize_hybrid_search_tokens,
 };
 
 pub const PERMISSION: &str = "conversation.redact";
@@ -544,6 +543,26 @@ fn unverified_full_versions(
         .collect())
 }
 
+/// Record a redaction's audit row, which freezes the target's retained
+/// alias set in the same transaction as the body rewrite.
+fn insert_audit(
+    tx: &rusqlite::Transaction<'_>,
+    target: &AgentId,
+    id: &str,
+    key: &str,
+    receipt: &Receipt,
+) -> Result<(), Error> {
+    tx.execute("INSERT INTO conversation_redactions (
+            id, agent_id, target_id, request_key, actor, permission, reason,
+            created_at_ms, span_unit, span_start, span_end, removed_bytes,
+            removed_chars, receipt, origin_chat_id, origin_message_id
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
+            (SELECT json_extract(origin, '$.chat_id') FROM messages WHERE agent_id = ?2 AND id = ?3),
+            (SELECT json_extract(origin, '$.message_id') FROM messages WHERE agent_id = ?2 AND id = ?3))",
+        params![receipt.audit_id, target.as_str(), id, key, receipt.actor, PERMISSION, receipt.reason, receipt.timestamp_ms, if receipt.span.unit == SpanUnit::Bytes { "bytes" } else { "chars" }, receipt.span.start as i64, receipt.span.end as i64, receipt.removed_bytes as i64, receipt.removed_chars as i64, serde_json::to_string(receipt).map_err(|_| invalid("receipt serialization failed"))?])?;
+    Ok(())
+}
+
 impl Store {
     /// Erase one logical body/span and its exact copies from local managed JSONL.
     /// The target must be quiescent; this does not stop/restart a harness or erase
@@ -574,7 +593,35 @@ impl Store {
                 _process: crate::AgentLock,
             },
         }
-        let phase1 = self.write_tx(|tx| -> Result<RedactPhase1, Error> {
+        // The search index is another copy of the body: its row leaves the
+        // index before the state rewrite and is re-projected from what state
+        // commits (`store/memory_index.rs`). A standalone tool summary has no
+        // state row; its text is read from, and rewritten in, the index.
+        let index_id = match &request.message_id {
+            Some(id) => Some(id.clone()),
+            None => self
+                .read_conn()
+                .query_row(
+                    "SELECT id FROM messages WHERE agent_id = ?1 AND seq = ?2",
+                    params![target.as_str(), request.seq],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?,
+        };
+        let standalone = match &index_id {
+            Some(id) => self.standalone_index_text(target, id)?,
+            None => None,
+        };
+        let index_ids: Vec<&str> = index_id.iter().map(String::as_str).collect();
+        let phase1 = self.reindex_around(&index_ids, &[], || {
+        // A standalone summary's scrubbed text and staged receipt are
+        // committed in the index before state commits the audit. The index
+        // lock is taken first, so the state transaction never waits on it.
+        let mut staged = match standalone {
+            Some(_) => Some(self.begin_staged_index()?),
+            None => None,
+        };
+        self.write_tx(|tx| -> Result<RedactPhase1, Error> {
         let actor = authorize(tx, &actor, target)?;
         if unresolved_history(self.data_dir(), &history_dir, target)? {
             return Err(invalid(
@@ -609,6 +656,42 @@ impl Store {
             ));
         }
         let _process = self.try_lock_agent(target)?;
+        // Recover only under the same quiescence and process guards as a new
+        // redaction. A staged receipt proves intent, not the current body.
+        if replay.is_none()
+            && let Some(staged) = &staged
+            && index_id.as_deref() == Some(id.as_str())
+            && let Some((staged_key, raw)) = staged.staged_receipt(&id)?
+        {
+            if staged_key != key {
+                return Err(invalid("staged redaction selector differs; retry the original selector"));
+            }
+            let receipt: Receipt = serde_json::from_str(&raw)
+                .map_err(|_| invalid("unreadable staged redaction receipt"))?;
+            let original = standalone.as_deref().ok_or_else(|| invalid("redaction target not found"))?;
+            let still_redacted = if request.span.is_none() {
+                original == TOMBSTONE
+            } else {
+                let start = match receipt.span.unit {
+                    SpanUnit::Bytes => Some(receipt.span.start),
+                    SpanUnit::Chars => original.char_indices().nth(receipt.span.start).map(|(i, _)| i),
+                };
+                start.and_then(|i| i.checked_add(TOMBSTONE.len()).and_then(|end| original.get(i..end))) == Some(TOMBSTONE)
+            };
+            if !still_redacted {
+                return Err(invalid("redaction target changed; staged receipt does not verify the current body"));
+            }
+            insert_audit(tx, target, &id, &key, &receipt)?;
+            // Reenter Phase 2: the staged commit may have left old WAL frames.
+            return Ok(RedactPhase1::Prepared {
+                receipt,
+                prepared: Vec::new(),
+                id,
+                whole_body: false,
+                _process,
+            });
+        }
+
         let host_index = self.data_dir().join(crate::host_retrieval::INDEX_FILE);
         if host_index.exists() {
             let mut index = crate::host_index::HostIndex::open(&host_index)
@@ -658,8 +741,10 @@ impl Store {
                     .ok_or_else(|| invalid("transcript index out of range"))?,
             )?
         } else {
-            tx.query_row("SELECT body FROM messages WHERE agent_id = ?1 AND id = ?2 UNION ALL SELECT body FROM outbound_messages WHERE agent_id = ?1 AND id = ?2 UNION ALL SELECT text FROM rag_chunks WHERE agent_id = ?1 AND chunk_id = ?2 LIMIT 1",
-                params![target.as_str(), id], |r| r.get::<_, String>(0)).optional()?.ok_or_else(|| invalid("redaction target not found"))?
+            tx.query_row("SELECT body FROM messages WHERE agent_id = ?1 AND id = ?2 UNION ALL SELECT body FROM outbound_messages WHERE agent_id = ?1 AND id = ?2 LIMIT 1",
+                params![target.as_str(), id], |r| r.get::<_, String>(0)).optional()?
+                .or_else(|| standalone.clone().filter(|_| index_id.as_deref() == Some(id.as_str())))
+                .ok_or_else(|| invalid("redaction target not found"))?
         };
         if let Some(receipt) = replay {
             // A historical receipt is not evidence about today's body. Verify
@@ -821,10 +906,6 @@ impl Store {
                 .push(failure(&file.path, "scrub pending/interrupted"));
         }
         tx.pragma_update(None, "secure_delete", "ON")?;
-        tx.execute(
-            "INSERT INTO rag_chunks_fts(rag_chunks_fts, rank) VALUES('secure-delete', 1)",
-            [],
-        )?;
         if transcript_index.is_none() {
             tx.execute(
                 "UPDATE messages SET body = ?3 WHERE agent_id = ?1 AND id = ?2",
@@ -879,42 +960,28 @@ impl Store {
                     }
                 }
             }
-            let cleaned = clean_rag_text(&redacted);
-            tx.execute("UPDATE rag_chunks SET text = ?3, content_hash = ?4 WHERE agent_id = ?1 AND chunk_id = ?2", params![target.as_str(), id, cleaned, rag_content_hash(&cleaned)])?;
-            // Found through the index (`MATCH` on the id's own token, `=` for
-            // the exact row): `chunk_id = ?` alone reads every row of the
-            // index with the writer held. The rebuild below still runs: it is
-            // what physically erases the old text.
-            let tokens = tokenize_hybrid_search_tokens(&cleaned).join(" ");
-            match crate::store::fts_chunk_lookup(&id) {
-                Some(lookup) => tx.execute(
-                    "UPDATE rag_chunks_fts SET text = ?2, search_tokens = ?3 \
-                     WHERE chunk_id MATCH ?4 AND chunk_id = ?1",
-                    params![id, cleaned, tokens, lookup],
-                )?,
-                None => tx.execute(
-                    "UPDATE rag_chunks_fts SET text = ?2, search_tokens = ?3 WHERE chunk_id = ?1",
-                    params![id, cleaned, tokens],
-                )?,
-            };
-            // Remove pre-existing FTS tombstone segments too, not just MATCH visibility.
-            tx.execute(
-                "INSERT INTO rag_chunks_fts(rag_chunks_fts) VALUES('rebuild')",
-                [],
+        }
+        if let Some(staged) = staged.as_mut()
+            && transcript_index.is_none()
+            && index_id.as_deref() == Some(id.as_str())
+        {
+            let receipt_json = serde_json::to_string(&receipt)
+                .map_err(|_| invalid("receipt serialization failed"))?;
+            staged.stage_redaction(
+                target.as_str(),
+                &id,
+                &clean_rag_text(&redacted),
+                &key,
+                &receipt_json,
             )?;
+            staged.commit()?;
         }
         // The audit's target_id freezes its complete retained alias set in the
         // same IMMEDIATE transaction as the body/index rewrite. The primary
         // origin columns are audit metadata only, never an unqualified fallback.
         // Ingress joins all aliases to this audit before any ordinary writer.
-        tx.execute("INSERT INTO conversation_redactions (
-                id, agent_id, target_id, request_key, actor, permission, reason,
-                created_at_ms, span_unit, span_start, span_end, removed_bytes,
-                removed_chars, receipt, origin_chat_id, origin_message_id
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
-                (SELECT json_extract(origin, '$.chat_id') FROM messages WHERE agent_id = ?2 AND id = ?3),
-                (SELECT json_extract(origin, '$.message_id') FROM messages WHERE agent_id = ?2 AND id = ?3))",
-            params![receipt.audit_id, target.as_str(), id, key, receipt.actor, PERMISSION, receipt.reason, timestamp_ms, if receipt.span.unit == SpanUnit::Bytes { "bytes" } else { "chars" }, receipt.span.start as i64, receipt.span.end as i64, receipt.removed_bytes as i64, receipt.removed_chars as i64, serde_json::to_string(&receipt).map_err(|_| invalid("receipt serialization failed"))?])?;
+        debug_assert_eq!(receipt.timestamp_ms, timestamp_ms);
+        insert_audit(tx, target, &id, &key, &receipt)?;
             Ok(RedactPhase1::Prepared {
                 receipt,
                 prepared,
@@ -922,6 +989,7 @@ impl Store {
                 whole_body,
                 _process,
             })
+        })
         })?;
         let (mut receipt, prepared, id, whole_body, _process) = match phase1 {
             RedactPhase1::Done(receipt) => return Ok(receipt),
@@ -1023,6 +1091,16 @@ impl Store {
                 &PathBuf::from(format!("{}-wal", self.database_path().display())),
                 "SQLite WAL truncation failed; residual bytes are unverified")),
         }
+        // The index's log can hold the old text the same way.
+        match self.truncate_index_wal() {
+            Ok(true) => {}
+            Ok(false) => receipt.unscrubbed.push(failure(
+                &PathBuf::from(format!("{}-wal", self.memory_index_path().display())),
+                "SQLite reader prevented WAL truncation; old bytes may remain until the reader exits and a successful TRUNCATE checkpoint")),
+            Err(_) => receipt.unscrubbed.push(failure(
+                &PathBuf::from(format!("{}-wal", self.memory_index_path().display())),
+                "SQLite WAL truncation failed; residual bytes are unverified")),
+        }
         receipt.full_scrub = receipt.unscrubbed.is_empty();
         let receipt_json =
             serde_json::to_string(&receipt).map_err(|_| invalid("receipt serialization failed"))?;
@@ -1033,6 +1111,9 @@ impl Store {
             )?;
             Ok(())
         })?;
+        // Keep recovery intent until the final receipt is durable. Cleanup
+        // failure must not turn an already completed redaction into an error.
+        let _ = self.clear_staged_index_redaction(&id);
         Ok(receipt)
     }
 }
