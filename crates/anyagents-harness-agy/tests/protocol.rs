@@ -69,12 +69,10 @@ fn a_second_message_during_a_turn_waits() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "hold", None);
     harness.deliver(&msg("m1")).unwrap();
-    assert!(matches!(
+    assert_eq!(
         harness.deliver(&msg("m2")).unwrap(),
-        DeliverOutcome::Accepted {
-            turn_finished: false
-        }
-    ));
+        DeliverOutcome::InFlight
+    );
     assert_eq!(harness.turns_started(), 1);
 }
 
