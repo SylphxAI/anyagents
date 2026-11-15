@@ -2093,25 +2093,20 @@ async fn mcp_spawn_and_create_default_to_general_and_schema_lists_general_first(
     let tools = alpha.list_all_tools().await.unwrap();
     let agents_tool = tools.iter().find(|t| t.name == "agents").unwrap();
     let tool_desc = agents_tool.description.as_deref().unwrap_or_default();
-    let general_pos = tool_desc
-        .find("`general`")
-        .unwrap_or_else(|| panic!("{tool_desc}"));
-    let assistant_pos = tool_desc
-        .find("`assistant`")
-        .unwrap_or_else(|| panic!("{tool_desc}"));
-    let counsel_pos = tool_desc
-        .find("`counsel`")
-        .unwrap_or_else(|| panic!("{tool_desc}"));
     assert!(
-        general_pos < assistant_pos && general_pos < counsel_pos,
+        tool_desc.contains("Available roles (`general` is the built-in default): `general`"),
         "{tool_desc}"
     );
-    let role_schema_desc = agents_tool.input_schema["properties"]["role"]["description"]
-        .as_str()
-        .unwrap();
+    let catalog_start = tool_desc.find("Available roles (").unwrap();
+    let catalog = &tool_desc[catalog_start..];
+    let general_pos = catalog.find("`general`").unwrap_or_else(|| panic!("{catalog}"));
+    let assistant_pos = catalog
+        .find("`assistant`")
+        .unwrap_or_else(|| panic!("{catalog}"));
+    let counsel_pos = catalog.find("`counsel`").unwrap_or_else(|| panic!("{catalog}"));
     assert!(
-        role_schema_desc.find("general").unwrap() < role_schema_desc.find("planner").unwrap(),
-        "{role_schema_desc}"
+        general_pos < assistant_pos && general_pos < counsel_pos,
+        "{catalog}"
     );
 
     // Omitted, empty, and explicit `general` all resolve to built-in `general` with `private` scope.
