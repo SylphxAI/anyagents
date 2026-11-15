@@ -4319,6 +4319,7 @@ done
         serde_json::from_slice(&out.stdout).unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn agy_artifacts_use_code_reader_not_native_path_exemptions() {
         use std::os::unix::fs::{PermissionsExt, symlink};
