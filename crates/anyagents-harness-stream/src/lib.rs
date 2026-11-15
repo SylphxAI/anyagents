@@ -333,6 +333,8 @@ impl Write for Input {
 struct State {
     child: Option<Child>,
     stderr: BoundedStderr,
+    /// A socket-owned child's diagnostics, read as a bounded prefix at exit.
+    process_log: Option<PathBuf>,
     stderr_done: bool,
     exit_status: Option<ExitStatus>,
     /// When the child was seen to have exited while its stdout stayed open
@@ -593,6 +595,48 @@ impl StreamHarness {
                 .map_err(fail)?,
         );
         Ok(harness)
+    }
+
+    /// Retain waitpid authority for a process served over this connection.
+    /// Detaching the socket releases the child without signalling it.
+    pub fn adopt_process(&self, child: Child, log: PathBuf) {
+        let mut state = lock(&self.shared);
+        state.child = Some(child);
+        state.process_log = Some(log);
+        state.reap_child();
+        self.wake.notify_all();
+    }
+
+    /// End an owned process explicitly; closing its socket alone never does.
+    pub fn end_process(&self) {
+        let child = {
+            let mut state = lock(&self.shared);
+            state.reap_child();
+            state.child.take()
+        };
+        if let Some(mut child) = child {
+            // A requested termination is not an unexpected exit fault.
+            anyagents_harness::kill_child(&mut child, &self.environment);
+            let _ = child.wait();
+        }
+    }
+
+    /// Collect a process exit racing a failed attach, without waiting beyond
+    /// `patience`. Successful exits are diagnostic here but never health faults.
+    pub fn process_exit(&self, patience: Duration) -> Option<String> {
+        let deadline = Instant::now() + patience;
+        loop {
+            let mut state = lock(&self.shared);
+            state.reap_child();
+            if let Some(status) = state.exit_status {
+                return Some(exit_message(status, None, &state.stderr.masked(true)));
+            }
+            if state.child.is_none() || Instant::now() >= deadline {
+                return None;
+            }
+            drop(state);
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// The seq of the `ready` that answered this connection's `attach`.
@@ -863,8 +907,8 @@ impl StreamHarness {
         state.proof_of(self.spec.protocol, self.agy_rpc.is_some(), id)
     }
 
-    /// A read of the child's state. It never does I/O: an Antigravity
-    /// cascade that stays open without a closing line is watched by its own
+    /// A read of the child's state, collecting bounded diagnostics at exit.
+    /// An Antigravity cascade without a closing line is watched by its own
     /// turn timer ([`watch_agy_cascade`]), not by how often the host asks.
     pub fn health(&self) -> HarnessHealth {
         let mut state = lock(&self.shared);
@@ -1595,11 +1639,17 @@ impl StreamHarness {
         // A v2 process outlives its connection: ending the connection ends
         // what this harness reads, and the process goes on.
         #[cfg(unix)]
+        let detached = self.socket.is_some();
+        #[cfg(not(unix))]
+        let detached = false;
+        #[cfg(unix)]
         if let Some(socket) = self.socket.take() {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
         let child = lock(&self.shared).child.take();
-        if let Some(mut child) = child {
+        if let Some(mut child) = child
+            && !detached
+        {
             anyagents_harness::kill_child(&mut child, &self.environment);
             let _ = child.wait();
         }
@@ -1693,6 +1743,43 @@ impl BoundedStderr {
         }
         masked
     }
+}
+
+// Read only the retention window plus one byte to prove truncation. A log may
+// grow without bound on disk; diagnostic memory and published text never do.
+fn read_process_log(path: &Path) -> BoundedStderr {
+    let mut capture = BoundedStderr::default();
+    if let Ok(file) = std::fs::File::open(path) {
+        let mut bytes = Vec::new();
+        if file
+            .take((STDERR_LIMIT + 1) as u64)
+            .read_to_end(&mut bytes)
+            .is_ok()
+        {
+            capture.push(&bytes);
+        }
+    }
+    capture
+}
+
+fn exit_message(status: ExitStatus, fault: Option<&str>, stderr: &str) -> String {
+    format!(
+        "harness exited with {status}{}{}{}{}",
+        if fault.is_some() { ": " } else { "" },
+        fault.unwrap_or(""),
+        if stderr.trim().is_empty() {
+            ""
+        } else {
+            "; stderr: "
+        },
+        stderr.trim()
+    )
+}
+
+/// A bounded, credential-masked diagnostic for a process that exited before
+/// its transport was attached. Incomplete retained lines are never disclosed.
+pub fn process_diagnostic(status: ExitStatus, log: &Path) -> String {
+    exit_message(status, None, &read_process_log(log).masked(true))
 }
 
 /// Everything the host reads through the harness API: liveness, turn state,
@@ -1842,9 +1929,17 @@ impl State {
             && let Ok(Some(status)) = child.try_wait()
         {
             self.child = None;
-            self.exit_status = Some(status);
-            self.refresh_exit_fault();
+            self.note_exit(status);
         }
+    }
+
+    fn note_exit(&mut self, status: ExitStatus) {
+        self.exit_status = Some(status);
+        if let Some(log) = &self.process_log {
+            self.stderr = read_process_log(log);
+            self.stderr_done = true;
+        }
+        self.refresh_exit_fault();
     }
 
     fn refresh_exit_fault(&mut self) {
@@ -1852,17 +1947,7 @@ impl State {
             && !status.success()
         {
             let stderr = self.stderr.masked(self.stderr_done);
-            self.exit_fault = Some(format!(
-                "harness exited with {status}{}{}{}{}",
-                self.sign_in_fault.as_ref().map_or("", |_| ": "),
-                self.sign_in_fault.as_deref().unwrap_or(""),
-                if stderr.trim().is_empty() {
-                    ""
-                } else {
-                    "; stderr: "
-                },
-                stderr.trim()
-            ));
+            self.exit_fault = Some(exit_message(status, self.sign_in_fault.as_deref(), &stderr));
             self.persist_failure();
         }
     }
@@ -1871,6 +1956,7 @@ impl State {
         Self {
             child: None,
             stderr: BoundedStderr::default(),
+            process_log: None,
             stderr_done: false,
             exit_status: None,
             exited_at: None,

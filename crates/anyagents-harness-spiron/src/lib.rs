@@ -11,7 +11,7 @@
 //! Inputs are journaled and deduplicated by request_id; only v2 is accepted.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
@@ -52,11 +52,8 @@ pub struct SpironHarness {
 
 /// A v2 process, as this adapter ends it.
 struct Listening {
-    /// The child, when this process started it.
-    child: Option<Child>,
     /// Ends the process's group when it was started by an earlier server.
     end: Option<Box<dyn Fn() + Send>>,
-    environment: Vec<(String, String)>,
     /// Its launch record, removed when the process ends.
     record: Option<PathBuf>,
     /// Left running for the next server, or already ended.
@@ -146,18 +143,8 @@ impl SpironHarness {
         let deadline = Instant::now() + patience;
         loop {
             if let Ok(Some(status)) = child.try_wait() {
-                let said = std::fs::read_to_string(log).unwrap_or_default();
-                let said = anyagents_harness::masking::mask_known_secrets(said.trim());
-                let tail: String = said
-                    .chars()
-                    .rev()
-                    .take(2000)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
-                return Err(failed(format!(
-                    "spiron exited with {status} before it listened: {tail}"
+                return Err(failed(anyagents_harness_stream::process_diagnostic(
+                    status, log,
                 )));
             }
             if std::os::unix::net::UnixStream::connect(socket).is_ok() {
@@ -184,28 +171,35 @@ impl SpironHarness {
             environment: launch.environment.clone(),
             delivery: DELIVERY,
         });
-        let harness = Self {
-            inner: match inner {
-                Ok(inner) => inner,
-                Err(err) => {
-                    anyagents_harness::kill_child(&mut child, &launch.environment);
-                    return Err(failed(err.to_string()));
+        let inner = match inner {
+            Ok(inner) => inner,
+            Err(error) => {
+                // Connect may race process exit; retain the real exit diagnostic.
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Err(failed(anyagents_harness_stream::process_diagnostic(
+                        status, log,
+                    )));
                 }
-            },
+                anyagents_harness::kill_child(&mut child, &launch.environment);
+                return Err(failed(error.to_string()));
+            }
+        };
+        inner.adopt_process(child, log.to_path_buf());
+        let harness = Self {
+            inner,
             process: Some(Listening {
-                child: Some(child),
                 end: None,
-                environment: launch.environment,
                 record: None,
                 released: false,
             }),
         };
         harness.inner.set_state_dir(&launch.state_dir);
-        // On failure the process is ended as the harness drops.
-        harness
-            .inner
-            .wait_ready(patience)
-            .map_err(|err| failed(err.to_string()))?;
+        // EOF and waitpid can race the attach; preserve diagnostics before drop
+        // explicitly stops a process that has not exited on its own.
+        if let Err(error) = harness.inner.wait_ready(patience) {
+            let diagnostic = harness.inner.process_exit(Duration::from_millis(250));
+            return Err(failed(diagnostic.unwrap_or_else(|| error.to_string())));
+        }
         Ok(harness)
     }
 
@@ -226,9 +220,7 @@ impl SpironHarness {
         let harness = Self {
             inner,
             process: Some(Listening {
-                child: None,
                 end: Some(attach.end),
-                environment: attach.environment,
                 record: Some(attach.record),
                 released: false,
             }),
@@ -284,9 +276,8 @@ impl SpironHarness {
             .inner
             .write_line(&json!({"type": "stop", "request_id": control_id("stop")}));
         self.inner.wait_gone(STOP_GRACE);
-        if let Some(child) = process.child.as_mut() {
-            anyagents_harness::kill_child(child, &process.environment);
-        } else if let Some(end) = &process.end {
+        self.inner.end_process();
+        if let Some(end) = &process.end {
             end();
         }
         if let Some(record) = &process.record {

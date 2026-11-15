@@ -7,6 +7,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -333,4 +334,69 @@ fn an_old_or_unnamed_ready_cannot_complete_a_v2_attach() {
         harness.stop();
         peer.join().unwrap();
     }
+}
+
+#[test]
+fn detaching_an_owned_socket_child_does_not_signal_it() {
+    struct Reap(u32);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            // SAFETY: this test exclusively owns this child and its process group.
+            unsafe {
+                libc::kill(-(self.0 as i32), libc::SIGKILL);
+                libc::waitpid(self.0 as i32, std::ptr::null_mut(), 0);
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let attach: Value = serde_json::from_str(&line).unwrap();
+        stream
+            .write_all(
+                frame(
+                    1,
+                    attach["request_id"].as_str().unwrap(),
+                    json!({"type":"ready", "protocol":"spiron.headless/v2"}),
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        line.clear();
+        assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+    });
+    let child = anyagents_harness::spawn_command(Path::new("/bin/sleep"), &[])
+        .unwrap()
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let reap = Reap(child.id());
+    let mut harness = StreamHarness::connect(Connect {
+        spec: spec(),
+        program: "sleep".into(),
+        socket: path,
+        pid: Some(reap.0),
+        after_seq: None,
+        session_id: None,
+        environment: Vec::new(),
+        delivery: SPIRON,
+    })
+    .unwrap();
+    let log = dir.path().join("process.log");
+    std::fs::write(&log, "").unwrap();
+    harness.adopt_process(child, log);
+    harness.wait_ready(Duration::from_secs(10)).unwrap();
+    harness.stop();
+    // SAFETY: signal 0 only checks the child this test started.
+    assert_eq!(
+        unsafe { libc::kill(reap.0 as i32, 0) },
+        0,
+        "detach killed the child"
+    );
+    peer.join().unwrap();
 }
