@@ -350,14 +350,9 @@ async fn existing_profile_opens_with_logins_and_every_operation_works() {
 
     // The session desktop's pointer, clipboard and held keys.
     let desk = async |req: Value| {
-        super::desktop::execute(
-            data,
-            &agent("agent-a"),
-            req,
-            &crate::agent_file::FileAuthority::Own,
-        )
-        .await
-        .unwrap()
+        super::desktop::execute(data, &agent("agent-a"), req)
+            .await
+            .unwrap()
     };
     desk(json!({"action": "mouse_move", "coordinate": [10, 20]})).await;
     let pos = desk(json!({"action": "cursor_position"})).await;
