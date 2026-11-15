@@ -101,7 +101,7 @@ fn redaction_preserves_mailbox_order_metadata_other_rows_and_removes_search_term
             .unwrap()
             .is_empty()
     );
-    let conn = f.store.conn();
+    let conn = f.store.read_conn();
     let count: i64 = conn
         .query_row(
             "SELECT count(*) FROM rag_chunks_fts WHERE rag_chunks_fts MATCH 'fixturecanary'",
@@ -1075,7 +1075,8 @@ fn redacted_provider_redelivery_and_edits_preserve_body_index_and_audit() {
                             "SELECT body FROM message_versions WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = 42",
                             params![f.target.id.as_str(), chat_id], |r| r.get(0)).unwrap();
                         assert_eq!(baseline, baseline_before);
-                        let indexed: String = conn
+                        let indexed: String = reopened
+                            .read_conn()
                             .query_row(
                                 "SELECT text FROM rag_chunks WHERE chunk_id = ?1",
                                 [m.id.as_str()],
@@ -1282,7 +1283,7 @@ fn admin_operator_and_deep_ancestor_are_authorized() {
     f.store
         .redact_conversation(Actor::Operator, &f.target.id, &request(&tool, None))
         .unwrap();
-    let conn = f.store.conn();
+    let conn = f.store.read_conn();
     let all: Vec<String> = conn
         .prepare("SELECT text FROM rag_chunks WHERE agent_id = ?1")
         .unwrap()

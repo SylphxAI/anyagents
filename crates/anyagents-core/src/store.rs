@@ -30,6 +30,7 @@ mod harness_leases;
 mod history_ops;
 mod lifecycle;
 mod mcp_ops;
+pub mod memory_index;
 mod operator_inbox;
 mod outcomes;
 mod registry;
@@ -969,6 +970,12 @@ fn open_reader(path: &Path) -> Option<Connection> {
     let _ = conn.busy_timeout(BUSY_TIMEOUT);
     let _ = conn.pragma_update(None, "query_only", "ON");
     tune_connection(&conn);
+    // The mailbox search index, read-only like the rest of this connection:
+    // `rag_chunks` resolves to it, as state has no table of that name.
+    let _ = conn.execute(
+        &format!("ATTACH DATABASE ?1 AS {}", memory_index::ATTACHED),
+        [memory_index::path_for(path).as_os_str().to_string_lossy()],
+    );
     Some(conn)
 }
 
@@ -1614,7 +1621,8 @@ impl Store {
             .unwrap_or(new_name.trim());
         validate_token(clean, "agent name")?;
         refuse_reserved_agent_name(clean)?;
-        let (updated, changed) = self.write_tx(|tx| {
+        // The agent's search rows are refiled from the committed name.
+        let (updated, changed) = self.reindex_around(&[], &[agent_id.as_str()], || self.write_tx(|tx| {
             let current = agent_by_id(tx, agent_id)?;
             if current.name == clean {
                 return Ok((current, false));
@@ -1636,15 +1644,8 @@ impl Store {
                 params![current.name, agent_id.as_str(), now_ms()],
             )?;
             tx.execute("DELETE FROM agent_aliases WHERE alias = ?1", [clean])?;
-            // The search rows first: they are found under the names
-            // `rag_chunks` still gives them.
-            let _ = rewrite_agent_fts_rows(tx, agent_id, Some(clean));
-            let _ = tx.execute(
-                "UPDATE rag_chunks SET agent_name = ?2 WHERE agent_id = ?1",
-                params![agent_id.as_str(), clean],
-            );
             Ok((agent_by_id(tx, agent_id)?, true))
-        })?;
+        }))?;
         if changed {
             self.notify(Wake::Agent {
                 agent_id: agent_id.clone(),
@@ -2818,23 +2819,6 @@ impl Store {
             )? > 0
         };
         let agent = agent_by_id(tx, agent_id)?;
-        index_rag_chunk(
-            tx,
-            message.id.as_str(),
-            message.agent_id.as_str(),
-            &agent.name,
-            "in",
-            message.sender.as_deref().unwrap_or("unknown"),
-            message
-                .reply_to
-                .as_deref()
-                .unwrap_or(&format!("agent:{}", agent.name)),
-            message.received_at_ms,
-            &message.text,
-            None,
-            None,
-            message.seq,
-        )?;
             Ok(ReceiveTx::Inserted {
                 message,
                 woke_agent,
@@ -2843,13 +2827,20 @@ impl Store {
             })
         })?;
         match tx_outcome {
-            ReceiveTx::Early(outcome) => Ok(outcome),
+            ReceiveTx::Early(outcome) => {
+                // A duplicate can merge a fuller body into the stored row.
+                if let Some(ReceiveOutcome::Duplicate(existing)) = &outcome {
+                    self.reindex_around(&[existing.id.as_str()], &[], || Ok(()))?;
+                }
+                Ok(outcome)
+            }
             ReceiveTx::Inserted {
                 message,
                 woke_agent,
                 is_passive_reaction,
                 recipient,
             } => {
+                self.project_mailbox();
                 if woke_agent {
                     self.notify(Wake::Agent {
                         agent_id: agent_id.clone(),
@@ -3166,15 +3157,18 @@ impl Store {
     /// bindings are removed with one audit row each, naming `actor`. The
     /// lifecycle journal and binding audit are kept.
     pub fn delete_agent_by(&self, id: &AgentId, actor: &str) -> Result<Agent, Error> {
-        let deleted = self.write_tx(|tx| {
+        // The agent's search rows leave the index after the commit, in the
+        // index's own transaction; the pending entry recorded first covers an
+        // interruption in between.
+        {
+            let state = self.read_conn();
+            self.shared
+                .memory_index
+                .invalidate(&state, &[], &[id.as_str()])?;
+        }
+        let (deleted, max_rowids) = self.write_tx(|tx| {
             let agent = agent_by_id(tx, id)?;
             credentials::delete_bindings_for_deleted_agent(tx, id, actor)?;
-            // The agent's own search rows, found through its chunks before
-            // they go, never by a name filter: FTS5 answers `agent_name = ?`
-            // only by reading every row of every agent, and this transaction
-            // holds the writer meanwhile. A failed creation, which has no
-            // chunks, used to stall every write of the server for minutes.
-            rewrite_agent_fts_rows(tx, id, None)?;
             for table in [
                 "agent_runtime",
                 "turns",
@@ -3198,7 +3192,6 @@ impl Store {
                 "messages",
                 "message_versions",
                 "outbound_messages",
-                "rag_chunks",
                 "group_agents",
                 "channel_agents",
             ] {
@@ -3208,8 +3201,19 @@ impl Store {
                 )?;
             }
             tx.execute("DELETE FROM agents WHERE id = ?1", [id.as_str()])?;
-            Ok(agent)
+            // Every row inserted after this commit lies above these, even
+            // one that reuses a rowid the deleted rows held.
+            let max_rowids = tx.query_row(
+                "SELECT (SELECT COALESCE(MAX(rowid), 0) FROM messages),
+                        (SELECT COALESCE(MAX(rowid), 0) FROM outbound_messages)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok((agent, max_rowids))
         })?;
+        self.shared
+            .memory_index
+            .agent_deleted(id.as_str(), max_rowids)?;
         self.notify(Wake::Agent {
             agent_id: id.clone(),
         });
@@ -3328,47 +3332,33 @@ impl Store {
         reply_to: Option<&str>,
         body: &str,
     ) -> Result<String, Error> {
-        self.write_tx(|tx| {
-            let agent = agent_by_id(tx, agent_id)?;
+        let id = self.write_tx(|tx| {
+            agent_by_id(tx, agent_id)?;
             let ts_ms = now_ms();
+            // `seq` places the turn in the mailbox: after the last message
+            // the agent had received when it sent.
             tx.execute(
-                "INSERT INTO outbound_messages (id, agent_id, destination, reply_to, body, sent_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO NOTHING",
+                "INSERT INTO outbound_messages (id, agent_id, destination, reply_to, body, sent_at_ms, seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                         (SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?2))
+                 ON CONFLICT(id) DO NOTHING",
                 params![id, agent_id.as_str(), destination, reply_to, body, ts_ms,],
             )?;
-            let (matches, ts_ms): (bool, i64) = tx.query_row(
-                "SELECT agent_id=?2 AND destination=?3 AND reply_to IS ?4 AND body=?5, sent_at_ms
+            let matches: bool = tx.query_row(
+                "SELECT agent_id=?2 AND destination=?3 AND reply_to IS ?4 AND body=?5
                  FROM outbound_messages WHERE id=?1",
                 params![id, agent_id.as_str(), destination, reply_to, body],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )?;
             if !matches {
                 return Err(Error::Message(
                     "outbound effect key payload conflict".into(),
                 ));
             }
-            let cur_seq: i64 = tx.query_row(
-                "SELECT COALESCE((SELECT seq FROM rag_chunks WHERE agent_id=?1 AND chunk_id=?2),
-                    (SELECT COALESCE(MAX(seq),0) FROM messages WHERE agent_id=?1))",
-                params![agent_id.as_str(), id],
-                |r| r.get(0),
-            )?;
-            index_rag_chunk(
-                tx,
-                &id,
-                agent_id.as_str(),
-                &agent.name,
-                "out",
-                &format!("agent:{}", agent.name),
-                destination,
-                ts_ms,
-                body,
-                None,
-                None,
-                cur_seq,
-            )?;
             Ok(id)
-        })
+        })?;
+        self.project_mailbox();
+        Ok(id)
     }
 
     /// Record a tool invocation or tool output in the history search index (`kind = 'tool'`)
@@ -3380,38 +3370,150 @@ impl Store {
         tool_name: &str,
         summary: &str,
     ) -> Result<String, Error> {
-        self.write_tx(|tx| {
-            let agent = agent_by_id(tx, agent_id)?;
-            let id = format!("tool_{}", MessageId::generate());
-            let ts_ms = now_ms();
-            let clean_tool = tool_name.trim().to_ascii_lowercase();
-            let summary = crate::masking::mask_known_secrets(summary);
-            let text = if summary.trim().starts_with("[tool") {
-                summary.trim().to_string()
-            } else {
-                format!("[tool:{clean_tool}] {}", summary.trim())
-            };
-            let cur_seq: i64 = tx.query_row(
+        // A standalone summary has no mailbox row: the index is where it is
+        // kept, and no state transaction is involved.
+        let (agent, cur_seq) = {
+            let conn = self.read_conn();
+            let agent = agent_by_id(&conn, agent_id)?;
+            let seq: i64 = conn.query_row(
                 "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?1",
                 [agent_id.as_str()],
                 |r| r.get(0),
             )?;
-            index_rag_chunk(
-                tx,
-                &id,
-                agent_id.as_str(),
-                &agent.name,
-                "out",
-                &format!("agent:{}", agent.name),
-                &format!("tool:{clean_tool}"),
-                ts_ms,
-                &text,
-                Some("tool"),
-                Some(&clean_tool),
-                cur_seq,
-            )?;
-            Ok(id)
-        })
+            (agent, seq)
+        };
+        let id = format!("tool_{}", MessageId::generate());
+        let clean_tool = tool_name.trim().to_ascii_lowercase();
+        let summary = crate::masking::mask_known_secrets(summary);
+        let text = if summary.trim().starts_with("[tool") {
+            summary.trim().to_string()
+        } else {
+            format!("[tool:{clean_tool}] {}", summary.trim())
+        };
+        self.shared
+            .memory_index
+            .record_standalone(&memory_index::Chunk {
+                id: &id,
+                agent_id: agent_id.as_str(),
+                agent_name: &agent.name,
+                direction: "out",
+                sender: &format!("agent:{}", agent.name),
+                destination: &format!("tool:{clean_tool}"),
+                timestamp_ms: now_ms(),
+                text: &text,
+                kind: Some("tool"),
+                tool: Some(&clean_tool),
+                seq: cur_seq,
+            })?;
+        Ok(id)
+    }
+
+    /// Project committed mailbox rows into the search index, without waiting:
+    /// when another writer holds the index, the next sync (at the latest the
+    /// next search) projects them. Never call it with the state writer held.
+    pub(crate) fn project_mailbox(&self) {
+        debug_assert!(!registry::holds_store_writer());
+        let state = self.read_conn();
+        if let Err(error) = self
+            .shared
+            .memory_index
+            .sync(&state, false, memory_index::READ_BUDGET)
+        {
+            eprintln!("anyagents memory index: projection deferred: {error}");
+        }
+    }
+
+    /// Bring the search index up to date before reading it. At most
+    /// [`memory_index::READ_BUDGET`] rows are projected here; a larger
+    /// backlog (a new or rebuilt index) is filled in the background.
+    pub(crate) fn sync_memory_index(&self) -> Result<(), Error> {
+        let state = self.read_conn();
+        self.shared
+            .memory_index
+            .sync(&state, true, memory_index::READ_BUDGET)?;
+        Ok(())
+    }
+
+    /// Re-project `chunks` and refile `agents`' rows around a state change:
+    /// `change` runs between recording the intent in the index and
+    /// re-projecting from what state committed, so an interruption anywhere
+    /// leaves an entry the next sync repairs. The chunks' old text leaves
+    /// the index before `change` runs.
+    pub(crate) fn reindex_around<T>(
+        &self,
+        chunks: &[&str],
+        agents: &[&str],
+        change: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        debug_assert!(!registry::holds_store_writer());
+        {
+            let state = self.read_conn();
+            self.shared
+                .memory_index
+                .invalidate(&state, chunks, agents)?;
+        }
+        let result = change();
+        let state = self.read_conn();
+        let synced = self
+            .shared
+            .memory_index
+            .sync(&state, true, memory_index::READ_BUDGET);
+        let value = result?;
+        synced?;
+        Ok(value)
+    }
+
+    /// The search index's file.
+    pub fn memory_index_path(&self) -> &Path {
+        self.shared.memory_index.path()
+    }
+
+    /// The text of a standalone tool summary (a chunk with no mailbox row).
+    pub(crate) fn standalone_index_text(
+        &self,
+        agent_id: &AgentId,
+        chunk_id: &str,
+    ) -> Result<Option<String>, Error> {
+        let in_mailbox: bool = self.read_conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)
+                 OR EXISTS(SELECT 1 FROM outbound_messages WHERE id = ?1)",
+            [chunk_id],
+            |r| r.get(0),
+        )?;
+        if in_mailbox {
+            return Ok(None);
+        }
+        self.shared
+            .memory_index
+            .standalone_text(agent_id.as_str(), chunk_id)
+    }
+
+    /// Replace a standalone tool summary's text (a redaction).
+    pub(crate) fn rewrite_standalone_index_text(
+        &self,
+        agent_id: &AgentId,
+        chunk_id: &str,
+        text: &str,
+    ) -> Result<(), Error> {
+        self.shared
+            .memory_index
+            .rewrite_standalone(agent_id.as_str(), chunk_id, text)
+    }
+
+    /// Checkpoint the index's log back into its file and truncate it, without
+    /// waiting. `false` when a reader still needs the log.
+    pub(crate) fn truncate_index_wal(&self) -> Result<bool, Error> {
+        let conn = self.shared.memory_index.writer();
+        conn.busy_timeout(Duration::ZERO)?;
+        let result = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        });
+        conn.busy_timeout(Duration::from_secs(30))?;
+        Ok(matches!(result?, (0, 0, 0)))
     }
 
     pub fn turn_ownership_snapshot(
@@ -3557,17 +3659,17 @@ impl Store {
         // 2. Outbound messages sent by this agent.
         let out_sql = match (sql_limit, since_ms.is_none()) {
             (Some(_), true) => {
-                "SELECT id, destination, reply_to, body, sent_at_ms, COALESCE((SELECT seq FROM rag_chunks c WHERE c.chunk_id = outbound_messages.id), 0)
+                "SELECT id, destination, reply_to, body, sent_at_ms, seq
                  FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
                  ORDER BY sent_at_ms DESC, id DESC LIMIT ?3"
             }
             (Some(_), false) => {
-                "SELECT id, destination, reply_to, body, sent_at_ms, COALESCE((SELECT seq FROM rag_chunks c WHERE c.chunk_id = outbound_messages.id), 0)
+                "SELECT id, destination, reply_to, body, sent_at_ms, seq
                  FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
                  ORDER BY sent_at_ms ASC, id ASC LIMIT ?3"
             }
             (None, _) => {
-                "SELECT id, destination, reply_to, body, sent_at_ms, COALESCE((SELECT seq FROM rag_chunks c WHERE c.chunk_id = outbound_messages.id), 0)
+                "SELECT id, destination, reply_to, body, sent_at_ms, seq
                  FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
                  ORDER BY sent_at_ms, id"
             }
@@ -3633,6 +3735,7 @@ impl Store {
         limit: Option<usize>,
         visible_agent_ids: Option<&[String]>,
     ) -> Result<Vec<ConversationTurn>, Error> {
+        self.sync_memory_index()?;
         let conn = self.read_conn();
         let since = since_ms.unwrap_or(0);
         let lim = limit
@@ -3699,117 +3802,6 @@ impl Store {
         Ok(turns)
     }
 
-    /// Upgrade only legacy authorized derivative chunks, in bounded transactions.
-    /// The format index makes current history a read-only no-op, independent of
-    /// mailbox size. Standalone tool summaries retain their available text;
-    /// redacted mailbox bodies remain the authoritative input when present.
-    fn backfill_full_mailbox_history(&self, visible: Option<&[String]>) -> Result<(), Error> {
-        {
-            let conn = self.read_conn();
-            let visibility = visible_agent_ids_sql("c.agent_id", visible, 1);
-            let pending = conn
-                .query_row(
-                    &format!(
-                        "SELECT 1 FROM rag_chunks c INDEXED BY idx_rag_chunks_format
-                         WHERE c.text_format < 2 {visibility} LIMIT 1"
-                    ),
-                    rusqlite::params_from_iter(scoped_params(&[], visible)),
-                    |_| Ok(()),
-                )
-                .optional()?;
-            if pending.is_none() {
-                return Ok(());
-            }
-        }
-        let mut after = String::new();
-        loop {
-            let progressed = self.write_tx(|tx| {
-                let visibility = visible_agent_ids_sql("c.agent_id", visible, 2);
-                let mut select = tx.prepare(&format!(
-                    "SELECT c.chunk_id, c.agent_id, a.name, c.direction,
-                            COALESCE(m.sender, CASE WHEN o.id IS NOT NULL THEN 'agent:' || a.name ELSE c.sender END),
-                            COALESCE(m.reply_to, o.destination, c.destination, 'agent:' || a.name),
-                            COALESCE(m.received_at_ms, o.sent_at_ms, c.timestamp_ms),
-                            COALESCE(m.body, o.body, c.text), c.kind, c.tool_name,
-                            COALESCE(m.seq, c.seq)
-                     FROM rag_chunks c INDEXED BY idx_rag_chunks_format
-                     JOIN agents a ON a.id = c.agent_id
-                     LEFT JOIN messages m ON m.id = c.chunk_id AND m.agent_id = c.agent_id
-                     LEFT JOIN outbound_messages o ON o.id = c.chunk_id AND o.agent_id = c.agent_id
-                     WHERE c.text_format < 2 AND c.chunk_id > ?1 {visibility}
-                     ORDER BY c.chunk_id LIMIT 64"
-                ))?;
-                struct Chunk {
-                    id: String,
-                    owner: String,
-                    name: String,
-                    direction: String,
-                    sender: String,
-                    destination: String,
-                    timestamp: i64,
-                    text: String,
-                    kind: Option<String>,
-                    tool: Option<String>,
-                    seq: i64,
-                }
-                let chunks = select
-                    .query_map(
-                        rusqlite::params_from_iter(scoped_params(&[&after], visible)),
-                        |r| {
-                            Ok(Chunk {
-                                id: r.get(0)?,
-                                owner: r.get(1)?,
-                                name: r.get(2)?,
-                                direction: r.get(3)?,
-                                sender: r.get(4)?,
-                                destination: r.get(5)?,
-                                timestamp: r.get(6)?,
-                                text: r.get(7)?,
-                                kind: r.get(8)?,
-                                tool: r.get(9)?,
-                                seq: r.get(10)?,
-                            })
-                        },
-                    )?
-                    .collect::<Result<Vec<_>, _>>()?;
-                drop(select);
-                if chunks.is_empty() {
-                    return Ok(false);
-                }
-                for chunk in chunks {
-                    after = chunk.id.clone();
-                    if clean_rag_text(&chunk.text).chars().count() < 2 {
-                        delete_fts_chunk(tx, &chunk.id)?;
-                        tx.execute(
-                            "DELETE FROM rag_chunks WHERE chunk_id=?1 AND agent_id=?2",
-                            params![chunk.id, chunk.owner],
-                        )?;
-                        continue;
-                    }
-                    index_rag_chunk(
-                        tx,
-                        &chunk.id,
-                        &chunk.owner,
-                        &chunk.name,
-                        &chunk.direction,
-                        &chunk.sender,
-                        &chunk.destination,
-                        chunk.timestamp,
-                        &chunk.text,
-                        chunk.kind.as_deref(),
-                        chunk.tool.as_deref(),
-                        chunk.seq,
-                    )?;
-                }
-                Ok(true)
-            })?;
-            if !progressed {
-                break;
-            }
-        }
-        Ok(())
-    }
-
     /// Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`).
     ///
     /// Searches `rag_chunks` and `rag_chunks_fts` across `req.agent` (`None` or `"all"` searches all agents)
@@ -3819,7 +3811,7 @@ impl Store {
     /// `from_seq`, `to_seq`), ordering (`Relevance`, `Newest`, `Oldest`), and contiguous episode
     /// context expansion (`radius`).
     pub fn search_history(&self, req: &HistorySearchQuery) -> Result<Vec<ConversationTurn>, Error> {
-        self.backfill_full_mailbox_history(req.visible_agent_ids.as_deref())?;
+        self.sync_memory_index()?;
         let conn = self.read_conn();
         let limit = if req.limit == 0 {
             (i64::MAX / 16) as usize
@@ -4471,7 +4463,7 @@ impl Store {
                 let mut raw_turns: Vec<crate::learned_memory::SleepTurnDelta> = Vec::new();
                 if max_in_seq > sleep.last_inbound_seq
                     && let Ok(mut stmt) = conn.prepare(
-                        "SELECT received_at_ms, COALESCE(sender, 'unknown'), body
+                        "SELECT received_at_ms, COALESCE(sender, 'unknown'), body, id, seq
                          FROM messages
                          WHERE agent_id = ?1 AND seq > ?2
                          ORDER BY seq DESC
@@ -4484,19 +4476,24 @@ impl Store {
                         let ts: i64 = row.get(0).unwrap_or(0);
                         let peer: String = row.get(1).unwrap_or_default();
                         let body: String = row.get(2).unwrap_or_default();
+                        let id: String = row.get(3).unwrap_or_default();
+                        let seq: i64 = row.get(4).unwrap_or_default();
                         if let Some(clean) = crate::learned_memory::clean_sleep_turn_text(&body) {
                             raw_turns.push(crate::learned_memory::SleepTurnDelta {
                                 timestamp_ms: ts,
                                 direction: "in".to_string(),
                                 peer,
                                 text: clean,
+                                citation: Some(crate::learned_memory::RawCitation::whole(
+                                    &id, &body, seq, "in",
+                                )),
                             });
                         }
                     }
                 }
                 if max_out_ms > sleep.last_outbound_ms
                     && let Ok(mut stmt) = conn.prepare(
-                        "SELECT sent_at_ms, destination, body
+                        "SELECT sent_at_ms, destination, body, id, seq
                          FROM outbound_messages
                          WHERE agent_id = ?1 AND sent_at_ms > ?2
                          ORDER BY sent_at_ms DESC
@@ -4509,12 +4506,17 @@ impl Store {
                         let ts: i64 = row.get(0).unwrap_or(0);
                         let peer: String = row.get(1).unwrap_or_default();
                         let body: String = row.get(2).unwrap_or_default();
+                        let id: String = row.get(3).unwrap_or_default();
+                        let seq: i64 = row.get(4).unwrap_or_default();
                         if let Some(clean) = crate::learned_memory::clean_sleep_turn_text(&body) {
                             raw_turns.push(crate::learned_memory::SleepTurnDelta {
                                 timestamp_ms: ts,
                                 direction: "out".to_string(),
                                 peer,
                                 text: clean,
+                                citation: Some(crate::learned_memory::RawCitation::whole(
+                                    &id, &body, seq, "out",
+                                )),
                             });
                         }
                     }
@@ -4606,32 +4608,54 @@ impl Store {
             return Ok((modified, true));
         };
 
-        // Phase 4: Apply upsert & defragmentation delete operations, rebuild MEMORY.md,
-        // synchronize HostIndex FTS5, and advance watermarks.
+        // Phase 4: Apply the plan without destroying anything: every topic
+        // version a write replaces, and every topic a merge retires, moves to
+        // the searchable history archive, and each written topic cites the
+        // immutable raw turns it was distilled from (`RawCitation`). Raw
+        // history is only read. Then rebuild MEMORY.md, synchronize the host
+        // index and advance watermarks.
         for op in &plan.operations {
             match op {
                 crate::learned_memory::SleepMemoryOp::Upsert {
                     topic,
                     description,
                     content,
+                    sources,
                 } => {
-                    crate::learned_memory::upsert_memory_topic(
+                    let cited: Vec<_> = sources
+                        .iter()
+                        .filter_map(|n| substantive_turns.get(*n))
+                        .filter_map(|turn| turn.citation.clone())
+                        .collect();
+                    // A plan that names no valid turn is cited to the whole
+                    // window it was distilled from.
+                    let cited = if cited.is_empty() {
+                        substantive_turns
+                            .iter()
+                            .filter_map(|turn| turn.citation.clone())
+                            .collect()
+                    } else {
+                        cited
+                    };
+                    crate::learned_memory::consolidate_memory_topic(
                         &agent_root,
                         &agent.name,
                         agent.role.as_deref(),
                         topic,
                         description.as_deref(),
                         content,
+                        &cited,
                         now,
                     )?;
                     modified = true;
                 }
                 crate::learned_memory::SleepMemoryOp::Delete { topic } => {
-                    let (removed, _) = crate::learned_memory::delete_memory_topic(
+                    let (removed, _) = crate::learned_memory::retire_memory_topic(
                         &agent_root,
                         &agent.name,
                         agent.role.as_deref(),
                         topic,
+                        now,
                     )?;
                     if removed {
                         modified = true;
@@ -6757,251 +6781,6 @@ fn claim_schedule_tick_on(
         )?,
     };
     Ok(updated == 1)
-}
-
-fn ensure_lexical_fts_backfilled(conn: &mut Connection) -> Result<(), Error> {
-    let fts_complete_sql =
-        "SELECT (SELECT count(*) FROM rag_chunks) = (SELECT count(*) FROM rag_chunks_fts)
-         AND NOT EXISTS (
-            SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text FROM rag_chunks
-            EXCEPT
-            SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text FROM rag_chunks_fts)";
-    if conn.query_row(fts_complete_sql, [], |r| r.get::<_, bool>(0))? {
-        return Ok(());
-    }
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    // A nonempty index can still be partial, duplicated or stale. Check the
-    // entire derivative membership under the same lock as any rebuild.
-    let complete: bool = tx.query_row(fts_complete_sql, [], |r| r.get(0))?;
-    if !complete {
-        tx.execute("DELETE FROM rag_chunks_fts", [])?;
-        let mut sel = tx.prepare(
-            "SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text
-             FROM rag_chunks",
-        )?;
-        let mut rows = sel.query([])?;
-        let mut ins = tx.prepare(
-            "INSERT INTO rag_chunks_fts (
-                chunk_id, agent_name, sender, destination, kind, tool_name, text, search_tokens
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        )?;
-        while let Some(row) = rows.next()? {
-            let text: String = row.get(6)?;
-            let search_tokens = tokenize_hybrid_search_tokens(&text).join(" ");
-            ins.execute(params![
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                text,
-                search_tokens,
-            ])?;
-        }
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-/// The search index (`rag_chunks_fts`, FTS5) answers only `rowid` and
-/// `MATCH` constraints from its index: a plain `column = ?` filter reads every
-/// row of the fleet's index (about a million rows, most of the store) with the
-/// Store writer held. Every statement that maintains it below finds its rows
-/// through `MATCH` and keeps the result exact with `=`.
-///
-/// One chunk's row, through the chunk id's own token (see
-/// [`fts_chunk_lookup`]). `?1` the chunk id, `?2` its lookup phrase.
-pub(crate) const FTS_DELETE_CHUNK: &str =
-    "DELETE FROM rag_chunks_fts WHERE chunk_id MATCH ?2 AND chunk_id = ?1";
-
-/// One agent's rows filed under one name: `MATCH` on the name, `=` for the
-/// exact name, and only chunks `rag_chunks` gives the agent. `?1` the name,
-/// `?2` its phrase, `?3` the agent id.
-pub(crate) const FTS_DELETE_AGENT_ROWS: &str = "DELETE FROM rag_chunks_fts \
-     WHERE agent_name MATCH ?2 AND agent_name = ?1 \
-       AND chunk_id IN (SELECT chunk_id FROM rag_chunks WHERE agent_id = ?3)";
-
-/// [`FTS_DELETE_AGENT_ROWS`]' rows renamed to `?4`.
-pub(crate) const FTS_RENAME_AGENT_ROWS: &str = "UPDATE rag_chunks_fts SET agent_name = ?4 \
-     WHERE agent_name MATCH ?2 AND agent_name = ?1 \
-       AND chunk_id IN (SELECT chunk_id FROM rag_chunks WHERE agent_id = ?3)";
-
-/// One chunk's row renamed to `?3`, found as in [`FTS_DELETE_CHUNK`].
-pub(crate) const FTS_RENAME_CHUNK: &str =
-    "UPDATE rag_chunks_fts SET agent_name = ?3 WHERE chunk_id MATCH ?2 AND chunk_id = ?1";
-
-/// `value` as one FTS5 phrase: quoted, with any quote doubled.
-pub(crate) fn fts_exact_phrase(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
-/// The tokens the index's `unicode61` tokenizer makes of `value`: runs of
-/// letters and digits (everything else separates).
-fn fts_tokens(value: &str) -> impl Iterator<Item = &str> {
-    value
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-}
-
-/// The phrase that finds one chunk's row: its id's longest token, the unique
-/// part. The whole id (`msg_<id>`, `out_<hash>`) starts with a token most of
-/// the index shares, and a phrase with it reads that token's doclist: about
-/// 40 ms on the fleet's store against 0.07 ms for the unique token alone.
-/// `None` for an id without a token, which only a full scan can find.
-pub(crate) fn fts_chunk_lookup(chunk_id: &str) -> Option<String> {
-    fts_tokens(chunk_id)
-        .max_by_key(|token| token.len())
-        .map(fts_exact_phrase)
-}
-
-/// Remove one chunk's search row (and any duplicate of it).
-fn delete_fts_chunk(conn: &Connection, chunk_id: &str) -> Result<usize, Error> {
-    Ok(match fts_chunk_lookup(chunk_id) {
-        Some(lookup) => conn.execute(FTS_DELETE_CHUNK, params![chunk_id, lookup])?,
-        None => conn.execute("DELETE FROM rag_chunks_fts WHERE chunk_id = ?1", [chunk_id])?,
-    })
-}
-
-/// The names an agent's chunks are filed under (normally one; more after a
-/// rename that left rows behind).
-fn agent_chunk_names(conn: &Connection, agent_id: &AgentId) -> Result<Vec<String>, Error> {
-    let mut stmt =
-        conn.prepare_cached("SELECT DISTINCT agent_name FROM rag_chunks WHERE agent_id = ?1")?;
-    let names = stmt
-        .query_map([agent_id.as_str()], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(names)
-}
-
-/// The chunk ids an agent owns under one name.
-fn agent_chunk_ids_named(
-    conn: &Connection,
-    agent_id: &AgentId,
-    name: &str,
-) -> Result<Vec<String>, Error> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT chunk_id FROM rag_chunks WHERE agent_id = ?1 AND agent_name = ?2",
-    )?;
-    let ids = stmt
-        .query_map(params![agent_id.as_str(), name], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ids)
-}
-
-/// Remove an agent's search rows, or (`rename_to`) refile them under a new
-/// name. Work is proportional to the agent's own rows: one indexed statement
-/// per name its chunks are filed under, chunk by chunk only for a name that
-/// has no token to match. An agent without chunks (a failed creation) costs
-/// one index probe.
-fn rewrite_agent_fts_rows(
-    conn: &Connection,
-    agent_id: &AgentId,
-    rename_to: Option<&str>,
-) -> Result<usize, Error> {
-    let mut changed = 0;
-    for name in agent_chunk_names(conn, agent_id)? {
-        if rename_to == Some(name.as_str()) {
-            continue;
-        }
-        if fts_tokens(&name).next().is_some() {
-            let phrase = fts_exact_phrase(&name);
-            changed += match rename_to {
-                None => conn.execute(
-                    FTS_DELETE_AGENT_ROWS,
-                    params![name, phrase, agent_id.as_str()],
-                )?,
-                Some(new) => conn.execute(
-                    FTS_RENAME_AGENT_ROWS,
-                    params![name, phrase, agent_id.as_str(), new],
-                )?,
-            };
-            continue;
-        }
-        for chunk_id in agent_chunk_ids_named(conn, agent_id, &name)? {
-            changed += match (rename_to, fts_chunk_lookup(&chunk_id)) {
-                (None, _) => delete_fts_chunk(conn, &chunk_id)?,
-                (Some(new), Some(lookup)) => {
-                    conn.execute(FTS_RENAME_CHUNK, params![chunk_id, lookup, new])?
-                }
-                (Some(new), None) => conn.execute(
-                    "UPDATE rag_chunks_fts SET agent_name = ?2 WHERE chunk_id = ?1",
-                    params![chunk_id, new],
-                )?,
-            };
-        }
-    }
-    Ok(changed)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn index_rag_chunk(
-    conn: &Connection,
-    chunk_id: &str,
-    agent_id: &str,
-    agent_name: &str,
-    direction: &str,
-    sender: &str,
-    destination: &str,
-    timestamp_ms: i64,
-    text: &str,
-    kind_override: Option<&str>,
-    tool_override: Option<&str>,
-    seq: i64,
-) -> Result<(), Error> {
-    let cleaned = clean_rag_text(text);
-    if cleaned.chars().count() < 2 {
-        return Ok(());
-    }
-    let chash = rag_content_hash(&cleaned);
-    let (kind, tool_name) =
-        classify_chunk_kind_and_tool(kind_override, tool_override, sender, destination, &cleaned);
-    let search_tokens = tokenize_hybrid_search_tokens(&cleaned).join(" ");
-    conn.execute(
-        "INSERT OR REPLACE INTO rag_chunks (
-            chunk_id, agent_id, agent_name, direction, sender, destination,
-            timestamp_ms, content_hash, text, kind, tool_name, seq, text_format
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 2)",
-        params![
-            chunk_id,
-            agent_id,
-            agent_name,
-            direction,
-            sender,
-            destination,
-            timestamp_ms,
-            chash,
-            cleaned,
-            kind,
-            tool_name,
-            seq,
-        ],
-    )?;
-    if seq <= 0 {
-        conn.execute(
-            "UPDATE rag_chunks SET seq = rowid WHERE chunk_id = ?1 AND seq <= 0",
-            params![chunk_id],
-        )?;
-    }
-    delete_fts_chunk(conn, chunk_id)?;
-    conn.execute(
-        "INSERT INTO rag_chunks_fts (
-            chunk_id, agent_name, sender, destination, kind, tool_name, text, search_tokens
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            chunk_id,
-            agent_name,
-            sender,
-            destination,
-            kind,
-            tool_name,
-            cleaned,
-            search_tokens
-        ],
-    )?;
-    Ok(())
 }
 
 fn build_fts5_query_with_filters(
@@ -10075,7 +9854,9 @@ mod tests {
             .unwrap();
         // Historical names are not a permission boundary (e.g. after rename).
         store
-            .conn()
+            .shared
+            .memory_index
+            .writer()
             .execute(
                 "UPDATE rag_chunks SET agent_name = 'own' WHERE agent_id = ?1",
                 [hidden.id.as_str()],
@@ -10124,13 +9905,6 @@ mod tests {
         let hidden = agent(&store, "legacy-hidden");
         store
             .record_tool_event(&hidden.id, "browser", "old tool")
-            .unwrap();
-        store
-            .conn()
-            .execute(
-                "UPDATE rag_chunks SET text_format=1 WHERE agent_id=?1",
-                [hidden.id.as_str()],
-            )
             .unwrap();
         let mut keyed = Incoming::new("keyed line");
         keyed.source_key = Some("src:read".into());
@@ -10210,9 +9984,8 @@ mod tests {
                     assert!(store.get_schedule(&watch.id)?.is_some());
                     // An unchanged observation is decided without the writer.
                     store.update_schedule_watch_observation(&watch.id, Some("base"), None)?;
-                    // No legacy chunks at all, then only invisible legacy chunks:
-                    // neither case may acquire the writer mutex or transaction.
-                    store.backfill_full_mailbox_history(Some(&[]))?;
+                    // Search syncs the index in the index's own file: it
+                    // never needs the state writer.
                     store.search_history(&HistorySearchQuery {
                         visible_agent_ids: Some(vec![id.to_string()]),
                         ..Default::default()
@@ -10248,11 +10021,11 @@ mod tests {
     }
 
     #[test]
-    fn full_mailbox_history_upgrade_and_redaction() {
-        let (_dir, store) = setup();
+    fn a_rebuilt_index_holds_authoritative_bodies_and_keeps_tool_summaries() {
+        let (dir, store) = setup();
         let own = agent(&store, "batch-owner");
-        // Cross multiple 64-row batches, retaining standalone tools as well.
-        for n in 0..130 {
+        // Cross several projection batches, retaining a standalone tool.
+        for n in 0..2600 {
             store
                 .record_outbound(&own.id, "agent:peer", None, &format!("full body {n}"))
                 .unwrap();
@@ -10261,37 +10034,145 @@ mod tests {
             .record_tool_event(&own.id, "browser", "legacy tool summary")
             .unwrap();
         {
-            let conn = store.conn();
-            conn.execute(
-                "UPDATE rag_chunks SET text='clipped',text_format=1 WHERE kind='message'",
+            let index = store.shared.memory_index.writer();
+            index
+                .execute(
+                    "UPDATE rag_chunks SET text='clipped' WHERE kind='message'",
+                    [],
+                )
+                .unwrap();
+            index
+                .execute("UPDATE index_meta SET value = 0 WHERE key = 'layout'", [])
+                .unwrap();
+        }
+        // A body too short to search leaves no row.
+        store
+            .conn()
+            .execute(
+                "UPDATE outbound_messages SET body='x' WHERE id=(SELECT min(id) FROM outbound_messages)",
                 [],
             )
             .unwrap();
-            conn.execute("UPDATE rag_chunks SET text_format=1 WHERE kind='tool'", [])
-                .unwrap();
-            // A redacted/short authoritative body removes its stale derivative.
-            conn.execute("UPDATE outbound_messages SET body='x' WHERE id=(SELECT min(id) FROM outbound_messages)", []).unwrap();
+        drop(store);
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        // More than one read's budget: the rest is filled in the background,
+        // and every search drains up to its budget.
+        for _ in 0..100 {
+            store.sync_memory_index().unwrap();
         }
-        store.backfill_full_mailbox_history(None).unwrap();
-        let conn = store.read_conn();
-        let (old, messages, tools): (i64, i64, i64) = conn.query_row(
-            "SELECT count(*) FILTER (WHERE text_format<2), count(*) FILTER (WHERE kind='message'), count(*) FILTER (WHERE kind='tool') FROM rag_chunks",
-            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).unwrap();
-        assert_eq!((old, messages, tools), (0, 129, 1));
-        let stale: i64 = conn.query_row("SELECT count(*) FROM rag_chunks_fts WHERE text='clipped' OR chunk_id IN (SELECT id FROM outbound_messages WHERE body='x')", [], |r| r.get(0)).unwrap();
-        assert_eq!(stale, 0);
-        let mut stmt = conn.prepare("EXPLAIN QUERY PLAN SELECT 1 FROM rag_chunks c INDEXED BY idx_rag_chunks_format WHERE c.text_format<2 LIMIT 1").unwrap();
-        let plan = stmt
-            .query_map([], |r| r.get::<_, String>(3))
+        let index = store.shared.memory_index.writer();
+        let (messages, tools, stale): (i64, i64, i64) = index
+            .query_row(
+                "SELECT count(*) FILTER (WHERE kind='message'), count(*) FILTER (WHERE kind='tool'),
+                        count(*) FILTER (WHERE text='clipped' OR text='x') FROM rag_chunks",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((messages, tools, stale), (2599, 1, 0));
+        let fts: i64 = index
+            .query_row("SELECT count(*) FROM rag_chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts, 2600);
+    }
+
+    #[test]
+    fn state_holds_no_search_index_and_mail_never_waits_for_it() {
+        let (dir, store) = setup();
+        let own = agent(&store, "oltp-owner");
+        for n in 0..200 {
+            store
+                .receive(&own.id, Incoming::new(format!("oltp warmup body {n}")))
+                .unwrap();
+        }
+        // State has no search table, index, trigger or FTS shadow table.
+        let state_search: Vec<String> = store
+            .conn()
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE name LIKE '%rag%' OR name LIKE '%fts%' OR name LIKE '%embedding%'
+                    OR sql LIKE '%fts5%'",
+            )
             .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+            .query_map([], |r| r.get(0))
             .unwrap()
-            .join("\n");
-        assert!(
-            plan.contains("COVERING INDEX idx_rag_chunks_format"),
-            "{plan}"
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(state_search.is_empty(), "{state_search:?}");
+        let indexed: i64 = store
+            .read_conn()
+            .query_row("SELECT count(*) FROM rag_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(indexed, 200);
+
+        // Another process holds the index's write lock, as a long rebuild
+        // would. Mail, sends and the state writer go on regardless.
+        let blocker = Connection::open(store.memory_index_path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        blocker
+            .execute(
+                "DELETE FROM rag_chunks WHERE rowid IN (SELECT rowid FROM rag_chunks LIMIT 1)",
+                [],
+            )
+            .unwrap();
+        let mut writes = Vec::new();
+        for n in 0..50 {
+            let started = std::time::Instant::now();
+            store
+                .receive(
+                    &own.id,
+                    Incoming::new(format!("oltpneedle{n} during rebuild")),
+                )
+                .unwrap();
+            store
+                .record_outbound(&own.id, "agent:peer", None, &format!("oltpsend{n}"))
+                .unwrap();
+            writes.push(started.elapsed());
+        }
+        // The state writer itself: one bare write transaction.
+        let mut held = Vec::new();
+        for _ in 0..50 {
+            let started = std::time::Instant::now();
+            store
+                .write_tx(|tx| {
+                    tx.execute(
+                        "UPDATE agents SET description = 'x' WHERE id = ?1",
+                        [own.id.as_str()],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            held.push(started.elapsed());
+        }
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        writes.sort();
+        held.sort();
+        eprintln!(
+            "receive+send p50 {:?} max {:?}; state write p50 {:?} max {:?}",
+            writes[25], writes[49], held[25], held[49]
         );
+        // Waiting on the index would take its 30 s busy timeout.
+        assert!(writes[49] < Duration::from_secs(2), "{:?}", writes[49]);
+        assert!(held[25] < Duration::from_millis(5), "{:?}", held[25]);
+        // Everything committed meanwhile is searchable once the index is free.
+        let hits = store
+            .search_history(&HistorySearchQuery {
+                query: Some("oltpneedle49".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        let indexed: i64 = store
+            .read_conn()
+            .query_row("SELECT count(*) FROM rag_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(indexed, 300);
+        let state_bytes = std::fs::metadata(dir.path().join("state.db"))
+            .unwrap()
+            .len();
+        let index_bytes = std::fs::metadata(store.memory_index_path()).unwrap().len();
+        eprintln!("state.db {state_bytes} bytes, memory-index.db {index_bytes} bytes");
     }
 
     #[test]
@@ -10348,44 +10229,10 @@ mod tests {
                 "{term}"
             );
         }
-        let hashes: i64 = store.conn().query_row("SELECT count(DISTINCT content_hash) FROM rag_chunks WHERE agent_id=?1 AND direction='in'", [own.id.as_str()], |r| r.get(0)).unwrap();
+        let hashes: i64 = store.shared.memory_index.writer().query_row("SELECT count(DISTINCT content_hash) FROM rag_chunks WHERE agent_id=?1 AND direction='in'", [own.id.as_str()], |r| r.get(0)).unwrap();
         assert_eq!(
             hashes, 2,
             "identical prefixes must not merge distinct tails"
-        );
-        // Simulate the already-present pre-upgrade population, including FTS.
-        // The real historical bodies remain untouched in the mailbox tables.
-        {
-            let conn = store.conn();
-            conn.execute("UPDATE rag_chunks SET text=substr(text,1,2400),text_format=1 WHERE chunk_id NOT LIKE 'tool_%'", []).unwrap();
-            conn.execute("DELETE FROM rag_chunks_fts", []).unwrap();
-            conn.execute("INSERT INTO rag_chunks_fts(chunk_id,agent_name,sender,destination,kind,tool_name,text,search_tokens) SELECT chunk_id,agent_name,sender,destination,kind,tool_name,text,text FROM rag_chunks", []).unwrap();
-        }
-        assert_eq!(
-            store
-                .search_history(&query("firsttailneedle"))
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            store
-                .search_history(&query("outboundtailneedle"))
-                .unwrap()
-                .len(),
-            1
-        );
-        let hidden_format: i64 = store
-            .conn()
-            .query_row(
-                "SELECT text_format FROM rag_chunks WHERE agent_id=?1",
-                [hidden.id.as_str()],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            hidden_format, 1,
-            "hidden bodies must not be read/backfilled"
         );
         let message = store
             .inbox(&own.id, None)
@@ -10410,14 +10257,13 @@ mod tests {
                 },
             )
             .unwrap();
-        // Retrying the upgrade must consume the redacted authoritative body,
-        // not resurrect text from an earlier derivative snapshot.
+        // A rebuild reads the redacted authoritative body, never an earlier
+        // derivative snapshot.
         store
-            .conn()
-            .execute(
-                "UPDATE rag_chunks SET text_format=1 WHERE agent_id=?1",
-                [own.id.as_str()],
-            )
+            .shared
+            .memory_index
+            .writer()
+            .execute("UPDATE index_meta SET value = 0 WHERE key = 'layout'", [])
             .unwrap();
         drop(store);
         let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -11691,9 +11537,12 @@ mod tests {
         )
         .unwrap();
 
-        let mut msg = Incoming::new("We migrated the service-endpoint port from 8080 to 9090.");
+        let body = "We migrated the service-endpoint port from 8080 to 9090.";
+        let mut msg = Incoming::new(body);
         msg.sender = Some("operator".into());
-        store.receive(&agent.id, msg).unwrap();
+        let ReceiveOutcome::New(received) = store.receive(&agent.id, msg).unwrap() else {
+            panic!("a new message");
+        };
 
         let modified = store.consolidate_agent_sleep_memory(&agent.id).unwrap();
         handle.join().unwrap();
@@ -11723,6 +11572,37 @@ mod tests {
         assert!(on_disk.contains("created_at_ms: 1700000000000"));
         assert!(on_disk.contains("port 9090 in production"));
         assert!(!on_disk.contains("runs on port 8080"));
+        // The turns were numbered for the model, and the written topic cites
+        // the immutable raw turn it was distilled from.
+        assert!(captured[0].contains("- #0 [ts="), "{}", captured[0]);
+        let (_, cited) = crate::learned_memory::split_topic_sources(&on_disk);
+        assert_eq!(
+            cited,
+            vec![crate::learned_memory::RawCitation {
+                raw_id: received.id.to_string(),
+                raw_sha256: crate::learned_memory::sha256(body.as_bytes()),
+                offset: 0,
+                length: body.len() as u64,
+                seq: received.seq,
+                direction: "in".into(),
+            }]
+        );
+        // Nothing was destroyed: the replaced version is archived history,
+        // and the raw turn is byte-for-byte what it was.
+        let archived: Vec<_> = std::fs::read_dir(root.join("history/archive/memory"))
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(archived.len(), 1);
+        assert!(archived[0].contains("Primary API endpoint runs on port 8080."));
+        assert_eq!(
+            store
+                .message(&agent.id, received.id.as_str())
+                .unwrap()
+                .unwrap()
+                .text,
+            body
+        );
     }
 
     #[test]
@@ -11818,6 +11698,24 @@ mod tests {
             old_hits.is_empty(),
             "deleted fragmented topic must be evicted from HostIndex FTS5"
         );
+        // Merged-away topics are retired to the history archive, not
+        // destroyed: still searchable as history, never pinned memory.
+        assert!(!root.join("memory/cache-ttl-v1.md").exists());
+        let archived = std::fs::read_dir(root.join("history/archive/memory"))
+            .unwrap()
+            .count();
+        assert_eq!(archived, 2);
+        let history_hits = store
+            .search_host_files(
+                &ids,
+                crate::host_index::MemoryScope::Transcripts,
+                &HistorySearchQuery {
+                    query: Some("oldfragmenttoken".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(history_hits.len(), 1);
     }
 
     #[test]

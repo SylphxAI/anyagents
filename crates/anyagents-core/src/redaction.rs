@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentId, Error, MessageId, Store, agent_config_dir, clean_rag_text, now_ms, rag_content_hash,
-    tokenize_hybrid_search_tokens,
 };
 
 pub const PERMISSION: &str = "conversation.redact";
@@ -574,7 +573,28 @@ impl Store {
                 _process: crate::AgentLock,
             },
         }
-        let phase1 = self.write_tx(|tx| -> Result<RedactPhase1, Error> {
+        // The search index is another copy of the body: its row leaves the
+        // index before the state rewrite and is re-projected from what state
+        // commits (`store/memory_index.rs`). A standalone tool summary has no
+        // state row; its text is read from, and rewritten in, the index.
+        let index_id = match &request.message_id {
+            Some(id) => Some(id.clone()),
+            None => self
+                .read_conn()
+                .query_row(
+                    "SELECT id FROM messages WHERE agent_id = ?1 AND seq = ?2",
+                    params![target.as_str(), request.seq],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?,
+        };
+        let standalone = match &index_id {
+            Some(id) => self.standalone_index_text(target, id)?,
+            None => None,
+        };
+        let index_ids: Vec<&str> = index_id.iter().map(String::as_str).collect();
+        let mut standalone_redacted: Option<String> = None;
+        let phase1 = self.reindex_around(&index_ids, &[], || self.write_tx(|tx| -> Result<RedactPhase1, Error> {
         let actor = authorize(tx, &actor, target)?;
         if unresolved_history(self.data_dir(), &history_dir, target)? {
             return Err(invalid(
@@ -658,8 +678,10 @@ impl Store {
                     .ok_or_else(|| invalid("transcript index out of range"))?,
             )?
         } else {
-            tx.query_row("SELECT body FROM messages WHERE agent_id = ?1 AND id = ?2 UNION ALL SELECT body FROM outbound_messages WHERE agent_id = ?1 AND id = ?2 UNION ALL SELECT text FROM rag_chunks WHERE agent_id = ?1 AND chunk_id = ?2 LIMIT 1",
-                params![target.as_str(), id], |r| r.get::<_, String>(0)).optional()?.ok_or_else(|| invalid("redaction target not found"))?
+            tx.query_row("SELECT body FROM messages WHERE agent_id = ?1 AND id = ?2 UNION ALL SELECT body FROM outbound_messages WHERE agent_id = ?1 AND id = ?2 LIMIT 1",
+                params![target.as_str(), id], |r| r.get::<_, String>(0)).optional()?
+                .or_else(|| standalone.clone().filter(|_| index_id.as_deref() == Some(id.as_str())))
+                .ok_or_else(|| invalid("redaction target not found"))?
         };
         if let Some(receipt) = replay {
             // A historical receipt is not evidence about today's body. Verify
@@ -821,10 +843,6 @@ impl Store {
                 .push(failure(&file.path, "scrub pending/interrupted"));
         }
         tx.pragma_update(None, "secure_delete", "ON")?;
-        tx.execute(
-            "INSERT INTO rag_chunks_fts(rag_chunks_fts, rank) VALUES('secure-delete', 1)",
-            [],
-        )?;
         if transcript_index.is_none() {
             tx.execute(
                 "UPDATE messages SET body = ?3 WHERE agent_id = ?1 AND id = ?2",
@@ -879,29 +897,9 @@ impl Store {
                     }
                 }
             }
-            let cleaned = clean_rag_text(&redacted);
-            tx.execute("UPDATE rag_chunks SET text = ?3, content_hash = ?4 WHERE agent_id = ?1 AND chunk_id = ?2", params![target.as_str(), id, cleaned, rag_content_hash(&cleaned)])?;
-            // Found through the index (`MATCH` on the id's own token, `=` for
-            // the exact row): `chunk_id = ?` alone reads every row of the
-            // index with the writer held. The rebuild below still runs: it is
-            // what physically erases the old text.
-            let tokens = tokenize_hybrid_search_tokens(&cleaned).join(" ");
-            match crate::store::fts_chunk_lookup(&id) {
-                Some(lookup) => tx.execute(
-                    "UPDATE rag_chunks_fts SET text = ?2, search_tokens = ?3 \
-                     WHERE chunk_id MATCH ?4 AND chunk_id = ?1",
-                    params![id, cleaned, tokens, lookup],
-                )?,
-                None => tx.execute(
-                    "UPDATE rag_chunks_fts SET text = ?2, search_tokens = ?3 WHERE chunk_id = ?1",
-                    params![id, cleaned, tokens],
-                )?,
-            };
-            // Remove pre-existing FTS tombstone segments too, not just MATCH visibility.
-            tx.execute(
-                "INSERT INTO rag_chunks_fts(rag_chunks_fts) VALUES('rebuild')",
-                [],
-            )?;
+            if standalone.is_some() {
+                standalone_redacted = Some(clean_rag_text(&redacted));
+            }
         }
         // The audit's target_id freezes its complete retained alias set in the
         // same IMMEDIATE transaction as the body/index rewrite. The primary
@@ -922,7 +920,10 @@ impl Store {
                 whole_body,
                 _process,
             })
-        })?;
+        }))?;
+        if let (Some(id), Some(text)) = (&index_id, &standalone_redacted) {
+            self.rewrite_standalone_index_text(target, id, text)?;
+        }
         let (mut receipt, prepared, id, whole_body, _process) = match phase1 {
             RedactPhase1::Done(receipt) => return Ok(receipt),
             RedactPhase1::Prepared {
@@ -1021,6 +1022,16 @@ impl Store {
                 "SQLite reader prevented WAL truncation; old bytes may remain until the reader exits and a successful TRUNCATE checkpoint")),
             Err(_) => receipt.unscrubbed.push(failure(
                 &PathBuf::from(format!("{}-wal", self.database_path().display())),
+                "SQLite WAL truncation failed; residual bytes are unverified")),
+        }
+        // The index's log can hold the old text the same way.
+        match self.truncate_index_wal() {
+            Ok(true) => {}
+            Ok(false) => receipt.unscrubbed.push(failure(
+                &PathBuf::from(format!("{}-wal", self.memory_index_path().display())),
+                "SQLite reader prevented WAL truncation; old bytes may remain until the reader exits and a successful TRUNCATE checkpoint")),
+            Err(_) => receipt.unscrubbed.push(failure(
+                &PathBuf::from(format!("{}-wal", self.memory_index_path().display())),
                 "SQLite WAL truncation failed; residual bytes are unverified")),
         }
         receipt.full_scrub = receipt.unscrubbed.is_empty();

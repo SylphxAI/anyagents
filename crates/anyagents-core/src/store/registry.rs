@@ -17,9 +17,9 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use super::{
     BUSY_TIMEOUT, MAX_IDLE_READERS, ReadConn, WAL_SIZE_LIMIT_BYTES, WRITE_RETRY_BUDGET, Wake,
-    data_dir_for, ensure_lexical_fts_backfilled, is_transient_lock_error,
-    is_transient_sqlite_error, legacy_last_error, open_reader, preserve_legacy_scopes, runtime,
-    tune_connection,
+    data_dir_for, is_transient_lock_error, is_transient_sqlite_error, legacy_last_error,
+    memory_index::{self, MemoryIndex},
+    open_reader, preserve_legacy_scopes, runtime, tune_connection,
 };
 use crate::error::Error;
 use crate::migrate;
@@ -31,6 +31,8 @@ pub(super) struct Shared {
     path: PathBuf,
     writer: Mutex<Connection>,
     readers: Arc<Mutex<Vec<Connection>>>,
+    /// The mailbox search index, in its own file (`memory_index.rs`).
+    pub(super) memory_index: Arc<MemoryIndex>,
     /// In-process wake subscribers shared across every handle on this file.
     wakes: Mutex<Vec<Sender<Wake>>>,
     /// Total time a bounded write may keep retrying transient lock errors.
@@ -135,22 +137,33 @@ impl Shared {
     fn open(path: &Path) -> Result<Self, Error> {
         note_open_pass();
         let mut conn = open_writer(path)?;
-        let schema_version = migrate::current_version(&conn)?;
+        let memory_index = Arc::new(MemoryIndex::open(&memory_index::path_for(path))?);
+        // Before the migration that drops state's own search tables: keep the
+        // standalone tool summaries only they hold.
+        if migrate::current_version(&conn)? < migrate::MEMORY_INDEX_SPLIT {
+            memory_index.adopt_legacy(&conn)?;
+        }
         migrate::migrate(&mut conn)?;
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
         let mut complete = repair_legacy_schema(&mut conn)?;
-        // Current schemas maintain FTS transactionally on every history write.
-        // Only legacy upgrades need the full derivative-index validation.
-        if schema_version < 23 {
-            ensure_lexical_fts_backfilled(&mut conn)?;
-        }
         complete &= backfill_runtime(&mut conn, &data_dir_for(path))?;
+        // Rows a writer committed but did not project before it stopped, and
+        // a new or rebuilt index's whole history, are projected from state;
+        // a large backlog is filled in the background, never on this open.
+        memory_index.check_tail(&conn)?;
+        if memory_index.far_behind(&conn)? {
+            let state = path.to_path_buf();
+            memory_index::spawn_rebuild(&memory_index, move || open_reader(&state));
+        } else {
+            memory_index.sync(&conn, true, memory_index::READ_BUDGET)?;
+        }
         Ok(Self {
             path: path.to_path_buf(),
             writer: Mutex::new(conn),
             readers: Arc::new(Mutex::new(Vec::new())),
+            memory_index,
             wakes: Mutex::new(Vec::new()),
             write_retry_budget_ms: AtomicU64::new(WRITE_RETRY_BUDGET.as_millis() as u64),
             busy_timeout_ms: AtomicU64::new(BUSY_TIMEOUT.as_millis() as u64),
@@ -317,7 +330,7 @@ fn repair_legacy_schema(conn: &mut Connection) -> Result<bool, Error> {
     let has_aux_schema = deferrable(
         &mut complete,
         conn.query_row(
-            "SELECT (SELECT count(*) FROM sqlite_master WHERE name IN ('message_versions', 'agent_topology_state', 'idx_rag_chunks_agent_id_time')) = 3",
+            "SELECT (SELECT count(*) FROM sqlite_master WHERE name IN ('message_versions', 'agent_topology_state')) = 2",
             [],
             |row| row.get(0),
         ),
@@ -338,9 +351,7 @@ fn repair_legacy_schema(conn: &mut Connection) -> Result<bool, Error> {
                     agent_id TEXT PRIMARY KEY,
                     state_json TEXT NOT NULL,
                     updated_at_ms INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_rag_chunks_agent_id_time
-                    ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
+                );",
             ),
         )?;
     }

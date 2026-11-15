@@ -658,6 +658,179 @@ pub struct SleepTurnDelta {
     pub direction: String,
     pub peer: String,
     pub text: String,
+    /// The immutable raw record the turn was read from.
+    #[serde(default)]
+    pub citation: Option<RawCitation>,
+}
+
+/// An immutable L3 coordinate a learned fact was distilled from: the raw
+/// record's id (a mailbox message id, the `raw_id` `conversation` reads back),
+/// the SHA-256 of the record's exact bytes, and the cited byte range in them.
+/// Consolidation only cites raw history; it never edits or removes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawCitation {
+    pub raw_id: String,
+    pub raw_sha256: String,
+    pub offset: u64,
+    pub length: u64,
+    pub seq: i64,
+    pub direction: String,
+}
+
+impl RawCitation {
+    /// The whole of one raw mailbox body.
+    pub fn whole(raw_id: &str, body: &str, seq: i64, direction: &str) -> Self {
+        Self {
+            raw_id: raw_id.to_string(),
+            raw_sha256: sha256(body.as_bytes()),
+            offset: 0,
+            length: body.len() as u64,
+            seq,
+            direction: direction.to_string(),
+        }
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "- raw_id={} raw_sha256={} offset={} length={} seq={} direction={}",
+            self.raw_id, self.raw_sha256, self.offset, self.length, self.seq, self.direction
+        )
+    }
+
+    fn parse(line: &str) -> Option<Self> {
+        let rest = line.trim().strip_prefix("- ")?;
+        let mut fields = std::collections::HashMap::new();
+        for pair in rest.split_whitespace() {
+            let (key, value) = pair.split_once('=')?;
+            fields.insert(key, value);
+        }
+        let citation = Self {
+            raw_id: fields.get("raw_id")?.to_string(),
+            raw_sha256: fields.get("raw_sha256")?.to_string(),
+            offset: fields.get("offset")?.parse().ok()?,
+            length: fields.get("length")?.parse().ok()?,
+            seq: fields.get("seq")?.parse().ok()?,
+            direction: fields.get("direction")?.to_string(),
+        };
+        (citation.raw_sha256.len() == 64
+            && citation.raw_sha256.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then_some(citation)
+    }
+}
+
+/// The heading of a topic's citation section, which consolidation owns.
+const SOURCES_HEADING: &str = "## Sources (raw history)";
+/// Citations a topic keeps, newest last.
+const MAX_SOURCES: usize = 64;
+
+/// A topic body without its citation section, and the citations in it.
+pub fn split_topic_sources(body: &str) -> (&str, Vec<RawCitation>) {
+    let Some(at) = body.find(SOURCES_HEADING) else {
+        return (body, Vec::new());
+    };
+    let citations = body[at + SOURCES_HEADING.len()..]
+        .lines()
+        .filter_map(RawCitation::parse)
+        .collect();
+    (body[..at].trim_end(), citations)
+}
+
+fn with_sources(body: &str, previous: Vec<RawCitation>, new: &[RawCitation]) -> String {
+    let (body, mut echoed) = split_topic_sources(body);
+    let mut all = previous;
+    all.append(&mut echoed);
+    all.extend(new.iter().cloned());
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<RawCitation> = all
+        .into_iter()
+        .rev()
+        .filter(|c| seen.insert((c.raw_id.clone(), c.raw_sha256.clone(), c.offset, c.length)))
+        .take(MAX_SOURCES)
+        .collect();
+    kept.reverse();
+    if kept.is_empty() {
+        return body.trim().to_string();
+    }
+    let lines: Vec<String> = kept.iter().map(RawCitation::line).collect();
+    format!("{}\n\n{SOURCES_HEADING}\n{}", body.trim(), lines.join("\n"))
+}
+
+/// Keep the current bytes of topic `slug` as searchable history before
+/// consolidation replaces or retires it: `history/archive/memory/` is read
+/// by `conversation` (`scope: transcripts`), never pinned into a prompt.
+fn archive_topic_version(agent_root: &Path, slug: &str, now_ms: i64) -> io::Result<bool> {
+    let path = agent_root.join("memory").join(format!("{slug}.md"));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let dir = agent_root.join("history/archive/memory");
+    let mut target = dir.join(format!("{slug}.{now_ms}.md"));
+    let mut n = 1;
+    while target.exists() {
+        if fs::read(&target)? == bytes {
+            return Ok(true);
+        }
+        target = dir.join(format!("{slug}.{now_ms}-{n}.md"));
+        n += 1;
+    }
+    atomic_write(&target, &bytes)?;
+    Ok(true)
+}
+
+/// Consolidation's write of one topic: the previous version is archived,
+/// the new body keeps every earlier citation and adds `citations`.
+#[allow(clippy::too_many_arguments)]
+pub fn consolidate_memory_topic(
+    agent_root: &Path,
+    agent_name: &str,
+    role: Option<&str>,
+    topic: &str,
+    description: Option<&str>,
+    content: &str,
+    citations: &[RawCitation],
+    now_ms: i64,
+) -> io::Result<(std::path::PathBuf, MemoryTopicEntry, String)> {
+    let slug = sanitize_topic_slug(topic)?;
+    let path = agent_root.join("memory").join(format!("{slug}.md"));
+    let previous = match fs::read_to_string(&path) {
+        Ok(old) => {
+            let (_, _, _, _, body) = parse_topic_frontmatter_full(&slug, &old);
+            let cited = split_topic_sources(body).1;
+            archive_topic_version(agent_root, &slug, now_ms)?;
+            cited
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let (_, _, _, _, new_body) = parse_topic_frontmatter_full(&slug, content.trim());
+    let body = with_sources(new_body, previous, citations);
+    upsert_memory_topic(
+        agent_root,
+        agent_name,
+        role,
+        &slug,
+        description,
+        &body,
+        now_ms,
+    )
+}
+
+/// Consolidation's retirement of a merged topic: it leaves the catalog and
+/// the pinned index, and its bytes move to the history archive.
+pub fn retire_memory_topic(
+    agent_root: &Path,
+    agent_name: &str,
+    role: Option<&str>,
+    topic: &str,
+    now_ms: i64,
+) -> io::Result<(bool, String)> {
+    let slug = sanitize_topic_slug(topic)?;
+    if !archive_topic_version(agent_root, &slug, now_ms)? {
+        return Ok((false, rebuild_memory_index(agent_root, agent_name, role)?));
+    }
+    delete_memory_topic(agent_root, agent_name, role, &slug)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -668,6 +841,10 @@ pub enum SleepMemoryOp {
         #[serde(default)]
         description: Option<String>,
         content: String,
+        /// Indices into the turns shown, the ones this topic was distilled
+        /// from.
+        #[serde(default)]
+        sources: Vec<usize>,
     },
     Delete {
         topic: String,
@@ -739,7 +916,9 @@ pub fn build_sleep_consolidation_prompts(
     let system_prompt = "\
 You are a sleep-time semantic memory consolidator (Sleep-time Compute arXiv:2504.13171, MemGPT arXiv:2310.08560, Zep bi-temporal state upsert arXiv:2501.13956).
 Your task is to inspect an agent's existing memory topic catalog/bodies and recent unconsolidated conversation turns, then output a strict JSON consolidation plan:
-{\"operations\": [{\"op\": \"upsert\", \"topic\": \"<kebab-slug>\", \"description\": \"<single-line <=140 chars>\", \"content\": \"<markdown body>\"}, {\"op\": \"delete\", \"topic\": \"<obsolete-slug>\"}]}
+{\"operations\": [{\"op\": \"upsert\", \"topic\": \"<kebab-slug>\", \"description\": \"<single-line <=140 chars>\", \"content\": \"<markdown body>\", \"sources\": [<turn numbers>]}, {\"op\": \"delete\", \"topic\": \"<obsolete-slug>\"}]}
+
+Every `upsert` lists in `sources` the numbers (`#n`) of the turns its facts come from. The host attaches those turns' immutable raw coordinates to the topic; do not write a sources section yourself.
 
 Follow these 4 strict rules:
 1. Strict Noise Rejection: Ignore transient questions, conversational acknowledgments (\"OK\", \"收到\", \"checking now\"), temporary progress chatter, and routine status heartbeats. If the turns contain no durable facts worth remembering across future sessions, return {\"operations\": []}. Only persist durable facts: verified IDs/accounts/endpoints/credential references, state transitions, architectural invariants, root-cause/fix lessons, or standing directives.
@@ -793,7 +972,7 @@ Output ONLY valid JSON with no markdown code fences or commentary."
             let path = mem_dir.join(&t.filename);
             if let Ok(raw) = fs::read_to_string(&path) {
                 let (_, _, _, _, body) = parse_topic_frontmatter_full(&t.slug, &raw);
-                let snippet = truncate_utf8_chars(body.trim(), 2000);
+                let snippet = truncate_utf8_chars(split_topic_sources(body).0.trim(), 2000);
                 user_prompt.push_str(&format!(
                     "### Topic `{}` (`{}`)\nDescription: {}\n```markdown\n{}\n```\n\n",
                     t.slug, t.filename, t.description, snippet
@@ -803,9 +982,9 @@ Output ONLY valid JSON with no markdown code fences or commentary."
     }
 
     user_prompt.push_str("## Unconsolidated Conversation Turns\n");
-    for turn in turns {
+    for (n, turn) in turns.iter().enumerate() {
         user_prompt.push_str(&format!(
-            "- [ts={} dir={} peer={}] {}\n",
+            "- #{n} [ts={} dir={} peer={}] {}\n",
             turn.timestamp_ms, turn.direction, turn.peer, turn.text
         ));
     }
@@ -856,7 +1035,7 @@ pub fn parse_sleep_consolidation_plan(
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| "consolidation plan JSON must contain an `operations` array".to_string())?;
 
-    let mut upserts: Vec<(String, Option<String>, String)> = Vec::new();
+    let mut upserts: Vec<(String, Option<String>, String, Vec<usize>)> = Vec::new();
     let mut deletes: Vec<String> = Vec::new();
 
     for item in ops_arr {
@@ -889,11 +1068,22 @@ pub fn parse_sleep_consolidation_plan(
                     .map(clean_single_line_description)
                     .map(|d| truncate_utf8_chars(&d, 140).to_string())
                     .filter(|d| !d.is_empty());
-                if let Some(existing) = upserts.iter_mut().find(|(s, _, _)| *s == slug) {
+                let sources: Vec<usize> = item
+                    .get("sources")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(serde_json::Value::as_u64)
+                            .filter_map(|n| usize::try_from(n).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(existing) = upserts.iter_mut().find(|(s, _, _, _)| *s == slug) {
                     existing.1 = description;
                     existing.2 = content.to_string();
+                    existing.3.extend(sources);
                 } else {
-                    upserts.push((slug, description, content.to_string()));
+                    upserts.push((slug, description, content.to_string(), sources));
                 }
             }
             "delete" | "remove" if !deletes.contains(&slug) => {
@@ -905,15 +1095,18 @@ pub fn parse_sleep_consolidation_plan(
 
     let has_upserts = !upserts.is_empty();
     let upsert_slugs: std::collections::HashSet<String> =
-        upserts.iter().map(|(s, _, _)| s.clone()).collect();
+        upserts.iter().map(|(s, _, _, _)| s.clone()).collect();
 
     let mut operations: Vec<SleepMemoryOp> = upserts
         .into_iter()
-        .map(|(topic, description, content)| SleepMemoryOp::Upsert {
-            topic,
-            description,
-            content,
-        })
+        .map(
+            |(topic, description, content, sources)| SleepMemoryOp::Upsert {
+                topic,
+                description,
+                content,
+                sources,
+            },
+        )
         .collect();
 
     if has_upserts {
@@ -1264,6 +1457,79 @@ fn build_sleep_consolidation_messages_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn consolidation_archives_every_replaced_version_and_keeps_its_citations() {
+        let root = tempfile::tempdir().unwrap();
+        let cite = |id: &str, body: &str| RawCitation::whole(id, body, 1, "in");
+        let first = cite("msg_a", "the port is 8080");
+        let second = cite("msg_b", "the port is now 9090");
+        consolidate_memory_topic(
+            root.path(),
+            "sage",
+            None,
+            "port",
+            Some("Service port"),
+            "Port 8080.",
+            std::slice::from_ref(&first),
+            1_000,
+        )
+        .unwrap();
+        // The model echoes a sources section of its own: it is replaced by
+        // the host's, never trusted.
+        consolidate_memory_topic(
+            root.path(),
+            "sage",
+            None,
+            "port",
+            Some("Service port"),
+            "Port 9090.\n\n## Sources (raw history)\n- invented",
+            std::slice::from_ref(&second),
+            2_000,
+        )
+        .unwrap();
+        let topic = fs::read_to_string(root.path().join("memory/port.md")).unwrap();
+        let (body, cited) = split_topic_sources(&topic);
+        assert!(body.contains("Port 9090.") && !body.contains("invented"));
+        assert_eq!(cited, vec![first.clone(), second]);
+        let archive = root.path().join("history/archive/memory");
+        let archived = fs::read_to_string(archive.join("port.2000.md")).unwrap();
+        assert!(archived.contains("Port 8080."));
+        assert_eq!(split_topic_sources(&archived).1, vec![first]);
+        // Retiring moves the last version to the archive; nothing is lost.
+        let (removed, index) =
+            retire_memory_topic(root.path(), "sage", None, "port", 3_000).unwrap();
+        assert!(removed);
+        assert!(!index.contains("port"));
+        assert!(!root.path().join("memory/port.md").exists());
+        assert!(
+            fs::read_to_string(archive.join("port.3000.md"))
+                .unwrap()
+                .contains("Port 9090.")
+        );
+        // A citation must carry a real digest.
+        assert!(
+            RawCitation::parse("- raw_id=x raw_sha256=short offset=0 length=1 seq=1 direction=in")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn plans_name_their_source_turns() {
+        let plan = parse_sleep_consolidation_plan(
+            r#"{"operations":[{"op":"upsert","topic":"a","content":"x","sources":[0,2]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.operations,
+            vec![SleepMemoryOp::Upsert {
+                topic: "a".into(),
+                description: None,
+                content: "x".into(),
+                sources: vec![0, 2],
+            }]
+        );
+    }
+
     #[test]
     fn cap_includes_wrappers_and_marker() {
         for input in [
