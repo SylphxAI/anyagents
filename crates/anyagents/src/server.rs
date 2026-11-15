@@ -12312,7 +12312,7 @@ exec '{}' "$@"
             .unwrap_or_else(|e| panic!("{name}: {}: {}", e.status, e.message));
             assert_eq!(status, StatusCode::CREATED, "{name}");
             assert_eq!(agent.role.as_deref(), Some("general"), "{name}");
-            assert_eq!(agent.scope(), "private", "{name}");
+            assert_eq!(agent.scope, "private", "{name}");
             assert!(
                 agent
                     .instructions
@@ -12345,7 +12345,7 @@ exec '{}' "$@"
         .unwrap_or_else(|e| panic!("override: {}: {}", e.status, e.message));
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(overridden.role.as_deref(), Some("general"));
-        assert_eq!(overridden.scope(), "public");
+        assert_eq!(overridden.scope, "public");
         assert_eq!(
             overridden.description.as_deref(),
             Some("HTTP General Override")
