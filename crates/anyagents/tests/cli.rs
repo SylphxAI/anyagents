@@ -110,13 +110,19 @@ fn configured_owner_catalog_is_authoritative_for_create_discovery_and_updates() 
             .unwrap()
     };
     let workspace = workspace.to_str().unwrap();
-    // A no-role agent remains possible, even before the catalog exists.
+    // Omitting --role automatically defaults to the built-in `general` role without any disk file.
     let created = run(&["agents", "create", "plain", "--workdir", workspace]);
     assert!(
         created.status.success(),
         "{}",
         String::from_utf8_lossy(&created.stderr)
     );
+    {
+        let store = Store::open(data.join("state.db")).unwrap();
+        let plain = store.agent_by_name("plain").unwrap();
+        assert_eq!(plain.role.as_deref(), Some("general"));
+        assert_eq!(plain.scope(), "public");
+    }
     for state in ["missing", "empty", "populated"] {
         if state == "empty" {
             std::fs::create_dir_all(owner.join(".agents/agents")).unwrap();
@@ -849,7 +855,8 @@ fn create_registers_mcp_only_in_the_agent_config() {
     let store = Store::open(dir.path().join("state.db")).unwrap();
     let agent = store.agent_by_name("alpha").unwrap();
     assert_eq!(agent.state, "running");
-    assert_eq!(agent.instructions.as_deref(), Some("be brief"));
+    assert_eq!(agent.role.as_deref(), Some("general"));
+    let alpha_instructions = agent.instructions.clone().unwrap();
     assert_eq!(agent.model.as_deref(), Some("sonnet"));
     assert_eq!(
         agent.workdir.as_deref(),
@@ -919,6 +926,15 @@ fn create_registers_mcp_only_in_the_agent_config() {
     assert!(toml.contains("[mcp_servers.anyagents]"), "{toml}");
     assert_eq!(std::fs::read(&claude_sentinel).unwrap(), b"sentinel-claude");
     assert_eq!(std::fs::read(&codex_sentinel).unwrap(), b"sentinel-codex");
+
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let beta = store.agent_by_name("beta").unwrap();
+    let default_body = beta.instructions.as_deref().unwrap();
+    assert!(
+        default_body.starts_with("You are a cohesive end-to-end execution worker."),
+        "{default_body}"
+    );
+    assert_eq!(alpha_instructions, format!("{default_body}\n\nbe brief"));
 }
 
 #[test]
@@ -1103,4 +1119,297 @@ fn add_telegram_copies_the_token_and_lists_no_secret() {
     assert!(stdout.contains("telegram"), "{stdout}");
     assert!(stdout.contains("alpha"), "{stdout}");
     assert!(!stdout.contains("123456"), "{stdout}");
+}
+
+#[test]
+fn cli_create_defaults_omitted_and_empty_role_to_builtin_general_and_allows_disk_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let workspace = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let ws_str = workspace.to_str().unwrap();
+    let run = |args: &[&str]| {
+        bin_in(&data)
+            .env("HOME", &home)
+            .env_remove("ANYAGENTS_OWNER_WORKDIR")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    for (name, extra_args) in [
+        ("omitted-role", &[][..]),
+        ("empty-role", &["--role", ""][..]),
+        ("explicit-general", &["--role", "general"][..]),
+    ] {
+        let mut args = vec!["agents", "create", name, "--workdir", ws_str];
+        args.extend_from_slice(extra_args);
+        let out = run(&args);
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Sub-agent with omitted role gets built-in `general` with `private` scope.
+    let sub = run(&[
+        "agents",
+        "create",
+        "sub-omitted",
+        "--parent",
+        "omitted-role",
+        "--workdir",
+        ws_str,
+    ]);
+    assert!(
+        sub.status.success(),
+        "sub-omitted: {}",
+        String::from_utf8_lossy(&sub.stderr)
+    );
+
+    {
+        let store = Store::open(data.join("state.db")).unwrap();
+        let omitted = store.agent_by_name("omitted-role").unwrap();
+        let default_body = omitted.instructions.as_deref().unwrap();
+        assert!(
+            default_body.starts_with("You are a cohesive end-to-end execution worker."),
+            "{default_body}"
+        );
+        for name in ["omitted-role", "empty-role", "explicit-general"] {
+            let agent = store.agent_by_name(name).unwrap();
+            assert_eq!(agent.role.as_deref(), Some("general"), "{name}");
+            assert_eq!(agent.scope(), "public", "{name}");
+            assert_eq!(agent.instructions.as_deref(), Some(default_body), "{name}");
+        }
+        let sub_agent = store.agent_by_name("sub-omitted").unwrap();
+        assert_eq!(sub_agent.role.as_deref(), Some("general"));
+        assert_eq!(sub_agent.scope(), "private");
+        assert_eq!(sub_agent.instructions.as_deref(), Some(default_body));
+    }
+
+    // Workspace .agents/agents/general.md overrides the built-in template (even root scope).
+    std::fs::create_dir_all(workspace.join(".agents/agents")).unwrap();
+    std::fs::write(
+        workspace.join(".agents/agents/general.md"),
+        "---\nname: general\ndescription: Workspace General Override\nscope: private\n---\nWorkspace general override body.\n",
+    )
+    .unwrap();
+    let overridden = run(&["agents", "create", "disk-general", "--workdir", ws_str]);
+    assert!(
+        overridden.status.success(),
+        "{}",
+        String::from_utf8_lossy(&overridden.stderr)
+    );
+    let store = Store::open(data.join("state.db")).unwrap();
+    let agent = store.agent_by_name("disk-general").unwrap();
+    assert_eq!(agent.role.as_deref(), Some("general"));
+    assert_eq!(agent.scope(), "private");
+    assert_eq!(
+        agent.description.as_deref(),
+        Some("Workspace General Override")
+    );
+    assert!(
+        agent
+            .instructions
+            .as_deref()
+            .is_some_and(|text| text.contains("Workspace general override body.")),
+        "{:?}",
+        agent.instructions
+    );
+}
+
+/// Read one HTTP request (head and its `content-length` body) from `stream`.
+fn read_request(stream: &mut std::os::unix::net::UnixStream) -> String {
+    use std::io::Read;
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let text = String::from_utf8_lossy(&seen).into_owned();
+        if let Some(end) = text.find("\r\n\r\n") {
+            let length = text[..end]
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if seen.len() >= end + 4 + length {
+                return text;
+            }
+        }
+        let read = stream.read(&mut buf).unwrap();
+        if read == 0 {
+            return String::from_utf8_lossy(&seen).into_owned();
+        }
+        seen.extend_from_slice(&buf[..read]);
+    }
+}
+
+#[test]
+fn an_agent_send_waits_for_a_restarting_server_instead_of_failing() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("mcp-capability"), "agent-capability\n").unwrap();
+    let socket = data.join("anyagents.sock");
+    // No socket: the server is between its stop and the next start.
+    let child = bin()
+        .args(["--data", data.to_str().unwrap(), "send", "worker", "hello"])
+        .env(
+            "ANYAGENTS_AGENT_ID",
+            anyagents_core::AgentId::generate().as_str(),
+        )
+        .env("ANYAGENTS_AGENT_CONFIG", &config)
+        .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+        .env("ANYAGENTS_RECONNECT_WAIT_MS", "20000")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    let request = read_request(&mut stream);
+    assert!(
+        request.starts_with("POST http://localhost/v1/send ")
+            || request.starts_with("POST /v1/send "),
+        "{request}"
+    );
+    assert!(request.contains("hello"), "{request}");
+    let body = r#"{"deliveries":[{"to":"agent:worker","id":"m-1","seq":7,"duplicate":false}]}"#;
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "m-1\t7");
+}
+
+#[test]
+fn an_agent_send_with_no_server_refuses_after_its_wait_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("mcp-capability"), "agent-capability\n").unwrap();
+    let started = std::time::Instant::now();
+    let output = bin()
+        .args(["--data", data.to_str().unwrap(), "send", "worker", "hello"])
+        .env(
+            "ANYAGENTS_AGENT_ID",
+            anyagents_core::AgentId::generate().as_str(),
+        )
+        .env("ANYAGENTS_AGENT_CONFIG", &config)
+        .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+        .env("ANYAGENTS_RECONNECT_WAIT_MS", "600")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(started.elapsed() >= std::time::Duration::from_millis(600));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("authenticated server"), "{stderr}");
+    // An agent never falls back to writing the store itself.
+    assert!(!data.join("state.db").exists());
+}
+
+#[test]
+fn an_authenticated_agent_cli_mutation_waits_for_a_restarting_server() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("mcp-capability"), "agent-capability\n").unwrap();
+    let agent_id = anyagents_core::AgentId::generate();
+    let socket = data.join("anyagents.sock");
+    // `anyagents.sock` is absent while the server restarts; `groups join` is
+    // gated by `client::can_call_server(data)`.
+    let child = bin()
+        .args([
+            "--data",
+            data.to_str().unwrap(),
+            "groups",
+            "join",
+            "room-1",
+            agent_id.as_str(),
+        ])
+        .env("ANYAGENTS_AGENT_ID", agent_id.as_str())
+        .env("ANYAGENTS_AGENT_CONFIG", &config)
+        .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+        .env("ANYAGENTS_RECONNECT_WAIT_MS", "20000")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    // First call: `agent::named` resolves the target agent via `GET /v1/agents/<id>`.
+    let (mut get_stream, _) = listener.accept().unwrap();
+    let get_req = read_request(&mut get_stream);
+    assert!(
+        get_req.contains(&format!("/v1/agents/{}", agent_id.as_str())),
+        "{get_req}"
+    );
+    let agent_body = serde_json::json!({
+        "id": agent_id.as_str(),
+        "name": "worker",
+        "harness": "codex",
+        "model": null,
+        "workdir": null,
+        "state": "running",
+        "process": "running",
+        "quota_reset_at_ms": null,
+        "oldest_undelivered_age_ms": null,
+        "install": "installed"
+    })
+    .to_string();
+    write!(
+        get_stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{agent_body}",
+        agent_body.len()
+    )
+    .unwrap();
+    drop(get_stream);
+
+    // Second call: `join_group` gated by `can_call_server` sends `POST /v1/groups`.
+    let (mut post_stream, _) = listener.accept().unwrap();
+    let request = read_request(&mut post_stream);
+    assert!(
+        request.starts_with("POST http://localhost/v1/groups ")
+            || request.starts_with("POST /v1/groups "),
+        "{request}"
+    );
+    assert!(request.contains("room-1"), "{request}");
+    let body = format!(
+        r#"{{"name":"room-1","public":true,"members":["{}"]}}"#,
+        agent_id.as_str()
+    );
+    write!(
+        post_stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

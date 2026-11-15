@@ -12,8 +12,9 @@ use anyagents_core::AgentId;
 use crate::operator::CAPABILITY_FILE;
 use crate::server;
 
-/// How long one call may take. Creating an agent installs a harness, which can
-/// take a minute; everything else answers at once.
+/// How long the server may take to answer one call once it is connected (a
+/// wait for a restarting server is not counted). Creating an agent installs
+/// a harness, which can take a minute; everything else answers at once.
 const TIMEOUT: Duration = Duration::from_secs(180);
 
 /// What this client presents.
@@ -44,8 +45,26 @@ pub(crate) fn authority(data: &Path) -> Authority {
     Authority::None
 }
 
+/// This command goes through the server. An operator's does when the server
+/// is up; otherwise it uses the store it owns. An authenticated agent's always
+/// does: it has no store of its own, and a socket missing for a moment is a
+/// server restarting, which its call waits out ([`restart_wait`]) before it
+/// refuses; an agent process with neither socket nor capability was never
+/// admitted by a server and falls through to each command's offline refusal.
 pub(crate) fn can_call_server(data: &Path) -> bool {
-    server::socket_path(data).exists() && !matches!(authority(data), Authority::None)
+    match authority(data) {
+        Authority::Agent(id) => {
+            server::socket_path(data).exists() || capability(data, &id).is_some()
+        }
+        Authority::Operator => server::socket_path(data).exists(),
+        Authority::None => false,
+    }
+}
+
+/// A command sending through the server whatever its authority: the server's
+/// socket is there, or it runs as an agent (see [`can_call_server`]).
+pub(crate) fn sends_through_server(data: &Path) -> bool {
+    server::socket_path(data).exists() || matches!(authority(data), Authority::Agent(_))
 }
 
 /// The agent whose config directory this process runs with, from the interface
@@ -65,27 +84,61 @@ pub(crate) fn get<T: serde::de::DeserializeOwned>(
     if !can_call_server(data) {
         return Ok(None);
     }
-    match call_inner(data, "GET", path, None, &authority(data)) {
+    let authority = authority(data);
+    match call_inner(data, "GET", path, None, &authority) {
         Err(err) if may_read_offline(&err, agent_identity().is_some()) => Ok(None),
+        // The agent waited and no server came back (its socket is still
+        // gone): answer as when there is none, so each command gives its own
+        // refusal ("... requires the authenticated server") rather than a
+        // transport error.
+        Err(CallError::Absent(_)) => Ok(None),
         result => result.map_err(CallError::message),
     }
 }
 
 enum CallError {
     Transport(String),
+    /// An agent's call found no server, even after waiting for one: nothing
+    /// was sent.
+    Absent(String),
     Response(String),
 }
 
 impl CallError {
     fn message(self) -> String {
         match self {
-            Self::Transport(message) | Self::Response(message) => message,
+            Self::Transport(message) | Self::Absent(message) | Self::Response(message) => message,
         }
     }
 }
 
 fn may_read_offline(error: &CallError, is_agent: bool) -> bool {
     !is_agent && matches!(error, CallError::Transport(_))
+}
+
+/// How long one command waits for a server that is restarting (its socket
+/// missing or refusing, so nothing was sent). An operator's read does not
+/// wait: it is answered from the store at once. Everything else (an agent's
+/// command, any change) waits the restart out.
+///
+/// `ANYAGENTS_RECONNECT_WAIT_MS` replaces the wait (an operator's choice, or
+/// a test of something other than restarts), up to ten minutes.
+fn restart_wait(
+    method: &str,
+    authority: &Authority,
+    has_agent_capability: bool,
+) -> std::time::Duration {
+    if method.eq_ignore_ascii_case("GET") && matches!(authority, Authority::Operator) {
+        return std::time::Duration::ZERO;
+    }
+    if matches!(authority, Authority::Agent(_)) && !has_agent_capability {
+        return std::time::Duration::ZERO;
+    }
+    std::env::var("ANYAGENTS_RECONNECT_WAIT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|ms| std::time::Duration::from_millis(ms).min(std::time::Duration::from_secs(600)))
+        .unwrap_or(crate::mcp::RECONNECT_WITHIN)
 }
 
 fn capability(data: &Path, id: &AgentId) -> Option<String> {
@@ -132,22 +185,29 @@ fn call_inner<T: serde::de::DeserializeOwned>(
         .enable_all()
         .build()
         .map_err(|err| CallError::Response(err.to_string()))?;
-    let (status, bytes) = runtime.block_on(async {
-        tokio::time::timeout(
+    let within = restart_wait(method, authority, agent_token.is_some());
+    let (status, bytes) = runtime
+        .block_on(crate::mcp::request_waiting(
+            &socket,
+            method,
+            path,
+            body,
+            agent_token.as_deref(),
+            operator_token.as_deref(),
+            within,
             TIMEOUT,
-            crate::mcp::request(
-                &socket,
-                method,
-                path,
-                body,
-                agent_token.as_deref(),
-                operator_token.as_deref(),
-            ),
-        )
-        .await
-        .map_err(|_| CallError::Transport("the server did not answer".into()))?
-        .map_err(CallError::Transport)
-    })?;
+        ))
+        .map_err(|error| {
+            if matches!(authority, Authority::Agent(_)) && !socket.exists() {
+                CallError::Absent(format!(
+                    "this command requires the authenticated server, and none came back within \
+                     {}s ({error})",
+                    within.as_secs()
+                ))
+            } else {
+                CallError::Transport(error)
+            }
+        })?;
     if !status.is_success() {
         let msg = error_message(&bytes);
         return Err(CallError::Response(if msg.is_empty() {
