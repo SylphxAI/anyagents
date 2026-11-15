@@ -189,6 +189,63 @@ mod tests {
         assert_eq!(fs::read(&tok_path).unwrap(), original);
     }
 
+    /// Profile markers are rewritten by concurrent writers (switch, wake,
+    /// rotation, the periodic seat pass) while readers parse them. A reader
+    /// sees one writer's whole value, never an empty or partial file, and no
+    /// temporary file is left behind.
+    #[test]
+    fn concurrent_marker_writers_never_expose_empty_or_partial_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".anyagents-profile-rotated-ms");
+        atomic_write_in_existing_dir(&marker, b"1000000000000\n", 0o664).unwrap();
+        let values: Vec<Vec<u8>> = (0..8)
+            .map(|w| format!("{}\n", 1_800_000_000_000_u64 + w).into_bytes())
+            .collect();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            for value in &values {
+                let marker = &marker;
+                scope.spawn(move || {
+                    for _ in 0..200 {
+                        atomic_write_in_existing_dir(marker, value, 0o664).unwrap();
+                    }
+                });
+            }
+            let mut readers = Vec::new();
+            for _ in 0..4 {
+                let (marker, stop, values) = (&marker, stop.clone(), &values);
+                readers.push(scope.spawn(move || {
+                    let mut reads = 0_u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let seen = fs::read(marker).unwrap();
+                        assert!(
+                            seen == b"1000000000000\n" || values.contains(&seen),
+                            "reader saw {seen:?}"
+                        );
+                        reads += 1;
+                    }
+                    reads
+                }));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            while fs::read_dir(dir.path()).unwrap().count() > 1 {
+                std::thread::yield_now();
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            for reader in readers {
+                assert!(reader.join().unwrap() > 0);
+            }
+        });
+        assert!(values.contains(&fs::read(&marker).unwrap()));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(
+            atomic_write_in_existing_dir(&marker, b"", 0o664)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn unwritable_parent_directory_preserves_writable_target_file() {

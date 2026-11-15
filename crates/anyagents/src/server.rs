@@ -5109,6 +5109,12 @@ async fn pause_agent_route(
         ) {
             require_admin_or_operator(&state.store, &principal, "agents.pause", &found.name)?;
         }
+        // Serialized with this agent's harness, profile, wake and archive
+        // transitions, as the command-line pause is.
+        let lifecycle = state
+            .store
+            .lock_agent_lifecycle(&found.id)
+            .map_err(ApiError::from_store)?;
         let agent = state
             .store
             .set_agent_state(&found.id, "paused")
@@ -5118,6 +5124,7 @@ async fn pause_agent_route(
         ) {
             let _ = anyagents_tools::SandboxProvider::pause(&sbx);
         }
+        drop(lifecycle);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
             if state

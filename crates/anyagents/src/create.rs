@@ -2044,12 +2044,74 @@ fn heal_mcp_config_file(path: &Path) -> bool {
     }
 }
 
-pub(crate) fn ensure_agy_mcp_config(profile_roots: &[PathBuf], target_config: &Path) {
+/// Arguments of the `anyagents mcp` server a seat's harness launches.
+pub(crate) fn mcp_server_args(data: &Path, config: &Path) -> Vec<String> {
+    vec![
+        "--data".to_string(),
+        data.display().to_string(),
+        "mcp".to_string(),
+        "--config".to_string(),
+        config.display().to_string(),
+    ]
+}
+
+fn config_writes_suppressed(data: &Path) -> bool {
+    std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
+        || data.join(".anyagents-suppress-config-write").exists()
+}
+
+/// Whether an Antigravity `mcp_config.json` registers an enabled `anyagents`
+/// server. Antigravity reloads this file while it runs: the moment it names
+/// no such server, `call_mcp_tool` leaves the tool list (`unknown tool`) and
+/// `list_resources` answers `server anyagents is not allowed in this context`
+/// until the registration is written back.
+pub(crate) fn agy_mcp_registered(path: &Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|root| root.pointer("/mcpServers/anyagents").cloned())
+        .is_some_and(|server| {
+            server
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|command| !command.trim().is_empty())
+                && server.get("disabled").and_then(serde_json::Value::as_bool) != Some(true)
+        })
+}
+
+/// Restore the `anyagents` registration of an Antigravity seat. Other
+/// servers in the file are kept; an empty or unparsable file is replaced.
+pub(crate) fn ensure_agy_mcp_registration(data: &Path, config: &Path) -> Result<bool, Error> {
+    let path = config.join(".gemini/config/mcp_config.json");
+    if agy_mcp_registered(&path) || config_writes_suppressed(data) {
+        return Ok(false);
+    }
+    let command = crate::data::current_exe_clean()?;
+    mcp_config::write_claude(&path, &command, &mcp_server_args(data, config))?;
+    Ok(true)
+}
+
+/// Profiles keep a parsable MCP file for a sign-in run inside them. A seat's
+/// Antigravity file must name its `anyagents` server: a parsable but empty
+/// server map there removes every AnyAgents tool from the running cascade.
+pub(crate) fn ensure_agy_mcp_config(
+    data: &Path,
+    agent: &Agent,
+    profile_roots: &[PathBuf],
+    target_config: &Path,
+) {
     for profile_root in profile_roots {
         let _ = heal_mcp_config_file(&profile_root.join(".gemini/config/mcp_config.json"));
         let _ = heal_mcp_config_file(&profile_root.join("mcp_config.json"));
     }
-    let _ = heal_mcp_config_file(&target_config.join(".gemini/config/mcp_config.json"));
+    let seat_agy = target_config.join(".gemini/config/mcp_config.json");
+    if normalize_harness_name(&agent.harness) == "agy" && target_config.is_dir() {
+        if let Err(err) = ensure_agy_mcp_registration(data, target_config) {
+            eprintln!("cannot restore {}: {err}", seat_agy.display());
+        }
+    } else {
+        let _ = heal_mcp_config_file(&seat_agy);
+    }
     let _ = heal_mcp_config_file(&target_config.join("mcp_config.json"));
 }
 
@@ -2298,7 +2360,7 @@ pub(crate) fn seed_harness_credentials(
             refresh_anthropic_profile_oauth_if_due(data, &primary_profile_root)?;
         }
     }
-    ensure_agy_mcp_config(&profile_roots, target_config);
+    ensure_agy_mcp_config(data, agent, &profile_roots, target_config);
 
     for profile_root in &profile_roots {
         for candidate in [
@@ -2854,16 +2916,10 @@ pub(crate) fn reconcile_agent_runtime_config(
         continuity.as_deref(),
     )?;
 
-    let suppress_config_write = std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
-        || data.join(".anyagents-suppress-config-write").exists();
-    if !suppress_config_write && let Ok(command) = crate::data::current_exe_clean() {
-        let args = vec![
-            "--data".to_string(),
-            data.display().to_string(),
-            "mcp".to_string(),
-            "--config".to_string(),
-            config.display().to_string(),
-        ];
+    if !config_writes_suppressed(data)
+        && let Ok(command) = crate::data::current_exe_clean()
+    {
+        let args = mcp_server_args(data, config);
         for (other_harness, stale_file) in [
             ("opencode", "opencode.json"),
             ("codex", "config.toml"),
@@ -3282,6 +3338,64 @@ fn install_changed_harness(
 /// Declaratively update an existing agent's runtime configuration (`harness`, `model`, `profile`)
 /// in `state.db` without deleting or recreating its identity, killing an in-progress turn,
 /// replaying already-delivered messages, or reopening paused scope.
+/// Copy a provider profile's files into an agent's seat on a profile switch.
+///
+/// Vendor runtime trees stay behind. So do the files the seat owns: the
+/// binding markers and MCP registrations are written for this agent by the
+/// switch and its reconcile, and a profile's copy (an empty server map kept
+/// for a sign-in run) would remove every AnyAgents tool from a running
+/// Antigravity cascade. A zero-byte file carries nothing to copy; refusing it
+/// would abort the switch half-way through the tree.
+fn copy_profile_tree(source: &Path, target: &Path) -> Result<(), Error> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let fname = entry.file_name();
+        if matches!(
+            fname.to_string_lossy().as_ref(),
+            "annotations"
+                | "bin"
+                | "brain"
+                | "builtin"
+                | "cache"
+                | "cache-home"
+                | "conversations"
+                | "crashes"
+                | "implicit"
+                | "log"
+                | "presence"
+                | "updater"
+                | "projects"
+                | "sessions"
+                | "session-env"
+                | "shell-snapshots"
+                | "backups"
+                | "cli.log"
+                | "conversation_summaries.db"
+                | "conversation_summaries.db-shm"
+                | "conversation_summaries.db-wal"
+                | "profile.json"
+                | "mcp_config.json"
+                | "mcp-capability"
+                | ".anyagents-profile"
+                | ".anyagents-seeded-profile"
+        ) {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        let target = target.join(&fname);
+        if kind.is_dir() {
+            copy_profile_tree(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            let bytes = std::fs::read(entry.path())?;
+            if !bytes.is_empty() {
+                write_required_file(&target, &bytes, 0o660)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn configure_agent_runtime(
     store: &Store,
     data: &Path,
@@ -3292,6 +3406,16 @@ pub(crate) fn configure_agent_runtime(
     profile: Option<&str>,
 ) -> Result<serde_json::Value, Error> {
     let existing = store.agent_by_name(name)?;
+    // One transition per agent at a time, across processes: a harness, model
+    // or profile switch rewrites the seat's markers and vendor configs, and
+    // pause, wake, reset and archive hold the same lock while they touch it.
+    // An automatic rotation skips a busy agent instead of queueing behind it.
+    let _transition = if actor.starts_with("system:") {
+        store.try_lock_agent_lifecycle(&existing.id)?
+    } else {
+        store.lock_agent_lifecycle(&existing.id)?
+    };
+    let existing = store.agent(&existing.id)?;
     let previous_harness = existing.harness.clone();
     let resolved_model = model
         .map(str::trim)
@@ -3387,50 +3511,7 @@ pub(crate) fn configure_agent_runtime(
     create_private_config_dir(&config)?;
     let normalized_profile = format!("{provider}/{profile_name}");
     if profile.is_some() && profile_dir.is_dir() {
-        fn copy_files(source: &Path, target: &Path) -> Result<(), Error> {
-            std::fs::create_dir_all(target)?;
-            for entry in std::fs::read_dir(source)? {
-                let entry = entry?;
-                let fname = entry.file_name();
-                let fname_s = fname.to_string_lossy();
-                if matches!(
-                    fname_s.as_ref(),
-                    "annotations"
-                        | "bin"
-                        | "brain"
-                        | "builtin"
-                        | "cache"
-                        | "cache-home"
-                        | "conversations"
-                        | "crashes"
-                        | "implicit"
-                        | "log"
-                        | "presence"
-                        | "updater"
-                        | "projects"
-                        | "sessions"
-                        | "session-env"
-                        | "shell-snapshots"
-                        | "backups"
-                        | "cli.log"
-                        | "conversation_summaries.db"
-                        | "conversation_summaries.db-shm"
-                        | "conversation_summaries.db-wal"
-                ) {
-                    continue;
-                }
-                let kind = entry.file_type()?;
-                let target = target.join(&fname);
-                if kind.is_dir() {
-                    copy_files(&entry.path(), &target)?;
-                } else if kind.is_file() && entry.file_name() != "profile.json" {
-                    let bytes = std::fs::read(entry.path())?;
-                    write_required_file(&target, &bytes, 0o660)?;
-                }
-            }
-            Ok(())
-        }
-        copy_files(&profile_dir, &config)?;
+        copy_profile_tree(&profile_dir, &config)?;
     }
     let now_rot = anyagents_core::now_ms();
     let _ = write_profile_marker(
@@ -6174,21 +6255,27 @@ pub(crate) fn sync_fresher_bound_agent_credentials_in(store: &Store, data: &Path
             if agent.state == "created" {
                 continue;
             }
+            // A harness, profile or lifecycle transition holds this lock while
+            // it rewrites the seat; the pass leaves that seat to it.
+            let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
+                continue;
+            };
             let cfg = agent_config_dir(data, &agent.id);
             let bound = bound_profile_name(&cfg);
             let seeded = seeded_profile_name(&cfg);
-            if seeded.is_some() && bound.is_some() && seeded != bound {
-                continue;
-            }
             let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
             let prof_name = bound
+                .clone()
                 .and_then(|b| {
                     let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
                     (!p.is_empty()).then_some(p)
                 })
                 .unwrap_or_else(|| "default".to_string());
             let profile_dir = profiles_root.join(&provider).join(&prof_name);
-            ensure_agy_mcp_config(std::slice::from_ref(&profile_dir), &cfg);
+            ensure_agy_mcp_config(data, agent, std::slice::from_ref(&profile_dir), &cfg);
+            if seeded.is_some() && bound.is_some() && seeded != bound {
+                continue;
+            }
             let rels: &[&str] = match provider.as_str() {
                 "anthropic" => &[".credentials.json", ".claude/.credentials.json"],
                 "openai" => &["auth.json", ".codex/auth.json"],
@@ -13504,6 +13591,204 @@ mod runtime_config_tests {
                 .and_then(serde_json::Value::as_str)
                 .is_some()
         );
+    }
+
+    fn agy_seat_fixture() -> (tempfile::TempDir, Store, Agent, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("agy-seat", "agy"))
+            .unwrap();
+        let agent = store.set_agent_state(&agent.id, "running").unwrap();
+        let profile = dir.path().join("profiles/google-antigravity/default");
+        std::fs::create_dir_all(profile.join(".gemini/config")).unwrap();
+        std::fs::write(
+            profile.join(".gemini/config/mcp_config.json"),
+            b"{\"mcpServers\":{}}\n",
+        )
+        .unwrap();
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(cfg.join(".gemini/config")).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "google-antigravity/default\n").unwrap();
+        write_profile_marker(
+            &cfg,
+            ".anyagents-seeded-profile",
+            "google-antigravity/default\n",
+        )
+        .unwrap();
+        (dir, store, agent, cfg)
+    }
+
+    /// The live outage: a seat's `mcp_config.json` held `{"mcpServers":{}}`,
+    /// the running Antigravity process reloaded it, and `call_mcp_tool` left
+    /// its tool list (`server anyagents is not allowed in this context`) until
+    /// a restart rewrote the file. The periodic seat pass restores the
+    /// registration without a restart and keeps the seat's other servers.
+    #[test]
+    fn seat_pass_restores_a_dropped_agy_mcp_registration_without_a_restart() {
+        let (dir, store, agent, cfg) = agy_seat_fixture();
+        let seat_mcp = cfg.join(".gemini/config/mcp_config.json");
+        for broken in [
+            &b"{\"mcpServers\":{}}\n"[..],
+            b"",
+            b"{truncated",
+            br#"{"mcpServers":{"other":{"command":"/bin/other"},"anyagents":{"command":"/bin/x","disabled":true}}}"#,
+        ] {
+            std::fs::write(&seat_mcp, broken).unwrap();
+            assert!(!agy_mcp_registered(&seat_mcp));
+            sync_fresher_bound_agent_credentials_in(&store, dir.path());
+            assert!(agy_mcp_registered(&seat_mcp), "not restored from {broken:?}");
+            let root: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&seat_mcp).unwrap()).unwrap();
+            let args: Vec<&str> = root
+                .pointer("/mcpServers/anyagents/args")
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            assert_eq!(args[2..4], ["mcp", "--config"]);
+            assert_eq!(args[4], cfg.display().to_string());
+            if broken.starts_with(br#"{"mcpServers":{"other""#) {
+                assert!(root.pointer("/mcpServers/other/command").is_some());
+            }
+        }
+
+        // A healthy registration is left byte-for-byte alone.
+        let before = std::fs::read(&seat_mcp).unwrap();
+        sync_fresher_bound_agent_credentials_in(&store, dir.path());
+        assert_eq!(std::fs::read(&seat_mcp).unwrap(), before);
+
+        // The seeding path every wake runs restores it as well.
+        std::fs::write(&seat_mcp, b"{\"mcpServers\":{}}\n").unwrap();
+        seed_harness_credentials(&store, dir.path(), &agent, &cfg).unwrap();
+        assert!(agy_mcp_registered(&seat_mcp));
+
+        // A transition in progress owns the seat: the pass leaves it alone.
+        std::fs::write(&seat_mcp, b"{\"mcpServers\":{}}\n").unwrap();
+        let held = store.lock_agent_lifecycle(&agent.id).unwrap();
+        sync_fresher_bound_agent_credentials_in(&store, dir.path());
+        assert!(!agy_mcp_registered(&seat_mcp));
+        drop(held);
+        sync_fresher_bound_agent_credentials_in(&store, dir.path());
+        assert!(agy_mcp_registered(&seat_mcp));
+    }
+
+    /// A profile switch copies the profile's files into the seat. The
+    /// profile's empty server map and binding markers are not the seat's, and
+    /// a zero-byte stamp left by an older writer must not abort the copy
+    /// half-way, leaving the seat with some of the profile's files and none of
+    /// its own rewrites.
+    #[test]
+    fn profile_copy_keeps_seat_owned_files_and_skips_empty_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let seat = dir.path().join("seat");
+        std::fs::create_dir_all(profile.join(".gemini/config")).unwrap();
+        std::fs::create_dir_all(profile.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::create_dir_all(profile.join("brain")).unwrap();
+        std::fs::create_dir_all(seat.join(".gemini/config")).unwrap();
+        std::fs::write(profile.join(".anyagents-agy-tier.txt"), b"").unwrap();
+        std::fs::write(profile.join(".anyagents-profile-meta-sync-ms"), b"").unwrap();
+        std::fs::write(
+            profile.join(".anyagents-profile"),
+            b"google-antigravity/other\n",
+        )
+        .unwrap();
+        std::fs::write(
+            profile.join(".gemini/config/mcp_config.json"),
+            b"{\"mcpServers\":{}}\n",
+        )
+        .unwrap();
+        std::fs::write(profile.join(".gemini/config/config.json"), b"{\"k\":1}\n").unwrap();
+        std::fs::write(
+            profile.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            br#"{"access_token":"fixture"}"#,
+        )
+        .unwrap();
+        std::fs::write(profile.join("brain/state"), b"vendor runtime").unwrap();
+        std::fs::write(profile.join("profile.json"), b"{}").unwrap();
+        let registered = br#"{"mcpServers":{"anyagents":{"command":"/bin/anyagents"}}}"#;
+        std::fs::write(seat.join(".gemini/config/mcp_config.json"), registered).unwrap();
+        std::fs::write(
+            seat.join(".anyagents-profile"),
+            b"google-antigravity/default\n",
+        )
+        .unwrap();
+        std::fs::write(seat.join(".anyagents-agy-tier.txt"), b"ultra\n").unwrap();
+
+        copy_profile_tree(&profile, &seat).unwrap();
+
+        assert_eq!(
+            std::fs::read(seat.join(".gemini/config/mcp_config.json")).unwrap(),
+            registered
+        );
+        assert_eq!(
+            std::fs::read(seat.join(".anyagents-profile")).unwrap(),
+            b"google-antigravity/default\n"
+        );
+        assert_eq!(
+            std::fs::read(seat.join(".anyagents-agy-tier.txt")).unwrap(),
+            b"ultra\n"
+        );
+        assert!(!seat.join(".anyagents-profile-meta-sync-ms").exists());
+        assert_eq!(
+            std::fs::read(seat.join(".gemini/config/config.json")).unwrap(),
+            b"{\"k\":1}\n"
+        );
+        assert!(
+            seat.join(".gemini/antigravity-cli/antigravity-oauth-token")
+                .is_file()
+        );
+        assert!(!seat.join("brain").exists());
+        assert!(!seat.join("profile.json").exists());
+    }
+
+    /// Transitions of one agent run one at a time across threads and
+    /// processes: an operator switch waits for the holder of the agent's
+    /// lifecycle lock; an automatic rotation skips the busy agent.
+    #[test]
+    fn harness_transitions_of_one_agent_are_serialized() {
+        let (dir, store, agent, _cfg) = agy_seat_fixture();
+        let data = dir.path().to_path_buf();
+        let held = store.lock_agent_lifecycle(&agent.id).unwrap();
+
+        let rotated = configure_agent_runtime(
+            &store,
+            &data,
+            "system:quota-rotate",
+            &agent.name,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(rotated, Err(Error::AgentBusy)), "{rotated:?}");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let name = agent.name.clone();
+        let waiter_data = data.clone();
+        let waiter = std::thread::spawn(move || {
+            let store = Store::open(waiter_data.join("state.db")).unwrap();
+            let started = std::time::Instant::now();
+            let _ =
+                configure_agent_runtime(&store, &waiter_data, "operator", &name, None, None, None);
+            tx.send(started.elapsed()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "an operator switch ran while another transition held the agent"
+        );
+        drop(held);
+        let waited = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the switch never ran after the lock was released");
+        assert!(waited >= std::time::Duration::from_millis(300));
+        waiter.join().unwrap();
+        assert!(store.try_lock_agent_lifecycle(&agent.id).is_ok());
     }
 
     fn serve_one_http_request(
