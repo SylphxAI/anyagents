@@ -1167,7 +1167,7 @@ fn list_profiles(data: &Path) -> Result<Vec<serde_json::Value>, ToolError> {
                 None => json!({"profile":name,"status":"stopped"}),
             })
         })();
-        summary.unwrap_or_else(|error| json!({"profile":name,"status":"error","error":error.to_string()}))
+        summary.unwrap_or_else(|error| json!({"profile":name,"status":"error","error":error.message}))
     }).collect())
 }
 
