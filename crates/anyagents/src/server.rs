@@ -731,8 +731,9 @@ pub(crate) const STOP_WITHIN: std::time::Duration = std::time::Duration::from_se
 /// ([`RESPONSE_FLUSH_WITHIN`]), the Telegram release and the joins after it
 /// finish, and the runtime abandons its blocking work. Background loops (the
 /// schedule timers and their external probes among them) already ended at the
-/// stop.
-const STOP_AFTER_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(8);
+/// stop. The budget includes response flushing, nine-second desktop session
+/// shutdown, and final cleanup.
+const STOP_AFTER_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The wait for Telegram to hand back every bot's long poll at shutdown. It
 /// runs beside the drain. A bot not released in time is polled again by the

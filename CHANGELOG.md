@@ -32,7 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--hold-ms` remain. `anyagents browser` needs a running server.
 - `ANYAGENTS_TAKEOVER_URL` is no longer read; the takeover page is published
   through a `cloudflared` quick tunnel when installed
-  (`ANYAGENTS_TAKEOVER_TUNNEL=0` disables it), otherwise on loopback.
+  (`ANYAGENTS_TAKEOVER_TUNNEL=0` disables it), otherwise on loopback. Public
+  listeners also route takeover pages through `/v1/webhooks/takeover/{key}`.
 
 - Git: every repository-backed agent has a repository of its own (ADR 0010
   D5). Its config, refs, index and hooks are its alone; it borrows objects
