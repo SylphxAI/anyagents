@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- The browser and session computer tools now run on one desktop per profile
+  from the open-source `agent-workstation` crate: a headless Wayland desktop
+  (sway) with one headful browser, web operations over loopback DevTools,
+  full-desktop screenshots and input, and a noVNC takeover of the whole desktop.
+  The previous Xvfb/CDP browser, its injected fingerprint scripts and its
+  screencast takeover page are removed. Existing profiles under
+  `browser-profiles/` open with their logins; browsers left running by the
+  previous version are stopped once and their bookkeeping files removed.
+  Linux hosts need `sway`, `wayvnc` and a Chromium-family browser
+  (`ANYAGENTS_CHROMIUM_BIN`, optional `ANYAGENTS_BROWSER_SEED_FLAG`).
+- **macOS and Windows hosts:** `tools.browser` (and `tools.computer` requests
+  for the session desktop) now return a typed `UNSUPPORTED` error naming
+  `ANYAGENTS_WORKSTATION_URL`, the setting remote routing to a Linux workstation
+  will use; this release does not route yet. Host desktop control
+  (`tools.computer` with `platform`, the default on these hosts) is unchanged.
+- `tools.computer` without `platform`, `display` or `wayland_display` drives the
+  agent's session desktop on Linux; host desktops are selected explicitly.
+- Browser refs are snapshot outlines with `@eN` refs; the response no longer
+  lists per-element geometry. `headless`, `ttl_ms` and `tunnel` are gone, and the
+  CLI drops `--headless` and `--repeat`; `--script`, `--full-page` and
+  `--hold-ms` remain. `anyagents browser` needs a running server.
+- `ANYAGENTS_TAKEOVER_URL` is no longer read; the takeover page is published
+  through a `cloudflared` quick tunnel when installed
+  (`ANYAGENTS_TAKEOVER_TUNNEL=0` disables it), otherwise on loopback. Public
+  listeners also route takeover pages through `/v1/webhooks/takeover/{key}`.
+
 - Git: every repository-backed agent has a repository of its own (ADR 0010
   D5). Its config, refs, index and hooks are its alone; it borrows objects
   read-only from a pool through `objects/info/alternates`, so a checkout

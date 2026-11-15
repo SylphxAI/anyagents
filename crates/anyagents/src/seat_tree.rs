@@ -431,6 +431,9 @@ pub(crate) fn open_regular_file(path: &Path, create: bool) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut options = std::fs::OpenOptions::new();
     if create {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
         options.write(true).create(true).truncate(true).mode(0o644);
     } else {
         options.read(true);
@@ -2456,6 +2459,18 @@ exec "$@"
         let out = temp.path().join("out.png");
         open(&out, true).unwrap().write_all(b"written").unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"written");
+        let screenshot = temp.path().join("sessions/screenshots/shot.png");
+        assert!(!screenshot.parent().unwrap().exists());
+        open(&screenshot, true)
+            .unwrap()
+            .write_all(b"screenshot")
+            .unwrap();
+        let mut content = Vec::new();
+        open(&screenshot, false)
+            .unwrap()
+            .read_to_end(&mut content)
+            .unwrap();
+        assert_eq!(content, b"screenshot");
         assert!(open(&temp.path().join("link"), true).is_err());
         assert_eq!(std::fs::read(&secret).unwrap(), b"operator-secret");
     }
