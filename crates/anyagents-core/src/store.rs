@@ -2941,6 +2941,22 @@ impl Store {
         Ok(changed)
     }
 
+    /// Persist an allocated workdir without starting or waking the agent.
+    /// Recovery may fill a missing value, but must not replace a newer one.
+    pub fn set_agent_workdir_if_missing(
+        &self,
+        id: &AgentId,
+        workdir: &str,
+    ) -> Result<Agent, Error> {
+        self.write_tx(|tx| {
+            tx.execute(
+                "UPDATE agents SET workdir = ?1 WHERE id = ?2 AND workdir IS NULL",
+                params![workdir, id.as_str()],
+            )?;
+            agent_by_id(tx, id)
+        })
+    }
+
     /// Store the work directory and mark the agent running.
     pub fn set_agent_running(&self, id: &AgentId, workdir: &str) -> Result<Agent, Error> {
         let changed = self.write_tx(|tx| {
@@ -9698,6 +9714,30 @@ mod tests {
         }
         assert_eq!(store.agent(&running.id).unwrap().name, "running");
         assert_eq!(store.agent(&retired.id).unwrap().name, "retired");
+    }
+
+    #[test]
+    fn allocated_workdir_is_durable_without_starting_or_waking() {
+        let (_dir, store) = setup();
+        let agent = agent(&store, "alpha");
+        let wakes = store.subscribe();
+        let allocated = store
+            .set_agent_workdir_if_missing(&agent.id, "/allocated")
+            .unwrap();
+        assert_eq!(allocated.state, agent.state);
+        assert_eq!(allocated.workdir.as_deref(), Some("/allocated"));
+        assert_eq!(store.agent(&agent.id).unwrap().workdir, allocated.workdir);
+        let unchanged = store
+            .set_agent_workdir_if_missing(&agent.id, "/stale")
+            .unwrap();
+        assert_eq!(unchanged.workdir, allocated.workdir);
+        assert!(wakes.try_recv().is_err());
+        assert!(matches!(
+            store
+                .set_agent_workdir_if_missing(&AgentId::generate(), "/missing")
+                .unwrap_err(),
+            Error::AgentNotFound(_)
+        ));
     }
 
     #[test]

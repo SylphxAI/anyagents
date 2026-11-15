@@ -366,6 +366,19 @@ fn create_with_seat(
         let workdir_created =
             explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
         let managed_abs = std::path::absolute(&managed)?;
+        // Record the allocation before any checkout or cloud provisioning can
+        // block. This does not admit the agent to the runtime.
+        if effective_repo.is_some()
+            || wd_is_private_keyword
+            || wd_is_worktree_keyword
+            || (explicit_workdir.is_none() && !wd_is_inherit_keyword && agent.parent_id.is_some())
+        {
+            let target = match &explicit_workdir {
+                Some(path) => std::path::absolute(path)?,
+                None => managed_abs.clone(),
+            };
+            store.set_agent_workdir_if_missing(&agent.id, &target.display().to_string())?;
+        }
         let cwd = if let Some(repo_raw) = effective_repo {
             if crate::vendor::is_spiron_harness(&agent.harness)
                 && is_cloud_agent_mode
@@ -473,6 +486,7 @@ fn create_with_seat(
                 }
             }
         };
+        store.set_agent_workdir_if_missing(&agent.id, &cwd.display().to_string())?;
         if cwd == managed_abs && !managed_abs.exists() {
             create_dir_all_recorded(&managed_abs, &made)?;
         }
@@ -11721,6 +11735,60 @@ stderr: {}",
             instructions: None,
             parent_id: None,
         }
+    }
+
+    #[test]
+    fn workdir_is_durable_while_checkout_provisioning_is_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let fixture = crate::repo::tests::Fixture::new(&data);
+        let entered = data.join("entered");
+        let release = data.join("release");
+        let provider = data.join("provider");
+        let script = std::fs::read_to_string(&provider).unwrap();
+        let script = script.replacen("#!/bin/sh\n", &format!(
+            "#!/bin/sh\nif [ \"$1\" = worktree ]; then touch {entered:?}; while [ ! -e {release:?} ]; do sleep 0.01; done; fi\n"
+        ), 1);
+        crate::repo::tests::write_executable(&provider, &script);
+        std::fs::write(&fixture.fail, "worktree").unwrap();
+        let db = data.join("state.db");
+        let store = Store::open(&db).unwrap();
+        let thread_data = data.clone();
+        let handle = std::thread::spawn(move || {
+            let store = Store::open(thread_data.join("state.db")).unwrap();
+            store
+                .hold_capability_key("0123456789abcdef0123456789abcdef")
+                .unwrap();
+            create_with_consumer(
+                &store,
+                &thread_data,
+                worktree_request("blocked", Some("ExampleOrg/demo".into())),
+                &fixture.checkouts,
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !entered.exists() && std::time::Instant::now() < deadline && !handle.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let observed = Store::open(&db).and_then(|store| store.agent_by_name("blocked"));
+        std::fs::write(&release, "release").unwrap();
+        let result = handle.join().unwrap();
+        assert!(
+            entered.exists(),
+            "checkout did not reach the blocking provider: {result:?}"
+        );
+        let observed = observed.unwrap();
+        assert_ne!(observed.state, "running");
+        assert_eq!(
+            observed.workdir.as_deref(),
+            Some(agent_work_dir(&data, &observed.id).to_str().unwrap())
+        );
+        assert!(result.is_err());
+        assert!(matches!(
+            store.agent_by_name("blocked"),
+            Err(Error::AgentNotFound(_))
+        ));
     }
 
     #[test]
