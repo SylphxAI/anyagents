@@ -3240,11 +3240,13 @@ async fn set_description_route(
 /// `default`).
 fn desktop_caller(principal: &Principal) -> crate::workstation::Caller {
     match principal {
-        Principal::Agent { name, .. } => crate::workstation::Caller {
+        Principal::Agent { agent_id, name } => crate::workstation::Caller {
+            agent_id: Some(agent_id.as_str().to_string()),
             principal: name.clone(),
             profile: name.clone(),
         },
         Principal::Operator => crate::workstation::Caller {
+            agent_id: None,
             principal: crate::workstation::OPERATOR.to_string(),
             profile: "default".to_string(),
         },

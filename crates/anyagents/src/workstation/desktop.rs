@@ -405,6 +405,7 @@ mod tests {
     async fn refs_on_the_session_desktop_point_to_the_browser() {
         let dir = tempfile::tempdir().unwrap();
         let caller = Caller {
+            agent_id: None,
             principal: "agent-a".into(),
             profile: "agent-a".into(),
         };

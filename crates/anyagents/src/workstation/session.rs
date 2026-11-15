@@ -447,6 +447,7 @@ fn session_config(
     {
         browser.extra_args.push("--disable-dev-shm-usage".into());
     }
+    super::private_dir(&dir.join("user-data")).map_err(|e| ToolError::invalid(e.to_string()))?;
     super::private_dir(runtime_dir).map_err(|e| ToolError::invalid(e.to_string()))?;
     let tmp = runtime_dir.join("chromium-tmp");
     super::private_dir(&tmp).map_err(|e| ToolError::invalid(e.to_string()))?;
@@ -460,13 +461,13 @@ fn session_config(
     .into_iter()
     .collect::<std::io::Result<Vec<_>>>()
     .map_err(|e| ToolError::invalid(e.to_string()))?;
-    let read = std::env::var_os("ANYAGENTS_BROWSER_JAIL_READ")
+    let extra_exec = std::env::var_os("ANYAGENTS_BROWSER_JAIL_READ")
         .map(|v| std::env::split_paths(&v).collect::<Vec<_>>())
         .unwrap_or_default();
     let (helper, mut args) = super::jail::wrap(
         &writable.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
-        &read,
         &[],
+        &extra_exec,
         crate::sandbox::seats_configured(),
         &browser.binary,
     )
@@ -588,6 +589,35 @@ pub async fn stop(data: &Path, profile: &str) -> bool {
     wait_for_shutdown(closing, SHUTDOWN_WAIT)
         .await
         .unwrap_or(true)
+}
+
+/// Check the lease and begin shutdown under one profile-slot lock.
+pub async fn stop_authorized(
+    data: &Path,
+    profile: &str,
+    principal: &str,
+) -> Result<bool, ToolError> {
+    let Some(key) =
+        server_profile_dir(data, profile, false).map_err(|e| ToolError::invalid(e.to_string()))?
+    else {
+        return Ok(false);
+    };
+    let slot = SESSIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&key)
+        .cloned();
+    let Some(slot) = slot else {
+        return Ok(false);
+    };
+    let guard = tokio::time::timeout(SHUTDOWN_WAIT, slot.lock_owned())
+        .await
+        .map_err(|_| session_busy())?;
+    if let Some(live) = guard.as_ref() {
+        live.session.lease(principal).map_err(ToolError::from)?;
+    }
+    let closing = tokio::spawn(close_slot(guard));
+    wait_for_shutdown(closing, SHUTDOWN_WAIT).await
 }
 
 // Dropping a JoinHandle detaches the cleanup; it never releases the writer

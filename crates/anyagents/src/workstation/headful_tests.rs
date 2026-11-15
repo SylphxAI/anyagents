@@ -20,6 +20,7 @@ use super::browser::{BrowserRequest, execute};
 
 fn agent(name: &str) -> Caller {
     Caller {
+        agent_id: None,
         principal: name.into(),
         profile: name.into(),
     }

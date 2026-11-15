@@ -28,20 +28,194 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent's session desktop on Linux; host desktops are selected explicitly.
 - Browser refs are snapshot outlines with `@eN` refs; the response no longer
   lists per-element geometry. `headless`, `ttl_ms` and `tunnel` are gone, and the
-  CLI drops `--headless`, `--script`, `--full-page`, `--hold-ms` and `--repeat`;
-  `anyagents browser` needs a running server.
-- Until upstream support lands, these return `UNSUPPORTED`: browser `eval`,
-  `cookies`, key holding, `fill` with `submit`, CSS selectors and `full_page`
-  screenshots; session `clipboard_get`/`clipboard_set`, `cursor_position`,
-  `hold_key`, modifier-held pointer input and back/forward mouse buttons.
+  CLI drops `--headless` and `--repeat`; `--script`, `--full-page` and
+  `--hold-ms` remain. `anyagents browser` needs a running server.
 - `ANYAGENTS_TAKEOVER_URL` is no longer read; the takeover page is published
   through a `cloudflared` quick tunnel when installed
   (`ANYAGENTS_TAKEOVER_TUNNEL=0` disables it), otherwise on loopback.
 
+- Git: every repository-backed agent has a repository of its own (ADR 0010
+  D5). Its config, refs, index and hooks are its alone; it borrows objects
+  read-only from a pool through `objects/info/alternates`, so a checkout
+  costs a checkout and two agents on one repository cannot see each other's
+  branches or config. The pool is a bare repository per remote under
+  `ANYAGENTS_GIT_POOL_DIR`, now `<data>/git-pool` by default, so `repo:`
+  works with no checkout provider configured. Only the server fetches into
+  it, and it is never pruned. A checkout provider remains optional; a
+  linked worktree it makes is converted in place into an own repository and
+  its store becomes the pool, which must then never prune
+  (`gc.pruneExpire=never`, `gc.cruftPacks=true`, else conversion is
+  refused); a keep ref in the store holds what each converted repository
+  borrows until it is reaped. Archive removes a checkout only when the
+  remote's own answer (`ls-remote`) covers every commit, tag and note it
+  has and it has no stash. Removed: worktrees of a shared bare pool, the
+  POSIX ACL grants on its `objects/`, `refs/`, `logs/` and `packed-refs`,
+  the `anyagents-config/` config symlink, per-checkout `--worktree` config,
+  the grant journals in `<data>/worktree-grants/` with their quarantine and
+  recovery, and `ANYAGENTS_TRUSTED_METADATA_GIDS`. Existing linked
+  worktrees keep working as they are; archive cleanup converts one in place
+  (same status, HEAD, index, sparse patterns and hooks, unpushed and
+  reflog-only objects copied) before judging it. For `repo: "inherit"` and local sources, the
+  remote is asked from outside the source repository.
+- `conversation` searches every harness's native history: Spiron's
+  `sessions.sqlite3`, OpenCode's `opencode.db` (tool parts included), Claude
+  Code subagents, Codex rollouts, AGY, Muse, OMP and Grok sessions, read
+  without ever creating a file beside a harness's store. A harness directory
+  the server may not read (Claude Code's owner-only `config/sessions` under a
+  seat) no longer stops the agent's other history from being indexed. The
+  server logs once when its pre-warm has indexed every agent.
+- History indexing never holds an agent's lifecycle lock or the index's write
+  lock across a long read: sources are read and projected unlocked and publish
+  in short batches that check the source is unchanged. A search indexes at most
+  4 MiB of new history before it answers and reports the rest in
+  `retrieval.pending`; a low-priority daemon thread indexes it, verifies
+  sources hourly, and pre-warms every agent's history after a start.
+- Embeddings and rerank can come from a remote model bound to an AnyAgents
+  profile: an OpenAI-compatible `/embeddings` endpoint or a Cohere/Voyage/Jina
+  style `/rerank`, chosen in `<data>/memory-service/config.json`. With nothing
+  configured the pinned local models run offline. Each dense index is stamped
+  with its vector space (provider, model, dimension, preprocessing); a new
+  embedding model is rebuilt in the background (niced, resumable, batched)
+  after its estimated tokens and cost are reported, and only within
+  `max_rebuild_usd`; while it builds, all embedding stops when the spend the
+  provider reports reaches the cap. `anyagents memory-service estimate`
+  previews the rebuild without calling a model. Spend outside a rebuild
+  (query embeddings, rerank, new history) is capped per UTC day by
+  `max_daily_usd` and persisted; past it query embedding, rerank and new-history embedding
+  wait for the next day. Background workers retry failures with backoff and
+  report them in `status`; marks follow the host index's generation and the
+  worker count. No space is deleted automatically: `memory-service prune`
+  removes other spaces once the configured one is built, and a `--config`
+  that does not exist is an error. A remote model must have a configured
+  price, so its spend is always counted, and a remote query is cut to the
+  piece budget. Every OpenRouter request
+  carries `provider.data_collection = "deny"`, and a remote reranker reads at
+  most `passage_chars` (1,000) characters of each passage. The desk's choice,
+  `qwen/qwen3-embedding-8b` with `mongodb/rerank-3` through
+  `openrouter/default` (MRR@10 0.296 and recall@10 0.463 on our history,
+  against 0.192 and 0.362 for the local pair), is documented with its exact
+  configuration in `docs/host-memory.md`.
+- Hybrid retrieval: BM25 fused with dense candidates from a local multilingual
+  embedder and reranked by a local cross-encoder, run by the new
+  `anyagents memory-service` process. Every result cites its raw bytes; without
+  the service the server ranks lexically and reports `retrieval.mode`
+  `lexical`, with nothing marked degraded.
+- Security: the server no longer opens host files with its own access on an
+  agent's behalf (ADR 0010 D3). A `send` with a local media path uploads it
+  only when the sending agent can read it itself: a seat agent's file is
+  opened by that seat (`anyagents internal seat-file open`, which hands back
+  the descriptor), a seatless agent's only beneath its own directories
+  (`openat2(RESOLVE_BENEATH)`); a final symbolic link is refused, URL and
+  `file_id` media are unchanged. The browser navigates only `http(s)://` and
+  `about:blank`, refuses to read or drive a page on any other URL, writes a
+  screenshot `path` with the caller's access, keeps Chromium's home and
+  downloads inside its profile, and on Linux starts Chromium inside a
+  Landlock jail that opens only the system and its profile to it, required
+  whenever OS seats are configured.
+- Mail and turn trouble is no longer silent (`docs/delivery.md`). A turn the
+  harness ends with an error no longer stays open: its work comes back as a
+  `[Recovery]` note, stored in the same transaction that closes the turn.
+  Only an error of the agent's own session (a full context, content the
+  vendor refuses) is a strike; after three in a row the agent is parked
+  (`paused`, listed as `faulted`) and its nearest running ancestor, or the
+  operator's inbox, is told. Provider, model, auth, network, host and store
+  errors back off (15 s doubling to 10 minutes) and never park anyone.
+  `anyagents resume --faulted` resumes every parked agent. A send that cannot
+  wake an archived recipient is refused for it with the reason and who
+  answers for it, never stored unread. Mail queued to a paused agent tells
+  its sender, or whoever answers for the agent, once per pause. A channel
+  post whose outcome is unknown is held, never resent automatically, and its
+  sender is told once; `agents inspect` and `status` list it, and `anyagents
+  outbound` retries or discards it. A post the Telegram API refused leaves
+  no stuck record, and a long post cut short is recorded as partly
+  delivered. A legacy Spiron input hold is settled when its agent launches
+  another harness, and at server start when its agent is archived or has
+  taken the held mail since. Migration 033 adds `turn_errors`.
+- Agents report defects to whoever runs the deployment with `send` to
+  `operator`: a defect in AnyAgents, the harness or the host that an agent
+  cannot fix within its own work. Only the operator reads it, with
+  `anyagents inbox --operator`. Each sender and the whole fleet have a small
+  burst and an hourly cap, the same text within an hour is counted on the
+  first report, and reports are kept for 30 days. No agent may be named
+  `operator`.
+- Usage accounting no longer over-counts cost for Claude Code and OpenCode
+  agents. Claude Code's `total_cost_usd` is the session's running total: a
+  resumed process restores it from the transcript's last `cost-state` row
+  and counts on from there. From 2026-10-18 (`bca6c22`), and summed across a
+  process's turns from 2026-10-21 (`977d123`), each turn recorded that
+  running total, so usage rows from that window overstate cost (live rows
+  near $112-115 a turn), most of all for long sessions that were resumed
+  many times. OpenCode reports its session's running totals, which outlive a
+  process; from 2026-10-21 (`7210d6f`) the first reading after every process
+  replacement recorded the whole session again, so rows following a
+  replacement in that window overstate tokens and cost. Both adapters now
+  report what each turn, and each process, added. Historical rows are not
+  rewritten; read usage and cost from that window with this in mind.
 - Keep role labels methodology-neutral: roots and labelled children can self-archive
   and release idle processes under the same rules. Preserve legacy effective scopes
   on upgrade, default all new children to private, and retain browser profiles until
   deletion. Discovery and generated lifecycle instructions no longer depend on roles.
+- Schedule wakes share the one mailbox: a due `at` or `every` tick, or a triggered
+  watch, is written at once like any other message and reaches a busy owner by
+  steering, or a paused or quota-blocked owner on resume. Recurring ticks are no
+  longer dropped as `skipped:busy`; a schedule keeps at most one undelivered wake.
+- The daemon's own cost now follows events, not fleet, archive or history size.
+  Every `Store` handle in a process shares one writer and one read pool, and
+  migrations run once per process. Idle agents run no supervisor passes, and a
+  streaming turn wakes the supervisor only on transitions. Schedules sleep until
+  their next due time. Roster views read no vendor history. Archived agents are
+  reaped once, with backoff on failure. History search re-walks only what changed
+  and reads each file through one buffered descriptor. Each `anyagents mcp` child
+  runs one runtime thread over a kept-alive connection. No history is deleted.
+- A credential renewal never holds an agent's mail: a profile change takes
+  effect at the agent's next idle point while mail keeps flowing.
+- Record outcomes beside usage (ADR 0008). A PR watch's merge, close or review
+  failure, and a verdict an ancestor or the operator records (`agents` `verdict`,
+  `anyagents verdict`), become `outcomes` rows; reads through the `skills` tool
+  become `skill_reads` with the digest of the bytes read. `GET /v1/outcomes`,
+  `agents` `outcomes` and `anyagents outcomes` report successes, recovery after
+  rework and cost per successful outcome by harness and model, role, profile,
+  agent or skill. The parent reminder for idle task sub-agents now asks for a
+  verdict. Usage docs no longer claim a price table or OpenTelemetry export.
+- Remote (cloud) agents call back with their own short-lived credential. Each
+  launch of a cloud harness or remote sandbox begins a remote session whose token
+  is bound to that agent and session, stored as a SHA-256 digest, rotated before
+  it expires (`remote_session_ttl_secs`, default one hour), and revoked on pause,
+  archive, relaunch or `anyagents agents revoke-remote`. The long-lived local
+  capability no longer leaves the host. Callback URLs derive from `public_url`
+  under `[server]` in `<data>/anyagents.toml`; without it a remote agent is not
+  created or started. Remote sessions get only the `remote` MCP profile, which
+  now holds coordination, `memory` and `skills`: `browser`, `computer`, `device`,
+  `media`, `web_search` and `web_fetch` run on or from the control-plane host and
+  are no longer in it. The public listener's `/`, `/healthz` and
+  `/v1/webhooks/healthz` return `{"ok":true}`; the serving identity stays on
+  `anyagents.sock`.
+- MCP over HTTP serves at most the `remote` profile, whatever credential is
+  presented: `?profile=full` is refused with 403 and no binding upgrades it,
+  because over HTTP the tools run inside the server process as its own user.
+  `full` remains available over stdio, where the tool server runs as the agent.
+  Calls over HTTP MCP also cannot place an agent on a host harness, wake an
+  agent that runs on the host (directly or by a send to an archived one), or
+  attach media by a local path.
+- A separate public listener (`public_listen` under `[server]`) serves only
+  readiness, Telegram webhooks and MCP for remote session tokens, and 404 for
+  everything else; once it is configured, the local TCP listener defaults to
+  loopback. Without `public_listen` nothing changes. A remote session token
+  stops authenticating once its agent's harness moves back onto the host.
+- Tool contracts follow what agents write. `code` honours `timeout_ms` up to a
+  ceiling (default 30 s, max 10 min) that only the server's environment sets
+  (`ANYAGENTS_CODE_TIMEOUT_MS`, `ANYAGENTS_CODE_MAX_TIMEOUT_MS`) and hands each
+  tool server in `whoami`. An inner `workspace.exec` inherits the call's
+  remaining time, and its own `timeout_ms` stretches the call; a request past
+  the ceiling is clamped and the result says so in `note`. A remote sandbox
+  still stops a command at 120 s, and the `code` description says which limit
+  applies. Failed snippets name their fix (ESM imports, `require`/Node globals,
+  Python, guessed API names, double-escaped code), and the description lists the
+  exact sandbox API. `schedules` accepts `action: "at"|"every"|"watch"`, and its
+  errors quote a correct call. `null`, `"null"` and `"undefined"` are absent in
+  `schedules` and `send`. `self` and `parent` resolve in `conversation`,
+  `agents` and `schedules`. An ancestor may message any non-isolated descendant,
+  and messaging refusals name the route.
 
 ## 0.1.3
 

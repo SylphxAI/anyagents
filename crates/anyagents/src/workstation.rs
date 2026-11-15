@@ -48,6 +48,7 @@ pub const OPERATOR: &str = "operator";
 pub struct Caller {
     /// Lease principal: the agent's name, or [`OPERATOR`].
     pub principal: String,
+    pub agent_id: Option<String>,
     /// The caller's own browser profile (used when a request names none).
     pub profile: String,
 }
@@ -173,8 +174,36 @@ fn directory_chain(data: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
 #[cfg(target_os = "linux")]
 fn trusted_data_dir(data: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
     let (dir, path) = directory_chain(data)?;
-    trusted_directory(&dir, true, false)?;
+    trusted_root_directory(&dir)?;
     Ok((dir, path))
+}
+
+/// Shared containers allow sticky group writes, never world writes.
+#[cfg(target_os = "linux")]
+fn trusted_root_directory(dir: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = dir.metadata()?;
+    if meta.uid() != crate::sandbox::server_uid()
+        || meta.mode() & 0o002 != 0
+        || (meta.mode() & 0o020 != 0 && meta.mode() & 0o1000 == 0)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "shared profile container requires server ownership, no world writes, and sticky group writes",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn owned_root_dir(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    mode: libc::mode_t,
+    create: bool,
+) -> std::io::Result<Option<std::fs::File>> {
+    trusted_root_directory(parent)?;
+    child_dir(parent, name, mode, create, true)
 }
 
 #[cfg(target_os = "linux")]
@@ -183,6 +212,17 @@ fn owned_child_dir(
     name: &std::ffi::OsStr,
     mode: libc::mode_t,
     create: bool,
+) -> std::io::Result<Option<std::fs::File>> {
+    child_dir(parent, name, mode, create, false)
+}
+
+#[cfg(target_os = "linux")]
+fn child_dir(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    mode: libc::mode_t,
+    create: bool,
+    shared_root: bool,
 ) -> std::io::Result<Option<std::fs::File>> {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
@@ -209,7 +249,11 @@ fn owned_child_dir(
     }
     let dir = open_directory_at(parent, name)?;
     if let Some(dir) = &dir {
-        trusted_directory(dir, true, false)?;
+        if shared_root {
+            trusted_root_directory(dir)?;
+        } else {
+            trusted_directory(dir, true, false)?;
+        }
     }
     Ok(dir)
 }
@@ -219,9 +263,12 @@ fn owned_child_dir(
 #[cfg(target_os = "linux")]
 fn validate_startup_leaves(profile: &std::fs::File) -> std::io::Result<()> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     if let Some(dir) = open_directory_at(profile, "user-data".as_ref())? {
         trusted_directory(&dir, true, false)?;
+        if dir.metadata()?.mode() & 0o077 != 0 {
+            dir.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     let name = c"fingerprint.json";
     // SAFETY: profile is a live directory descriptor and name is NUL terminated.
@@ -258,7 +305,8 @@ fn validate_startup_leaves(profile: &std::fs::File) -> std::io::Result<()> {
 
 /// The profile's server-owned directory. Ancestors are descriptor-walked from
 /// root without following links; their access policy belongs to the operator.
-/// Data, browser-profiles and the profile must not be group/other-writable.
+/// Data and browser-profiles allow sticky group writes, never world writes.
+/// Individual profiles and leaves must not be group/other-writable.
 /// Missing profiles return None without creation when create is false.
 #[cfg(target_os = "linux")]
 pub(crate) fn server_profile_dir(
@@ -284,7 +332,7 @@ pub(crate) fn server_profile_dir(
     };
     let (data_dir, data_path) = trusted_data_dir(data).map_err(refuse)?;
     let Some(root) =
-        owned_child_dir(&data_dir, "browser-profiles".as_ref(), 0o755, create).map_err(refuse)?
+        owned_root_dir(&data_dir, "browser-profiles".as_ref(), 0o755, create).map_err(refuse)?
     else {
         return Ok(None);
     };
@@ -609,6 +657,14 @@ mod profile_authority_tests {
             fs::read_to_string(profile.join("user-data/cookies")).unwrap(),
             "login"
         );
+        assert_eq!(
+            fs::metadata(profile.join("user-data"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         for name in ["", ".", "..", "../escape", "one/two", "/absolute"] {
             assert!(
                 server_profile_dir(data.path(), name, true).is_err(),
@@ -625,7 +681,7 @@ mod profile_authority_tests {
         mode(&data, 0o700);
         let profile = create(&data);
         for target in [data.clone(), profiles_root(&data), profile.clone()] {
-            for permissions in [0o775, 0o777] {
+            for permissions in [0o775, 0o777, 0o1777] {
                 mode(&target, permissions);
                 assert!(
                     server_profile_dir(&data, "profile", false).is_err(),
@@ -635,6 +691,13 @@ mod profile_authority_tests {
                 mode(&target, 0o755);
             }
         }
+        mode(&data, 0o3771);
+        mode(&profiles_root(&data), 0o3770);
+        mode(&profile, 0o2755);
+        assert_eq!(
+            server_profile_dir(&data, "profile", false).unwrap(),
+            Some(profile.clone())
+        );
         for target in [profiles_root(&data), profile] {
             mode(&target, 0o1777);
             assert!(server_profile_dir(&data, "profile", false).is_err());

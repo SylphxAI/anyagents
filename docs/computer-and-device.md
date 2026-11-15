@@ -25,11 +25,13 @@ and Windows hosts, browser calls return `UNSUPPORTED` and name
 workstation; this release does not route yet.
 
 Credentials are filled by reference (`secret_ref`: `op://...`, `op-otp://...`,
-`secret://...`) and never returned. The following return `UNSUPPORTED` in this
-release: browser `eval`, `cookies`, key holding, `fill` with `submit`, CSS
-selectors, and `full_page` screenshots; session `clipboard_get`/`clipboard_set`,
-`cursor_position`, `hold_key`, modifier-held pointer input, and back/forward
-mouse buttons.
+`secret://...`) and never returned. Browser actions support `eval`, `cookies`,
+key holding (`hold`, `key_down`, `key_up`, `release_keys`), `fill` with `submit`,
+and refs or CSS selectors. Screenshots capture the whole desktop by default;
+`full_page: true` captures the scrollable page without browser chrome. Session
+computer actions support `clipboard_get`/`clipboard_set`, `cursor_position`,
+`hold_key`, modifier-held pointer input, and back/forward mouse buttons.
+`cursor_position` requires the pointer to have been placed on the desktop first.
 
 ## Host desktop
 
