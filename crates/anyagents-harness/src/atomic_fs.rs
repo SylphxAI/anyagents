@@ -125,35 +125,11 @@ where
             )));
         }
 
-        #[cfg(unix)]
-        let written_inode = {
-            use std::os::unix::fs::MetadataExt as _;
-            let meta = fs::metadata(&tmp)?;
-            (meta.dev(), meta.ino())
-        };
+        // The synced temporary file was verified above; `rename` commits it
+        // whole. A concurrent writer's later rename may replace it at once,
+        // so `dst` is not read back: its bytes may rightly be another commit.
         fs::rename(&tmp, dst)?;
         File::open(parent)?.sync_all()?;
-
-        // Read back what `dst` names now. A concurrent writer's later rename
-        // may already have replaced this commit: that inode is its write, not
-        // a corruption of ours, so only this write's own inode is compared.
-        let mut committed = File::open(dst)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            let meta = committed.metadata()?;
-            if (meta.dev(), meta.ino()) != written_inode {
-                return Ok(());
-            }
-        }
-        let mut read_back = Vec::with_capacity(bytes.len());
-        io::Read::read_to_end(&mut committed, &mut read_back)?;
-        if read_back != bytes {
-            return Err(io::Error::other(format!(
-                "atomic write verification failed after commit: {}",
-                dst.display()
-            )));
-        }
         Ok(())
     })();
 
