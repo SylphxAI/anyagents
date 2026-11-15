@@ -3472,6 +3472,7 @@ impl Store {
             return;
         }
         let Some(state) = self.index_state_reader() else {
+            self.shared.memory_index.defer(merged);
             return;
         };
         if let Err(error) = self.shared.memory_index.try_reproject(&state, merged) {

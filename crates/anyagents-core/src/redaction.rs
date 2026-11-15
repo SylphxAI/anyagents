@@ -645,19 +645,6 @@ impl Store {
             params![target.as_str(), id, key], |r| r.get::<_, String>(0)).optional()?
             .map(|raw| serde_json::from_str::<Receipt>(&raw).map_err(|_| invalid("unreadable redaction receipt")))
             .transpose()?;
-        // An earlier attempt of this request scrubbed the standalone summary
-        // and stopped before its audit committed: complete that audit rather
-        // than redact the scrubbed text again.
-        if replay.is_none()
-            && let Some(staged) = &staged
-            && index_id.as_deref() == Some(id.as_str())
-            && let Some(raw) = staged.staged_receipt(&id, &key)?
-        {
-            let receipt: Receipt = serde_json::from_str(&raw)
-                .map_err(|_| invalid("unreadable staged redaction receipt"))?;
-            insert_audit(tx, target, &id, &key, &receipt)?;
-            return Ok(RedactPhase1::Done(receipt));
-        }
         let state: String = tx.query_row(
             "SELECT state FROM agents WHERE id = ?1",
             [target.as_str()],
@@ -669,6 +656,42 @@ impl Store {
             ));
         }
         let _process = self.try_lock_agent(target)?;
+        // Recover only under the same quiescence and process guards as a new
+        // redaction. A staged receipt proves intent, not the current body.
+        if replay.is_none()
+            && let Some(staged) = &staged
+            && index_id.as_deref() == Some(id.as_str())
+            && let Some((staged_key, raw)) = staged.staged_receipt(&id)?
+        {
+            if staged_key != key {
+                return Err(invalid("staged redaction selector differs; retry the original selector"));
+            }
+            let receipt: Receipt = serde_json::from_str(&raw)
+                .map_err(|_| invalid("unreadable staged redaction receipt"))?;
+            let original = standalone.as_deref().ok_or_else(|| invalid("redaction target not found"))?;
+            let still_redacted = if request.span.is_none() {
+                original == TOMBSTONE
+            } else {
+                let start = match receipt.span.unit {
+                    SpanUnit::Bytes => Some(receipt.span.start),
+                    SpanUnit::Chars => original.char_indices().nth(receipt.span.start).map(|(i, _)| i),
+                };
+                start.and_then(|i| i.checked_add(TOMBSTONE.len()).and_then(|end| original.get(i..end))) == Some(TOMBSTONE)
+            };
+            if !still_redacted {
+                return Err(invalid("redaction target changed; staged receipt does not verify the current body"));
+            }
+            insert_audit(tx, target, &id, &key, &receipt)?;
+            // Reenter Phase 2: the staged commit may have left old WAL frames.
+            return Ok(RedactPhase1::Prepared {
+                receipt,
+                prepared: Vec::new(),
+                id,
+                whole_body: false,
+                _process,
+            });
+        }
+
         let host_index = self.data_dir().join(crate::host_retrieval::INDEX_FILE);
         if host_index.exists() {
             let mut index = crate::host_index::HostIndex::open(&host_index)
@@ -968,12 +991,6 @@ impl Store {
             })
         })
         })?;
-        // The audit is in state: the staged receipt has done its work.
-        if standalone.is_some()
-            && let Some(id) = &index_id
-        {
-            self.clear_staged_index_redaction(id)?;
-        }
         let (mut receipt, prepared, id, whole_body, _process) = match phase1 {
             RedactPhase1::Done(receipt) => return Ok(receipt),
             RedactPhase1::Prepared {
@@ -1094,6 +1111,9 @@ impl Store {
             )?;
             Ok(())
         })?;
+        // Keep recovery intent until the final receipt is durable. Cleanup
+        // failure must not turn an already completed redaction into an error.
+        let _ = self.clear_staged_index_redaction(&id);
         Ok(receipt)
     }
 }

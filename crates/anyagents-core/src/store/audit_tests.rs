@@ -944,11 +944,79 @@ fn a_standalone_redaction_scrubs_the_index_before_its_audit_and_a_retry_complete
         .conn()
         .execute_batch("DROP TRIGGER reject_audit")
         .unwrap();
+    let assert_refusal = |error: Error, needle: &str| {
+        assert!(matches!(&error, Error::Message(_)), "{error:?}");
+        assert!(error.to_string().contains(needle), "{error:?}");
+    };
+    // Recovery is a write, not an unguarded receipt replay.
+    store.set_agent_state(&agent.id, "running").unwrap();
+    assert_refusal(
+        store
+            .redact_conversation(Actor::Operator, &agent.id, &request)
+            .unwrap_err(),
+        "quiescent target",
+    );
+    store.set_agent_state(&agent.id, "archived").unwrap();
+    let process = store.try_lock_agent(&agent.id).unwrap();
+    assert!(matches!(
+        store.redact_conversation(Actor::Operator, &agent.id, &request),
+        Err(Error::AgentBusy)
+    ));
+    drop(process);
+    let mut different = request.clone();
+    different.span = Some(crate::redaction::Span {
+        unit: crate::redaction::SpanUnit::Bytes,
+        start: 0,
+        end: 1,
+    });
+    assert_refusal(
+        store
+            .redact_conversation(Actor::Operator, &agent.id, &different)
+            .unwrap_err(),
+        "staged redaction selector differs",
+    );
+    // A receipt cannot authorize recovery over a changed body.
+    ix(&store)
+        .execute(
+            "UPDATE rag_chunks SET text = 'changed' WHERE chunk_id = ?1",
+            [&tool],
+        )
+        .unwrap();
+    assert_refusal(
+        store
+            .redact_conversation(Actor::Operator, &agent.id, &request)
+            .unwrap_err(),
+        "staged receipt does not verify",
+    );
+    ix(&store)
+        .execute(
+            "UPDATE rag_chunks SET text = '[redacted]' WHERE chunk_id = ?1",
+            [&tool],
+        )
+        .unwrap();
+    assert_eq!(count(&store, "conversation_redactions"), 0);
+    let pending: i64 = ix(&store)
+        .query_row("SELECT count(*) FROM index_redactions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(pending, 1, "refused retries retain recovery intent");
     // The retry completes the staged audit instead of refusing a changed
     // target, and the replay after it returns the same receipt.
     let receipt = store
         .redact_conversation(Actor::Operator, &agent.id, &request)
         .unwrap();
+    assert!(receipt.full_scrub, "{:?}", receipt.unscrubbed);
+    let persisted: String = store
+        .conn()
+        .query_row(
+            "SELECT receipt FROM conversation_redactions WHERE id = ?1",
+            [&receipt.audit_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<crate::redaction::Receipt>(&persisted).unwrap(),
+        receipt
+    );
     assert_eq!(count(&store, "conversation_redactions"), 1);
     let staged: i64 = ix(&store)
         .query_row("SELECT count(*) FROM index_redactions", [], |r| r.get(0))

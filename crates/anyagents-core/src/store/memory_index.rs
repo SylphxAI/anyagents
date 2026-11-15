@@ -463,6 +463,14 @@ impl MemoryIndex {
         Ok(())
     }
 
+    /// Retry committed state changes on the next in-process sync.
+    pub(super) fn defer(&self, chunks: &[String]) {
+        self.deferred
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(chunks.iter().cloned());
+    }
+
     /// Re-project `chunks` from state without waiting: `false` when another
     /// writer holds the index, and nothing was done.
     pub(super) fn try_reproject(
@@ -470,14 +478,8 @@ impl MemoryIndex {
         state: &Connection,
         chunks: &[String],
     ) -> Result<bool, Error> {
-        let defer = || {
-            self.deferred
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .extend(chunks.iter().cloned());
-        };
         let Some(mut conn) = self.try_writer() else {
-            defer();
+            self.defer(chunks);
             return Ok(false);
         };
         conn.busy_timeout(Duration::ZERO)?;
@@ -496,7 +498,7 @@ impl MemoryIndex {
         match result {
             Ok(()) => Ok(true),
             Err(error) => {
-                defer();
+                self.defer(chunks);
                 if error.is_transient_lock_error() {
                     Ok(false)
                 } else {
@@ -521,19 +523,14 @@ pub(crate) struct Staged<'a> {
 }
 
 impl Staged<'_> {
-    /// The receipt staged for `chunk_id` by an earlier attempt of the same
-    /// request, if that attempt scrubbed the index but its audit is missing.
-    pub(crate) fn staged_receipt(
-        &self,
-        chunk_id: &str,
-        request_key: &str,
-    ) -> Result<Option<String>, Error> {
+    /// Any receipt staged for this chunk; a different selector must be refused.
+    pub(crate) fn staged_receipt(&self, chunk_id: &str) -> Result<Option<(String, String)>, Error> {
         Ok(self
             .conn
             .query_row(
-                "SELECT receipt FROM index_redactions WHERE chunk_id = ?1 AND request_key = ?2",
-                params![chunk_id, request_key],
-                |r| r.get(0),
+                "SELECT request_key, receipt FROM index_redactions WHERE chunk_id = ?1",
+                [chunk_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
     }
