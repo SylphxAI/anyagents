@@ -2075,6 +2075,18 @@ async fn mcp_spawn_and_create_default_to_general_and_schema_lists_general_first(
     )
     .unwrap();
 
+    let created_alpha = bin()
+        .env("PATH", machine_path(dir.path()))
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "create", "alpha"])
+        .output()
+        .unwrap();
+    assert!(
+        created_alpha.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created_alpha.stderr)
+    );
     let _server = start_server(dir.path());
     let alpha = connect_with_owner(dir.path(), "alpha", Some(&owner)).await;
 
@@ -2142,7 +2154,7 @@ async fn mcp_spawn_and_create_default_to_general_and_schema_lists_general_first(
         call(
             &alpha,
             "agents",
-            serde_json::json!({"action": "spawn", "name": "spawn-overridden"}),
+            serde_json::json!({"action": "spawn", "name": "spawn-overridden", "workdir": &owner}),
         )
         .await,
     );
