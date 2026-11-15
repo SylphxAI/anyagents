@@ -629,7 +629,11 @@ impl StreamHarness {
             let mut state = lock(&self.shared);
             state.reap_child();
             if let Some(status) = state.exit_status {
-                return Some(exit_message(status, None, &state.stderr.masked(true)));
+                return Some(exit_message(
+                    status,
+                    None,
+                    &state.stderr.masked(state.stderr_done),
+                ));
             }
             if state.child.is_none() || Instant::now() >= deadline {
                 return None;
