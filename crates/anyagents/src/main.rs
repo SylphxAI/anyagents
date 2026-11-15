@@ -162,6 +162,9 @@ enum Command {
     Spawn {
         /// Optional agent name (`[a-z0-9][a-z0-9_-]*`). Auto-generated when omitted.
         name: Option<String>,
+        /// Role template slug (for example `general`) that dynamically provides role instructions.
+        #[arg(long)]
+        role: Option<String>,
         #[arg(long)]
         harness: Option<String>,
         #[arg(long)]
@@ -1270,6 +1273,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         }
         Command::Spawn {
             name,
+            role,
             harness,
             model,
             profile,
@@ -1284,6 +1288,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         } => agent::spawn(
             &data,
             name,
+            role,
             harness,
             model,
             profile,
