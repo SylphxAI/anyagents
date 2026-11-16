@@ -15,6 +15,9 @@ pub fn is_secret_reference(text: &str) -> bool {
     s.starts_with("op://") || s.starts_with("op-otp://") || s.starts_with("secret://")
 }
 
+const OP_CONNECT_TOKEN_FILES_ENV: &str = "OP_CONNECT_TOKEN_FILES";
+const OP_CONNECT_TOKEN_ENV: &str = "OP_CONNECT_TOKEN";
+
 /// The resolver handed to the desktop session for one fill.
 #[derive(Debug, Clone)]
 pub struct SecretRefs {
@@ -75,7 +78,7 @@ pub fn resolve_fill_value(
     raw_text: Option<&str>,
     secret_ref: Option<&str>,
 ) -> Result<(String, Option<String>), Error> {
-    resolve_fill_value_with_op(data, raw_text, secret_ref, None)
+    resolve_fill_value_with_connect(data, raw_text, secret_ref, None, None)
 }
 
 /// The `op` CLI: `op_program` in tests, otherwise the toolchain's declared
@@ -89,11 +92,157 @@ fn resolve_op_program(op_program: Option<&std::ffi::OsStr>) -> Result<std::ffi::
     }
 }
 
+fn parse_connect_token_files(raw: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(raw)
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect()
+}
+
+fn configured_connect_token_files_from_env() -> Option<Vec<PathBuf>> {
+    let raw = std::env::var_os(OP_CONNECT_TOKEN_FILES_ENV)?;
+    let paths = parse_connect_token_files(&raw);
+    if paths.is_empty() { None } else { Some(paths) }
+}
+
+fn read_connect_token_file(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn load_connect_tokens(paths: &[PathBuf]) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for path in paths {
+        if let Some(token) = read_connect_token_file(path)
+            && !tokens.contains(&token)
+        {
+            tokens.push(token);
+        }
+    }
+    tokens
+}
+
+fn is_connect_vault_refusal(out: &std::process::Output) -> bool {
+    let stderr = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+    let combined = format!("{stderr}\n{stdout}");
+    combined.contains("reason=ungranted")
+        || combined.contains("ungranted")
+        || combined.contains("403")
+        || combined.contains("forbidden")
+        || combined.contains("outside connect scope")
+        || combined.contains("in connect grants")
+}
+
+enum OpAttemptError {
+    VaultRefused(i32),
+    Fatal(Error),
+}
+
+fn run_op_secret_attempt(
+    op_bin: &std::ffi::OsStr,
+    args: &[&str],
+    connect_token: Option<&str>,
+    label: &str,
+) -> Result<String, OpAttemptError> {
+    let mut cmd = build_op_secret_command(op_bin, args);
+    if let Some(token) = connect_token {
+        cmd.env(OP_CONNECT_TOKEN_ENV, token);
+        // Scope each attempt to one token so an underlying wrapper does not re-iterate.
+        cmd.env_remove(OP_CONNECT_TOKEN_FILES_ENV);
+    }
+    let out = cmd.output().map_err(|_| {
+        OpAttemptError::Fatal(Error::Message(format!(
+            "failed to invoke `op` CLI for {label} reference"
+        )))
+    })?;
+    if !out.status.success() {
+        let code = out.status.code().unwrap_or(-1);
+        if is_connect_vault_refusal(&out) {
+            return Err(OpAttemptError::VaultRefused(code));
+        }
+        return Err(OpAttemptError::Fatal(Error::Message(format!(
+            "1Password {label} resolution failed (exit code {code})"
+        ))));
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if value.is_empty() {
+        return Err(OpAttemptError::Fatal(Error::Message(format!(
+            "1Password {label} resolution returned an empty value"
+        ))));
+    }
+    Ok(value)
+}
+
+fn run_op_secret_with_connect(
+    op_program: Option<&std::ffi::OsStr>,
+    args: &[&str],
+    connect_token_files: Option<&[PathBuf]>,
+    label: &str,
+) -> Result<String, Error> {
+    let configured_from_env;
+    let token_files = match connect_token_files {
+        Some(files) => Some(files),
+        None => {
+            configured_from_env = configured_connect_token_files_from_env();
+            configured_from_env.as_deref()
+        }
+    };
+
+    let Some(paths) = token_files else {
+        let op_bin = resolve_op_program(op_program)?;
+        return match run_op_secret_attempt(&op_bin, args, None, label) {
+            Ok(value) => Ok(value),
+            Err(OpAttemptError::VaultRefused(code)) => Err(Error::Message(format!(
+                "1Password {label} resolution failed (exit code {code})"
+            ))),
+            Err(OpAttemptError::Fatal(err)) => Err(err),
+        };
+    };
+
+    let tokens = load_connect_tokens(paths);
+    if tokens.is_empty() {
+        return Err(Error::Message(format!(
+            "1Password {label} resolution failed: no readable Connect token files"
+        )));
+    }
+
+    let op_bin = resolve_op_program(op_program)?;
+    let mut last_refusal_code = -1;
+    for token in tokens {
+        match run_op_secret_attempt(&op_bin, args, Some(&token), label) {
+            Ok(value) => return Ok(value),
+            Err(OpAttemptError::VaultRefused(code)) => {
+                last_refusal_code = code;
+            }
+            Err(OpAttemptError::Fatal(err)) => return Err(err),
+        }
+    }
+
+    Err(Error::Message(format!(
+        "1Password {label} resolution failed (exit code {last_refusal_code})"
+    )))
+}
+
+#[cfg(test)]
 fn resolve_fill_value_with_op(
     data: &Path,
     raw_text: Option<&str>,
     secret_ref: Option<&str>,
     op_program: Option<&std::ffi::OsStr>,
+) -> Result<(String, Option<String>), Error> {
+    resolve_fill_value_with_connect(data, raw_text, secret_ref, op_program, None)
+}
+
+fn resolve_fill_value_with_connect(
+    data: &Path,
+    raw_text: Option<&str>,
+    secret_ref: Option<&str>,
+    op_program: Option<&std::ffi::OsStr>,
+    connect_token_files: Option<&[PathBuf]>,
 ) -> Result<(String, Option<String>), Error> {
     let candidate = secret_ref
         .map(str::trim)
@@ -113,23 +262,12 @@ fn resolve_fill_value_with_op(
                     .into(),
             ));
         }
-        let op_bin = resolve_op_program(op_program)?;
-        let mut cmd = build_op_secret_command(&op_bin, &["read", "--no-newline", candidate]);
-        let out = cmd
-            .output()
-            .map_err(|_| Error::Message("failed to invoke `op` CLI for secret reference".into()))?;
-        if !out.status.success() {
-            return Err(Error::Message(format!(
-                "1Password secret resolution failed (exit code {})",
-                out.status.code().unwrap_or(-1)
-            )));
-        }
-        let secret = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if secret.is_empty() {
-            return Err(Error::Message(
-                "1Password secret resolution returned an empty value".into(),
-            ));
-        }
+        let secret = run_op_secret_with_connect(
+            op_program,
+            &["read", "--no-newline", candidate],
+            connect_token_files,
+            "secret",
+        )?;
         return Ok((secret, Some(candidate.to_string())));
     }
 
@@ -140,7 +278,7 @@ fn resolve_fill_value_with_op(
                 "invalid 1Password OTP reference format (expected op-otp://<vault>/<item>)".into(),
             ));
         }
-        let mut cmd = if let Some((vault, item)) = trimmed.split_once('/') {
+        let otp = if let Some((vault, item)) = trimmed.split_once('/') {
             let vault = vault.trim().trim_matches('/');
             let item = item.trim().trim_matches('/');
             if vault.is_empty() || item.is_empty() {
@@ -149,27 +287,20 @@ fn resolve_fill_value_with_op(
                         .into(),
                 ));
             }
-            let op_bin = resolve_op_program(op_program)?;
-            build_op_secret_command(&op_bin, &["item", "get", item, "--vault", vault, "--otp"])
+            run_op_secret_with_connect(
+                op_program,
+                &["item", "get", item, "--vault", vault, "--otp"],
+                connect_token_files,
+                "OTP",
+            )?
         } else {
-            let op_bin = resolve_op_program(op_program)?;
-            build_op_secret_command(&op_bin, &["item", "get", trimmed, "--otp"])
+            run_op_secret_with_connect(
+                op_program,
+                &["item", "get", trimmed, "--otp"],
+                connect_token_files,
+                "OTP",
+            )?
         };
-        let out = cmd
-            .output()
-            .map_err(|_| Error::Message("failed to invoke `op` CLI for OTP reference".into()))?;
-        if !out.status.success() {
-            return Err(Error::Message(format!(
-                "1Password OTP resolution failed (exit code {})",
-                out.status.code().unwrap_or(-1)
-            )));
-        }
-        let otp = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if otp.is_empty() {
-            return Err(Error::Message(
-                "1Password OTP resolution returned an empty value".into(),
-            ));
-        }
         return Ok((otp, Some(candidate.to_string())));
     }
 
@@ -508,5 +639,210 @@ esac
             assert!(!msg.contains("item-beta"), "{msg}");
             assert!(!msg.contains("only-two"), "{msg}");
         }
+    }
+
+    #[test]
+    fn connect_token_file_parsing_and_loading_skip_empty_unreadable_and_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("connect-token");
+        let blank = dir.path().join("connect-token-empty");
+        let subdir = dir.path().join("subdir");
+        let dup = dir.path().join("connect-token-dup");
+        let second = dir.path().join("connect-token-secondary");
+        let missing = dir.path().join("connect-token-missing");
+
+        std::fs::write(&first, "  tok-first\n").unwrap();
+        std::fs::write(&blank, "   \n\t  ").unwrap();
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(&dup, "tok-first").unwrap();
+        std::fs::write(&second, "tok-second").unwrap();
+
+        let joined = std::env::join_paths([
+            Path::new(""),
+            &missing,
+            &blank,
+            &subdir,
+            &first,
+            &dup,
+            &second,
+            Path::new(""),
+        ])
+        .unwrap();
+        let parsed = parse_connect_token_files(&joined);
+        assert_eq!(
+            parsed,
+            vec![
+                missing.clone(),
+                blank.clone(),
+                subdir.clone(),
+                first.clone(),
+                dup.clone(),
+                second.clone(),
+            ]
+        );
+        assert!(parse_connect_token_files(std::ffi::OsStr::new("")).is_empty());
+
+        let loaded = load_connect_tokens(&parsed);
+        assert_eq!(
+            loaded,
+            vec!["tok-first".to_string(), "tok-second".to_string()]
+        );
+
+        let err = resolve_fill_value_with_connect(
+            dir.path(),
+            None,
+            Some("op://vault-alpha/item-beta/password"),
+            None,
+            Some(&[missing, blank, subdir]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no readable Connect token files"), "{err}");
+        assert!(!err.contains("connect-token-missing"), "{err}");
+        assert!(!err.contains("vault-alpha"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_token_files_fall_through_on_ungranted_or_403_and_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("attempts.log");
+        let shim = dir.path().join("fake-op-connect");
+        let script = format!(
+            r##"#!/bin/sh
+if [ -n "$OP_CONNECT_TOKEN_FILES" ]; then
+  echo "nested OP_CONNECT_TOKEN_FILES should be cleared per attempt" >&2
+  exit 9
+fi
+printf '%s|%s\n' "$OP_CONNECT_TOKEN" "$*" >> '{log}'
+case "$OP_CONNECT_TOKEN:$*" in
+  tok-ungranted:*vault-beta*|tok-ungranted:*StandaloneBeta*)
+    echo "op-connect-read-refused token=tok-ungranted reason=ungranted" >&2
+    exit 2
+    ;;
+  tok-403:*vault-beta*)
+    echo "HTTP 403 Forbidden for vault-beta" >&2
+    exit 1
+    ;;
+  tok-403:*StandaloneBeta*)
+    echo "OTP item not found or ambiguous in Connect grants" >&2
+    exit 1
+    ;;
+  tok-granted-b:read\ --no-newline\ op://vault-beta/item-beta/password)
+    printf 'secret-from-third-token\n'
+    exit 0
+    ;;
+  tok-granted-b:item\ get\ item-beta\ --vault\ vault-beta\ --otp)
+    printf '445566\n'
+    exit 0
+    ;;
+  tok-granted-b:item\ get\ StandaloneBeta\ --otp)
+    printf '778899\n'
+    exit 0
+    ;;
+  tok-fatal:*)
+    echo "network connection refused tok-fatal" >&2
+    exit 3
+    ;;
+  *)
+    echo "vault is outside Connect scope" >&2
+    exit 2
+    ;;
+esac
+"##,
+            log = log.display(),
+        );
+        write_executable(&shim, &script);
+
+        let missing = dir.path().join("missing-token");
+        let empty = dir.path().join("empty-token");
+        let tok_ungranted = dir.path().join("token-1");
+        let tok_403 = dir.path().join("token-2");
+        let tok_granted_b = dir.path().join("token-3");
+        let tok_fatal = dir.path().join("token-fatal");
+        std::fs::write(&empty, " \n").unwrap();
+        std::fs::write(&tok_ungranted, "tok-ungranted\n").unwrap();
+        std::fs::write(&tok_403, "tok-403\n").unwrap();
+        std::fs::write(&tok_granted_b, "tok-granted-b\n").unwrap();
+        std::fs::write(&tok_fatal, "tok-fatal\n").unwrap();
+
+        let ordered = [
+            missing,
+            empty,
+            tok_ungranted.clone(),
+            tok_403.clone(),
+            tok_granted_b.clone(),
+            tok_fatal.clone(),
+        ];
+
+        let (secret, src) = resolve_fill_value_with_connect(
+            dir.path(),
+            None,
+            Some("op://vault-beta/item-beta/password"),
+            Some(shim.as_os_str()),
+            Some(&ordered),
+        )
+        .unwrap();
+        assert_eq!(secret, "secret-from-third-token");
+        assert_eq!(src.as_deref(), Some("op://vault-beta/item-beta/password"));
+
+        let (otp, _) = resolve_fill_value_with_connect(
+            dir.path(),
+            None,
+            Some("op-otp://vault-beta/item-beta"),
+            Some(shim.as_os_str()),
+            Some(&ordered),
+        )
+        .unwrap();
+        assert_eq!(otp, "445566");
+
+        let (standalone_otp, _) = resolve_fill_value_with_connect(
+            dir.path(),
+            None,
+            Some("op-otp://StandaloneBeta"),
+            Some(shim.as_os_str()),
+            Some(&ordered),
+        )
+        .unwrap();
+        assert_eq!(standalone_otp, "778899");
+
+        let attempts = std::fs::read_to_string(&log).unwrap();
+        assert!(!attempts.contains("tok-fatal"), "{attempts}");
+        let lines: Vec<&str> = attempts.lines().collect();
+        assert_eq!(lines.len(), 9, "{attempts}");
+        assert!(lines[0].starts_with("tok-ungranted|"));
+        assert!(lines[1].starts_with("tok-403|"));
+        assert!(lines[2].starts_with("tok-granted-b|"));
+
+        // Fail closed when all configured token files refuse the target vault/item.
+        let err = resolve_fill_value_with_connect(
+            dir.path(),
+            None,
+            Some("op://vault-gamma/item-beta/password"),
+            Some(shim.as_os_str()),
+            Some(&[tok_ungranted.clone(), tok_403.clone()]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("exit code 2"), "{err}");
+        for forbidden in ["tok-ungranted", "tok-403", "vault-gamma", "item-beta"] {
+            assert!(!err.contains(forbidden), "leaked {forbidden} in {err}");
+        }
+
+        // Non-refusal failures stop immediately without falling through to later tokens.
+        let before_fatal = std::fs::read_to_string(&log).unwrap().lines().count();
+        let fatal_err = resolve_fill_value_with_connect(
+            dir.path(),
+            None,
+            Some("op://vault-beta/item-beta/password"),
+            Some(shim.as_os_str()),
+            Some(&[tok_fatal, tok_granted_b]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(fatal_err.contains("exit code 3"), "{fatal_err}");
+        assert!(!fatal_err.contains("tok-fatal"), "{fatal_err}");
+        let after_fatal = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(after_fatal, before_fatal + 1);
     }
 }
