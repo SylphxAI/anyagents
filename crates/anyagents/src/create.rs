@@ -1494,6 +1494,113 @@ pub(crate) fn ensure_seat_skills(target_config: &Path, _host_home: &Path) {
 /// Only a refused mirror is delegated, and all effects run as the existing
 /// parent owner. No daemon chmod, broad home grant or foreign-link replacement.
 #[cfg(unix)]
+const SKILL_PROJECTION_OWNER_SCRIPT: &str = r#"set -eu
+config=$1; relative=$2; view=$3; global=$4; overlay=$5
+  managed_source() {
+    for src_root in "$global" "$overlay"; do
+      case $1 in
+        "$src_root"/*)
+          rest=${1#"$src_root"/}
+          case "/$rest/" in *"/./"*|*"/../"*|*"//"*) continue;; esac
+          case $rest in
+            synced/*/*) rest=${rest#synced/}; rest=${rest#*/}; case $rest in */*) ;; *) return 0;; esac;;
+            */*) ;;
+            *) return 0;;
+          esac;;
+      esac
+    done
+    return 1
+  }
+if [ "$relative" = "skills-view" ]; then
+  if [ -L "$overlay" ] || [ -L "$view" ]; then exit 1; fi
+  mkdir -p -m 02770 "$overlay"
+  chmod 02770 "$overlay"
+  mkdir -p "$view"
+  chmod 0755 "$view"
+  # Same bounded layout and precedence as host_skills::discover. Shell glob
+  # order is deterministic under C; the first synced bucket wins.
+  LC_ALL=C; export LC_ALL
+  desired_for() {
+    name=$1; desired=""
+    for src_root in "$global" "$overlay"; do
+      for bucket in "$src_root"/synced/*; do
+        [ -d "$bucket" ] || continue
+        case ${bucket##*/} in .*) continue;; esac
+        if [ -d "$bucket/$name" ] && [ -f "$bucket/$name/SKILL.md" ]; then
+          desired=$bucket/$name; break
+        fi
+      done
+    done
+    # Direct skills override synced skills, irrespective of source root.
+    for src_root in "$global" "$overlay"; do
+      if [ -d "$src_root/$name" ] && [ -f "$src_root/$name/SKILL.md" ]; then desired=$src_root/$name; fi
+    done
+    # Keep visible legacy containers, without letting them mask a skill.
+    if [ -z "$desired" ]; then
+      for src_root in "$global" "$overlay"; do
+        if [ -d "$src_root/$name" ]; then desired=$src_root/$name; fi
+      done
+    fi
+  }
+  for item in "$view"/*; do
+    [ -L "$item" ] || continue
+    old=$(readlink "$item")
+    if managed_source "$old"; then
+      desired_for "${item##*/}"
+      if [ "$old" != "$desired" ]; then rm "$item"; fi
+    fi
+  done
+  for item in "$global"/* "$overlay"/* "$global"/synced/*/* "$overlay"/synced/*/*; do
+    [ -d "$item" ] || continue
+    name=${item##*/}
+    case $name in .*) continue;; esac
+    desired_for "$name"
+    [ -n "$desired" ] || continue
+    link=$view/$name
+    if [ -L "$link" ] || [ -e "$link" ]; then continue; fi
+    ln -s "$desired" "$link"
+  done
+  exit 0
+fi
+# Every existing component is inspected by its actual owner, not the daemon
+# which was denied traversal. Foreign parent links are preserved untouched.
+parent=$config
+old_ifs=$IFS; IFS=/; set -- $relative; IFS=$old_ifs
+while [ "$#" -gt 1 ]; do
+  parent=$parent/$1; shift
+  if [ -L "$parent" ]; then exit 0; fi
+  mkdir -p "$parent"
+done
+target=$parent/$1
+if [ -L "$target" ]; then
+  old=$(readlink "$target")
+  if [ "$old" = "$view" ]; then exit 0; fi
+  if [ "$old" != "$global" ]; then exit 0; fi
+  temp=$parent/.skills-owner-$$
+  trap 'rm -f "$temp"' EXIT HUP INT TERM
+  ln -s "$view" "$temp"
+  mv -fT "$temp" "$target"
+elif [ -d "$target" ]; then
+  for item in "$target"/*; do
+    [ -L "$item" ] || continue
+    old=$(readlink "$item")
+    if managed_source "$old" && [ ! -e "$view/${item##*/}" ]; then rm "$item"; fi
+  done
+  for item in "$view"/*; do
+    [ -L "$item" ] || continue
+    link=$target/${item##*/}; source=$(readlink "$item")
+    if [ -L "$link" ]; then
+      old=$(readlink "$link")
+      if ! managed_source "$old"; then continue; fi
+      if [ "$old" = "$source" ]; then continue; fi
+      rm "$link"
+    elif [ -e "$link" ]; then continue; fi
+    ln -s "$source" "$link"
+  done
+elif [ ! -e "$target" ]; then ln -s "$view" "$target"; fi
+"#;
+
+#[cfg(unix)]
 fn install_skill_projection_as_owner(
     config: &Path,
     target: &Path,
@@ -1551,83 +1658,30 @@ fn install_skill_projection_as_owner(
         Some(sg) if sg != eff_gid && sg != 0 => format!("{eff_gid},{sg}"),
         _ => eff_gid.to_string(),
     };
-    let output = std::process::Command::new(launcher).args([
-        "--reuid", &eff_uid.to_string(), "--regid", &eff_gid.to_string(),
-        "--groups", &groups, "--no-new-privs", "--", "/bin/sh", "-c",
-        r#"set -eu
-config=$1; relative=$2; view=$3; global=$4; overlay=$5
-if [ "$relative" = "skills-view" ]; then
-  if [ -L "$overlay" ] || [ -L "$view" ]; then exit 1; fi
-  mkdir -p -m 02770 "$overlay"
-  chmod 02770 "$overlay"
-  mkdir -p "$view"
-  chmod 0755 "$view"
-  for item in "$view"/*; do
-    [ -L "$item" ] || continue
-    old=$(readlink "$item"); source_parent=${old%/*}; name=${item##*/}
-    if [ "$source_parent" = "$global" ] || [ "$source_parent" = "$overlay" ]; then
-      if [ -d "$overlay/$name" ]; then expected="$overlay/$name"
-      elif [ -d "$global/$name" ]; then expected="$global/$name"
-      else expected=""; fi
-      if [ "$old" != "$expected" ]; then rm "$item"; fi
-    fi
-  done
-  for src_root in "$global" "$overlay"; do
-    [ -d "$src_root" ] || continue
-    for item in "$src_root"/*; do
-      [ -d "$item" ] || continue
-      name=${item##*/}; link="$view/$name"
-      if [ -d "$overlay/$name" ]; then desired="$overlay/$name"; else desired="$item"; fi
-      if [ -L "$link" ]; then
-        old=$(readlink "$link"); source_parent=${old%/*}
-        if [ "$source_parent" != "$global" ] && [ "$source_parent" != "$overlay" ]; then continue; fi
-        if [ "$old" = "$desired" ]; then continue; fi
-        rm "$link"
-      elif [ -e "$link" ]; then continue; fi
-      ln -s "$desired" "$link"
-    done
-  done
-  exit 0
-fi
-# Every existing component is inspected by its actual owner, not the daemon
-# which was denied traversal. Foreign parent links are preserved untouched.
-parent=$config
-old_ifs=$IFS; IFS=/; set -- $relative; IFS=$old_ifs
-while [ "$#" -gt 1 ]; do
-  parent=$parent/$1; shift
-  if [ -L "$parent" ]; then exit 0; fi
-  mkdir -p "$parent"
-done
-target=$parent/$1
-if [ -L "$target" ]; then
-  old=$(readlink "$target")
-  if [ "$old" = "$view" ]; then exit 0; fi
-  if [ "$old" != "$global" ]; then exit 0; fi
-  temp=$parent/.skills-owner-$$
-  trap 'rm -f "$temp"' EXIT HUP INT TERM
-  ln -s "$view" "$temp"
-  mv -fT "$temp" "$target"
-elif [ -d "$target" ]; then
-  for item in "$target"/*; do
-    [ -L "$item" ] || continue
-    old=$(readlink "$item"); source_parent=${old%/*}
-    if { [ "$source_parent" = "$global" ] || [ "$source_parent" = "$overlay" ]; } && [ ! -e "$view/${item##*/}" ]; then rm "$item"; fi
-  done
-  for item in "$view"/*; do
-    [ -L "$item" ] || continue
-    link=$target/${item##*/}; source=$(readlink "$item")
-    if [ -L "$link" ]; then
-      old=$(readlink "$link"); source_parent=${old%/*}
-      if [ "$source_parent" != "$global" ] && [ "$source_parent" != "$overlay" ]; then continue; fi
-      if [ "$old" = "$source" ]; then continue; fi
-      rm "$link"
-    elif [ -e "$link" ]; then continue; fi
-    ln -s "$source" "$link"
-  done
-elif [ ! -e "$target" ]; then ln -s "$view" "$target"; fi
-"#, "skill-projection-owner",
-    ]).args([config.as_os_str(), relative.as_os_str(), view.as_os_str(), global.as_os_str(), overlay.as_os_str()])
-        .stdin(std::process::Stdio::null()).output()?;
+    let output = std::process::Command::new(launcher)
+        .args([
+            "--reuid",
+            &eff_uid.to_string(),
+            "--regid",
+            &eff_gid.to_string(),
+            "--groups",
+            &groups,
+            "--no-new-privs",
+            "--",
+            "/bin/sh",
+            "-c",
+            SKILL_PROJECTION_OWNER_SCRIPT,
+            "skill-projection-owner",
+        ])
+        .args([
+            config.as_os_str(),
+            relative.as_os_str(),
+            view.as_os_str(),
+            global.as_os_str(),
+            overlay.as_os_str(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()?;
     if output.status.success() {
         Ok(())
     } else {
@@ -10215,13 +10269,25 @@ pub(crate) fn effective_agent_instructions(
         .as_ref()
         .map(|(_, tpl)| tpl.body.trim())
         .filter(|s| !s.is_empty());
-    let custom = strip_known_baked_role_prefixes(agent.instructions.as_deref(), role_body);
-    match (role_body, custom.as_deref()) {
-        (Some(role), Some(custom)) => Some(format!("{role}\n\n{custom}")),
-        (Some(role), None) => Some(role.to_string()),
-        (None, Some(custom)) => Some(custom.to_string()),
-        (None, None) => None,
+    let mut custom = agent.instructions.clone();
+    loop {
+        let next = strip_known_baked_role_prefixes(custom.as_deref(), role_body);
+        if next == custom {
+            break;
+        }
+        custom = next;
     }
+    // Execution discipline is a runtime baseline, not a role-name policy.
+    // Role templates stay caller-owned and are reloaded from their source.
+    let mut sections = vec![BUILTIN_GENERAL_ROLE_BODY.to_string()];
+    for section in [role_body, custom.as_deref()].into_iter().flatten() {
+        let section = strip_role_prefix_match(section, BUILTIN_GENERAL_ROLE_BODY)
+            .unwrap_or_else(|| Some(section.to_string()));
+        if let Some(section) = section {
+            sections.push(section);
+        }
+    }
+    Some(sections.join("\n\n"))
 }
 
 pub(crate) fn backfill_historical_agent_roles(
@@ -10657,6 +10723,88 @@ pub(crate) fn resolve_subagent_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_projection_script_flattens_synced_skills_without_touching_local_or_foreign_data() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("skills");
+        let agent = dir.path().join("agent");
+        let config = agent.join("config");
+        let overlay = agent.join("skills");
+        let view = agent.join("skills-view");
+        let agy = config.join(".gemini/config/skills");
+        let skill = |root: &Path, name: &str, body: &str| {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join("SKILL.md"), body).unwrap();
+        };
+        skill(&global.join("synced/z"), "sample", "later");
+        skill(&global.join("synced/a"), "sample", "first");
+        skill(&global.join("synced/.bucket-temp"), "hidden", "hidden");
+        skill(&global.join("synced/a"), ".hidden", "hidden");
+        skill(&overlay.join("synced/a"), "sample", "overlay");
+        skill(&global, "sample", "direct");
+        skill(&agy, "local", "local bytes");
+        let foreign = dir.path().join("foreign");
+        skill(&foreign, "sample", "foreign bytes");
+        symlink(foreign.join("sample"), agy.join("foreign")).unwrap();
+        std::fs::write(global.join("synced/manifest.json"), "{}").unwrap();
+        let project = || {
+            for relative in ["skills-view", ".gemini/config/skills"] {
+                let result = std::process::Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        SKILL_PROJECTION_OWNER_SCRIPT,
+                        "skill-projection-owner",
+                    ])
+                    .arg(&config)
+                    .arg(relative)
+                    .arg(&view)
+                    .arg(&global)
+                    .arg(&overlay)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        };
+        project();
+        assert_eq!(
+            std::fs::read_to_string(agy.join("sample/SKILL.md")).unwrap(),
+            "direct"
+        );
+        assert!(!agy.join("hidden").exists());
+        assert!(!agy.join(".hidden").exists());
+        assert!(!agy.join("manifest.json").exists());
+        std::fs::remove_dir_all(global.join("sample")).unwrap();
+        project();
+        assert_eq!(
+            std::fs::read_to_string(agy.join("sample/SKILL.md")).unwrap(),
+            "overlay"
+        );
+        std::fs::remove_dir_all(overlay.join("synced/a/sample")).unwrap();
+        project();
+        assert_eq!(
+            std::fs::read_to_string(agy.join("sample/SKILL.md")).unwrap(),
+            "first"
+        );
+        std::fs::remove_dir_all(global.join("synced/a/sample")).unwrap();
+        std::fs::remove_dir_all(global.join("synced/z/sample")).unwrap();
+        project();
+        assert!(std::fs::symlink_metadata(agy.join("sample")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(agy.join("local/SKILL.md")).unwrap(),
+            "local bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(agy.join("foreign/SKILL.md")).unwrap(),
+            "foreign bytes"
+        );
+    }
 
     #[test]
     fn a_model_change_on_an_unconfigured_harness_installs_nothing() {
@@ -13450,7 +13598,7 @@ mod archetype_tests {
             preview_agent.workdir = Some(dir.path().display().to_string());
             assert_eq!(
                 effective_agent_instructions(None, dir.path(), &preview_agent).as_deref(),
-                Some(format!("{expected_body}\n\nCustom assignment instructions.").as_str())
+                Some(format!("{BUILTIN_GENERAL_ROLE_BODY}\n\n{expected_body}\n\nCustom assignment instructions.").as_str())
             );
         }
 
@@ -13834,11 +13982,20 @@ mod archetype_tests {
         );
         assert_eq!(
             effective_agent_instructions(Some(&store), &data, &agent).as_deref(),
-            Some("Role SSOT v1 instructions.\n\nKeep only custom task assignment.")
+            Some(format!("{BUILTIN_GENERAL_ROLE_BODY}\n\nRole SSOT v1 instructions.\n\nKeep only custom task assignment.").as_str())
         );
         let cfg = agent_config_dir(&data, &agent.id);
         let prompt_v1 = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
         assert!(prompt_v1.contains("Role SSOT v1 instructions."));
+        assert_eq!(prompt_v1.matches(BUILTIN_GENERAL_ROLE_BODY).count(), 1);
+        // Old composed instructions do not duplicate either runtime baseline
+        // or the current caller template when rendered again.
+        let mut baked = agent.clone();
+        baked.instructions = effective_agent_instructions(Some(&store), &data, &agent);
+        assert_eq!(
+            effective_agent_instructions(Some(&store), &data, &baked),
+            baked.instructions
+        );
         assert!(prompt_v1.contains("Keep only custom task assignment."));
         assert!(!cfg.join(INSTRUCTIONS_ROTATED_MARKER).exists());
 
@@ -15954,7 +16111,7 @@ Connection: close
             probe.workdir = None;
             assert_eq!(
                 effective_agent_instructions(Some(&store), &data_dir, &probe).as_deref(),
-                Some(expected_body)
+                Some(format!("{BUILTIN_GENERAL_ROLE_BODY}\n\n{expected_body}").as_str())
             );
         }
 
@@ -16016,7 +16173,7 @@ Connection: close
         override_probe.workdir = None;
         assert_eq!(
             effective_agent_instructions(Some(&store), &data_dir, &override_probe).as_deref(),
-            Some("L1 local writer override.")
+            Some(format!("{BUILTIN_GENERAL_ROLE_BODY}\n\nL1 local writer override.").as_str())
         );
 
         {
