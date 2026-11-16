@@ -7,8 +7,10 @@
 //! message can land.
 
 use std::collections::HashSet;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::Path;
+
+mod presentation;
 
 use crate::{ConversationArgs, HistoryOptions, InboxArgs};
 
@@ -113,7 +115,14 @@ pub fn send_with_options(data: &Path, opts: SendOptions) -> Result<(), Error> {
         .map_err(Error::Message)?;
         if let Some(sent) = sent {
             for delivery in sent.deliveries {
-                if delivery.duplicate {
+                if crate::ui::is_pretty() {
+                    presentation::delivery(
+                        &delivery.to,
+                        &delivery.id,
+                        Some(delivery.seq),
+                        delivery.duplicate,
+                    );
+                } else if delivery.duplicate {
                     println!("{}\t{}\tduplicate", delivery.id, delivery.seq);
                 } else {
                     println!("{}\t{}", delivery.id, delivery.seq);
@@ -173,11 +182,20 @@ fn send_stored(
                 )));
             }
             for (agent, outcome) in delivered {
-                let message = match outcome {
-                    anyagents_core::ReceiveOutcome::New(message)
-                    | anyagents_core::ReceiveOutcome::Duplicate(message) => message,
+                let (message, duplicate) = match outcome {
+                    anyagents_core::ReceiveOutcome::New(message) => (message, false),
+                    anyagents_core::ReceiveOutcome::Duplicate(message) => (message, true),
                 };
-                println!("{}\t{}\t{}", agent.name, message.id, message.seq);
+                if crate::ui::is_pretty() {
+                    presentation::delivery(
+                        &agent.name,
+                        message.id.as_str(),
+                        Some(message.seq),
+                        duplicate,
+                    );
+                } else {
+                    println!("{}\t{}\t{}", agent.name, message.id, message.seq);
+                }
             }
             return Ok(());
         }
@@ -220,9 +238,19 @@ fn send_stored(
         },
     )?;
     match outcome {
-        anyagents_core::ReceiveOutcome::New(message) => println!("{}\t{}", message.id, message.seq),
+        anyagents_core::ReceiveOutcome::New(message) => {
+            if crate::ui::is_pretty() {
+                presentation::delivery(&agent.name, message.id.as_str(), Some(message.seq), false);
+            } else {
+                println!("{}\t{}", message.id, message.seq);
+            }
+        }
         anyagents_core::ReceiveOutcome::Duplicate(message) => {
-            println!("{}\t{}\tduplicate", message.id, message.seq);
+            if crate::ui::is_pretty() {
+                presentation::delivery(&agent.name, message.id.as_str(), Some(message.seq), true);
+            } else {
+                println!("{}\t{}\tduplicate", message.id, message.seq);
+            }
         }
     }
     Ok(())
@@ -252,10 +280,18 @@ fn report_stored(
     })?;
     match receipt {
         anyagents_core::OperatorReceipt::New(message) => {
-            println!("{}\t{}", message.id, message.seq);
+            if crate::ui::is_pretty() {
+                presentation::delivery("operator", message.id.as_str(), Some(message.seq), false);
+            } else {
+                println!("{}\t{}", message.id, message.seq);
+            }
         }
         anyagents_core::OperatorReceipt::Duplicate(message) => {
-            println!("{}\t{}\tduplicate", message.id, message.seq);
+            if crate::ui::is_pretty() {
+                presentation::delivery("operator", message.id.as_str(), Some(message.seq), true);
+            } else {
+                println!("{}\t{}\tduplicate", message.id, message.seq);
+            }
         }
         anyagents_core::OperatorReceipt::Limited { retry_after_ms } => {
             return Err(Error::Message(format!(
@@ -294,7 +330,16 @@ fn send_telegram(
     let store = open(data)?;
     let message_id =
         telegram::post_text(&store, data, from, None, chat_id, text, reply_to, thread_id)?;
-    println!("{message_id}");
+    if crate::ui::is_pretty() {
+        presentation::delivery(
+            &format!("Telegram chat {chat_id}"),
+            &message_id.to_string(),
+            None,
+            false,
+        );
+    } else {
+        println!("{message_id}");
+    }
     Ok(())
 }
 
@@ -396,7 +441,11 @@ pub fn inbox(data: &Path, args: InboxArgs) -> Result<(), Error> {
                         .map_err(|e| Error::Message(e.to_string()))?
                 );
             }
-        } else if args.full || !std::io::stdout().is_terminal() {
+        } else if crate::ui::is_pretty() {
+            if !args.follow || !read.messages.is_empty() {
+                presentation::inbox(&target, &read.messages, args.full);
+            }
+        } else {
             for m in &read.messages {
                 println!(
                     "[#{}] {}  IN   {} -> {}  ({})\n{}\n",
@@ -408,8 +457,6 @@ pub fn inbox(data: &Path, args: InboxArgs) -> Result<(), Error> {
                     m.text
                 );
             }
-        } else {
-            crate::ui::print_inbox_pretty(&target, &read.messages);
         }
         if !args.follow {
             return Ok(());
@@ -486,7 +533,7 @@ fn operator_inbox(data: &Path, args: &InboxArgs) -> Result<(), Error> {
                         .map_err(|e| Error::Message(e.to_string()))?
                 );
             }
-        } else if args.full || !std::io::stdout().is_terminal() {
+        } else if !crate::ui::is_pretty() {
             for m in &read.messages {
                 println!(
                     "[#{}] {}  IN   {} ({}) -> operator\n{}\n",
@@ -513,7 +560,9 @@ fn operator_inbox(data: &Path, args: &InboxArgs) -> Result<(), Error> {
                     delivered_at_ms: None,
                 })
                 .collect();
-            crate::ui::print_inbox_pretty("operator", &rows);
+            if !args.follow || !rows.is_empty() {
+                presentation::inbox("operator", &rows, args.full);
+            }
         }
         if !args.follow {
             return Ok(());
@@ -526,7 +575,7 @@ fn operator_inbox(data: &Path, args: &InboxArgs) -> Result<(), Error> {
 
 pub fn emit_turns(
     turns: &[crate::api::ConversationTurnView],
-    full: bool,
+    _full: bool,
     json: bool,
 ) -> Result<(), Error> {
     if json {
@@ -536,7 +585,9 @@ pub fn emit_turns(
                 serde_json::to_string(turn).map_err(|e| Error::Message(e.to_string()))?
             );
         }
-    } else if full || !std::io::stdout().is_terminal() {
+    } else if crate::ui::is_pretty() {
+        presentation::conversation("", None, turns);
+    } else {
         for t in turns {
             println!(
                 "[#{}] {}  {:<4} {} -> {}\n{}\n",
@@ -549,8 +600,6 @@ pub fn emit_turns(
                 t.text
             );
         }
-    } else {
-        crate::ui::print_conversation_pretty("", None, turns);
     }
     Ok(())
 }
@@ -585,7 +634,13 @@ pub fn conversation(data: &Path, args: ConversationArgs) -> Result<(), Error> {
             );
             return Ok(());
         }
-        emit_turns(&turns, options.full, options.json)?;
+        if !options.json && crate::ui::is_pretty() {
+            if !options.follow || !turns.is_empty() {
+                presentation::conversation(&target, query, &turns);
+            }
+        } else {
+            emit_turns(&turns, options.full, options.json)?;
+        }
         if !options.follow {
             return Ok(());
         }
@@ -866,10 +921,13 @@ pub fn add_channel_with_options(
             &client::authority(data),
         ) {
             Ok(result) => {
-                println!(
-                    "{}",
-                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
-                );
+                let result =
+                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?;
+                if crate::ui::is_pretty() {
+                    presentation::channel_receipt(&result, agent_name);
+                } else {
+                    println!("{result}");
+                }
                 return Ok(());
             }
             Err(err) if err.contains("404") => {}
@@ -879,13 +937,17 @@ pub fn add_channel_with_options(
     let store = open(data)?;
     let agent = store.agent_by_name(agent_name)?;
     if let Some(ref token) = token_opt {
-        let _ = crate::telegram::bind_agent_telegram_token(&store, data, &agent, token, None)?;
+        let bound = crate::telegram::bind_agent_telegram_token(&store, data, &agent, token, None)?;
         let recorded = store
             .list_channels()?
             .into_iter()
             .find(|channel| channel.agents.contains(&agent.id))
             .ok_or_else(|| Error::Message("no channel was recorded".into()))?;
-        println!("{}\t{}", recorded.id, recorded.kind);
+        if crate::ui::is_pretty() {
+            presentation::channel_receipt(&bound, &agent.name);
+        } else {
+            println!("{}\t{}", recorded.id, recorded.kind);
+        }
         return Ok(());
     }
     let out = crate::telegram::request_or_bind_telegram_channel(
@@ -899,7 +961,11 @@ pub fn add_channel_with_options(
         manager,
         false,
     )?;
-    println!("{out}");
+    if crate::ui::is_pretty() {
+        presentation::channel_receipt(&out, &agent.name);
+    } else {
+        println!("{out}");
+    }
     Ok(())
 }
 
@@ -913,10 +979,9 @@ pub fn list_channels(data: &Path) -> Result<(), Error> {
             &client::authority(data),
         ) {
             Ok(result) => {
-                println!(
-                    "{}",
-                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
-                );
+                let result =
+                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?;
+                println!("{result}");
                 return Ok(());
             }
             Err(err) if err.contains("404") => {}
@@ -926,55 +991,21 @@ pub fn list_channels(data: &Path) -> Result<(), Error> {
     let store = open(data)?;
     let channels = store.list_channels()?;
     if crate::ui::is_pretty() {
-        if channels.is_empty() {
-            println!("  {}", crate::ui::dim("No channels recorded."));
-            return Ok(());
-        }
-        println!(
-            "\n  {}  {} total\n",
-            crate::ui::bold_cyan("Channels"),
-            crate::ui::bold(&channels.len().to_string())
-        );
-        let mut table = crate::ui::Table::new(&[
-            ("KIND", false),
-            ("BOT", false),
-            ("AGENTS", false),
-            ("GROUPS / CHATS", false),
-            ("ID", false),
-        ]);
-        for channel in channels {
-            let names: Vec<String> = channel
-                .agents
-                .iter()
-                .filter_map(|id| store.agent(id).ok().map(|agent| agent.name))
-                .collect();
-            let agents_cell = if names.is_empty() {
-                crate::ui::dim("-")
-            } else {
-                crate::ui::bold(&names.join(", "))
-            };
-            let bot_cell = match channel.identity.as_deref() {
-                Some(id) if !id.is_empty() => {
-                    let uname = id.split_once(':').map(|(_, u)| u).unwrap_or(id);
-                    if uname.starts_with('@') {
-                        crate::ui::cyan(uname)
-                    } else {
-                        crate::ui::cyan(&format!("@{uname}"))
-                    }
-                }
-                _ => crate::ui::dim("-"),
-            };
-            let chats_cell = summarize_channel_chats(&channel.state);
-            table.add_row(vec![
-                crate::ui::cyan(&channel.kind),
-                bot_cell,
-                agents_cell,
-                chats_cell,
-                crate::ui::dim(channel.id.as_ref()),
-            ]);
-        }
-        table.print();
-        println!();
+        let rows = channels
+            .into_iter()
+            .map(|channel| presentation::ChannelRow {
+                agents: channel
+                    .agents
+                    .iter()
+                    .filter_map(|id| store.agent(id).ok().map(|agent| agent.name))
+                    .collect(),
+                chats: summarize_channel_chats(&channel.state),
+                id: channel.id.to_string(),
+                kind: channel.kind,
+                bot: channel.identity.filter(|id| !id.is_empty()),
+            })
+            .collect();
+        presentation::channels(rows);
         return Ok(());
     }
     for channel in channels {
