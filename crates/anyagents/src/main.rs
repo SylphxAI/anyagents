@@ -60,6 +60,9 @@ struct Cli {
     /// Directory that holds the database.
     #[arg(long, global = true, default_value = ".anyagents")]
     data: PathBuf,
+    /// Show storage paths and additional diagnostic metadata.
+    #[arg(long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -1081,7 +1084,7 @@ fn main() -> ExitCode {
         return match cloud_harness::run(cloud_args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("{err}");
+                ui::error(&err.to_string());
                 ExitCode::FAILURE
             }
         };
@@ -1090,12 +1093,13 @@ fn main() -> ExitCode {
         return match sandbox_exec::run(sbx_args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("{err}");
+                ui::error(&err.to_string());
                 ExitCode::FAILURE
             }
         };
     }
     let cli = Cli::parse();
+    ui::set_verbose(cli.verbose);
     // The daemon also writes child stdin pipes and must handle their closure as
     // an I/O error, not terminate the entire service. Only operator output uses
     // the default pipeline disposition installed above.
@@ -1108,7 +1112,7 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("{err}");
+            ui::error(&err.to_string());
             ExitCode::FAILURE
         }
     }
