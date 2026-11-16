@@ -780,9 +780,26 @@ fn spiron_supervisor_recovers_from_transient_mid_turn_server_error_via_recovery(
 
     // Observe the installed wait, not error persistence, which precedes
     // installation of the in-memory follow-up and its not_before deadline.
+    // Time moves only to a timer a worker is blocked on: moved earlier, the
+    // timer it is about to install lands past the new time and nothing wakes it.
     struct RecordingClock {
         inner: ManualClock,
         waits: Mutex<Vec<(i64, Option<i64>)>>,
+        blocked: Mutex<Vec<i64>>,
+    }
+    impl RecordingClock {
+        fn fire_next_timer(&self, limit: i64) -> bool {
+            let now = self.inner.now_ms();
+            let next = self
+                .blocked
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|at| (now + 1..=limit).contains(at))
+                .min();
+            next.map(|at| self.inner.set_ms(at)).is_some()
+        }
     }
     impl Clock for RecordingClock {
         fn now_ms(&self) -> i64 {
@@ -790,7 +807,17 @@ fn spiron_supervisor_recovers_from_transient_mid_turn_server_error_via_recovery(
         }
         fn wait(&self, deadline: Option<i64>, woken: &Arc<AtomicBool>) -> bool {
             self.waits.lock().unwrap().push((self.now_ms(), deadline));
-            self.inner.wait(deadline, woken)
+            if let Some(at) = deadline {
+                self.blocked.lock().unwrap().push(at);
+            }
+            let flagged = self.inner.wait(deadline, woken);
+            if let Some(at) = deadline {
+                let mut blocked = self.blocked.lock().unwrap();
+                if let Some(index) = blocked.iter().position(|blocked| *blocked == at) {
+                    blocked.swap_remove(index);
+                }
+            }
+            flagged
         }
         fn poke(&self) {
             self.inner.poke();
@@ -803,6 +830,7 @@ fn spiron_supervisor_recovers_from_transient_mid_turn_server_error_via_recovery(
     let recorded = Arc::new(RecordingClock {
         inner: clock.clone(),
         waits: Mutex::new(Vec::new()),
+        blocked: Mutex::new(Vec::new()),
     });
 
     let _lock = crate::server::tests::env_lock();
@@ -904,12 +932,18 @@ for request_num, msg in enumerate(inputs(), 1):
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         eventually(|| read_wire().len() == 1);
-        clock.set_ms(START + 1_000);
+        // The pass that records the error may wait on the short timer the
+        // worker installs after the delivery: fire it once it is installed,
+        // never past the second the backoff window allows for.
         eventually(|| {
-            store
+            let errored = store
                 .turn_errors(&agent.id)
                 .unwrap()
-                .is_some_and(|errors| errors.last_error.as_deref() == Some(ERROR))
+                .is_some_and(|errors| errors.last_error.as_deref() == Some(ERROR));
+            if !errored {
+                recorded.fire_next_timer(START + 1_000);
+            }
+            errored
         });
         eventually(|| {
             recorded.waits.lock().unwrap().iter().any(|(_, deadline)| {
@@ -930,11 +964,13 @@ for request_num, msg in enumerate(inputs(), 1):
                 deadline.filter(|at| (START + 15_000..=START + 16_000).contains(at))
             })
             .expect("the systemic follow-up must install its backoff");
+        // Time stands just before the deadline when the mail arrives, so the
+        // wake the mail causes re-installs the backoff at that time.
+        clock.set_ms(deadline - 1);
         let observed = recorded.waits.lock().unwrap().len();
         store
             .receive(&agent.id, Incoming::new("mail during backoff"))
             .unwrap();
-        clock.set_ms(deadline - 1);
         eventually(|| {
             recorded.waits.lock().unwrap()[observed..].contains(&(deadline - 1, Some(deadline)))
         });

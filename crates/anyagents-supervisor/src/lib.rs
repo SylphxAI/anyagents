@@ -1694,18 +1694,23 @@ impl<H: Harness + 'static> Session<H> {
     /// skips the delivery pass: a quota wait, a switch drain, or replacing
     /// the process, alive or dead. A proof outlives the process that gave it
     /// but not the adapter that holds it, so an uncommitted one would hand
-    /// the message to the next process again. Nothing is written.
-    fn commit_proven(&mut self) {
+    /// the message to the next process again. Nothing is written. `false`
+    /// when the store could not record a proof: the commit is tried again.
+    fn commit_proven(&mut self) -> bool {
         let Some(delivery) = self.delivery.as_mut() else {
-            return;
+            return true;
         };
         match delivery.commit_proven() {
             Ok(committed) => {
                 self.written = self
                     .written
                     .saturating_add(committed.clamp(0, u64::from(u32::MAX)) as u32);
+                true
             }
-            Err(err) => self.last_error = Some(format!("commit proven mail: {err}")),
+            Err(err) => {
+                self.last_error = Some(format!("commit proven mail: {err}"));
+                false
+            }
         }
     }
 
@@ -2005,6 +2010,18 @@ impl<H: Harness + 'static> Session<H> {
         let advanced = usage_advanced(&served, &before);
         let ended = (served_turn || (advanced && health.process_alive))
             && health.turn_state == TurnState::Idle;
+        // A line the harness took and finished while `deliver` still answered
+        // `Deferred` is proven, not yet committed: the store holds no open
+        // turn for it. Commit that proof before the turn's custody is read or
+        // closed below, or an errored turn would be followed up as one
+        // nobody holds open, and a completed one left open behind its own
+        // proof. A store that cannot record it leaves the turn for another pass.
+        if ended && !self.commit_proven() {
+            return false;
+        }
+        let Some(delivery) = self.delivery.as_ref() else {
+            return true;
+        };
         let completed = ended && health.sign_in_fault.is_none();
         // A turn the harness saw end with an error (not a quota wait) never
         // holds the mailbox: it is counted now, and `follow_errored_turn`

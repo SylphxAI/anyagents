@@ -5,15 +5,16 @@
 
 mod support;
 
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyagents_core::{Incoming, MAX_ERRORED_TURNS, NewAgent, SYSTEM_SENDER, Store};
 use anyagents_harness::{
     DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    TurnState,
+    Proof, TurnState,
 };
 use anyagents_supervisor::{Clock, LaunchRequest, ManualClock, Supervisor, SystemClock};
+use support::RecordingClock;
 
 const OVERFLOW: &str = "Sylphx AI failure Some(\"context_length_exceeded\"): The request exceeds the model's context window.";
 
@@ -21,11 +22,15 @@ const OVERFLOW: &str = "Sylphx AI failure Some(\"context_length_exceeded\"): The
 const UNAVAILABLE: &str = "Sylphx AI failure Some(\"service_unavailable\"): The model response was interrupted. Retry the request.";
 
 /// A vendor whose turns end at once: the next `fail` of them with `error`
-/// (as Spiron reports a turn the model refused), the rest completed.
+/// (as Spiron reports a turn the model refused), the rest completed. With
+/// `deferred` each input is written, taken and finished before `deliver`
+/// returns, yet answered `Deferred`: the vendor's acceptance and result reach
+/// the adapter after the write, so the line is proven rather than reported.
 #[derive(Default, Clone)]
 struct Vendor {
     fail: usize,
     error: Option<&'static str>,
+    deferred: bool,
     served: u32,
     fault: Option<String>,
     given: Vec<(String, String)>,
@@ -56,9 +61,21 @@ impl Harness for ErroringHarness {
         } else {
             None
         };
-        Ok(DeliverOutcome::Accepted {
-            turn_finished: true,
+        Ok(if vendor.deferred {
+            DeliverOutcome::Deferred
+        } else {
+            DeliverOutcome::Accepted {
+                turn_finished: true,
+            }
         })
+    }
+    fn proven(&self, message_id: &str) -> Option<Proof> {
+        let vendor = self.vendor.lock().unwrap();
+        (vendor.deferred && vendor.given.iter().any(|(id, _)| id == message_id)).then_some(
+            Proof::Taken {
+                turn_finished: true,
+            },
+        )
     }
     fn background(&mut self) -> Result<(), HarnessError> {
         Ok(())
@@ -113,6 +130,17 @@ fn start(fail: usize) -> Fixture {
 }
 
 fn start_with(fail: usize, error: Option<&'static str>, clock: Arc<dyn Clock>) -> Fixture {
+    start_vendor(
+        Vendor {
+            fail,
+            error,
+            ..Vendor::default()
+        },
+        clock,
+    )
+}
+
+fn start_vendor(vendor: Vendor, clock: Arc<dyn Clock>) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
     let lead = store.create_agent(NewAgent::new("lead", "spiron")).unwrap();
@@ -129,11 +157,7 @@ fn start_with(fail: usize, error: Option<&'static str>, clock: Arc<dyn Clock>) -
     store
         .set_agent_running(&worker.id, &work.display().to_string())
         .unwrap();
-    let vendor = Arc::new(Mutex::new(Vendor {
-        fail,
-        error,
-        ..Vendor::default()
-    }));
+    let vendor = Arc::new(Mutex::new(vendor));
     let supervisor = Supervisor::start(
         Arc::clone(&store),
         clock,
@@ -304,52 +328,35 @@ fn turns_that_keep_erroring_park_the_agent_and_tell_its_parent() {
     support::stop(fx.supervisor);
 }
 
-// Record the actual installed deadline, rather than racing durable error
-// persistence (which precedes installation of the in-memory follow-up).
-struct RecordingClock {
-    inner: ManualClock,
-    waits: Mutex<Vec<(i64, Option<i64>)>>,
-}
-
-impl Clock for RecordingClock {
-    fn now_ms(&self) -> i64 {
-        self.inner.now_ms()
-    }
-    fn wait(&self, deadline: Option<i64>, woken: &Arc<AtomicBool>) -> bool {
-        self.waits.lock().unwrap().push((self.now_ms(), deadline));
-        self.inner.wait(deadline, woken)
-    }
-    fn poke(&self) {
-        self.inner.poke();
-    }
-}
-
 // This fixture proves terminal consumption using a new, nonduplicate served
 // counter and Idle with no outstanding inputs. It does not infer a terminal
 // result from an arbitrary provider error or authorise replay of partial work.
 fn terminal_systemic_fault_keeps_backoff_and_queued_mail(error: &'static str) {
-    let clock = ManualClock::new(1_700_000_000_000);
-    let recorded = Arc::new(RecordingClock {
-        inner: clock.clone(),
-        waits: Mutex::new(Vec::new()),
-    });
+    const START: i64 = 1_700_000_000_000;
+    let clock = ManualClock::new(START);
+    let recorded = RecordingClock::new(clock.clone());
     let fx = start_with(1, Some(error), recorded.clone());
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         fx.store
             .receive(&fx.worker.id, Incoming::new("original task"))
             .unwrap();
         assert!(wait_until(|| fx.vendor.lock().unwrap().given.len() == 1));
-        clock.set_ms(clock.now_ms() + 1_000);
-        assert!(wait_until(|| fx
-            .store
-            .turn_errors(&fx.worker.id)
-            .unwrap()
-            .is_some_and(
-                |errors| errors.last_error.as_deref() == Some(error)
-            )));
+        // The pass that records the error runs on the short timer the worker
+        // installs after the delivery: fire it once it is installed, never
+        // earlier, and never past the second the backoff window allows for.
+        let errored = || {
+            fx.store
+                .turn_errors(&fx.worker.id)
+                .unwrap()
+                .is_some_and(|errors| errors.last_error.as_deref() == Some(error))
+        };
+        assert!(wait_until(|| errored() || {
+            recorded.fire_next_timer(START + 1_000);
+            false
+        }));
         assert!(wait_until(|| {
-            recorded.waits.lock().unwrap().iter().any(|(_, deadline)| {
-                deadline.is_some_and(|at| (1_700_000_015_000..=1_700_000_016_000).contains(&at))
+            recorded.waits().iter().any(|(_, deadline)| {
+                deadline.is_some_and(|at| (START + 15_000..=START + 16_000).contains(&at))
             }) || fx.vendor.lock().unwrap().attempts.len() > 1
         }));
         let (original_id, attempts) = {
@@ -358,23 +365,23 @@ fn terminal_systemic_fault_keeps_backoff_and_queued_mail(error: &'static str) {
         };
         assert_eq!(attempts.as_slice(), std::slice::from_ref(&original_id));
         let deadline = recorded
-            .waits
-            .lock()
-            .unwrap()
+            .waits()
             .iter()
             .find_map(|(_, deadline)| {
-                deadline.filter(|at| (1_700_000_015_000..=1_700_000_016_000).contains(at))
+                deadline.filter(|at| (START + 15_000..=START + 16_000).contains(at))
             })
-            .unwrap();
-        let observed = recorded.waits.lock().unwrap().len();
-        fx.store
-            .receive(&fx.worker.id, Incoming::new("mail during backoff"))
             .unwrap();
         // A mailbox wake must neither erase the terminal follow-up nor bypass its
         // deadline. Process replacement must not turn it into an open-turn replay.
+        // Time stands just before the deadline when the mail arrives, so the
+        // wake the mail causes re-installs the backoff at that time.
         clock.set_ms(deadline - 1);
+        let observed = recorded.waits().len();
+        fx.store
+            .receive(&fx.worker.id, Incoming::new("mail during backoff"))
+            .unwrap();
         assert!(wait_until(
-            || recorded.waits.lock().unwrap()[observed..].contains(&(deadline - 1, Some(deadline)))
+            || recorded.waits()[observed..].contains(&(deadline - 1, Some(deadline)))
         ));
         {
             let vendor = fx.vendor.lock().unwrap().clone();
@@ -454,30 +461,123 @@ fn transient_text_cannot_discard_proven_terminal_backoff_and_mail() {
     terminal_systemic_fault_keeps_backoff_and_queued_mail("HTTP 503: service unavailable");
 }
 
+fn received(store: &Store, agent: &anyagents_core::Agent, text: &str) -> anyagents_core::Message {
+    match store.receive(&agent.id, Incoming::new(text)).unwrap() {
+        anyagents_core::ReceiveOutcome::New(message) => message,
+        anyagents_core::ReceiveOutcome::Duplicate(_) => unreachable!(),
+    }
+}
+
+/// A vendor that has taken and finished a turn before `deliver` returns
+/// answers `Deferred`: the line is proven, not reported. The pass that finds
+/// the turn ended commits that proof first, so the turn is held open for its
+/// follow-up (an error) or closed (a completion), and the line is never
+/// handed over again.
+#[test]
+fn an_errored_turn_proven_while_deferred_stays_open_for_its_follow_up() {
+    const START: i64 = 1_700_000_000_000;
+    let clock = ManualClock::new(START);
+    let fx = start_vendor(
+        Vendor {
+            fail: 1,
+            error: Some(UNAVAILABLE),
+            deferred: true,
+            ..Vendor::default()
+        },
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+    );
+    let task = received(&fx.store, &fx.worker, "summarise the incident");
+    assert!(wait_until(|| {
+        fx.store
+            .turn_errors(&fx.worker.id)
+            .unwrap()
+            .is_some_and(|errors| errors.last_error.as_deref() == Some(UNAVAILABLE))
+    }));
+    assert!(
+        fx.store.has_open_turn(&fx.worker.id).unwrap(),
+        "the errored turn is held open for its follow-up"
+    );
+    assert_eq!(
+        fx.store.delivered_cursor(&fx.worker.id).unwrap(),
+        task.seq,
+        "the proof is committed, not handed over again"
+    );
+    // The systemic backoff ends: the note goes out and closes the turn.
+    clock.set_ms(START + 15_000);
+    assert!(wait_until(|| fx.vendor.lock().unwrap().given.len() == 2));
+    assert!(wait_until(|| !fx
+        .store
+        .has_open_turn(&fx.worker.id)
+        .unwrap()));
+    let vendor = fx.vendor.lock().unwrap().clone();
+    assert!(
+        vendor.given[1].1.contains("[Recovery]") && vendor.given[1].1.contains(task.id.as_str()),
+        "{:?}",
+        vendor.given
+    );
+    assert_eq!(
+        vendor
+            .attempts
+            .iter()
+            .filter(|id| **id == vendor.given[0].0)
+            .count(),
+        1,
+        "the proven task is never offered again: {:?}",
+        vendor.attempts
+    );
+    support::stop(fx.supervisor);
+}
+
+#[test]
+fn a_completed_turn_proven_while_deferred_is_closed() {
+    let fx = start_vendor(
+        Vendor {
+            deferred: true,
+            ..Vendor::default()
+        },
+        Arc::new(SystemClock::new()),
+    );
+    let task = received(&fx.store, &fx.worker, "summarise the incident");
+    assert!(wait_until(|| fx
+        .store
+        .delivered_cursor(&fx.worker.id)
+        .unwrap()
+        >= task.seq));
+    assert!(
+        wait_until(|| !fx.store.has_open_turn(&fx.worker.id).unwrap()),
+        "a turn the vendor finished is not left open"
+    );
+    assert_eq!(fx.vendor.lock().unwrap().attempts.len(), 1);
+    support::stop(fx.supervisor);
+}
+
 /// A provider that is unavailable is the fleet's trouble, not the agent's:
 /// each retry waits out a growing backoff, the turn stays open (a restart
 /// would recover it) while it waits, and no run of them ever parks it.
 #[test]
 fn systemic_errors_back_off_and_never_park() {
-    let clock = ManualClock::new(1_700_000_000_000);
-    let fx = start_with(
-        usize::MAX,
-        Some(UNAVAILABLE),
-        Arc::new(clock.clone()) as Arc<dyn Clock>,
-    );
+    const START: i64 = 1_700_000_000_000;
+    let clock = ManualClock::new(START);
+    let recorded = RecordingClock::new(clock.clone());
+    let fx = start_with(usize::MAX, Some(UNAVAILABLE), recorded.clone());
     let given = || fx.vendor.lock().unwrap().given.len();
     let advance = |ms: i64| clock.set_ms(clock.now_ms() + ms);
     fx.store
         .receive(&fx.worker.id, Incoming::new("summarise the incident"))
         .unwrap();
     assert!(wait_until(|| given() == 1));
-    // The next pass finds the errored turn and starts its backoff.
-    advance(1_000);
-    assert!(wait_until(|| {
+    // The next pass finds the errored turn and starts its backoff. It runs on
+    // the short timer the worker installs after the delivery: fire it once it
+    // is installed, as time moved earlier is read by the worker as its own.
+    let errored = || {
         fx.store
             .turn_errors(&fx.worker.id)
             .unwrap()
             .is_some_and(|errors| errors.last_error.as_deref() == Some(UNAVAILABLE))
+    };
+    assert!(wait_until(|| errored() || {
+        recorded.fire_next_timer(START + 1_000);
+        false
     }));
     advance(10_000);
     std::thread::sleep(Duration::from_millis(200));
