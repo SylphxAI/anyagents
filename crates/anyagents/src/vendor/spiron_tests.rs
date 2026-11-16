@@ -44,6 +44,27 @@ fn eventually(mut check: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+/// Physical temporary root short enough for `<data>/agents/<id>/config/spiron.sock`
+/// to fit within `anyagents_harness_spiron::MAX_SOCKET_PATH` (103 bytes on macOS).
+fn supervisor_tempdir() -> tempfile::TempDir {
+    // Reserve 72 bytes for `/sp-XXXXXX/data/agents/agt_<26>/config/spiron.sock`.
+    let max_root = anyagents_harness_spiron::MAX_SOCKET_PATH.saturating_sub(72);
+    let candidate = std::env::temp_dir()
+        .canonicalize()
+        .expect("physical temporary root");
+    let root = if candidate.as_os_str().len() <= max_root {
+        candidate
+    } else {
+        Path::new("/tmp")
+            .canonicalize()
+            .expect("physical /tmp root")
+    };
+    tempfile::Builder::new()
+        .prefix("sp-")
+        .tempdir_in(root)
+        .expect("owned temporary fixture")
+}
 fn message(id: &str) -> OutboundMessage {
     OutboundMessage {
         id: id.into(),
@@ -56,36 +77,136 @@ fn message(id: &str) -> OutboundMessage {
     }
 }
 
+/// Native Unix fixture support; no stdio protocol or compatibility translation.
+const NATIVE_PEER: &str = r#"import json, os, pathlib, socket, sys, threading
+args = sys.argv[1:]
+assert '--listen' in args
+root = pathlib.Path(args[args.index('--state-dir') + 1])
+socket_path = args[args.index('--listen') + 1]
+try:
+    os.unlink(socket_path)
+except FileNotFoundError:
+    pass
+listener = socket.socket(socket.AF_UNIX)
+listener.bind(socket_path)
+os.chmod(socket_path, 0o660)
+listener.listen()
+connection = None
+sequence = 0
+frames = []
+output_lock = threading.RLock()
+session = args[args.index('--session') + 1] if '--session' in args else 'fake-session'
+
+def send_frame(frame):
+    global connection
+    if connection is not None:
+        try:
+            connection.sendall((json.dumps(frame) + '\n').encode())
+        except OSError:
+            connection = None
+
+def emit(kind, request_id=None, **fields):
+    global sequence
+    with output_lock:
+        sequence += 1
+        frame = dict(type=kind, request_id=request_id, session_id=session, seq=sequence, **fields)
+        with (root / 'native-frames.jsonl').open('a') as journal:
+            journal.write(json.dumps(frame) + '\n')
+        frames.append(frame)
+        send_frame(frame)
+
+def inputs():
+    global connection
+    while True:
+        stream, _ = listener.accept()
+        reader = stream.makefile('r')
+        line = reader.readline()
+        if not line:
+            reader.close()
+            stream.close()
+            continue
+        attach = json.loads(line)
+        assert attach['type'] == 'attach' and attach['protocol'] == 'spiron.headless/v2', attach
+        assert isinstance(attach['request_id'], str) and attach['request_id']
+        with output_lock:
+            if connection is not None:
+                connection.close()
+            connection = stream
+            with (root / 'native-attaches.jsonl').open('a') as journal:
+                journal.write(json.dumps(attach) + '\n')
+            after = attach.get('after_seq')
+            if after is not None:
+                for frame in frames:
+                    if frame['seq'] > after:
+                        send_frame(frame)
+            emit('ready', attach['request_id'], protocol='spiron.headless/v2', replay=dict(after_seq=after, complete=True))
+        for line in reader:
+            msg = json.loads(line)
+            assert msg['type'] in ('prompt', 'steer', 'cancel', 'stop'), msg
+            assert isinstance(msg.get('request_id'), str) and msg['request_id'], msg
+            if msg['type'] == 'stop':
+                emit('stopped', msg['request_id'])
+                os.unlink(socket_path)
+                os._exit(0)
+            yield msg
+        reader.close()
+        stream.close()
+"#;
+
+fn native_script(body: &str) -> String {
+    format!("#!/usr/bin/python3\n{NATIVE_PEER}\n{body}")
+}
+
+/// Test-only launch path uses the same arguments/config and journal reconciliation
+/// as production, then attaches directly to the native Unix listener.
+fn launch_native_probe(
+    program: &Path,
+    config: &Path,
+    work: &Path,
+    agent: SpironAgent<'_>,
+    session: Option<&str>,
+    env: &[(String, String)],
+) -> Result<SpironHarness, String> {
+    let (launch, applied) = spiron_launch(program, config, work, agent, session, env)?;
+    let harness = SpironHarness::launch_listening(
+        launch,
+        &config.join("spiron.sock"),
+        &config.join("spiron.log"),
+        SPIRON_READY_WAIT,
+        |_pid| Ok(()),
+    )
+    .map_err(|error| format!("{error:?}"))?;
+    harness.recognise_applied(applied);
+    Ok(harness)
+}
+
 #[test]
 fn spiron_external_spawn_steer_cancel_and_wake_preserve_legacy_state() {
     let _lock = crate::server::tests::env_lock();
     let temp = crate::test_tempdir();
     let probe = temp.path().join("spiron-probe");
-    std::fs::write(&probe, r#"#!/usr/bin/env python3
+    std::fs::write(&probe, native_script(r#"
 import sys, os, json, pathlib, time
 root = pathlib.Path(os.environ['ANYAGENTS_AGENT_CONFIG'])
 args = sys.argv[1:]
 with (root/'launches.jsonl').open('a') as out:
     out.write(json.dumps({'args':args, 'cwd':os.getcwd(), 'home':os.environ['HOME'], 'instructions':pathlib.Path(args[args.index('--instructions-file')+1]).read_text()})+'\n')
-session = args[args.index('--session')+1] if '--session' in args else 'fresh-session'
-def emit(kind, id=None, **fields):
-    print(json.dumps(dict(type=kind, session_id=session, request_id=id, **fields)), flush=True)
-emit('ready')
 active = None
-for line in sys.stdin:
-    msg=json.loads(line)
+for msg in inputs():
     with (root/'inputs.jsonl').open('a') as out: out.write(json.dumps(msg)+'\n')
     id=msg.get('request_id')
     if msg['type']=='cancel':
-        emit('cancel_ack', turn_id=active, status='cancelling')
+        emit('cancel_ack', id, turn_id=active, status='cancelling')
         (root/'cancel-ack').touch()
         while not (root/'cancel-complete').exists(): time.sleep(.005)
-        emit('result', active, status='cancelled', usage={'input_tokens':11,'output_tokens':7,'cache_read_input_tokens':3,'cache_creation_input_tokens':2})
+        emit('result', active, status='cancelled', usage={'input_tokens':11,'output_tokens':7,'cache_read_tokens':3,'cache_write_tokens':2})
         active=None
     elif active:
         emit('steer_ack', id, accepted=True, turn_id=active)
         (root/'steer-ack').touch()
         emit('result', 'unrelated-request', status='completed', usage={'input_tokens':999})
+        while not (root/'consume-steer').exists(): time.sleep(.005)
+        emit('steer_consumed', active, steer_request_id=id, turn_id=active, duplicate=False)
     else:
         active=id
         if id=='first':
@@ -99,7 +220,7 @@ for line in sys.stdin:
         elif id=='failure':
             emit('result', id, status='failed', is_error=True, error='synthetic provider refusal', usage={'input_tokens':13,'output_tokens':2})
             active=None
-"#).unwrap();
+"#)).unwrap();
     std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
     let _env = Environment::set(&[
         ("ANYAGENTS_SPIRON_BIN", probe.as_os_str()),
@@ -236,12 +357,12 @@ for line in sys.stdin:
         );
         assert_eq!(
             vendor.deliver(&message("first")).unwrap(),
-            DeliverOutcome::Deferred
+            DeliverOutcome::InFlight
         );
         eventually(|| config.join("awaiting-ack").exists());
         assert_eq!(
             vendor.deliver(&message("first")).unwrap(),
-            DeliverOutcome::Deferred
+            DeliverOutcome::InFlight
         );
         std::fs::write(config.join("accept"), "").unwrap();
         eventually(|| {
@@ -252,22 +373,37 @@ for line in sys.stdin:
                 })
             )
         });
-        // A peer whose ready names no consumption proof is given nothing
-        // while its turn runs.
+        // Admission is not consumption: even after steer_ack and an unrelated
+        // result, this input remains in flight until steer_consumed arrives.
         assert_eq!(
             vendor.deliver(&message("steer")).unwrap(),
-            DeliverOutcome::Deferred
+            DeliverOutcome::InFlight
         );
-        vendor.cancel().unwrap();
-        eventually(|| config.join("cancel-ack").exists());
-        assert_eq!(vendor.turns_served(), 0, "cancel_ack is not completion");
-        std::fs::write(config.join("cancel-complete"), "").unwrap();
-        eventually(|| vendor.turns_served() == 1);
+        eventually(|| config.join("steer-ack").exists());
+        assert_eq!(
+            vendor.deliver(&message("steer")).unwrap(),
+            DeliverOutcome::InFlight
+        );
+        assert_eq!(vendor.turns_served(), 0);
+        std::fs::write(config.join("consume-steer"), "").unwrap();
         eventually(|| {
             matches!(
                 vendor.deliver(&message("steer")),
                 Ok(DeliverOutcome::Accepted {
                     turn_finished: false
+                })
+            )
+        });
+        vendor.cancel().unwrap();
+        eventually(|| config.join("cancel-ack").exists());
+        assert_eq!(vendor.turns_served(), 0, "cancel_ack is not completion");
+        std::fs::write(config.join("cancel-complete"), "").unwrap();
+        eventually(|| vendor.turns_served() == 2);
+        eventually(|| {
+            matches!(
+                vendor.deliver(&message("steer")),
+                Ok(DeliverOutcome::Accepted {
+                    turn_finished: true
                 })
             )
         });
@@ -366,6 +502,10 @@ for line in sys.stdin:
                 );
             }
             assert!(args.contains(&"--headless"));
+            assert_eq!(
+                args[args.iter().position(|arg| *arg == "--listen").unwrap() + 1],
+                config.join("spiron.sock").to_str().unwrap()
+            );
             assert!(
                 !args.contains(&"--profile"),
                 "coordinator profile selectors are not TOML files"
@@ -385,12 +525,18 @@ for line in sys.stdin:
         assert_eq!(
             inputs.len(),
             5,
-            "each mailbox request crosses stdin only once"
+            "each mailbox request crosses the native socket only once"
         );
         assert_eq!(inputs[0]["request_id"], "first");
-        assert_eq!(inputs[1]["type"], "cancel");
-        assert_eq!(inputs[2]["request_id"], "steer");
-        assert!(inputs[2]["text"].as_str().unwrap().contains("body-steer"));
+        assert_eq!(inputs[1]["type"], "steer");
+        assert_eq!(inputs[1]["request_id"], "steer");
+        assert!(inputs[1]["text"].as_str().unwrap().contains("body-steer"));
+        assert_eq!(inputs[2]["type"], "cancel");
+        assert!(
+            inputs[2]["request_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
         assert_eq!(inputs[3]["request_id"], "wake");
         assert_eq!(inputs[4]["request_id"], "failure");
         assert_eq!(store.agent(&agent.id).unwrap(), agent);
@@ -416,14 +562,14 @@ for line in sys.stdin:
     }
 }
 
-fn external_probe(
+fn external_probe_result(
     temp: &Path,
     script: &str,
 ) -> (
     std::sync::MutexGuard<'static, ()>,
     Store,
     anyagents_core::Agent,
-    SpironHarness,
+    Result<SpironHarness, String>,
 ) {
     // A child inherits process-global environment even when this fixture never
     // mutates it. Keep the shared guard until its harness and restart are done,
@@ -434,14 +580,27 @@ fn external_probe(
     std::fs::create_dir_all(&config).unwrap();
     std::fs::create_dir_all(&work).unwrap();
     let program = temp.join("peer");
-    std::fs::write(&program, format!("#!/usr/bin/env python3\n{script}")).unwrap();
+    std::fs::write(&program, native_script(script)).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     let store = Store::open(temp.join("state.db")).unwrap();
     let agent = store
         .create_agent(NewAgent::new("external-probe", "spiron"))
         .unwrap();
-    let harness = start_spiron(&program, &config, &work, (&agent).into(), None, &[]).unwrap();
+    let harness = launch_native_probe(&program, &config, &work, (&agent).into(), None, &[]);
     (environment, store, agent, harness)
+}
+
+fn external_probe(
+    temp: &Path,
+    script: &str,
+) -> (
+    std::sync::MutexGuard<'static, ()>,
+    Store,
+    anyagents_core::Agent,
+    SpironHarness,
+) {
+    let (environment, store, agent, harness) = external_probe_result(temp, script);
+    (environment, store, agent, harness.unwrap())
 }
 
 #[test]
@@ -453,15 +612,14 @@ canary='SYNTHETIC_FIXTURE_0123456789012345'
 forms=['Bearer '+canary,'bearer '+canary,'api_key='+canary,'sk-'+canary,'xoxb-'+canary,
  'https://fixture:'+canary+'@example.invalid/path','https://example.invalid/path?access_token='+canary+'&page=2',
  'OPENAI_API_KEY='+canary,'X-Api-Key: '+canary]
-print(json.dumps({'type':'ready'}),flush=True)
-for line in sys.stdin:
- m=json.loads(line); id=m['request_id']
- print(json.dumps({'type':'accepted','request_id':id}),flush=True)
+for m in inputs():
+ id=m['request_id']
+ emit('accepted', id)
  text='\n'.join(forms)+'\nfailed to parse config.toml; 測試🙂'
  # Transport frame boundaries are unrelated to credential boundaries.
  for char in text:
-  print(json.dumps({'type':'text_delta','request_id':id,'text':char}),flush=True)
- print(json.dumps({'type':'result','request_id':id,'status':'completed','usage':{'input_tokens':7}}),flush=True)
+  emit('text_delta', id, text=char)
+ emit('result', id, status='completed', usage={'input_tokens':7})
 "#;
     let (_environment, store, agent, mut harness) = external_probe(temp.path(), script);
     eventually(|| {
@@ -502,9 +660,8 @@ fn spiron_external_nonzero_exit_retains_masked_bounded_stderr_and_success_does_n
             r#"
 import sys,json
 if {after_input}:
- print(json.dumps({{'type':'ready'}}),flush=True)
- m=json.loads(sys.stdin.readline())
- print(json.dumps({{'type':'accepted','request_id':m['request_id']}}),flush=True)
+ m=next(inputs())
+ emit('accepted', m['request_id'])
 sys.stderr.write('failed to parse config.toml; 測試🙂\n')
 canary='SYNTHETIC_FIXTURE_0123456789012345'
 forms=['Bearer '+canary,'bearer '+canary,'api_key='+canary,'sk-'+canary,'xoxb-'+canary,
@@ -518,7 +675,24 @@ sys.exit({exit})
 "#,
             after_input = if after_input { "True" } else { "False" }
         );
-        let (_environment, _, _, mut harness) = external_probe(temp.path(), &script);
+        let (_environment, _, _, harness) = external_probe_result(temp.path(), &script);
+        if !after_input {
+            let error = harness.err().expect("exit before attach must fail launch");
+            assert!(error.contains(&format!("exit status: {exit}")), "{error}");
+            if exit != 0 {
+                assert!(
+                    error.contains("failed to parse config.toml; 測試🙂"),
+                    "{error}"
+                );
+                assert!(error.contains("long actionable diagnostic"));
+                assert!(error.contains("stderr truncated"));
+                assert_eq!(error.matches("[redacted]").count(), 9);
+                assert!(!error.contains("SYNTHETIC_FIXTURE"));
+                assert!(error.len() < 17 * 1024);
+            }
+            continue;
+        }
+        let mut harness = harness.unwrap();
         if after_input {
             // The peer can die between writing and observing acceptance.
             let _ = harness.deliver(&message("startup"));
@@ -632,27 +806,18 @@ fn spiron_supervisor_recovers_from_transient_mid_turn_server_error_via_recovery(
     });
 
     let _lock = crate::server::tests::env_lock();
-    let temp = crate::test_tempdir();
+    let temp = supervisor_tempdir();
     let probe = temp.path().join("spiron-server-error-probe");
     std::fs::write(
         &probe,
-        r#"#!/usr/bin/env python3
+        native_script(r#"
 import json, os, pathlib, sys
 cfg = pathlib.Path(sys.argv[sys.argv.index("--state-dir") + 1])
 launch_file = cfg / "launch_count"
 launch_num = int(launch_file.read_text()) + 1 if launch_file.exists() else 1
 launch_file.write_text(str(launch_num))
 
-def emit(kind, req_id=None, **fields):
-    payload = {"type": kind, "session_id": "spiron-rollout-sess"}
-    if req_id is not None:
-        payload["request_id"] = req_id
-    payload.update(fields)
-    print(json.dumps(payload), flush=True)
-
-emit("ready")
-for request_num, raw in enumerate(sys.stdin, 1):
-    msg = json.loads(raw)
+for request_num, msg in enumerate(inputs(), 1):
     with (cfg / "wire.jsonl").open("a") as out:
         out.write(json.dumps({"launch": launch_num, "msg": msg}) + "\n")
     req_id = msg.get("request_id")
@@ -668,7 +833,7 @@ for request_num, raw in enumerate(sys.stdin, 1):
     else:
         emit("text_delta", req_id, text="done-after-rollout")
         emit("result", req_id, status="completed", usage={"input_tokens": 8, "output_tokens": 3})
-"#,
+"#),
     )
     .unwrap();
     std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -710,7 +875,7 @@ for request_num, raw in enumerate(sys.stdin, 1):
             anyagents_core::host_session::ensure_active(req.config_dir.parent().unwrap(), "spiron")
                 .map_err(|e| e.to_string())?;
             let session = session_from_file(&req.config_dir, "spiron-session-id")?;
-            let h = start_spiron(
+            let h = launch_native_probe(
                 &probe_launch,
                 &req.config_dir,
                 &req.work_dir,
@@ -845,9 +1010,152 @@ for request_num, raw in enumerate(sys.stdin, 1):
     assert!(shutdown.is_ok(), "supervisor shutdown timed out");
 }
 
-/// The fake Spiron of the stream harness tests, launched the way AnyAgents
-/// launches Spiron: its fixture directory is the agent's config directory.
-const FAKE_SPIRON: &str = include_str!("../../../anyagents-harness-stream/tests/fake_spiron.py");
+/// Native v2 fixture with journal-backed deduplication and controllable steps,
+/// failed turn admission and crashes; state lives in the agent config directory.
+const FAKE_SPIRON: &str = r#"import json
+import os
+import pathlib
+import sys
+import threading
+import time
+
+launches = root / "launches"
+launch = int(launches.read_text()) + 1 if launches.exists() else 1
+launches.write_text(str(launch))
+journal = root / "journal.jsonl"
+out_lock = threading.Lock()
+turn_lock = threading.Lock()
+# The open turn: its request id and prompt, whether `accepted` announced it,
+# whether it takes more steers, and the steers acknowledged and not journaled.
+active = None
+prompt = ""
+announced = False
+sealed = False
+pending = []
+
+
+def receipt(frame, request_id=None):
+    kind = frame.pop('type')
+    emit(kind, request_id, **frame)
+
+
+def append(path, value):
+    with path.open("a") as out:
+        out.write(json.dumps(value) + "\n")
+
+
+def journaled(key):
+    if not journal.exists():
+        return False
+    return any(json.loads(line)["key"] == key for line in journal.read_text().splitlines())
+
+
+def journal_input(request_id, text, turn):
+    """Journal one input; False when idempotent input finds it already there."""
+    key = "input:" + request_id
+    if journaled(key):
+        return False
+    append(journal, {"key": key, "text": text, "turn": turn, "launch": launch})
+    return True
+
+
+def take(name):
+    path = root / name
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
+def close_turn():
+    global active, prompt, announced, sealed, pending
+    active, prompt, announced, sealed, pending = None, "", False, False, []
+
+
+def settle():
+    """Journal the open turn's prompt and announce it, or refuse the turn."""
+    global announced
+    turn = active
+    if (root / "lease").exists():
+        receipt({"type": "rejected", "code": "turn_not_started",
+              "error": "session already has an active turn"}, turn)
+        for request_id, _ in pending:
+            receipt({"type": "rejected", "code": "turn_not_started"}, request_id)
+        close_turn()
+        return
+    if not journal_input(turn, prompt, turn):
+        receipt({"type": "accepted", "mode": "duplicate"}, turn)
+        receipt({
+            "type": "result", "status": "completed", "is_error": False, "error": None,
+            "duplicate": True, "usage": {"input_tokens": 0, "output_tokens": 0},
+            "undelivered_steer_ids": [request_id for request_id, _ in pending],
+        }, turn)
+        close_turn()
+        return
+    announced = True
+    receipt({"type": "accepted", "mode": "turn"}, turn)
+
+
+def drive():
+    global sealed, pending
+    while True:
+        if take("crash"):
+            os._exit(1)
+        with turn_lock:
+            if (root / "journal-crash").exists():
+                for request_id, text in pending:
+                    journal_input(request_id, text, active)
+                take("journal-crash")
+                os._exit(1)
+            if active is not None and not announced and not (root / "hold").exists():
+                settle()
+            if (root / "step").exists() and (active is None or announced):
+                steered = []
+                for request_id, text in pending:
+                    fresh = journal_input(request_id, text, active)
+                    steered.append(request_id)
+                    receipt({"type": "steer_consumed", "steer_request_id": request_id,
+                          "turn_id": active, "duplicate": not fresh}, active)
+                pending = []
+                append(root / "steps.jsonl", {"launch": launch, "turn": active, "consumed": steered})
+                take("step")
+            if take("seal"):
+                sealed = True
+            if (root / "finish").exists() and active is not None and announced:
+                turn = active
+                frame = {
+                    "type": "result", "status": "completed", "is_error": False, "error": None,
+                    "usage": {"input_tokens": 3, "output_tokens": 1},
+                        }
+                frame["undelivered_steer_ids"] = [request_id for request_id, _ in pending]
+                close_turn()
+                receipt(frame, turn)
+                take("finish")
+        time.sleep(0.005)
+
+
+threading.Thread(target=drive, daemon=True).start()
+for msg in inputs():
+    kind = msg.get("type")
+    request_id = msg.get("request_id")
+    text = msg.get("text", "")
+    with turn_lock:
+        # On the wire only once handled: a test that sees it can act on it.
+        append(root / "wire.jsonl", {"launch": launch, "msg": msg})
+        if kind in ("prompt", "steer") and active is not None:
+            if sealed:
+                receipt({"type": "rejected", "code": "turn_closed"}, request_id)
+            else:
+                pending.append((request_id, text))
+                receipt({"type": "steer_ack", "accepted": True, "turn_id": active}, request_id)
+        elif kind == "steer":
+            receipt({"type": "rejected", "code": "no_active_turn"}, request_id)
+        elif kind in ("prompt",):
+            active, prompt, announced, sealed, pending = request_id, text, False, False, []
+        else:
+            receipt({"type": "rejected", "code": "unknown_command"}, request_id)
+os._exit(0)
+"#;
 
 struct FakeSpiron {
     _environment: std::sync::MutexGuard<'static, ()>,
@@ -855,18 +1163,17 @@ struct FakeSpiron {
     config: PathBuf,
     work: PathBuf,
     agent: anyagents_core::Agent,
-    capable: bool,
 }
 
 impl FakeSpiron {
-    fn new(temp: &Path, capable: bool) -> (Self, Store) {
+    fn new(temp: &Path) -> (Self, Store) {
         let environment = crate::server::tests::env_lock();
         let config = temp.join("config");
         let work = temp.join("work");
         std::fs::create_dir_all(&config).unwrap();
         std::fs::create_dir_all(&work).unwrap();
         let program = temp.join("fake-spiron");
-        std::fs::write(&program, format!("#!/usr/bin/env python3\n{FAKE_SPIRON}")).unwrap();
+        std::fs::write(&program, native_script(FAKE_SPIRON)).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let store = Store::open(temp.join("state.db")).unwrap();
         let agent = store
@@ -880,23 +1187,21 @@ impl FakeSpiron {
             config,
             work,
             agent,
-            capable,
         };
         (fake, store)
     }
 
     fn launch(&self) -> VendorHarness {
-        let capable = if self.capable { "1" } else { "0" };
-        let harness = start_spiron(
+        let harness = launch_native_probe(
             &self.program,
             &self.config,
             &self.work,
             (&self.agent).into(),
             None,
-            &[("FAKE_SPIRON_CAPABLE".to_string(), capable.to_string())],
+            &[],
         )
         .unwrap();
-        assert_eq!(harness.proves_consumption(), self.capable);
+        assert!(harness.proves_consumption());
         VendorHarness::local(
             LocalAdapter::Spiron(Box::new(harness)),
             Some(self.config.join("spiron-session-id")),
@@ -969,7 +1274,7 @@ fn deliver_through(delivery: &mut anyagents_agent::DeliveryLoop<VendorHarness>, 
 #[test]
 fn spiron_steers_five_mid_turn_messages_into_its_next_step_and_commits_them_in_order() {
     let temp = crate::test_tempdir();
-    let (fake, store) = FakeSpiron::new(temp.path(), true);
+    let (fake, store) = FakeSpiron::new(temp.path());
     let first = fake.receive(&store, "start the work");
     let mut delivery = fake.delivery(store);
     assert_eq!(deliver_through(&mut delivery, first.seq), 1);
@@ -1019,7 +1324,7 @@ fn spiron_steers_five_mid_turn_messages_into_its_next_step_and_commits_them_in_o
 #[test]
 fn spiron_crash_between_consumption_and_commit_replays_once_and_the_cursor_lands_right() {
     let temp = crate::test_tempdir();
-    let (fake, store) = FakeSpiron::new(temp.path(), true);
+    let (fake, store) = FakeSpiron::new(temp.path());
     let first = fake.receive(&store, "start the work");
     let mut delivery = fake.delivery(store);
     deliver_through(&mut delivery, first.seq);
@@ -1067,7 +1372,7 @@ fn spiron_crash_between_consumption_and_commit_replays_once_and_the_cursor_lands
 #[test]
 fn spiron_undelivered_steer_ids_are_redelivered_as_the_next_turn() {
     let temp = crate::test_tempdir();
-    let (fake, store) = FakeSpiron::new(temp.path(), true);
+    let (fake, store) = FakeSpiron::new(temp.path());
     let first = fake.receive(&store, "start the work");
     let mut delivery = fake.delivery(store);
     deliver_through(&mut delivery, first.seq);
@@ -1110,48 +1415,9 @@ fn spiron_undelivered_steer_ids_are_redelivered_as_the_next_turn() {
 }
 
 #[test]
-fn spiron_without_the_capabilities_gets_one_input_per_turn() {
-    let temp = crate::test_tempdir();
-    let (fake, store) = FakeSpiron::new(temp.path(), false);
-    let first = fake.receive(&store, "start the work");
-    let mut delivery = fake.delivery(store);
-    assert_eq!(
-        delivery.harness().health().delivery.level,
-        anyagents_harness::DeliveryLevel::TurnEnd
-    );
-    deliver_through(&mut delivery, first.seq);
-    let second = fake.receive(delivery.store(), "waits for the turn to end");
-    let third = fake.receive(delivery.store(), "waits behind it");
-    // Nothing reaches the running turn: nothing would prove it took it.
-    delivery.run_once().unwrap();
-    fake.act("step");
-    delivery.run_once().unwrap();
-    assert_eq!(delivery.delivered_cursor().unwrap(), first.seq);
-    assert_eq!(fake.wire().len(), 1);
-    fake.act("finish");
-    deliver_through(&mut delivery, second.seq);
-    fake.act("finish");
-    deliver_through(&mut delivery, third.seq);
-    let written: Vec<_> = fake
-        .wire()
-        .into_iter()
-        .map(|(_, kind, id)| (kind, id))
-        .collect();
-    assert_eq!(
-        written,
-        [
-            ("user".to_string(), first.id.to_string()),
-            ("user".to_string(), second.id.to_string()),
-            ("user".to_string(), third.id.to_string()),
-        ]
-    );
-    assert!(!fake.config.join("spiron-unconfirmed-steers.json").exists());
-}
-
-#[test]
 fn a_hold_an_older_anyagents_left_is_settled_against_the_spiron_journal_at_launch() {
     let temp = crate::test_tempdir();
-    let (fake, store) = FakeSpiron::new(temp.path(), false);
+    let (fake, store) = FakeSpiron::new(temp.path());
     let applied = fake.receive(&store, "journaled by the old process");
     let lost = fake.receive(&store, "acknowledged, never journaled");
     // The hold names both; only the first reached the session journal.
@@ -1248,9 +1514,9 @@ fn spiron_supervisor_sends_the_recovery_note_first_after_the_lease_and_commits_a
     use std::sync::Arc;
 
     let _lock = crate::server::tests::env_lock();
-    let temp = crate::test_tempdir();
+    let temp = supervisor_tempdir();
     let program = temp.path().join("fake-spiron");
-    std::fs::write(&program, format!("#!/usr/bin/env python3\n{FAKE_SPIRON}")).unwrap();
+    std::fs::write(&program, native_script(FAKE_SPIRON)).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     let data = temp.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
@@ -1280,13 +1546,13 @@ fn spiron_supervisor_sends_the_recovery_note_first_after_the_lease_and_commits_a
             anyagents_core::host_session::ensure_active(req.config_dir.parent().unwrap(), "spiron")
                 .map_err(|e| e.to_string())?;
             let session = session_from_file(&req.config_dir, "spiron-session-id")?;
-            let harness = start_spiron(
+            let harness = launch_native_probe(
                 &launch_program,
                 &req.config_dir,
                 &req.work_dir,
                 (&req.agent).into(),
                 session.as_deref(),
-                &[("FAKE_SPIRON_CAPABLE".to_string(), "1".to_string())],
+                &[],
             )?;
             let vendor = VendorHarness::local(
                 LocalAdapter::Spiron(Box::new(harness)),

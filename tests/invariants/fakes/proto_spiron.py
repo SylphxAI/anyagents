@@ -1,10 +1,7 @@
-"""`spiron --headless --json` (`spiron.headless/v1`), with and without
-`steer_consumed` and `idempotent_input`, as `spiron-cli`'s `headless.rs`
-speaks it on the deployed branch (`fix/headless-steer-consumption`):
+"""`spiron --headless --json` (`spiron.headless/v2` over Unix socket):
 
-- Every frame carries `session_id` and `request_id` (the input's own id, or
-  the turn's for the turn's frames).
-- A `prompt`/`user`/`steer` with empty text is `rejected` `empty_prompt`; a
+- Every frame carries `session_id`, `request_id`, and monotonic `seq`.
+- A `prompt`/`steer` with empty text is `rejected` `empty_prompt`; a
   line naming another session `wrong_session`; an unknown `type`
   `unknown_command`. No offer makes Spiron take such a line.
 - A `steer` with no turn running is `rejected` `no_active_turn`; one that
@@ -21,6 +18,12 @@ Besides the engine's commands, this vendor reads these files:
   reject  the next input is refused with the code the file holds (a code
           Spiron answers for a line no offer can make it take)
 """
+import json
+import os
+import socket
+import threading
+import time
+
 from engine import Input, Protocol, image_file
 
 LEASED = "This Session already has an active turn."
@@ -28,26 +31,104 @@ CAPABILITIES = ["steer_consumed", "idempotent_input"]
 
 
 def images_of(msg):
-    """Images an input line would carry (`images: [{"path", "mime_type"}]`);
-    `spiron.headless/v1` defines none, so AnyAgents sends none."""
+    """Images an input line would carry (`images: [{"path", "mime_type"}]`)."""
     return [image_file(item["path"], item["mime_type"]) for item in msg.get("images") or []]
 
 
 class Spiron(Protocol):
-    """`spiron --headless --json` with `steer_consumed` and `idempotent_input`."""
+    """`spiron --headless --json` speaking `spiron.headless/v2` over Unix socket."""
 
     idempotent = True
 
+    def __init__(self, engine, args):
+        self.conn = None
+        self.conn_lock = threading.RLock()
+        self.seq = 0
+        self.frames = []
+        self.sock_path = None
+        self.listener = None
+        super().__init__(engine, args)
+
     def frame(self, frame, request_id):
-        frame["session_id"] = self.session
-        frame["request_id"] = request_id
+        with self.conn_lock:
+            self.seq += 1
+            frame["session_id"] = self.session
+            frame["request_id"] = request_id
+            frame["seq"] = self.seq
+            self.frames.append(dict(frame))
         self.emit(frame)
+
+    def write_out(self):
+        while True:
+            not_before, line = self.outbox.get()
+            wait = not_before - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            with self.conn_lock:
+                if self.conn is not None:
+                    try:
+                        self.conn.sendall((line + "\n").encode())
+                    except OSError:
+                        self.conn = None
+            self.outbox.task_done()
 
     def start(self):
         if "--session" in self.args:
             self.session = self.args[self.args.index("--session") + 1]
-        self.frame({"type": "ready", "protocol": "spiron.headless/v1",
-                    "capabilities": CAPABILITIES}, None)
+        self.sock_path = self.args[self.args.index("--listen") + 1]
+        try:
+            os.unlink(self.sock_path)
+        except FileNotFoundError:
+            pass
+        self.listener = socket.socket(socket.AF_UNIX)
+        self.listener.bind(self.sock_path)
+        os.chmod(self.sock_path, 0o660)
+        self.listener.listen()
+
+    def serve(self):
+        while True:
+            conn, _ = self.listener.accept()
+            reader = conn.makefile("r")
+            first = reader.readline()
+            if not first:
+                reader.close()
+                conn.close()
+                continue
+            attach = json.loads(first)
+            assert attach["type"] == "attach" and attach["protocol"] == "spiron.headless/v2", attach
+            with self.conn_lock:
+                if self.conn is not None:
+                    try:
+                        self.conn.close()
+                    except OSError:
+                        pass
+                self.conn = conn
+                after = attach.get("after_seq")
+                if after is not None:
+                    for frame in self.frames:
+                        if frame["seq"] > after:
+                            conn.sendall((json.dumps(frame) + "\n").encode())
+                self.frame(
+                    {
+                        "type": "ready",
+                        "protocol": "spiron.headless/v2",
+                        "capabilities": CAPABILITIES,
+                        "replay": {"after_seq": after, "complete": True},
+                    },
+                    attach["request_id"],
+                )
+            for line in reader:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                with self.engine.lock:
+                    self.on_line(msg)
+            reader.close()
+            conn.close()
 
     def refused(self, msg):
         """The code Spiron refuses `msg` with before any turn sees it."""
@@ -58,16 +139,24 @@ class Spiron(Protocol):
             return code
         if msg.get("session_id") not in (None, self.session):
             return "wrong_session"
-        if msg.get("type") not in ("prompt", "user", "steer", "cancel", "interrupt"):
+        if msg.get("type") not in ("prompt", "steer", "cancel", "stop"):
             return "unknown_command"
-        if msg.get("type") != "cancel" and not (msg.get("text") or "").strip():
+        if msg.get("type") not in ("cancel", "stop") and not (msg.get("text") or "").strip():
             return "empty_prompt"
         return None
 
     def on_line(self, msg):
         kind = msg.get("type")
         rid = msg.get("request_id")
-        if kind in ("cancel", "interrupt"):
+        if kind == "stop":
+            self.frame({"type": "stopped"}, rid)
+            self.flush()
+            try:
+                os.unlink(self.sock_path)
+            except FileNotFoundError:
+                pass
+            os._exit(0)
+        if kind == "cancel":
             return
         inp = Input(rid, msg.get("text", ""), kind, media=images_of(msg))
         self.engine.received(inp)
@@ -118,45 +207,4 @@ class Spiron(Protocol):
                     "undelivered_steer_ids": [inp.id for inp in leftover]}, turn)
 
 
-class SpironV0(Spiron):
-    """A Spiron from before `steer_consumed`: `ready` names no capability,
-    `accepted` opens a turn, a mid-turn input is only acknowledged, and the
-    result lists the acknowledged steers it never applied, by text."""
-
-    idempotent = False
-
-    def start(self):
-        if "--session" in self.args:
-            self.session = self.args[self.args.index("--session") + 1]
-        self.frame({"type": "ready", "protocol": "spiron.headless/v1"}, None)
-
-    def on_line(self, msg):
-        kind = msg.get("type")
-        rid = msg.get("request_id")
-        if kind == "cancel":
-            return
-        inp = Input(rid, msg.get("text", ""), kind)
-        self.engine.received(inp)
-        engine = self.engine
-        if engine.turn is None:
-            engine.open_turn(inp, rid)
-            turn = engine.turn
-            self.later(lambda: self.frame({"type": "accepted", "mode": "turn"}, turn))
-            return
-        engine.queue(inp)
-        turn = engine.turn
-        self.later(lambda: self.frame(
-            {"type": "steer_ack", "accepted": True, "turn_id": turn}, rid))
-
-    def consumed(self, taken):
-        pass
-
-    def finish(self):
-        turn = self.engine.turn
-        leftover = self.engine.end_turn()
-        self.frame({"type": "result", "status": "completed", "is_error": False, "error": None,
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                    "undelivered_steers": [inp.text for inp in leftover]}, turn)
-
-
-PROTOCOLS = {"spiron": Spiron, "spiron-v0": SpironV0}
+PROTOCOLS = {"spiron": Spiron}

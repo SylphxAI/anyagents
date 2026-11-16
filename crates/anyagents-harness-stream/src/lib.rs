@@ -15,7 +15,7 @@ pub use rpc::{NotificationEffect, RequestHandler, RpcChild, RpcFail, RpcLaunch};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
@@ -162,7 +162,10 @@ impl StreamSpec {
             cache_write_tokens: number(usage, "cache_write_tokens")
                 .max(number(usage, "cacheWrite"))
                 .max(number(usage, "cache_creation_input_tokens")),
-            reported_cost_micros: None,
+            // Spiron reports what a turn cost (`cost_micros`, micro-USD).
+            reported_cost_micros: (self.protocol == LineProtocol::AcknowledgedResult)
+                .then(|| value.get("cost_micros").and_then(Value::as_i64))
+                .flatten(),
         }
     }
 
@@ -214,25 +217,31 @@ pub const LINE_INTO_TURN: Delivery = Delivery {
     peer: None,
 };
 
-/// A Spiron peer whose `ready` names no consumption proof: it is given one
-/// input per turn, never one while a turn runs, and `accepted` commits it.
-/// Gated on the capability for peers built before it; it goes when no such
-/// Spiron is installed.
-const OLDER_SPIRON: Delivery = Delivery {
-    level: DeliveryLevel::TurnEnd,
-    idempotent: false,
-    proof: std::borrow::Cow::Borrowed("accepted (one input per turn)"),
-    peer: None,
-};
-
-/// Spiron's headless peer when its `ready` frame names `steer_consumed` and
-/// `idempotent_input`.
+/// Spiron v2's journal-backed consumption and request-id deduplication.
 pub const SPIRON: Delivery = Delivery {
     level: DeliveryLevel::NextStep,
     idempotent: true,
     proof: std::borrow::Cow::Borrowed("accepted/steer_consumed receipts; request_id journal"),
     peer: None,
 };
+
+/// The protocol a v2 connection speaks (`docs/adr/0011-spiron-headless-v2.md`).
+pub const SPIRON_V2: &str = "spiron.headless/v2";
+
+/// How to reach one `spiron.headless/v2` process over its Unix socket.
+pub struct Connect {
+    pub spec: StreamSpec,
+    /// The binary the process runs, for what the host shows.
+    pub program: PathBuf,
+    pub socket: PathBuf,
+    /// The process, when known: what `process_id` answers.
+    pub pid: Option<u32>,
+    /// Replay the frames after this seq; `None` replays nothing.
+    pub after_seq: Option<u64>,
+    pub session_id: Option<String>,
+    pub environment: Vec<(String, String)>,
+    pub delivery: Delivery,
+}
 
 /// Native `LanguageServerService` ConnectRPC configuration for Antigravity (`agy`).
 #[derive(Clone, Debug)]
@@ -253,7 +262,12 @@ pub struct StreamHarness {
     mode: DeliveryMode,
     delivery: Delivery,
     shared: Arc<Mutex<State>>,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    stdin: Arc<Mutex<Option<Input>>>,
+    /// A `spiron.headless/v2` connection: its socket, which `stop` shuts
+    /// down (the process outlives it), and the process's pid.
+    #[cfg(unix)]
+    socket: Option<std::os::unix::net::UnixStream>,
+    socket_pid: Option<u32>,
     wake: Arc<Condvar>,
     reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<()>>,
@@ -273,9 +287,57 @@ struct PendingWrite {
     generation: u64,
 }
 
+/// Where input lines go: the child's stdin, or the Unix socket of a
+/// `spiron.headless/v2` process this harness did not start as its child.
+enum Input {
+    Pipe(ChildStdin),
+    #[cfg(unix)]
+    Socket(std::os::unix::net::UnixStream),
+}
+
+impl Write for Input {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Pipe(pipe) => pipe.write(bytes),
+            // Never blocks, as the nonblocking pipe never does, without
+            // making the reader's descriptor (the same socket) nonblocking.
+            #[cfg(unix)]
+            Self::Socket(socket) => {
+                use std::os::fd::AsRawFd;
+                // SAFETY: a valid descriptor and a buffer of `bytes.len()` bytes.
+                let sent = unsafe {
+                    libc::send(
+                        socket.as_raw_fd(),
+                        bytes.as_ptr().cast(),
+                        bytes.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if sent < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(sent as usize)
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Pipe(pipe) => pipe.flush(),
+            #[cfg(unix)]
+            Self::Socket(_) => Ok(()),
+        }
+    }
+}
+
 /// Shared by every harness over one child: the owner and any reader.
 struct State {
     child: Option<Child>,
+    /// A listening v2 child outlives [`StreamHarness::stop`] unless reaped or
+    /// stopped by its owning adapter.
+    listening_child: bool,
+    log_path: Option<PathBuf>,
     stderr: BoundedStderr,
     stderr_done: bool,
     exit_status: Option<ExitStatus>,
@@ -377,6 +439,18 @@ struct State {
     /// gave.
     turn_refused_since: Option<Instant>,
     turn_refusal: Option<String>,
+    /// A `spiron.headless/v2` connection: the request id of its `attach`.
+    /// Every receipt is a fact about the session, so one for an input an
+    /// earlier connection wrote is taken as this connection's own: a replay
+    /// rebuilds what that connection knew.
+    v2_attach: Option<String>,
+    /// The `ready` answering that `attach` arrived (the replay before it is
+    /// read), and its seq; or the attach was refused, with the code.
+    attached: bool,
+    attached_seq: Option<u64>,
+    attach_refused: Option<String>,
+    /// The highest `seq` read.
+    last_seq: u64,
 }
 
 impl StreamHarness {
@@ -403,6 +477,9 @@ impl StreamHarness {
             delivery: launch.delivery,
             shared: Arc::new(Mutex::new(State::new(launch.session_id.as_deref()))),
             stdin: Arc::new(Mutex::new(None)),
+            #[cfg(unix)]
+            socket: None,
+            socket_pid: None,
             wake: Arc::new(Condvar::new()),
             reader: None,
             stderr_reader: None,
@@ -437,7 +514,168 @@ impl StreamHarness {
         })
     }
 
+    /// Connect to a `spiron.headless/v2` process listening on its Unix
+    /// socket (`spiron --headless --json --listen`). The process is not this
+    /// harness's child and outlives the connection: [`StreamHarness::stop`]
+    /// ends the connection, not the process. The `attach` written first
+    /// replays the frames after `after_seq` (`None`: none) before its
+    /// `ready`; [`StreamHarness::wait_ready`] waits for that `ready`, so the
+    /// replay is read before the harness is used.
+    #[cfg(unix)]
+    pub fn connect(connect: Connect) -> Result<Self, HarnessError> {
+        let fail = |err: std::io::Error| HarnessError::Failed(err.to_string());
+        let stream = std::os::unix::net::UnixStream::connect(&connect.socket).map_err(fail)?;
+        let attach_id = format!(
+            "attach-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |time| time.as_nanos())
+        );
+        let attach = json!({
+            "type": "attach",
+            "protocol": SPIRON_V2,
+            "after_seq": connect.after_seq,
+            "request_id": attach_id,
+        });
+        (&stream)
+            .write_all(format!("{attach}\n").as_bytes())
+            .map_err(fail)?;
+        let reader = stream.try_clone().map_err(fail)?;
+        let writer = stream.try_clone().map_err(fail)?;
+        let mut harness = Self {
+            spec: connect.spec,
+            program: connect.program,
+            args: Vec::new(),
+            environment: connect.environment,
+            work_dir: None,
+            agy_rpc: None,
+            mode: DeliveryMode::Steer,
+            delivery: connect.delivery,
+            shared: Arc::new(Mutex::new(State::new(connect.session_id.as_deref()))),
+            stdin: Arc::new(Mutex::new(None)),
+            socket: Some(stream),
+            socket_pid: connect.pid,
+            wake: Arc::new(Condvar::new()),
+            reader: None,
+            stderr_reader: None,
+            pending: None,
+            #[cfg(test)]
+            after_write: None,
+            #[cfg(target_os = "linux")]
+            readiness: None,
+        };
+        let generation = {
+            let mut state = lock(&harness.shared);
+            state.generation = state.generation.wrapping_add(1);
+            state.alive = true;
+            // No stderr of its own to wait for: the process keeps its log.
+            state.stderr_done = true;
+            // v2 proves consumption and deduplicates input by definition.
+            state.ready = Some(true);
+            state.peer = Some(SPIRON_V2.to_string());
+            state.v2_attach = Some(attach_id);
+            state.generation
+        };
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            let fd = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if fd < 0 {
+                return Err(fail(std::io::Error::last_os_error()));
+            }
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let shared = Arc::clone(&harness.shared);
+            let wake = Arc::clone(&harness.wake);
+            harness.readiness = Some(
+                thread::Builder::new()
+                    .name(format!("{}-socket", harness.spec.name))
+                    .spawn(move || watch_writable(fd, shared, wake, generation))
+                    .map_err(fail)?,
+            );
+        }
+        *lock(&harness.stdin) = Some(Input::Socket(writer));
+        let shared = Arc::clone(&harness.shared);
+        let wake = Arc::clone(&harness.wake);
+        let spec = harness.spec.clone();
+        let stdin = Arc::clone(&harness.stdin);
+        harness.reader = Some(
+            thread::Builder::new()
+                .name(spec.name.clone())
+                .spawn(move || {
+                    read_stdout(
+                        Box::new(reader),
+                        stdin,
+                        shared,
+                        wake,
+                        spec,
+                        None,
+                        generation,
+                    )
+                })
+                .map_err(fail)?,
+        );
+        Ok(harness)
+    }
+
+    /// The seq of the `ready` that answered this connection's `attach`.
+    pub fn attached_seq(&self) -> Option<u64> {
+        lock(&self.shared).attached_seq
+    }
+
+    /// Whether this is a `spiron.headless/v2` connection.
+    pub fn speaks_v2(&self) -> bool {
+        lock(&self.shared).v2_attach.is_some()
+    }
+
+    /// Write one line to the process, outside any delivery (`stop`).
+    pub fn write_line(&self, value: &Value) -> Result<(), HarnessError> {
+        write_stdin(&self.stdin, value).map_err(|err| HarnessError::Failed(err.to_string()))
+    }
+
+    /// Wait until what the process writes has ended: its connection or its
+    /// stdout closed. `false` after `timeout`.
+    pub fn wait_gone(&self, timeout: Duration) -> bool {
+        self.wait_pred(timeout, |state| !state.alive)
+    }
+
     /// Persist the child's exit fault into `dir` for the server to show.
+    /// Attach a listening v2 child and its log path so spontaneous exit
+    /// reports status and bounded masked log without killing on `detach`.
+    #[cfg(unix)]
+    pub fn attach_listening_child(&self, mut child: Child, log: PathBuf) {
+        let mut state = lock(&self.shared);
+        state.log_path = Some(log);
+        state.listening_child = true;
+        if state.alive {
+            state.child = Some(child);
+        } else {
+            let deadline = Instant::now() + Duration::from_millis(250);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        state.exit_status = Some(status);
+                        state.refresh_exit_fault();
+                        break;
+                    }
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    _ => {
+                        state.child = Some(child);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take the listening child if it has not exited on its own yet.
+    #[cfg(unix)]
+    pub fn take_child(&self) -> Option<Child> {
+        lock(&self.shared).child.take()
+    }
+
     pub fn set_state_dir(&self, dir: &Path) {
         let mut state = lock(&self.shared);
         state.state_dir = Some(dir.to_path_buf());
@@ -609,6 +847,10 @@ impl StreamHarness {
         if same {
             return Ok(());
         }
+        // A connection to a process it did not start: the host replaces it.
+        if self.socket_pid.is_some() {
+            return Err(HarnessError::Dead);
+        }
         self.stop_child();
         self.args = self.spec.resume_args(Some(session));
         lock(&self.shared).session_id = Some(session.to_string());
@@ -706,17 +948,9 @@ impl StreamHarness {
         }
     }
 
-    /// What this child guarantees as it announced itself. A Spiron peer whose
-    /// `ready` names no consumption proof keeps the older custody rules.
+    /// The negotiated delivery contract.
     fn delivery_now(&self, state: &State) -> Delivery {
-        let delivery = if self.spec.protocol == LineProtocol::AcknowledgedResult
-            && state.ready == Some(false)
-        {
-            OLDER_SPIRON
-        } else {
-            self.delivery.clone()
-        };
-        delivery.with_peer(state.peer.clone())
+        self.delivery.clone().with_peer(state.peer.clone())
     }
 
     pub fn clear_quota(&self) {
@@ -730,7 +964,7 @@ impl StreamHarness {
         if !state.alive {
             state.reap_child();
         }
-        state.child.as_ref().map(Child::id)
+        state.child.as_ref().map(Child::id).or(self.socket_pid)
     }
 
     /// Write one line into the child and record it as taken.
@@ -752,21 +986,22 @@ impl StreamHarness {
         }
         if self.spec.protocol == LineProtocol::AcknowledgedResult {
             let state = lock(&self.shared);
-            // The peer says what it can do before it is given anything: its
-            // `ready` decides which custody rules every input follows.
-            if state.ready.is_none() && state.alive {
+            if let Some(error) = &state.attach_refused {
+                return Err(HarnessError::Failed(error.clone()));
+            }
+            // No input is written before v2 negotiation and replay complete.
+            if (state.ready.is_none() || (state.v2_attach.is_some() && !state.attached))
+                && state.alive
+            {
                 return Ok(DeliverOutcome::Deferred);
             }
             if state.ready == Some(true) {
                 drop(state);
                 return self.deliver_consumed(message, line);
             }
-            // An older peer proves nothing about input it takes mid-turn: it
-            // is given the next input only once the running turn has ended.
-            let unwritten = self.pending.as_ref().is_none_or(|p| p.id != id);
-            if unwritten && !state.seen.contains(id) && !state.open.is_empty() {
-                return Ok(DeliverOutcome::Deferred);
-            }
+            return Err(HarnessError::Failed(
+                "spiron requires spiron.headless/v2".into(),
+            ));
         }
         if self.agy_rpc.is_some() {
             let mut state = lock(&self.shared);
@@ -815,8 +1050,7 @@ impl StreamHarness {
                 if let Some(reset_at_ms) = state.quota_reset_at_ms {
                     return Ok(DeliverOutcome::Quota { reset_at_ms });
                 }
-                // Written and not proven yet: an Antigravity prompt until its
-                // cascade shows the turn, an older Spiron's until `accepted`.
+                // An Antigravity prompt waits until its cascade shows the turn.
                 if state.seen.contains(id) {
                     return Ok(if self.spec.is_agy() {
                         DeliverOutcome::InFlight
@@ -1095,8 +1329,53 @@ impl StreamHarness {
     /// Wait until the peer's `ready` frame is read or the process exits.
     /// A peer that says nothing within `patience` is refused.
     pub fn wait_ready(&self, patience: Duration) -> Result<(), HarnessError> {
+        if lock(&self.shared).v2_attach.is_some() {
+            // The `ready` that answers the attach, after the replay.
+            let done = self.wait_pred(patience, |state| {
+                state.attached || state.attach_refused.is_some() || !state.alive
+            });
+            let state = lock(&self.shared);
+            return if let Some(code) = &state.attach_refused {
+                Err(HarnessError::Failed(format!(
+                    "spiron refused the attach: {code}"
+                )))
+            } else if state.attached {
+                Ok(())
+            } else if !done {
+                Err(HarnessError::Failed(format!(
+                    "{} sent no ready frame within {}s",
+                    self.spec.name,
+                    patience.as_secs()
+                )))
+            } else {
+                let detail = state
+                    .failure()
+                    .or_else(|| {
+                        state.exit_status.map(|status| {
+                            format!("spiron exited with {status} before its ready frame")
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        "spiron closed the connection before its ready frame".into()
+                    });
+                Err(HarnessError::Failed(detail))
+            };
+        }
         if self.wait_pred(patience, |state| state.ready.is_some() || !state.alive) {
-            return Ok(());
+            if self.spec.protocol != LineProtocol::AcknowledgedResult {
+                return Ok(());
+            }
+            let state = lock(&self.shared);
+            return if state.ready == Some(true) && state.attach_refused.is_none() {
+                Ok(())
+            } else {
+                Err(HarnessError::Failed(
+                    state
+                        .attach_refused
+                        .clone()
+                        .unwrap_or_else(|| "spiron exited before its v2 ready frame".into()),
+                ))
+            };
         }
         Err(HarnessError::Failed(format!(
             "{} sent no ready frame within {}s",
@@ -1117,7 +1396,9 @@ impl StreamHarness {
             return false;
         }
         if self.spec.protocol == LineProtocol::AcknowledgedResult
-            && (state.ready.is_none()
+            && (state.ready != Some(true)
+                || state.attach_refused.is_some()
+                || (state.v2_attach.is_some() && !state.attached)
                 || (state.open.is_empty()
                     && state
                         .turn_retry_at
@@ -1298,7 +1579,7 @@ impl StreamHarness {
                 }
             };
         }
-        *lock(&self.stdin) = Some(child_stdin);
+        *lock(&self.stdin) = Some(Input::Pipe(child_stdin));
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
         self.stderr_reader = match thread::Builder::new()
@@ -1354,8 +1635,17 @@ impl StreamHarness {
         let stdin = Arc::clone(&self.stdin);
         match thread::Builder::new()
             .name(spec.name.clone())
-            .spawn(move || read_stdout(stdout, stdin, shared, wake, spec, agy_rpc, generation))
-        {
+            .spawn(move || {
+                read_stdout(
+                    Box::new(stdout),
+                    stdin,
+                    shared,
+                    wake,
+                    spec,
+                    agy_rpc,
+                    generation,
+                )
+            }) {
             Ok(handle) => self.reader = Some(handle),
             Err(err) => {
                 self.stop_child();
@@ -1382,8 +1672,17 @@ impl StreamHarness {
     fn stop_child(&mut self) {
         self.pending = None;
         *lock(&self.stdin) = None;
-        let child = lock(&self.shared).child.take();
-        if let Some(mut child) = child {
+        // A v2 process outlives its connection: ending the connection ends
+        // what this harness reads, and the process goes on.
+        #[cfg(unix)]
+        if let Some(socket) = self.socket.take() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        let (child, owns) = {
+            let mut state = lock(&self.shared);
+            (state.child.take(), !state.listening_child)
+        };
+        if owns && let Some(mut child) = child {
             anyagents_harness::kill_child(&mut child, &self.environment);
             let _ = child.wait();
         }
@@ -1446,6 +1745,29 @@ impl Drop for StreamHarness {
 // Retain at most 16 KiB while draining the entire pipe. If retention cuts a
 // line, withhold that partial line rather than publishing a credential prefix.
 const STDERR_LIMIT: usize = 16 * 1024;
+
+/// Read at most [`STDERR_LIMIT`] bytes from `path`, withholding an incomplete
+/// trailing line if truncated, and mask known secrets.
+pub fn read_bounded_masked_log(path: &Path) -> String {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let mut stderr = BoundedStderr::default();
+    let mut buf = [0u8; 4096];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                stderr.push(&buf[..n]);
+                if stderr.truncated {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    stderr.masked(true)
+}
 
 #[derive(Default)]
 struct BoundedStderr {
@@ -1559,7 +1881,6 @@ impl State {
     /// - Every protocol: the session's own record shows an earlier process
     ///   applied it (`applied_before`).
     /// - Spiron that proves consumption: `accepted` or `steer_consumed`.
-    /// - An older Spiron: `accepted`.
     /// - Antigravity with its language server: the cascade took it (its
     ///   transcript or mailbox says so, or its turn showed a step or closed).
     /// - A line-per-turn child: the whole line was written.
@@ -1577,7 +1898,6 @@ impl State {
                 } else {
                     taken()
                 }),
-                Some(false) if self.acknowledged.contains(id) => Some(taken()),
                 _ => None,
             },
             _ if agy => self.agy_taken.contains(id).then(taken),
@@ -1624,7 +1944,11 @@ impl State {
         if let Some(status) = self.exit_status
             && !status.success()
         {
-            let stderr = self.stderr.masked(self.stderr_done);
+            let stderr = if let Some(path) = &self.log_path {
+                read_bounded_masked_log(path)
+            } else {
+                self.stderr.masked(self.stderr_done)
+            };
             self.exit_fault = Some(format!(
                 "harness exited with {status}{}{}{}{}",
                 self.sign_in_fault.as_ref().map_or("", |_| ": "),
@@ -1643,6 +1967,8 @@ impl State {
     fn new(session_id: Option<&str>) -> Self {
         Self {
             child: None,
+            listening_child: false,
+            log_path: None,
             stderr: BoundedStderr::default(),
             stderr_done: false,
             exit_status: None,
@@ -1697,13 +2023,18 @@ impl State {
             held_inputs: HashMap::new(),
             turn_refused_since: None,
             turn_refusal: None,
+            v2_attach: None,
+            attached: false,
+            attached_seq: None,
+            attach_refused: None,
+            last_seq: 0,
         }
     }
 }
 
 fn read_stdout(
-    stdout: ChildStdout,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    stdout: Box<dyn Read + Send>,
+    stdin: Arc<Mutex<Option<Input>>>,
     shared: Arc<Mutex<State>>,
     wake: Arc<Condvar>,
     spec: StreamSpec,
@@ -1847,52 +2178,46 @@ fn read_stdout(
             let before = state.observed();
             state.idle_since = None;
             note_markers(&mut state, &value);
-            if spec.protocol == LineProtocol::AcknowledgedResult
-                && kind == Some("ready")
-                && state.ready.is_none()
-            {
-                state.ready = Some(announces_consumption(&value));
-                state.peer = Some(announced_peer(&value));
+            if let Some(seq) = value.get("seq").and_then(Value::as_u64) {
+                state.last_seq = state.last_seq.max(seq);
             }
-            // A peer that proves consumption is read by its own rules; the
-            // receipts below are the older peer's.
+            if spec.protocol == LineProtocol::AcknowledgedResult && state.attach_refused.is_some() {
+                continue;
+            }
+            if spec.protocol == LineProtocol::AcknowledgedResult && kind == Some("ready") {
+                if value.get("protocol").and_then(Value::as_str) != Some(SPIRON_V2) {
+                    state.attach_refused =
+                        Some("unsupported_protocol: spiron requires spiron.headless/v2".into());
+                    state.ready = Some(false);
+                    state.touch();
+                    wake.notify_all();
+                    continue;
+                }
+                state.ready = Some(true);
+                state.peer = Some(announced_peer(&value));
+                if let Some(attach) = &state.v2_attach
+                    && value.get("request_id").and_then(Value::as_str) == Some(attach.as_str())
+                {
+                    state.attached = true;
+                    state.attached_seq = value.get("seq").and_then(Value::as_u64);
+                }
+            }
+            if let Some(attach) = &state.v2_attach
+                && kind == Some("rejected")
+                && value.get("request_id").and_then(Value::as_str) == Some(attach.as_str())
+            {
+                state.attach_refused = Some(
+                    value
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("no code")
+                        .to_string(),
+                );
+            }
             let consumption =
                 spec.protocol == LineProtocol::AcknowledgedResult && state.ready == Some(true);
             if consumption {
                 retry_after = note_consumption_receipt(&mut state, kind, &value);
-            } else if spec.protocol == LineProtocol::AcknowledgedResult
-                && let Some(id) = value.get("request_id").and_then(Value::as_str)
-                && state
-                    .open
-                    .iter()
-                    .chain(&state.followups)
-                    .any(|open| open == id)
-            {
-                match kind {
-                    Some("accepted") => {
-                        state.acknowledged.insert(id.to_string());
-                        state.input_turns.insert(id.to_string(), id.to_string());
-                    }
-                    Some("rejected") => match spiron_refusal(&value) {
-                        // Never taken: it is offered again once the turn
-                        // that refused it is gone.
-                        SpironRefusal::NotStarted
-                        | SpironRefusal::TurnClosed
-                        | SpironRefusal::Unknown(_) => {
-                            let id = id.to_string();
-                            state.open.retain(|open| *open != id);
-                            state.followups.retain(|open| *open != id);
-                            state.seen.remove(&id);
-                        }
-                        SpironRefusal::ForGood(reason) => {
-                            let id = id.to_string();
-                            state.open.retain(|open| *open != id);
-                            state.followups.retain(|open| *open != id);
-                            state.rejected.insert(id, reason);
-                        }
-                    },
-                    _ => {}
-                }
             }
             if let Some(step_type) = value
                 .pointer("/step_update/step_type")
@@ -1910,7 +2235,11 @@ fn read_stdout(
                     state.agy_turn_has_work = true;
                 }
             }
-            if let Some(reset_at_ms) = effect.quota_reset_at_ms {
+            // A quota a replayed frame reports is history, and one measured
+            // from now ("resets in 5h") would hold the agent anew: only the
+            // live process's own report counts.
+            let replayed = state.v2_attach.is_some() && !state.attached;
+            if let Some(reset_at_ms) = effect.quota_reset_at_ms.filter(|_| !replayed) {
                 state.quota_reset_at_ms = Some(reset_at_ms);
                 // Such a peer still closes its turn with a result that names
                 // what it consumed; nothing is dropped before that.
@@ -1988,8 +2317,6 @@ fn read_stdout(
                         usage,
                         &value,
                     );
-                } else if spec.protocol == LineProtocol::AcknowledgedResult {
-                    finish_correlated(&mut state, value["request_id"].as_str().unwrap(), usage);
                 } else if spec.is_agy()
                     && !state.open.is_empty()
                     && !state.agy_turn_has_work
@@ -2337,32 +2664,6 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     }
 }
 
-/// The result that closes an older Spiron's turn: its one input is finished.
-fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage) {
-    if !state.open.iter().any(|id| id == turn) {
-        return;
-    }
-    state.open.retain(|id| id != turn);
-    state.finished.insert(turn.to_string());
-    state.usages.push((turn.to_string(), usage));
-    state.turn_user_inputs = 0;
-    state.last_turn_step_type = None;
-    state.idle_since = None;
-    state.agy_turn_has_work = false;
-}
-
-/// The `ready` frame names both capabilities the pipelined path relies on:
-/// a per-input consumption signal and request-id deduplication.
-fn announces_consumption(value: &Value) -> bool {
-    let named = |capability: &str| {
-        value
-            .get("capabilities")
-            .and_then(Value::as_array)
-            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(capability)))
-    };
-    named("steer_consumed") && named("idempotent_input")
-}
-
 /// What a `ready` frame says about the peer: its protocol and capabilities.
 fn announced_peer(value: &Value) -> String {
     let protocol = value
@@ -2374,11 +2675,32 @@ fn announced_peer(value: &Value) -> String {
         .and_then(Value::as_array)
         .map(|items| items.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    if capabilities.is_empty() {
+    let mut peer = if capabilities.is_empty() {
         protocol.to_string()
     } else {
         format!("{protocol} [{}]", capabilities.join(", "))
+    };
+    // A v2 `ready` says which build, model and window serve the session.
+    if let Some(version) = value.get("version").and_then(Value::as_str) {
+        peer.push_str(&format!("; spiron {version}"));
+        if let Some(commit) = value.get("commit").and_then(Value::as_str) {
+            peer.push_str(&format!("+{}", &commit[..commit.len().min(8)]));
+        }
     }
+    if let Some(model) = value.get("model").and_then(Value::as_str) {
+        peer.push_str(&format!("; model {model}"));
+    }
+    if let Some(window) = value
+        .pointer("/context/window_tokens")
+        .and_then(Value::as_u64)
+    {
+        let source = value
+            .pointer("/context/window_source")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        peer.push_str(&format!("; window {window} tokens ({source})"));
+    }
+    peer
 }
 
 /// One receipt from a peer that proves consumption. Only an input this
@@ -2393,6 +2715,39 @@ fn note_consumption_receipt(
     value: &Value,
 ) -> Option<Duration> {
     let request = value.get("request_id").and_then(Value::as_str);
+    // A v2 receipt for an input this connection did not write is about one
+    // an earlier connection wrote (read again in a replay, or answered while
+    // no host was attached): taken as written here, so the state it leaves
+    // is the one that connection would have had.
+    if state.v2_attach.is_some()
+        && let Some(id) = request
+    {
+        let acked = kind == Some("steer_ack")
+            && value.get("accepted").and_then(Value::as_bool) == Some(true);
+        if acked
+            && let Some(turn) = value.get("turn_id").and_then(Value::as_str)
+            && !state.in_flight.contains(turn)
+            && !state.consumed.contains(turn)
+        {
+            state.in_flight.insert(turn.to_string());
+            if !state.open.iter().any(|open| open == turn) {
+                state.open.push(turn.to_string());
+            }
+        }
+        if !state.in_flight.contains(id) && !state.consumed.contains(id) {
+            if kind == Some("accepted") || acked {
+                state.in_flight.insert(id.to_string());
+                if !state.open.iter().any(|open| open == id) {
+                    state.open.push(id.to_string());
+                }
+            } else if kind == Some("rejected") {
+                if let SpironRefusal::ForGood(reason) = spiron_refusal(value) {
+                    state.rejected.insert(id.to_string(), reason);
+                }
+                return None;
+            }
+        }
+    }
     match kind {
         // The turn-starting prompt is consumed when its turn is accepted,
         // which the peer says only after journaling it. A steer may be
@@ -2555,9 +2910,10 @@ fn spiron_refusal(value: &Value) -> SpironRefusal {
     match value.get("code").and_then(Value::as_str) {
         Some("turn_not_started") => SpironRefusal::NotStarted,
         Some("turn_closed" | "no_active_turn") => SpironRefusal::TurnClosed,
-        Some(code @ ("empty_prompt" | "wrong_session" | "unknown_command" | "upgrade_retired")) => {
-            SpironRefusal::ForGood(format!("spiron rejected the input: {code}"))
-        }
+        Some(
+            code @ ("empty_prompt" | "wrong_session" | "unknown_command" | "upgrade_retired"
+            | "missing_request_id"),
+        ) => SpironRefusal::ForGood(format!("spiron rejected the input: {code}")),
         code => SpironRefusal::Unknown(format!(
             "spiron refused the input with {}",
             code.map_or("no code".to_string(), |code| format!("code {code}"))
@@ -2735,10 +3091,7 @@ fn nonblocking_stdin(_stdin: &ChildStdin) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_pending(
-    slot: &Mutex<Option<ChildStdin>>,
-    pending: &mut PendingWrite,
-) -> std::io::Result<bool> {
+fn write_pending(slot: &Mutex<Option<Input>>, pending: &mut PendingWrite) -> std::io::Result<bool> {
     let mut guard = lock(slot);
     let stdin = guard
         .as_mut()
@@ -2756,7 +3109,7 @@ fn write_pending(
     Ok(true)
 }
 
-fn write_stdin(slot: &Mutex<Option<ChildStdin>>, value: &Value) -> std::io::Result<()> {
+fn write_stdin(slot: &Mutex<Option<Input>>, value: &Value) -> std::io::Result<()> {
     let mut guard = lock(slot);
     let Some(stdin) = guard.as_mut() else {
         return Err(std::io::Error::other("stdin closed"));
@@ -4593,6 +4946,8 @@ pub fn cancel_line(spec: &StreamSpec) -> Value {
 mod consumption_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod v2_tests;
 
 /// Close every descriptor above stderr in the child just before it starts, so a
 /// vendor never inherits the server's open files.

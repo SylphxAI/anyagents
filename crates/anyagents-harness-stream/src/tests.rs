@@ -1482,7 +1482,7 @@ fn immediate_receipt_harness() -> super::StreamHarness {
 const IMMEDIATE_RECEIPT_SCRIPT: &str = r#"
 import json,sys,time
 time.sleep(int(sys.argv[1])/1000)
-print(json.dumps({'type':'ready','session_id':'fixture-ready'}),flush=True)
+print(json.dumps({'type':'ready','protocol':'spiron.headless/v2','session_id':'fixture-ready'}),flush=True)
 first=None
 for line in sys.stdin:
  m=json.loads(line)
@@ -1584,42 +1584,6 @@ fn receipt_message(id: &str) -> anyagents_harness::OutboundMessage {
         source_time_ms: None,
         context: Default::default(),
     }
-}
-
-#[test]
-#[cfg(unix)]
-fn an_older_peer_takes_the_next_input_only_after_its_turn_ends() {
-    use anyagents_harness::DeliverOutcome::{Accepted, Deferred};
-    let mut harness = immediate_receipt_harness();
-    let first = receipt_message("first");
-    await_receipt_before_post_write(&mut harness, |state| state.acknowledged.contains("first"));
-    assert_eq!(
-        harness
-            .deliver(&first, &json!({"type":"user","request_id":"first"}))
-            .unwrap(),
-        Accepted {
-            turn_finished: false
-        },
-        "an accepted turn commits its input"
-    );
-    let next = receipt_message("next");
-    let line = json!({"type":"user","request_id":"next"});
-    assert_eq!(harness.deliver(&next, &line).unwrap(), Deferred);
-    assert_eq!(harness.deliver(&next, &line).unwrap(), Deferred);
-    assert_eq!(
-        harness.written_ids(),
-        ["first"],
-        "nothing reaches a busy turn"
-    );
-    harness.cancel(&json!({"type":"cancel"})).unwrap();
-    assert!(harness.wait_finished("first", std::time::Duration::from_secs(3)));
-    assert_eq!(
-        deliver_until_accepted(&mut harness, "next"),
-        Accepted {
-            turn_finished: false
-        }
-    );
-    assert_eq!(harness.written_ids(), ["first", "next"], "no replay");
 }
 
 /// A refusal for good, read before the write returns, is the answer: the
@@ -2451,7 +2415,7 @@ fn deliver_until_accepted(
 const CONFIRMED_TURN_SCRIPT: &str = r#"
 import json,sys,time
 time.sleep(int(sys.argv[1])/1000)
-print(json.dumps({'type':'ready','session_id':'fixture-ready'}),flush=True)
+print(json.dumps({'type':'ready','protocol':'spiron.headless/v2','session_id':'fixture-ready'}),flush=True)
 first=None
 for line in sys.stdin:
  m=json.loads(line)
@@ -3078,14 +3042,20 @@ fn an_agy_proof_written_just_before_the_stop_is_kept() {
 #[cfg(unix)]
 fn a_proof_written_just_before_the_stop_is_answered_after_it() {
     let dir = tempfile::tempdir().unwrap();
+    let release = dir.path().join("release");
     let written = dir.path().join("proved");
     let script = r#"
 import json, pathlib, sys, time
-print(json.dumps({"type":"ready","protocol":"spiron.headless/v1","capabilities":["steer_consumed","idempotent_input"]}), flush=True)
+print(json.dumps({"type":"ready","protocol":"spiron.headless/v2","capabilities":["steer_consumed","idempotent_input"]}), flush=True)
+release = pathlib.Path(sys.argv[1])
+written = pathlib.Path(sys.argv[2])
 for line in sys.stdin:
     message = json.loads(line)
+    deadline = time.monotonic() + 30
+    while not release.exists() and time.monotonic() < deadline:
+        time.sleep(0.005)
     print(json.dumps({"type":"accepted","mode":"turn","request_id":message["request_id"]}), flush=True)
-    pathlib.Path(sys.argv[1]).write_text("")
+    written.write_text("")
     time.sleep(60)
 "#;
     let mut harness = super::StreamHarness::launch(super::Launch {
@@ -3102,6 +3072,7 @@ for line in sys.stdin:
             "-u".into(),
             "-c".into(),
             script.into(),
+            release.display().to_string(),
             written.display().to_string(),
         ],
         environment: vec![],
@@ -3121,6 +3092,7 @@ for line in sys.stdin:
             .unwrap(),
         anyagents_harness::DeliverOutcome::InFlight
     );
+    std::fs::write(&release, "").unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while !written.exists() {
         assert!(

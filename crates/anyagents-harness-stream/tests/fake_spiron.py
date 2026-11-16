@@ -1,22 +1,9 @@
 """A fake `spiron --headless --json` peer for the AnyAgents steering tests.
 
 The fixture directory is the `--state-dir` argument when there is one (as
-AnyAgents launches Spiron), else argv[1]. FAKE_SPIRON_CAPABLE=1 announces
-`steer_consumed` and `idempotent_input` in `ready` and follows them, as
-Spiron's headless frontend does:
-- a prompt opens a turn at once; the turn is announced with `accepted` only
-  after its prompt is journaled under `input:<request_id>`, so steers written
-  behind it can be acknowledged before that `accepted`;
-- a prompt already in the journal is announced `accepted {mode: duplicate}`
-  and closed by a `result {duplicate: true}` that lists every steer admitted
-  to it in `undelivered_steer_ids`; nothing runs;
-- a turn that cannot journal its prompt (the session is still leased) did
-  not start: its prompt and every steer admitted to it are refused
-  `turn_not_started`, and no `result` follows;
-- a step journals every acknowledged steer once, in order, and answers each
-  with `steer_consumed`.
-Without FAKE_SPIRON_CAPABLE the peer speaks the protocol as it was before
-those capabilities: no `steer_consumed`, no deduplication.
+AnyAgents launches Spiron), else argv[1]. The fixture speaks v2 and follows
+its journal-backed consumption and request-id deduplication contract. Tests may
+set FAKE_SPIRON_PROTOCOL to an unsupported version to exercise refusal.
 
 The test drives the peer with files in the fixture directory; each command
 file is removed once acted on:
@@ -45,7 +32,7 @@ import time
 
 args = sys.argv[1:]
 root = pathlib.Path(args[args.index("--state-dir") + 1] if "--state-dir" in args else args[0])
-capable = os.environ.get("FAKE_SPIRON_CAPABLE") == "1"
+protocol = os.environ.get("FAKE_SPIRON_PROTOCOL", "spiron.headless/v2")
 launches = root / "launches"
 launch = int(launches.read_text()) + 1 if launches.exists() else 1
 launches.write_text(str(launch))
@@ -82,7 +69,7 @@ def journaled(key):
 def journal_input(request_id, text, turn):
     """Journal one input; False when idempotent input finds it already there."""
     key = "input:" + request_id
-    if capable and journaled(key):
+    if journaled(key):
         return False
     append(journal, {"key": key, "text": text, "turn": turn, "launch": launch})
     return True
@@ -105,7 +92,7 @@ def settle():
     """Journal the open turn's prompt and announce it, or refuse the turn."""
     global announced
     turn = active
-    if capable and (root / "lease").exists():
+    if (root / "lease").exists():
         emit({"type": "rejected", "code": "turn_not_started",
               "error": "session already has an active turn"}, turn)
         for request_id, _ in pending:
@@ -144,9 +131,8 @@ def drive():
                 for request_id, text in pending:
                     fresh = journal_input(request_id, text, active)
                     steered.append(request_id)
-                    if capable:
-                        emit({"type": "steer_consumed", "steer_request_id": request_id,
-                              "turn_id": active, "duplicate": not fresh}, active)
+                    emit({"type": "steer_consumed", "steer_request_id": request_id,
+                          "turn_id": active, "duplicate": not fresh}, active)
                 pending = []
                 append(root / "steps.jsonl", {"launch": launch, "turn": active, "consumed": steered})
                 take("step")
@@ -159,17 +145,14 @@ def drive():
                     "usage": {"input_tokens": 3, "output_tokens": 1},
                     "undelivered_steers": [text for _, text in pending],
                 }
-                if capable:
-                    frame["undelivered_steer_ids"] = [request_id for request_id, _ in pending]
+                frame["undelivered_steer_ids"] = [request_id for request_id, _ in pending]
                 close_turn()
                 emit(frame, turn)
                 take("finish")
         time.sleep(0.005)
 
 
-ready = {"type": "ready", "protocol": "spiron.headless/v1"}
-if capable:
-    ready["capabilities"] = ["steer_consumed", "idempotent_input"]
+ready = {"type": "ready", "protocol": protocol}
 emit(ready)
 threading.Thread(target=drive, daemon=True).start()
 for line in sys.stdin:
@@ -180,7 +163,7 @@ for line in sys.stdin:
     with turn_lock:
         # On the wire only once handled: a test that sees it can act on it.
         append(root / "wire.jsonl", {"launch": launch, "msg": msg})
-        if kind in ("prompt", "user", "steer") and active is not None:
+        if kind in ("prompt", "steer") and active is not None:
             if sealed:
                 emit({"type": "rejected", "code": "turn_closed"}, request_id)
             else:
@@ -188,7 +171,7 @@ for line in sys.stdin:
                 emit({"type": "steer_ack", "accepted": True, "turn_id": active}, request_id)
         elif kind == "steer":
             emit({"type": "rejected", "code": "no_active_turn"}, request_id)
-        elif kind in ("prompt", "user"):
+        elif kind in ("prompt",):
             active, prompt, announced, sealed, pending = request_id, text, False, False, []
         else:
             emit({"type": "rejected", "code": "unknown_command"}, request_id)

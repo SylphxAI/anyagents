@@ -5110,7 +5110,7 @@ async fn archive_agent_route(
         }
         let mut process_guard = None;
         if !is_self {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
             while std::time::Instant::now() < deadline {
                 if state
                     .health
@@ -5681,7 +5681,7 @@ async fn pause_agent_route(
             let _ = anyagents_tools::SandboxProvider::pause(&sbx);
         }
         drop(lifecycle);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
         while std::time::Instant::now() < deadline {
             if state
                 .health
@@ -5732,7 +5732,7 @@ async fn delete_agent_route(
             .store
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
         // Health is a projection: the supervisor may publish stopped before
         // its worker exits. Allow that normal shutdown to release actual
         // process custody within the same deadline, retaining the guard to commit.
