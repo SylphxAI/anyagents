@@ -9939,8 +9939,17 @@ pub(crate) mod tests {
             &ListAgentsQuery::default(),
         )
         .unwrap_or_else(|e| panic!("{}", e.message));
-        assert!(operator.0.agents.iter().any(|a| a.name == root.name
-            && a.instructions.as_deref() == Some("private instruction sentinel")));
+        let root_view = operator
+            .0
+            .agents
+            .iter()
+            .find(|a| a.name == root.name)
+            .unwrap();
+        let expected = format!(
+            "{}\n\nprivate instruction sentinel",
+            create::BUILTIN_GENERAL_ROLE_BODY
+        );
+        assert_eq!(root_view.instructions.as_deref(), Some(expected.as_str()));
     }
 
     #[test]
@@ -13519,7 +13528,13 @@ exec '{}' "$@"
             assert_eq!(stored.instructions.as_deref(), Some("Fix issue #42."));
             assert_eq!(
                 created.instructions.as_deref(),
-                Some("Always run cargo test before opening a PR.\n\nFix issue #42.")
+                Some(
+                    format!(
+                        "{}\n\nAlways run cargo test before opening a PR.\n\nFix issue #42.",
+                        create::BUILTIN_GENERAL_ROLE_BODY
+                    )
+                    .as_str()
+                )
             );
 
             // Role matching a template slug (`role: "code-reviewer"`) applies template defaults
@@ -13554,7 +13569,13 @@ exec '{}' "$@"
             );
             assert_eq!(
                 reviewer.instructions.as_deref(),
-                Some("Verify all invariants before approving.")
+                Some(
+                    format!(
+                        "{}\n\nVerify all invariants before approving.",
+                        create::BUILTIN_GENERAL_ROLE_BODY
+                    )
+                    .as_str()
+                )
             );
 
             // `<data_dir>/agents-templates/<name>.md` is also searched.
@@ -16662,7 +16683,13 @@ exec '{}' "$@"
             .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
         assert_eq!(
             resp["instructions"].as_str(),
-            Some("Role SSOT instructions.\n\nCustom task v2.")
+            Some(
+                format!(
+                    "{}\n\nRole SSOT instructions.\n\nCustom task v2.",
+                    create::BUILTIN_GENERAL_ROLE_BODY
+                )
+                .as_str()
+            )
         );
         let prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
         assert!(prompt.contains("Role SSOT instructions."));
@@ -16680,7 +16707,13 @@ exec '{}' "$@"
         assert!(view.pending_switch);
         assert_eq!(
             view.instructions.as_deref(),
-            Some("Role SSOT instructions.\n\nCustom task v2.")
+            Some(
+                format!(
+                    "{}\n\nRole SSOT instructions.\n\nCustom task v2.",
+                    create::BUILTIN_GENERAL_ROLE_BODY
+                )
+                .as_str()
+            )
         );
     }
 }
