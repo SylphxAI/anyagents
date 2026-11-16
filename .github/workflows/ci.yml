@@ -107,7 +107,7 @@ jobs:
           tar -xzf "$nextest_tgz" -C "$HOME/.cargo/bin" cargo-nextest
           rm -f "$nextest_tgz"
           cargo nextest --version
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -217,7 +217,7 @@ jobs:
           tar -xzf "$nextest_tgz" -C "$HOME/.cargo/bin" cargo-nextest
           rm -f "$nextest_tgz"
           cargo nextest --version
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
