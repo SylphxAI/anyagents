@@ -2167,7 +2167,7 @@ mod automation_tests {
     fn local_lifecycle_counts_active_kinds_without_dropping_schedule_details() {
         let _env = crate::server::tests::env_lock();
         let data = tempfile::tempdir().unwrap();
-        let store = Store::open(data.path()).unwrap();
+        let store = super::open(data.path()).unwrap();
         let agent = store
             .create_agent(NewAgent::new("worker", "claude-code"))
             .unwrap();
