@@ -154,13 +154,48 @@ impl Installer {
 /// Verify that `harness` names a known catalog entry.
 pub fn adapter(harness: &str) -> Result<(), anyagents_core::Error> {
     let harness = normalize_harness_name(harness);
-    if Catalog::builtin().get(harness).is_some() {
+    let catalog = Catalog::builtin();
+    if catalog.get(harness).is_some() {
         Ok(())
     } else {
-        Err(anyagents_core::Error::Message(format!(
-            "unknown harness: {harness}"
+        Err(anyagents_core::Error::Message(unknown_harness_message(
+            harness,
+            catalog.harnesses().iter().map(|entry| entry.id.as_str()),
         )))
     }
+}
+
+/// The refusal for a harness name the catalog does not know: the valid names,
+/// and the likely one first when the name is a prefix or part of one (agents
+/// write `claude` for `claude-code`).
+pub(crate) fn unknown_harness_message<'a>(
+    harness: &str,
+    known: impl Iterator<Item = &'a str>,
+) -> String {
+    let mut names: Vec<&str> = known.collect();
+    names.sort_unstable();
+    names.dedup();
+    let wanted = harness.trim().to_ascii_lowercase();
+    let likely: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| !wanted.is_empty() && (name.starts_with(&wanted) || name.contains(&wanted)))
+        .collect();
+    let mut message = format!(
+        "unknown harness `{harness}`; valid harnesses: {}",
+        names.join(", ")
+    );
+    if !likely.is_empty() {
+        message.push_str(&format!(
+            " (did you mean {}?)",
+            likely
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ));
+    }
+    message
 }
 
 static INSTALLER: OnceLock<Installer> = OnceLock::new();
@@ -294,6 +329,30 @@ mod tests {
         Current, DoctorRecord, Receipt, write_current, write_receipt,
     };
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn an_unknown_harness_names_the_valid_ones_and_the_likely_one() {
+        let error = adapter("claude").unwrap_err().to_string();
+        assert!(error.contains("unknown harness `claude`"), "{error}");
+        assert!(error.contains("valid harnesses: "), "{error}");
+        assert!(error.contains("claude-code"), "{error}");
+        assert!(
+            error.contains("did you mean `claude-cloud` or `claude-code`?")
+                || error.contains("did you mean `claude-code`"),
+            "{error}"
+        );
+        for entry in Catalog::builtin().harnesses() {
+            assert!(
+                error.contains(entry.id.as_str()),
+                "{error} lacks {}",
+                entry.id
+            );
+        }
+        let error = adapter("nothing-like-it").unwrap_err().to_string();
+        assert!(!error.contains("did you mean"), "{error}");
+        assert!(adapter("claude-code").is_ok());
+        assert!(adapter("sylphx").is_ok(), "legacy names still resolve");
+    }
 
     fn sha256_hex(bytes: &[u8]) -> String {
         let mut hasher = Sha256::new();
