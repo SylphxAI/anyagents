@@ -10,6 +10,9 @@ use std::io::IsTerminal as _;
 
 use crate::api::{AgentView, ConversationTurnView, MessageView};
 
+mod presentation;
+pub use presentation::{error, heading, is_verbose, note, schedules, set_verbose, success, value};
+
 /// True when stdout should use interactive human formatting.
 pub fn is_pretty() -> bool {
     if std::env::var_os("ANYAGENTS_RAW").is_some_and(|v| v == "1" || v == "true") {
@@ -188,11 +191,11 @@ pub fn truncate_visible(s: &str, max_cols: usize) -> String {
     out
 }
 
-/// Detect the active terminal width in columns (falls back to 120 when not attached to a tty).
+/// Detect the active terminal width in columns (falls back to 120 without a tty).
 pub fn terminal_width() -> usize {
     if let Ok(val) = std::env::var("COLUMNS")
         && let Ok(cols) = val.trim().parse::<usize>()
-        && cols >= 40
+        && cols >= 20
     {
         return cols;
     }
@@ -201,13 +204,13 @@ pub fn terminal_width() -> usize {
         for fd in [1, 2, 0] {
             unsafe {
                 let mut ws: libc::winsize = std::mem::zeroed();
-                if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col >= 40 {
+                if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col >= 20 {
                     return ws.ws_col as usize;
                 }
             }
         }
     }
-    160
+    120
 }
 
 /// Pad a potentially ANSI-styled string on the right to `target_width` visible chars.
@@ -376,6 +379,40 @@ impl Table {
         }
 
         let term_w = terminal_width();
+        let available = term_w.saturating_sub(visible_width(self.indent));
+        let natural = widths.iter().sum::<usize>() + 2 * cols.saturating_sub(1);
+        if self.fit_terminal && natural > available {
+            let minimum = self
+                .headers
+                .iter()
+                .map(|(h, _)| visible_width(h).max(6))
+                .sum::<usize>()
+                + 2 * cols.saturating_sub(1);
+            if minimum > available {
+                let mut lines = Vec::new();
+                for (n, row) in self.rows.iter().enumerate() {
+                    if n > 0 {
+                        lines.push(String::new());
+                    }
+                    for (i, (title, _)) in self.headers.iter().enumerate() {
+                        let cell = row.get(i).map(String::as_str).unwrap_or("—");
+                        let label = format!("{}{}  ", self.indent, dim(title));
+                        let space = term_w.saturating_sub(visible_width(&label));
+                        lines.push(format!("{label}{}", truncate_visible(cell, space)));
+                    }
+                }
+                return lines;
+            }
+            while widths.iter().sum::<usize>() + 2 * cols.saturating_sub(1) > available {
+                let Some(i) = (0..cols)
+                    .filter(|&i| widths[i] > visible_width(self.headers[i].0).max(6))
+                    .max_by_key(|&i| widths[i])
+                else {
+                    break;
+                };
+                widths[i] -= 1;
+            }
+        }
         let max_last_col = if self.fit_terminal && cols > 1 && !self.headers[cols - 1].1 {
             let prefix_cols: usize = visible_width(self.indent)
                 + widths[..cols - 1].iter().sum::<usize>()
@@ -405,7 +442,7 @@ impl Table {
                 }
             }
         }
-        if self.fit_terminal && term_w >= 115 && visible_width(&header_line) > term_w {
+        if self.fit_terminal && visible_width(&header_line) > term_w {
             header_line = truncate_visible(&header_line, term_w);
         }
         out.push(header_line);
@@ -415,6 +452,12 @@ impl Table {
             let mut line = String::from(self.indent);
             for (i, (_, right)) in self.headers.iter().enumerate() {
                 let cell = row.get(i).map(String::as_str).unwrap_or("");
+                let fitted = if self.fit_terminal {
+                    truncate_visible(cell, widths[i])
+                } else {
+                    cell.to_string()
+                };
+                let cell = fitted.as_str();
                 if i + 1 == cols && !*right {
                     if let Some(max_w) = max_last_col {
                         line.push_str(&truncate_visible(cell, max_w));
@@ -433,7 +476,7 @@ impl Table {
                     }
                 }
             }
-            if self.fit_terminal && term_w >= 115 && visible_width(&line) > term_w {
+            if self.fit_terminal && visible_width(&line) > term_w {
                 line = truncate_visible(&line, term_w);
             }
             out.push(line);
