@@ -1983,20 +1983,31 @@ fn seat_sanitized_anthropic_credentials(src_bytes: &[u8], now_ms: i64) -> Vec<u8
     src_bytes.to_vec()
 }
 
+// Both paths are aliases within one selected profile, not independent accounts.
+// Prefer the usable token with the latest expiry rather than a stale root alias.
+fn read_anthropic_profile_credentials(profile_root: &Path) -> Option<Vec<u8>> {
+    [".credentials.json", ".claude/.credentials.json"]
+        .into_iter()
+        .filter_map(|rel| std::fs::read(profile_root.join(rel)).ok())
+        .reduce(|current, candidate| {
+            if json_oauth_expires_at(&candidate) > json_oauth_expires_at(&current) {
+                candidate
+            } else {
+                current
+            }
+        })
+}
+
 fn refresh_anthropic_profile_oauth_if_due(data: &Path, profile_root: &Path) -> Result<(), Error> {
     if crate::sandbox::is_isolated_test_env()
         && std::env::var_os("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL").is_none()
     {
         return Ok(());
     }
-    let cred_path = profile_root.join(".credentials.json");
-    let sub_cred_path = profile_root.join(".claude/.credentials.json");
-    let Ok(cred_text) =
-        std::fs::read_to_string(&cred_path).or_else(|_| std::fs::read_to_string(&sub_cred_path))
-    else {
+    let Some(cred_bytes) = read_anthropic_profile_credentials(profile_root) else {
         return Ok(());
     };
-    let Ok(mut cred) = serde_json::from_str::<serde_json::Value>(&cred_text) else {
+    let Ok(mut cred) = serde_json::from_slice::<serde_json::Value>(&cred_bytes) else {
         return Ok(());
     };
     let now_ms = anyagents_core::now_ms();
@@ -2031,7 +2042,7 @@ fn refresh_anthropic_profile_oauth_if_due(data: &Path, profile_root: &Path) -> R
     let reservation = OAuthRefreshDiskReservation::acquire(
         profile_root,
         &[".credentials.json", ".claude/.credentials.json"],
-        cred_text.len(),
+        cred_bytes.len(),
         now_ms,
     )?;
     let http = ureq::Agent::config_builder()
@@ -2235,14 +2246,7 @@ pub(crate) fn sync_anthropic_agent_credentials_from_profile(
             profile_root.display()
         );
     }
-    let src = if profile_root.join(".credentials.json").is_file() {
-        profile_root.join(".credentials.json")
-    } else if profile_root.join(".claude/.credentials.json").is_file() {
-        profile_root.join(".claude/.credentials.json")
-    } else {
-        return;
-    };
-    let Ok(raw_src_bytes) = std::fs::read(&src) else {
+    let Some(raw_src_bytes) = read_anthropic_profile_credentials(profile_root) else {
         return;
     };
     let now_ms = anyagents_core::now_ms();
@@ -2535,10 +2539,17 @@ pub(crate) fn seed_harness_credentials(
                     }
                 }
             }
-            if src.is_file() {
-                let Ok(raw_src_bytes) = std::fs::read(&src) else {
-                    continue;
-                };
+            let source = if is_anthropic_cred {
+                read_anthropic_profile_credentials(profile_root)
+            } else if src.is_file() {
+                match std::fs::read(&src) {
+                    Ok(bytes) => Some(bytes),
+                    Err(_) => continue,
+                }
+            } else {
+                None
+            };
+            if let Some(raw_src_bytes) = source {
                 let now_ms = anyagents_core::now_ms();
                 let src_bytes = if is_anthropic_cred {
                     seat_sanitized_anthropic_credentials(&raw_src_bytes, now_ms)
@@ -2560,6 +2571,28 @@ pub(crate) fn seed_harness_credentials(
                     }
                     if let Ok(dst_bytes) = std::fs::read(&dst) {
                         if src_bytes == dst_bytes {
+                            found_in_profile = true;
+                            break;
+                        }
+                        // Do not regress a newer isolated seat token to an expired
+                        // or older profile snapshot. A profile/account cutover must
+                        // still replace it, and retained seat bytes stay sanitized.
+                        if !profile_changed
+                            && is_anthropic_cred
+                            && json_oauth_expires_at(&dst_bytes).is_some_and(|dst_exp| {
+                                dst_exp > now_ms
+                                    && Some(dst_exp) > json_oauth_expires_at(&src_bytes)
+                            })
+                            && !matches!(
+                                (json_oauth_identity(&src_bytes), json_oauth_identity(&dst_bytes)),
+                                (Some(src_id), Some(dst_id)) if src_id != dst_id
+                            )
+                        {
+                            let sanitized =
+                                seat_sanitized_anthropic_credentials(&dst_bytes, now_ms);
+                            if sanitized != dst_bytes {
+                                write_required_file(&dst, &sanitized, 0o660)?;
+                            }
                             found_in_profile = true;
                             break;
                         }
@@ -15112,6 +15145,271 @@ Connection: close
         let _ = stream.shutdown(std::net::Shutdown::Write);
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
         let _ = stream.read(&mut chunk);
+    }
+
+    // Exercise production sanitization without changing the environment of parallel tests.
+    fn claude_projection_test_worker(test: &str) -> bool {
+        const WORKER: &str = "ANYAGENTS_CLAUDE_PROJECTION_TEST";
+        if std::env::var_os(WORKER).is_some() {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(WORKER, "1")
+            .env(
+                "ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL",
+                "http://127.0.0.1:1/oauth/token",
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        false
+    }
+
+    fn claude_projection_credentials(token: &str, expiry: i64, refresh: bool) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"claudeAiOauth": {
+            "accessToken": token,
+            "refreshToken": if refresh { Some("profile-only-refresh") } else { None },
+            "expiresAt": expiry,
+            "accountUuid": "selected-account"
+        }}))
+        .unwrap()
+    }
+
+    fn assert_claude_projection(config: &Path, token: &str, expiry: i64) {
+        for rel in [".credentials.json", ".claude/.credentials.json"] {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(config.join(rel)).unwrap()).unwrap();
+            assert_eq!(value["claudeAiOauth"]["accessToken"], token, "{rel}");
+            assert_eq!(value["claudeAiOauth"]["expiresAt"], expiry, "{rel}");
+            assert!(value["claudeAiOauth"]["refreshToken"].is_null(), "{rel}");
+        }
+    }
+
+    #[test]
+    fn claude_projection_seed_respects_source_target_expiry_and_isolation() {
+        if !claude_projection_test_worker(
+            "create::runtime_config_tests::claude_projection_seed_respects_source_target_expiry_and_isolation",
+        ) {
+            return;
+        }
+        let now = anyagents_core::now_ms();
+        // Each alias can be the only authoritative source; an absent or expired
+        // source must never regress a valid seat or borrow another profile.
+        for source_rel in [".credentials.json", ".claude/.credentials.json"] {
+            for source_exp in [None, Some(now - 1_000), Some(now + 7_200_000)] {
+                for target_exp in [
+                    None,
+                    Some(now - 2_000),
+                    Some(now + 3_600_000),
+                    Some(now + 10_800_000),
+                ] {
+                    for target_identity in ["selected-account", "other-account"] {
+                        let dir = tempfile::tempdir().unwrap();
+                        let store = Store::open(dir.path().join("state.db")).unwrap();
+                        let agent = store
+                            .create_agent(anyagents_core::NewAgent::new("sample", "claude-code"))
+                            .unwrap();
+                        let profile = dir.path().join("profiles/anthropic/selected");
+                        let other = dir.path().join("profiles/anthropic/default");
+                        let cfg = agent_config_dir(dir.path(), &agent.id);
+                        for root in [&profile, &other, &cfg] {
+                            std::fs::create_dir_all(root.join(".claude")).unwrap();
+                        }
+                        // Suppress a network refresh, not the production sanitizer.
+                        write_profile_marker(
+                            &profile,
+                            OAUTH_REFRESH_ATTEMPT_FILE,
+                            &now.to_string(),
+                        )
+                        .unwrap();
+                        write_profile_marker(&cfg, ".anyagents-profile", "anthropic/selected\n")
+                            .unwrap();
+                        write_profile_marker(
+                            &cfg,
+                            ".anyagents-seeded-profile",
+                            "anthropic/selected\n",
+                        )
+                        .unwrap();
+                        let foreign =
+                            claude_projection_credentials("other-profile", now + 14_400_000, true);
+                        std::fs::write(other.join(".credentials.json"), &foreign).unwrap();
+                        let source = source_exp
+                            .map(|exp| claude_projection_credentials("source", exp, true));
+                        if let Some(ref bytes) = source {
+                            std::fs::write(profile.join(source_rel), bytes).unwrap();
+                        }
+                        if let Some(exp) = target_exp {
+                            let mut value: serde_json::Value = serde_json::from_slice(
+                                &claude_projection_credentials("target", exp, false),
+                            )
+                            .unwrap();
+                            value["claudeAiOauth"]["accountUuid"] = target_identity.into();
+                            if source.is_some() {
+                                // A retained token must also have its refresh field sanitized.
+                                value["claudeAiOauth"]["refreshToken"] = "".into();
+                            }
+                            let bytes = serde_json::to_vec(&value).unwrap();
+                            for rel in [".credentials.json", ".claude/.credentials.json"] {
+                                std::fs::write(cfg.join(rel), &bytes).unwrap();
+                            }
+                        }
+                        seed_harness_credentials(&store, dir.path(), &agent, &cfg).unwrap();
+                        let expected = match (source_exp, target_exp) {
+                            (None, target) => target.map(|exp| ("target", exp)),
+                            (Some(src), Some(dst))
+                                if dst > now
+                                    && dst > src
+                                    && target_identity == "selected-account" =>
+                            {
+                                Some(("target", dst))
+                            }
+                            (Some(src), _) if src > now => Some(("source", src)),
+                            _ => Some(("", 0)),
+                        };
+                        if let Some((token, expiry)) = expected {
+                            assert_claude_projection(&cfg, token, expiry);
+                            let projected: serde_json::Value = serde_json::from_slice(
+                                &std::fs::read(cfg.join(".credentials.json")).unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                projected["claudeAiOauth"]["accountUuid"],
+                                if token == "target" {
+                                    target_identity
+                                } else {
+                                    "selected-account"
+                                }
+                            );
+                        } else {
+                            assert!(!cfg.join(".credentials.json").exists());
+                            assert!(!cfg.join(".claude/.credentials.json").exists());
+                        }
+                        if let Some(bytes) = source {
+                            assert_eq!(std::fs::read(profile.join(source_rel)).unwrap(), bytes);
+                        }
+                        assert_eq!(
+                            std::fs::read(other.join(".credentials.json")).unwrap(),
+                            foreign
+                        );
+                        assert_eq!(
+                            bound_profile_name(&cfg).as_deref(),
+                            Some("anthropic/selected")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn claude_projection_switch_and_launch_choose_fresh_selected_profile_alias() {
+        if !claude_projection_test_worker(
+            "create::runtime_config_tests::claude_projection_switch_and_launch_choose_fresh_selected_profile_alias",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sample", "codex"))
+            .unwrap();
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        let profile = dir.path().join("profiles/anthropic/selected");
+        for root in [&cfg, &profile] {
+            std::fs::create_dir_all(root.join(".claude")).unwrap();
+        }
+        let now = anyagents_core::now_ms();
+        let stale = claude_projection_credentials("expired", now - 1_000, true);
+        let fresh = claude_projection_credentials("selected-fresh", now + 7_200_000, true);
+        let previous = claude_projection_credentials("previous-profile", now + 14_400_000, false);
+        std::fs::write(profile.join(".credentials.json"), &stale).unwrap();
+        std::fs::write(profile.join(".claude/.credentials.json"), &fresh).unwrap();
+        for rel in [".credentials.json", ".claude/.credentials.json"] {
+            std::fs::write(cfg.join(rel), &previous).unwrap();
+        }
+        write_profile_marker(&cfg, ".anyagents-profile", "openai/default\n").unwrap();
+        write_profile_marker(&cfg, ".anyagents-seeded-profile", "openai/default\n").unwrap();
+        // The stale alias must not trigger refresh while a fresh alias exists.
+        let result = configure_agent_runtime(
+            &store,
+            dir.path(),
+            "operator",
+            &agent.name,
+            Some("claude-code"),
+            Some("anthropic/claude-opus-4-6"),
+            Some("anthropic/selected"),
+        )
+        .unwrap();
+        assert_eq!(result["harness"], "claude-code");
+        assert_eq!(result["profile"], "anthropic/selected");
+        assert_claude_projection(&cfg, "selected-fresh", now + 7_200_000);
+        assert!(!profile.join(OAUTH_REFRESH_ATTEMPT_FILE).exists());
+        assert_eq!(
+            std::fs::read(profile.join(".credentials.json")).unwrap(),
+            stale
+        );
+        assert_eq!(
+            std::fs::read(profile.join(".claude/.credentials.json")).unwrap(),
+            fresh
+        );
+
+        // Ordinary launch reconciles via the same owner, with the other alias fresh.
+        std::fs::write(profile.join(".credentials.json"), &fresh).unwrap();
+        std::fs::write(profile.join(".claude/.credentials.json"), &stale).unwrap();
+        for rel in [".credentials.json", ".claude/.credentials.json"] {
+            std::fs::write(
+                cfg.join(rel),
+                claude_projection_credentials("expired-seat", now - 2_000, false),
+            )
+            .unwrap();
+        }
+        let updated = store.agent(&agent.id).unwrap();
+        reconcile_agent_runtime_config_for_launch(
+            &store,
+            dir.path(),
+            &updated,
+            &cfg,
+            &agent_work_dir(dir.path(), &agent.id),
+        )
+        .unwrap();
+        assert_claude_projection(&cfg, "selected-fresh", now + 7_200_000);
+        assert_eq!(
+            std::fs::read(profile.join(".credentials.json")).unwrap(),
+            fresh
+        );
+        assert_eq!(
+            std::fs::read(profile.join(".claude/.credentials.json")).unwrap(),
+            stale
+        );
+
+        // Required credential writes still fail closed on an unwritable destination.
+        std::fs::remove_file(cfg.join(".credentials.json")).unwrap();
+        std::fs::create_dir(cfg.join(".credentials.json")).unwrap();
+        assert!(seed_harness_credentials(&store, dir.path(), &updated, &cfg).is_err());
+        std::fs::remove_dir(cfg.join(".credentials.json")).unwrap();
+
+        // A profile switch with no credentials clears old-profile credentials,
+        // rather than retaining a valid token from a different account.
+        let empty = dir.path().join("profiles/anthropic/empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "anthropic/empty\n").unwrap();
+        seed_harness_credentials(&store, dir.path(), &updated, &cfg).unwrap();
+        assert!(!cfg.join(".credentials.json").exists());
+        assert!(!cfg.join(".claude/.credentials.json").exists());
+        assert_eq!(
+            seeded_profile_name(&cfg).as_deref(),
+            Some("anthropic/empty")
+        );
     }
 
     #[test]
