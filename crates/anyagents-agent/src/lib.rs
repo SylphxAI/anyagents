@@ -1202,7 +1202,7 @@ mod stream_custody_tests {
         assert!(delivery.harness().written_ids().is_empty());
         drop(delivery);
 
-        fs::write(&program, "#!/usr/bin/python3\nimport sys\nfor line in sys.stdin:\n print('{\"type\":\"result\"}', flush=True)\n").unwrap();
+        fs::write(&program, "#!/usr/bin/python3\nimport sys\nfor line in sys.stdin:\n print('{\"type\":\"result\",\"response\":\"ok\"}', flush=True)\n").unwrap();
         let store = Store::open(&db).unwrap();
         let pending = store.next_undelivered(&agent.id).unwrap().unwrap();
         assert_eq!(pending.sender.as_deref(), Some("original-sender"));

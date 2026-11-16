@@ -129,9 +129,7 @@ impl StreamSpec {
         let finishes = quota_reset_at_ms.is_none()
             && match self.protocol {
                 LineProtocol::AcknowledgedResult => kind == Some("result"),
-                LineProtocol::Result => {
-                    kind == Some("result") && (!is_error || self.name == "anyagents-agy")
-                }
+                LineProtocol::Result => kind == Some("result") && (!is_error || self.is_agy()),
             };
         LineEffect {
             finishes_turn: finishes,
@@ -178,6 +176,10 @@ impl StreamSpec {
             .flatten()
             .and_then(Value::as_str)
             .map(str::to_string)
+    }
+
+    fn is_agy(&self) -> bool {
+        self.name == "anyagents-agy"
     }
 }
 
@@ -317,6 +319,9 @@ struct State {
     /// stdin showed its first step or closed. A proof about the session, so
     /// a new process keeps it.
     agy_taken: HashSet<String>,
+    /// Whether the currently open Antigravity turn has shown meaningful
+    /// progress (model response text, planner step, or tool execution).
+    agy_turn_has_work: bool,
     /// The message whose turn closed on a stray syntax fragment and was told
     /// once to continue: a turn is continued at most once.
     agy_continued: Option<String>,
@@ -663,6 +668,7 @@ impl StreamHarness {
         state.turn_user_inputs = 0;
         state.last_turn_step_type = None;
         state.idle_since = None;
+        state.agy_turn_has_work = false;
         Ok(())
     }
 
@@ -672,7 +678,7 @@ impl StreamHarness {
     /// does no I/O.
     pub fn proven(&self, id: &str) -> Option<Proof> {
         let state = lock(&self.shared);
-        state.proof_of(self.spec.protocol, self.agy_rpc.is_some(), id)
+        state.proof_of(self.spec.protocol, self.spec.is_agy(), id)
     }
 
     /// A read of the child's state. It never does I/O: an Antigravity
@@ -812,7 +818,7 @@ impl StreamHarness {
                 // Written and not proven yet: an Antigravity prompt until its
                 // cascade shows the turn, an older Spiron's until `accepted`.
                 if state.seen.contains(id) {
-                    return Ok(if self.agy_rpc.is_some() {
+                    return Ok(if self.spec.is_agy() {
                         DeliverOutcome::InFlight
                     } else if self.spec.protocol == LineProtocol::AcknowledgedResult {
                         DeliverOutcome::Deferred
@@ -862,6 +868,7 @@ impl StreamHarness {
                         state.open.push(id.to_string());
                         state.turn_user_inputs = 0;
                         state.idle_since = None;
+                        state.agy_turn_has_work = false;
                         state.sign_in_fault = None;
                     } else if self.mode == DeliveryMode::Steer {
                         if !state.open.iter().any(|open| open == id) {
@@ -1253,6 +1260,7 @@ impl StreamHarness {
             state.turn_user_inputs = 0;
             state.last_turn_step_type = None;
             state.idle_since = None;
+            state.agy_turn_has_work = false;
             state.last_rpc_health_poll = None;
             state.last_steer_probe = None;
             state.planner_config = None;
@@ -1398,6 +1406,7 @@ impl StreamHarness {
         state.turn_user_inputs = 0;
         state.last_turn_step_type = None;
         state.idle_since = None;
+        state.agy_turn_has_work = false;
         state.last_rpc_health_poll = None;
         state.last_steer_probe = None;
         state.planner_config = None;
@@ -1584,21 +1593,7 @@ impl State {
 
     fn persist_failure(&self) {
         if let (Some(dir), Some(error)) = (&self.state_dir, self.failure()) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |time| time.as_millis());
-            let path = dir.join(".anyagents-last-error.json");
-            let payload = json!({
-                "error": error,
-                "timestamp_ms": now,
-                "quota_reset_at_ms": self.quota_reset_at_ms,
-            })
-            .to_string();
-            if let Err(err) =
-                anyagents_harness::atomic_write_in_existing_dir(&path, payload.as_bytes(), 0o664)
-            {
-                eprintln!("cannot persist {}: {err}", path.display());
-            }
+            persist_failure_to_dir(dir, &error, self.quota_reset_at_ms);
         }
     }
 
@@ -1678,6 +1673,7 @@ impl State {
             agy_refused_turn: None,
             agy_queued: Vec::new(),
             agy_taken: HashSet::new(),
+            agy_turn_has_work: false,
             agy_continued: None,
             session_retired: false,
             stdin_broken: false,
@@ -1781,7 +1777,7 @@ fn read_stdout(
             })
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let poisoned_agy = spec.name == "anyagents-agy"
+        let poisoned_agy = spec.is_agy()
             && matches!(kind, Some("done") | Some("result"))
             && error.is_some_and(|error| {
                 error
@@ -1794,21 +1790,8 @@ fn read_stdout(
         }
         if let Some(ref rpc) = agy_rpc {
             if poisoned_agy {
-                let path = rpc.config_dir.join(".anyagents-last-error.json");
-                let payload = json!({
-                    "error": error,
-                    "timestamp_ms": std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0),
-                })
-                .to_string();
-                if let Err(err) = anyagents_harness::atomic_write_in_existing_dir(
-                    &path,
-                    payload.as_bytes(),
-                    0o664,
-                ) {
-                    eprintln!("cannot persist {}: {err}", path.display());
+                if let Some(err_str) = error {
+                    persist_failure_to_dir(&rpc.config_dir, err_str, None);
                 }
             } else if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                 let err_msg = value
@@ -1816,24 +1799,7 @@ fn read_stdout(
                     .or_else(|| value.get("error"))
                     .and_then(Value::as_str)
                     .unwrap_or("RESOURCE_EXHAUSTED: quota reached");
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                let path = rpc.config_dir.join(".anyagents-last-error.json");
-                let payload = serde_json::json!({
-                    "error": err_msg,
-                    "quota_reset_at_ms": reset_at_ms,
-                    "timestamp_ms": now_ms,
-                })
-                .to_string();
-                if let Err(err) = anyagents_harness::atomic_write_in_existing_dir(
-                    &path,
-                    payload.as_bytes(),
-                    0o664,
-                ) {
-                    eprintln!("cannot persist {}: {err}", path.display());
-                }
+                persist_failure_to_dir(&rpc.config_dir, err_msg, Some(reset_at_ms));
             } else if effect.finishes_turn {
                 let _ = std::fs::remove_file(rpc.config_dir.join(".anyagents-last-error.json"));
             }
@@ -1865,16 +1831,18 @@ fn read_stdout(
             if state.generation != generation {
                 return;
             }
-            if let Some(content) = &fragment
-                && let Some(id) = state.open.first().cloned()
-                && state.agy_continued.as_ref() != Some(&id)
-            {
-                state.agy_continued = Some(id);
-                effect.finishes_turn = false;
-                continue_turn = Some((
-                    agy_continue_line(&spec, content),
-                    effect.usage.take().unwrap_or_else(|| spec.usage_of(&value)),
-                ));
+            if let Some(content) = &fragment {
+                state.agy_turn_has_work = true;
+                if let Some(id) = state.open.first().cloned()
+                    && state.agy_continued.as_ref() != Some(&id)
+                {
+                    state.agy_continued = Some(id);
+                    effect.finishes_turn = false;
+                    continue_turn = Some((
+                        agy_continue_line(&spec, content),
+                        effect.usage.take().unwrap_or_else(|| spec.usage_of(&value)),
+                    ));
+                }
             }
             let before = state.observed();
             state.idle_since = None;
@@ -1931,16 +1899,23 @@ fn read_stdout(
                 .and_then(Value::as_str)
             {
                 state.last_turn_step_type = Some(step_type.to_string());
+                let has_work = spec.is_agy() && agy_step_has_work(&value);
                 if step_type == "user_input" || state.turn_user_inputs == 0 {
                     state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
                 }
-                agy_note_opener_taken(&mut state);
+                if !spec.is_agy() || step_type == "user_input" || has_work {
+                    agy_note_opener_taken(&mut state);
+                }
+                if has_work {
+                    state.agy_turn_has_work = true;
+                }
             }
             if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                 state.quota_reset_at_ms = Some(reset_at_ms);
                 // Such a peer still closes its turn with a result that names
                 // what it consumed; nothing is dropped before that.
                 if !consumption {
+                    state.agy_turn_has_work = false;
                     let rejected_ids = std::mem::take(&mut state.open);
                     for id in rejected_ids {
                         state.seen.remove(&id);
@@ -2015,6 +1990,12 @@ fn read_stdout(
                     );
                 } else if spec.protocol == LineProtocol::AcknowledgedResult {
                     finish_correlated(&mut state, value["request_id"].as_str().unwrap(), usage);
+                } else if spec.is_agy()
+                    && !state.open.is_empty()
+                    && !state.agy_turn_has_work
+                    && !agy_result_has_output(&value, error)
+                {
+                    retire_agy_empty_turn(&mut state, agy_rpc.as_ref());
                 } else {
                     finish_open(&mut state, usage);
                 }
@@ -2216,6 +2197,98 @@ fn finish_open_quiet(state: &mut State) {
     id_for_quiet(state, &id);
 }
 
+const AGY_EMPTY_TURN_FAULT: &str =
+    "agy_empty_turn: Antigravity turn ended without model output, planner response, or tool work";
+
+fn persist_failure_to_dir(dir: &Path, error: &str, quota_reset_at_ms: Option<i64>) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_millis() as i64);
+    let path = dir.join(".anyagents-last-error.json");
+    let payload = json!({
+        "error": error,
+        "timestamp_ms": now_ms,
+        "quota_reset_at_ms": quota_reset_at_ms,
+    })
+    .to_string();
+    if let Err(err) =
+        anyagents_harness::atomic_write_in_existing_dir(&path, payload.as_bytes(), 0o664)
+    {
+        eprintln!("cannot persist {}: {err}", path.display());
+    }
+}
+
+fn non_empty_str(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+fn agy_step_has_work(value: &Value) -> bool {
+    let Some(step_update) = value.get("step_update") else {
+        return false;
+    };
+    let Some(step_type) = step_update.get("step_type").and_then(Value::as_str) else {
+        return false;
+    };
+    match step_type {
+        "" | "user_input" | "system_message" | "error_message" | "checkpoint"
+        | "ephemeral_message" => false,
+        "agent_response" => [
+            step_update.get("text_delta"),
+            step_update.get("text"),
+            step_update.get("content"),
+            step_update.pointer("/agent_response/text_delta"),
+            step_update.pointer("/agent_response/text"),
+            step_update.pointer("/agent_response/response"),
+        ]
+        .into_iter()
+        .any(non_empty_str),
+        _ => true,
+    }
+}
+
+fn agy_result_has_output(value: &Value, error: Option<&str>) -> bool {
+    error.is_some()
+        || [
+            value.pointer("/result/response"),
+            value.pointer("/result/text"),
+            value.get("response"),
+            value.get("text"),
+        ]
+        .into_iter()
+        .any(non_empty_str)
+}
+
+/// Fault and retire an Antigravity child whose turn closed without meaningful
+/// model/planner/tool work, clearing open/followup queues without fabricating
+/// consumption or finish proofs while keeping any verified prior proofs intact.
+fn retire_agy_empty_turn(state: &mut State, agy_rpc: Option<&AgyRpcConfig>) {
+    state.sign_in_fault = Some(AGY_EMPTY_TURN_FAULT.to_string());
+    state.open.clear();
+    state.followups.clear();
+    state.turn_user_inputs = 0;
+    state.last_turn_step_type = None;
+    state.idle_since = None;
+    state.agy_turn_has_work = false;
+    state.agy_refused_turn = None;
+    state.agy_queued.clear();
+    state.persist_failure();
+    if let Some(rpc) = agy_rpc
+        && state.state_dir.as_deref() != Some(rpc.config_dir.as_path())
+    {
+        persist_failure_to_dir(
+            &rpc.config_dir,
+            AGY_EMPTY_TURN_FAULT,
+            state.quota_reset_at_ms,
+        );
+    }
+    if let Some(child) = state.child.as_mut() {
+        let _ = child.kill();
+    }
+    state.touch();
+}
+
 /// Finish the open message with no usage of its own, keeping its last text.
 fn id_for_quiet(state: &mut State, id: &str) {
     let text = state.text.clone();
@@ -2224,6 +2297,7 @@ fn id_for_quiet(state: &mut State, id: &str) {
     state.turn_user_inputs = 0;
     state.last_turn_step_type = None;
     state.idle_since = None;
+    state.agy_turn_has_work = false;
     state.finished.insert(id.to_string());
     state.text = text;
 }
@@ -2235,6 +2309,7 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     state.turn_user_inputs = 0;
     state.last_turn_step_type = None;
     state.idle_since = None;
+    state.agy_turn_has_work = false;
     if state.open.is_empty() {
         return;
     }
@@ -2273,6 +2348,7 @@ fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage) {
     state.turn_user_inputs = 0;
     state.last_turn_step_type = None;
     state.idle_since = None;
+    state.agy_turn_has_work = false;
 }
 
 /// The `ready` frame names both capabilities the pipelined path relies on:
@@ -2570,6 +2646,7 @@ fn finish_consumed(state: &mut State, turn: &str, usage: TurnUsage, value: &Valu
     state.turn_user_inputs = 0;
     state.last_turn_step_type = None;
     state.idle_since = None;
+    state.agy_turn_has_work = false;
 }
 
 fn note_markers(state: &mut State, value: &Value) {
@@ -3223,6 +3300,11 @@ fn agy_steer_attempt(
         }
         let had_open = !state.open.is_empty();
         if !running && had_open {
+            if !state.agy_turn_has_work {
+                retire_agy_empty_turn(&mut state, Some(&rpc));
+                wake.notify_all();
+                return AgySteered::Returned;
+            }
             // The previous turn in `agy` already finished (`CASCADE_RUN_STATUS_IDLE`)
             // while held open by a background task. Close those open messages now
             // so `turn_recovery.completed_seq` advances and never replays stale
@@ -3231,6 +3313,7 @@ fn agy_steer_attempt(
             state.turns_started += 1;
         } else if !had_open {
             state.turns_started += 1;
+            state.agy_turn_has_work = false;
         }
         if !state.open.contains(&id) {
             state.open.push(id.clone());
@@ -3928,6 +4011,12 @@ fn watch_agy_cascade(
         let first_idle = state.idle_since.is_none();
         let idle_since = *state.idle_since.get_or_insert(now);
         if now.duration_since(idle_since) >= AGY_TURN_CLOSE_GRACE {
+            if !state.agy_turn_has_work {
+                retire_agy_empty_turn(&mut state, Some(&rpc));
+                drop(state);
+                wake.notify_all();
+                continue;
+            }
             finish_open(&mut state, TurnUsage::default());
             state.turn_user_inputs = 1;
             state.touch();
