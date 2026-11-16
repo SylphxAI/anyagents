@@ -5099,36 +5099,75 @@ impl AgentMcp {
     /// One skill file's text. Over stdio this tool server runs as the agent
     /// and reads what the agent can read. Over HTTP it runs as the server, and
     /// the skill directories it scans are writable by the agent's seat, so it
-    /// never follows a link the seat could have planted: a linked skill
-    /// directory (a `skills-view` entry) is followed once and only into the
-    /// shared or the agent's own skill root, and every component from there
-    /// is opened without following links.
+    /// resolves directory links only into shared/own skill roots (or the exact
+    /// own view from a vendor projection). The final descriptor-relative open
+    /// rejects links in every component, including resource files.
     fn read_skill_text(&self, dir: &Path, rel: &Path) -> std::io::Result<String> {
         if !self.client.via_http {
             return std::fs::read_to_string(dir.join(rel));
         }
-        let base = if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
-            let link = std::fs::read_link(dir)?;
-            let target = match dir.parent() {
-                Some(parent) if link.is_relative() => parent.join(link),
-                _ => link,
-            };
-            let mut roots = Vec::new();
-            if let Some(data_dir) = self.client.socket.parent() {
-                roots.push(data_dir.join("skills"));
+        let mut roots = Vec::new();
+        if let Some(data_dir) = self.client.socket.parent() {
+            roots.push(data_dir.join("skills"));
+        }
+        if let Some(agent_root) = self.client.config.parent() {
+            roots.push(agent_root.join("skills"));
+        }
+        let view = self
+            .client
+            .config
+            .parent()
+            .map(|root| root.join("skills-view"));
+        // Resolve projection directories only. Every link destination stays in
+        // the shared/own roots; resources below the skill remain no-follow.
+        let mut base = dir.to_path_buf();
+        let mut links = std::collections::BTreeSet::new();
+        loop {
+            let mut prefix = PathBuf::new();
+            let mut next = None;
+            for component in base.components() {
+                prefix.push(component.as_os_str());
+                if !std::fs::symlink_metadata(&prefix)?.file_type().is_symlink() {
+                    continue;
+                }
+                if links.len() >= 40 || !links.insert(prefix.clone()) {
+                    return Err(std::io::Error::other("cyclic skill projection"));
+                }
+                let link = std::fs::read_link(&prefix)?;
+                let target = if link.is_relative() {
+                    prefix
+                        .parent()
+                        .ok_or_else(|| std::io::Error::other("skill parent missing"))?
+                        .join(link)
+                } else {
+                    link
+                };
+                if target.components().any(|c| {
+                    !matches!(
+                        c,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                }) || !(roots.iter().any(|root| target.starts_with(root))
+                    || (view.as_ref().is_some_and(|view| target == *view)
+                        && [
+                            self.client.config.join("skills"),
+                            self.client.config.join(".agents/skills"),
+                        ]
+                        .contains(&prefix)))
+                {
+                    return Err(std::io::Error::other(
+                        "a linked skill directory points outside the skill roots",
+                    ));
+                }
+                next =
+                    Some(target.join(base.strip_prefix(&prefix).map_err(std::io::Error::other)?));
+                break;
             }
-            if let Some(agent_root) = self.client.config.parent() {
-                roots.push(agent_root.join("skills"));
+            match next {
+                Some(path) => base = path,
+                None => break,
             }
-            if !roots.iter().any(|root| target.starts_with(root)) {
-                return Err(std::io::Error::other(
-                    "a linked skill directory points outside the skill roots",
-                ));
-            }
-            target
-        } else {
-            dir.to_path_buf()
-        };
+        }
         let mut file = anyagents_core::raw_segment::open_readonly(&base.join(rel))?;
         let mut text = String::new();
         std::io::Read::read_to_string(&mut file, &mut text)?;
@@ -5136,7 +5175,6 @@ impl AgentMcp {
     }
 
     fn collect_skill_directories(&self) -> std::collections::BTreeMap<String, PathBuf> {
-        let mut map = std::collections::BTreeMap::new();
         let mut roots = Vec::new();
         if let Some(data_dir) = self.client.socket.parent() {
             roots.push(data_dir.join("skills"));
@@ -5151,23 +5189,7 @@ impl AgentMcp {
         roots.push(wd.join(".agents/skills"));
         roots.push(wd.join("skills"));
 
-        for root in roots {
-            let Ok(entries) = std::fs::read_dir(&root) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() || !path.join("SKILL.md").is_file() {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.is_empty() || name.starts_with('.') {
-                    continue;
-                }
-                map.insert(name, path);
-            }
-        }
-        map
+        anyagents_core::host_skills::discover(&roots)
     }
 
     /// Tell the server which skill file this agent read and the digest of the
