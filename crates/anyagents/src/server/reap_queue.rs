@@ -76,21 +76,38 @@ fn retry_delay_ms(attempts: u32) -> i64 {
         .min(MAX_RETRY_MS)
 }
 
-/// Queued agents whose cleanup is due at `now_ms`. An unreadable entry is due.
-pub(super) fn due(data: &Path, now_ms: i64) -> Vec<AgentId> {
+/// At most limit due archives, oldest deadline first. Selection memory is
+/// bounded; directory enumeration is not a wall-clock deadline.
+pub(super) fn due(data: &Path, now_ms: i64, limit: usize) -> Vec<AgentId> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let Ok(entries) = std::fs::read_dir(data.join(DIR)) else {
         return Vec::new();
     };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let id = AgentId::parse(entry.file_name().to_str()?).ok()?;
-            let due = std::fs::read(entry.path())
-                .ok()
-                .and_then(|raw| serde_json::from_slice::<Entry>(&raw).ok())
-                .is_none_or(|entry| entry.next_at_ms <= now_ms);
-            due.then_some(id)
-        })
+    let mut selected = BTreeSet::new();
+    for entry in entries.flatten() {
+        let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| AgentId::parse(s).ok())
+        else {
+            continue;
+        };
+        let next = std::fs::read(entry.path())
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Entry>(&raw).ok())
+            .map_or(i64::MIN, |entry| entry.next_at_ms);
+        if next <= now_ms {
+            selected.insert((next, id.to_string()));
+            if selected.len() > limit {
+                selected.pop_last();
+            }
+        }
+    }
+    selected
+        .into_iter()
+        .filter_map(|(_, id)| AgentId::parse(&id).ok())
         .collect()
 }
 
@@ -128,25 +145,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn due_selects_oldest_bounded_entries_and_recovers_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut expected = Vec::new();
+        for i in (0..65).rev() {
+            let id = AgentId::generate();
+            write(
+                dir.path(),
+                &id,
+                &Entry {
+                    attempts: 0,
+                    next_at_ms: i,
+                },
+            );
+            expected.push((i, id));
+        }
+        expected.sort_by_key(|(i, _)| *i);
+        assert!(due(dir.path(), i64::MAX, 0).is_empty());
+        assert!(due(dir.path(), -1, 32).is_empty());
+        let malformed = AgentId::generate();
+        std::fs::write(entry_path(dir.path(), &malformed), b"broken").unwrap();
+        assert_eq!(due(dir.path(), 0, 1), vec![malformed.clone()]);
+        dequeue(dir.path(), &malformed);
+        for chunk in expected.chunks(32) {
+            let selected = due(dir.path(), i64::MAX, 32);
+            assert_eq!(
+                selected,
+                chunk.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>()
+            );
+            for id in selected {
+                dequeue(dir.path(), &id);
+            }
+        }
+        assert!(due(dir.path(), i64::MAX, 32).is_empty());
+    }
+
+    #[test]
     fn failures_back_off_doubling_to_a_day() {
         let dir = tempfile::tempdir().unwrap();
         let id = AgentId::generate();
         enqueue(dir.path(), &id);
-        assert_eq!(due(dir.path(), 0), std::slice::from_ref(&id));
+        assert_eq!(due(dir.path(), 0, usize::MAX), std::slice::from_ref(&id));
         note_failure(dir.path(), &id, 1_000);
-        assert!(due(dir.path(), 1_000 + 59_999).is_empty());
-        assert_eq!(due(dir.path(), 1_000 + 60_000), std::slice::from_ref(&id));
-        note_failure(dir.path(), &id, 100_000);
-        assert!(due(dir.path(), 100_000 + 119_999).is_empty());
+        assert!(due(dir.path(), 1_000 + 59_999, usize::MAX).is_empty());
         assert_eq!(
-            due(dir.path(), 100_000 + 120_000),
+            due(dir.path(), 1_000 + 60_000, usize::MAX),
+            std::slice::from_ref(&id)
+        );
+        note_failure(dir.path(), &id, 100_000);
+        assert!(due(dir.path(), 100_000 + 119_999, usize::MAX).is_empty());
+        assert_eq!(
+            due(dir.path(), 100_000 + 120_000, usize::MAX),
             std::slice::from_ref(&id)
         );
         assert_eq!(retry_delay_ms(30), MAX_RETRY_MS);
         // A new archive owes a fresh cleanup at once.
         enqueue(dir.path(), &id);
-        assert_eq!(due(dir.path(), 0), std::slice::from_ref(&id));
+        assert_eq!(due(dir.path(), 0, usize::MAX), std::slice::from_ref(&id));
         dequeue(dir.path(), &id);
-        assert!(due(dir.path(), i64::MAX).is_empty());
+        assert!(due(dir.path(), i64::MAX, usize::MAX).is_empty());
     }
 }
