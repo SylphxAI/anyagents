@@ -3042,14 +3042,20 @@ fn an_agy_proof_written_just_before_the_stop_is_kept() {
 #[cfg(unix)]
 fn a_proof_written_just_before_the_stop_is_answered_after_it() {
     let dir = tempfile::tempdir().unwrap();
+    let release = dir.path().join("release");
     let written = dir.path().join("proved");
     let script = r#"
 import json, pathlib, sys, time
 print(json.dumps({"type":"ready","protocol":"spiron.headless/v2","capabilities":["steer_consumed","idempotent_input"]}), flush=True)
+release = pathlib.Path(sys.argv[1])
+written = pathlib.Path(sys.argv[2])
 for line in sys.stdin:
     message = json.loads(line)
+    deadline = time.monotonic() + 30
+    while not release.exists() and time.monotonic() < deadline:
+        time.sleep(0.005)
     print(json.dumps({"type":"accepted","mode":"turn","request_id":message["request_id"]}), flush=True)
-    pathlib.Path(sys.argv[1]).write_text("")
+    written.write_text("")
     time.sleep(60)
 "#;
     let mut harness = super::StreamHarness::launch(super::Launch {
@@ -3066,6 +3072,7 @@ for line in sys.stdin:
             "-u".into(),
             "-c".into(),
             script.into(),
+            release.display().to_string(),
             written.display().to_string(),
         ],
         environment: vec![],
@@ -3085,6 +3092,7 @@ for line in sys.stdin:
             .unwrap(),
         anyagents_harness::DeliverOutcome::InFlight
     );
+    std::fs::write(&release, "").unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while !written.exists() {
         assert!(
