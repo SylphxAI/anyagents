@@ -20,15 +20,14 @@ use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyagents_harness_spiron::{ListenError, Reattach, SpironHarness, SpironLaunch};
+use anyagents_harness_spiron::{
+    ListenError, MAX_SOCKET_PATH, Reattach, SpironHarness, SpironLaunch,
+};
 use anyagents_keeper::{Presence, ProcessIdentity};
 use serde::{Deserialize, Serialize};
 
 /// How long an attach may take: the replay of one process's frames.
 const ATTACH_WAIT: Duration = Duration::from_secs(60);
-
-/// The longest Unix socket path (`sun_path` less its terminator).
-const SOCKET_PATH_MAX: usize = 107;
 
 /// One launch of a v2 Spiron, as the server that launched it recorded it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -148,9 +147,9 @@ pub(crate) fn launch(
 ) -> Result<SpironHarness, ListenError> {
     // The agent's config directory: the server and the agent's seat reach it.
     let socket = spiron.state_dir.join("spiron.sock");
-    if socket.as_os_str().len() > SOCKET_PATH_MAX {
+    if socket.as_os_str().len() > MAX_SOCKET_PATH {
         return Err(ListenError::Failed(format!(
-            "Unix socket path for {} exceeds {SOCKET_PATH_MAX} bytes: {}",
+            "Unix socket path for {} exceeds {MAX_SOCKET_PATH} bytes: {}",
             at.agent,
             socket.display()
         )));

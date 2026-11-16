@@ -43,6 +43,9 @@ pub struct SpironLaunch {
 /// [`anyagents_harness::STOP_DEADLINE`], which a host waits for a stop.
 const STOP_GRACE: Duration = Duration::from_secs(3);
 
+/// The longest Unix socket path (`sun_path` less its terminator) this host OS binds.
+pub const MAX_SOCKET_PATH: usize = if cfg!(target_os = "linux") { 107 } else { 103 };
+
 /// One long-lived Spiron process.
 pub struct SpironHarness {
     inner: StreamHarness,
@@ -141,6 +144,12 @@ impl SpironHarness {
         spawned: impl FnOnce(u32) -> Result<(), String>,
     ) -> Result<Self, ListenError> {
         let failed = |error: String| ListenError::Failed(error);
+        if socket.as_os_str().len() > MAX_SOCKET_PATH {
+            return Err(failed(format!(
+                "Unix socket path exceeds {MAX_SOCKET_PATH} bytes: {}",
+                socket.display()
+            )));
+        }
         let mut args = launch.args.clone();
         if let Some(session) = &launch.session {
             args.extend(["--session".to_string(), session.clone()]);
@@ -410,5 +419,41 @@ impl Drop for SpironHarness {
     /// adapter, as a stdio child does.
     fn drop(&mut self) {
         self.end_listening();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_listening_rejects_oversized_socket_path_before_spawning() {
+        let temp = tempfile::tempdir().unwrap();
+        let oversized = temp
+            .path()
+            .join(format!("{}.sock", "x".repeat(MAX_SOCKET_PATH)));
+        let log = temp.path().join("spiron.log");
+        let launch = SpironLaunch {
+            program: temp.path().join("missing-spiron"),
+            args: Vec::new(),
+            environment: Vec::new(),
+            work_dir: temp.path().to_path_buf(),
+            session: None,
+            state_dir: temp.path().to_path_buf(),
+        };
+        let Err(ListenError::Failed(error)) = SpironHarness::launch_listening(
+            launch,
+            &oversized,
+            &log,
+            Duration::from_secs(1),
+            |_| Ok(()),
+        ) else {
+            panic!("expected ListenError::Failed for oversized socket path");
+        };
+        assert!(error.contains(&MAX_SOCKET_PATH.to_string()), "{error}");
+        assert!(
+            !log.exists(),
+            "oversized socket must fail before opening log"
+        );
     }
 }

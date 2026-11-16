@@ -44,6 +44,27 @@ fn eventually(mut check: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+/// Physical temporary root short enough for `<data>/agents/<id>/config/spiron.sock`
+/// to fit within `anyagents_harness_spiron::MAX_SOCKET_PATH` (103 bytes on macOS).
+fn supervisor_tempdir() -> tempfile::TempDir {
+    // Reserve 72 bytes for `/sp-XXXXXX/data/agents/agt_<26>/config/spiron.sock`.
+    let max_root = anyagents_harness_spiron::MAX_SOCKET_PATH.saturating_sub(72);
+    let candidate = std::env::temp_dir()
+        .canonicalize()
+        .expect("physical temporary root");
+    let root = if candidate.as_os_str().len() <= max_root {
+        candidate
+    } else {
+        Path::new("/tmp")
+            .canonicalize()
+            .expect("physical /tmp root")
+    };
+    tempfile::Builder::new()
+        .prefix("sp-")
+        .tempdir_in(root)
+        .expect("owned temporary fixture")
+}
 fn message(id: &str) -> OutboundMessage {
     OutboundMessage {
         id: id.into(),
@@ -785,7 +806,7 @@ fn spiron_supervisor_recovers_from_transient_mid_turn_server_error_via_recovery(
     });
 
     let _lock = crate::server::tests::env_lock();
-    let temp = crate::test_tempdir();
+    let temp = supervisor_tempdir();
     let probe = temp.path().join("spiron-server-error-probe");
     std::fs::write(
         &probe,
@@ -1493,7 +1514,7 @@ fn spiron_supervisor_sends_the_recovery_note_first_after_the_lease_and_commits_a
     use std::sync::Arc;
 
     let _lock = crate::server::tests::env_lock();
-    let temp = crate::test_tempdir();
+    let temp = supervisor_tempdir();
     let program = temp.path().join("fake-spiron");
     std::fs::write(&program, native_script(FAKE_SPIRON)).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
