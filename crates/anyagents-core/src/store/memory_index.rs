@@ -147,6 +147,7 @@ impl MemoryIndex {
     /// Open (creating or rebuilding when needed) the index at `path`. An empty
     /// path is a private in-memory index, for a private in-memory state.
     pub(super) fn open(path: &Path) -> Result<Self, Error> {
+        owner_only(path)?;
         let conn = match open_checked(path) {
             Ok(conn) => conn,
             // Another process is writing it (or this is private memory):
@@ -165,6 +166,7 @@ impl MemoryIndex {
                         Err(e) => return Err(e.into()),
                     }
                 }
+                owner_only(path)?;
                 open_checked(path)?
             }
         };
@@ -623,6 +625,42 @@ pub(super) fn spawn_rebuild(
                 }
             }
         });
+}
+
+/// Make the index file and its log readable by its owner only, creating the
+/// file that way when it is missing. The index holds every mailbox body, so
+/// it is no more readable than the state database it projects; SQLite gives
+/// the log files it creates the database file's mode.
+fn owner_only(path: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.as_os_str().to_owned();
+            file.push(suffix);
+            let file = PathBuf::from(file);
+            let mode = match std::fs::metadata(&file) {
+                Ok(meta) => meta.permissions().mode(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if mode & 0o077 != 0 {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode & 0o700))?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn open_checked(path: &Path) -> Result<Connection, Error> {

@@ -143,6 +143,37 @@ fn upgrading_moves_search_out_of_state_keeping_tool_summaries_and_outbound_order
     assert_eq!(seq, 7);
 }
 
+#[cfg(unix)]
+#[test]
+fn the_index_file_is_readable_by_its_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let (dir, store, agent) = setup();
+    store
+        .receive(&agent.id, Incoming::new("privateindexneedle"))
+        .unwrap();
+    let index = store.memory_index_path().to_path_buf();
+    assert_eq!(mode(&index), 0o600);
+    let wal = std::path::PathBuf::from(format!("{}-wal", index.display()));
+    if wal.exists() {
+        assert_eq!(mode(&wal) & 0o077, 0);
+    }
+    drop(store);
+    // A file an earlier release left readable to others is narrowed on open.
+    for file in [&index, &wal] {
+        if file.exists() {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+    let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
+    assert_fts(&store, "privateindexneedle");
+    assert_eq!(mode(&index), 0o600);
+    if wal.exists() {
+        assert_eq!(mode(&wal) & 0o077, 0);
+    }
+}
+
 #[test]
 fn a_damaged_or_deleted_index_is_rebuilt_from_state() {
     let (dir, store, agent) = setup();
