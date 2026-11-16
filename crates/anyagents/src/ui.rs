@@ -328,7 +328,7 @@ pub fn format_agent_status(
         }
         ("running", other, _) => cyan(&format!("● {other}")),
         ("idle", _, _) => dim("◌ idle"),
-        ("paused", _, "faulted") => red("◐ faulted"),
+        ("paused", _, "faulted") => red("✗ faulted"),
         ("paused", _, _) => yellow("◐ paused"),
         ("archived", _, _) => dim("▫ archived"),
         (other, _, _) => dim(other),
@@ -1134,6 +1134,7 @@ pub fn print_agents_table_with_options(
         ("TREE", false),
         ("RUNTIME", false),
         ("DELIVERY", false),
+        ("AUTOMATIONS", false),
     ];
     if profile_lookup.is_some() {
         headers.push(("PROFILE", false));
@@ -1225,6 +1226,7 @@ pub fn print_agents_table_with_options(
             tree_cell,
             runtime,
             delivery_cell,
+            automation_summary(&agent.automations),
         ];
         if let Some(lookup) = profile_lookup {
             let prof = lookup(agent);
@@ -1841,5 +1843,45 @@ mod tests {
         let stats = compute_subtree_stats("agt_root", &children, 10_000_000, &mut memo);
         assert_eq!(stats.working, 4);
         assert_eq!(stats.lagging, 3);
+    }
+}
+
+/// Compact overview; full watch targets and prompts remain in schedules.
+pub fn automation_summary(counts: &crate::api::AutomationCountsView) -> String {
+    let mut parts = Vec::new();
+    for (count, singular, plural) in [
+        (counts.watches, "watch", "watches"),
+        (counts.timers, "timer", "timers"),
+        (counts.crons, "cron", "crons"),
+    ] {
+        if count > 0 {
+            parts.push(format!(
+                "{count} {}",
+                if count == 1 { singular } else { plural }
+            ));
+        }
+    }
+    if parts.is_empty() {
+        "-".into()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+#[cfg(test)]
+mod automation_tests {
+    use super::*;
+    #[test]
+    fn summaries_have_exact_counts_and_pluralization() {
+        assert_eq!(automation_summary(&Default::default()), "-");
+        assert_eq!(
+            automation_summary(&crate::api::AutomationCountsView {
+                total: 7,
+                watches: 3,
+                timers: 1,
+                crons: 3,
+            }),
+            "3 watches · 1 timer · 3 crons"
+        );
     }
 }

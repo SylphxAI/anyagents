@@ -89,6 +89,9 @@ pub fn schedules(value: &serde_json::Value) {
     if let Some(count) = value.get("cancelled") {
         success(&format!("Cancelled {count} schedule(s)"));
     }
+    if value.get("schedule").is_none() && value.get("schedules").is_none() {
+        return;
+    }
     let rows: Vec<&serde_json::Value> = match value.get("schedule") {
         Some(one) => {
             success("Schedule created");
@@ -105,18 +108,38 @@ pub fn schedules(value: &serde_json::Value) {
         note("No schedules. Use `anyagents schedule --help` to add one.");
         return;
     }
-    let mut table = Table::new(&[
-        ("ID", false),
+    let fleet = rows.iter().any(|row| row.get("agent_name").is_some());
+    let mut columns = Vec::new();
+    if fleet {
+        columns.push(("AGENT", false));
+    }
+    columns.extend([
         ("KIND", false),
-        ("WHEN", false),
+        ("WHEN / TARGET", false),
         ("STATE", false),
         ("PROMPT", false),
     ]);
+    if is_verbose() {
+        columns.push(("ID", false));
+    }
+    let mut table = Table::new(&columns);
     for row in rows {
+        let mut keys = Vec::new();
+        if fleet {
+            keys.push("agent_name");
+        }
+        keys.extend(["kind", "spec", "state", "prompt"]);
+        if is_verbose() {
+            keys.push("id");
+        }
         table.add_row(
-            ["id", "kind", "spec", "state", "prompt"]
-                .iter()
-                .map(|key| row.get(key).map(scalar).unwrap_or_else(|| "—".into()))
+            keys.iter()
+                .map(|key| {
+                    row.get(key)
+                        .map(scalar)
+                        .unwrap_or_else(|| "—".into())
+                        .replace(['\n', '\r'], " ")
+                })
                 .collect(),
         );
     }
