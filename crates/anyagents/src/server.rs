@@ -5286,7 +5286,11 @@ fn reap_subagent_ephemeral_dirs_in(
     // managed workspace directory when not shared with another agent.
     let seat = seat_ids.map(|(uid, gid, _)| (uid, gid));
     for work_dir in managed_work_dirs {
-        if shared_workdirs.contains(&work_dir) {
+        // A live agent may work inside this directory, or this one inside its.
+        if shared_workdirs
+            .iter()
+            .any(|live| workdirs_overlap(live, &work_dir))
+        {
             continue;
         }
         let dotgit = work_dir.join(".git");
@@ -5341,6 +5345,23 @@ fn reap_subagent_ephemeral_dirs_in(
     complete
 }
 
+/// Either directory is the other or lies inside it, under any spelling
+/// (as given, absolute, or with links resolved). An empty path is no workdir.
+fn workdirs_overlap(a: &Path, b: &Path) -> bool {
+    let spellings = |path: &Path| -> Vec<PathBuf> {
+        if path.as_os_str().is_empty() {
+            return Vec::new();
+        }
+        let mut forms = vec![path.to_path_buf()];
+        forms.extend(std::path::absolute(path).ok());
+        forms.extend(std::fs::canonicalize(path).ok());
+        forms
+    };
+    let (a, b) = (spellings(a), spellings(b));
+    a.iter()
+        .any(|x| b.iter().any(|y| x.starts_with(y) || y.starts_with(x)))
+}
+
 fn reap_build_outputs_in_worktree(wt_path: &Path, seat_ids: Option<(u32, u32, u32)>) -> bool {
     let mut complete = true;
     const BUILD_DIRS: &[&str] = &["target", "node_modules", ".next", ".turbo", "dist"];
@@ -5372,10 +5393,17 @@ fn reap_build_outputs_in_worktree(wt_path: &Path, seat_ids: Option<(u32, u32, u3
     complete
 }
 
-/// A checkout may go only when it is the agent's own repository, its status
-/// is clean, and the remote holds everything else it has: no stash, no tag or
-/// note the remote lacks, and no commit (of HEAD, a branch, a tag, a note or
-/// any other ref but remote-tracking ones) that no advertised ref reaches.
+/// A checkout may go only when it is the agent's own repository and nothing
+/// in it is the only copy of anything:
+/// - no tracked change, and no untracked or ignored path but build output
+///   (inside `node_modules/`, or a Cargo `target/` that carries its
+///   `CACHEDIR.TAG`); AnyAgents writes nothing else into a workdir;
+/// - a born HEAD, and no submodule with a Git directory of its own;
+/// - the remote holds everything else: no stash, no tag or note the remote
+///   lacks, and no commit of any ref (every namespace, `refs/original` and
+///   the like included) but remote-tracking ones that no advertised ref
+///   reaches.
+///
 /// The proof is the remote's own answer, asked by the server; a checkout it
 /// cannot ask about stays. Git reads the checkout as the agent's seat.
 pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, seat: Option<(u32, u32)>) -> bool {
@@ -5388,31 +5416,50 @@ pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, seat: Option<(u32, u3
     let output = |args: &[&str]| {
         git().and_then(|mut cmd| cmd.args(args).stdin(std::process::Stdio::null()).output())
     };
-    let Ok(status_out) = output(&["status", "--porcelain", "--untracked-files=normal"]) else {
+    let Ok(status_out) = output(&[
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=normal",
+        "--ignored=matching",
+    ]) else {
         return false;
     };
     if !status_out.status.success() {
         return false;
     }
     let status_text = String::from_utf8_lossy(&status_out.stdout);
-    let has_substantive_dirty = status_text.lines().any(|line| {
-        let path = line.get(3..).unwrap_or("").trim();
-        !matches!(
-            path,
-            "CLAUDE.md"
-                | "AGENTS.md"
-                | "GEMINI.md"
-                | ".claude"
-                | ".gemini"
-                | "node_modules"
-                | "target"
-        ) && !path.starts_with(".desk-worktree")
-            && !path.starts_with(".claude/")
-            && !path.starts_with(".gemini/")
-            && !path.starts_with("node_modules/")
-            && !path.starts_with("target/")
-    });
-    if has_substantive_dirty {
+    let only_build_output = status_text
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .all(|entry| match entry.split_at_checked(3) {
+            Some(("?? " | "!! ", path)) => is_build_output(wt_path, path),
+            _ => false,
+        });
+    if !only_build_output {
+        return false;
+    }
+    // An unborn HEAD (`switch --orphan`) says nothing about the branches beside it.
+    if !output(&["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok_and(|out| out.status.success())
+    {
+        return false;
+    }
+    // A submodule with its own Git directory holds history no check here reads.
+    if git_dir.join("modules").exists() {
+        return false;
+    }
+    let Ok(stage) = output(&["ls-files", "--stage", "-z"]) else {
+        return false;
+    };
+    if !stage.status.success() {
+        return false;
+    }
+    let populated_gitlink = String::from_utf8_lossy(&stage.stdout)
+        .split('\0')
+        .filter_map(|entry| entry.strip_prefix("160000 "))
+        .filter_map(|entry| entry.split_once('\t').map(|(_, path)| path))
+        .any(|path| std::fs::symlink_metadata(wt_path.join(path).join(".git")).is_ok());
+    if populated_gitlink {
         return false;
     }
     let Ok(local) = output(&[
@@ -5459,6 +5506,19 @@ pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, seat: Option<(u32, u3
     ]);
     crate::repo::output_with_input(&mut unpublished, &covered)
         .is_ok_and(|out| out.status.success() && out.stdout == b"0\n")
+}
+
+/// A path inside `node_modules/`, or inside a `target/` directory Cargo
+/// marked as its own with `CACHEDIR.TAG`. Nothing else is build output here.
+fn is_build_output(wt_path: &Path, path: &str) -> bool {
+    let mut dir = wt_path.to_path_buf();
+    for part in path.trim_end_matches('/').split('/') {
+        dir.push(part);
+        if part == "node_modules" || (part == "target" && dir.join("CACHEDIR.TAG").is_file()) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(unix)]
@@ -8005,6 +8065,7 @@ fn send_sync(
     // The request's `reply_to` is a reference, not a Telegram id; a Telegram
     // target carries the id the reference resolved to instead.
     let reply = plan.reply.clone();
+    let authored_text = body.text.clone();
     let effective_text = format_internal_send_text(&body);
     let body = SendRequest {
         text: effective_text,
@@ -8015,6 +8076,10 @@ fn send_sync(
                 .filter(|v| crate::reply::ref_message(v).is_none())
         }),
         ..body
+    };
+    let internal_body = SendRequest {
+        text: authored_text,
+        ..body.clone()
     };
     check_targets(store, actor, &body, &plan)?;
     let upload = media_upload(store, &body, &plan)?;
@@ -8072,22 +8137,24 @@ fn send_sync(
                         history_key.as_deref(),
                         true,
                         || {
-                            Ok(vec![deliver_agent(
+                            Ok(vec![deliver_agent_with_media(
                                 store,
-                                &body,
+                                &internal_body,
                                 name,
                                 key.as_deref(),
                                 wake_archived,
+                                upload.as_ref(),
                             )?])
                         },
                     )?
                 } else {
-                    vec![deliver_agent(
+                    vec![deliver_agent_with_media(
                         store,
-                        &body,
+                        &internal_body,
                         name,
                         key.as_deref(),
                         wake_archived,
+                        upload.as_ref(),
                     )?]
                 };
                 deliveries.extend(sent);
@@ -8108,10 +8175,24 @@ fn send_sync(
                         &composed_body,
                         history_key.as_deref(),
                         true,
-                        || deliver_room(store, &body, room, key.as_deref()),
+                        || {
+                            deliver_room_with_media(
+                                store,
+                                &internal_body,
+                                room,
+                                key.as_deref(),
+                                upload.as_ref(),
+                            )
+                        },
                     )?
                 } else {
-                    deliver_room(store, &body, room, key.as_deref())?
+                    deliver_room_with_media(
+                        store,
+                        &internal_body,
+                        room,
+                        key.as_deref(),
+                        upload.as_ref(),
+                    )?
                 };
                 let mut room_skip = room_skipped(store, &body, room);
                 deliveries.append(&mut all);
@@ -8190,11 +8271,10 @@ fn send_sync(
     Ok(Json(response))
 }
 
-/// The bytes of a send's local media file, for its Telegram targets: read
-/// once, before any target is written, with the caller's own access and never
-/// the server's (ADR 0010 D3). A URL, a Telegram `file_id`, or a send with no
-/// Telegram target reads nothing; an agent's mailbox gets the path, which its
-/// recipient opens as itself.
+/// The bytes of a send's local media file: read once, before any target is
+/// written, with the caller's own access and never the server's (ADR 0010 D3).
+/// A URL or a Telegram `file_id` reads nothing; internal recipients receive
+/// daemon-owned private copies rather than a sender-private path.
 fn media_upload(
     store: &Store,
     body: &SendRequest,
@@ -8204,12 +8284,7 @@ fn media_upload(
         return Ok(None);
     };
     let source = media.source.trim();
-    if !crate::telegram::is_local_media(source)
-        || !plan
-            .targets
-            .iter()
-            .any(|target| matches!(target, Target::Telegram { .. }))
-    {
+    if !crate::telegram::is_local_media(source) {
         return Ok(None);
     }
     // The authenticated agent, never a sender the operator names.
@@ -8379,14 +8454,46 @@ fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api
 }
 
 /// One room message, one delivery per recipient.
-fn deliver_room(
+/// `upload` was read once as the authenticated principal, before any delivery
+/// effects. Each recipient gets a private copy, never a sender-private path.
+fn recipient_media_text(
+    store: &Store,
+    body: &SendRequest,
+    agent: &anyagents_core::Agent,
+    upload: Option<&crate::telegram::MediaUpload>,
+) -> Result<(String, Option<crate::seat_tree::InboundMedia>), anyagents_core::Error> {
+    let (Some(media), Some(upload)) = (&body.media, upload) else {
+        return Ok((format_internal_send_text(body), None));
+    };
+    let uid = crate::sandbox::seat_for_agent(agent.id.as_str()).map(|(_, uid, _, _)| uid);
+    if uid.is_none() && crate::sandbox::seats_configured() {
+        return Err(anyagents_core::Error::PermissionDenied(
+            "recipient has no admitted seat".into(),
+        ));
+    }
+    let staged = crate::seat_tree::persist_inbound_media(
+        store.data_dir(),
+        &agent.id,
+        uid,
+        &upload.file_name,
+        &upload.bytes,
+    )?;
+    let line = anyagents_harness::media::local_media_line(&media.kind, staged.path());
+    Ok((
+        format_internal_send_text_with_attachment(body, Some(&line)),
+        Some(staged),
+    ))
+}
+
+fn deliver_room_with_media(
     store: &Store,
     body: &SendRequest,
     room: &str,
     key: Option<&str>,
+    upload: Option<&crate::telegram::MediaUpload>,
 ) -> Result<Vec<Delivery>, ApiError> {
     let delivered = store
-        .receive_room(
+        .receive_room_with(
             room,
             Incoming {
                 text: body.text.clone(),
@@ -8397,6 +8504,17 @@ fn deliver_room(
                 quote: body.quote.clone(),
                 origin: None,
                 received_at_ms: None,
+            },
+            |agent, mut incoming| {
+                let (text, staged) = recipient_media_text(store, body, agent, upload)?;
+                incoming.text = text;
+                let outcome = store.receive(&agent.id, incoming)?;
+                if matches!(outcome, ReceiveOutcome::New(_))
+                    && let Some(staged) = staged
+                {
+                    staged.retain();
+                }
+                Ok(outcome)
             },
         )
         .map_err(ApiError::from_store)?;
@@ -8437,12 +8555,13 @@ fn archived_refusal(store: &Store, name: &str) -> Option<crate::api::SkippedDeli
     })
 }
 
-fn deliver_agent(
+fn deliver_agent_with_media(
     store: &Store,
     body: &SendRequest,
     name: &str,
     key: Option<&str>,
     wake_archived: bool,
+    upload: Option<&crate::telegram::MediaUpload>,
 ) -> Result<Delivery, ApiError> {
     let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
     let _lifecycle = store
@@ -8463,6 +8582,8 @@ fn deliver_agent(
             duplicate: true,
         });
     }
+    let (text, staged) =
+        recipient_media_text(store, body, &agent, upload).map_err(ApiError::from_store)?;
     if wake_archived && is_explicitly_archived(store.data_dir(), &agent) {
         prepare_agent_wake(store, &agent)?;
     }
@@ -8477,7 +8598,7 @@ fn deliver_agent(
         let _ = store.set_agent_state(&agent.id, "running");
     }
     let incoming = Incoming {
-        text: body.text.clone(),
+        text,
         sender: body.sender.clone(),
         source_time_ms: None,
         source_key: key.map(str::to_string),
@@ -8497,6 +8618,9 @@ fn deliver_agent(
         ReceiveOutcome::Duplicate(message) => (message, true),
     };
     if !duplicate {
+        if let Some(staged) = staged {
+            staged.retain();
+        }
         crate::create::poke_agent_wake_socket(store.data_dir(), &agent.id);
         crate::create::poke_agent_wake_socket_mail(store.data_dir(), &agent.id);
     }
@@ -8646,12 +8770,23 @@ fn telegram_reply(body: &SendRequest, reply: Option<&str>) -> Result<Option<i64>
 }
 
 fn format_internal_send_text(body: &SendRequest) -> String {
+    format_internal_send_text_with_attachment(body, None)
+}
+
+fn format_internal_send_text_with_attachment(
+    body: &SendRequest,
+    attachment: Option<&str>,
+) -> String {
     let mut parts = Vec::new();
     if !body.text.trim().is_empty() {
         parts.push(body.text.clone());
     }
     if let Some(ref media) = body.media {
-        parts.push(format!("[Attachment ({}): {}]", media.kind, media.source));
+        parts.push(
+            attachment
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("[Attachment ({}): {}]", media.kind, media.source)),
+        );
     }
     if let Some(ref loc) = body.location {
         match (&loc.title, &loc.address) {
@@ -8914,6 +9049,7 @@ pub fn owner_workdir() -> Option<std::path::PathBuf> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("a2a_media_tests.rs");
     #[test]
     fn memory_backlog_follows_wakes_and_idle_consolidation_visits_nothing() {
         let dir = crate::test_tempdir();
@@ -10617,8 +10753,8 @@ pub(crate) mod tests {
     /// A send's local media is read with the sending agent's own access,
     /// once, before any Telegram post: the operator token, a link to it and
     /// a path outside the agent's directories are refused; the agent's own
-    /// file is read; a URL or `file_id` and an internal-only send read
-    /// nothing; the operator reads with its own access.
+    /// file is read, including internal-only sends; URLs and file IDs read
+    /// nothing. The operator reads with its own access.
     #[test]
     fn send_media_is_read_with_the_senders_access_never_the_servers() {
         let _env = env_lock();
@@ -10700,11 +10836,7 @@ pub(crate) mod tests {
             );
         }
         let internal = plan(Some(&agent.id), "agent:bob");
-        assert!(
-            media_upload(&store, &body(token.to_str().unwrap()), &internal)
-                .unwrap()
-                .is_none()
-        );
+        assert!(media_upload(&store, &body(token.to_str().unwrap()), &internal).is_err());
         let operator = plan(None, "telegram:chat:100");
         let read = media_upload(&store, &body(token.to_str().unwrap()), &operator)
             .unwrap()
@@ -12236,6 +12368,240 @@ pub(crate) mod tests {
     /// Archive keeps anything only the checkout holds: a stash, a tag or a
     /// note the remote lacks. What the remote advertises is the proof, so a
     /// branch published by URL (no remote-tracking ref moves) is reaped.
+    /// A clean checkout of a fresh pool clone whose every commit is on the
+    /// remote: the baseline each refusal below changes one thing in.
+    fn published_checkout(dir: &Path) -> (PathBuf, PathBuf) {
+        let fixture = dir.join("fixture");
+        let remote = crate::repo::tests::seed_remote(&fixture);
+        let work = dir.join("work");
+        crate::repo::tests::pool_checkouts(&fixture)
+            .remote("ExampleOrg/demo", &work, "worker", None)
+            .unwrap();
+        crate::repo::tests::git(&work, &["push", "-q", "origin", "worker"]);
+        assert!(is_git_worktree_safe_to_reap(&work, None), "baseline");
+        (work, remote)
+    }
+
+    fn git_as_author(dir: &Path, args: &[&str]) -> String {
+        let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.test"];
+        all.extend_from_slice(args);
+        crate::repo::tests::git(dir, &all)
+    }
+
+    /// Ignored files are often the only copy of something (`.env`, data, a
+    /// gitignored memory file). Only build output may be left behind:
+    /// `node_modules/`, and a `target/` Cargo marked with `CACHEDIR.TAG`.
+    #[test]
+    fn cleanup_keeps_ignored_files_other_than_build_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let (work, _) = published_checkout(dir.path());
+        std::fs::create_dir_all(work.join(".git/info")).unwrap();
+        std::fs::write(
+            work.join(".git/info/exclude"),
+            "node_modules/\ntarget/\n.env\nmemory/\nbench/results/\n",
+        )
+        .unwrap();
+        for dir in ["node_modules/pkg", "target/debug", "crates/x/target/debug"] {
+            std::fs::create_dir_all(work.join(dir)).unwrap();
+        }
+        std::fs::write(work.join("node_modules/pkg/index.js"), "x").unwrap();
+        std::fs::write(
+            work.join("target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        std::fs::write(work.join("target/debug/bin"), "x").unwrap();
+        std::fs::write(
+            work.join("crates/x/target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        assert!(
+            is_git_worktree_safe_to_reap(&work, None),
+            "build output alone"
+        );
+        for (path, body) in [
+            (".env", "SECRET=only-copy\n"),
+            ("memory/MEMORY.md", "# the agent's only memory\n"),
+            ("bench/results/run.json", "{}\n"),
+        ] {
+            let file = work.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, body).unwrap();
+            assert!(
+                !is_git_worktree_safe_to_reap(&work, None),
+                "ignored {path} was judged disposable"
+            );
+            std::fs::remove_file(&file).unwrap();
+        }
+        // A directory merely named target is not build output.
+        std::fs::create_dir_all(work.join("notes/target")).unwrap();
+        std::fs::write(work.join("notes/target/plan.md"), "x").unwrap();
+        assert!(
+            !is_git_worktree_safe_to_reap(&work, None),
+            "an untagged target/"
+        );
+    }
+
+    /// An edit to a tracked file is never incidental, whatever the file is
+    /// called; and AnyAgents writes no instruction file into a workdir, so an
+    /// untracked one is the agent's too.
+    #[test]
+    fn cleanup_keeps_tracked_and_untracked_instruction_file_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (work, _) = published_checkout(dir.path());
+        for path in ["AGENTS.md", "CLAUDE.md", ".claude/settings.json"] {
+            let file = work.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "committed\n").unwrap();
+        }
+        crate::repo::tests::git(&work, &["add", "."]);
+        git_as_author(&work, &["commit", "-qm", "instructions"]);
+        crate::repo::tests::git(&work, &["push", "-q", "origin", "worker"]);
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        for path in ["AGENTS.md", "CLAUDE.md", ".claude/settings.json"] {
+            std::fs::write(work.join(path), "an edit\n").unwrap();
+            assert!(
+                !is_git_worktree_safe_to_reap(&work, None),
+                "tracked {path} edit"
+            );
+            crate::repo::tests::git(&work, &["checkout", "-q", "--", path]);
+        }
+        std::fs::write(work.join("GEMINI.md"), "written by the agent\n").unwrap();
+        assert!(
+            !is_git_worktree_safe_to_reap(&work, None),
+            "untracked GEMINI.md"
+        );
+    }
+
+    /// An orphan HEAD has no commit, so nothing about it is proven.
+    #[test]
+    fn cleanup_keeps_an_unborn_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let (work, _) = published_checkout(dir.path());
+        crate::repo::tests::git(&work, &["switch", "-q", "--orphan", "scratch"]);
+        assert!(!is_git_worktree_safe_to_reap(&work, None));
+    }
+
+    /// A submodule's own Git directory, absorbed or embedded, is history the
+    /// check cannot read: keep.
+    #[test]
+    fn cleanup_keeps_submodules_with_their_own_git_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (work, _) = published_checkout(dir.path());
+        let library = dir.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        crate::repo::tests::git(&library, &["init", "-q", "-b", "main"]);
+        git_as_author(
+            &library,
+            &["commit", "-q", "--allow-empty", "-m", "library"],
+        );
+        // Embedded: a repository inside the checkout, staged as a gitlink.
+        let embedded = work.join("vendor/embedded");
+        std::fs::create_dir_all(&embedded).unwrap();
+        crate::repo::tests::git(&embedded, &["init", "-q", "-b", "main"]);
+        git_as_author(
+            &embedded,
+            &["commit", "-q", "--allow-empty", "-m", "unpushed"],
+        );
+        crate::repo::tests::git(&work, &["add", "vendor/embedded"]);
+        git_as_author(&work, &["commit", "-qm", "gitlink"]);
+        crate::repo::tests::git(&work, &["push", "-q", "origin", "worker"]);
+        assert!(
+            !is_git_worktree_safe_to_reap(&work, None),
+            "embedded gitlink"
+        );
+        // Absorbed: `.git/modules` holds the submodule's repository.
+        git_as_author(
+            &work,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                library.to_str().unwrap(),
+                "lib",
+            ],
+        );
+        assert!(work.join(".git/modules").is_dir());
+        assert!(!is_git_worktree_safe_to_reap(&work, None), ".git/modules");
+    }
+
+    /// Every ref namespace counts, not only branches: a filter-branch backup
+    /// in `refs/original` is the only copy of the history it names.
+    #[test]
+    fn cleanup_counts_every_ref_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (work, _) = published_checkout(dir.path());
+        // A commit no branch, tag or reflog names yet.
+        let only_copy = git_as_author(
+            &work,
+            &[
+                "commit-tree",
+                "HEAD^{tree}",
+                "-p",
+                "HEAD",
+                "-m",
+                "rewritten away",
+            ],
+        );
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        for name in [
+            "refs/original/refs/heads/worker",
+            "refs/anyagents/backup",
+            "refs/pull/1/head",
+        ] {
+            crate::repo::tests::git(&work, &["update-ref", name, &only_copy]);
+            assert!(!is_git_worktree_safe_to_reap(&work, None), "{name}");
+            crate::repo::tests::git(&work, &["update-ref", "-d", name]);
+        }
+    }
+
+    /// A live agent working inside an archived agent's directory, or in a
+    /// directory holding it, keeps that directory whole.
+    #[test]
+    fn cleanup_keeps_a_directory_a_live_agent_works_in_or_around() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let archived = archived_reap_fixture(&store, "old-worker", &parent);
+        let work = anyagents_core::agent_work_dir(dir.path(), &archived.id);
+        let inside = work.join("closure/live-worker");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::write(inside.join("progress.md"), "live work\n").unwrap();
+        let live = store
+            .create_agent(anyagents_core::NewAgent::new("live-worker", "codex"))
+            .unwrap();
+        store
+            .set_agent_running(&live.id, &inside.display().to_string())
+            .unwrap();
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &archived.id));
+        assert_eq!(
+            std::fs::read_to_string(inside.join("progress.md")).unwrap(),
+            "live work\n",
+            "a live agent's workdir inside the reaped one was deleted"
+        );
+        // The other way round: the live agent works in a directory that holds it.
+        store
+            .set_agent_running(&live.id, &work.parent().unwrap().display().to_string())
+            .unwrap();
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &archived.id));
+        assert!(inside.join("progress.md").is_file());
+        assert!(workdirs_overlap(&work, &inside) && workdirs_overlap(&inside, &work));
+        assert!(!workdirs_overlap(
+            &work,
+            &dir.path().join("agents/other/work")
+        ));
+        assert!(!workdirs_overlap(
+            &work,
+            &work.with_file_name(format!("{}2", work.file_name().unwrap().to_string_lossy()))
+        ));
+        assert!(!workdirs_overlap(&work, Path::new("")));
+    }
+
     #[test]
     fn cleanup_keeps_a_stash_and_unpublished_tags_or_notes() {
         use crate::repo::tests::git;

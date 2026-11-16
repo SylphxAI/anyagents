@@ -2049,6 +2049,18 @@ impl Store {
         room: &str,
         incoming: Incoming,
     ) -> Result<Vec<(Agent, ReceiveOutcome)>, Error> {
+        self.receive_room_with(room, incoming, |agent, one| self.receive(&agent.id, one))
+    }
+
+    /// Deliver an unread recipient's incoming message after membership and
+    /// replay checks. The callback owns preparation and persistence, so it can
+    /// release temporary resources if persistence fails. Replays skip it.
+    pub fn receive_room_with(
+        &self,
+        room: &str,
+        incoming: Incoming,
+        mut deliver: impl FnMut(&Agent, Incoming) -> Result<ReceiveOutcome, Error>,
+    ) -> Result<Vec<(Agent, ReceiveOutcome)>, Error> {
         let sender = incoming.sender.clone();
         // Immutable IDs never fall back to a same-spelled display name. Legacy
         // names (with or without agent:) retain their existing alias lookup.
@@ -2093,7 +2105,7 @@ impl Store {
                     Some(format!("group:{clean}"))
                 }
             });
-            let mut one = Incoming {
+            let one = Incoming {
                 text: incoming.text.clone(),
                 sender: sender.clone(),
                 source_time_ms: incoming.source_time_ms,
@@ -2106,10 +2118,13 @@ impl Store {
                 origin: incoming.origin,
                 received_at_ms: incoming.received_at_ms,
             };
-            // The body is built once, so every recipient reads the same text.
-            one.text = one.body();
-            one.quote = None;
-            let outcome = self.receive(&agent.id, one)?;
+            if let Some(key) = one.source_key.as_deref()
+                && let Some(message) = self.message_by_source_key(&agent.id, key)?
+            {
+                delivered.push((agent, ReceiveOutcome::Duplicate(message)));
+                continue;
+            }
+            let outcome = deliver(&agent, one)?;
             delivered.push((agent, outcome));
         }
         Ok(delivered)
