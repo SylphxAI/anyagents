@@ -67,8 +67,36 @@ impl DeliveryView {
     }
 }
 
+/// Active automation counts. Missing counts from older servers default to zero.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct AutomationCountsView {
+    pub total: usize,
+    pub watches: usize,
+    pub timers: usize,
+    pub crons: usize,
+}
+
+impl AutomationCountsView {
+    pub fn from_schedules(schedules: &[ScheduleView]) -> Self {
+        let mut counts = Self::default();
+        for schedule in schedules.iter().filter(|s| s.state == "active") {
+            match schedule.kind.as_str() {
+                "watch" => counts.watches += 1,
+                "at" => counts.timers += 1,
+                "every" => counts.crons += 1,
+                _ => continue,
+            }
+            counts.total += 1;
+        }
+        counts
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AgentView {
+    #[serde(default)]
+    pub automations: AutomationCountsView,
     #[serde(default)]
     pub has_open_turn: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
