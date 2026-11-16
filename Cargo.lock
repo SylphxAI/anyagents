@@ -11,7 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-workstation"
 version = "0.2.0"
-source = "git+https://github.com/SylphxAI/agent-workstation?rev=b740702cca87d2282ae827f4dc03694ae241d76e#b740702cca87d2282ae827f4dc03694ae241d76e"
+source = "git+https://github.com/SylphxAI/agent-workstation?rev=ec73f6cf0d36d42cf02b3a19e0d0765a3d9082a6#ec73f6cf0d36d42cf02b3a19e0d0765a3d9082a6"
 dependencies = [
  "async-trait",
  "axum",

@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use agent_workstation::{
@@ -73,6 +73,8 @@ pub struct Live {
     hand_backs: tokio::sync::watch::Receiver<u64>,
     /// Hand-backs counted when the latest takeover was requested.
     awaited: AtomicU64,
+    /// Whether the latest takeover started on a challenged page requiring solve proof.
+    watch_challenge: Arc<AtomicBool>,
     runtime_dir: PathBuf,
 }
 
@@ -111,7 +113,9 @@ impl Live {
     }
 
     /// A person is asked to take over: the next hand-back completes it.
-    pub fn expect_hand_back(&self) {
+    pub fn expect_hand_back(&self, challenge_detected: bool) {
+        self.watch_challenge
+            .store(challenge_detected, Ordering::Release);
         self.awaited
             .store(*self.hand_backs.borrow(), Ordering::Release);
     }
@@ -573,7 +577,9 @@ async fn start(
     // A fresh session: the lease cannot be held by anyone else yet.
     session.lease(principal).map_err(|e| in_use(profile, e))?;
     let mount = takeover::mount(data, &session);
-    let (watcher, hand_backs) = takeover::watch_hand_backs(data, profile, session.clone());
+    let watch_challenge = Arc::new(AtomicBool::new(false));
+    let (watcher, hand_backs) =
+        takeover::watch_hand_backs(data, profile, session.clone(), watch_challenge.clone());
     let now = now_ms();
     Ok(Live {
         session,
@@ -586,6 +592,7 @@ async fn start(
         watcher,
         hand_backs,
         awaited: AtomicU64::new(0),
+        watch_challenge,
         runtime_dir,
     })
 }
