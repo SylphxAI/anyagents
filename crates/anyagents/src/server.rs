@@ -4811,7 +4811,7 @@ async fn create_agent_route(
         let (harness, model, profile) = create::resolve_subagent_defaults(
             state.store.data_dir(),
             parent_agent.as_ref(),
-            body.harness.as_deref().unwrap_or("claude-code"),
+            body.harness.as_deref().unwrap_or(""),
             body.model,
             body.profile,
         );
@@ -5291,15 +5291,13 @@ fn reap_subagent_ephemeral_dirs_in(
                 continue;
             }
         }
-        if dotgit.symlink_metadata().is_ok() {
-            if is_git_worktree_safe_to_reap(&work_dir, seat) {
-                // Keep pool recovery refs: removing them before checkout
-                // deletion succeeds would discard recovery on an I/O error.
-                if remove_path_with_seat(&work_dir, seat_ids) {
-                    let _ = std::fs::remove_file(&marker_path);
-                } else {
-                    complete = false;
-                }
+        if dotgit.symlink_metadata().is_ok() && is_git_worktree_safe_to_reap(&work_dir, seat) {
+            // Keep pool recovery refs: removing them before checkout
+            // deletion succeeds would discard recovery on an I/O error.
+            if remove_path_with_seat(&work_dir, seat_ids) {
+                let _ = std::fs::remove_file(&marker_path);
+            } else {
+                complete = false;
             }
         }
         // Missing/unreadable Git metadata and non-Git work are unknown, not
