@@ -35,6 +35,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
 
 jobs:
   # Whether the change reaches more than documentation, so a docs-only pull
@@ -87,6 +89,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: clippy, rustfmt
+      - name: Configure linker and nextest
+        run: |
+          set -euo pipefail
+          sysroot="$(rustc --print sysroot 2>/dev/null || true)"
+          gccld="$sysroot/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld"
+          if [ -n "$sysroot" ] && [ -x "$gccld/ld.lld" ] && cc -B"$gccld" -fuse-ld=lld -Wl,--version >/dev/null 2>&1; then
+            linker_wrapper="$RUNNER_TEMP/ci-lld-cc"
+            printf '#!/bin/sh\nexec cc -B"%s" -fuse-ld=lld "$@"\n' "$gccld" > "$linker_wrapper"
+            chmod 0755 "$linker_wrapper"
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=$linker_wrapper" >> "$GITHUB_ENV"
+          fi
+          nextest_tgz="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          curl -fsSL -o "$nextest_tgz" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.150/cargo-nextest-0.9.150-x86_64-unknown-linux-gnu.tar.gz"
+          printf '%s  %s\n' "b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f" "$nextest_tgz" | sha256sum -c -
+          mkdir -p "$HOME/.cargo/bin"
+          tar -xzf "$nextest_tgz" -C "$HOME/.cargo/bin" cargo-nextest
+          rm -f "$nextest_tgz"
+          cargo nextest --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Format
         run: cargo fmt --all -- --check
@@ -98,13 +118,26 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_deploy_build.py' -v
       - name: npm package tests
         run: npm test
-      - name: Build harness helper binaries
-        run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
+      - name: Build harness helper and runtime binaries
+        run: |
+          set -euo pipefail
+          cargo build -p anyagents-harness-opencode --bin fake_opencode -p anyagents --bin anyagents --locked --message-format=json > "$RUNNER_TEMP/prod-build.json"
+          binary=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and not o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/prod-build.json")
+          echo "ANYAGENTS_PROD_BIN=$binary" >> "$GITHUB_ENV"
       - name: Test
         env:
           # The browser jail's acceptance fails, never skips, without Landlock.
           ANYAGENTS_REQUIRE_LANDLOCK_TEST: '1'
-        run: cargo test --workspace --locked
+        run: |
+          set -euo pipefail
+          cargo nextest run --workspace --locked --no-fail-fast
+          cargo test --doc --workspace --locked
+      - name: Locate anyagents test binary
+        run: |
+          set -euo pipefail
+          cargo test -p anyagents --bin anyagents --locked --no-run --message-format=json > "$RUNNER_TEMP/unit-test-build.json"
+          test_binary=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/unit-test-build.json")
+          echo "ANYAGENTS_UNIT_TEST_BIN=$test_binary" >> "$GITHUB_ENV"
       # A real desktop session: headless Wayland (sway), the VNC server behind
       # takeover (wayvnc) and the runner's Chrome, driven through the browser
       # and computer tools. It also proves an existing profile opens with its
@@ -117,21 +150,20 @@ jobs:
         env:
           ANYAGENTS_DESKTOP_HEADFUL: '1'
           ANYAGENTS_CHROMIUM_BIN: /usr/bin/google-chrome
-        run: cargo test -p anyagents --bin anyagents --locked workstation::headful_tests -- --nocapture
+        run: |
+          set -euo pipefail
+          "$ANYAGENTS_UNIT_TEST_BIN" workstation::headful_tests --list | grep -q ': test$'
+          "$ANYAGENTS_UNIT_TEST_BIN" workstation::headful_tests --nocapture
 
       # Same public Linux sudo lane as the cross-seat repository acceptance.
       # This is required: missing privilege, identity change or setpriv fails.
       - name: Host memory managed-UID admission
         run: |
           set -euo pipefail
-          cargo build -p anyagents --bin anyagents --locked --message-format=json > "$RUNNER_TEMP/host-memory-build.json"
-          binary=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and not o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/host-memory-build.json")
-          cargo test -p anyagents --bin anyagents --locked --no-run --message-format=json > "$RUNNER_TEMP/host-memory-test-build.json"
-          vendor_test=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/host-memory-test-build.json")
           # RUNNER_TEMP is below the runner's private home, inaccessible to the
           # distinct UID. Only a new owned leaf under public /var/tmp is used;
           # the script verifies ancestry and never changes existing ancestors.
-          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 python3 scripts/verify-host-memory-seat.py --binary "$binary" --vendor-test-binary "$vendor_test" --source-sha "$GITHUB_SHA" --uid 24031 --gid 24032 --socket-gid 24033 --base /var/tmp --receipt "$RUNNER_TEMP/host-memory-seat-receipt.json"
+          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 python3 scripts/verify-host-memory-seat.py --binary "$ANYAGENTS_PROD_BIN" --vendor-test-binary "$ANYAGENTS_UNIT_TEST_BIN" --source-sha "$GITHUB_SHA" --uid 24031 --gid 24032 --socket-gid 24033 --base /var/tmp --receipt "$RUNNER_TEMP/host-memory-seat-receipt.json"
       - name: Host memory managed-UID receipt
         if: always()
         run: |
@@ -142,28 +174,24 @@ jobs:
       - name: Privileged config ACL acceptance
         run: |
           set -euo pipefail
-          cargo test -p anyagents --bin anyagents --locked --no-run --message-format=json > "$RUNNER_TEMP/config-acl-build.json"
-          test_binary=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/config-acl-build.json")
           test_name=seat_tree::privileged_config_tests::privileged_config_acl_cross_uid
           # A missing module/test must not become a successful zero-test run.
-          "$test_binary" --ignored --exact "$test_name" --list | grep -Fx "$test_name: test"
-          sudo env LC_ALL=C ANYAGENTS_REQUIRE_CONFIG_ACL_TEST=1 ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST=1 /usr/bin/setpriv --bounding-set=-dac_override,-dac_read_search -- "$test_binary" --ignored --exact "$test_name" --nocapture 2>&1 | tee "$RUNNER_TEMP/config-acl-test.log"
+          "$ANYAGENTS_UNIT_TEST_BIN" --ignored --exact "$test_name" --list | grep -Fx "$test_name: test"
+          sudo env LC_ALL=C ANYAGENTS_REQUIRE_CONFIG_ACL_TEST=1 ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST=1 /usr/bin/setpriv --bounding-set=-dac_override,-dac_read_search -- "$ANYAGENTS_UNIT_TEST_BIN" --ignored --exact "$test_name" --nocapture 2>&1 | tee "$RUNNER_TEMP/config-acl-test.log"
           grep -Fx 'CONFIG_ACL_PRIVILEGED_ACCEPTANCE_EXECUTED' "$RUNNER_TEMP/config-acl-test.log"
           test_name=server::tests::privileged_a2a_private_media_cross_uid
-          "$test_binary" --ignored --exact "$test_name" --list | grep -Fx "$test_name: test"
-          sudo env LC_ALL=C ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST=1 /usr/bin/setpriv --bounding-set=-dac_override,-dac_read_search -- "$test_binary" --ignored --exact "$test_name" --nocapture 2>&1 | tee "$RUNNER_TEMP/a2a-media-test.log"
+          "$ANYAGENTS_UNIT_TEST_BIN" --ignored --exact "$test_name" --list | grep -Fx "$test_name: test"
+          sudo env LC_ALL=C ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST=1 /usr/bin/setpriv --bounding-set=-dac_override,-dac_read_search -- "$ANYAGENTS_UNIT_TEST_BIN" --ignored --exact "$test_name" --nocapture 2>&1 | tee "$RUNNER_TEMP/a2a-media-test.log"
           grep -Fx 'A2A_PRIVATE_MEDIA_CROSS_UID_EXECUTED' "$RUNNER_TEMP/a2a-media-test.log"
 
       - name: Cross-seat repositories
         run: |
           set -euo pipefail
-          cargo test -p anyagents --bin anyagents --locked --no-run --message-format=json > "$RUNNER_TEMP/worktree-test-build.json"
-          test_binary=$(python3 -c 'import json,sys; artifacts=[a for line in open(sys.argv[1]) if (a:=json.loads(line)).get("reason")=="compiler-artifact" and a.get("target",{}).get("name")=="anyagents" and a.get("profile",{}).get("test") and a.get("executable")]; assert len(artifacts)==1; print(artifacts[0]["executable"])' "$RUNNER_TEMP/worktree-test-build.json")
           # Two seat uids, each committing and pushing in its own repository
           # over one pool, neither able to read the other's Git directory.
-          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact repo::tests::privileged_seats_own_their_repositories --nocapture
+          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$ANYAGENTS_UNIT_TEST_BIN" --exact repo::tests::privileged_seats_own_their_repositories --nocapture
           # A file the server opens for a seat is opened by that seat.
-          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact seat_tree::tests::privileged_seat_open_refuses_what_the_seat_cannot_read --nocapture
+          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$ANYAGENTS_UNIT_TEST_BIN" --exact seat_tree::tests::privileged_seat_open_refuses_what_the_seat_cannot_read --nocapture
 
   # The macOS lane: the same gate on a second platform. macOS is a supported
   # host for a long-lived agent, so its build is checked before merge.
@@ -179,6 +207,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: clippy, rustfmt
+      - name: Install nextest
+        run: |
+          set -euo pipefail
+          nextest_tgz="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          curl -fsSL -o "$nextest_tgz" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.150/cargo-nextest-0.9.150-universal-apple-darwin.tar.gz"
+          printf '%s  %s\n' "82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a" "$nextest_tgz" | shasum -a 256 -c -
+          mkdir -p "$HOME/.cargo/bin"
+          tar -xzf "$nextest_tgz" -C "$HOME/.cargo/bin" cargo-nextest
+          rm -f "$nextest_tgz"
+          cargo nextest --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Format
         run: cargo fmt --all -- --check
@@ -187,7 +225,10 @@ jobs:
       - name: Build harness helper binaries
         run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
       - name: Test
-        run: cargo test --workspace --locked
+        run: |
+          set -euo pipefail
+          cargo nextest run --workspace --locked --no-fail-fast
+          cargo test --doc --workspace --locked
 
   # The required check name. Skipped lanes pass; a failed or cancelled lane
   # fails. It reads results only and runs no repository code.

@@ -337,11 +337,16 @@ impl<W> FrameArtifactStdout<W> {
         self.out.extend_from_slice(line);
     }
 
-    fn absorb_pending(&mut self) {
-        while let Some(pos) = self.pending.iter().position(|byte| *byte == b'\n') {
+    fn absorb_pending_from(&mut self, mut scan_from: usize) {
+        while let Some(rel) = self.pending[scan_from..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let pos = scan_from + rel;
             let line = self.pending[..=pos].to_vec();
             self.transform_line(&line);
             self.pending.drain(..=pos);
+            scan_from = 0;
         }
     }
 }
@@ -388,8 +393,9 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FrameArtifactSt
                 Poll::Ready(Ok(())) => {}
             }
         }
+        let scan_from = this.pending.len();
         this.pending.extend_from_slice(buf);
-        this.absorb_pending();
+        this.absorb_pending_from(scan_from);
         // Transformed bytes are buffered; the caller reports the input as
         // consumed and the next write/flush drains the queue.
         // Drain on the next write/flush so no post-acceptance error is hidden.
@@ -701,6 +707,39 @@ mod stdio_frame_cap_tests {
             gated.inner,
             b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n".to_vec()
         );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn chunked_multi_mb_media_and_trailing_frame_boundaries_scan_linearly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gated = FrameArtifactStdout::with_spill_dir(Vec::new(), dir.path().into());
+        let media = serde_json::json!({
+            "type": "image",
+            "mimeType": "image/png",
+            "data": "A".repeat(2_500_000)
+        });
+        let mut payload = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "result": {"content": [media]}
+        }))
+        .unwrap();
+        payload.push(b'\n');
+        let tail = b"{\"jsonrpc\":\"2.0\",\"id\":12,\"result\":{\"ok\":true}}\n";
+        payload.extend_from_slice(tail);
+
+        let started = std::time::Instant::now();
+        for part in payload.chunks(1023) {
+            gated.write_all(part).await.unwrap();
+        }
+        gated.flush().await.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "chunked frame buffering should stay O(N), took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(gated.inner, payload);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

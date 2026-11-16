@@ -1124,7 +1124,12 @@ fn forget_agent(conn: &Connection, agent_id: &str) -> Result<(), Error> {
 /// leaves no row.
 pub(super) fn upsert_chunk(conn: &Connection, chunk: &Chunk<'_>) -> Result<(), Error> {
     let cleaned = clean_rag_text(chunk.text);
-    remove_chunk(conn, chunk.id)?;
+    let existed: bool = conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM rag_chunks WHERE chunk_id = ?1)")?
+        .query_row([chunk.id], |r| r.get(0))?;
+    if existed {
+        remove_chunk(conn, chunk.id)?;
+    }
     if cleaned.chars().count() < 2 {
         return Ok(());
     }
@@ -1231,14 +1236,38 @@ fn fts_tokens(value: &str) -> impl Iterator<Item = &str> {
         .filter(|token| !token.is_empty())
 }
 
-/// The phrase that finds one chunk's row: its id's longest token, the unique
-/// part. The whole id (`msg_<id>`, `out_<hash>`) starts with a token most of
-/// the index shares, and a phrase with it reads that token's doclist.
+/// The phrase that finds one chunk's row: intersecting its non-prefix tokens
+/// (`"tok1" AND "tok2"`), or all tokens when only prefix markers exist.
+/// Skipping shared leading markers (`msg`, `out`, `tool`) avoids reading those
+/// whole-index doclists, while intersecting remaining tokens keeps composite ids
+/// narrow even when one component token is shared across many chunks.
 /// `None` for an id without a token, which only a full scan can find.
 pub(crate) fn fts_chunk_lookup(chunk_id: &str) -> Option<String> {
-    fts_tokens(chunk_id)
-        .max_by_key(|token| token.len())
-        .map(fts_exact_phrase)
+    let mut all = Vec::new();
+    for token in fts_tokens(chunk_id) {
+        if !all.contains(&token) {
+            all.push(token);
+        }
+    }
+    if all.is_empty() {
+        return None;
+    }
+    let mut chosen: Vec<&str> = all
+        .iter()
+        .copied()
+        .filter(|token| !matches!(*token, "msg" | "out" | "tool"))
+        .collect();
+    if chosen.is_empty() {
+        chosen = all;
+    }
+    chosen.truncate(16);
+    Some(
+        chosen
+            .into_iter()
+            .map(fts_exact_phrase)
+            .collect::<Vec<_>>()
+            .join(" AND "),
+    )
 }
 
 /// Remove an agent's full-text rows, or (`rename_to`) refile them under a

@@ -1245,3 +1245,92 @@ fn duplicate_mail_never_waits_on_the_index_and_merged_bodies_are_repaired() {
         .unwrap();
     assert!(text.contains("channelmergedneedle"), "{text}");
 }
+
+#[test]
+fn fts_chunk_lookup_intersects_composite_tokens_and_handles_shared_prefix_upserts() {
+    use super::memory_index::{Chunk, fts_chunk_lookup, remove_chunk, upsert_chunk};
+
+    assert_eq!(
+        fts_chunk_lookup("msg_01m7abc_123"),
+        Some("\"01m7abc\" AND \"123\"".to_string())
+    );
+    assert_eq!(
+        fts_chunk_lookup("out_01m7abc"),
+        Some("\"01m7abc\"".to_string())
+    );
+    assert_eq!(
+        fts_chunk_lookup("msg_out_tool"),
+        Some("\"msg\" AND \"out\" AND \"tool\"".to_string())
+    );
+
+    let (_dir, store, agent) = setup();
+    let conn = ix(&store);
+    for idx in 0..32u32 {
+        let id = format!("msg_01sharedprefix_{idx}");
+        let body = format!("alpha token_{idx}");
+        upsert_chunk(
+            &conn,
+            &Chunk {
+                id: &id,
+                agent_id: agent.id.as_str(),
+                agent_name: "worker",
+                direction: "in",
+                sender: "user",
+                destination: "worker",
+                timestamp_ms: idx as i64,
+                text: &body,
+                kind: None,
+                tool: None,
+                seq: idx as i64,
+            },
+        )
+        .unwrap();
+    }
+    upsert_chunk(
+        &conn,
+        &Chunk {
+            id: "msg_01sharedprefix_7",
+            agent_id: agent.id.as_str(),
+            agent_name: "worker",
+            direction: "in",
+            sender: "user",
+            destination: "worker",
+            timestamp_ms: 7,
+            text: "updated token_7",
+            kind: None,
+            tool: None,
+            seq: 7,
+        },
+    )
+    .unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM rag_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 32);
+    let updated: String = conn
+        .query_row(
+            "SELECT text FROM rag_chunks WHERE chunk_id = 'msg_01sharedprefix_7'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(updated, "updated token_7");
+    let fts_hits: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM rag_chunks_fts WHERE rag_chunks_fts MATCH '\"01sharedprefix\" AND \"7\"'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fts_hits, 1);
+
+    remove_chunk(&conn, "msg_01sharedprefix_7").unwrap();
+    let after_remove: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM rag_chunks_fts WHERE rag_chunks_fts MATCH '\"01sharedprefix\" AND \"7\"'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(after_remove, 0);
+}

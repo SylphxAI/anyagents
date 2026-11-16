@@ -29,3 +29,31 @@ version = "0.1.8"
 edition = "2024"
 license = "MIT"
 rust-version = "1.98"
+
+# Pure-CPU hashing and PNG/deflate encoding run in integration/unit test
+# suites over multi-megabyte payloads; optimize only those leaf dependencies so
+# debug builds stay fast while tests do not burn minutes in unoptimized loops.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.test.package.sha2]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.test.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.test.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.test.package.fdeflate]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.test.package.crc32fast]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.test.package.png]
+opt-level = 3
