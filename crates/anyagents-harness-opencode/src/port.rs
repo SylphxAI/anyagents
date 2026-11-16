@@ -5,6 +5,7 @@ use std::io;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyagents_harness::HarnessError;
 
@@ -12,6 +13,7 @@ const FIRST: u16 = 20_000;
 const COUNT: u16 = 10_000;
 const FILENAME: &str = "opencode-service-port";
 static LEASED: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
+static EPHEMERAL_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// A socket reserves the port until spawn; the process-local lease prevents
 /// another agent selecting it while the child is binding or still starting.
@@ -44,14 +46,30 @@ impl PortLease {
                 .ok()
                 .filter(|port| range.contains(port))
         });
-        // Stable FNV-1a seed, independent of randomized HashMap state or PID.
-        let seed = config
-            .map(|dir| dir.as_os_str().as_encoded_bytes())
-            .unwrap_or_default()
-            .iter()
-            .fold(2_166_136_261u32, |hash, byte| {
-                (hash ^ u32::from(*byte)).wrapping_mul(16_777_619)
-            });
+        // Stable FNV-1a seed from config path when reclaiming a persisted agent
+        // port; vary ephemeral sessions across processes and retries so
+        // concurrent processes do not race on the same first candidate after
+        // reservation handoff.
+        let mut seed = 2_166_136_261u32;
+        match config {
+            Some(dir) => {
+                for &byte in dir.as_os_str().as_encoded_bytes() {
+                    seed = (seed ^ u32::from(byte)).wrapping_mul(16_777_619);
+                }
+            }
+            None => {
+                let seq = EPHEMERAL_SEQ.fetch_add(1, Ordering::Relaxed);
+                for value in [
+                    std::process::id(),
+                    seq,
+                    u32::from(avoid.unwrap_or_default()),
+                ] {
+                    for byte in value.to_le_bytes() {
+                        seed = (seed ^ u32::from(byte)).wrapping_mul(16_777_619);
+                    }
+                }
+            }
+        }
         let first = stored.unwrap_or(range.start + (seed % u32::from(count)) as u16);
         let mut leased = LEASED.lock().unwrap_or_else(|err| err.into_inner());
         let ports = leased.get_or_insert_with(HashSet::new);
@@ -287,5 +305,22 @@ mod tests {
     fn unrelated_startup_errors_do_not_report_a_collision() {
         let events = watch_collision(Cursor::new("configuration rejected\n".repeat(1024)));
         assert_eq!(events.recv_timeout(Duration::from_secs(5)), Ok(false));
+    }
+
+    #[test]
+    fn ephemeral_leases_without_config_spread_starting_candidates() {
+        let mut first_candidates = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let mut first = None;
+            let _ = PortLease::acquire_with(None, None, FIRST..FIRST + COUNT, |candidate| {
+                first = Some(candidate);
+                Err(io::Error::other("stop after initial candidate"))
+            });
+            first_candidates.insert(first.unwrap());
+        }
+        assert!(
+            first_candidates.len() > 1,
+            "expected spread candidates across ephemeral calls, got {first_candidates:?}"
+        );
     }
 }
