@@ -251,6 +251,14 @@ fn create_with_seat(
                 .map(str::to_string)
         });
     new.parent_id = request.parent_id;
+    // Refused before the row exists: a creation rolled back later costs a
+    // delete of everything keyed by the agent.
+    ensure_harness_runs_profile(
+        data,
+        &normalized_harness,
+        request.profile.as_deref(),
+        new.model.as_deref(),
+    )?;
     let agent = store.create_agent(new)?;
     let data = std::path::absolute(data)?;
     // A checkout the consumer produced for this creation; rollback removes it.
@@ -5430,6 +5438,48 @@ pub(crate) fn ensure_profile_compatible_and_mapped(
         }
     }
     Ok(())
+}
+
+/// Whether `harness` can run the provider profile a creation names, checked
+/// before anything is created: a creation refused after its row exists is
+/// rolled back with a delete of everything keyed by the agent. Only
+/// compatibility is checked here; [`ensure_profile_compatible_and_mapped`]
+/// still checks the profile's mapping once the agent's config exists.
+pub(crate) fn ensure_harness_runs_profile(
+    data: &Path,
+    harness: &str,
+    profile: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), Error> {
+    let Some(explicit) = profile.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let harness = normalize_harness_name(harness);
+    let (provider, profile_name) = match explicit.split_once('/') {
+        Some((p, n)) => (p.trim().to_string(), n.trim().to_string()),
+        None => (upstream_provider_of(harness, model), explicit.to_string()),
+    };
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+            && s != "."
+            && s != ".."
+    };
+    if !plain(&provider) || !plain(&profile_name) {
+        // The full check refuses it once the config exists.
+        return Ok(());
+    }
+    let profile_dir = data.join("profiles").join(&provider).join(&profile_name);
+    let compatible = profile_compatible_harnesses(&profile_dir, &provider);
+    if compatible.iter().any(|h| h == harness) {
+        return Ok(());
+    }
+    Err(Error::Message(format!(
+        "harness `{harness}` is not compatible with provider profile `{provider}/{profile_name}` \
+         (compatible harnesses: {})",
+        compatible.join(", ")
+    )))
 }
 
 fn copy_host_file(src: &Path, dst: &Path) -> bool {
@@ -15279,6 +15329,51 @@ Connection: close
         )
         .expect_err("parent traversal in relative path must fail closed");
         assert!(trav.to_string().contains("escapes base"), "{trav}");
+    }
+
+    #[test]
+    fn a_creation_its_profile_cannot_run_is_refused_and_leaves_no_agent() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        // Report #34's pairing is a supported one (see vendor's Sylphx route).
+        ensure_harness_runs_profile(
+            data,
+            "claude-code",
+            Some("sylphx/default"),
+            Some("sylphx/openai/gpt-6.1-sol"),
+        )
+        .unwrap();
+        let refused = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "agy-on-sylphx".to_string(),
+                role: None,
+                harness: "agy".to_string(),
+                model: None,
+                profile: Some("sylphx/default".to_string()),
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: Some(data.to_path_buf()),
+                description: Some("test".to_string()),
+                instructions: Some("test".to_string()),
+                parent_id: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refused.contains("not compatible with provider profile `sylphx/default`"),
+            "{refused}"
+        );
+        // Nothing to roll back: no row was written.
+        assert!(store.agent_by_name("agy-on-sylphx").is_err());
     }
 
     #[test]
