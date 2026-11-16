@@ -868,6 +868,21 @@ pub(crate) fn reap_archived_agent_locked(
     data_dir: &Path,
     agent_id: &anyagents_core::AgentId,
 ) {
+    // Health is a projection; only custody excludes a worker still exiting.
+    let Ok(process) = store.try_lock_agent(agent_id) else {
+        reap_queue::note_failure(data_dir, agent_id, now_ms());
+        return;
+    };
+    reap_archived_agent_with_process_locked(store, data_dir, agent_id, &process);
+}
+
+/// Caller holds the lifecycle lock and retains actual process custody.
+fn reap_archived_agent_with_process_locked(
+    store: &Store,
+    data_dir: &Path,
+    agent_id: &anyagents_core::AgentId,
+    _process: &anyagents_core::AgentLock,
+) {
     let agent = match store.agent(agent_id) {
         Ok(agent) => agent,
         Err(Error::AgentNotFound(_)) => return reap_queue::dequeue(data_dir, agent_id),
@@ -907,19 +922,21 @@ pub(crate) fn reap_archived_agent_locked(
 
 /// The maintenance worker runs this at startup and each minute without waiting
 /// for an agent lock. It visits only archives whose cleanup is owed and due.
-fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
+pub(crate) fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
     reap_archived_agents_at(store, data_dir, health, now_ms());
 }
 
 fn reap_archived_agents_at(store: &Store, data_dir: &Path, health: &HealthBoard, now: i64) {
     reap_queue::backfill(store, data_dir);
-    for agent_id in reap_queue::due(data_dir, now) {
+    for agent_id in reap_queue::due(data_dir, now, 32) {
         let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent_id) else {
+            reap_queue::note_failure(data_dir, &agent_id, now);
             continue;
         };
         // A wake followed by a new self-archive may have started a process
         // since the archive. Check current health only after taking the lock.
         if health.get(&agent_id).is_some_and(|live| live.process_alive) {
+            reap_queue::note_failure(data_dir, &agent_id, now);
             continue;
         }
         // Re-read under the lock: the queue may predate a direct wake.
@@ -5132,14 +5149,13 @@ async fn archive_agent_route(
                 process_guard = state.store.try_lock_agent(&found.id).ok();
             }
         }
-        if process_guard.is_some()
-            || (is_self
-                && state
-                    .health
-                    .get(&found.id)
-                    .is_none_or(|live| !live.process_alive))
-        {
-            reap_archived_agent_locked(&state.store, state.store.data_dir(), &found.id);
+        if let Some(process) = process_guard.as_ref() {
+            reap_archived_agent_with_process_locked(
+                &state.store,
+                state.store.data_dir(),
+                &found.id,
+                process,
+            );
         }
         drop(process_guard);
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
@@ -5183,6 +5199,8 @@ fn reap_subagent_ephemeral_dirs_in(
         return false;
     };
     let agent = agent.as_ref();
+    // Intentionally retained unknown work is a terminal preservation decision;
+    // only failed cleanup operations need a retry.
     let mut complete = true;
     let agent_root = data_dir.join("agents").join(agent_id.as_str());
     let config_dir = agent_root.join("config");
@@ -5191,34 +5209,9 @@ fn reap_subagent_ephemeral_dirs_in(
     let seat_ids = detect_seat_ids(&config_dir)
         .or_else(|| detect_seat_ids(&configured_work))
         .or_else(|| detect_seat_ids(&legacy_work));
-    for rel in [
-        "cache-home",
-        "cache",
-        ".cache",
-        ".local",
-        "data-home",
-        "state-home",
-        "muse",
-        ".omp",
-        ".dsh",
-        ".grok",
-        ".gemini",
-        ".npm",
-        ".bun",
-        ".cargo",
-        ".rustup",
-        ".tmp",
-        "tmp",
-        ".claude",
-        ".codex",
-        ".config",
-        "opencode",
-        "projects",
-        "shell-snapshots",
-        "session-env",
-        "todos",
-        "logs",
-    ] {
+    // Native harness homes can contain the only session or learned-memory
+    // copy. Remove only runtime-designated cache and temporary directories.
+    for rel in ["cache-home", ".cache", "tmp"] {
         let target = config_dir.join(rel);
         complete &= remove_path_with_seat(&target, seat_ids);
     }
@@ -5265,16 +5258,6 @@ fn reap_subagent_ephemeral_dirs_in(
         shared_workdirs.insert(wd_path);
     }
     let marker_path = config_dir.join(".anyagents-managed-worktree.json");
-    let marker_val = std::fs::read_to_string(&marker_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-    let recorded_wt = marker_val
-        .as_ref()
-        .and_then(|v| v.get("path"))
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-        .map(|p| std::path::absolute(&p).unwrap_or(p));
-
     let mut managed_work_dirs =
         vec![std::path::absolute(&configured_work).unwrap_or_else(|_| configured_work.clone())];
     let legacy_abs = std::path::absolute(&legacy_work).unwrap_or_else(|_| legacy_work.clone());
@@ -5293,6 +5276,9 @@ fn reap_subagent_ephemeral_dirs_in(
         {
             continue;
         }
+        if !real_directory_path(&work_dir) {
+            continue;
+        }
         let dotgit = work_dir.join(".git");
         if std::fs::symlink_metadata(&dotgit).is_ok_and(|meta| meta.is_file()) {
             // A linked worktree from before per-agent repositories: convert it
@@ -5302,51 +5288,36 @@ fn reap_subagent_ephemeral_dirs_in(
                     "agent {agent_id}: keeping checkout {}: not converted: {reason}",
                     work_dir.display()
                 );
-                complete &= reap_build_outputs_in_worktree(&work_dir, seat_ids);
                 continue;
             }
         }
         if dotgit.symlink_metadata().is_ok() {
             if is_git_worktree_safe_to_reap(&work_dir, seat) {
-                crate::repo::forget(&work_dir);
-                complete &= remove_path_with_seat(&work_dir, seat_ids);
-                let _ = std::fs::remove_file(&marker_path);
-            } else {
-                complete &= reap_build_outputs_in_worktree(&work_dir, seat_ids);
-            }
-        } else if work_dir.exists() && recorded_wt.as_ref() == Some(&work_dir) {
-            // A repository checkout that lost its `.git` is not disposable.
-            eprintln!(
-                "agent {agent_id}: preserving checkout {}: its .git is missing",
-                work_dir.display()
-            );
-            complete &= reap_build_outputs_in_worktree(&work_dir, seat_ids);
-        } else {
-            let mut preserved_dirty_child = false;
-            if let Ok(entries) = std::fs::read_dir(&work_dir) {
-                for entry in entries.flatten() {
-                    let child_path = entry.path();
-                    // A repository the agent made inside its private directory
-                    // is kept; only its build output goes.
-                    if child_path.is_dir() && child_path.join(".git").exists() {
-                        complete &= reap_build_outputs_in_worktree(&child_path, seat_ids);
-                        preserved_dirty_child = true;
-                    }
-                }
-            }
-            if !preserved_dirty_child {
-                complete &= remove_path_with_seat(&work_dir, seat_ids);
-                if recorded_wt.as_ref().is_none_or(|p| !p.exists()) {
+                // Keep pool recovery refs: removing them before checkout
+                // deletion succeeds would discard recovery on an I/O error.
+                if remove_path_with_seat(&work_dir, seat_ids) {
                     let _ = std::fs::remove_file(&marker_path);
+                } else {
+                    complete = false;
                 }
             }
         }
+        // Missing/unreadable Git metadata and non-Git work are unknown, not
+        // disposable. A build-like name is not a recovery proof either.
     }
     complete
 }
 
-/// Either directory is the other or lies inside it, under any spelling
-/// (as given, absolute, or with links resolved). An empty path is no workdir.
+/// Reject symlinks and unreadable ancestors while deleting.
+fn real_directory_path(path: &Path) -> bool {
+    let Ok(path) = std::path::absolute(path) else {
+        return false;
+    };
+    path.ancestors()
+        .all(|part| std::fs::symlink_metadata(part).is_ok_and(|meta| meta.is_dir()))
+}
+
+/// Either directory contains the other, including aliases.
 fn workdirs_overlap(a: &Path, b: &Path) -> bool {
     let spellings = |path: &Path| -> Vec<PathBuf> {
         if path.as_os_str().is_empty() {
@@ -5362,42 +5333,9 @@ fn workdirs_overlap(a: &Path, b: &Path) -> bool {
         .any(|x| b.iter().any(|y| x.starts_with(y) || y.starts_with(x)))
 }
 
-fn reap_build_outputs_in_worktree(wt_path: &Path, seat_ids: Option<(u32, u32, u32)>) -> bool {
-    let mut complete = true;
-    const BUILD_DIRS: &[&str] = &["target", "node_modules", ".next", ".turbo", "dist"];
-    for rel in BUILD_DIRS {
-        complete &= remove_path_with_seat(&wt_path.join(rel), seat_ids);
-    }
-    for container in ["apps", "packages", "crates", "services"] {
-        let dir = wt_path.join(container);
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) => {
-                complete &= error.kind() == std::io::ErrorKind::NotFound;
-                continue;
-            }
-        };
-        for entry in entries {
-            let Ok(entry) = entry else {
-                complete = false;
-                continue;
-            };
-            let path = entry.path();
-            if path.is_dir() {
-                for rel in BUILD_DIRS {
-                    complete &= remove_path_with_seat(&path.join(rel), seat_ids);
-                }
-            }
-        }
-    }
-    complete
-}
-
 /// A checkout may go only when it is the agent's own repository and nothing
 /// in it is the only copy of anything:
-/// - no tracked change, and no untracked or ignored path but build output
-///   (inside `node_modules/`, or a Cargo `target/` that carries its
-///   `CACHEDIR.TAG`); AnyAgents writes nothing else into a workdir;
+/// - no tracked change, untracked file, or ignored content;
 /// - a born HEAD, and no submodule with a Git directory of its own;
 /// - the remote holds everything else: no stash, no tag or note the remote
 ///   lacks, and no commit of any ref (every namespace, `refs/original` and
@@ -5411,6 +5349,25 @@ pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, seat: Option<(u32, u3
     let git_dir = wt_path.join(".git");
     if !std::fs::symlink_metadata(&git_dir).is_ok_and(|meta| meta.is_dir()) {
         return false;
+    }
+    // In-progress operations and locks can hold unique recovery state.
+    for name in [
+        "index.lock",
+        "HEAD.lock",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "REBASE_HEAD",
+        "rebase-apply",
+        "rebase-merge",
+        "sequencer",
+        "BISECT_START",
+        "AUTO_MERGE",
+    ] {
+        match std::fs::symlink_metadata(git_dir.join(name)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return false,
+        }
     }
     let git = || crate::repo::inspect_command(seat, &git_dir, Some(wt_path));
     let output = |args: &[&str]| {
@@ -5428,15 +5385,7 @@ pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, seat: Option<(u32, u3
     if !status_out.status.success() {
         return false;
     }
-    let status_text = String::from_utf8_lossy(&status_out.stdout);
-    let only_build_output = status_text
-        .split('\0')
-        .filter(|entry| !entry.is_empty())
-        .all(|entry| match entry.split_at_checked(3) {
-            Some(("?? " | "!! ", path)) => is_build_output(wt_path, path),
-            _ => false,
-        });
-    if !only_build_output {
+    if !status_out.stdout.is_empty() {
         return false;
     }
     // An unborn HEAD (`switch --orphan`) says nothing about the branches beside it.
@@ -5501,6 +5450,8 @@ pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, seat: Option<(u32, u3
         "--count",
         "--exclude=refs/remotes/*",
         "--all",
+        "HEAD",
+        "--reflog",
         "--ignore-missing",
         "--stdin",
     ]);
@@ -5508,19 +5459,7 @@ pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, seat: Option<(u32, u3
         .is_ok_and(|out| out.status.success() && out.stdout == b"0\n")
 }
 
-/// A path inside `node_modules/`, or inside a `target/` directory Cargo
-/// marked as its own with `CACHEDIR.TAG`. Nothing else is build output here.
-fn is_build_output(wt_path: &Path, path: &str) -> bool {
-    let mut dir = wt_path.to_path_buf();
-    for part in path.trim_end_matches('/').split('/') {
-        dir.push(part);
-        if part == "node_modules" || (part == "target" && dir.join("CACHEDIR.TAG").is_file()) {
-            return true;
-        }
-    }
-    false
-}
-
+/// Determine the seat owning a runtime directory for permission-aware cleanup.
 #[cfg(unix)]
 fn detect_seat_ids(config_dir: &Path) -> Option<(u32, u32, u32)> {
     use std::os::unix::fs::MetadataExt as _;
@@ -5575,6 +5514,9 @@ fn remove_path_with_seat(target: &Path, seat_ids: Option<(u32, u32, u32)>) -> bo
         Ok(meta) => meta,
         Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
     };
+    if !target.parent().is_some_and(real_directory_path) {
+        return false;
+    }
     if meta.file_type().is_symlink() || meta.is_file() {
         if std::fs::remove_file(target).is_ok() {
             return true;
@@ -11977,18 +11919,18 @@ pub(crate) mod tests {
         let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
         let generation = std::fs::read(cfg.join(".anyagents-archived")).unwrap();
         std::fs::write(cfg.join(".anyagents-reaped"), b"foreign generation").unwrap();
-        std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        std::fs::create_dir_all(cfg.join(".cache")).unwrap();
         reap_archived_agents(&store, dir.path(), &HealthBoard::default());
-        assert!(!cfg.join(".claude").exists());
+        assert!(!cfg.join(".cache").exists());
         assert_eq!(
             std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
             generation
         );
         // A fresh process must use durable completion, not rescan retained dirs.
-        std::fs::create_dir_all(cfg.join("shell-snapshots")).unwrap();
+        std::fs::create_dir_all(cfg.join("cache-home")).unwrap();
         let restarted = Store::open(&db).unwrap();
         reap_archived_agents(&restarted, dir.path(), &HealthBoard::default());
-        assert!(cfg.join("shell-snapshots").exists());
+        assert!(cfg.join("cache-home").exists());
         let stale_child = restarted.agent(&child.id).unwrap();
         authored_send(
             &store,
@@ -12004,7 +11946,7 @@ pub(crate) mod tests {
             reap_archived_agent_locked(&restarted, dir.path(), &stale_child.id);
         }
         assert!(
-            cfg.join("shell-snapshots").exists(),
+            cfg.join("cache-home").exists(),
             "stale cleanup deleted running config"
         );
         assert_eq!(store.agent(&child.id).unwrap().state, "running");
@@ -12015,7 +11957,7 @@ pub(crate) mod tests {
         );
         assert!(!cfg.join(".anyagents-reaped").exists());
         reap_archived_agents(&store, dir.path(), &HealthBoard::default());
-        assert!(!cfg.join("shell-snapshots").exists());
+        assert!(!cfg.join("cache-home").exists());
         assert_eq!(
             std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
             std::fs::read(cfg.join(".anyagents-archived")).unwrap()
@@ -12105,16 +12047,16 @@ pub(crate) mod tests {
         // Forget what this binary queued, as if the archives predated the queue.
         std::fs::remove_dir_all(dir.path().join("reap-pending")).unwrap();
         for cfg in [&finished_cfg, &legacy_cfg] {
-            std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+            std::fs::create_dir_all(cfg.join(".cache")).unwrap();
         }
 
         reap_archived_agents(&store, dir.path(), &HealthBoard::default());
         assert!(
-            finished_cfg.join(".claude").exists(),
+            finished_cfg.join(".cache").exists(),
             "finished archive revisited"
         );
         assert!(
-            !legacy_cfg.join(".claude").exists(),
+            !legacy_cfg.join(".cache").exists(),
             "legacy archive not backfilled"
         );
         assert_eq!(
@@ -12123,12 +12065,12 @@ pub(crate) mod tests {
         );
 
         // Nothing is owed now, so maintenance visits no agent at all.
-        std::fs::create_dir_all(legacy_cfg.join(".claude")).unwrap();
+        std::fs::create_dir_all(legacy_cfg.join(".cache")).unwrap();
         std::fs::remove_file(finished_cfg.join(".anyagents-reaped")).unwrap();
         reap_archived_agents(&store, dir.path(), &HealthBoard::default());
-        assert!(legacy_cfg.join(".claude").exists());
-        assert!(finished_cfg.join(".claude").exists());
-        assert!(reap_queue::due(dir.path(), i64::MAX).is_empty());
+        assert!(legacy_cfg.join(".cache").exists());
+        assert!(finished_cfg.join(".cache").exists());
+        assert!(reap_queue::due(dir.path(), i64::MAX, usize::MAX).is_empty());
     }
 
     #[test]
@@ -12204,7 +12146,7 @@ pub(crate) mod tests {
             .unwrap();
         let child = archived_reap_fixture(&store, "worker", &parent);
         let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
-        std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        std::fs::create_dir_all(cfg.join(".cache")).unwrap();
         let health = HealthBoard::default();
         let mut live = anyagents_supervisor::LiveState {
             process_alive: true,
@@ -12220,17 +12162,18 @@ pub(crate) mod tests {
         };
         health.publish(&child.id, live.clone());
         reap_archived_agents(&store, dir.path(), &health);
-        assert!(cfg.join(".claude").exists());
+        assert!(cfg.join(".cache").exists());
         assert!(!cfg.join(".anyagents-reaped").exists());
         live.process_alive = false;
         health.publish(&child.id, live);
+        reap_queue::enqueue(dir.path(), &child.id);
         reap_archived_agents(&store, dir.path(), &health);
-        assert!(!cfg.join(".claude").exists());
+        assert!(!cfg.join(".cache").exists());
         assert!(cfg.join(".anyagents-reaped").exists());
     }
 
     #[test]
-    fn archive_reap_failed_protection_read_preserves_work_and_delete_still_cleans() {
+    fn archive_reap_failed_protection_read_and_delete_preserve_unknown_work() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let parent = store
@@ -12261,7 +12204,97 @@ pub(crate) mod tests {
         assert!(work.join("keep").exists());
         store.delete_agent(&sibling.id).unwrap();
         assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
-        assert!(!work.exists());
+        assert_eq!(std::fs::read(work.join("keep")).unwrap(), b"protected");
+    }
+
+    #[test]
+    fn archive_reap_requires_process_custody_even_when_health_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
+        std::fs::create_dir_all(cfg.join(".cache")).unwrap();
+        let custody = store.try_lock_agent(&child.id).unwrap();
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        assert!(cfg.join(".cache").exists());
+        assert!(!cfg.join(".anyagents-reaped").exists());
+        drop(custody);
+        reap_queue::enqueue(dir.path(), &child.id);
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        assert!(!cfg.join(".cache").exists());
+        assert!(cfg.join(".anyagents-reaped").exists());
+    }
+
+    #[test]
+    fn archive_reap_preserves_native_homes_memory_sessions_and_unknown_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
+        let work = anyagents_core::agent_work_dir(dir.path(), &child.id);
+        let files: Vec<_> = [
+            ".claude/projects/session.json",
+            ".codex/history.jsonl",
+            "state-home/learned.md",
+            ".config/settings",
+            "data-home/sessions/a",
+        ]
+        .map(|p| cfg.join(p))
+        .into_iter()
+        .chain(
+            [
+                "memory/MEMORY.md",
+                "sessions/transcript.json",
+                "target/report",
+            ]
+            .map(|p| work.join(p)),
+        )
+        .collect();
+        for file in &files {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"only copy").unwrap();
+        }
+        std::fs::create_dir_all(cfg.join(".cache")).unwrap();
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        for file in &files {
+            assert_eq!(std::fs::read(file).unwrap(), b"only copy");
+        }
+        assert!(!cfg.join(".cache").exists());
+        assert!(cfg.join(".anyagents-reaped").exists());
+    }
+
+    #[test]
+    fn archive_reap_drains_at_most_32_per_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let children: Vec<_> = (0..65)
+            .map(|i| archived_reap_fixture(&store, &format!("worker-{i}"), &parent))
+            .collect();
+        for remaining in [33, 1, 0] {
+            reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+            assert_eq!(
+                reap_queue::due(dir.path(), i64::MAX, usize::MAX).len(),
+                remaining
+            );
+            let done = children
+                .iter()
+                .filter(|a| {
+                    anyagents_core::agent_config_dir(dir.path(), &a.id)
+                        .join(".anyagents-reaped")
+                        .exists()
+                })
+                .count();
+            assert_eq!(done, 65 - remaining);
+        }
     }
 
     #[test]
@@ -12337,12 +12370,11 @@ pub(crate) mod tests {
             let missing_work = snapshot(&work);
             assert!(!is_git_worktree_safe_to_reap(&work, None));
             assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
-            let mut expected = missing_work;
-            expected.remove(Path::new("target/uncertain-report"));
-            assert_eq!(snapshot(&work), expected, "lost .git deleted source");
+            assert_eq!(snapshot(&work), missing_work, "lost .git deleted source");
             let _ = std::fs::remove_file(&own);
         }
         std::fs::rename(&aside, &own).unwrap();
+        std::fs::remove_dir_all(work.join("target")).unwrap();
         git(&work, &["push", "-q", "origin", "HEAD:refs/heads/worker"]);
         assert!(is_git_worktree_safe_to_reap(&work, None));
         let pushed_head = git(&work, &["rev-parse", "HEAD"]);
@@ -12382,6 +12414,42 @@ pub(crate) mod tests {
         (work, remote)
     }
 
+    #[test]
+    fn cleanup_preserves_detached_reflog_and_in_progress_git_state() {
+        use crate::repo::tests::git;
+        let dir = tempfile::tempdir().unwrap();
+        let (work, _) = published_checkout(dir.path());
+        git(&work, &["checkout", "--detach"]);
+        git_as_author(&work, &["commit", "--allow-empty", "-m", "detached-only"]);
+        assert!(!is_git_worktree_safe_to_reap(&work, None), "detached HEAD");
+        git(&work, &["checkout", "worker"]);
+        assert!(
+            !is_git_worktree_safe_to_reap(&work, None),
+            "reflog-only commit"
+        );
+        git(&work, &["reflog", "expire", "--expire=now", "--all"]);
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+        for name in [
+            "index.lock",
+            "HEAD.lock",
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "REBASE_HEAD",
+            "rebase-apply",
+            "rebase-merge",
+            "sequencer",
+            "BISECT_START",
+            "AUTO_MERGE",
+        ] {
+            let path = work.join(".git").join(name);
+            std::fs::write(&path, "recovery state").unwrap();
+            assert!(!is_git_worktree_safe_to_reap(&work, None), "{name}");
+            std::fs::remove_file(path).unwrap();
+        }
+        assert!(is_git_worktree_safe_to_reap(&work, None));
+    }
+
     fn git_as_author(dir: &Path, args: &[&str]) -> String {
         let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@example.test"];
         all.extend_from_slice(args);
@@ -12389,10 +12457,9 @@ pub(crate) mod tests {
     }
 
     /// Ignored files are often the only copy of something (`.env`, data, a
-    /// gitignored memory file). Only build output may be left behind:
-    /// `node_modules/`, and a `target/` Cargo marked with `CACHEDIR.TAG`.
+    /// gitignored memory file). Build-like names do not prove disposability.
     #[test]
-    fn cleanup_keeps_ignored_files_other_than_build_output() {
+    fn cleanup_keeps_all_ignored_files_including_build_names() {
         let dir = tempfile::tempdir().unwrap();
         let (work, _) = published_checkout(dir.path());
         std::fs::create_dir_all(work.join(".git/info")).unwrap();
@@ -12417,9 +12484,13 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(
-            is_git_worktree_safe_to_reap(&work, None),
-            "build output alone"
+            !is_git_worktree_safe_to_reap(&work, None),
+            "build output may hide unique work"
         );
+        for path in ["node_modules", "target", "crates"] {
+            std::fs::remove_dir_all(work.join(path)).unwrap();
+        }
+        assert!(is_git_worktree_safe_to_reap(&work, None));
         for (path, body) in [
             (".env", "SECRET=only-copy\n"),
             ("memory/MEMORY.md", "# the agent's only memory\n"),
@@ -12735,13 +12806,13 @@ pub(crate) mod tests {
                 && !registered.contains(checkouts[1].to_str().unwrap()),
             "{registered}"
         );
-        // The kept checkout's borrowed objects stay held; the reaped one's
-        // keep ref went with it.
+        // Preserve both pool recovery references, even after successful reaping.
+        // Cleanup must not drop recovery protection before directory removal.
         let keeps = git(
             &hub,
             &["for-each-ref", "--format=%(refname)", "refs/anyagents/keep"],
         );
-        assert_eq!(keeps.lines().count(), 1, "{keeps}");
+        assert_eq!(keeps.lines().count(), 2, "{keeps}");
     }
 
     #[test]
@@ -12782,12 +12853,16 @@ pub(crate) mod tests {
         git(&["add", "source.rs", ".gitignore"]);
         git(&["commit", "-qm", "Initial source"]);
         std::fs::create_dir_all(work.join("target/debug")).unwrap();
+        std::fs::write(work.join("target/debug/report"), b"unique report").unwrap();
         // A clean commit with no remote is not safe to delete.
         assert!(!is_git_worktree_safe_to_reap(&work, None));
         reap_archived_agents(&store, dir.path(), &HealthBoard::default());
         assert!(work.join("source.rs").exists());
         assert!(work.join(".git").exists());
-        assert!(!work.join("target").exists());
+        assert_eq!(
+            std::fs::read(work.join("target/debug/report")).unwrap(),
+            b"unique report"
+        );
         let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
         assert!(
             cfg.join(".anyagents-reaped").exists(),
@@ -12934,7 +13009,7 @@ exec '{}' "$@"
     }
 
     #[test]
-    fn reap_subagent_ephemeral_dirs_removes_gemini_tmp_and_dirty_worktree_build_outputs() {
+    fn reap_subagent_ephemeral_dirs_preserves_dirty_worktree_including_build_names() {
         let data = tempfile::tempdir().unwrap();
         let agent_id = anyagents_core::AgentId::generate();
         let agent_root = data.path().join("agents").join(agent_id.as_str());
@@ -12955,13 +13030,17 @@ exec '{}' "$@"
 
         reap_subagent_ephemeral_dirs(data.path(), &agent_id);
 
-        assert!(!config_dir.join(".gemini").exists());
+        assert_eq!(
+            std::fs::read(config_dir.join(".gemini/antigravity-cli/brain/transcript.jsonl"))
+                .unwrap(),
+            b"large transcript"
+        );
         assert!(!config_dir.join(".cache").exists());
         assert!(!agent_root.join("tmp").exists());
-        // Dirty worktree is preserved, while heavy build outputs inside it are reaped:
+        // Dirty worktree contents are preserved regardless of build-like names:
         assert!(work_dir.join("dirty.rs").exists());
-        assert!(!work_dir.join("target").exists());
-        assert!(!work_dir.join("apps/web/node_modules").exists());
+        assert!(work_dir.join("target").exists());
+        assert!(work_dir.join("apps/web/node_modules").exists());
     }
     fn mark_explicitly_archived(store: &Store, data_dir: &Path, agent: &Agent) {
         let Ok(_lifecycle) = store.lock_agent_lifecycle(&agent.id) else {

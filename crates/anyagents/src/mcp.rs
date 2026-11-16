@@ -1152,7 +1152,17 @@ impl Client {
     }
 
     async fn get_agents(&self) -> Result<AgentsResponse, String> {
-        self.get("/v1/agents", None).await
+        self.get_agents_for_state(None).await
+    }
+
+    async fn get_agents_for_state(&self, state: Option<&str>) -> Result<AgentsResponse, String> {
+        // The daemon defaults to live rows; turn-state filters stay local.
+        let path = match state.map(str::trim) {
+            Some(s) if s.eq_ignore_ascii_case("archived") => "/v1/agents?state=archived",
+            Some(s) if s.eq_ignore_ascii_case("all") => "/v1/agents?state=all",
+            _ => "/v1/agents",
+        };
+        self.get(path, None).await
     }
 }
 
@@ -2525,12 +2535,12 @@ impl AgentMcp {
                 Ok(rmcp::handler::server::wrapper::Json(response))
             }
             "list" | "ls" => {
-                let mut response: AgentsResponse = self.client.get_agents().await?;
                 let state_trimmed = args
                     .state
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
+                let mut response = self.client.get_agents_for_state(state_trimmed).await?;
                 match state_trimmed {
                     Some(state_filter) if !state_filter.eq_ignore_ascii_case("all") => {
                         response.agents.retain(|a| {
@@ -3066,7 +3076,10 @@ impl AgentMcp {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .unwrap_or("self");
-                let mut resp: AgentsResponse = self.client.get_agents().await?;
+                let mut resp = self
+                    .client
+                    .get_agents_for_state(args.state.as_deref())
+                    .await?;
                 if parent_arg.eq_ignore_ascii_case("all") {
                     resp.agents.retain(|a| a.parent.is_some());
                 } else {
@@ -10820,6 +10833,109 @@ mod spawn_args_tests {
                 assert_eq!(result["summary"]["matched"], 105);
                 assert_eq!(result["summary"]["working"], 1);
                 assert_eq!(result["summary"]["paused"], 1);
+            }
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_lifecycle_states_fetch_the_requested_daemon_population() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let parent_id = AgentId::generate();
+        let mut live = vec![
+            dummy_agent_view("idle", "idle", "running", "idle", None),
+            dummy_agent_view("working", "working", "running", "working", None),
+        ];
+        let mut archived = vec![dummy_agent_view(
+            "archived", "archived", "archived", "idle", None,
+        )];
+        for row in live.iter_mut().chain(archived.iter_mut()) {
+            row.parent = Some(parent_id.to_string());
+        }
+        // The mock has the daemon's live-only default, not an all-rows response
+        // that could hide a missing lifecycle query in either public tool.
+        let server = tokio::spawn(async move {
+            for _ in 0..16 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    request.push(stream.read_u8().await.unwrap());
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = std::str::from_utf8(&request).unwrap();
+                let mut parts = request.lines().next().unwrap().split_whitespace();
+                assert_eq!(parts.next(), Some("GET"));
+                let uri: hyper::Uri = parts.next().unwrap().parse().unwrap();
+                assert_eq!(uri.path(), "/v1/agents");
+                let agents = match uri.query() {
+                    None => live.clone(),
+                    Some("state=archived") => archived.clone(),
+                    Some("state=all") => live.iter().chain(archived.iter()).cloned().collect(),
+                    query => panic!("unexpected population query: {query:?}"),
+                };
+                let body = serde_json::to_vec(&AgentsResponse {
+                    agents,
+                    archived_count: 1,
+                    gateway: None,
+                })
+                .unwrap();
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        });
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: parent_id,
+                name: "parent".into(),
+                workdir: None,
+            },
+            client: Client::new(
+                socket,
+                dir.path().join("config"),
+                "synthetic-test-capability".into(),
+            ),
+            profile: McpProfile::Full,
+        };
+        for legacy in [false, true] {
+            for (state, expected) in [
+                (None, vec!["idle", "working"]),
+                (Some("  "), vec!["idle", "working"]),
+                (Some("archived"), vec!["archived"]),
+                (Some(" ARCHIVED "), vec!["archived"]),
+                (Some("all"), vec!["archived", "idle", "working"]),
+                (Some(" ALL "), vec!["archived", "idle", "working"]),
+                (Some("working"), vec!["working"]),
+                (Some(" WORKING "), vec!["working"]),
+            ] {
+                let args = json!({ "action": "list", "state": state });
+                let result = if legacy {
+                    mcp.subagents(Parameters(serde_json::from_value(args).unwrap()))
+                        .await
+                        .unwrap()
+                        .0
+                } else {
+                    mcp.agents(Parameters(serde_json::from_value(args).unwrap()))
+                        .await
+                        .unwrap()
+                        .0
+                };
+                let mut actual: Vec<_> = result[if legacy { "subagents" } else { "agents" }]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["id"].as_str().unwrap())
+                    .collect();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "legacy={legacy}, state={state:?}");
             }
         }
         server.await.unwrap();
