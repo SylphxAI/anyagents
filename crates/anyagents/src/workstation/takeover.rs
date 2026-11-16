@@ -17,15 +17,46 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use agent_workstation::{DesktopSession, HandBack};
+use agent_workstation::{DesktopSession, HandBack, Holder, PageEvidence};
 use anyagents_core::{Error, now_ms};
 use tokio::io::AsyncBufReadExt as _;
 use tokio::process::{Child, Command};
 
 const TUNNEL_START: Duration = Duration::from_secs(15);
+const SOLVE_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+const SOLVE_REQUIRED_READS: u32 = 2;
+
+/// Neutral light-DOM challenge widget/container selectors matching
+/// `DETECT_CAPTCHA_JS`, within `Handoff::observe`'s 32-selector budget.
+const CHALLENGE_SELECTORS: &[&str] = &[
+    "#cf-chl-widget",
+    ".cf-turnstile",
+    "#challenge-running",
+    "#challenge-stage",
+    r#"iframe[src*="challenges.cloudflare.com"]"#,
+    r#"iframe[src*="turnstile"]"#,
+    ".g-recaptcha:not(.grecaptcha-badge)",
+    "#g-recaptcha",
+    r#"iframe[src*="google.com/recaptcha"]"#,
+    r#"iframe[src*="recaptcha/api2"]"#,
+    r#"iframe[src*="recaptcha/enterprise"]"#,
+    ".h-captcha",
+    r#"iframe[src*="hcaptcha.com"]"#,
+    "#arkose",
+    "[data-arkose]",
+    r#"iframe[src*="arkoselabs.com"]"#,
+    r#"iframe[src*="funcaptcha.com"]"#,
+    ".geetest_panel",
+    ".geetest_holder",
+    ".nc_scale",
+    "#nc_1_n1z",
+    "[data-captcha]",
+    "#captcha-box",
+];
 /// Path prefix of takeover pages on the public listener.
 pub const MOUNT_PREFIX: &str = "/v1/webhooks/takeover/";
 
@@ -149,14 +180,104 @@ fn trycloudflare_url(line: &str) -> Option<String> {
         .then(|| candidate.to_string())
 }
 
+fn challenge_visible(ev: &PageEvidence) -> bool {
+    !ev.truncated && ev.selectors.iter().any(|s| s.visible)
+}
+
+fn has_solved_token(ev: &PageEvidence) -> bool {
+    !ev.truncated
+        && ev.forms.iter().any(|f| {
+            f.value_nonempty
+                && (f.name.starts_with("g-recaptcha-response")
+                    || f.name == "h-captcha-response"
+                    || f.name == "cf-turnstile-response")
+        })
+}
+
+/// Positive proof that a challenge seen on `initial` was solved: a newly filled
+/// response token appeared, or the page navigated to another `http(s)` address
+/// (ignoring `#fragment`) where no challenge selector is visible. Same-page
+/// disappearance or truncated evidence never resolves as solved.
+fn challenge_solved(initial: &PageEvidence, now: &PageEvidence) -> bool {
+    if initial.truncated || now.truncated {
+        return false;
+    }
+    fn address(url: &str) -> &str {
+        url.split_once('#').map_or(url, |(a, _)| a)
+    }
+    (has_solved_token(now) && !has_solved_token(initial))
+        || (!challenge_visible(now)
+            && (now.url.starts_with("https://") || now.url.starts_with("http://"))
+            && address(&now.url) != address(&initial.url))
+}
+
+fn hand_back_note(reason: Option<HandBack>) -> Option<String> {
+    match reason {
+        Some(HandBack::Released { note }) => note,
+        Some(HandBack::Idle) => Some("ended after five idle minutes".into()),
+        Some(HandBack::Confirmed) => {
+            Some("CAPTCHA challenge automatically detected as solved".into())
+        }
+        None => None,
+    }
+}
+
+/// Observe one cycle-fenced snapshot during human takeover. Returns `true` if
+/// auto-completion triggered, or `false` to continue watching.
+async fn observe_challenge_step(
+    session: &DesktopSession,
+    watch_challenge: &AtomicBool,
+    initial: &mut Option<PageEvidence>,
+    consecutive_solved: &mut u32,
+    skip_non_challenge_cycle: &mut bool,
+) -> bool {
+    let Some(owner) = session.leaseholder().map(|l| l.principal) else {
+        *consecutive_solved = 0;
+        return false;
+    };
+    let Ok(handoff) = session.handoff(&owner) else {
+        *consecutive_solved = 0;
+        return false;
+    };
+    let Ok(obs) = handoff.observe(CHALLENGE_SELECTORS).await else {
+        *consecutive_solved = 0;
+        return false;
+    };
+    let ev = obs.evidence();
+    if ev.truncated {
+        *consecutive_solved = 0;
+        return false;
+    }
+    if let Some(init) = initial.as_ref() {
+        if challenge_solved(init, ev) {
+            *consecutive_solved += 1;
+            if *consecutive_solved >= SOLVE_REQUIRED_READS {
+                return obs.complete().is_ok();
+            }
+        } else {
+            *consecutive_solved = 0;
+        }
+        return false;
+    }
+    if watch_challenge.load(Ordering::Acquire) || challenge_visible(ev) {
+        *initial = Some(ev.clone());
+    } else {
+        *skip_non_challenge_cycle = true;
+    }
+    false
+}
+
 /// Count every hand-back from a person (the returned receiver), and deliver
 /// a mailbox message to the agent holding the session for each, so it
 /// resumes without polling. Hand-backs are read from the gate's counter, so
-/// one between two wake-ups is never missed.
+/// one between two wake-ups is never missed. While a person controls a
+/// challenged page, positive solve proof (`Handoff::observe`) can complete the
+/// cycle without relaxing `ControlGate` isolation.
 pub fn watch_hand_backs(
     data: &Path,
     profile: &str,
     session: Arc<DesktopSession>,
+    watch_challenge: Arc<AtomicBool>,
 ) -> (
     tokio::task::JoinHandle<()>,
     tokio::sync::watch::Receiver<u64>,
@@ -166,40 +287,94 @@ pub fn watch_hand_backs(
     let mut seen = session.gate().hand_backs();
     let (count, hand_backs) = tokio::sync::watch::channel(seen);
     let task = tokio::spawn(async move {
-        while holder.changed().await.is_ok() {
+        let mut initial: Option<PageEvidence> = None;
+        let mut consecutive_solved = 0u32;
+        let mut skip_non_challenge_cycle = false;
+        loop {
             holder.borrow_and_update();
             let now = session.gate().hand_backs();
-            if now == seen {
+            if now != seen {
+                seen = now;
+                initial = None;
+                consecutive_solved = 0;
+                skip_non_challenge_cycle = false;
+                watch_challenge.store(false, Ordering::Release);
+                count.send_replace(now);
+                let note = hand_back_note(session.gate().take_hand_back());
+                if let Some(owner) = session.leaseholder().map(|l| l.principal) {
+                    let url = match session.lease(&owner) {
+                        Ok(agent) => agent.current_url().await.unwrap_or_default(),
+                        Err(_) => String::new(),
+                    };
+                    let (d, p) = (data.clone(), profile.clone());
+                    let delivered = tokio::task::spawn_blocking(move || {
+                        notify_agent_takeover_completed(
+                            &d,
+                            Some(&owner),
+                            &p,
+                            &url,
+                            note.as_deref(),
+                            now_ms(),
+                        )
+                    })
+                    .await;
+                    if let Ok(Err(e)) = delivered {
+                        eprintln!("browser takeover completion for `{profile}` not delivered: {e}");
+                    }
+                }
+            }
+            if session.is_closed() {
+                break;
+            }
+            let in_human = matches!(*holder.borrow(), Holder::Human { .. });
+            if !in_human {
+                initial = None;
+                consecutive_solved = 0;
+                skip_non_challenge_cycle = false;
+                if holder.changed().await.is_err() {
+                    break;
+                }
                 continue;
             }
-            seen = now;
-            count.send_replace(now);
-            let note = match session.gate().take_hand_back() {
-                Some(HandBack::Released { note }) => note,
-                Some(HandBack::Idle) => Some("ended after five idle minutes".into()),
-                None => None,
-            };
-            let Some(owner) = session.leaseholder().map(|l| l.principal) else {
+            if skip_non_challenge_cycle {
+                if holder.changed().await.is_err() {
+                    break;
+                }
                 continue;
-            };
-            let url = match session.lease(&owner) {
-                Ok(agent) => agent.current_url().await.unwrap_or_default(),
-                Err(_) => String::new(),
-            };
-            let (d, p) = (data.clone(), profile.clone());
-            let delivered = tokio::task::spawn_blocking(move || {
-                notify_agent_takeover_completed(
-                    &d,
-                    Some(&owner),
-                    &p,
-                    &url,
-                    note.as_deref(),
-                    now_ms(),
-                )
-            })
-            .await;
-            if let Ok(Err(e)) = delivered {
-                eprintln!("browser takeover completion for `{profile}` not delivered: {e}");
+            }
+            // Only sleep between polls once the initial baseline is captured;
+            // capture immediately on transition into human control.
+            if initial.is_some() {
+                tokio::select! {
+                    changed = holder.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    () = tokio::time::sleep(SOLVE_POLL_INTERVAL) => {}
+                }
+            }
+            if !observe_challenge_step(
+                &session,
+                &watch_challenge,
+                &mut initial,
+                &mut consecutive_solved,
+                &mut skip_non_challenge_cycle,
+            )
+            .await
+                && initial.is_none()
+                && !skip_non_challenge_cycle
+            {
+                // Transient observe error before baseline; wait before retrying.
+                tokio::select! {
+                    changed = holder.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    () = tokio::time::sleep(SOLVE_POLL_INTERVAL) => {}
+                }
             }
         }
     });
@@ -322,5 +497,97 @@ mod tests {
             9,
         )
         .unwrap();
+    }
+
+    fn evidence(
+        url: &str,
+        visible_challenge: bool,
+        solved_token: bool,
+        truncated: bool,
+    ) -> PageEvidence {
+        PageEvidence {
+            target_id: "tab-1".into(),
+            url: url.into(),
+            forms: vec![agent_workstation::FormState {
+                tag: "textarea".into(),
+                id: "cf-token".into(),
+                name: "cf-turnstile-response".into(),
+                value_nonempty: solved_token,
+            }],
+            selectors: vec![agent_workstation::SelectorState {
+                matched: visible_challenge,
+                visible: visible_challenge,
+            }],
+            truncated,
+        }
+    }
+
+    #[test]
+    fn challenge_solved_requires_token_or_clean_http_navigation() {
+        let initial = evidence("https://example.com/login#start", true, false, false);
+        // Positive: newly filled challenge token on same page.
+        assert!(challenge_solved(
+            &initial,
+            &evidence("https://example.com/login#start", true, true, false)
+        ));
+        // Positive: clean navigation to another http(s) address without challenge.
+        assert!(challenge_solved(
+            &initial,
+            &evidence("https://example.com/dashboard#done", false, false, false)
+        ));
+
+        // Negative (#310): challenge disappears on same page with no token.
+        assert!(!challenge_solved(
+            &initial,
+            &evidence("https://example.com/login#start", false, false, false)
+        ));
+        // Negative (#310): only #fragment changed with no token.
+        assert!(!challenge_solved(
+            &initial,
+            &evidence("https://example.com/login#reset", false, false, false)
+        ));
+        // Negative (#310): navigated to another challenged page.
+        assert!(!challenge_solved(
+            &initial,
+            &evidence("https://example.com/step2", true, false, false)
+        ));
+        // Negative (#310): navigated to non-http(s) URL (about:blank).
+        assert!(!challenge_solved(
+            &initial,
+            &evidence("about:blank", false, false, false)
+        ));
+        // Negative (#310): truncated evidence never solves.
+        assert!(!challenge_solved(
+            &initial,
+            &evidence("https://example.com/dashboard", false, true, true)
+        ));
+        assert!(!challenge_solved(
+            &evidence("https://example.com/login", true, false, true),
+            &evidence("https://example.com/dashboard", false, true, false)
+        ));
+        // Negative: pre-existing filled token without new solve on same URL.
+        assert!(!challenge_solved(
+            &evidence("https://example.com/login", true, true, false),
+            &evidence("https://example.com/login", false, true, false)
+        ));
+    }
+
+    #[test]
+    fn hand_back_confirmed_reason_formats_auto_solve_note() {
+        assert_eq!(
+            hand_back_note(Some(HandBack::Confirmed)).as_deref(),
+            Some("CAPTCHA challenge automatically detected as solved")
+        );
+        assert_eq!(
+            hand_back_note(Some(HandBack::Idle)).as_deref(),
+            Some("ended after five idle minutes")
+        );
+        assert_eq!(
+            hand_back_note(Some(HandBack::Released {
+                note: Some("done".into())
+            }))
+            .as_deref(),
+            Some("done")
+        );
     }
 }

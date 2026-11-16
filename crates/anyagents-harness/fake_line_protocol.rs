@@ -7,7 +7,7 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-const RESULT: &str = r#"{"type":"result","session_id":"sess-from-vendor","usage":{"input_tokens":11,"output_tokens":7,"cache_read_tokens":3,"cache_write_tokens":2}}"#;
+const RESULT: &str = r#"{"type":"result","session_id":"sess-from-vendor","response":"ok","usage":{"input_tokens":11,"output_tokens":7,"cache_read_tokens":3,"cache_write_tokens":2}}"#;
 const QUOTA: &str = r#"{"type":"rate_limit","resets_at_ms":1700000000000}"#;
 const ECHO: &str = r#"{"type":"user","text":"anyagents-message:echoed\nprior"}"#;
 
