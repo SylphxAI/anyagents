@@ -964,6 +964,9 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         (&crate::vendor::declared_delivery(&agent.harness)).into();
     let effective_instructions =
         crate::create::effective_agent_instructions(Some(&store), data, &agent);
+    let schedules =
+        crate::schedule::list_agent_schedules(&store, &agent.id, false).map_err(Error::Message)?;
+    let automations = crate::api::AutomationCountsView::from_schedules(&schedules);
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -1000,8 +1003,8 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
-        schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)
-            .map_err(Error::Message)?,
+        schedules,
+        automations,
         turn_errors: None,
         unsettled_outbound: Vec::new(),
     })
@@ -1123,6 +1126,8 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         (&crate::vendor::declared_delivery(&agent.harness)).into();
     let effective_instructions =
         crate::create::effective_agent_instructions(Some(&store), data, &agent);
+    let schedules = crate::schedule::list_agent_schedules(&store, &agent.id, false)?;
+    let automations = crate::api::AutomationCountsView::from_schedules(&schedules);
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -1159,7 +1164,8 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
-        schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)?,
+        schedules,
+        automations,
         turn_errors: None,
         unsettled_outbound: Vec::new(),
     })
@@ -2336,5 +2342,119 @@ mod archetype_tests {
         );
         assert!(open(dir.path()).unwrap().list_agents().unwrap().is_empty());
         assert!(!dir.path().join("agents").exists());
+    }
+}
+
+#[cfg(test)]
+mod automation_tests {
+    use super::*;
+    use crate::api::AutomationCountsView;
+    use anyagents_core::{NewAgent, NewSchedule};
+
+    #[test]
+    fn local_create_has_zero_automations_and_reads_legacy_views() {
+        let _env = crate::server::tests::env_lock();
+        let data = tempfile::tempdir().unwrap();
+        let workdir = data.path().join("workspace");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let view = create(
+            data.path(),
+            serde_json::json!({
+                "name": "worker",
+                "harness": "claude-code",
+                "workdir": workdir,
+            }),
+        )
+        .unwrap();
+        assert!(view.schedules.is_empty());
+        assert_eq!(view.automations, AutomationCountsView::default());
+
+        let mut wire = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            wire["automations"],
+            serde_json::json!({"total": 0, "watches": 0, "timers": 0, "crons": 0})
+        );
+        wire.as_object_mut().unwrap().remove("automations");
+        let legacy: AgentView = serde_json::from_value(wire).unwrap();
+        assert_eq!(legacy.automations, AutomationCountsView::default());
+        assert_eq!(legacy.id, view.id);
+    }
+
+    #[test]
+    fn local_lifecycle_counts_active_kinds_without_dropping_schedule_details() {
+        let _env = crate::server::tests::env_lock();
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("worker", "claude-code"))
+            .unwrap();
+        let empty = set_state(data.path(), "worker", "paused").unwrap();
+        assert!(empty.schedules.is_empty());
+        assert_eq!(empty.automations, AutomationCountsView::default());
+
+        let mut active = Vec::new();
+        for (index, kind) in ["watch", "watch", "at", "every", "unknown"]
+            .iter()
+            .enumerate()
+        {
+            let id = store
+                .create_schedule(NewSchedule {
+                    agent_id: agent.id.clone(),
+                    kind: (*kind).into(),
+                    spec: format!("spec-{index}"),
+                    prompt: format!("prompt-{index}"),
+                    interval_ms: None,
+                    next_fire_at_ms: None,
+                    watch_baseline: None,
+                })
+                .unwrap()
+                .id;
+            active.push(id);
+        }
+        let cancelled = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "at".into(),
+                spec: "cancelled-spec".into(),
+                prompt: "cancelled-prompt".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: None,
+            })
+            .unwrap()
+            .id;
+        assert_eq!(
+            store.cancel_schedule(Some(&agent.id), &cancelled).unwrap(),
+            1
+        );
+
+        let mixed = set_state(data.path(), "worker", "paused").unwrap();
+        assert_eq!(mixed.schedules.len(), 6);
+        assert!(
+            mixed
+                .schedules
+                .iter()
+                .any(|row| row.id == cancelled && row.state != "active")
+        );
+        assert!(mixed.schedules.iter().any(|row| row.kind == "unknown"));
+        assert_eq!(
+            mixed.automations,
+            AutomationCountsView {
+                total: 4,
+                watches: 2,
+                timers: 1,
+                crons: 1
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&mixed).unwrap()["automations"],
+            serde_json::json!({"total": 4, "watches": 2, "timers": 1, "crons": 1})
+        );
+        for id in active {
+            assert_eq!(store.cancel_schedule(Some(&agent.id), &id).unwrap(), 1);
+        }
+        let inactive = set_state(data.path(), "worker", "paused").unwrap();
+        assert_eq!(inactive.schedules.len(), 6);
+        assert_eq!(inactive.automations, AutomationCountsView::default());
     }
 }
