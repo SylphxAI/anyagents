@@ -2434,6 +2434,17 @@ fn read_stdout(
             .unwrap_or_else(|err| err.into_inner());
         state = guard;
     }
+    // A clean stream end without a result is not evidence of useful work.
+    // Keep real exit/auth/quota errors, and never finish or replay this input.
+    if spec.is_agy()
+        && state.exit_status.is_some_and(|status| status.success())
+        && state.failure().is_none()
+        && state.quota_reset_at_ms.is_none()
+        && !state.open.is_empty()
+        && !state.agy_turn_has_work
+    {
+        retire_agy_empty_turn(&mut state, agy_rpc.as_ref());
+    }
     state.alive = false;
     state.refresh_exit_fault();
     state.touch();
@@ -2600,6 +2611,9 @@ fn agy_result_has_output(value: &Value, error: Option<&str>) -> bool {
 /// model/planner/tool work, clearing open/followup queues without fabricating
 /// consumption or finish proofs while keeping any verified prior proofs intact.
 fn retire_agy_empty_turn(state: &mut State, agy_rpc: Option<&AgyRpcConfig>) {
+    // Invalidate before publishing the fault: stdout can outlive the child,
+    // and resume must not reuse this transport while its reader drains.
+    state.alive = false;
     state.sign_in_fault = Some(AGY_EMPTY_TURN_FAULT.to_string());
     state.open.clear();
     state.followups.clear();
