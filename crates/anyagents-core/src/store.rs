@@ -987,7 +987,7 @@ fn open_reader(path: &Path) -> Option<Connection> {
     .ok()?;
     let _ = conn.busy_timeout(BUSY_TIMEOUT);
     let _ = conn.pragma_update(None, "query_only", "ON");
-    tune_connection(&conn)?;
+    tune_connection(&conn).ok()?;
     // The mailbox search index, read-only like the rest of this connection:
     // `rag_chunks` resolves to it, as state has no table of that name. A
     // reader without it is not a reader of this store; none is pooled.
