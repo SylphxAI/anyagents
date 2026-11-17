@@ -2610,7 +2610,11 @@ impl AgentMcp {
                     obj.insert("next_cursor".to_string(), summary["next_cursor"].clone());
                     obj.insert("summary".to_string(), summary);
                 }
-                Ok(rmcp::handler::server::wrapper::Json(val))
+                Ok(rmcp::handler::server::wrapper::Json(bound_agent_list(
+                    val,
+                    "agents",
+                    args.cursor,
+                )?))
             }
             "spawn" => {
                 let spawned = self
@@ -2933,11 +2937,8 @@ impl AgentMcp {
                             agent: view.name.clone(),
                             turns: Vec::new(),
                         });
-                let schedules = view.schedules.clone();
                 Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
                     "agent": view,
-                    "subagent": view,
-                    "schedules": schedules,
                     "recent_turns": conv.turns,
                 })))
             }
@@ -3106,12 +3107,17 @@ impl AgentMcp {
                     args.limit,
                     args.cursor,
                 );
-                Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
+                let value = serde_json::json!({
                     "parent": self.agent.name,
                     "next_cursor": summary["next_cursor"],
                     "summary": summary,
                     "subagents": resp.agents,
-                })))
+                });
+                Ok(rmcp::handler::server::wrapper::Json(bound_agent_list(
+                    value,
+                    "subagents",
+                    args.cursor,
+                )?))
             }
             "inspect" | "status" | "get" | "info" | "show" => {
                 let target = args
@@ -3144,10 +3150,8 @@ impl AgentMcp {
                             agent: view.name.clone(),
                             turns: Vec::new(),
                         });
-                let schedules = view.schedules.clone();
                 Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
                     "subagent": view,
-                    "schedules": schedules,
                     "recent_turns": conv.turns,
                 })))
             }
@@ -3868,7 +3872,7 @@ impl AgentMcp {
 pub const CANONICAL_MCP_TOOLS: &[&str] = &["code"];
 
 /// The `schedules` tool's contract, with the exact shape of each action.
-const SCHEDULES_TOOL_DESCRIPTION: &str = "Wake yourself later or on an event. Create: `{action: \"create\", prompt, <one trigger>}` with `at` (\"20m\" or an ISO time), `every` (\"15m\") or `watch`: `github:pr:<owner>/<repo>#<num>` (PR or its checks terminal), `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name_or_id>`. `action: \"at\"|\"every\"|\"watch\"` with that field also creates. One trigger per schedule; make two calls for a watch plus a deadline. `{action: \"list\"}`; `{action: \"cancel\", id: \"sch_...\"|\"all\"}`. A fired schedule enters your mailbox like any message (steered into a running turn, held while you are paused or quota-blocked) and never queues a second wake while its last one is undelivered.";
+const SCHEDULES_TOOL_DESCRIPTION: &str = "List authorized fleet automations with {action: list, agent: all}; fleet reads include owner names and never permit mutation. Wake yourself later or on an event. Create: `{action: \"create\", prompt, <one trigger>}` with `at` (\"20m\" or an ISO time), `every` (\"15m\") or `watch`: `github:pr:<owner>/<repo>#<num>` (PR or its checks terminal), `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name_or_id>`. `action: \"at\"|\"every\"|\"watch\"` with that field also creates. One trigger per schedule; make two calls for a watch plus a deadline. `{action: \"list\"}`; `{action: \"cancel\", id: \"sch_...\"|\"all\"}`. A fired schedule enters your mailbox like any message (steered into a running turn, held while you are paused or quota-blocked) and never queues a second wake while its last one is undelivered.";
 
 /// The `code` tool's contract: language, scope, limits and every callable
 /// name, compact because every agent turn pays for it.
@@ -9069,6 +9073,93 @@ pub(crate) fn filter_and_summarize_agent_list(
     })
 }
 
+// A row-count limit alone cannot bound arbitrary descriptions or JSON escaping.
+// Budget the encoded rmcp result (including its backward-compatible JSON text
+// fallback AND structuredContent), not only the row JSON. HTTP AgentView is unchanged.
+const AGENT_LIST_RESULT_BUDGET: usize = 30_000;
+
+fn compact_agent_row(row: &mut serde_json::Value) {
+    let Some(row) = row.as_object_mut() else {
+        return;
+    };
+    row.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "id" | "name"
+                | "role"
+                | "aliases"
+                | "parent"
+                | "scope"
+                | "lifecycle"
+                | "relationship"
+                | "can_message"
+                | "harness"
+                | "model"
+                | "live_harness"
+                | "live_model"
+                | "pending_switch"
+                | "state"
+                | "process"
+                | "turn_state"
+                | "delivery"
+                | "automations"
+                | "description"
+                | "has_open_turn"
+        )
+    });
+    if let Some(description) = row.get("description").and_then(|v| v.as_str()) {
+        if description.chars().count() > 160 {
+            let preview: String = description.chars().take(160).collect();
+            row.insert("description".into(), serde_json::json!(preview));
+            row.insert("description_truncated".into(), serde_json::json!(true));
+        }
+    }
+}
+
+// Measure the same Json wrapper conversion the generated MCP router uses, not
+// an approximation of the rows or only structuredContent.
+fn encoded_agent_list_result(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    use rmcp::handler::server::tool::IntoCallToolResult as _;
+    let response = rmcp::handler::server::wrapper::Json(value.clone())
+        .into_call_tool_result()
+        .map_err(|error| error.to_string())?;
+    match response {
+        rmcp::model::CallToolResponse::Complete(result) => {
+            serde_json::to_vec(&result).map_err(|error| error.to_string())
+        }
+        _ => Err("agent list unexpectedly returned a deferred tool response".into()),
+    }
+}
+
+fn bound_agent_list(
+    mut value: serde_json::Value,
+    key: &str,
+    cursor: Option<usize>,
+) -> Result<serde_json::Value, String> {
+    let matched = value["summary"]["matched"].as_u64().unwrap_or(0) as usize;
+    let start = cursor.unwrap_or(0).min(matched);
+    let rows = value[key].as_array_mut().ok_or("missing agent rows")?;
+    for row in rows {
+        compact_agent_row(row);
+    }
+    loop {
+        let returned = value[key].as_array().unwrap().len();
+        let end = start.saturating_add(returned);
+        let next = (end < matched).then_some(end);
+        value["next_cursor"] = serde_json::json!(next);
+        value["summary"]["next_cursor"] = serde_json::json!(next);
+        value["summary"]["returned"] = serde_json::json!(returned);
+        let bytes = encoded_agent_list_result(&value)?.len();
+        if bytes < AGENT_LIST_RESULT_BUDGET {
+            return Ok(value);
+        }
+        if returned <= 1 {
+            return Err("one agent summary exceeds the 30000-byte MCP result budget; use agents inspect with its name or ID".into());
+        }
+        value[key].as_array_mut().unwrap().pop();
+    }
+}
+
 fn error_message(bytes: &[u8]) -> String {
     serde_json::from_slice::<serde_json::Value>(bytes)
         .ok()
@@ -10491,6 +10582,7 @@ mod spawn_args_tests {
             seat_user: None,
             seat_uid: None,
             seat_gid: None,
+            automations: Default::default(),
             schedules: Vec::new(),
             turn_errors: None,
             unsettled_outbound: Vec::new(),
@@ -10613,6 +10705,100 @@ mod spawn_args_tests {
             agents
                 .iter()
                 .all(|agent| agent.name.starts_with("archived-worker-1"))
+        );
+    }
+
+    #[test]
+    fn compact_roster_150_agents_preserves_reachability_and_final_result_budget() {
+        let population: Vec<_> = (0..150)
+            .map(|index| {
+                let mut row = dummy_agent_view(
+                    &format!("agt_{index:026}"),
+                    &format!("worker-{index:03}"),
+                    "idle",
+                    "none",
+                    None,
+                );
+                row.name = format!("worker-{index:03}");
+                row.instructions = Some("private instructions ".repeat(2000));
+                row.description =
+                    Some("Description with Unicode 繁體 and escaped \"text\" ".repeat(200));
+                row.automations = crate::api::AutomationCountsView {
+                    total: 6,
+                    watches: 3,
+                    timers: 2,
+                    crons: 1,
+                };
+                row
+            })
+            .collect();
+        for key in ["agents", "subagents"] {
+            let mut cursor = None;
+            let mut seen = std::collections::BTreeSet::new();
+            let mut page_sizes = Vec::new();
+            loop {
+                let mut agents = population.clone();
+                let summary = filter_and_summarize_agent_list(&mut agents, None, Some(100), cursor);
+                let value = serde_json::json!({key: agents, "summary": summary});
+                let page = bound_agent_list(value, key, cursor).unwrap();
+                let encoded = encoded_agent_list_result(&page).unwrap();
+                let wire: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+                assert_eq!(wire["structuredContent"], page);
+                // Text-only and structured clients receive identical data.
+                let text = wire["content"][0]["text"].as_str().unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(text).unwrap(),
+                    page
+                );
+                assert!(encoded.len() < AGENT_LIST_RESULT_BUDGET);
+                let rows = page[key].as_array().unwrap();
+                assert!(!rows.is_empty());
+                page_sizes.push((
+                    rows.len(),
+                    serde_json::to_vec(rows).unwrap().len(),
+                    encoded.len(),
+                ));
+                for row in rows {
+                    assert!(seen.insert(row["id"].as_str().unwrap().to_owned()));
+                    for omitted in [
+                        "instructions",
+                        "schedules",
+                        "turn_errors",
+                        "unsettled_outbound",
+                    ] {
+                        assert!(row.get(omitted).is_none(), "{omitted}");
+                    }
+                    assert_eq!(row["automations"]["total"], 6);
+                    assert_eq!(row["description_truncated"], true);
+                    assert_eq!(row["description"].as_str().unwrap().chars().count(), 160);
+                    for retained in [
+                        "id",
+                        "name",
+                        "state",
+                        "turn_state",
+                        "harness",
+                        "model",
+                        "delivery",
+                    ] {
+                        assert!(row.get(retained).is_some(), "{retained}");
+                    }
+                }
+                cursor = page["next_cursor"].as_u64().map(|v| v as usize);
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(seen.len(), 150);
+            eprintln!(
+                "compact roster {key}: pages (rows, row bytes, CallToolResult bytes) = {page_sizes:?}"
+            );
+        }
+        let oversized =
+            serde_json::json!({"agents": [{"id": "x".repeat(31000)}], "summary": {"matched": 1}});
+        assert!(
+            bound_agent_list(oversized, "agents", None)
+                .unwrap_err()
+                .contains("one agent summary exceeds")
         );
     }
 
@@ -10809,13 +10995,24 @@ mod spawn_args_tests {
                 let rows = result[if legacy { "subagents" } else { "agents" }]
                     .as_array()
                     .unwrap();
-                assert_eq!(rows.len(), expected_len);
+                if expected_len == 100 {
+                    assert!(!rows.is_empty() && rows.len() <= 100);
+                } else {
+                    assert_eq!(rows.len(), expected_len);
+                }
+                assert!(
+                    encoded_agent_list_result(&result).unwrap().len() < AGENT_LIST_RESULT_BUDGET
+                );
                 assert_eq!(rows[0]["name"], first);
                 assert!(
                     rows.iter()
-                        .all(|a| a["instructions"].is_null() && a.get("schedules").is_none())
+                        .all(|a| a.get("instructions").is_none() && a.get("schedules").is_none())
                 );
-                assert_eq!(result["next_cursor"], json!(next));
+                if expected_len == 100 {
+                    assert_eq!(result["next_cursor"], json!(rows.len()));
+                } else {
+                    assert_eq!(result["next_cursor"], json!(next));
+                }
                 assert_eq!(result["summary"]["total"], 105);
                 assert_eq!(result["summary"]["matched"], 105);
                 assert_eq!(result["summary"]["working"], 1);
