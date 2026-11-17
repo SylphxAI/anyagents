@@ -2422,21 +2422,14 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         let staging =
             create::SigninStaging::create(data, &provider, &anyagents_core::now_ms().to_string())?;
         let staging_dir = staging.path();
-        let use_native_agy_pkce = target == "agy"
-            && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
-            && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none();
-        let outcome = if use_native_agy_pkce {
-            signin::google_antigravity_pkce_sign_in(staging_dir, &mut sink)?
-        } else {
-            anyagents_installer::sign_in_at(
-                &anyagents_installer::builtin_catalog(),
-                staging_dir,
-                target,
-                &mut runner,
-                &mut sink,
-            )
-            .map_err(|err| anyagents_core::Error::Message(err.to_string()))?
-        };
+        let outcome = anyagents_installer::sign_in_at(
+            &anyagents_installer::builtin_catalog(),
+            staging_dir,
+            target,
+            &mut runner,
+            &mut sink,
+        )
+        .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
         let (resolved_prof, final_dir, resolved_acct) =
             create::resolve_and_commit_staged_signin(data, &provider, staging_dir, explicit_prof)?;
         if ui::is_pretty() {
@@ -2495,18 +2488,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         }
     }
     let rec = agent::named(data, target)?;
-    let outcome = if anyagents_harness::normalize_harness_name(&rec.harness) == "agy"
-        && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
-        && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none()
-    {
-        let root = std::path::absolute(data)?;
-        let cfg = anyagents_core::agent_config_dir(&root, &rec.id);
-        std::fs::create_dir_all(&cfg)?;
-        std::fs::create_dir_all(anyagents_core::agent_work_dir(&root, &rec.id))?;
-        signin::google_antigravity_pkce_sign_in(&cfg, &mut sink)?
-    } else {
-        signin::sign_in_agent(data, target, &mut runner, &mut sink)?
-    };
+    let outcome = signin::sign_in_agent(data, target, &mut runner, &mut sink)?;
     let harness = rec.harness.clone();
     if !outcome.signed_in {
         let hint = signin::install_hint(&harness).unwrap_or_else(|| "-".to_string());
