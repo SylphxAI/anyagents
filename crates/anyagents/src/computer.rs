@@ -151,10 +151,11 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn post_json_bytes(
+fn post_raw_bytes(
     url: &str,
     bearer_token: &str,
-    payload: &Value,
+    content_type: &str,
+    body_bytes: &[u8],
     timeout_secs: u64,
 ) -> Result<(u16, Vec<u8>), String> {
     let http = ureq::Agent::config_builder()
@@ -162,12 +163,11 @@ fn post_json_bytes(
         .http_status_as_error(false)
         .build()
         .new_agent();
-    let body_bytes = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
     let resp = http
         .post(url)
         .header("Authorization", &format!("Bearer {bearer_token}"))
-        .header("Content-Type", "application/json")
-        .send(body_bytes.as_slice())
+        .header("Content-Type", content_type)
+        .send(body_bytes)
         .map_err(|e| format!("HTTP request failed: {e}"))?;
     let status = resp.status().as_u16();
     let mut bytes = Vec::new();
@@ -177,6 +177,22 @@ fn post_json_bytes(
         .read_to_end(&mut bytes)
         .map_err(|e| format!("failed reading HTTP response bytes: {e}"))?;
     Ok((status, bytes))
+}
+
+fn post_json_bytes(
+    url: &str,
+    bearer_token: &str,
+    payload: &Value,
+    timeout_secs: u64,
+) -> Result<(u16, Vec<u8>), String> {
+    let body_bytes = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
+    post_raw_bytes(
+        url,
+        bearer_token,
+        "application/json",
+        &body_bytes,
+        timeout_secs,
+    )
 }
 
 /// 2D screen coordinate in logical pixels (`(0, 0)` is top-left).
@@ -1554,7 +1570,7 @@ pub fn resolve_sylphx_gateway_base_url() -> String {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
         })
-        .unwrap_or_else(|| "https://ai.sylphx.com".to_string());
+        .unwrap_or_else(|| "https://api.sylphx.com".to_string());
     let trimmed = raw.trim().trim_end_matches('/');
     trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
 }
@@ -1593,6 +1609,44 @@ pub fn resolve_sylphx_api_key(data_dir: Option<&Path>, config_dir: &Path) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sylphx_gateway_base_url_defaults_to_api_and_strips_v1_suffix() {
+        let _environment = crate::server::tests::env_lock();
+        let prev_ai = std::env::var_os("SYLPHX_AI_BASE_URL");
+        let prev_gw = std::env::var_os("SYLPHX_GATEWAY_URL");
+
+        unsafe {
+            std::env::remove_var("SYLPHX_AI_BASE_URL");
+            std::env::remove_var("SYLPHX_GATEWAY_URL");
+        }
+        assert_eq!(resolve_sylphx_gateway_base_url(), "https://api.sylphx.com");
+
+        unsafe {
+            std::env::set_var("SYLPHX_AI_BASE_URL", "   ");
+            std::env::set_var("SYLPHX_GATEWAY_URL", "https://gateway.sylphx.com/v1/");
+        }
+        assert_eq!(
+            resolve_sylphx_gateway_base_url(),
+            "https://gateway.sylphx.com"
+        );
+
+        unsafe {
+            std::env::set_var("SYLPHX_AI_BASE_URL", "https://api.sylphx.com/v1/");
+        }
+        assert_eq!(resolve_sylphx_gateway_base_url(), "https://api.sylphx.com");
+
+        unsafe {
+            match prev_ai {
+                Some(v) => std::env::set_var("SYLPHX_AI_BASE_URL", v),
+                None => std::env::remove_var("SYLPHX_AI_BASE_URL"),
+            }
+            match prev_gw {
+                Some(v) => std::env::set_var("SYLPHX_GATEWAY_URL", v),
+                None => std::env::remove_var("SYLPHX_GATEWAY_URL"),
+            }
+        }
+    }
 
     #[test]
     fn a_mutating_action_that_timed_out_is_delivery_uncertain() {

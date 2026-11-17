@@ -398,11 +398,7 @@ fn resolve_sylphx_codex_provider(config_dir: Option<&Path>) -> (String, Option<S
                     .map(str::trim)
                     .filter(|u| !u.is_empty())
             {
-                base_url = if url.contains("models.sylphx.ai") || url.contains("api.sylphx.ai") {
-                    "https://api.sylphx.com/v1".to_string()
-                } else {
-                    url.to_string()
-                };
+                base_url = url.to_string();
                 break;
             }
         }

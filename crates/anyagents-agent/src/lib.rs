@@ -529,6 +529,16 @@ impl<H: Harness> DeliveryLoop<H> {
     /// Stop the vendor process and commit every proof it gave, so nothing
     /// it took is handed to its replacement. The harness stays in place,
     /// dead, until `replace_harness`.
+    /// Checked retirement keeps both harness and process lock on failure.
+    /// Final proofs are committed only after the adapter acknowledges drain.
+    pub fn retire_harness_verified(&mut self) -> Result<u64, Error> {
+        self.harness.stop_verified().map_err(|err| match err {
+            HarnessError::Dead => Error::HarnessDown,
+            HarnessError::Failed(reason) => Error::HarnessFailed(reason),
+        })?;
+        self.commit_proven()
+    }
+
     pub fn retire_harness(&mut self) -> Result<u64, Error> {
         self.harness.stop();
         self.commit_proven()
