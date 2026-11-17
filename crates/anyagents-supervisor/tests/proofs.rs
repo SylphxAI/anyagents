@@ -617,3 +617,72 @@ fn inbound_mail_during_slow_worker_retirement_wakes_replacement_deterministicall
     });
     assert_eq!(scene.store.agent(&scene.agent).unwrap().state, "running");
 }
+
+#[test]
+fn completed_turn_followed_by_expired_quota_does_not_emit_recovery() {
+    let scene = Scene::new(true);
+    let first = scene.receive("complete-me");
+    scene.until("first line is committed", |s| s.cursor() == first.seq);
+    assert!(scene.store.has_open_turn(&scene.agent).unwrap());
+
+    {
+        let proc0 = scene.vendor.process(0);
+        let mut proc0 = proc0.lock().unwrap();
+        proc0.turns_served = 1;
+        proc0.usage = TurnUsage {
+            input_tokens: 11,
+            output_tokens: 7,
+            ..TurnUsage::default()
+        };
+        proc0.quota_reset_at_ms = Some(START_MS + 1_000);
+        proc0.in_turn = false;
+    }
+    scene.clock.set_ms(START_MS + 1_000);
+    scene.poke();
+    scene.until_ticking("completed turn closes cleanly and scales idle", |s| {
+        !s.store.has_open_turn(&s.agent).unwrap()
+            && s.store.list_usage(Some(&s.agent)).unwrap().len() == 1
+            && s.store.agent(&s.agent).unwrap().state == "idle"
+    });
+    assert_eq!(scene.written_to(0), vec![first.id.as_str()]);
+    assert_eq!(
+        scene
+            .store
+            .agent_turn_snapshot(&scene.agent)
+            .unwrap()
+            .outcome
+            .as_deref(),
+        Some("completed")
+    );
+}
+
+#[test]
+fn mid_turn_quota_expiry_recovers_open_turn_on_same_process() {
+    let scene = Scene::new(true);
+    let first = scene.receive("interrupted-by-quota");
+    scene.until("first line is committed", |s| s.cursor() == first.seq);
+    assert!(scene.store.has_open_turn(&scene.agent).unwrap());
+
+    {
+        let proc0 = scene.vendor.process(0);
+        let mut proc0 = proc0.lock().unwrap();
+        proc0.usage = TurnUsage {
+            input_tokens: 19,
+            output_tokens: 13,
+            ..TurnUsage::default()
+        };
+        proc0.quota_reset_at_ms = Some(START_MS + 1_000);
+        proc0.in_turn = false;
+    }
+    scene.clock.set_ms(START_MS + 1_000);
+    scene.poke();
+    scene.until_ticking(
+        "expired mid-turn quota preserves open turn and delivers [Recovery] on proc0",
+        |s| s.written_to(0).len() == 2 && s.store.list_usage(Some(&s.agent)).unwrap().len() == 1,
+    );
+    assert_eq!(scene.vendor.launches(), 1);
+    assert!(scene.store.has_open_turn(&scene.agent).unwrap());
+    let written = scene.written_to(0);
+    assert_eq!(written[0], first.id.as_str());
+    assert!(written[1].starts_with("recovery_"), "{written:?}");
+}

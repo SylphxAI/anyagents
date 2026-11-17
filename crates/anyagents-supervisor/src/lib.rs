@@ -1760,19 +1760,39 @@ impl<H: Harness + 'static> Session<H> {
             .is_some_and(|ms| ms >= started_at);
         let config_switched = self.runtime_switch_pending() == Some(true);
         if rotated_after_start || cleared_after_start || config_switched || now >= reset_at {
-            self.quota_started_at = None;
             // Replace before clearing the old harness's quota hold so pre-swap
             // usage accounting sees that any partial token growth stopped on
             // quota rather than completing the open turn.
             let should_replace =
                 rotated_after_start || config_switched || self.instructions_rotation_pending();
             if should_replace && self.replace_process() {
+                self.quota_started_at = None;
                 return true;
             }
+            // Flush any proof or adapter-completed turn (`turns_served`) while
+            // `quota_reset_at_ms` is still set, so a turn that finished before
+            // a trailing quota event closes cleanly instead of receiving a
+            // spurious `[Recovery]` note when `pending_recovery` arms below,
+            // while partial mid-turn token growth stays open.
+            if !self.commit_proven() {
+                let retry_at = now.saturating_add(IDLE_REVIEW_MS);
+                self.sleep(Some(retry_at));
+                return true;
+            }
+            let mut fresh = self.harness_health().unwrap_or_else(|| health.clone());
+            if fresh.quota_reset_at_ms.is_none() {
+                fresh.quota_reset_at_ms = Some(reset_at);
+            }
+            if !self.record_usage_with(&fresh) {
+                let retry_at = now.saturating_add(IDLE_REVIEW_MS);
+                self.sleep(Some(retry_at));
+                return true;
+            }
+            self.quota_started_at = None;
             if let Some(delivery) = self.delivery.as_mut() {
                 delivery.clear_quota();
             }
-            if health.turn_state == TurnState::Idle {
+            if fresh.turn_state == TurnState::Idle {
                 self.pending_recovery = true;
             }
             return false;
