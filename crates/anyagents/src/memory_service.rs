@@ -236,10 +236,19 @@ pub fn run(data: &Path, args: MemoryServiceArgs) -> Result<(), anyagents_core::E
                 },
             };
             if estimate {
-                for (model, tokens) in
-                    anyagents_memory::eval::estimate(&sample, &config, &plan).map_err(fail)?
-                {
-                    println!("{model}\t{tokens} tokens");
+                let rows =
+                    anyagents_memory::eval::estimate(&sample, &config, &plan).map_err(fail)?;
+                if crate::ui::is_pretty() {
+                    crate::ui::heading("Token estimate");
+                    let mut table = crate::ui::Table::new(&[("MODEL", false), ("TOKENS", true)]);
+                    for (model, tokens) in rows {
+                        table.add_row(vec![model, tokens.to_string()]);
+                    }
+                    table.print();
+                } else {
+                    for (model, tokens) in rows {
+                        println!("{model}\t{tokens} tokens");
+                    }
                 }
                 return Ok(());
             }

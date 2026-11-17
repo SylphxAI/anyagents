@@ -2,6 +2,8 @@
 //! the server owns when the boundary is in place, and through the store on a
 //! single-user machine.
 
+mod presentation;
+
 use std::path::Path;
 
 use anyagents_core::{Agent, AgentId, Error, Store};
@@ -66,15 +68,27 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
                 "prompt": prompt,
             });
             let view = create(data, body).map_err(Error::Message)?;
-            println!("{}\t{}", view.id, view.name);
+            if crate::ui::is_pretty() {
+                presentation::lifecycle("Created", &view);
+            } else {
+                println!("{}\t{}", view.id, view.name);
+            }
         }
         AgentsCommand::Archive { name } => {
             let view = set_state(data, &name, "archived")?;
-            println!("{}\t{}\t{}", view.id, view.name, view.state);
+            if crate::ui::is_pretty() {
+                presentation::lifecycle("Archived", &view);
+            } else {
+                println!("{}\t{}\t{}", view.id, view.name, view.state);
+            }
         }
         AgentsCommand::Pause { name } => {
             let view = set_state(data, &name, "paused")?;
-            println!("{}\t{}\t{}", view.id, view.name, view.state);
+            if crate::ui::is_pretty() {
+                presentation::lifecycle("Paused", &view);
+            } else {
+                println!("{}\t{}\t{}", view.id, view.name, view.state);
+            }
         }
         AgentsCommand::Resume { name, prompt } => resume_cmd(data, &name, prompt)?,
         AgentsCommand::Inspect { agent, limit, json } => {
@@ -184,16 +198,20 @@ pub fn rename_cmd(data: &Path, agent: &str, new_name: &str) -> Result<(), Error>
             &client::authority(data),
         ) {
             Ok(Some(view)) => {
-                println!(
-                    "{}\t{}\t{}",
-                    view.id,
-                    view.name,
-                    if view.aliases.is_empty() {
-                        "-".to_string()
-                    } else {
-                        view.aliases.join(",")
-                    }
-                );
+                if crate::ui::is_pretty() {
+                    presentation::renamed(clean_agent, &view.name, &view.aliases);
+                } else {
+                    println!(
+                        "{}\t{}\t{}",
+                        view.id,
+                        view.name,
+                        if view.aliases.is_empty() {
+                            "-".to_string()
+                        } else {
+                            view.aliases.join(",")
+                        }
+                    );
+                }
                 return Ok(());
             }
             Ok(None) => return Err(Error::Message("the server answered nothing".into())),
@@ -235,16 +253,20 @@ pub fn rename_cmd(data: &Path, agent: &str, new_name: &str) -> Result<(), Error>
     crate::create::reconcile_agent_runtime_config(&store, data, &updated, &cfg, &work_dir)?;
     crate::telegram::sync_agent_telegram_bot_name(&store, data, &updated);
     let aliases = store.agent_aliases(&updated.id).unwrap_or_default();
-    println!(
-        "{}\t{}\t{}",
-        updated.id,
-        updated.name,
-        if aliases.is_empty() {
-            "-".to_string()
-        } else {
-            aliases.join(",")
-        }
-    );
+    if crate::ui::is_pretty() {
+        presentation::renamed(&old.name, &updated.name, &aliases);
+    } else {
+        println!(
+            "{}\t{}\t{}",
+            updated.id,
+            updated.name,
+            if aliases.is_empty() {
+                "-".to_string()
+            } else {
+                aliases.join(",")
+            }
+        );
+    }
     Ok(())
 }
 
@@ -263,12 +285,16 @@ pub fn role_cmd(data: &Path, agent: &str, role: Option<&str>, clear: bool) -> Re
             &client::authority(data),
         ) {
             Ok(Some(view)) => {
-                println!(
-                    "{}\t{}\t{}",
-                    view.id,
-                    crate::create::format_agent_display(&view.name, view.role.as_deref()),
-                    view.role.as_deref().unwrap_or("-")
-                );
+                if crate::ui::is_pretty() {
+                    presentation::role(&view.name, view.role.as_deref());
+                } else {
+                    println!(
+                        "{}\t{}\t{}",
+                        view.id,
+                        crate::create::format_agent_display(&view.name, view.role.as_deref()),
+                        view.role.as_deref().unwrap_or("-")
+                    );
+                }
                 return Ok(());
             }
             Ok(None) => return Err(Error::Message("the server answered nothing".into())),
@@ -312,12 +338,16 @@ pub fn role_cmd(data: &Path, agent: &str, role: Option<&str>, clear: bool) -> Re
         .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &updated.id));
     crate::create::reconcile_agent_runtime_config(&store, data, &updated, &cfg, &work_dir)?;
     crate::telegram::sync_agent_telegram_bot_name(&store, data, &updated);
-    println!(
-        "{}\t{}\t{}",
-        updated.id,
-        crate::create::format_agent_display(&updated.name, updated.role.as_deref()),
-        updated.role.as_deref().unwrap_or("-")
-    );
+    if crate::ui::is_pretty() {
+        presentation::role(&updated.name, updated.role.as_deref());
+    } else {
+        println!(
+            "{}\t{}\t{}",
+            updated.id,
+            crate::create::format_agent_display(&updated.name, updated.role.as_deref()),
+            updated.role.as_deref().unwrap_or("-")
+        );
+    }
     Ok(())
 }
 
@@ -356,10 +386,13 @@ pub fn harness_cmd(
                         profile,
                     );
                 }
-                println!(
-                    "{}",
-                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
-                );
+                let result =
+                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?;
+                if crate::ui::is_pretty() {
+                    presentation::harness(&result, clean_agent);
+                } else {
+                    println!("{}", result);
+                }
                 return Ok(());
             }
             Err(err) if err.contains("404") && client::agent_identity().is_none() => {}
@@ -382,7 +415,11 @@ pub fn harness_cmd(
         model,
         profile,
     )?;
-    println!("{out}");
+    if crate::ui::is_pretty() {
+        presentation::harness(&out, clean_agent);
+    } else {
+        println!("{out}");
+    }
     Ok(())
 }
 
@@ -437,17 +474,21 @@ pub fn describe_cmd(
             )
             .map_err(Error::Message)?;
             if let Some(listed) = listed {
-                for a in listed.agents {
-                    if a.state == "archived" && a.parent.is_some() {
-                        continue;
+                if crate::ui::is_pretty() {
+                    presentation::descriptions(&listed.agents);
+                } else {
+                    for a in listed.agents {
+                        if a.state == "archived" && a.parent.is_some() {
+                            continue;
+                        }
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            crate::create::format_agent_display(&a.name, a.role.as_deref()),
+                            a.harness,
+                            a.state,
+                            a.description.as_deref().unwrap_or("-")
+                        );
                     }
-                    println!(
-                        "{}\t{}\t{}\t{}",
-                        crate::create::format_agent_display(&a.name, a.role.as_deref()),
-                        a.harness,
-                        a.state,
-                        a.description.as_deref().unwrap_or("-")
-                    );
                 }
                 return Ok(());
             }
@@ -477,10 +518,14 @@ pub fn describe_cmd(
                     .get("description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("-");
-                println!(
-                    "updated\t{}\t{d}",
-                    crate::create::format_agent_display(n, r)
-                );
+                if crate::ui::is_pretty() {
+                    presentation::description(n, r, d, true);
+                } else {
+                    println!(
+                        "updated\t{}\t{d}",
+                        crate::create::format_agent_display(n, r)
+                    );
+                }
                 return Ok(());
             }
         } else {
@@ -502,7 +547,11 @@ pub fn describe_cmd(
                     .get("description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("-");
-                println!("{}\t{d}", crate::create::format_agent_display(n, r));
+                if crate::ui::is_pretty() {
+                    presentation::description(n, r, d, false);
+                } else {
+                    println!("{}\t{d}", crate::create::format_agent_display(n, r));
+                }
                 return Ok(());
             }
         }
@@ -510,7 +559,11 @@ pub fn describe_cmd(
     let store = Store::open(data.join("state.db"))?;
     if target_name == "all" {
         crate::create::sync_all_agent_instructions(&store, data)?;
-        println!("synced\tall");
+        if crate::ui::is_pretty() {
+            crate::ui::success("Synced all agent instructions");
+        } else {
+            println!("synced\tall");
+        }
         return Ok(());
     }
     let mut rec = store.agent_by_name(&target_name)?;
@@ -564,17 +617,35 @@ pub fn describe_cmd(
     }
     let pub_desc = rec.public_description();
     if new_desc.is_some() || instructions.is_some() || role.is_some() || clear {
-        println!(
-            "updated\t{}\t{}",
-            crate::create::format_agent_display(&rec.name, rec.role.as_deref()),
-            pub_desc.as_deref().unwrap_or("-")
-        );
+        if crate::ui::is_pretty() {
+            presentation::description(
+                &rec.name,
+                rec.role.as_deref(),
+                pub_desc.as_deref().unwrap_or("-"),
+                true,
+            );
+        } else {
+            println!(
+                "updated\t{}\t{}",
+                crate::create::format_agent_display(&rec.name, rec.role.as_deref()),
+                pub_desc.as_deref().unwrap_or("-")
+            );
+        }
     } else {
-        println!(
-            "{}\t{}",
-            crate::create::format_agent_display(&rec.name, rec.role.as_deref()),
-            pub_desc.as_deref().unwrap_or("-")
-        );
+        if crate::ui::is_pretty() {
+            presentation::description(
+                &rec.name,
+                rec.role.as_deref(),
+                pub_desc.as_deref().unwrap_or("-"),
+                false,
+            );
+        } else {
+            println!(
+                "{}\t{}",
+                crate::create::format_agent_display(&rec.name, rec.role.as_deref()),
+                pub_desc.as_deref().unwrap_or("-")
+            );
+        }
     }
     Ok(())
 }
@@ -630,14 +701,18 @@ pub fn spawn(
         "prompt": prompt,
     });
     let view = create(data, body).map_err(Error::Message)?;
-    println!(
-        "{}\t{}\t{}\t{}\t{}",
-        view.id,
-        view.name,
-        view.parent.as_deref().unwrap_or("-"),
-        view.harness,
-        view.state
-    );
+    if crate::ui::is_pretty() {
+        presentation::lifecycle("Spawned", &view);
+    } else {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            view.id,
+            view.name,
+            view.parent.as_deref().unwrap_or("-"),
+            view.harness,
+            view.state
+        );
+    }
     Ok(())
 }
 
@@ -649,7 +724,11 @@ pub fn archive_cmd(data: &Path, name: Option<String>) -> Result<(), Error> {
             .ok_or_else(|| Error::Message("archive needs an agent name or id".into()))?,
     };
     let view = set_state(data, &target, "archived")?;
-    println!("{}\t{}\t{}", view.id, view.name, view.state);
+    if crate::ui::is_pretty() {
+        presentation::lifecycle("Archived", &view);
+    } else {
+        println!("{}\t{}\t{}", view.id, view.name, view.state);
+    }
     Ok(())
 }
 
@@ -661,7 +740,11 @@ pub fn pause_cmd(data: &Path, name: Option<String>) -> Result<(), Error> {
             .ok_or_else(|| Error::Message("pause needs an agent name or id".into()))?,
     };
     let view = set_state(data, &target, "paused")?;
-    println!("{}\t{}\t{}", view.id, view.name, view.state);
+    if crate::ui::is_pretty() {
+        presentation::lifecycle("Paused", &view);
+    } else {
+        println!("{}\t{}\t{}", view.id, view.name, view.state);
+    }
     Ok(())
 }
 
@@ -678,7 +761,11 @@ pub fn delete_cmd(data: &Path, name: &str) -> Result<(), Error> {
         if let Some(val) = answered {
             let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("-");
             let deleted_name = val.get("name").and_then(|v| v.as_str()).unwrap_or(name);
-            println!("{id}\t{deleted_name}\tdeleted");
+            if crate::ui::is_pretty() {
+                presentation::receipt("Deleted", deleted_name);
+            } else {
+                println!("{id}\t{deleted_name}\tdeleted");
+            }
             return Ok(());
         }
         return Err(Error::Message("the server answered nothing".to_string()));
@@ -690,7 +777,11 @@ pub fn delete_cmd(data: &Path, name: &str) -> Result<(), Error> {
     let deleted = store.delete_agent(&found.id)?;
     let agent_dir = data.join("agents").join(deleted.id.as_str());
     let _ = std::fs::remove_dir_all(&agent_dir);
-    println!("{}\t{}\tdeleted", deleted.id, deleted.name);
+    if crate::ui::is_pretty() {
+        presentation::receipt("Deleted", &deleted.name);
+    } else {
+        println!("{}\t{}\tdeleted", deleted.id, deleted.name);
+    }
     Ok(())
 }
 
@@ -717,7 +808,11 @@ pub fn reset_session_cmd(data: &Path, name: &str) -> Result<(), Error> {
         let found = store.agent(&found.id)?;
         crate::create::reset_agent_session_locked(&store, &found)?
     };
-    println!("{result}");
+    if crate::ui::is_pretty() {
+        presentation::reset(&result, name);
+    } else {
+        println!("{result}");
+    }
     Ok(())
 }
 
@@ -726,7 +821,11 @@ pub fn resume_cmd(data: &Path, name: &str, prompt: Option<String>) -> Result<(),
     if let Some(text) = prompt.filter(|s| !s.trim().is_empty()) {
         crate::channel::send_simple(data, &view.name, text)?;
     }
-    println!("{}\t{}\t{}", view.id, view.name, view.state);
+    if crate::ui::is_pretty() {
+        presentation::lifecycle("Woken", &view);
+    } else {
+        println!("{}\t{}\t{}", view.id, view.name, view.state);
+    }
     Ok(())
 }
 
@@ -755,12 +854,20 @@ pub fn resume_faulted(data: &Path) -> Result<(), Error> {
         .filter(|agent| agent.display_state() == "faulted")
         .collect();
     if faulted.is_empty() {
-        println!("no faulted agent");
+        if crate::ui::is_pretty() {
+            crate::ui::note("No faulted agents.");
+        } else {
+            println!("no faulted agent");
+        }
         return Ok(());
     }
     for agent in faulted {
         let view = set_state(data, &agent.id, "running")?;
-        println!("{}\t{}\t{}", view.id, view.name, view.state);
+        if crate::ui::is_pretty() {
+            presentation::lifecycle("Woken", &view);
+        } else {
+            println!("{}\t{}\t{}", view.id, view.name, view.state);
+        }
     }
     Ok(())
 }
@@ -857,6 +964,9 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         (&crate::vendor::declared_delivery(&agent.harness)).into();
     let effective_instructions =
         crate::create::effective_agent_instructions(Some(&store), data, &agent);
+    let schedules =
+        crate::schedule::list_agent_schedules(&store, &agent.id, false).map_err(Error::Message)?;
+    let automations = crate::api::AutomationCountsView::from_schedules(&schedules);
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -893,8 +1003,8 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
-        schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)
-            .map_err(Error::Message)?,
+        schedules,
+        automations,
         turn_errors: None,
         unsettled_outbound: Vec::new(),
     })
@@ -1016,6 +1126,8 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         (&crate::vendor::declared_delivery(&agent.harness)).into();
     let effective_instructions =
         crate::create::effective_agent_instructions(Some(&store), data, &agent);
+    let schedules = crate::schedule::list_agent_schedules(&store, &agent.id, false)?;
+    let automations = crate::api::AutomationCountsView::from_schedules(&schedules);
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -1052,7 +1164,8 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
-        schedules: crate::schedule::list_agent_schedules(&store, &agent.id, false)?,
+        schedules,
+        automations,
         turn_errors: None,
         unsettled_outbound: Vec::new(),
     })
@@ -1072,17 +1185,28 @@ fn revoke_remote_cmd(data: &Path, agent: &str, session: Option<&str>) -> Result<
         )
         .map_err(Error::Message)?
         .ok_or_else(|| Error::Message("the server answered nothing".into()))?;
-        println!("{answered}");
+        if crate::ui::is_pretty() {
+            presentation::revoked(&answered, agent);
+        } else {
+            println!("{answered}");
+        }
         return Ok(());
     }
     let store = open(data)?;
     let rec = store.agent_by_name(agent)?;
     store.record_admin_audit("operator", "agents.revoke_remote_sessions", &rec.name)?;
     let revoked = crate::remote::revoke(&store, &rec.id, session)?;
-    println!(
-        "{}",
-        serde_json::json!({ "agent": rec.name, "session_id": session, "revoked": revoked })
-    );
+    if crate::ui::is_pretty() {
+        presentation::revoked(
+            &serde_json::json!({ "agent": rec.name, "revoked": revoked }),
+            agent,
+        );
+    } else {
+        println!(
+            "{}",
+            serde_json::json!({ "agent": rec.name, "session_id": session, "revoked": revoked })
+        );
+    }
     Ok(())
 }
 
@@ -1096,10 +1220,13 @@ fn set_admin(data: &Path, agent: &str, admin: bool) -> Result<(), Error> {
         &client::authority(data),
     ) {
         Ok(result) => {
-            println!(
-                "{}",
-                result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
-            );
+            let result =
+                result.ok_or_else(|| Error::Message("the server answered nothing".into()))?;
+            if crate::ui::is_pretty() {
+                presentation::admin(&result, agent, admin);
+            } else {
+                println!("{}", result);
+            }
             return Ok(());
         }
         Err(err) if err.contains("404") && client::agent_identity().is_none() => {}
@@ -1117,7 +1244,11 @@ fn set_admin(data: &Path, agent: &str, admin: bool) -> Result<(), Error> {
         &rec.name,
     )?;
     store.set_agent_admin(&rec.id, admin)?;
-    println!("{}", serde_json::json!({"agent": rec.name, "admin": admin}));
+    if crate::ui::is_pretty() {
+        presentation::admin(&serde_json::json!({"agent": rec.name}), agent, admin);
+    } else {
+        println!("{}", serde_json::json!({"agent": rec.name, "admin": admin}));
+    }
     Ok(())
 }
 
@@ -1513,23 +1644,61 @@ pub fn requeue(
     let store = open(data)?;
     let agent = store.agent_by_name(name)?;
     let Some(message) = message else {
-        for parked in store.rejected_messages(&agent.id)? {
-            println!(
-                "{}\t{}\t{}\t{}",
-                parked.message_id,
-                parked.seq,
-                parked.sender.as_deref().unwrap_or("-"),
-                parked.reason
-            );
+        let parked = store.rejected_messages(&agent.id)?;
+        if crate::ui::is_pretty() {
+            if parked.is_empty() {
+                crate::ui::note("No parked messages.");
+            } else {
+                crate::ui::heading("Parked messages");
+                let mut table = crate::ui::Table::new(&[
+                    ("MESSAGE", false),
+                    ("SEQ", true),
+                    ("SENDER", false),
+                    ("STATUS", false),
+                ]);
+                for item in &parked {
+                    table.add_row(vec![
+                        item.message_id.clone(),
+                        item.seq.to_string(),
+                        item.sender.clone().unwrap_or_else(|| "—".into()),
+                        "Rejected".into(),
+                    ]);
+                }
+                table.print();
+                if crate::ui::is_verbose() {
+                    for item in &parked {
+                        crate::ui::note(&format!("{}: {}", item.message_id, item.reason));
+                    }
+                } else {
+                    crate::ui::note("Use --verbose for rejection details.");
+                }
+            }
+        } else {
+            for parked in parked {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    parked.message_id,
+                    parked.seq,
+                    parked.sender.as_deref().unwrap_or("-"),
+                    parked.reason
+                );
+            }
         }
         return Ok(());
     };
     let requeued = store.requeue_rejected(&agent.id, message)?;
-    println!(
-        "{}\trequeued\t{message}\t{}",
-        agent.name,
-        requeued.id.as_str()
-    );
+    if crate::ui::is_pretty() {
+        presentation::receipt("Requeued message for", &agent.name);
+        if crate::ui::is_verbose() {
+            crate::ui::note(&format!("{message} → {}", requeued.id.as_str()));
+        }
+    } else {
+        println!(
+            "{}\trequeued\t{message}\t{}",
+            agent.name,
+            requeued.id.as_str()
+        );
+    }
     Ok(())
 }
 
@@ -1549,7 +1718,16 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
         let _process = match store.try_lock_agent(&agent.id) {
             Ok(lock) => lock,
             Err(anyagents_core::Error::AgentBusy) => {
-                println!("{}	skipped	its harness process is live", agent.name);
+                if crate::ui::is_pretty() {
+                    presentation::diagnostic(
+                        &agent.name,
+                        "skipped",
+                        "The harness is already running.",
+                        None,
+                    );
+                } else {
+                    println!("{}	skipped	its harness process is live", agent.name);
+                }
                 continue;
             }
             Err(error) => return Err(error),
@@ -1571,7 +1749,16 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
         let mut harness = match crate::vendor::vendor_launch_with_store(request, &store) {
             Ok(harness) => harness,
             Err(reason) => {
-                println!("{}\tskipped\t{reason}", agent.name);
+                if crate::ui::is_pretty() {
+                    presentation::diagnostic(
+                        &agent.name,
+                        "skipped",
+                        "The harness could not start.",
+                        Some(&reason.to_string()),
+                    );
+                } else {
+                    println!("{}\tskipped\t{reason}", agent.name);
+                }
                 continue;
             }
         };
@@ -1630,11 +1817,20 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                         break;
                     }
                     store.reject_message(&agent.id, message.seq, &reason)?;
-                    println!(
-                        "{}\trejected\t{}\t{reason}",
-                        agent.name,
-                        message.id.as_str()
-                    );
+                    if crate::ui::is_pretty() {
+                        presentation::diagnostic(
+                            &agent.name,
+                            "rejected",
+                            "A message was parked.",
+                            Some(&reason),
+                        );
+                    } else {
+                        println!(
+                            "{}\trejected\t{}\t{reason}",
+                            agent.name,
+                            message.id.as_str()
+                        );
+                    }
                     if !message_specific {
                         last_rejection = Some(reason);
                     }
@@ -1646,9 +1842,28 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
             }
         }
         let cursor = store.delivered_cursor(&agent.id)?;
-        match failure {
-            Some(reason) => println!("{}\tstopped\t{cursor}\t{flushed}\t{reason}", agent.name),
-            None => println!("{}\tdelivered\t{cursor}\t{flushed}", agent.name),
+        if crate::ui::is_pretty() {
+            if let Some(reason) = failure {
+                presentation::diagnostic(
+                    &agent.name,
+                    "stopped",
+                    &format!("{flushed} message(s) delivered; remaining messages stay queued."),
+                    Some(&reason),
+                );
+            } else {
+                crate::ui::success(&format!(
+                    "{} · {flushed} message(s) delivered",
+                    crate::ui::bold(&agent.name)
+                ));
+            }
+            if crate::ui::is_verbose() {
+                crate::ui::note(&format!("Delivery cursor: {cursor}"));
+            }
+        } else {
+            match failure {
+                Some(reason) => println!("{}\tstopped\t{cursor}\t{flushed}\t{reason}", agent.name),
+                None => println!("{}\tdelivered\t{cursor}\t{flushed}", agent.name),
+            }
         }
     }
     Ok(())
@@ -1986,12 +2201,20 @@ pub fn verdict_cmd(
         &client::authority(data),
     ) {
         Ok(Some(outcome)) => {
-            println!(
-                "{}\t{clean_agent}\t{}\t{}",
-                outcome.id,
-                outcome.kind.as_str(),
-                outcome.actor
-            );
+            if crate::ui::is_pretty() {
+                crate::ui::success(&format!(
+                    "Verdict recorded: {} · {}",
+                    crate::ui::bold(clean_agent),
+                    outcome.kind.as_str()
+                ));
+            } else {
+                println!(
+                    "{}\t{clean_agent}\t{}\t{}",
+                    outcome.id,
+                    outcome.kind.as_str(),
+                    outcome.actor
+                );
+            }
             Ok(())
         }
         Ok(None) => Err(Error::Message("the server answered nothing".into())),
@@ -2119,5 +2342,119 @@ mod archetype_tests {
         );
         assert!(open(dir.path()).unwrap().list_agents().unwrap().is_empty());
         assert!(!dir.path().join("agents").exists());
+    }
+}
+
+#[cfg(test)]
+mod automation_tests {
+    use super::*;
+    use crate::api::AutomationCountsView;
+    use anyagents_core::{NewAgent, NewSchedule};
+
+    #[test]
+    fn local_create_has_zero_automations_and_reads_legacy_views() {
+        let _env = crate::server::tests::env_lock();
+        let data = tempfile::tempdir().unwrap();
+        let workdir = data.path().join("workspace");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let view = create(
+            data.path(),
+            serde_json::json!({
+                "name": "worker",
+                "harness": "claude-code",
+                "workdir": workdir,
+            }),
+        )
+        .unwrap();
+        assert!(view.schedules.is_empty());
+        assert_eq!(view.automations, AutomationCountsView::default());
+
+        let mut wire = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            wire["automations"],
+            serde_json::json!({"total": 0, "watches": 0, "timers": 0, "crons": 0})
+        );
+        wire.as_object_mut().unwrap().remove("automations");
+        let legacy: AgentView = serde_json::from_value(wire).unwrap();
+        assert_eq!(legacy.automations, AutomationCountsView::default());
+        assert_eq!(legacy.id, view.id);
+    }
+
+    #[test]
+    fn local_lifecycle_counts_active_kinds_without_dropping_schedule_details() {
+        let _env = crate::server::tests::env_lock();
+        let data = tempfile::tempdir().unwrap();
+        let store = super::open(data.path()).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("worker", "claude-code"))
+            .unwrap();
+        let empty = set_state(data.path(), "worker", "paused").unwrap();
+        assert!(empty.schedules.is_empty());
+        assert_eq!(empty.automations, AutomationCountsView::default());
+
+        let mut active = Vec::new();
+        for (index, kind) in ["watch", "watch", "at", "every", "unknown"]
+            .iter()
+            .enumerate()
+        {
+            let id = store
+                .create_schedule(NewSchedule {
+                    agent_id: agent.id.clone(),
+                    kind: (*kind).into(),
+                    spec: format!("spec-{index}"),
+                    prompt: format!("prompt-{index}"),
+                    interval_ms: None,
+                    next_fire_at_ms: None,
+                    watch_baseline: None,
+                })
+                .unwrap()
+                .id;
+            active.push(id);
+        }
+        let cancelled = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "at".into(),
+                spec: "cancelled-spec".into(),
+                prompt: "cancelled-prompt".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: None,
+            })
+            .unwrap()
+            .id;
+        assert_eq!(
+            store.cancel_schedule(Some(&agent.id), &cancelled).unwrap(),
+            1
+        );
+
+        let mixed = set_state(data.path(), "worker", "paused").unwrap();
+        assert_eq!(mixed.schedules.len(), 6);
+        assert!(
+            mixed
+                .schedules
+                .iter()
+                .any(|row| row.id == cancelled && row.state != "active")
+        );
+        assert!(mixed.schedules.iter().any(|row| row.kind == "unknown"));
+        assert_eq!(
+            mixed.automations,
+            AutomationCountsView {
+                total: 4,
+                watches: 2,
+                timers: 1,
+                crons: 1
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&mixed).unwrap()["automations"],
+            serde_json::json!({"total": 4, "watches": 2, "timers": 1, "crons": 1})
+        );
+        for id in active {
+            assert_eq!(store.cancel_schedule(Some(&agent.id), &id).unwrap(), 1);
+        }
+        let inactive = set_state(data.path(), "worker", "paused").unwrap();
+        assert_eq!(inactive.schedules.len(), 6);
+        assert_eq!(inactive.automations, AutomationCountsView::default());
     }
 }

@@ -24,6 +24,7 @@ use std::sync::Arc;
 use anyagents_core::{AgentId, AgentLock, Store};
 use anyagents_supervisor::{Attached, Custody};
 
+use crate::ui;
 use crate::vendor::{AdapterLaunch, HarnessHost, VendorHarness};
 
 /// Whether `serve` hosts harnesses in keepers on this platform: only where a
@@ -245,11 +246,55 @@ pub fn list(data: &Path) -> Result<(), anyagents_core::Error> {
     }
     let root = anyagents_keeper::root(data);
     anyagents_keeper::check_root(&root).map_err(anyagents_core::Error::Message)?;
-    println!(
-        "agent\tkeeper_pid\tharness_pid\tharness\tmodel\tprotocol\tbinary\tstarted_at_ms\tstate"
-    );
+    if ui::is_pretty() {
+        ui::heading("Keepers");
+    } else {
+        println!(
+            "agent\tkeeper_pid\tharness_pid\tharness\tmodel\tprotocol\tbinary\tstarted_at_ms\tstate"
+        );
+    }
+    let mut table = ui::Table::new(&[
+        ("AGENT", false),
+        ("PID", true),
+        ("HARNESS", false),
+        ("MODEL", false),
+        ("STATE", false),
+    ]);
+    let mut count = 0;
     for instance in anyagents_keeper::instances(&root) {
+        count += 1;
         match anyagents_keeper::inspect(&instance.dir) {
+            Ok(hello) if ui::is_pretty() => {
+                table.add_row(vec![
+                    hello.agent.to_string(),
+                    hello.keeper_pid.to_string(),
+                    hello.harness.clone(),
+                    hello.model.clone().unwrap_or_else(|| "—".into()),
+                    if hello.health.process_alive {
+                        ui::green("● alive")
+                    } else {
+                        ui::red("✗ harness exited")
+                    },
+                ]);
+                if ui::is_verbose() {
+                    ui::note(&format!(
+                        "{} · {} · protocol {}",
+                        hello.agent, hello.binary, hello.protocol
+                    ));
+                }
+            }
+            Err(reason) if ui::is_pretty() => {
+                table.add_row(vec![
+                    instance.agent.to_string(),
+                    "—".into(),
+                    "—".into(),
+                    "—".into(),
+                    ui::red("✗ unavailable"),
+                ]);
+                if ui::is_verbose() {
+                    ui::note(&format!("{reason}: {}", instance.dir.display()));
+                }
+            }
             Ok(hello) => println!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 hello.agent,
@@ -273,6 +318,13 @@ pub fn list(data: &Path) -> Result<(), anyagents_core::Error> {
                 instance.agent,
                 instance.dir.display()
             ),
+        }
+    }
+    if ui::is_pretty() {
+        if count == 0 {
+            ui::note("No keepers.");
+        } else {
+            table.print();
         }
     }
     Ok(())
@@ -299,7 +351,11 @@ pub fn stop(data: &Path, agent: Option<&str>, force: bool) -> Result<(), anyagen
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let _server = hold_server_lock(data)?;
             if !stop_native(data, agent)? {
-                println!("no keepers");
+                if ui::is_pretty() {
+                    ui::note("No keepers.");
+                } else {
+                    println!("no keepers");
+                }
             }
             return Ok(());
         }
@@ -334,7 +390,11 @@ pub fn stop(data: &Path, agent: Option<&str>, force: bool) -> Result<(), anyagen
             .collect();
         if let Err(error) = anyagents_keeper::stop_agent_with(&root, agent, force) {
             failures.push(format!("{agent}: {error}"));
-            println!("{agent}\tfailed");
+            if ui::is_pretty() {
+                ui::error(&format!("Could not stop {agent}"));
+            } else {
+                println!("{agent}\tfailed");
+            }
             continue;
         }
         if let Some(held) = locks.iter().find(|path| !lock_is_free(path)) {
@@ -342,10 +402,18 @@ pub fn stop(data: &Path, agent: Option<&str>, force: bool) -> Result<(), anyagen
                 "{agent}: its lock {} is still held",
                 held.display()
             ));
-            println!("{agent}\tfailed");
+            if ui::is_pretty() {
+                ui::error(&format!("Could not stop {agent}"));
+            } else {
+                println!("{agent}\tfailed");
+            }
             continue;
         }
-        println!("{agent}\tstopped");
+        if ui::is_pretty() {
+            ui::success(&format!("Stopped {agent}"));
+        } else {
+            println!("{agent}\tstopped");
+        }
     }
     if failures.is_empty() {
         Ok(())
@@ -369,7 +437,11 @@ fn stop_native(data: &Path, agent: Option<&str>) -> Result<bool, anyagents_core:
     for agent in agents {
         if crate::spiron_native::record_path(data, &agent).exists() {
             crate::spiron_native::end_recorded(data, &agent);
-            println!("{agent}\tstopped (spiron)");
+            if ui::is_pretty() {
+                ui::success(&format!("Stopped {agent} (spiron)"));
+            } else {
+                println!("{agent}\tstopped (spiron)");
+            }
             any = true;
         }
     }

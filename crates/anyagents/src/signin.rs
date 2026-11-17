@@ -2,6 +2,11 @@
 //! the config directory of a recorded agent, so the credential lands in the same
 //! store the agent's harness is started with.
 
+mod input;
+#[cfg(unix)]
+mod vendor;
+pub use input::read_secret_line;
+
 use std::io::{BufRead, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -353,30 +358,32 @@ pub fn google_antigravity_pkce_sign_in(
     sink: &mut dyn SignInSink,
 ) -> Result<SignInOutcome, Error> {
     let (tx, rx) = mpsc::channel::<std::io::Result<String>>();
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let mut reader = stdin.lock();
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    let _ = tx.send(Ok(String::new()));
-                    break;
-                }
-                Ok(_) => {
-                    if line.trim().is_empty() {
-                        continue;
+    if !input::interactive() {
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut reader = stdin.lock();
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = tx.send(Ok(String::new()));
+                        break;
                     }
-                    let _ = tx.send(Ok(line));
-                    break;
-                }
-                Err(err) => {
-                    let _ = tx.send(Err(err));
-                    break;
+                    Ok(_) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let _ = tx.send(Ok(line));
+                        break;
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Err(err));
+                        break;
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
     let endpoints = GooglePkceEndpoints::default();
     let mut verifier_bytes = [0u8; 32];
@@ -399,6 +406,16 @@ pub fn google_antigravity_pkce_sign_in(
             "Paste the authorization code or full callback URL (waiting up to 15m):".to_string(),
         ),
     ];
+    // Disable echo before showing the prompt, including for an immediate paste.
+    #[cfg(unix)]
+    let mut terminal =
+        if input::interactive() {
+            Some(input::Terminal::new().map_err(|err| {
+                Error::Message(format!("sign-in failed preparing terminal: {err}"))
+            })?)
+        } else {
+            None
+        };
     for p in &prompts {
         sink.prompt(p);
     }
@@ -409,33 +426,59 @@ pub fn google_antigravity_pkce_sign_in(
         let _ = ctx.send(crate::create::extract_agy_oauth_clients());
     });
 
-    let raw_input = match rx.recv_timeout(endpoints.timeout) {
-        Ok(Ok(line)) if !line.trim().is_empty() => line,
-        Ok(Ok(_)) => {
-            return Err(Error::Message(
-                "sign-in aborted: standard input closed before receiving an authorization code"
-                    .into(),
-            ));
+    let raw_input = if input::interactive() {
+        let deadline = std::time::Instant::now() + endpoints.timeout;
+        loop {
+            #[cfg(unix)]
+            let line = input::terminal_line(
+                terminal
+                    .as_mut()
+                    .ok_or_else(|| Error::Message("sign-in terminal unavailable".into()))?,
+                Some(deadline),
+            );
+            #[cfg(not(unix))]
+            let line = read_secret_line(
+                "",
+                Some(deadline.saturating_duration_since(std::time::Instant::now())),
+            );
+            let line = line.map_err(|err| {
+                Error::Message(format!("sign-in failed reading authorization code: {err}"))
+            })?;
+            if !line.trim().is_empty() {
+                break line;
+            }
         }
-        Ok(Err(err)) => {
-            return Err(Error::Message(format!(
-                "sign-in failed reading authorization code: {err}"
-            )));
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            return Err(Error::Message(format!(
-                "sign-in timed out after {}s waiting for authorization code",
-                endpoints.timeout.as_secs()
-            )));
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            return Err(Error::Message(
-                "sign-in aborted: input channel closed before receiving an authorization code"
-                    .into(),
-            ));
+    } else {
+        match rx.recv_timeout(endpoints.timeout) {
+            Ok(Ok(line)) if !line.trim().is_empty() => line,
+            Ok(Ok(_)) => {
+                return Err(Error::Message(
+                    "sign-in aborted: standard input closed before receiving an authorization code"
+                        .into(),
+                ));
+            }
+            Ok(Err(err)) => {
+                return Err(Error::Message(format!(
+                    "sign-in failed reading authorization code: {err}"
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(Error::Message(format!(
+                    "sign-in timed out after {}s waiting for authorization code",
+                    endpoints.timeout.as_secs()
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::Message(
+                    "sign-in aborted: input channel closed before receiving an authorization code"
+                        .into(),
+                ));
+            }
         }
     };
 
+    #[cfg(unix)]
+    drop(terminal);
     let code = parse_google_oauth_input(&raw_input, &state)?;
     let mut clients = crx
         .recv_timeout(Duration::from_secs(30))
@@ -774,6 +817,13 @@ impl CommandRunner for ProcessRunner {
         for (key, value) in env {
             command.env(key, value);
         }
+        #[cfg(unix)]
+        let terminal = if input::interactive() {
+            command.stdin(Stdio::piped()).stderr(Stdio::piped());
+            Some(input::Terminal::new().map_err(|err| InstallError::Failed(err.to_string()))?)
+        } else {
+            None
+        };
         let mut child = command.spawn().map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 InstallError::Failed(format!("{program} is not installed"))
@@ -781,6 +831,10 @@ impl CommandRunner for ProcessRunner {
                 InstallError::Failed(err.to_string())
             }
         })?;
+        #[cfg(unix)]
+        if let Some(terminal) = terminal {
+            return vendor::run(child, terminal, on_line);
+        }
         if let Some(mut stdout) = child.stdout.take() {
             let pass_through = std::io::IsTerminal::is_terminal(&std::io::stdout())
                 && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none();
@@ -862,10 +916,26 @@ pub struct TerminalSink;
 impl SignInSink for TerminalSink {
     fn prompt(&mut self, prompt: &SignInPrompt) {
         let mut out = std::io::stdout().lock();
-        let _ = match prompt {
-            SignInPrompt::Link(url) => writeln!(out, "open {url}"),
-            SignInPrompt::DeviceCode(code) => writeln!(out, "enter code {code}"),
-            SignInPrompt::Prompt(text) => writeln!(out, "{text}"),
+        let _ = if input::interactive() {
+            match prompt {
+                SignInPrompt::Link(url) => writeln!(
+                    out,
+                    "\n  {}\n  {url}\n",
+                    crate::ui::bold("Open this link to sign in")
+                ),
+                SignInPrompt::DeviceCode(code) => writeln!(
+                    out,
+                    "  Enter this code in your browser: {}\n",
+                    crate::ui::bold(code)
+                ),
+                SignInPrompt::Prompt(text) => writeln!(out, "  {text}"),
+            }
+        } else {
+            match prompt {
+                SignInPrompt::Link(url) => writeln!(out, "open {url}"),
+                SignInPrompt::DeviceCode(code) => writeln!(out, "enter code {code}"),
+                SignInPrompt::Prompt(text) => writeln!(out, "{text}"),
+            }
         };
         let _ = out.flush();
     }

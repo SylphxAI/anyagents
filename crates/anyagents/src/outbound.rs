@@ -62,8 +62,39 @@ pub fn list(data: &Path, json: bool) -> Result<(), Error> {
     if json {
         return print_json(&listed);
     }
-    for held in &listed.unsettled {
-        print_one(held);
+    if ui::is_pretty() {
+        ui::heading("Unconfirmed sends");
+        if listed.unsettled.is_empty() {
+            ui::note("No unconfirmed sends.");
+        } else {
+            ui::note(
+                "Delivery is uncertain. Retry may send a duplicate; discard settles without sending.",
+            );
+            let mut table = ui::Table::new(&[
+                ("KEY", false),
+                ("AGENT", false),
+                ("TO", false),
+                ("SINCE", false),
+                ("ERROR", false),
+                ("MESSAGE", false),
+            ]);
+            for held in &listed.unsettled {
+                table.add_row(vec![
+                    held.key.clone(),
+                    held.agent_id.clone(),
+                    held.destination.clone(),
+                    held.since_ms
+                        .map_or_else(|| "—".into(), ui::format_timestamp_ms),
+                    held.error.clone().unwrap_or_else(|| "—".into()),
+                    held.excerpt.clone(),
+                ]);
+            }
+            table.print();
+        }
+    } else {
+        for held in &listed.unsettled {
+            print_one(held);
+        }
     }
     Ok(())
 }
@@ -92,10 +123,19 @@ pub fn retry(data: &Path, key: &str, json: bool) -> Result<(), Error> {
         return print_json(&response);
     }
     for delivery in &response.deliveries {
-        println!("retried\t{key}\t{}\t{}", delivery.to, delivery.id);
+        if ui::is_pretty() {
+            ui::success(&format!("Retried {key} → {}", delivery.to));
+            ui::note(&format!("Delivery {}", delivery.id));
+        } else {
+            println!("retried\t{key}\t{}\t{}", delivery.to, delivery.id);
+        }
     }
     for skipped in &response.skipped {
-        println!("skipped\t{key}\t{}\t{}", skipped.to, skipped.reason);
+        if ui::is_pretty() {
+            ui::note(&format!("Skipped {}: {}", skipped.to, skipped.reason));
+        } else {
+            println!("skipped\t{key}\t{}\t{}", skipped.to, skipped.reason);
+        }
     }
     Ok(())
 }
@@ -123,7 +163,14 @@ pub fn discard(data: &Path, key: &str, json: bool) -> Result<(), Error> {
     if json {
         return print_json(&held);
     }
-    print!("discarded\t");
-    print_one(&held);
+    if ui::is_pretty() {
+        ui::success(&format!(
+            "Discarded {} → {} without resending",
+            held.key, held.destination
+        ));
+    } else {
+        print!("discarded\t");
+        print_one(&held);
+    }
     Ok(())
 }

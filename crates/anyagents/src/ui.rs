@@ -8,7 +8,10 @@
 use std::collections::HashMap;
 use std::io::IsTerminal as _;
 
-use crate::api::{AgentView, ConversationTurnView, MessageView};
+use crate::api::AgentView;
+
+mod presentation;
+pub use presentation::{error, heading, is_verbose, note, schedules, set_verbose, success, value};
 
 /// True when stdout should use interactive human formatting.
 pub fn is_pretty() -> bool {
@@ -188,11 +191,11 @@ pub fn truncate_visible(s: &str, max_cols: usize) -> String {
     out
 }
 
-/// Detect the active terminal width in columns (falls back to 120 when not attached to a tty).
+/// Detect the active terminal width in columns (falls back to 120 without a tty).
 pub fn terminal_width() -> usize {
     if let Ok(val) = std::env::var("COLUMNS")
         && let Ok(cols) = val.trim().parse::<usize>()
-        && cols >= 40
+        && cols >= 20
     {
         return cols;
     }
@@ -201,13 +204,13 @@ pub fn terminal_width() -> usize {
         for fd in [1, 2, 0] {
             unsafe {
                 let mut ws: libc::winsize = std::mem::zeroed();
-                if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col >= 40 {
+                if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col >= 20 {
                     return ws.ws_col as usize;
                 }
             }
         }
     }
-    160
+    120
 }
 
 /// Pad a potentially ANSI-styled string on the right to `target_width` visible chars.
@@ -325,7 +328,7 @@ pub fn format_agent_status(
         }
         ("running", other, _) => cyan(&format!("● {other}")),
         ("idle", _, _) => dim("◌ idle"),
-        ("paused", _, "faulted") => red("◐ faulted"),
+        ("paused", _, "faulted") => red("✗ faulted"),
         ("paused", _, _) => yellow("◐ paused"),
         ("archived", _, _) => dim("▫ archived"),
         (other, _, _) => dim(other),
@@ -376,6 +379,40 @@ impl Table {
         }
 
         let term_w = terminal_width();
+        let available = term_w.saturating_sub(visible_width(self.indent));
+        let natural = widths.iter().sum::<usize>() + 2 * cols.saturating_sub(1);
+        if self.fit_terminal && natural > available {
+            let minimum = self
+                .headers
+                .iter()
+                .map(|(h, _)| visible_width(h).max(6))
+                .sum::<usize>()
+                + 2 * cols.saturating_sub(1);
+            if minimum > available {
+                let mut lines = Vec::new();
+                for (n, row) in self.rows.iter().enumerate() {
+                    if n > 0 {
+                        lines.push(String::new());
+                    }
+                    for (i, (title, _)) in self.headers.iter().enumerate() {
+                        let cell = row.get(i).map(String::as_str).unwrap_or("—");
+                        let label = format!("{}{}  ", self.indent, dim(title));
+                        let space = term_w.saturating_sub(visible_width(&label));
+                        lines.push(format!("{label}{}", truncate_visible(cell, space)));
+                    }
+                }
+                return lines;
+            }
+            while widths.iter().sum::<usize>() + 2 * cols.saturating_sub(1) > available {
+                let Some(i) = (0..cols)
+                    .filter(|&i| widths[i] > visible_width(self.headers[i].0).max(6))
+                    .max_by_key(|&i| widths[i])
+                else {
+                    break;
+                };
+                widths[i] -= 1;
+            }
+        }
         let max_last_col = if self.fit_terminal && cols > 1 && !self.headers[cols - 1].1 {
             let prefix_cols: usize = visible_width(self.indent)
                 + widths[..cols - 1].iter().sum::<usize>()
@@ -405,7 +442,7 @@ impl Table {
                 }
             }
         }
-        if self.fit_terminal && term_w >= 115 && visible_width(&header_line) > term_w {
+        if self.fit_terminal && visible_width(&header_line) > term_w {
             header_line = truncate_visible(&header_line, term_w);
         }
         out.push(header_line);
@@ -415,6 +452,12 @@ impl Table {
             let mut line = String::from(self.indent);
             for (i, (_, right)) in self.headers.iter().enumerate() {
                 let cell = row.get(i).map(String::as_str).unwrap_or("");
+                let fitted = if self.fit_terminal {
+                    truncate_visible(cell, widths[i])
+                } else {
+                    cell.to_string()
+                };
+                let cell = fitted.as_str();
                 if i + 1 == cols && !*right {
                     if let Some(max_w) = max_last_col {
                         line.push_str(&truncate_visible(cell, max_w));
@@ -433,7 +476,7 @@ impl Table {
                     }
                 }
             }
-            if self.fit_terminal && term_w >= 115 && visible_width(&line) > term_w {
+            if self.fit_terminal && visible_width(&line) > term_w {
                 line = truncate_visible(&line, term_w);
             }
             out.push(line);
@@ -1091,6 +1134,7 @@ pub fn print_agents_table_with_options(
         ("TREE", false),
         ("RUNTIME", false),
         ("DELIVERY", false),
+        ("AUTOMATIONS", false),
     ];
     if profile_lookup.is_some() {
         headers.push(("PROFILE", false));
@@ -1182,6 +1226,7 @@ pub fn print_agents_table_with_options(
             tree_cell,
             runtime,
             delivery_cell,
+            automation_summary(&agent.automations),
         ];
         if let Some(lookup) = profile_lookup {
             let prof = lookup(agent);
@@ -1567,74 +1612,6 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
     println!();
 }
 
-/// Pretty-print an agent's inbox messages.
-pub fn print_inbox_pretty(agent_name: &str, messages: &[MessageView]) {
-    if messages.is_empty() {
-        println!("  {} {}", bold_cyan(agent_name), dim("inbox is empty."));
-        return;
-    }
-    println!(
-        "\n  {}  {} messages\n",
-        bold_cyan(&format!("Inbox · {agent_name}")),
-        bold(&messages.len().to_string())
-    );
-    let mut table = Table::new(&[
-        ("SEQ", true),
-        ("STATUS", false),
-        ("TIME", false),
-        ("FROM", false),
-        ("MESSAGE", false),
-    ]);
-    for m in messages {
-        let seq = dim(&format!("[#{}]", m.seq));
-        let ack = match m.ack.as_str() {
-            "delivered" => green("✓ delivered"),
-            "received" => yellow("● queued"),
-            other => dim(other),
-        };
-        let time = dim(&format_timestamp_ms(m.received_at_ms));
-        let sender = cyan(m.sender.as_deref().unwrap_or("-"));
-        let preview = m.text.replace('\n', " ↵ ");
-        table.add_row(vec![seq, ack, time, sender, preview]);
-    }
-    table.print();
-    println!();
-}
-
-/// Pretty-print two-way conversation turns (`conversation` and `search`).
-pub fn print_conversation_pretty(
-    target: &str,
-    query: Option<&str>,
-    turns: &[ConversationTurnView],
-) {
-    if turns.is_empty() {
-        println!("  {}", dim("No conversation turns matched."));
-        return;
-    }
-    let header = match query {
-        Some(q) => format!("Search \"{q}\" · {target} ({} turns)", turns.len()),
-        None => format!("Conversation · {target} ({} turns)", turns.len()),
-    };
-    println!("\n  {}\n", bold_cyan(&header));
-    for turn in turns {
-        let ts = dim(&turn
-            .timestamp_ms
-            .map_or_else(|| "unknown".into(), format_timestamp_ms));
-        let dir = if turn.direction == "out" {
-            bold_green("→ out")
-        } else {
-            cyan("← in ")
-        };
-        let route = format!("{} {} {}", bold(&turn.from), dim("→"), bold(&turn.to));
-        let id = dim(&format!("[{}]", turn.id));
-        println!("  [#{}] {ts}  {dir}  {route}  {id}", turn.seq);
-        for line in turn.text.lines() {
-            println!("      {line}");
-        }
-        println!();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1798,5 +1775,45 @@ mod tests {
         let stats = compute_subtree_stats("agt_root", &children, 10_000_000, &mut memo);
         assert_eq!(stats.working, 4);
         assert_eq!(stats.lagging, 3);
+    }
+}
+
+/// Compact overview; full watch targets and prompts remain in schedules.
+pub fn automation_summary(counts: &crate::api::AutomationCountsView) -> String {
+    let mut parts = Vec::new();
+    for (count, singular, plural) in [
+        (counts.watches, "watch", "watches"),
+        (counts.timers, "timer", "timers"),
+        (counts.crons, "cron", "crons"),
+    ] {
+        if count > 0 {
+            parts.push(format!(
+                "{count} {}",
+                if count == 1 { singular } else { plural }
+            ));
+        }
+    }
+    if parts.is_empty() {
+        "-".into()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+#[cfg(test)]
+mod automation_tests {
+    use super::*;
+    #[test]
+    fn summaries_have_exact_counts_and_pluralization() {
+        assert_eq!(automation_summary(&Default::default()), "-");
+        assert_eq!(
+            automation_summary(&crate::api::AutomationCountsView {
+                total: 7,
+                watches: 3,
+                timers: 1,
+                crons: 3,
+            }),
+            "3 watches · 1 timer · 3 crons"
+        );
     }
 }

@@ -2484,12 +2484,54 @@ fn authorize_schedule_target(
     }
 }
 
+fn is_fleet_schedule_target(target: Option<&str>) -> bool {
+    target.is_some_and(|name| {
+        let name = name.trim();
+        name.strip_prefix("agent:")
+            .unwrap_or(name)
+            .eq_ignore_ascii_case("all")
+    })
+}
+
+/// Roster visibility is not schedule authority. Reuse the per-owner authorization
+/// boundary, skip only permission denials, and propagate unreadable state.
+fn list_fleet_schedules(
+    store: &Store,
+    principal: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    let mut schedules = Vec::new();
+    for owner in store.list_agents().map_err(ApiError::from_store)? {
+        match authorize_schedule_target(store, principal, Some(owner.id.as_str())) {
+            Ok(_) => {}
+            Err(error) if error.status == StatusCode::FORBIDDEN => continue,
+            Err(error) => return Err(error),
+        }
+        for schedule in store
+            .list_schedules(Some(&owner.id), true)
+            .map_err(ApiError::from_store)?
+        {
+            let schedule = crate::api::ScheduleView::from(schedule);
+            let mut row = serde_json::to_value(&schedule).map_err(|error| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+            })?;
+            row["agent_name"] = serde_json::json!(owner.name);
+            row["next_fire_at_ms"] = serde_json::json!(schedule.next_fire_at_ms);
+            row["last_observed"] = serde_json::json!(schedule.last_observed);
+            schedules.push(row);
+        }
+    }
+    Ok(serde_json::json!({"agent": "all", "schedules": schedules}))
+}
+
 async fn list_schedules_route(
     principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
+        if is_fleet_schedule_target(Some(&name)) {
+            return list_fleet_schedules(&state.store, &principal).map(Json);
+        }
         let target = authorize_schedule_target(&state.store, &principal, Some(&name))?;
         let schedules: Vec<crate::api::ScheduleView> = state
             .store
@@ -2582,6 +2624,16 @@ async fn handle_schedule_action(
         body.at = trigger.at;
         body.every = trigger.every;
         body.watch = trigger.watch;
+
+        if is_fleet_schedule_target(body.agent.as_deref()) {
+            if !matches!(verb, ScheduleVerb::List) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "fleet schedules are read-only; select one agent to create or cancel",
+                ));
+            }
+            return list_fleet_schedules(&state.store, &principal).map(Json);
+        }
 
         match verb {
             ScheduleVerb::List => {
@@ -4286,6 +4338,7 @@ fn archived_agent_view_fast(agent: &Agent) -> AgentView {
         seat_user: None,
         seat_uid: None,
         seat_gid: None,
+        automations: Default::default(),
         schedules: Vec::new(),
         turn_errors: None,
         unsettled_outbound: Vec::new(),
@@ -4530,7 +4583,7 @@ fn agent_view_preloaded(
     let seat_info = seats
         .get(agent.id.as_str())
         .map(|(user, uid, gid, _)| (user.clone(), *uid, *gid));
-    let schedules = if let Some(metadata) = metadata.as_mut() {
+    let schedules: Vec<crate::api::ScheduleView> = if let Some(metadata) = metadata.as_mut() {
         metadata
             .schedules
             .remove(agent.id.as_str())
@@ -4579,6 +4632,7 @@ fn agent_view_preloaded(
         seat_user: seat_info.as_ref().map(|(u, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid)| *gid),
+        automations: crate::api::AutomationCountsView::from_schedules(&schedules),
         schedules,
         turn_errors: turn_errors.map(Into::into),
         unsettled_outbound: outbound_history::unsettled(store)
@@ -14839,6 +14893,142 @@ exec '{}' "$@"
             "method": "tools/call",
             "params": { "name": name, "arguments": arguments }
         })
+    }
+
+    #[tokio::test]
+    async fn fleet_schedules_enforce_owner_authority_and_reject_all_mutations() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let store = &state.store;
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("fleet-parent", "codex"))
+            .unwrap();
+        let child = store
+            .create_agent(anyagents_core::NewAgent {
+                parent_id: Some(parent.id.clone()),
+                ..anyagents_core::NewAgent::new("fleet-child", "codex")
+            })
+            .unwrap();
+        let unrelated = store
+            .create_agent(anyagents_core::NewAgent::new("fleet-unrelated", "codex"))
+            .unwrap();
+        for agent in [&parent, &child, &unrelated] {
+            store
+                .create_schedule(anyagents_core::NewSchedule {
+                    agent_id: agent.id.clone(),
+                    kind: "watch".into(),
+                    spec: "file:/tmp/fleet-fixture".into(),
+                    prompt: format!("private prompt for {}", agent.name),
+                    interval_ms: None,
+                    next_fire_at_ms: None,
+                    watch_baseline: None,
+                })
+                .unwrap();
+        }
+        let principal = Principal::Agent {
+            agent_id: parent.id.clone(),
+            name: parent.name.clone(),
+        };
+        let child_principal = Principal::Agent {
+            agent_id: child.id.clone(),
+            name: child.name.clone(),
+        };
+        assert_eq!(
+            authorize_schedule_target(store, &principal, Some(unrelated.id.as_str()))
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        for (actor, expected) in [
+            (&principal, 2),
+            (&child_principal, 1),
+            (&Principal::Operator, 3),
+        ] {
+            for target in ["all", "ALL", " agent:All "] {
+                let request: ScheduleRequest =
+                    serde_json::from_value(serde_json::json!({"action": "list", "agent": target}))
+                        .unwrap();
+                let result = handle_schedule_action(actor.clone(), state.clone(), request)
+                    .await
+                    .unwrap()
+                    .0;
+                let rows = result["schedules"].as_array().unwrap();
+                assert_eq!(rows.len(), expected);
+                for row in rows {
+                    assert!(row["agent_name"].is_string());
+                    assert!(row["agent_id"].is_string());
+                    assert!(row.get("next_fire_at_ms").unwrap().is_null());
+                    assert!(row.get("last_observed").unwrap().is_null());
+                    if expected < 3 {
+                        assert_ne!(row["agent_name"], unrelated.name);
+                    }
+                }
+            }
+        }
+        // Both HTTP GET and the MCP-backed action share the same authorized population.
+        let get = list_schedules_route(
+            principal.clone(),
+            State(state.clone()),
+            AxumPath("all".into()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(get["schedules"].as_array().unwrap().len(), 2);
+        for actor in [&principal, &Principal::Operator] {
+            for payload in [
+                serde_json::json!({"action": "create", "at": "1h", "prompt": "no"}),
+                serde_json::json!({"action": "at", "at": "1h", "prompt": "no"}),
+                serde_json::json!({"action": "every", "every": "1h", "prompt": "no"}),
+                serde_json::json!({"action": "watch", "watch": "file:/tmp/no", "prompt": "no"}),
+                serde_json::json!({"action": "cancel", "id": "all"}),
+                serde_json::json!({"at": "1h", "prompt": "no"}),
+            ] {
+                let mut payload = payload;
+                payload["agent"] = serde_json::json!("all");
+                let request = serde_json::from_value(payload).unwrap();
+                assert_eq!(
+                    handle_schedule_action(actor.clone(), state.clone(), request)
+                        .await
+                        .unwrap_err()
+                        .status,
+                    StatusCode::BAD_REQUEST
+                );
+            }
+        }
+        assert_eq!(store.list_schedules(None, true).unwrap().len(), 3);
+        assert!(authorize_schedule_target(store, &Principal::Operator, None).is_err());
+        // Only top-level agents can hold administrative authority.
+        assert!(store.set_agent_admin(&child.id, true).is_err());
+        assert_eq!(
+            list_fleet_schedules(store, &child_principal).unwrap()["schedules"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        store.set_agent_admin(&parent.id, true).unwrap();
+        assert_eq!(
+            list_fleet_schedules(store, &principal).unwrap()["schedules"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        store.set_agent_admin(&parent.id, false).unwrap();
+        assert_eq!(
+            list_fleet_schedules(store, &principal).unwrap()["schedules"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        // An unreadable caller is an error, not a fleet-wide visibility grant.
+        let absent = Principal::Agent {
+            agent_id: anyagents_core::AgentId::generate(),
+            name: "missing".into(),
+        };
+        assert!(list_fleet_schedules(store, &absent).is_err());
     }
 
     #[test]
