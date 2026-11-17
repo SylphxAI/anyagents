@@ -980,10 +980,7 @@ fn persisted_agent_fault(cfg: &Path, harness: &str, now: i64) -> PersistedFault 
     if harness == "claude-code" {
         return (None, error);
     }
-    match record
-        .get("quota_reset_at_ms")
-        .and_then(serde_json::Value::as_i64)
-    {
+    match anyagents_harness::quota::recorded_reset_at_ms(&record) {
         Some(reset_ms) if reset_ms > now => (Some(reset_ms), error),
         Some(_) => (None, None),
         None => (None, error),

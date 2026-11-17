@@ -426,7 +426,31 @@ impl Default for HealthBoard {
 }
 
 type WakeStop =
-    Arc<dyn Fn(&AgentId, &str, Duration, &AtomicBool) -> Result<(), String> + Send + Sync>;
+    Arc<dyn Fn(&AgentId, WakeFault<'_>, Duration, &AtomicBool) -> Result<(), String> + Send + Sync>;
+
+/// The published state an explicit wake retires. It is checked before any
+/// worker is stopped and again before the stop is acknowledged, so a wake never
+/// retires a generation it did not observe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeFault<'a> {
+    /// A worker publishing exactly this fault, its process alive or not.
+    Error(&'a str),
+    /// A worker whose process is down, publishing exactly this fault (or
+    /// none). It still holds the agent's process lock while it waits out a
+    /// restart backoff or a quota hold; a live process never matches.
+    ProcessDown(Option<&'a str>),
+}
+
+impl WakeFault<'_> {
+    fn matches(self, live: &LiveState) -> bool {
+        match self {
+            Self::Error(expected) => live.last_error.as_deref() == Some(expected),
+            Self::ProcessDown(expected) => {
+                !live.process_alive && live.last_error.as_deref() == expected
+            }
+        }
+    }
+}
 
 impl HealthBoard {
     /// Subscribe before reading health to avoid missing a concurrent transition.
@@ -475,13 +499,18 @@ impl HealthBoard {
         expected: &str,
         timeout: Duration,
     ) -> Result<(), String> {
-        self.stop_for_wake_cancellable(id, expected, timeout, &AtomicBool::new(false))
+        self.stop_for_wake_cancellable(
+            id,
+            WakeFault::Error(expected),
+            timeout,
+            &AtomicBool::new(false),
+        )
     }
 
     pub fn stop_for_wake_cancellable(
         &self,
         id: &AgentId,
-        expected: &str,
+        expected: WakeFault<'_>,
         timeout: Duration,
         cancelled: &AtomicBool,
     ) -> Result<(), String> {
@@ -887,7 +916,7 @@ fn is_running(store: &Store, id: &AgentId) -> bool {
 fn stop_for_wake<H: Harness + 'static>(
     inner: &Arc<Inner<H>>,
     id: &AgentId,
-    expected: &str,
+    expected: WakeFault<'_>,
     timeout: Duration,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
@@ -900,12 +929,10 @@ fn stop_for_wake<H: Harness + 'static>(
         if inner.stop.load(Ordering::SeqCst) || inner.retain.load(Ordering::SeqCst) {
             return Err("supervisor is stopping or transferring custody".into());
         }
-        if inner
+        if !inner
             .board
             .get(id)
-            .and_then(|live| live.last_error)
-            .as_deref()
-            != Some(expected)
+            .is_some_and(|live| expected.matches(&live))
         {
             return Err("agent fault changed before wake recovery".into());
         }
@@ -994,12 +1021,10 @@ fn stop_for_wake<H: Harness + 'static>(
     {
         return Err("another worker is still stopping".into());
     }
-    if inner
+    if !inner
         .board
         .get(id)
-        .and_then(|live| live.last_error)
-        .as_deref()
-        != Some(expected)
+        .is_some_and(|live| expected.matches(&live))
     {
         return Err("agent fault changed during wake recovery".into());
     }

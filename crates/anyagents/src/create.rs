@@ -1339,12 +1339,10 @@ pub(crate) fn ensure_seat_environment(target_config: &Path, workdir: &Path) -> R
     for subdir in ["tmp", "data-home", "cache-home", "state-home"] {
         let dir = target_config.join(subdir);
         std::fs::create_dir_all(&dir)?;
+        // Shared runtime trees must not permit peers to unlink each other's
+        // entries. One the agent's seat created only that seat may chmod.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            // Shared runtime trees must not permit peers to unlink each other's entries.
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
-        }
+        crate::seat_tree::set_runtime_dir_mode(&dir, 0o1777)?;
     }
     crate::repo::configure_seat_git(target_config, workdir)?;
     #[cfg(unix)]
@@ -6632,35 +6630,7 @@ pub(crate) fn record_profile_quota_reset(data: &Path, agent: &Agent, reset_at_ms
 }
 
 fn parse_reset_eta_secs(eta: &str) -> Option<i64> {
-    let mut total = 0i64;
-    let mut num = 0i64;
-    let mut has_digit = false;
-    let mut matched_any = false;
-    for ch in eta.trim().chars() {
-        if let Some(d) = ch.to_digit(10) {
-            num = num.saturating_mul(10).saturating_add(d as i64);
-            has_digit = true;
-        } else {
-            if !has_digit {
-                return None;
-            }
-            let mult = match ch {
-                'd' => 86_400,
-                'h' => 3_600,
-                'm' => 60,
-                's' => 1,
-                _ => return None,
-            };
-            total = total.saturating_add(num.saturating_mul(mult));
-            num = 0;
-            has_digit = false;
-            matched_any = true;
-        }
-    }
-    if has_digit || !matched_any {
-        return None;
-    }
-    Some(total)
+    anyagents_harness::quota::parse_duration_ms(eta.trim()).map(|ms| ms / 1_000)
 }
 
 fn advance_cached_usage_etas(cached: &str, elapsed_secs: i64) -> String {
@@ -9348,10 +9318,7 @@ pub(crate) fn try_rotate_exhausted_profile(
                 .get("timestamp_ms")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            let q = val
-                .get("quota_reset_at_ms")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
+            let q = anyagents_harness::quota::recorded_reset_at_ms(&val).unwrap_or(0);
             cleared_ms > 0 && ts > cleared_ms && q > now_ms && now_ms.saturating_sub(ts) < 900_000
         });
     let cur_pct = if post_clear_error {
@@ -10021,6 +9988,18 @@ fn archetype_search_roots_for_owner(
             data_dir.to_path_buf(),
             PathBuf::from(".agents/agents"),
         );
+        // The data directory's `AGENTS.md` may link into the shared rules
+        // repository; that repository's catalog sits beside the file it names.
+        if let Some(rules_root) = std::fs::canonicalize(data_dir.join("AGENTS.md"))
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+        {
+            push_unique_search_root(
+                &mut search_roots,
+                rules_root,
+                PathBuf::from(".agents/agents"),
+            );
+        }
     }
     push_unique_search_root(
         &mut search_roots,
@@ -16113,6 +16092,63 @@ Connection: close
             std::env::remove_var("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL");
         }
     }
+    /// A worker in a repository without a role catalog still gets the shared
+    /// rules repository's template when the data directory's `AGENTS.md`
+    /// links into it, never the built-in fallback.
+    #[cfg(unix)]
+    #[test]
+    fn archetype_lookup_follows_the_data_dir_agents_md_into_its_rules_repo() {
+        let dir = crate::test_tempdir();
+        let rules = dir.path().join("rules-repo");
+        let data_dir = dir.path().join("data");
+        let parent_wd = dir.path().join("product-repo/parent");
+        let child_wd = dir.path().join("product-repo/child");
+        for path in [
+            rules.join(".agents/agents"),
+            data_dir.clone(),
+            parent_wd.clone(),
+            child_wd.clone(),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(rules.join("AGENTS.md"), "# Rules\n").unwrap();
+        std::fs::write(
+            rules.join(".agents/agents/general.md"),
+            "---\ndescription: Default worker\nharness: codex\nmodel: worker-model\n---\nShared worker template.\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(rules.join("AGENTS.md"), data_dir.join("AGENTS.md")).unwrap();
+
+        let tpl = resolve_archetype_template_with_ancestors(
+            "general",
+            Some(&child_wd),
+            std::slice::from_ref(&parent_wd),
+            &data_dir,
+        )
+        .unwrap()
+        .expect("general template");
+        assert_eq!(tpl.harness.as_deref(), Some("codex"));
+        assert_eq!(tpl.model.as_deref(), Some("worker-model"));
+        assert!(tpl.body.contains("Shared worker template."));
+
+        // A workspace with its own catalog keeps precedence over the rules repo.
+        std::fs::create_dir_all(child_wd.join(".agents/agents")).unwrap();
+        std::fs::write(
+            child_wd.join(".agents/agents/general.md"),
+            "---\ndescription: Local worker\nharness: claude-code\n---\nLocal template.\n",
+        )
+        .unwrap();
+        let tpl = resolve_archetype_template_with_ancestors(
+            "general",
+            Some(&child_wd),
+            &[parent_wd],
+            &data_dir,
+        )
+        .unwrap()
+        .expect("general template");
+        assert_eq!(tpl.harness.as_deref(), Some("claude-code"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn archetype_lookup_allows_symlinked_trusted_base_roots_and_blocks_relative_escapes() {

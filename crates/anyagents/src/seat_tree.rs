@@ -1489,6 +1489,115 @@ pub(super) fn share_config(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     )
 }
 
+/// Give the runtime directory at `path` exactly `mode`, never through a
+/// symbolic link. A directory its seat created only that owner may chmod, so
+/// the owner makes the change through the seat helper on the opened inode.
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "mode_t is u16 on macOS and u32 on Linux"
+)]
+pub(crate) fn set_runtime_dir_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::fd::AsFd as _;
+    let absolute = std::path::absolute(path)?;
+    // The config directory is the daemon's own path, which may run through
+    // links (`/var` is one on macOS); only the runtime directory itself is
+    // never followed.
+    let parent = File::open(
+        absolute
+            .parent()
+            .ok_or_else(|| io::Error::other("runtime directory parent missing"))?,
+    )?;
+    let name = absolute
+        .file_name()
+        .ok_or_else(|| io::Error::other("runtime directory name missing"))?;
+    let directory = open_directory_inode(&parent, name)?;
+    set_dir_mode_with(
+        &directory,
+        mode,
+        super::sandbox::server_uid(),
+        |directory| set_inode(directory.as_fd(), None, mode as libc::mode_t),
+        |directory, uid, gid| {
+            if super::sandbox::is_isolated_test_env()
+                && std::env::var_os("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").is_none()
+            {
+                return Err(io::Error::other("no seat launcher in an isolated test"));
+            }
+            let launcher = super::sandbox::descriptor_launcher()
+                .ok_or_else(|| io::Error::other("no seat descriptor launcher"))?;
+            let mut command = seat_file_command(&launcher, uid, gid, &gid.to_string())?;
+            command
+                .args(["inode", &format!("{mode:o}")])
+                .stdin(directory.try_clone()?);
+            run_seat_command(&mut command, "seat-runtime-dir")
+        },
+    )
+}
+
+/// The directory `name` of `parent` as an inode handle, even when its mode
+/// denies the daemon reading it. A symbolic link is refused.
+fn open_directory_inode(parent: &File, name: &OsStr) -> io::Result<File> {
+    let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
+    #[cfg(target_os = "linux")]
+    let access = libc::O_PATH;
+    #[cfg(not(target_os = "linux"))]
+    let access = libc::O_RDONLY;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+/// `chmod` the opened directory to `mode` unless it already has it. Only an
+/// `EPERM` on a directory a seat owns (neither root's nor `daemon_uid`'s) is
+/// handed to `as_owner(directory, owner uid, owner gid)`; the result is read
+/// back from the inode.
+fn set_dir_mode_with(
+    directory: &File,
+    mode: u32,
+    daemon_uid: u32,
+    chmod: impl FnOnce(&File) -> io::Result<()>,
+    as_owner: impl FnOnce(&File, u32, u32) -> io::Result<()>,
+) -> io::Result<()> {
+    let meta = directory.metadata()?;
+    if !meta.is_dir() {
+        return Err(io::Error::other("runtime path is not a directory"));
+    }
+    if meta.mode() & 0o7777 == mode {
+        return Ok(());
+    }
+    let error = match chmod(directory) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if error.raw_os_error() != Some(libc::EPERM) || meta.uid() == 0 || meta.uid() == daemon_uid {
+        return Err(error);
+    }
+    as_owner(directory, meta.uid(), meta.gid()).map_err(|owner_error| {
+        io::Error::new(
+            owner_error.kind(),
+            format!(
+                "cannot set mode {mode:o} on a runtime directory owned by uid {}: {owner_error}",
+                meta.uid()
+            ),
+        )
+    })?;
+    if directory.metadata()?.mode() & 0o7777 != mode {
+        return Err(io::Error::other(format!(
+            "runtime directory owned by uid {} still lacks mode {mode:o}",
+            meta.uid()
+        )));
+    }
+    Ok(())
+}
+
 fn tighten_private_op_dir(directory: &File, name: &OsStr, uid: u32, gid: u32) -> io::Result<()> {
     use std::os::fd::AsFd as _;
     let op_dir = match open_child(directory, name, true) {
@@ -1645,6 +1754,12 @@ fn share_open(
         }
         let kind = stat.st_mode & libc::S_IFMT;
         if kind == libc::S_IFLNK || kind == libc::S_IFSOCK || kind == libc::S_IFIFO {
+            continue;
+        }
+        // Package stores (pnpm, uv, cargo) hardlink their files into a seat's
+        // runtime trees. Such an inode is shared with its other names, so it
+        // is never granted, and it is no reason to refuse the tree.
+        if access.runtime_tree && kind == libc::S_IFREG && stat.st_nlink != 1 {
             continue;
         }
         if kind != libc::S_IFDIR && kind != libc::S_IFREG {
@@ -2923,6 +3038,155 @@ exec "$@"
                 .unwrap(),
             b"public"
         );
+    }
+
+    fn runtime_dir(mode: u32) -> (tempfile::TempDir, PathBuf, File) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = crate::test_tempdir();
+        let dir = temp.path().join("config/data-home");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        let parent = File::open(dir.parent().unwrap()).unwrap();
+        let opened = open_directory_inode(&parent, OsStr::new("data-home")).unwrap();
+        (temp, dir, opened)
+    }
+
+    fn eperm(_: &File) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::EPERM))
+    }
+
+    /// A runtime directory the seat created refuses the daemon's chmod with
+    /// `EPERM`; its owner then makes the change, and the mode is read back.
+    #[test]
+    fn a_seat_owned_runtime_dir_takes_its_mode_from_its_owner_after_eperm() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_temp, dir, opened) = runtime_dir(0o700);
+        let owner = dir.metadata().unwrap();
+        let daemon = owner.uid().wrapping_add(1);
+        let mut asked = None;
+        set_dir_mode_with(&opened, 0o1777, daemon, eperm, |inode, uid, gid| {
+            asked = Some((uid, gid));
+            set_inode(std::os::fd::AsFd::as_fd(inode), None, 0o1777)
+        })
+        .unwrap();
+        assert_eq!(asked, Some((owner.uid(), owner.gid())));
+        assert_eq!(
+            dir.metadata().unwrap().permissions().mode() & 0o7777,
+            0o1777
+        );
+
+        // Already shared: nothing is changed and nobody is asked.
+        set_dir_mode_with(
+            &opened,
+            0o1777,
+            daemon,
+            |_| panic!("chmod of a directory that has its mode"),
+            |_, _, _| panic!("owner asked for a directory that has its mode"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_runtime_dir_refuses_when_its_owner_cannot_or_must_not_change_it() {
+        let (_temp, dir, opened) = runtime_dir(0o700);
+        let owner = dir.metadata().unwrap().uid();
+
+        let error = set_dir_mode_with(&opened, 0o1777, owner.wrapping_add(1), eperm, |_, _, _| {
+            Err(io::Error::other("launcher refused"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("launcher refused"), "{error}");
+        assert!(
+            error.to_string().contains(&format!("uid {owner}")),
+            "{error}"
+        );
+
+        let error = set_dir_mode_with(&opened, 0o1777, owner.wrapping_add(1), eperm, |_, _, _| {
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("still lacks mode"), "{error}");
+
+        // The daemon's own directory is never handed to anyone else.
+        let error = set_dir_mode_with(&opened, 0o1777, owner, eperm, |_, _, _| {
+            panic!("the daemon's own directory was delegated")
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+
+        // Any other failure is reported as it is.
+        let error = set_dir_mode_with(
+            &opened,
+            0o1777,
+            owner.wrapping_add(1),
+            |_| Err(io::Error::from_raw_os_error(libc::EROFS)),
+            |_, _, _| panic!("a non-EPERM failure was delegated"),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EROFS));
+    }
+
+    #[test]
+    fn set_runtime_dir_mode_repairs_a_directory_and_never_follows_a_link() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (temp, dir, _) = runtime_dir(0o700);
+        set_runtime_dir_mode(&dir, 0o1777).unwrap();
+        assert_eq!(
+            dir.metadata().unwrap().permissions().mode() & 0o7777,
+            0o1777
+        );
+
+        // The config path may run through a linked ancestor (`/var` on
+        // macOS); only the runtime directory itself is never followed.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let linked_root = temp.path().join("linked-root");
+        std::os::unix::fs::symlink(temp.path().join("config"), &linked_root).unwrap();
+        set_runtime_dir_mode(&linked_root.join("data-home"), 0o1777).unwrap();
+        assert_eq!(
+            dir.metadata().unwrap().permissions().mode() & 0o7777,
+            0o1777
+        );
+
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = temp.path().join("config/state-home");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(set_runtime_dir_mode(&link, 0o1777).is_err());
+        assert_eq!(
+            outside.metadata().unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+    }
+
+    /// pnpm hardlinks its store into `data-home`; the walk leaves such shared
+    /// inodes alone instead of refusing the whole config.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_sharing_skips_hardlinked_package_store_files_in_runtime_trees() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = crate::test_tempdir();
+        let config = temp.path().join("config");
+        let store = config.join("data-home/pnpm/store/v10/files/00");
+        std::fs::create_dir_all(&store).unwrap();
+        let linked = store.join("abc-index.json");
+        std::fs::write(&linked, b"{}").unwrap();
+        std::fs::set_permissions(&linked, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let other_name = temp.path().join("node_modules-copy.json");
+        std::fs::hard_link(&linked, &other_name).unwrap();
+        let single = store.join("single.json");
+        std::fs::write(&single, b"{}").unwrap();
+        std::fs::set_permissions(&single, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let me = super::super::sandbox::server_uid();
+        let gid = super::super::sandbox::server_gid();
+        share_config(&config, me, gid).unwrap();
+
+        let shared = linked.metadata().unwrap();
+        assert_eq!(shared.nlink(), 2);
+        assert_eq!(shared.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(std::fs::read(&other_name).unwrap(), b"{}");
+        assert_eq!(single.metadata().unwrap().gid(), gid);
     }
 }
 
