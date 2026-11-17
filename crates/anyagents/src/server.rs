@@ -17774,14 +17774,12 @@ exec '{}' "$@"
             let dir = crate::test_tempdir();
             let mut state = archetype_validation_state(dir.path());
             let launches = Arc::new(AtomicUsize::new(0));
-            let healthy = Arc::new(AtomicBool::new(false));
             let active = Arc::new(AtomicUsize::new(0));
             let max_concurrent = Arc::new(AtomicUsize::new(0));
             let delivered = Arc::new(Mutex::new(Vec::<(usize, String)>::new()));
 
-            let (launches_l, healthy_l, active_l, max_l, delivered_l) = (
+            let (launches_l, active_l, max_l, delivered_l) = (
                 Arc::clone(&launches),
-                Arc::clone(&healthy),
                 Arc::clone(&active),
                 Arc::clone(&max_concurrent),
                 Arc::clone(&delivered),
@@ -17789,11 +17787,16 @@ exec '{}' "$@"
             let sup = anyagents_supervisor::Supervisor::start(
                 Arc::clone(&state.store),
                 Arc::new(anyagents_supervisor::SystemClock::new()),
-                Arc::new(move |_| {
+                Arc::new(move |request: anyagents_supervisor::LaunchRequest| {
                     let gen_no = launches_l.fetch_add(1, Ordering::SeqCst) + 1;
                     // Until the wake, every process the worker starts is
                     // already gone: it waits out its backoff holding the lock.
-                    let alive = healthy_l.load(Ordering::SeqCst);
+                    // The wake writes this marker only after it retired that
+                    // worker, so every later launch is healthy.
+                    let alive = request
+                        .config_dir
+                        .join(".anyagents-profile-rotated-ms")
+                        .exists();
                     if alive {
                         let cur = active_l.fetch_add(1, Ordering::SeqCst) + 1;
                         max_l.fetch_max(cur, Ordering::SeqCst);
@@ -17870,7 +17873,7 @@ exec '{}' "$@"
             assert_eq!(woken.block_reason, None);
             assert_eq!(woken.last_error, None);
             assert!(!cfg.join(".anyagents-last-error.json").exists());
-            healthy.store(true, Ordering::SeqCst);
+            assert!(cfg.join(".anyagents-profile-rotated-ms").exists());
 
             state
                 .store
@@ -17885,7 +17888,11 @@ exec '{}' "$@"
             {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "replacement generation never delivered post-wake mail"
+                    "replacement generation never delivered post-wake mail: launches={} \
+                     (dead before wake: {dead_generations}), state={}, live={:?}",
+                    launches.load(Ordering::SeqCst),
+                    state.store.agent(&running.id).unwrap().state,
+                    sup.live(&running.id),
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }

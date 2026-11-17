@@ -1499,7 +1499,10 @@ pub(super) fn share_config(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
 pub(crate) fn set_runtime_dir_mode(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::fd::AsFd as _;
     let absolute = std::path::absolute(path)?;
-    let parent = open_root(
+    // The config directory is the daemon's own path, which may run through
+    // links (`/var` is one on macOS); only the runtime directory itself is
+    // never followed.
+    let parent = File::open(
         absolute
             .parent()
             .ok_or_else(|| io::Error::other("runtime directory parent missing"))?,
@@ -3043,7 +3046,7 @@ exec "$@"
         let dir = temp.path().join("config/data-home");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
-        let parent = open_root(dir.parent().unwrap()).unwrap();
+        let parent = File::open(dir.parent().unwrap()).unwrap();
         let opened = open_directory_inode(&parent, OsStr::new("data-home")).unwrap();
         (temp, dir, opened)
     }
@@ -3128,6 +3131,17 @@ exec "$@"
         use std::os::unix::fs::PermissionsExt as _;
         let (temp, dir, _) = runtime_dir(0o700);
         set_runtime_dir_mode(&dir, 0o1777).unwrap();
+        assert_eq!(
+            dir.metadata().unwrap().permissions().mode() & 0o7777,
+            0o1777
+        );
+
+        // The config path may run through a linked ancestor (`/var` on
+        // macOS); only the runtime directory itself is never followed.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let linked_root = temp.path().join("linked-root");
+        std::os::unix::fs::symlink(temp.path().join("config"), &linked_root).unwrap();
+        set_runtime_dir_mode(&linked_root.join("data-home"), 0o1777).unwrap();
         assert_eq!(
             dir.metadata().unwrap().permissions().mode() & 0o7777,
             0o1777
