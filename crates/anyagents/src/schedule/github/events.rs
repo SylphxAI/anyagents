@@ -361,7 +361,7 @@ mod tests {
                 Ok(Response {
                     status: 200,
                     headers: HashMap::new(),
-                    body: serde_json::to_vec(&body).unwrap(),
+                    body: body.to_string(),
                 })
             },
             || 10,

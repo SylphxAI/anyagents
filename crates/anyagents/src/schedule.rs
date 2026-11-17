@@ -3475,7 +3475,7 @@ mod tests {
     fn signed_github_events_wake_each_selected_schedule_without_waiting_for_rest() {
         use axum::http::{HeaderMap, HeaderValue};
         use serde_json::json;
-        let _env_guard = crate::test_env::env_lock();
+        let _env_guard = crate::server::tests::env_lock();
         github::reset_probes_for_test();
         struct Reset;
         impl Drop for Reset {
@@ -3484,22 +3484,16 @@ mod tests {
             }
         }
         let _reset = Reset;
-        let tmp = crate::test_env::test_tempdir("anyagents-signed-github-schedules-").unwrap();
-        let store = Store::open(tmp.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
         let health = HealthBoard::default();
-        let now = now_ms();
+        let now = anyagents_core::now_ms();
         let mut agents = Vec::new();
-        let mut schedules = Vec::new();
         for (name, check) in [("build-a", "build"), ("build-b", "build"), ("lint", "lint")] {
-            let agent = store
-                .create_agent(NewAgent {
-                    name: name.into(),
-                    role: "general".into(),
-                    ..Default::default()
-                })
-                .unwrap();
+            let agent = store.create_agent(NewAgent::new(name, "codex")).unwrap();
+            store.set_agent_running(&agent.id, "/work").unwrap();
             let watch = format!("github:check:org/repo@7#{check}");
-            let schedule = create_agent_schedule(
+            create_agent_schedule(
                 &store,
                 &health,
                 &agent,
@@ -3510,7 +3504,6 @@ mod tests {
             )
             .unwrap();
             agents.push(agent);
-            schedules.push(schedule);
         }
         let watches = store.list_schedules(None, true).unwrap();
         let targets: Vec<_> = watches
@@ -3518,6 +3511,8 @@ mod tests {
             .map(|s| (s.id.as_str(), parse_watch_spec(&s.spec).unwrap()))
             .collect();
         github::begin_cycle(targets.iter().map(|(id, t)| (*id, t)), now);
+        let build_target = parse_watch_spec("github:check:org/repo@7#build").unwrap();
+        let lint_target = parse_watch_spec("github:check:org/repo@7#lint").unwrap();
         let receive = |name: &str, status: &str, delivery: &str, at: i64| {
             let body = serde_json::to_vec(&json!({
                 "repository":{"full_name":"ORG/repo"},
@@ -3554,37 +3549,32 @@ mod tests {
             |at| github::with_completion_clock(at, || tick_schedules_once(&store, &health, at));
         assert_eq!(tick(now), 0);
         assert!(receive("build", "completed", "build-done", now + 1));
-        assert_eq!(github::next_probe_at(&targets[0].1), Some(0));
+        assert_eq!(github::next_probe_at(&build_target), Some(0));
+        assert_ne!(github::next_probe_at(&lint_target), Some(0));
         assert_eq!(tick(now + 1), 2);
         for agent in &agents[..2] {
-            let pending = store.pending_wakes(&agent.id).unwrap();
+            let pending = store.inbox(&agent.id, None).unwrap();
             assert_eq!(pending.len(), 1);
-            assert!(pending[0].text.contains("transition=checks_completed]"));
+            assert_eq!(pending[0].text, "report selected completion");
+            assert!(
+                store
+                    .list_schedules(Some(&agent.id), true)
+                    .unwrap()
+                    .is_empty()
+            );
+            let retired = &store.list_schedules(Some(&agent.id), false).unwrap()[0];
+            assert_eq!(retired.state, "fired");
+            assert_eq!(retired.last_observed.as_deref(), Some("checks_completed"));
         }
-        assert!(store.pending_wakes(&agents[2].id).unwrap().is_empty());
+        assert!(store.inbox(&agents[2].id, None).unwrap().is_empty());
         assert!(!receive("build", "completed", "build-done", now + 2));
         assert!(!receive("build", "completed", "same-observation", now + 2));
         assert_eq!(tick(now + 2), 0);
-        assert!(
-            !store
-                .get_schedule(&schedules[0].id)
-                .unwrap()
-                .unwrap()
-                .active
-        );
-        assert!(
-            !store
-                .get_schedule(&schedules[1].id)
-                .unwrap()
-                .unwrap()
-                .active
-        );
-        assert!(
-            store
-                .get_schedule(&schedules[2].id)
-                .unwrap()
-                .unwrap()
-                .active
+        let lint_active = store.list_schedules(Some(&agents[2].id), true).unwrap();
+        assert_eq!(lint_active.len(), 1);
+        assert_eq!(
+            lint_active[0].last_observed.as_deref(),
+            Some("checks_in_progress")
         );
     }
 
