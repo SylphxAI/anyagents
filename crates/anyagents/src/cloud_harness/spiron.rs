@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const HARNESS: &str = "spiron-cloud";
-const TURN_BUDGET: Duration = Duration::from_secs(1800);
+const TURN_BUDGET: Duration = crate::remote::LONGEST_TURN;
 
 #[derive(Serialize, Deserialize)]
 struct Pending {
@@ -110,7 +110,7 @@ impl Api {
     fn new(config: &Path) -> Self {
         Self {
             client: ureq::Agent::config_builder()
-                .timeout_global(Some(Duration::from_secs(30)))
+                .timeout_global(Some(crate::remote::REQUEST_MARGIN))
                 .http_status_as_error(false)
                 .build()
                 .into(),
