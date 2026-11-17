@@ -5909,12 +5909,9 @@ fn sync_and_list_provider_profiles_inner(
             if seeded.is_some() && bound.is_some() && seeded != bound {
                 continue;
             }
-            let prof_name = bound
-                .and_then(|b| {
-                    let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
-                    (!p.is_empty()).then_some(p)
-                })
-                .unwrap_or_else(|| "default".to_string());
+            let Some(prof_name) = bound_profile_of_provider(&cfg, &provider) else {
+                continue;
+            };
             let profile_dir = profiles_root.join(&provider).join(&prof_name);
             match provider.as_str() {
                 "anthropic" => {
@@ -6240,12 +6237,9 @@ fn rebalance_provider_profiles(
                 continue;
             }
             let cfg = agent_config_dir(data, &a.id);
-            let prof_name = bound_profile_name(&cfg)
-                .and_then(|b| {
-                    let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
-                    (!p.is_empty()).then_some(p)
-                })
-                .unwrap_or_else(|| "default".to_string());
+            let Some(prof_name) = bound_profile_of_provider(&cfg, &provider) else {
+                continue;
+            };
             bound.entry(prof_name).or_default().push(a.name.clone());
         }
         // Working seats still contribute load, but automatic maintenance must
@@ -6397,12 +6391,9 @@ pub(crate) fn record_profile_quota_reset(data: &Path, agent: &Agent, reset_at_ms
         return;
     }
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-    let prof_name = bound_profile_name(&cfg)
-        .and_then(|b| {
-            let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
-            (!p.is_empty()).then_some(p)
-        })
-        .unwrap_or_else(|| "default".to_string());
+    let Some(prof_name) = bound_profile_of_provider(&cfg, &provider) else {
+        return;
+    };
     let profile_dir = data.join("profiles").join(&provider).join(&prof_name);
     if profile_dir.is_dir() {
         let marker = profile_dir.join(".anyagents-quota-reset-ms");
@@ -6500,8 +6491,11 @@ fn overlay_active_quota_reset_on_cached_usage(
     let eta = format_reset_eta_epoch_ms(reset_ms)
         .map(|e| format!(" ↻{e}"))
         .unwrap_or_default();
-    let zero_5h = format!("5h: 0% left{eta}");
+    // A reading with a 5h window shows the hit as that window run out. A plan
+    // without one (Ultra has only a weekly window) gets no invented 5h window:
+    // the hit is stated as an active limit beside the windows it does report.
     if cached_advanced.starts_with("5h:") {
+        let zero_5h = format!("5h: 0% left{eta}");
         if let Some((_, rest)) = cached_advanced.split_once(" · ") {
             return format!("{zero_5h} · {rest}");
         }
@@ -6511,14 +6505,19 @@ fn overlay_active_quota_reset_on_cached_usage(
             .unwrap_or_default();
         return format!("{zero_5h}{tier_suffix}");
     }
+    let limited = format!("{USAGE_LIMITED_PREFIX}{eta}");
     if cached_advanced.is_empty() {
-        zero_5h
+        limited
     } else if cached_advanced.starts_with('(') {
-        format!("{zero_5h} {cached_advanced}")
+        format!("{limited} {cached_advanced}")
     } else {
-        format!("{zero_5h} · {cached_advanced}")
+        format!("{limited} · {cached_advanced}")
     }
 }
+
+/// Leads a usage reading whose profile is rate limited outside any window the
+/// reading reports; such a reading has no capacity left until the limit lifts.
+pub(crate) const USAGE_LIMITED_PREFIX: &str = "limited";
 
 pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
     if let Ok(store) = Store::open(data.join("state.db")) {
@@ -6566,13 +6565,10 @@ pub(crate) fn sync_fresher_bound_agent_credentials_in(store: &Store, data: &Path
             let bound = bound_profile_name(&cfg);
             let seeded = seeded_profile_name(&cfg);
             let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-            let prof_name = bound
-                .clone()
-                .and_then(|b| {
-                    let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
-                    (!p.is_empty()).then_some(p)
-                })
-                .unwrap_or_else(|| "default".to_string());
+            let Some(prof_name) = bound_profile_of_provider(&cfg, &provider) else {
+                ensure_agy_mcp_config(store, data, agent, &[], &cfg);
+                continue;
+            };
             let profile_dir = profiles_root.join(&provider).join(&prof_name);
             ensure_agy_mcp_config(store, data, agent, std::slice::from_ref(&profile_dir), &cfg);
             if seeded.is_some() && bound.is_some() && seeded != bound {
@@ -6872,13 +6868,22 @@ fn extract_jwt_sub_tail(jwt: &str) -> Option<String> {
     Some(sub.split('|').next_back().unwrap_or(sub).to_string())
 }
 
+/// The plan badge of an Anthropic subscription. Ultra is named by either its
+/// organization type (`claude_ultra`) or its rate-limit tier
+/// (`default_claude_ultra*`), and wins over a Max tier an upgrade left behind.
 fn anthropic_tier_label(sub_type: Option<&str>, rate_tier: Option<&str>) -> Option<&'static str> {
-    match rate_tier.unwrap_or("") {
-        "default_claude_max_20x" => return Some("max 20x"),
-        "default_claude_max_5x" => return Some("max 5x"),
-        _ => {}
+    let sub_type = sub_type.unwrap_or("");
+    let rate_tier = rate_tier.unwrap_or("");
+    if sub_type.contains("ultra") || rate_tier.contains("ultra") {
+        return Some("ultra");
     }
-    match sub_type.unwrap_or("") {
+    if rate_tier.contains("max_20x") {
+        return Some("max 20x");
+    }
+    if rate_tier.contains("max_5x") {
+        return Some("max 5x");
+    }
+    match sub_type {
         "max" | "claude_max" => Some("max"),
         "pro" | "claude_pro" => Some("pro"),
         "team" | "claude_team" => Some("team"),
@@ -6932,6 +6937,7 @@ fn sync_anthropic_profile_metadata(
             .pointer("/organization/organization_type")
             .and_then(serde_json::Value::as_str);
         let mapped_sub = match org_type {
+            Some(t) if t.contains("ultra") => Some("ultra"),
             Some("claude_max") => Some("max"),
             Some("claude_pro") => Some("pro"),
             Some("claude_team") => Some("team"),
@@ -7255,6 +7261,11 @@ pub(crate) fn probe_one_profile_usage(
     profile: &str,
 ) -> Option<String> {
     let prof_dir = data.join("profiles").join(provider).join(profile);
+    // A probe records its reading inside the profile; a profile that does not
+    // exist has no reading, and recording one would create it.
+    if !prof_dir.is_dir() {
+        return None;
+    }
     let last_usage_path = prof_dir.join(".anyagents-last-usage.txt");
     let now_ms = anyagents_core::now_ms();
     if provider != "anthropic"
@@ -7345,13 +7356,7 @@ pub(crate) fn probe_one_profile_usage(
                                 .pointer("/claudeAiOauth/subscriptionType")
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("");
-                            let badge = if tier.contains("20x") {
-                                "max 20x"
-                            } else if tier.contains("5x") {
-                                "max 5x"
-                            } else {
-                                sub
-                            };
+                            let badge = anthropic_tier_label(Some(sub), Some(tier)).unwrap_or(sub);
                             let base = if badge.is_empty() {
                                 String::new()
                             } else {
@@ -8498,7 +8503,7 @@ pub(crate) fn probe_one_profile_usage(
 }
 
 pub(crate) fn parse_remaining_pct_from_usage(usage: &str, model: Option<&str>) -> Option<i64> {
-    if usage.starts_with("oauth expired") {
+    if usage.starts_with("oauth expired") || usage.starts_with(USAGE_LIMITED_PREFIX) {
         return Some(0);
     }
     let extract_after = |label: &str| -> Option<i64> {
@@ -9056,12 +9061,7 @@ pub(crate) fn try_rotate_exhausted_profile(
     let cfg = agent_config_dir(data, &agent.id);
     let now_ms = anyagents_core::now_ms();
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-    let current_prof = bound_profile_name(&cfg)
-        .and_then(|b| {
-            let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
-            (!p.is_empty()).then_some(p)
-        })
-        .unwrap_or_else(|| "default".to_string());
+    let current_prof = bound_profile_of_provider(&cfg, &provider)?;
     let prof_dir = data.join("profiles").join(&provider).join(&current_prof);
     let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
         .ok()
@@ -9204,7 +9204,7 @@ pub(crate) fn compatible_harnesses_for(provider_or_harness: &str) -> &'static [&
         }
         "codex" | "openai-cloud" | "openai" => &["openai", "codex", "openai-cloud"],
         "cursor-cloud" | "cursor" => &["cursor", "cursor-cloud"],
-        "agy" | "google" => &["google", "agy"],
+        "agy" | "google" | "google-antigravity" => &["google-antigravity", "google", "agy"],
         "grok" | "xai" => &["xai", "grok"],
         _ => &[],
     }
@@ -9261,6 +9261,29 @@ pub(crate) fn bound_profile_name(config_dir: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// The profile of `provider` a seat's binding names: `default` for an unbound
+/// seat, and `None` for a binding to another provider's profile. A seat whose
+/// model moved from `google-antigravity/...` to `sylphx/...` keeps its old
+/// binding until it is rebound; that name is an account of the old provider,
+/// never a profile under the new one.
+pub(crate) fn bound_profile_of_provider(config_dir: &Path, provider: &str) -> Option<String> {
+    let Some(bound) = bound_profile_name(config_dir) else {
+        return Some("default".to_string());
+    };
+    let name = match bound.split_once('/') {
+        Some((bound_provider, name)) => {
+            if bound_provider != provider
+                && !compatible_harnesses_for(provider).contains(&bound_provider)
+            {
+                return None;
+            }
+            name
+        }
+        None => bound.as_str(),
+    };
+    Some(if name.is_empty() { "default" } else { name }.to_string())
 }
 
 const PROFILE_HEALTHY_USAGE_FRESHNESS_MS: i64 = 65_000;
@@ -13160,6 +13183,153 @@ stderr: {}",
             "expected 7d tail preserved, got: {overlaid}"
         );
         assert_eq!(parse_remaining_pct_from_usage(&overlaid, None), Some(0));
+    }
+
+    #[test]
+    fn overlay_active_quota_reset_never_invents_a_5h_window_for_a_weekly_only_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prof_dir = tmp.path();
+        let usage_path = prof_dir.join(".anyagents-last-usage.txt");
+        let cached = "7d: 5% left ↻1d22h (ultra)";
+        std::fs::write(&usage_path, format!("{cached}\n")).unwrap();
+        let now_ms = anyagents_core::now_ms();
+        let reset_ms = now_ms + 140 * 60 * 1_000;
+        std::fs::write(
+            prof_dir.join(".anyagents-quota-reset-ms"),
+            format!("{reset_ms}\n"),
+        )
+        .unwrap();
+
+        let overlaid =
+            overlay_active_quota_reset_on_cached_usage(prof_dir, &usage_path, cached, now_ms);
+        assert!(!overlaid.contains("5h:"), "got: {overlaid}");
+        assert!(overlaid.starts_with("limited ↻2h"), "got: {overlaid}");
+        assert!(
+            overlaid.ends_with(" · 7d: 5% left ↻1d22h (ultra)"),
+            "got: {overlaid}"
+        );
+        assert_eq!(parse_remaining_pct_from_usage(&overlaid, None), Some(0));
+
+        for (cached, want) in [("(ultra)", " (ultra)"), ("", "")] {
+            let overlaid =
+                overlay_active_quota_reset_on_cached_usage(prof_dir, &usage_path, cached, now_ms);
+            assert!(!overlaid.contains("5h:"), "got: {overlaid}");
+            assert!(overlaid.starts_with("limited ↻2h"), "got: {overlaid}");
+            assert!(overlaid.ends_with(want), "got: {overlaid}");
+        }
+    }
+
+    #[test]
+    fn anthropic_tier_label_names_ultra_over_a_leftover_max_tier() {
+        assert_eq!(anthropic_tier_label(Some("ultra"), None), Some("ultra"));
+        assert_eq!(
+            anthropic_tier_label(Some("claude_ultra"), None),
+            Some("ultra")
+        );
+        assert_eq!(
+            anthropic_tier_label(Some("max"), Some("default_claude_ultra")),
+            Some("ultra")
+        );
+        assert_eq!(
+            anthropic_tier_label(Some("ultra"), Some("default_claude_max_20x")),
+            Some("ultra")
+        );
+        assert_eq!(
+            anthropic_tier_label(Some("max"), Some("default_claude_max_20x")),
+            Some("max 20x")
+        );
+        assert_eq!(
+            anthropic_tier_label(Some("max"), Some("default_claude_max_5x")),
+            Some("max 5x")
+        );
+        assert_eq!(anthropic_tier_label(Some("pro"), None), Some("pro"));
+        assert_eq!(anthropic_tier_label(None, None), None);
+    }
+
+    #[test]
+    fn a_binding_to_another_providers_profile_names_no_profile_of_this_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path();
+        assert_eq!(
+            bound_profile_of_provider(cfg, "sylphx").as_deref(),
+            Some("default")
+        );
+        for (bound, provider, want) in [
+            ("google-antigravity/foo", "sylphx", None),
+            ("anthropic/foo", "sylphx", None),
+            ("sylphx/foo", "anthropic", None),
+            ("sylphx/foo", "sylphx", Some("foo")),
+            ("spiron/foo", "sylphx", Some("foo")),
+            ("claude-code/foo", "anthropic", Some("foo")),
+            ("agy/foo", "google-antigravity", Some("foo")),
+            ("anthropic/", "anthropic", Some("default")),
+            ("foo", "sylphx", Some("foo")),
+        ] {
+            std::fs::write(cfg.join(".anyagents-profile"), format!("{bound}\n")).unwrap();
+            assert_eq!(
+                bound_profile_of_provider(cfg, provider).as_deref(),
+                want,
+                "{bound} under {provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_a_bound_agent_to_sylphx_never_creates_a_sylphx_profile_of_its_old_name() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        std::fs::create_dir_all(data.join("profiles/google-antigravity/foo")).unwrap();
+        std::fs::create_dir_all(data.join("profiles/anthropic/bar")).unwrap();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let opencode =
+            r#"{"provider":{"sylphx":{"options":{"baseURL":"https://gateway.example/v1"}}}}"#;
+        let seat = |name: &str, bound: Option<&str>| {
+            let mut new = anyagents_core::NewAgent::new(name, "spiron");
+            new.model = Some("sylphx/openai/gpt-test".to_string());
+            let agent = store.create_agent(new).unwrap();
+            store.set_agent_state(&agent.id, "running").unwrap();
+            let cfg = agent_config_dir(data, &agent.id);
+            std::fs::create_dir_all(cfg.join(".config/opencode")).unwrap();
+            std::fs::write(cfg.join(".config/opencode/opencode.json"), opencode).unwrap();
+            std::fs::create_dir_all(cfg.join(".gemini/config")).unwrap();
+            std::fs::write(cfg.join(".gemini/config/mcp_config.json"), "").unwrap();
+            if let Some(bound) = bound {
+                std::fs::write(cfg.join(".anyagents-profile"), format!("{bound}\n")).unwrap();
+            }
+            assert_eq!(
+                upstream_provider_of(&agent.harness, agent.model.as_deref()),
+                "sylphx"
+            );
+        };
+        seat("was-agy", Some("google-antigravity/foo"));
+        seat("was-claude", Some("anthropic/bar"));
+        seat("unbound", None);
+
+        let profiles = sync_and_list_provider_profiles_inner(&store, data, false, false);
+        sync_fresher_bound_agent_credentials_in(&store, data);
+
+        assert!(!data.join("profiles/sylphx/foo").exists());
+        assert!(!data.join("profiles/sylphx/bar").exists());
+        assert!(
+            !profiles
+                .iter()
+                .any(|p| p.provider == "sylphx" && p.profile != "default"),
+            "{:?}",
+            profiles
+                .iter()
+                .map(|p| format!("{}/{}", p.provider, p.profile))
+                .collect::<Vec<_>>()
+        );
+        // An unbound Sylphx seat still seeds the provider's default profile.
+        assert!(
+            data.join("profiles/sylphx/default/.config/opencode/opencode.json")
+                .is_file()
+        );
+        // The old providers' profiles are left as they were.
+        assert!(data.join("profiles/google-antigravity/foo").is_dir());
+        assert!(data.join("profiles/anthropic/bar").is_dir());
+        assert_eq!(probe_one_profile_usage(data, "sylphx", "foo"), None);
+        assert!(!data.join("profiles/sylphx/foo").exists());
     }
 
     #[test]

@@ -1453,6 +1453,12 @@ fn parse_profile_usage_columns(kind: &str, usage: Option<&str>) -> (String, Stri
             }
         } else if let Some(amt) = seg.strip_suffix(" left") {
             extra_parts.push(green(amt.trim()));
+        } else if let Some(eta) = seg.strip_prefix(crate::create::USAGE_LIMITED_PREFIX) {
+            extra_parts.push(format!(
+                "{}{}",
+                red(&bold(crate::create::USAGE_LIMITED_PREFIX)),
+                style_usage_suffix(eta, true)
+            ));
         } else if seg == "online (gateway-edge)" {
             extra_parts.push(format!("{} {}", green("online"), dim("(gateway)")));
         } else if let Some((head, tail)) = seg.split_once(" (") {
@@ -1615,6 +1621,24 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_limit_outside_the_reported_windows_shows_in_no_5h_column() {
+        let (plan, five_hour, weekly) = parse_profile_usage_columns(
+            "subscription",
+            Some("limited ↻2h20m · 7d: 5% left ↻1d22h (ultra)"),
+        );
+        assert!(plan.contains("ultra"), "{plan}");
+        assert!(!five_hour.contains('%'), "{five_hour}");
+        assert!(
+            weekly.contains("5%") && weekly.contains("↻1d22h"),
+            "{weekly}"
+        );
+        assert!(
+            weekly.contains("limited") && weekly.contains("↻2h20m"),
+            "{weekly}"
+        );
+    }
 
     #[test]
     fn visible_width_counts_cjk_as_double_width_and_ignores_ansi() {
