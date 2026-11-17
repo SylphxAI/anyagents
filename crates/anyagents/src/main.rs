@@ -19,6 +19,7 @@ mod data;
 mod dsh;
 mod fake_opencode;
 mod gateway;
+mod github_webhook;
 mod grok;
 mod harness_double;
 mod host_memory;
