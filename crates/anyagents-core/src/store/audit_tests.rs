@@ -285,7 +285,7 @@ fn schedule_claim_and_wake_retry_in_state(state: &str) {
             watch_baseline: None,
         })
         .unwrap();
-    let deliver = |store: &Store, target: &AgentId, expected| {
+    let deliver = |store: &Store, schedule: &AgentSchedule, target: &AgentId, expected| {
         let mut incoming = Incoming::new("timerneedle");
         incoming.source_key = Some(format!("{}:100", schedule.id));
         store.claim_schedule_tick_with_wake(
@@ -303,12 +303,34 @@ fn schedule_claim_and_wake_retry_in_state(state: &str) {
     let other = store
         .create_agent(NewAgent::new("wrong-recipient", "test"))
         .unwrap();
-    assert!(!deliver(&store, &other.id, 100).unwrap());
+    assert!(!deliver(&store, &schedule, &other.id, 100).unwrap());
     // Retirement rejects publication; pause only delays normal mailbox delivery.
     store.set_agent_state(&agent.id, "archived").unwrap();
-    assert!(!deliver(&store, &agent.id, 100).unwrap());
+    assert!(!deliver(&store, &schedule, &agent.id, 100).unwrap());
+    let archived = store.get_schedule(&schedule.id).unwrap().unwrap();
+    assert_eq!(archived.state, "cancelled");
+    assert_eq!(archived.next_fire_at_ms, None);
     store.set_agent_state(&agent.id, state).unwrap();
-    assert!(!deliver(&store, &agent.id, 99).unwrap());
+    // A revived owner does not rearm its archived schedule, even for the old due time.
+    assert!(!deliver(&store, &schedule, &agent.id, 100).unwrap());
+    assert_eq!(
+        store.get_schedule(&schedule.id).unwrap().unwrap().state,
+        "cancelled"
+    );
+    // Archival is permanent, so mailbox rollback uses a fresh active schedule.
+    let retry_schedule = store
+        .create_schedule(NewSchedule {
+            agent_id: agent.id.clone(),
+            kind: "at".into(),
+            spec: "2m".into(),
+            prompt: "timerneedle".into(),
+            interval_ms: None,
+            next_fire_at_ms: Some(100),
+            watch_baseline: None,
+        })
+        .unwrap();
+    // An active schedule also rejects a stale expected due time.
+    assert!(!deliver(&store, &retry_schedule, &agent.id, 99).unwrap());
     // A failing mailbox write rolls the claim back with it.
     store
         .conn()
@@ -318,7 +340,7 @@ fn schedule_claim_and_wake_retry_in_state(state: &str) {
         )
         .unwrap();
     assert_fault(
-        deliver(&store, &agent.id, 100).unwrap_err(),
+        deliver(&store, &retry_schedule, &agent.id, 100).unwrap_err(),
         "fixture-mail-write",
     );
     let pending = store.list_schedules(Some(&agent.id), true).unwrap();
@@ -331,8 +353,8 @@ fn schedule_claim_and_wake_retry_in_state(state: &str) {
         .conn()
         .execute_batch("DROP TRIGGER reject_mail")
         .unwrap();
-    assert!(deliver(&store, &agent.id, 100).unwrap());
-    assert!(!deliver(&store, &agent.id, 100).unwrap());
+    assert!(deliver(&store, &retry_schedule, &agent.id, 100).unwrap());
+    assert!(!deliver(&store, &retry_schedule, &agent.id, 100).unwrap());
     drop(store);
     let store = Store::open(dir.path().join("custom-mailbox.sqlite")).unwrap();
     assert!(

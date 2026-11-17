@@ -364,7 +364,7 @@ impl Store {
                  SET pending_since_ms = COALESCE(pending_since_ms, ?2),
                      pending_count = pending_count + 1,
                      next_fire_at_ms = ?3
-                 WHERE id = ?1 AND next_fire_at_ms = ?2",
+                 WHERE id = ?1 AND next_fire_at_ms = ?2 AND state = 'active'",
                 params![schedule_id, due_ms, next_fire_at_ms],
             )?;
             if updated == 0 {
@@ -394,12 +394,21 @@ impl Store {
     }
 
     /// Take and clear the coalesced ticks of `schedule_id` (one delivery covers
-    /// them all). `None` when nothing is pending.
+    /// them all). `None` when nothing is pending or the schedule was cancelled.
+    /// Cancelled ticks remain available through `schedule_pending` as history.
     pub fn take_schedule_pending(
         &self,
         schedule_id: &str,
     ) -> Result<Option<SchedulePending>, Error> {
         self.lifecycle_write(|tx| {
+            let cancelled: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_schedules WHERE id = ?1 AND state = 'cancelled')",
+                [schedule_id],
+                |row| row.get(0),
+            )?;
+            if cancelled {
+                return Ok(None);
+            }
             let pending = pending_of(tx, schedule_id)?;
             if pending.is_some() {
                 tx.execute(

@@ -41,6 +41,10 @@ mod runtime;
 #[cfg(test)]
 #[path = "store/runtime_tests.rs"]
 mod runtime_tests;
+#[cfg(test)]
+#[path = "store/schedule_archive_tests.rs"]
+mod schedule_archive_tests;
+
 mod server_ops;
 mod steer_ops;
 pub use mail_notices::SYSTEM_SENDER;
@@ -69,6 +73,17 @@ pub use runtime::{
     TurnOutcome, TurnState,
 };
 pub use turn_errors::{ErroredTurn, MAX_ERRORED_TURNS, TurnErrors, is_session_turn_error};
+
+/// Run in the owner's archive transaction, never in a second Store write.
+/// Cancelled history and coalesced counts remain available for inspection.
+fn cancel_archived_schedules(conn: &Connection, id: &AgentId) -> Result<(), Error> {
+    conn.execute(
+        "UPDATE agent_schedules SET state = 'cancelled', next_fire_at_ms = NULL
+         WHERE agent_id = ?1 AND state = 'active'",
+        [id.as_str()],
+    )?;
+    Ok(())
+}
 
 /// A line's provider coordinates: the chat, the forum topic and the message id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -3015,6 +3030,8 @@ impl Store {
             }
             if state == "running" {
                 turn_errors::clear_parking(tx, id)?;
+            } else if state == "archived" {
+                cancel_archived_schedules(tx, id)?;
             }
             agent_by_id(tx, id)
         })?;
@@ -3169,6 +3186,7 @@ impl Store {
                     "agent {id} was admitted; its name is not a failed reservation"
                 )));
             }
+            cancel_archived_schedules(tx, id)?;
             agent_by_id(tx, id)
         })?;
         self.notify(Wake::Agent {
@@ -5432,7 +5450,13 @@ impl Store {
         }
         let id = format!("sch_{:012x}{}", now, hex(&rand_bytes));
         self.write_tx(|tx| {
-            agent_exists(tx, &input.agent_id)?;
+            let owner = agent_by_id(tx, &input.agent_id)?;
+            if owner.state == "archived" {
+                return Err(Error::Precondition {
+                    machine: "schedule",
+                    reason: format!("agent {} is archived", input.agent_id),
+                });
+            }
             // Deduplicate identical active recurring/watch schedules for the same agent.
             if (input.kind == "every" || input.kind == "watch")
                 && let Some(existing_id) = tx
@@ -5689,6 +5713,9 @@ impl Store {
                      watch_baseline = 'checks_completed'
                  WHERE kind = 'watch'
                    AND state = 'fired'
+                   AND EXISTS (SELECT 1 FROM agents a
+                               WHERE a.id = agent_schedules.agent_id
+                                 AND a.state <> 'archived')
                    AND last_observed = 'checks_completed'
                    AND (
                        spec LIKE 'github:pr:%'
