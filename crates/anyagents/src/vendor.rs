@@ -948,7 +948,7 @@ pub fn read_persisted_last_error(config_dir: &Path) -> Option<(Option<String>, O
         .get("error")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let reset = val.get("quota_reset_at_ms").and_then(|v| v.as_i64());
+    let reset = anyagents_harness::quota::recorded_reset_at_ms(&val);
     Some((err, reset))
 }
 

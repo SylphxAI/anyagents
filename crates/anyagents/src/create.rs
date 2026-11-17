@@ -1339,12 +1339,10 @@ pub(crate) fn ensure_seat_environment(target_config: &Path, workdir: &Path) -> R
     for subdir in ["tmp", "data-home", "cache-home", "state-home"] {
         let dir = target_config.join(subdir);
         std::fs::create_dir_all(&dir)?;
+        // Shared runtime trees must not permit peers to unlink each other's
+        // entries. One the agent's seat created only that seat may chmod.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            // Shared runtime trees must not permit peers to unlink each other's entries.
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
-        }
+        crate::seat_tree::set_runtime_dir_mode(&dir, 0o1777)?;
     }
     crate::repo::configure_seat_git(target_config, workdir)?;
     #[cfg(unix)]
@@ -6419,35 +6417,7 @@ pub(crate) fn record_profile_quota_reset(data: &Path, agent: &Agent, reset_at_ms
 }
 
 fn parse_reset_eta_secs(eta: &str) -> Option<i64> {
-    let mut total = 0i64;
-    let mut num = 0i64;
-    let mut has_digit = false;
-    let mut matched_any = false;
-    for ch in eta.trim().chars() {
-        if let Some(d) = ch.to_digit(10) {
-            num = num.saturating_mul(10).saturating_add(d as i64);
-            has_digit = true;
-        } else {
-            if !has_digit {
-                return None;
-            }
-            let mult = match ch {
-                'd' => 86_400,
-                'h' => 3_600,
-                'm' => 60,
-                's' => 1,
-                _ => return None,
-            };
-            total = total.saturating_add(num.saturating_mul(mult));
-            num = 0;
-            has_digit = false;
-            matched_any = true;
-        }
-    }
-    if has_digit || !matched_any {
-        return None;
-    }
-    Some(total)
+    anyagents_harness::quota::parse_duration_ms(eta.trim()).map(|ms| ms / 1_000)
 }
 
 fn advance_cached_usage_etas(cached: &str, elapsed_secs: i64) -> String {
@@ -9129,10 +9099,7 @@ pub(crate) fn try_rotate_exhausted_profile(
                 .get("timestamp_ms")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            let q = val
-                .get("quota_reset_at_ms")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
+            let q = anyagents_harness::quota::recorded_reset_at_ms(&val).unwrap_or(0);
             cleared_ms > 0 && ts > cleared_ms && q > now_ms && now_ms.saturating_sub(ts) < 900_000
         });
     let cur_pct = if post_clear_error {

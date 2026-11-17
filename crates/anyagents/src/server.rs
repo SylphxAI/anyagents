@@ -4316,10 +4316,7 @@ fn persisted_fault(
     if harness == "claude-code" {
         return (None, error);
     }
-    match record
-        .get("quota_reset_at_ms")
-        .and_then(serde_json::Value::as_i64)
-    {
+    match anyagents_harness::quota::recorded_reset_at_ms(&record) {
         Some(reset_ms) if reset_ms > now => (Some(reset_ms), error),
         Some(_) => (None, None),
         None => (None, error),
@@ -5948,7 +5945,7 @@ async fn wake_agent_route(
             .as_deref()
             .and_then(|err| compute_block_reason(None, Some(err), now));
         let live_delivery_err = if live_err_kind.as_deref() == Some("delivery_error") {
-            live_err
+            live_err.clone()
         } else {
             None
         };
@@ -5970,7 +5967,7 @@ async fn wake_agent_route(
                     .health
                     .stop_for_wake_cancellable(
                         &found.id,
-                        expected,
+                        anyagents_supervisor::WakeFault::Error(expected),
                         WAKE_RECOVERY_TIMEOUT,
                         &cancelled,
                     )
@@ -5979,9 +5976,41 @@ async fn wake_agent_route(
             if cancelled.load(Ordering::SeqCst) {
                 return Err(ApiError::conflict("wake recovery cancelled"));
             }
-            let custody = state.store.try_lock_agent(&found.id).map_err(|_| {
-                ApiError::conflict("agent process lock is still held; refusing wake recovery")
-            })?;
+            let custody = match state.store.try_lock_agent(&found.id) {
+                Ok(custody) => custody,
+                // This server's own worker keeps the lock through a restart
+                // backoff or quota hold after its process died. Retire that
+                // exact generation with checked custody, as for a live fault;
+                // a lock held by anything else (a live process, a keeper or
+                // another server) is still refused.
+                Err(anyagents_core::Error::AgentBusy)
+                    if live_delivery_err.is_none()
+                        && live.as_ref().is_some_and(|l| !l.process_alive) =>
+                {
+                    state
+                        .health
+                        .stop_for_wake_cancellable(
+                            &found.id,
+                            anyagents_supervisor::WakeFault::ProcessDown(live_err.as_deref()),
+                            WAKE_RECOVERY_TIMEOUT,
+                            &cancelled,
+                        )
+                        .map_err(ApiError::conflict)?;
+                    if cancelled.load(Ordering::SeqCst) {
+                        return Err(ApiError::conflict("wake recovery cancelled"));
+                    }
+                    state.store.try_lock_agent(&found.id).map_err(|_| {
+                        ApiError::conflict(
+                            "agent process lock is still held; refusing wake recovery",
+                        )
+                    })?
+                }
+                Err(_) => {
+                    return Err(ApiError::conflict(
+                        "agent process lock is still held; refusing wake recovery",
+                    ));
+                }
+            };
             let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
             if let Some(ref expected) = live_delivery_err {
                 state
@@ -9811,6 +9840,57 @@ pub(crate) mod tests {
             }
             std::fs::remove_file(cfg.join(".anyagents-last-error.json")).unwrap();
         }
+    }
+
+    /// A quota refusal persisted with only its text still names its reset:
+    /// the wait it states counts from when it was recorded, however many days
+    /// or hours it spans, and an elapsed one releases the agent.
+    #[test]
+    fn agent_view_reads_a_multi_day_reset_from_a_persisted_quota_text() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("quota-agy", "agy"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "running").unwrap();
+        let agent = store.agent(&agent.id).unwrap();
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        let text = "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 86h43m28s.";
+        let recorded_at = now_ms();
+        std::fs::write(
+            cfg.join(".anyagents-last-error.json"),
+            serde_json::json!({"error": text, "quota_reset_at_ms": null, "timestamp_ms": recorded_at})
+                .to_string(),
+        )
+        .unwrap();
+        let reset_ms = recorded_at + ((86 * 60 + 43) * 60 + 28) * 1_000;
+        for view in [
+            agent_view(&store, &health, &agent).unwrap(),
+            crate::agent::view_named(dir.path(), &agent.name).unwrap(),
+        ] {
+            assert_eq!(view.quota_reset_at_ms, Some(reset_ms));
+            assert_eq!(view.block_reason.as_deref(), Some("quota_exhausted"));
+            assert_ne!(view.turn_state, "errored");
+        }
+
+        // The stated wait has passed: the record no longer holds the agent.
+        std::fs::write(
+            cfg.join(".anyagents-last-error.json"),
+            serde_json::json!({
+                "error": "Individual quota reached. Resets in 3d14h.",
+                "quota_reset_at_ms": null,
+                "timestamp_ms": now_ms() - (3 * 24 + 15) * 3_600_000,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let view = agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(view.quota_reset_at_ms, None);
+        assert_eq!(view.last_error, None);
+        assert_eq!(view.block_reason, None);
     }
 
     #[test]
@@ -17674,6 +17754,266 @@ exec '{}' "$@"
                 );
                 assert!(cfg.join(".anyagents-last-error.json").exists());
             }
+        });
+    }
+
+    /// A worker whose process died keeps the agent's process lock through its
+    /// restart backoff while the board shows `process: down`. A wake for the
+    /// persisted fault retires that generation and restarts in one step,
+    /// never beside it.
+    #[test]
+    fn wake_route_reclaims_the_lock_a_dead_process_worker_holds() {
+        let _env = env_lock();
+        let _fake = FakeModeGuard::enter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            let dir = crate::test_tempdir();
+            let mut state = archetype_validation_state(dir.path());
+            let launches = Arc::new(AtomicUsize::new(0));
+            let healthy = Arc::new(AtomicBool::new(false));
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_concurrent = Arc::new(AtomicUsize::new(0));
+            let delivered = Arc::new(Mutex::new(Vec::<(usize, String)>::new()));
+
+            let (launches_l, healthy_l, active_l, max_l, delivered_l) = (
+                Arc::clone(&launches),
+                Arc::clone(&healthy),
+                Arc::clone(&active),
+                Arc::clone(&max_concurrent),
+                Arc::clone(&delivered),
+            );
+            let sup = anyagents_supervisor::Supervisor::start(
+                Arc::clone(&state.store),
+                Arc::new(anyagents_supervisor::SystemClock::new()),
+                Arc::new(move |_| {
+                    let gen_no = launches_l.fetch_add(1, Ordering::SeqCst) + 1;
+                    // Until the wake, every process the worker starts is
+                    // already gone: it waits out its backoff holding the lock.
+                    let alive = healthy_l.load(Ordering::SeqCst);
+                    if alive {
+                        let cur = active_l.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_l.fetch_max(cur, Ordering::SeqCst);
+                    }
+                    Ok(RouteWakeHarness {
+                        generation: gen_no,
+                        alive,
+                        in_turn: false,
+                        diagnostic: None,
+                        allow_verified_stop: Arc::new(AtomicBool::new(true)),
+                        stop_entered_tx: None,
+                        stop_release_rx: None,
+                        delivered: Arc::clone(&delivered_l),
+                        active_processes: Arc::clone(&active_l),
+                    })
+                }),
+                Vec::new(),
+            )
+            .unwrap();
+            state.health = sup.board();
+
+            let created = state
+                .store
+                .create_agent(anyagents_core::NewAgent::new("dead-worker", "claude-code"))
+                .unwrap();
+            let cfg = anyagents_core::agent_config_dir(dir.path(), &created.id);
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(
+                cfg.join(".anyagents-last-error.json"),
+                r#"{"error":"agy_empty_turn: turn ended without model output","timestamp_ms":9999999999999}"#,
+            )
+            .unwrap();
+            let work = dir.path().join("work");
+            std::fs::create_dir_all(&work).unwrap();
+            let running = state
+                .store
+                .set_agent_running(&created.id, &work.display().to_string())
+                .unwrap();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let down = sup
+                    .live(&running.id)
+                    .is_some_and(|l| !l.process_alive && l.last_error.is_none());
+                let held = matches!(
+                    state.store.try_lock_agent(&running.id),
+                    Err(anyagents_core::Error::AgentBusy)
+                );
+                if down && held {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "worker never held the lock over a dead process"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let before = agent_view(&state.store, &state.health, &running).unwrap();
+            assert_eq!(before.state, "running");
+            assert_eq!(before.process, "down");
+            assert_eq!(before.turn_state, "errored");
+            assert_eq!(before.block_reason.as_deref(), Some("delivery_error"));
+            let dead_generations = launches.load(Ordering::SeqCst);
+
+            let Json(woken) = wake_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath(running.name.clone()),
+                axum::http::HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(woken.state, "running");
+            assert_eq!(woken.block_reason, None);
+            assert_eq!(woken.last_error, None);
+            assert!(!cfg.join(".anyagents-last-error.json").exists());
+            healthy.store(true, Ordering::SeqCst);
+
+            state
+                .store
+                .receive(&running.id, anyagents_core::Incoming::new("post-wake message"))
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !delivered
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, text)| text.contains("post-wake message"))
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "replacement generation never delivered post-wake mail"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(delivered.lock().unwrap()[0].0 > dead_generations);
+            assert_eq!(max_concurrent.load(Ordering::SeqCst), 1);
+            drop(sup);
+        });
+    }
+
+    /// A wake never takes the lock from a process that is alive, or from a
+    /// holder that is not this server's worker: it refuses and keeps the fault.
+    #[test]
+    fn wake_route_refuses_a_lock_held_by_a_live_process_or_another_holder() {
+        let _env = env_lock();
+        let _fake = FakeModeGuard::enter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            let dir = crate::test_tempdir();
+            let fault = r#"{"error":"broken transport pipe","timestamp_ms":9999999999999}"#;
+
+            // A foreign holder: no worker of this server owns the lock.
+            let state = archetype_validation_state(dir.path());
+            let created = state
+                .store
+                .create_agent(anyagents_core::NewAgent::new("foreign-lock", "claude-code"))
+                .unwrap();
+            let cfg = anyagents_core::agent_config_dir(dir.path(), &created.id);
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(cfg.join(".anyagents-last-error.json"), fault).unwrap();
+            let work = dir.path().join("work-foreign");
+            std::fs::create_dir_all(&work).unwrap();
+            let running = state
+                .store
+                .set_agent_running(&created.id, &work.display().to_string())
+                .unwrap();
+            let held = state.store.try_lock_agent(&running.id).unwrap();
+            let err = wake_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath(running.name.clone()),
+                axum::http::HeaderMap::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::CONFLICT);
+            assert!(
+                err.message.contains("lock is still held"),
+                "{}",
+                err.message
+            );
+            assert!(cfg.join(".anyagents-last-error.json").exists());
+            assert_eq!(state.store.agent(&running.id).unwrap().state, "running");
+            drop(held);
+
+            let dir = crate::test_tempdir();
+            // A live process: its worker holds the lock and it is never stopped
+            // for a persisted fault.
+            let mut state = archetype_validation_state(dir.path());
+            let launches = Arc::new(AtomicUsize::new(0));
+            let active = Arc::new(AtomicUsize::new(0));
+            let (launches_l, active_l) = (Arc::clone(&launches), Arc::clone(&active));
+            let sup = anyagents_supervisor::Supervisor::start(
+                Arc::clone(&state.store),
+                Arc::new(anyagents_supervisor::SystemClock::new()),
+                Arc::new(move |_| {
+                    let gen_no = launches_l.fetch_add(1, Ordering::SeqCst) + 1;
+                    active_l.fetch_add(1, Ordering::SeqCst);
+                    Ok(RouteWakeHarness {
+                        generation: gen_no,
+                        alive: true,
+                        in_turn: false,
+                        diagnostic: None,
+                        allow_verified_stop: Arc::new(AtomicBool::new(true)),
+                        stop_entered_tx: None,
+                        stop_release_rx: None,
+                        delivered: Arc::new(Mutex::new(Vec::new())),
+                        active_processes: Arc::clone(&active_l),
+                    })
+                }),
+                Vec::new(),
+            )
+            .unwrap();
+            state.health = sup.board();
+            let created = state
+                .store
+                .create_agent(anyagents_core::NewAgent::new("live-lock", "claude-code"))
+                .unwrap();
+            let cfg = anyagents_core::agent_config_dir(dir.path(), &created.id);
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(cfg.join(".anyagents-last-error.json"), fault).unwrap();
+            let work = dir.path().join("work-live");
+            std::fs::create_dir_all(&work).unwrap();
+            let running = state
+                .store
+                .set_agent_running(&created.id, &work.display().to_string())
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !sup.live(&running.id).is_some_and(|l| l.process_alive) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "process never came up"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let err = wake_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath(running.name.clone()),
+                axum::http::HeaderMap::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::CONFLICT);
+            assert!(
+                err.message.contains("lock is still held"),
+                "{}",
+                err.message
+            );
+            assert!(cfg.join(".anyagents-last-error.json").exists());
+            assert_eq!(state.store.agent(&running.id).unwrap().state, "running");
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+            assert_eq!(active.load(Ordering::SeqCst), 1);
+            assert!(sup.live(&running.id).is_some_and(|l| l.process_alive));
+            drop(sup);
         });
     }
 
