@@ -735,9 +735,8 @@ async fn resolve_explicit_target<C: BrowserClient>(
 async fn require_readable_page<C: BrowserClient>(s: &C) -> Result<(), ToolError> {
     let url = s.current_url().await?;
     if !readable_page_url(&url) {
-        let _ = s.navigate("about:blank").await;
         return Err(ToolError::invalid(
-            "browser page access allows only http://, https:// and about:blank; attempted to reset the prohibited page to about:blank",
+            "browser page access allows only http://, https:// and about:blank; the active page was left unchanged",
         ));
     }
     Ok(())
@@ -2562,6 +2561,35 @@ mod tests {
         )
         .await
         .map_err(|e| e.into_action_error(redact, mutating))
+    }
+
+    #[tokio::test]
+    async fn unreadable_page_refusal_preserves_active_tab() {
+        for url in [
+            "file:///tmp/private.txt",
+            "chrome://settings/",
+            "data:text/html,keep",
+        ] {
+            let state = std::sync::Arc::new(std::sync::Mutex::new(FakeBrowserState::new(vec![
+                FakeTab {
+                    id: "kept-target".into(),
+                    url: url.into(),
+                    title: "Keep this page".into(),
+                    active: true,
+                    text: "unsaved state".into(),
+                },
+            ])));
+            state.lock().unwrap().gate.acquire("test-agent").unwrap();
+            let client = FakeBrowserClient {
+                principal: "test-agent".into(),
+                state: state.clone(),
+            };
+            assert!(require_readable_page(&client).await.is_err());
+            let state = state.lock().unwrap();
+            assert_eq!(state.tabs[0].url, url);
+            assert_eq!(state.active_id(), "kept-target");
+            assert!(state.actions_on_tab.is_empty());
+        }
     }
 
     #[tokio::test]
