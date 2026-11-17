@@ -1374,7 +1374,7 @@ async fn status(
         return Ok(json!({"profile": profile, "status": "stopped", "fingerprint": null}));
     };
     let p = agent_workstation::Profile::new(profile, dir);
-    let fingerprint = agent_workstation::Fingerprint::read(&p.fingerprint_path())?;
+    let fingerprint = read_fingerprint(&p.fingerprint_path())?;
     match super::session::running(data, profile) {
         Some(live) => {
             // Never impersonate or acquire another caller's session to read tabs or token.
@@ -1455,6 +1455,17 @@ fn profile_entry_metadata(
 }
 
 #[cfg(target_os = "linux")]
+fn read_fingerprint(path: &Path) -> Result<Option<agent_workstation::Fingerprint>, ToolError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() && meta.len() == 0 => return Ok(None),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(ToolError::invalid(e.to_string())),
+    }
+    Ok(agent_workstation::Fingerprint::read(path)?)
+}
+
+#[cfg(target_os = "linux")]
 fn list_profiles(data: &Path) -> Result<Vec<serde_json::Value>, ToolError> {
     use serde_json::json;
     use std::os::fd::IntoRawFd as _;
@@ -1521,7 +1532,7 @@ fn list_profiles(data: &Path) -> Result<Vec<serde_json::Value>, ToolError> {
         let summary = (|| -> Result<serde_json::Value, ToolError> {
             if let Some(dir) = super::server_profile_dir(data, &name, false).map_err(|e| ToolError::invalid(e.to_string()))? {
                 let profile = agent_workstation::Profile::new(&name, dir);
-                agent_workstation::Fingerprint::read(&profile.fingerprint_path())?;
+                read_fingerprint(&profile.fingerprint_path())?;
             }
             Ok(match super::session::running(data, &name) {
                 Some(live) => json!({"profile":name,"status":"running","holder":live.holder(),"held_by":live.leaseholder(),"last_used_at_ms":live.last_used_ms()}),
@@ -1715,9 +1726,10 @@ mod tests {
         assert!(list_profiles(data.path()).unwrap().is_empty());
         let root = data.path().join("browser-profiles");
         std::fs::create_dir(&root).unwrap();
-        for name in ["healthy", "bad-json", "bad-schema", "insecure"] {
+        for name in ["healthy", "empty-fp", "bad-json", "bad-schema", "insecure"] {
             std::fs::create_dir(root.join(name)).unwrap();
         }
+        std::fs::write(root.join("empty-fp/fingerprint.json"), b"").unwrap();
         std::fs::write(root.join("bad-json/fingerprint.json"), b"{").unwrap();
         std::fs::write(root.join("bad-schema/fingerprint.json"), b"{}").unwrap();
         std::fs::set_permissions(
@@ -1732,6 +1744,7 @@ mod tests {
         let profiles = list_profiles(data.path()).unwrap();
         let get = |name: &str| profiles.iter().find(|p| p["profile"] == name).unwrap();
         assert_eq!(get("healthy")["status"], "stopped");
+        assert_eq!(get("empty-fp")["status"], "stopped");
         for name in ["bad-json", "bad-schema", "insecure"] {
             assert_eq!(get(name)["status"], "error", "{name}");
             assert!(get(name)["error"].is_string());
