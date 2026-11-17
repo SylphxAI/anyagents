@@ -1008,7 +1008,7 @@ fn attach_memory_index(conn: &Connection, path: &Path) -> Result<(), Error> {
         [index.as_os_str().to_string_lossy()],
     )?;
     // Pager settings are per schema: tuning main does not tune an attachment.
-    let schema = Some(rusqlite::DatabaseName::Attached(memory_index::ATTACHED));
+    let schema = Some(memory_index::ATTACHED);
     conn.pragma_update(schema, "mmap_size", MMAP_SIZE_BYTES)?;
     conn.pragma_update(schema, "cache_size", -CACHE_SIZE_KIB)?;
     Ok(())
@@ -8523,10 +8523,7 @@ mod tests {
         }
         let reader = store.read_conn();
         check(&reader, None);
-        check(
-            &reader,
-            Some(rusqlite::DatabaseName::Attached(memory_index::ATTACHED)),
-        );
+        check(&reader, Some(memory_index::ATTACHED));
     }
 
     #[test]
