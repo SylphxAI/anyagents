@@ -500,12 +500,13 @@ impl Probes {
         completed_at: impl FnOnce() -> i64,
     ) -> Observation {
         if let Some(target) = self.targets.get_mut(key) {
-            if target.event_ready || (target.event_observation && now < target.next_at) {
+            if target.event_observation && (target.event_ready || now < target.next_at) {
                 target.event_ready = false;
                 if let Some(result) = &target.result {
                     return result.clone();
                 }
             }
+            target.event_ready = false;
         }
         let auth_owner = owner.to_ascii_lowercase();
         if now < self.auth_until.get(&auth_owner).copied().unwrap_or(0) {
@@ -681,7 +682,7 @@ fn read_target(
         target.legacy_review_failed = legacy.review_failed;
         checks.add(&legacy);
     }
-    target.snapshot_complete = true;
+    target.snapshot_complete = !checks.runs.is_empty() || checks.count > 0;
     target.head_sha = checks
         .runs
         .values()

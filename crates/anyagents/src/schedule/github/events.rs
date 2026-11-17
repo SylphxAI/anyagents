@@ -61,15 +61,14 @@ pub(super) fn apply(
     if probes.deliveries.contains_key(delivery) {
         return Ok(false);
     }
-    if probes.deliveries.len() >= MAX_DELIVERIES {
-        if let Some(oldest) = probes
+    if probes.deliveries.len() >= MAX_DELIVERIES
+        && let Some(oldest) = probes
             .deliveries
             .iter()
             .min_by_key(|(_, at)| **at)
             .map(|(id, _)| id.clone())
-        {
-            probes.deliveries.remove(&oldest);
-        }
+    {
+        probes.deliveries.remove(&oldest);
     }
     probes.deliveries.insert(delivery.to_string(), now);
     let mut changed = false;
@@ -152,21 +151,24 @@ pub(super) fn apply(
         {
             continue;
         }
-        if event == "check_run" && !new_head {
-            if let Some(snapshot) = &target.snapshot {
-                let id = object["id"].as_u64().unwrap();
-                let same_check = |run: &Value| {
-                    run["name"] == object["name"] && run["app"]["id"] == object["app"]["id"]
-                };
-                if snapshot.runs.get(&id).is_some_and(|old| {
-                    old["status"] == "completed" && object["status"] != "completed"
-                }) || snapshot
+        if event == "check_run"
+            && !new_head
+            && let Some(snapshot) = &target.snapshot
+        {
+            let id = object["id"].as_u64().unwrap();
+            let same_check = |run: &Value| {
+                run["name"] == object["name"] && run["app"]["id"] == object["app"]["id"]
+            };
+            if snapshot
+                .runs
+                .get(&id)
+                .is_some_and(|old| old["status"] == "completed" && object["status"] != "completed")
+                || snapshot
                     .runs
                     .iter()
                     .any(|(old_id, run)| *old_id > id && same_check(run))
-                {
-                    continue;
-                }
+            {
+                continue;
             }
         }
         let before = (
@@ -206,6 +208,12 @@ pub(super) fn apply(
         } else if event == "check_run" {
             let id = object["id"].as_u64().unwrap();
             let snapshot = target.snapshot.get_or_insert_with(Checks::default);
+            let known_slot = snapshot.runs.values().any(|run| {
+                run["name"] == object["name"] && run["app"]["id"] == object["app"]["id"]
+            });
+            if spec.check_name.is_none() && target.snapshot_complete && !known_slot {
+                target.snapshot_complete = false;
+            }
             // REST's default filter is latest per name/app, not all reruns.
             snapshot.runs.retain(|old_id, run| {
                 *old_id == id
@@ -213,35 +221,34 @@ pub(super) fn apply(
                     || run["app"]["id"] != object["app"]["id"]
             });
             snapshot.runs.insert(id, object.clone());
-            let result = if let Some(name) = spec.check_name.as_deref() {
-                snapshot.selected(name)
-            } else if target.snapshot_complete {
-                let pending = target.legacy_pending
-                    || snapshot
-                        .runs
-                        .values()
-                        .any(|run| run["status"] != "completed");
-                let review = target.legacy_review_failed
+            let review = spec.pr
+                && (target.legacy_review_failed
                     || snapshot.runs.values().any(|run| {
                         run["name"].as_str() == Some(review_check_name().as_str())
                             && matches!(
                                 run["conclusion"].as_str(),
                                 Some("failure" | "timed_out" | "action_required" | "error")
                             )
-                    });
-                if spec.pr && review {
-                    (false, "review_failed".into())
-                } else {
-                    (
-                        !pending,
-                        if pending {
-                            "checks_in_progress"
-                        } else {
-                            "checks_completed"
-                        }
-                        .into(),
-                    )
-                }
+                    }));
+            let result = if let Some(name) = spec.check_name.as_deref() {
+                snapshot.selected(name)
+            } else if review {
+                (false, "review_failed".into())
+            } else if target.snapshot_complete {
+                let pending = target.legacy_pending
+                    || snapshot
+                        .runs
+                        .values()
+                        .any(|run| run["status"] != "completed");
+                (
+                    !pending,
+                    if pending {
+                        "checks_in_progress"
+                    } else {
+                        "checks_completed"
+                    }
+                    .into(),
+                )
             } else {
                 (false, "checks_in_progress".into())
             };
@@ -262,6 +269,20 @@ pub(super) fn apply(
                 target.event_versions.insert("head".into(), version.into());
             }
         }
+        let reconcile_rest = event != "pull_request"
+            && spec.check_name.is_none()
+            && !target.snapshot_complete
+            && !target.settled
+            && target
+                .result
+                .as_ref()
+                .is_none_or(|(_, state)| state != "review_failed")
+            && object["status"].as_str() == Some("completed")
+            && target
+                .snapshot
+                .as_ref()
+                .is_none_or(|s| s.runs.values().all(|r| r["status"] == "completed"));
+        let rest_deferred = target.event_observation || target.next_at > now;
         if before
             == (
                 target.result.clone(),
@@ -270,13 +291,19 @@ pub(super) fn apply(
                 target.settled,
                 target.snapshot_complete,
             )
+            && !(reconcile_rest && rest_deferred)
         {
             continue;
         }
         target.successful = target.result.clone();
         target.event_ready = true;
-        target.event_observation = true;
-        target.next_at = now.saturating_add(DISCONNECTED_INTERVAL);
+        if reconcile_rest {
+            target.event_observation = false;
+            target.next_at = 0;
+        } else {
+            target.event_observation = true;
+            target.next_at = now.saturating_add(DISCONNECTED_INTERVAL);
+        }
         target.accessed_at = now;
         changed = true;
     }
@@ -399,7 +426,7 @@ mod tests {
             )
             .unwrap()
         );
-        assert_eq!(p.targets[&key].result.as_ref().unwrap().0, false);
+        assert!(!p.targets[&key].result.as_ref().unwrap().0);
         p.targets.get_mut(&key).unwrap().snapshot_complete = true;
         assert!(
             apply(
@@ -411,7 +438,7 @@ mod tests {
             )
             .unwrap()
         );
-        assert_eq!(p.targets[&key].result.as_ref().unwrap().0, true);
+        assert!(p.targets[&key].result.as_ref().unwrap().0);
         let sync = json!({"repository":{"full_name":"org/repo"},"pull_request":{"id":7,"number":7,"state":"open","head":{"sha":"b","ref":"main"},"updated_at":"2026-11-12T02:00:00Z"}});
         assert!(apply(&mut p, "pull_request", &sync, "3", 12).unwrap());
         assert!(!p.targets[&key].snapshot_complete);

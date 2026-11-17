@@ -850,14 +850,11 @@ fn mark_archive_generation_locked(store: &Store, data_dir: &Path, agent: &Agent)
         reap_queue::enqueue(data_dir, &agent.id);
     }
     if let Ok(schedules) = store.list_schedules(Some(&agent.id), true) {
-        let any = !schedules.is_empty();
         for sched in schedules {
             let _ = store.cancel_schedule(Some(&agent.id), &sched.id);
         }
-        if any {
-            crate::schedule::schedules_changed(store.data_dir());
-        }
     }
+    crate::schedule::schedules_changed(store.data_dir());
     crate::telegram::detach_archived_agent_from_telegram_groups(store, data_dir, agent, true);
 }
 
