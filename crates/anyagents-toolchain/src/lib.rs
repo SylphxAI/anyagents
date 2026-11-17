@@ -231,7 +231,8 @@ impl Toolchain {
                 needed_by: needed_by.to_string(),
             });
         }
-        let found = legacy::resolve(name, &self.legacy);
+        let preferred = manifest.map_or(&[][..], |m| m.child_path_tail.as_slice());
+        let found = legacy::resolve(name, &self.legacy, preferred);
         self.record_legacy(name, needed_by, found.as_deref());
         match found {
             Some(path) => Ok(ResolvedTool {
@@ -304,11 +305,18 @@ impl Toolchain {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let entry = uses.entry(name.to_string()).or_insert_with(|| {
-            eprintln!(
-                "anyagents-toolchain: `{name}` is not declared; legacy lookup for {needed_by} resolved {}. Declare it in {}.",
-                found.map_or_else(|| "nothing".to_string(), |p| p.display().to_string()),
-                manifest::FILE_NAME,
-            );
+            if name == "PATH" {
+                eprintln!(
+                    "anyagents-toolchain: no {} is loaded, so {needed_by} helpers inherit the ambient PATH. Declare child_path_tail in it.",
+                    manifest::FILE_NAME,
+                );
+            } else {
+                eprintln!(
+                    "anyagents-toolchain: `{name}` is not declared; legacy lookup for {needed_by} resolved {}. Declare it in {}.",
+                    found.map_or_else(|| "nothing".to_string(), |p| p.display().to_string()),
+                    manifest::FILE_NAME,
+                );
+            }
             LegacyUse {
                 tool: name.to_string(),
                 resolved: None,
@@ -456,8 +464,8 @@ pub fn install_global(toolchain: Toolchain) -> Result<(), Box<Toolchain>> {
     GLOBAL.set(toolchain).map_err(Box::new)
 }
 
-/// The server's toolchain; an empty (all-legacy) one when none was installed,
-/// as in unit tests and short CLI commands.
+/// The process's toolchain; an empty (all-legacy) one when none was installed,
+/// as in unit tests.
 pub fn global() -> &'static Toolchain {
     GLOBAL.get_or_init(Toolchain::empty)
 }
@@ -465,6 +473,15 @@ pub fn global() -> &'static Toolchain {
 /// Resolve through [`global`].
 pub fn tool(name: &str, needed_by: &str) -> Result<ResolvedTool, ToolchainError> {
     global().tool(name, needed_by)
+}
+
+/// Install the deployment's toolchain for a command-line process, so helpers it
+/// runs (Git admission, seat configuration) use the same manifest as the
+/// server. Verification and the exposed links stay the server's work.
+pub fn init_cli(data_dir: &Path, host_home: Option<PathBuf>) -> &'static Toolchain {
+    let _ =
+        install_global(Toolchain::load(data_dir).with_legacy_context(LegacyContext { host_home }));
+    global()
 }
 
 /// Install the server's toolchain once at startup, verify every declared tool,

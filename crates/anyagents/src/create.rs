@@ -4427,6 +4427,209 @@ fn extract_profile_dedup_key(prof_dir: &Path, provider: &str) -> Option<String> 
     }
 }
 
+const SIGNIN_STAGING_PREFIX: &str = ".signin-staging-";
+const MERGED_PROFILE_PREFIX: &str = ".merged-";
+
+/// A sign-in's staging directory, `profiles/<provider>/.signin-staging-<suffix>`.
+/// An exclusive `flock` on the directory marks it in flight for as long as this
+/// value lives; dropping it removes the directory, committed or not.
+pub(crate) struct SigninStaging {
+    path: PathBuf,
+    #[cfg(unix)]
+    _lock: std::fs::File,
+}
+
+impl SigninStaging {
+    /// Create a fresh staging directory, first removing the ones abandoned by
+    /// sign-ins that no longer run.
+    pub(crate) fn create(data: &Path, provider: &str, suffix: &str) -> Result<Self, Error> {
+        let parent = data.join("profiles").join(provider);
+        std::fs::create_dir_all(&parent)?;
+        reap_abandoned_signin_staging(&parent);
+        let path = parent.join(format!("{SIGNIN_STAGING_PREFIX}{suffix}"));
+        std::fs::create_dir(&path)?;
+        #[cfg(unix)]
+        let _lock = match lock_signin_staging(&path) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                return Err(Error::Message(format!(
+                    "sign-in staging {} was taken by another process",
+                    path.display()
+                )));
+            }
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&path);
+                return Err(err.into());
+            }
+        };
+        Ok(Self {
+            path,
+            #[cfg(unix)]
+            _lock,
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SigninStaging {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => eprintln!(
+                "sign-in staging {} was not removed: {err}",
+                self.path.display()
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// Take the staging lock on `path` without waiting. `None` when a live sign-in
+/// holds it, or when `path` no longer names the locked directory.
+#[cfg(unix)]
+fn lock_signin_staging(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::io::AsRawFd as _;
+    let dir = std::fs::File::open(path)?;
+    // SAFETY: `dir` is an open descriptor for the duration of the call.
+    if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = std::io::Error::last_os_error();
+        return if err.kind() == std::io::ErrorKind::WouldBlock {
+            Ok(None)
+        } else {
+            Err(err)
+        };
+    }
+    let (held, named) = (dir.metadata()?, std::fs::symlink_metadata(path)?);
+    Ok((named.is_dir() && held.dev() == named.dev() && held.ino() == named.ino()).then_some(dir))
+}
+
+/// Remove the staging directories under one provider that no running sign-in
+/// holds: one whose process exited, failed or was killed before committing.
+fn reap_abandoned_signin_staging(provider_dir: &Path) {
+    #[cfg(unix)]
+    {
+        let Ok(entries) = std::fs::read_dir(provider_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(SIGNIN_STAGING_PREFIX)
+                || !entry.file_type().is_ok_and(|t| t.is_dir())
+            {
+                continue;
+            }
+            let path = entry.path();
+            if let Ok(Some(_held)) = lock_signin_staging(&path)
+                && let Err(err) = std::fs::remove_dir_all(&path)
+            {
+                eprintln!(
+                    "abandoned sign-in staging {} was not removed: {err}",
+                    path.display()
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = provider_dir;
+}
+
+/// The identities a profile directory holds, keyed as the deduplication keys them.
+fn profile_identity_keys(dir: &Path, provider: &str) -> Vec<String> {
+    let (email, account_id) = extract_profile_account_identity(dir, provider);
+    email
+        .map(|e| format!("email:{}", e.to_ascii_lowercase()))
+        .into_iter()
+        .chain(account_id.map(|id| format!("id:{id}")))
+        .chain(extract_profile_dedup_key(dir, provider))
+        .collect()
+}
+
+/// Remove `.merged-*` recovery copies that hold nothing a live profile lacks: a
+/// live profile with credentials holds the same account and has every declared
+/// sign-in file the copy has, and the copy holds nothing else but AnyAgents'
+/// own bookkeeping. A copy holding anything more is kept.
+fn reap_superseded_merged_profiles(provider_dir: &Path, provider: &str) {
+    let Ok((primary, companion)) = staged_signin_manifest(provider) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(provider_dir) else {
+        return;
+    };
+    let is_file = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
+    let mut live = Vec::new();
+    let mut copies = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(MERGED_PROFILE_PREFIX) {
+            copies.push(entry.path());
+        } else if !name.starts_with('.')
+            && primary.iter().any(|rel| is_file(&entry.path().join(rel)))
+        {
+            live.push((profile_identity_keys(&entry.path(), provider), entry.path()));
+        }
+    }
+    for copy in copies {
+        let keys = profile_identity_keys(&copy, provider);
+        let Some((_, holder)) = live
+            .iter()
+            .find(|(held, _)| held.iter().any(|k| keys.contains(k)))
+        else {
+            continue;
+        };
+        let mut superseded = true;
+        let mut pending = vec![copy.clone()];
+        while superseded && let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                superseded = false;
+                break;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(rel) = path.strip_prefix(&copy) else {
+                    superseded = false;
+                    break;
+                };
+                let rel_str = rel.to_string_lossy();
+                superseded = match entry.file_type() {
+                    Ok(t) if t.is_dir() => {
+                        pending.push(path.clone());
+                        true
+                    }
+                    Ok(t) if t.is_symlink() => true,
+                    Ok(_)
+                        if primary.contains(&rel_str.as_ref())
+                            || companion.contains(&rel_str.as_ref()) =>
+                    {
+                        is_file(&holder.join(rel))
+                    }
+                    Ok(_) => {
+                        rel == Path::new("profile.json")
+                            || (rel.components().count() == 1 && rel_str.starts_with(".anyagents-"))
+                    }
+                    Err(_) => false,
+                };
+                if !superseded {
+                    break;
+                }
+            }
+        }
+        if superseded && let Err(err) = std::fs::remove_dir_all(&copy) {
+            eprintln!(
+                "merged profile copy {} was not removed: {err}",
+                copy.display()
+            );
+        }
+    }
+}
+
 /// Enforces the `1 Email / Account = 1 Profile` invariant across all providers under
 /// `<data>/profiles/<provider>`. If two or more profiles under the same provider share
 /// the exact same email, account ID, or API key, merges them into a single canonical
@@ -4584,6 +4787,23 @@ pub(crate) fn deduplicate_same_account_profiles(data: &Path) {
                 }
             }
         }
+    }
+    reap_signin_leftovers(&profiles_root);
+}
+
+/// Remove what finished sign-ins and merges leave beside the profiles of every
+/// provider: abandoned staging directories and superseded `.merged-*` copies.
+fn reap_signin_leftovers(profiles_root: &Path) {
+    let Ok(providers) = std::fs::read_dir(profiles_root) else {
+        return;
+    };
+    for prov_entry in providers.flatten() {
+        let provider = prov_entry.file_name().to_string_lossy().into_owned();
+        if provider.starts_with('.') || !prov_entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        reap_abandoned_signin_staging(&prov_entry.path());
+        reap_superseded_merged_profiles(&prov_entry.path(), &provider);
     }
 }
 
@@ -5110,7 +5330,9 @@ pub(crate) fn resolve_and_commit_staged_signin(
         && data.join("state.db").is_file()
         && let Ok(store) = Store::open(data.join("state.db"))
     {
-        let _ = sync_and_list_provider_profiles_with_options(&store, data, true);
+        // Moving agents onto the new profile is the server's rebalance; a
+        // sign-in never reconfigures other agents' seats from this process.
+        let _ = sync_and_list_provider_profiles_inner(&store, data, true, false);
     }
     Ok((chosen_profile, final_dir, final_email.or(final_id)))
 }
@@ -5247,19 +5469,13 @@ pub(crate) fn finalize_profile_signin(
 pub(crate) fn finalize_agent_signin(data: &Path, agent: &Agent) -> Result<(), Error> {
     let cfg = agent_config_dir(data, &agent.id);
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-    let stage = data.join("profiles").join(&provider).join(format!(
-        ".signin-staging-agent-{}-{}",
-        agent.id.as_str(),
-        anyagents_core::now_ms()
-    ));
-    std::fs::create_dir_all(&stage)?;
-    let (primary_rels, companion_rels) = match staged_signin_manifest(&provider) {
-        Ok(m) => m,
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&stage);
-            return Err(err);
-        }
-    };
+    let (primary_rels, companion_rels) = staged_signin_manifest(&provider)?;
+    let staging = SigninStaging::create(
+        data,
+        &provider,
+        &format!("agent-{}-{}", agent.id.as_str(), anyagents_core::now_ms()),
+    )?;
+    let stage = staging.path();
     let read_seat_regular = |rel: &str| -> Result<Option<Vec<u8>>, Error> {
         match read_staged_regular_file(&cfg, rel) {
             Ok(v) => Ok(v),
@@ -5308,11 +5524,8 @@ pub(crate) fn finalize_agent_signin(data: &Path, agent: &Agent) -> Result<(), Er
         }
         Ok(())
     })();
-    if let Err(err) = stage_res {
-        let _ = std::fs::remove_dir_all(&stage);
-        return Err(err);
-    }
-    let (resolved_prof, _, _) = resolve_and_commit_staged_signin(data, &provider, &stage, None)?;
+    stage_res?;
+    let (resolved_prof, _, _) = resolve_and_commit_staged_signin(data, &provider, stage, None)?;
     let normalized = format!("{provider}/{resolved_prof}\n");
     write_profile_marker(&cfg, ".anyagents-profile", &normalized)?;
     write_profile_marker(&cfg, ".anyagents-seeded-profile", &normalized)?;
@@ -8638,6 +8851,9 @@ pub(crate) fn force_refresh_provider_profiles(
                 continue;
             }
             let profile = prof_entry.file_name().to_string_lossy().into_owned();
+            if profile.starts_with('.') {
+                continue;
+            }
             let full_name = format!("{provider}/{profile}");
             if let Some(f) = filter
                 && f != provider
@@ -9003,6 +9219,9 @@ pub(crate) fn probe_profile_models_catalog(data: &Path, target: Option<&str>) ->
                     continue;
                 }
                 let profile = prof_entry.file_name().to_string_lossy().into_owned();
+                if profile.starts_with('.') {
+                    continue;
+                }
                 let full_name = format!("{provider}/{profile}");
                 if let Some(f) = filter
                     && f != provider
@@ -13098,8 +13317,8 @@ stderr: {}",
 
         // Signing in a new account (`account-two@example.test`) without `--profile`
         // creates its own distinct profile (`account-two`) without touching `default`.
-        let stage1 = data.join("profiles/anthropic/.signin-staging-test1");
-        std::fs::create_dir_all(&stage1).unwrap();
+        let held1 = SigninStaging::create(data, "anthropic", "test1").unwrap();
+        let stage1 = held1.path().to_path_buf();
         std::fs::write(
             stage1.join(".credentials.json"),
             serde_json::json!({
@@ -13133,8 +13352,8 @@ stderr: {}",
 
         // Re-signing in `account-one@example.test` (even with an explicit `--profile extra`)
         // updates its existing `default` profile rather than creating a duplicate email profile.
-        let stage2 = data.join("profiles/anthropic/.signin-staging-test2");
-        std::fs::create_dir_all(&stage2).unwrap();
+        let held2 = SigninStaging::create(data, "anthropic", "test2").unwrap();
+        let stage2 = held2.path().to_path_buf();
         std::fs::write(
             stage2.join(".credentials.json"),
             serde_json::json!({
@@ -14808,17 +15027,78 @@ mod runtime_config_tests {
         deduplicate_same_account_profiles(dir.path());
         assert_eq!(std::fs::read(canonical.join("auth.json")).unwrap(), bytes);
         assert!(!duplicate.exists());
-        let recovery = std::fs::read_dir(provider)
+        // The canonical profile now holds every byte the recovery copy held.
+        let leftovers: Vec<_> = std::fs::read_dir(provider)
             .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|p| {
-                p.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with(".merged-duplicate-")
-            })
-            .unwrap();
-        assert_eq!(std::fs::read(recovery.join("auth.json")).unwrap(), bytes);
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn merged_copies_are_removed_only_when_a_live_profile_holds_all_they_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("profiles/openai");
+        let write = |path: PathBuf, bytes: &[u8]| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        let same = br#"{"tokens":{"account_id":"same-account","access_token":"fixture"}}"#;
+        write(provider.join("default/auth.json"), same);
+        // Superseded: same account, declared files and bookkeeping only.
+        write(provider.join(".merged-a-1/auth.json"), same);
+        write(provider.join(".merged-a-1/profile.json"), b"{}");
+        write(provider.join(".merged-a-1/.anyagents-last-usage.txt"), b"1");
+        // Holds a file no live profile has: kept.
+        write(provider.join(".merged-b-1/auth.json"), same);
+        write(
+            provider.join(".merged-b-1/.claude/.credentials.json"),
+            b"{}",
+        );
+        // Holds a declared file the live profile lacks: kept.
+        write(provider.join(".merged-c-1/auth.json"), same);
+        write(provider.join(".merged-c-1/.codex/auth.json"), same);
+        // Another account: kept.
+        write(
+            provider.join(".merged-d-1/auth.json"),
+            br#"{"tokens":{"account_id":"other-account","access_token":"fixture"}}"#,
+        );
+        deduplicate_same_account_profiles(dir.path());
+        assert!(!provider.join(".merged-a-1").exists());
+        for kept in [".merged-b-1", ".merged-c-1", ".merged-d-1"] {
+            assert!(provider.join(kept).is_dir(), "{kept} was removed");
+        }
+        assert_eq!(
+            std::fs::read(provider.join("default/auth.json")).unwrap(),
+            same
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_signin_staging_is_reaped_and_a_held_one_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("profiles/openai");
+        let abandoned = provider.join(".signin-staging-1-1");
+        std::fs::create_dir_all(abandoned.join(".codex")).unwrap();
+        std::fs::write(abandoned.join("cli.log"), b"vendor residue").unwrap();
+        let held = SigninStaging::create(dir.path(), "openai", "2-2").unwrap();
+        assert!(
+            !abandoned.exists(),
+            "creating a staging reaps abandoned ones"
+        );
+        std::fs::write(held.path().join("auth.json"), b"{}").unwrap();
+        std::fs::create_dir_all(&abandoned).unwrap();
+        deduplicate_same_account_profiles(dir.path());
+        assert!(!abandoned.exists());
+        assert!(
+            held.path().join("auth.json").is_file(),
+            "a held staging is in flight"
+        );
+        let path = held.path().to_path_buf();
+        drop(held);
+        assert!(!path.exists(), "a dropped staging is removed");
     }
 
     #[test]
@@ -16417,9 +16697,8 @@ Connection: close
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
         let dir = tempfile::tempdir().unwrap();
-        let staging = dir
-            .path()
-            .join("profiles/google-antigravity/.signin-staging-4242");
+        let held = SigninStaging::create(dir.path(), "google-antigravity", "4242").unwrap();
+        let staging = held.path().to_path_buf();
         let agy_dir = staging.join(".gemini/antigravity-cli");
         let cfg_dir = staging.join(".gemini/config");
         std::fs::create_dir_all(agy_dir.join("log")).unwrap();

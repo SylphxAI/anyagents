@@ -16,7 +16,11 @@ pub struct LegacyContext {
 }
 
 /// The program the call site would have run, or `None` when nothing matched.
-pub(crate) fn resolve(name: &str, ctx: &LegacyContext) -> Option<PathBuf> {
+///
+/// `preferred` holds the directories a loaded manifest declares for helpers
+/// (`child_path_tail`). They are searched before the inherited `PATH`, so a
+/// system tool wins over a same-named wrapper earlier on the operator's `PATH`.
+pub(crate) fn resolve(name: &str, ctx: &LegacyContext, preferred: &[PathBuf]) -> Option<PathBuf> {
     if let Some(var) = env_override(name)
         && let Some(value) = std::env::var_os(var)
         && !value.is_empty()
@@ -35,15 +39,15 @@ pub(crate) fn resolve(name: &str, ctx: &LegacyContext) -> Option<PathBuf> {
         .iter()
         .map(PathBuf::from)
         .find(|p| p.is_file() && answers_version(p))
-        .or_else(|| on_path("chromium")),
+        .or_else(|| on_path("chromium", preferred)),
         "cloudflared" => ["/usr/local/bin/cloudflared", "/usr/bin/cloudflared"]
             .iter()
             .map(PathBuf::from)
             .find(|p| p.is_file())
-            .or_else(|| on_path(name)),
-        "git" => on_path(name).or_else(|| in_dirs(name, &system_dirs())),
+            .or_else(|| on_path(name, preferred)),
+        "git" => on_path(name, preferred).or_else(|| in_dirs(name, &system_dirs())),
         "node" | "bun" => in_dirs(name, &runtime_dirs(ctx)),
-        _ => on_path(name),
+        _ => on_path(name, preferred),
     }
 }
 
@@ -105,8 +109,8 @@ fn runtime_dirs(ctx: &LegacyContext) -> Vec<PathBuf> {
     dirs
 }
 
-fn on_path(name: &str) -> Option<PathBuf> {
-    in_dirs(name, &path_dirs())
+fn on_path(name: &str, preferred: &[PathBuf]) -> Option<PathBuf> {
+    in_dirs(name, preferred).or_else(|| in_dirs(name, &path_dirs()))
 }
 
 fn in_dirs(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
