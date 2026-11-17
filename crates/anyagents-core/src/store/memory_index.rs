@@ -693,7 +693,7 @@ fn open_checked(path: &Path) -> Result<Connection, Error> {
     // free pages.
     conn.pragma_update(None, "secure_delete", "ON")?;
     conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
-    tune_connection(&conn);
+    tune_connection(&conn)?;
     let layout: Option<i64> = conn
         .query_row(
             "SELECT value FROM index_meta WHERE key = 'layout'",

@@ -959,23 +959,23 @@ fn is_transient_sqlite_error(error: &rusqlite::Error) -> bool {
 /// discards SQLite's page cache and re-reads the schema every time; on a
 /// multi-GB store that turned every read into a burst of `pread` syscalls and
 /// pinned the daemon in the kernel. Readers beyond this many simply close.
-const MAX_IDLE_READERS: usize = 32;
-/// Upper bound for memory-mapped I/O (SQLite clamps it to its compile-time
-/// maximum). Mapped pages come straight from the shared OS page cache, so
-/// reads cost no syscalls and no per-connection copy.
-const MMAP_SIZE_BYTES: i64 = 64 * 1024 * 1024 * 1024;
-/// Per-connection page cache, in KiB (negative `cache_size` units).
-const CACHE_SIZE_KIB: i64 = 32 * 1024;
+const MAX_IDLE_READERS: usize = 8;
+/// Use the bounded page cache instead of retaining resident file mappings
+/// across pooled connections. The OS still caches ordinary file reads.
+const MMAP_SIZE_BYTES: i64 = 0;
+/// Per-schema page cache, in KiB (negative `cache_size` units).
+const CACHE_SIZE_KIB: i64 = 2 * 1024;
 /// Prepared statements kept per connection; read paths reuse a few dozen.
 const STATEMENT_CACHE: usize = 128;
 
-/// Apply the shared performance settings to any store connection. Failures
-/// are ignored: each setting is an optimisation, never a correctness need.
-fn tune_connection(conn: &Connection) {
-    let _ = conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES);
-    let _ = conn.pragma_update(None, "cache_size", -CACHE_SIZE_KIB);
-    let _ = conn.pragma_update(None, "temp_store", "MEMORY");
+/// Apply resource bounds to every store/index connection. Do not admit a
+/// connection whose pager settings could not be established.
+pub(crate) fn tune_connection(conn: &Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES)?;
+    conn.pragma_update(None, "cache_size", -CACHE_SIZE_KIB)?;
+    conn.pragma_update(None, "temp_store", "FILE")?;
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+    Ok(())
 }
 
 /// Open one read-only connection for the reader pool.
@@ -987,7 +987,7 @@ fn open_reader(path: &Path) -> Option<Connection> {
     .ok()?;
     let _ = conn.busy_timeout(BUSY_TIMEOUT);
     let _ = conn.pragma_update(None, "query_only", "ON");
-    tune_connection(&conn);
+    tune_connection(&conn).ok()?;
     // The mailbox search index, read-only like the rest of this connection:
     // `rag_chunks` resolves to it, as state has no table of that name. A
     // reader without it is not a reader of this store; none is pooled.
@@ -1007,6 +1007,10 @@ fn attach_memory_index(conn: &Connection, path: &Path) -> Result<(), Error> {
         &format!("ATTACH DATABASE ?1 AS {}", memory_index::ATTACHED),
         [index.as_os_str().to_string_lossy()],
     )?;
+    // Pager settings are per schema: tuning main does not tune an attachment.
+    let schema = Some(memory_index::ATTACHED);
+    conn.pragma_update(schema, "mmap_size", MMAP_SIZE_BYTES)?;
+    conn.pragma_update(schema, "cache_size", -CACHE_SIZE_KIB)?;
     Ok(())
 }
 
@@ -8494,6 +8498,32 @@ mod tests {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn sqlite_resident_cache_limits_cover_writer_reader_and_attachment() {
+        let (_dir, store) = setup();
+        let check = |conn: &Connection, schema| {
+            let cache: i64 = conn
+                .pragma_query_value(schema, "cache_size", |r| r.get(0))
+                .unwrap();
+            let mmap: i64 = conn
+                .pragma_query_value(schema, "mmap_size", |r| r.get(0))
+                .unwrap();
+            assert_eq!(cache, -CACHE_SIZE_KIB);
+            assert_eq!(mmap, 0);
+        };
+        {
+            let writer = store.conn();
+            check(&writer, None);
+            let temporary: i64 = writer
+                .pragma_query_value(None, "temp_store", |r| r.get(0))
+                .unwrap();
+            assert_eq!(temporary, 1, "large sorts must be able to spill to disk");
+        }
+        let reader = store.read_conn();
+        check(&reader, None);
+        check(&reader, Some(memory_index::ATTACHED));
     }
 
     #[test]
