@@ -120,6 +120,11 @@ pub fn run_with_io<R: BufRead + Send + 'static, W: Write + Send + 'static>(
         .map_err(Error::Message);
     }
 
+    if harness == "spiron-cloud" {
+        return spiron::serve(&config, model.as_deref(), resume.as_deref(), reader, writer)
+            .map_err(Error::Message);
+    }
+
     let session_id = Arc::new(Mutex::new(resume));
     let writer = Arc::new(Mutex::new(writer));
 
