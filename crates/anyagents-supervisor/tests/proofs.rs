@@ -434,6 +434,11 @@ fn a_poison_message_is_parked_its_sender_told_and_the_mail_behind_it_flows() {
     scene.poke();
     scene.until_ticking("the mail behind the poison is committed", |s| {
         s.cursor() == after.seq
+            && s.supervisor
+                .as_ref()
+                .and_then(|sup| sup.live(&s.agent))
+                .and_then(|live| live.last_error)
+                .is_some()
     });
     assert_eq!(scene.vendor.launches(), 1, "a refusal restarts nothing");
     assert_eq!(scene.times_written(poison.id.as_str()), 0);

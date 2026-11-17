@@ -204,6 +204,9 @@ pub struct Client<H: Write, P: Write> {
     waiting: VecDeque<String>,
     /// Items cancelled by a transient refusal, held briefly in `drive` to avoid spin.
     cancelled_batch: Vec<String>,
+    /// Bounded FIFO fence after flushing a cancelled batch so a pipelined tail
+    /// line still in host stdin cannot overtake the cancelled head before retry.
+    retry_fence: Option<(String, Instant)>,
     defer_cancel: bool,
     stopping: bool,
     cost_micros_total: Option<u64>,
@@ -234,6 +237,7 @@ impl<H: Write, P: Write> Client<H, P> {
             delivering: None,
             waiting: VecDeque::new(),
             cancelled_batch: Vec::new(),
+            retry_fence: None,
             defer_cancel: false,
             stopping: false,
             cost_micros_total: None,
@@ -350,6 +354,13 @@ impl<H: Write, P: Write> Client<H, P> {
         if text.is_empty() {
             // `acp/v1` takes no empty item; the host is told it never will.
             return self.lifecycle(&event, "refused");
+        }
+        if let Some((ref expected, until)) = self.retry_fence {
+            if expected == &id || Instant::now() >= until {
+                self.retry_fence = None;
+            } else {
+                return self.lifecycle(&event, "cancelled");
+            }
         }
         if !self.lines.contains_key(&id) {
             self.arrival.push(id.clone());
@@ -788,6 +799,11 @@ impl<H: Write, P: Write> Client<H, P> {
 
     fn flush_cancelled(&mut self) -> Result<(), String> {
         let batch = std::mem::take(&mut self.cancelled_batch);
+        if self.defer_cancel
+            && let Some(head) = batch.first()
+        {
+            self.retry_fence = Some((head.clone(), Instant::now() + REFUSAL_BACKOFF));
+        }
         for id in batch {
             self.arrival.retain(|entry| entry != &id);
             if let Some(line) = self.lines.remove(&id) {
@@ -2514,6 +2530,7 @@ mod conformance {
             let first = world.prompt();
             world.fixture.command("refuse");
             let queued = world.receive(2);
+            world.pump_for(std::time::Duration::from_millis(150));
             world.drain(queued[1].seq);
             assert_eq!(
                 ids(&world.fixture.journal()),
