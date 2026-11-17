@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Keeps one harness process running for each agent"
 
 [dependencies]
+tokio = { version = "1", features = ["sync"] }
 anyagents-agent = { path = "../anyagents-agent" }
 anyagents-core = { path = "../anyagents-core" }
 anyagents-harness = { path = "../anyagents-harness" }

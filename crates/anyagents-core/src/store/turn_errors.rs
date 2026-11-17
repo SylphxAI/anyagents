@@ -105,6 +105,29 @@ fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnErrors> {
     })
 }
 
+/// Shared error effects, called only after custody admission for async callbacks.
+pub(super) fn record_error(
+    conn: &rusqlite::Connection,
+    agent_id: &AgentId,
+    error: &str,
+    strike: bool,
+) -> Result<i64, Error> {
+    conn.execute(
+        "INSERT INTO turn_errors (agent_id, streak, last_error, last_error_at_ms)
+         VALUES (?1, ?4, ?2, ?3)
+         ON CONFLICT(agent_id) DO UPDATE SET
+             streak = turn_errors.streak + ?4,
+             last_error = excluded.last_error,
+             last_error_at_ms = excluded.last_error_at_ms",
+        params![agent_id.as_str(), error, now_ms(), i64::from(strike)],
+    )?;
+    Ok(conn.query_row(
+        "SELECT streak FROM turn_errors WHERE agent_id = ?1",
+        [agent_id.as_str()],
+        |row| row.get(0),
+    )?)
+}
+
 impl Store {
     /// Record a turn the harness ended with `error`, and return the strikes
     /// in a row: a `strike` (an error of the session's own) adds one, any
@@ -116,23 +139,10 @@ impl Store {
         error: &str,
         strike: bool,
     ) -> Result<i64, Error> {
-        let add = i64::from(strike);
         self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
-            tx.execute(
-                "INSERT INTO turn_errors (agent_id, streak, last_error, last_error_at_ms)
-                 VALUES (?1, ?4, ?2, ?3)
-                 ON CONFLICT(agent_id) DO UPDATE SET
-                     streak = turn_errors.streak + ?4,
-                     last_error = excluded.last_error,
-                     last_error_at_ms = excluded.last_error_at_ms",
-                params![agent_id.as_str(), error, now_ms(), add],
-            )?;
-            Ok(tx.query_row(
-                "SELECT streak FROM turn_errors WHERE agent_id = ?1",
-                [agent_id.as_str()],
-                |row| row.get::<_, i64>(0),
-            )?)
+            super::turn_events::record_terminal(tx, agent_id, "errored")?;
+            record_error(tx, agent_id, error, strike)
         })
     }
 
