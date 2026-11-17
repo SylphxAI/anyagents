@@ -2366,6 +2366,40 @@ impl Store {
         })
     }
 
+    /// Commit adapter discoveries only if channel and owner still match their
+    /// pre-I/O snapshots. A stale snapshot is a normal no-op, not an overwrite.
+    pub fn compare_set_channel_state(
+        &self,
+        expected: &Channel,
+        owner: &Agent,
+        state: &str,
+    ) -> Result<bool, Error> {
+        serde_json::from_str::<serde_json::Value>(state)
+            .map_err(|_| Error::Message("channel state is not json".into()))?;
+        self.write_tx(|tx| {
+            let mut current = channel_with(tx, &expected.id)?;
+            current.agents = agents_of(tx, &current.id)?;
+            let agent = agent_by_id(tx, &owner.id)?;
+            if current.kind != expected.kind
+                || current.config != expected.config
+                || current.identity != expected.identity
+                || current.state != expected.state
+                || current.credential_ref != expected.credential_ref
+                || current.agents != expected.agents
+                || !current.agents.contains(&owner.id)
+                || agent.state != owner.state
+                || agent.launch_env != owner.launch_env
+            {
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE channels SET state = ?2 WHERE id = ?1",
+                params![expected.id.as_str(), state],
+            )?;
+            Ok(true)
+        })
+    }
+
     pub fn attach_channel(&self, channel_id: &ChannelId, agent_id: &AgentId) -> Result<(), Error> {
         self.write_tx(|tx| {
             channel_with(tx, channel_id)?;
@@ -9128,6 +9162,65 @@ mod tests {
         let missing = AgentId::generate();
         let err = store.receive(&missing, Incoming::new("nope")).unwrap_err();
         assert!(matches!(err, Error::AgentNotFound(_)));
+    }
+
+    #[test]
+    fn channel_state_compare_set_writes_only_over_its_own_snapshot() {
+        let (_dir, store) = setup();
+        let owner = agent(&store, "alpha");
+        let channel = store
+            .create_channel(NewChannel {
+                kind: "telegram".into(),
+                identity: Some("bot".into()),
+                config: "{}".into(),
+                credential_ref: Some("channels/one".into()),
+            })
+            .unwrap();
+        store.attach_channel(&channel.id, &owner.id).unwrap();
+        store
+            .set_channel_state(&channel.id, r#"{"offset":1}"#)
+            .unwrap();
+        let snapshot = store.channel(&channel.id).unwrap().unwrap();
+        let state_of = |store: &Store| store.channel(&channel.id).unwrap().unwrap().state;
+
+        assert!(
+            store
+                .compare_set_channel_state(&snapshot, &owner, r#"{"offset":2}"#)
+                .unwrap()
+        );
+        assert_eq!(state_of(&store), r#"{"offset":2}"#);
+
+        // The state moved on since the snapshot: a stale write is refused.
+        assert!(
+            !store
+                .compare_set_channel_state(&snapshot, &owner, r#"{"offset":9}"#)
+                .unwrap()
+        );
+        assert_eq!(state_of(&store), r#"{"offset":2}"#);
+
+        // The owner's lifecycle changed since it was read: refused.
+        let snapshot = store.channel(&channel.id).unwrap().unwrap();
+        store.set_agent_state(&owner.id, "paused").unwrap();
+        assert!(
+            !store
+                .compare_set_channel_state(&snapshot, &owner, r#"{"offset":9}"#)
+                .unwrap()
+        );
+        let owner = store.agent(&owner.id).unwrap();
+
+        // The owner no longer holds the channel: refused.
+        store.detach_channel_agents(&channel.id).unwrap();
+        assert!(
+            !store
+                .compare_set_channel_state(&snapshot, &owner, r#"{"offset":9}"#)
+                .unwrap()
+        );
+        assert_eq!(state_of(&store), r#"{"offset":2}"#);
+        assert!(
+            store
+                .compare_set_channel_state(&snapshot, &owner, "not json")
+                .is_err()
+        );
     }
 
     #[test]

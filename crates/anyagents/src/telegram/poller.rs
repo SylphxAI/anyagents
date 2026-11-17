@@ -35,22 +35,25 @@ use anyagents_core::{AgentId, Channel, ChannelId, FileCredentialStore, Store, Wa
 
 use super::channel::{
     CHANGES, LONG_POLL_S, Signal, changed, delete_webhook, ensure_webhook, poll_channel_once,
-    reconcile_channel_groups,
+    reconcile_channel_groups, retry_after_s,
 };
 
 /// The longest the supervisor or an idle bot waits with no event. It only
-/// bounds how late a change no event announced is seen.
-const SAFETY_NET: Duration = Duration::from_secs(60);
+/// bounds how late a change no event announced is seen, such as a binding
+/// another process wrote to the store; a look is a few store reads.
+const SAFETY_NET: Duration = Duration::from_secs(10);
 
 /// While a local receipt is still pending, its projection is retried this
 /// often.
 const RECEIPT_RETRY: Duration = Duration::from_secs(2);
 
-/// A failed poll or registration waits this long before it is tried again.
+/// A failed poll or registration waits this long before it is tried again,
+/// unless Telegram asked for a longer wait (`429` with `retry_after`).
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(2);
 
-/// A bot pushed by webhook reconciles its groups this often.
-const WEBHOOK_RECONCILE_EVERY: Duration = Duration::from_secs(30);
+/// A bot reconciles its groups this often, on a thread of its own so the
+/// provider calls it makes never hold back the bot's next poll.
+const GROUPS_RECONCILE_EVERY: Duration = Duration::from_secs(30);
 
 /// The timeout the shutdown's own call carries, so the held long poll and this
 /// one both come back now that Telegram has answered them.
@@ -92,7 +95,7 @@ impl Poller {
 
     /// Signal every polling thread to stop so that when [`release_every_bot`]
     /// interrupts an in-flight long poll, the thread commits its offset and
-    /// exits instead of starting a new 30-second poll.
+    /// exits instead of starting a new long poll.
     pub fn signal_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         changed();
@@ -290,8 +293,86 @@ fn webhook_origin_ready(base: &str) -> bool {
     ok
 }
 
+/// How long a failed provider call waits before the next: what Telegram asked
+/// for when it rate-limited the bot, and never less than the usual pause, so a
+/// flood wait is not lengthened by calls made inside it.
+fn failure_pause(err: &anyagents_core::Error) -> Duration {
+    retry_after_s(err).map_or(RETRY_AFTER_FAILURE, |secs| {
+        Duration::from_secs(secs).max(RETRY_AFTER_FAILURE)
+    })
+}
+
+/// The group reconciliation one bot runs off its polling thread. It is
+/// cancelled between provider calls, and joined before the bot's thread ends,
+/// so no reconciliation outlives the bot that started it.
+#[derive(Default)]
+struct GroupWorker {
+    cancel: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+    started_at: Option<Instant>,
+}
+
+impl GroupWorker {
+    /// Start a reconciliation of `channel` when the last one has finished and
+    /// is [`GROUPS_RECONCILE_EVERY`] old.
+    fn start_when_due(
+        &mut self,
+        store: &Arc<Store>,
+        data_dir: &std::path::Path,
+        channel: &Channel,
+        stops: [&Arc<AtomicBool>; 2],
+    ) {
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return;
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        if self
+            .started_at
+            .is_some_and(|at| at.elapsed() < GROUPS_RECONCILE_EVERY)
+        {
+            return;
+        }
+        let store = Arc::clone(store);
+        let secrets = FileCredentialStore::new(data_dir);
+        let channel = channel.clone();
+        let cancel = [
+            Arc::clone(&self.cancel),
+            Arc::clone(stops[0]),
+            Arc::clone(stops[1]),
+        ];
+        let started = std::thread::Builder::new()
+            .name(format!("anyagents-telegram-groups-{}", channel.id))
+            .spawn(move || {
+                reconcile_channel_groups(&store, &secrets, &channel, &|| {
+                    cancel.iter().any(|flag| flag.load(Ordering::SeqCst))
+                });
+            });
+        match started {
+            Ok(handle) => self.handle = Some(handle),
+            Err(err) => eprintln!("Telegram group reconciliation unavailable: {err}"),
+        }
+        self.started_at = Some(Instant::now());
+    }
+}
+
+impl Drop for GroupWorker {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// One channel's own loop: register its webhook when a live webhook origin is
-/// configured, otherwise long-poll it.
+/// configured, otherwise long-poll it. Group reconciliation runs beside it
+/// (see [`GroupWorker`]), so an update is fetched as soon as Telegram has it.
 fn run_channel(
     store: Arc<Store>,
     data_dir: std::path::PathBuf,
@@ -303,7 +384,7 @@ fn run_channel(
     let stops = [&*stop, &*global_stop];
     let secrets = FileCredentialStore::new(&data_dir);
     let mut webhook_registered_for: Option<String> = None;
-    let mut groups_reconciled_at: Option<Instant> = None;
+    let mut groups = GroupWorker::default();
     while !stop.load(Ordering::SeqCst) && !global_stop.load(Ordering::SeqCst) {
         let seen = signal.generation();
         // The channel is re-read each pass: its saved offset and chats are what
@@ -318,7 +399,7 @@ fn run_channel(
             }
         };
         let Some(channel) = channel else {
-            return;
+            break;
         };
         let active = match channel_has_running_agent(&store, &channel) {
             Ok(active) => active,
@@ -336,6 +417,7 @@ fn run_channel(
             signal.wait(seen, SAFETY_NET, &stops);
             continue;
         }
+        groups.start_when_due(&store, &data_dir, &channel, [&stop, &global_stop]);
         if let Some(base) = configured_webhook_base()
             && webhook_origin_ready(&base)
         {
@@ -343,28 +425,25 @@ fn run_channel(
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     ensure_webhook(&store, &secrets, &channel, &base)
                 }));
-                if matches!(outcome, Ok(Ok(()))) {
-                    webhook_registered_for = Some(base);
-                } else {
-                    signal.pause(RETRY_AFTER_FAILURE, &stops);
-                    continue;
+                match outcome {
+                    Ok(Ok(())) => webhook_registered_for = Some(base),
+                    Ok(Err(err)) => {
+                        signal.pause(failure_pause(&err), &stops);
+                        continue;
+                    }
+                    Err(_) => {
+                        signal.pause(RETRY_AFTER_FAILURE, &stops);
+                        continue;
+                    }
                 }
             }
             // A lifecycle change wakes this loop early so an archived or
             // paused agent's webhook goes at once; the groups themselves are
             // reconciled on their own cadence.
-            if groups_reconciled_at.is_none_or(|at| at.elapsed() >= WEBHOOK_RECONCILE_EVERY) {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    reconcile_channel_groups(&store, &secrets, &channel);
-                }));
-                groups_reconciled_at = Some(Instant::now());
-            }
-            let since = groups_reconciled_at.map_or(Duration::ZERO, |at| at.elapsed());
-            signal.wait(seen, WEBHOOK_RECONCILE_EVERY.saturating_sub(since), &stops);
+            signal.wait(seen, GROUPS_RECONCILE_EVERY, &stops);
             continue;
         }
         webhook_registered_for = None;
-        groups_reconciled_at = None;
         if channel.agents.is_empty() {
             // A bot no agent holds yet has nobody to poll for: wait for the
             // binding instead of asking again at once.
@@ -381,14 +460,17 @@ fn run_channel(
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             poll_channel_once(&store, &secrets, &channel, timeout)
         }));
-        if let Ok(Err(ref err)) = outcome
-            && err.to_string().contains("Conflict: webhook is active")
-        {
-            let _ = delete_webhook(&secrets, &channel);
-        }
-        // A failed poll waits a moment; a good one asks again at once.
-        if !matches!(outcome, Ok(Ok(()))) {
-            signal.pause(RETRY_AFTER_FAILURE, &stops);
+        // A good poll asks again at once; a failed one waits a moment, or as
+        // long as Telegram asked when it rate-limited the bot.
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                if err.to_string().contains("Conflict: webhook is active") {
+                    let _ = delete_webhook(&secrets, &channel);
+                }
+                signal.pause(failure_pause(&err), &stops);
+            }
+            Err(_) => signal.pause(RETRY_AFTER_FAILURE, &stops),
         }
     }
     if webhook_registered_for.is_some()
@@ -539,6 +621,43 @@ mod tests {
         let channel = store.list_channels().unwrap().remove(0);
         (dir, store, channel, agent)
     }
+    fn telegram_error(detail: serde_json::Value) -> anyagents_core::Error {
+        anyagents_core::Error::Message(format!("telegram {detail}"))
+    }
+
+    #[test]
+    fn a_rate_limited_bot_waits_as_long_as_telegram_asked_and_others_the_usual_pause() {
+        let limited = |retry_after: serde_json::Value| {
+            telegram_error(serde_json::json!({
+                "method": "getUpdates", "class": "rate_limited", "status": 429,
+                "error_code": 429, "description": "Telegram rate limit exceeded",
+                "retry_after": retry_after,
+            }))
+        };
+        assert_eq!(
+            failure_pause(&limited(serde_json::json!(37))),
+            Duration::from_secs(37)
+        );
+        // A wait shorter than the usual pause never shortens it.
+        assert_eq!(
+            failure_pause(&limited(serde_json::json!(0))),
+            RETRY_AFTER_FAILURE
+        );
+        assert_eq!(
+            failure_pause(&limited(serde_json::Value::Null)),
+            RETRY_AFTER_FAILURE
+        );
+        // Only a rate limit carries a wait: any other refusal or a transport
+        // error is retried after the usual pause.
+        let conflict = telegram_error(serde_json::json!({
+            "method": "getUpdates", "class": "conflict", "status": 409,
+            "error_code": 409, "description": "Conflict", "retry_after": 60,
+        }));
+        assert_eq!(failure_pause(&conflict), RETRY_AFTER_FAILURE);
+        let transport = anyagents_core::Error::Message("connection reset".into());
+        assert_eq!(failure_pause(&transport), RETRY_AFTER_FAILURE);
+    }
+
     #[test]
     fn failed_census_is_not_an_empty_population() {
         let (dir, store, _, _) = fixture();
