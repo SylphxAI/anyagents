@@ -303,7 +303,42 @@ fn an_errored_result_is_a_failed_turn_with_no_usage() {
         }
     );
     assert_eq!(harness.turns_started(), 1);
+    assert_eq!(harness.turns_served(), 1);
+    assert!(
+        harness
+            .health()
+            .sign_in_fault
+            .as_deref()
+            .is_some_and(|fault| fault.contains("Invalid API key"))
+    );
     assert_eq!(harness.written_ids(), ["m1"]);
+}
+
+#[test]
+fn mid_turn_rate_limit_does_not_advance_turns_served() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    let log = log_path(&dir);
+    let config_text = config.display().to_string();
+    let env = [
+        ("ANYAGENTS_FAKE_MODE", "mid_turn_quota"),
+        ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+        ("CLAUDE_CONFIG_DIR", config_text.as_str()),
+    ];
+    let mut harness = ClaudeHarness::start(env!("CARGO_BIN_EXE_fake_claude"), None, &env).unwrap();
+    let _ = harness.deliver(&msg("m1")).unwrap();
+    assert_eq!(
+        harness.wait_quota(Duration::from_secs(5)),
+        Some(1_700_000_000_000)
+    );
+    assert!(harness.consumed("m1"));
+    assert!(!harness.is_finished("m1"));
+    assert_eq!(
+        harness.turns_served(),
+        0,
+        "a mid-turn rate limit must not count as a completed turn"
+    );
+    assert!(harness.health().sign_in_fault.is_none());
 }
 
 #[test]

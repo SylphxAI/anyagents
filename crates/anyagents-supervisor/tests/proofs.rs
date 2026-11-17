@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyagents_core::{AgentId, Incoming, Message, NewAgent, ReceiveOutcome, Store, Wake};
 use anyagents_harness::{
     DeliverOutcome, Delivery, DeliveryLevel, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    Proof, TurnState,
+    Proof, TurnState, TurnUsage,
 };
 use anyagents_supervisor::{Clock, LaunchRequest, ManualClock, Supervisor};
 
@@ -35,6 +35,9 @@ struct Process {
     prove_on_write: bool,
     /// Ids the vendor refuses for good.
     refused: HashMap<String, String>,
+    usage: TurnUsage,
+    turns_served: u32,
+    drop_delay_ms: u64,
     stopped: bool,
 }
 
@@ -85,6 +88,15 @@ impl Vendor {
 
 struct Scripted {
     process: Arc<Mutex<Process>>,
+}
+
+impl Drop for Scripted {
+    fn drop(&mut self) {
+        let delay = self.process.lock().unwrap().drop_delay_ms;
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+    }
 }
 
 impl Harness for Scripted {
@@ -167,6 +179,18 @@ impl Harness for Scripted {
             quota_reset_at_ms: process.quota_reset_at_ms,
             sign_in_fault: None,
         }
+    }
+
+    fn served_usage(&self) -> TurnUsage {
+        self.process.lock().unwrap().usage.clone()
+    }
+
+    fn turns_served(&self) -> u32 {
+        self.process.lock().unwrap().turns_served
+    }
+
+    fn clear_quota(&mut self) {
+        self.process.lock().unwrap().quota_reset_at_ms = None;
     }
 }
 
@@ -460,4 +484,136 @@ fn a_poison_message_is_parked_its_sender_told_and_the_mail_behind_it_flows() {
             .is_some_and(|error| error.contains(poison.id.as_str())),
         "{live:?}"
     );
+}
+
+#[test]
+fn mid_turn_quota_and_profile_rotation_preserve_open_turn_and_auto_resume() {
+    let scene = Scene::new(true);
+    let first = scene.receive("ship the interrupted task");
+    scene.until("the first line is committed", |s| s.cursor() == first.seq);
+    assert!(scene.store.has_open_turn(&scene.agent).unwrap());
+
+    // The process serves partial usage mid-turn, then stops on a quota hold
+    // without completing the turn (turns_served == 0).
+    {
+        let proc0 = scene.vendor.process(0);
+        let mut proc0 = proc0.lock().unwrap();
+        proc0.usage = TurnUsage {
+            input_tokens: 19,
+            output_tokens: 13,
+            reported_cost_micros: Some(250_000),
+            ..TurnUsage::default()
+        };
+        proc0.quota_reset_at_ms = Some(START_MS + 3_600_000);
+        proc0.in_turn = false;
+    }
+    scene.poke();
+    scene.until("partial usage before the hold is recorded", |s| {
+        s.store.list_usage(Some(&s.agent)).unwrap().len() == 1
+    });
+    assert!(
+        scene.store.has_open_turn(&scene.agent).unwrap(),
+        "mid-turn quota hold must not mark the interrupted turn completed"
+    );
+
+    // Profile rotation (`anthropic/default -> anthropic/cubeage-insight`) updates
+    // the rotation marker and wakes the supervisor.
+    let config = anyagents_core::agent_config_dir(&scene.data, &scene.agent);
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join(".anyagents-profile-rotated-ms"),
+        format!("{}\n", START_MS + 1),
+    )
+    .unwrap();
+    scene.poke();
+    scene.until_ticking(
+        "profile rotation launches a replacement and delivers [Recovery] automatically",
+        |s| s.vendor.launches() == 2 && !s.written_to(1).is_empty(),
+    );
+    assert!(
+        scene.store.has_open_turn(&scene.agent).unwrap(),
+        "open turn obligation must survive process replacement until the resumed turn finishes"
+    );
+    let written = scene.written_to(1);
+    assert!(written[0].starts_with("recovery_"), "{written:?}");
+    let note = scene.vendor.process(1).lock().unwrap().written[0].1.clone();
+    assert!(note.contains("ship the interrupted task"), "{note}");
+
+    // Once the rotated process finishes the recovered turn, the open turn closes.
+    {
+        let proc1 = scene.vendor.process(1);
+        let mut proc1 = proc1.lock().unwrap();
+        proc1.turns_served = 1;
+        proc1.in_turn = false;
+    }
+    scene.poke();
+    scene.until_ticking("the resumed turn completes cleanly", |s| {
+        !s.store.has_open_turn(&s.agent).unwrap()
+    });
+    assert_eq!(
+        scene
+            .store
+            .agent_turn_snapshot(&scene.agent)
+            .unwrap()
+            .outcome
+            .as_deref(),
+        Some("completed")
+    );
+}
+
+#[test]
+fn state_only_datagram_pokes_store_changes_without_starting_worker() {
+    let scene = Scene::new(true);
+    scene.store.set_agent_state(&scene.agent, "paused").unwrap();
+    scene.until("paused worker stops", |s| {
+        s.supervisor
+            .as_ref()
+            .unwrap()
+            .live(&s.agent)
+            .is_some_and(|live| !live.process_alive)
+    });
+    let launches_before = scene.vendor.launches();
+    let mut rx = scene.store.subscribe_changes();
+    let baseline = *rx.borrow_and_update();
+
+    let sock = std::os::unix::net::UnixDatagram::unbound().unwrap();
+    sock.send_to(b"s", scene.data.join("wake.sock")).unwrap();
+
+    scene.until("b's' datagram advances Store::subscribe_changes", |_| {
+        *rx.borrow() != baseline
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        scene.vendor.launches(),
+        launches_before,
+        "b's' datagram must never ensure or spawn a worker"
+    );
+}
+
+#[test]
+fn inbound_mail_during_slow_worker_retirement_wakes_replacement_deterministically() {
+    let scene = Scene::new(true);
+    let first = scene.receive("turn before idle");
+    scene.until("first message delivered", |s| s.cursor() == first.seq);
+    {
+        let proc0 = scene.vendor.process(0);
+        let mut proc0 = proc0.lock().unwrap();
+        // Hold AgentLock past stop_slot's 250ms wait while retiring.
+        proc0.drop_delay_ms = 450;
+        proc0.turns_served = 1;
+        proc0.in_turn = false;
+    }
+    scene.poke();
+    scene.until_ticking("agent scales to idle", |s| {
+        s.store.agent(&s.agent).unwrap().state == "idle"
+    });
+
+    // Immediately send new mail while the retiring worker is still inside Drop
+    // holding AgentLock: the first replacement hits Boot::Busy, and finish_run
+    // must hand off cleanly once AgentLock is released.
+    let followup = scene.receive("wake after slow teardown");
+    scene.until_ticking("followup mail is delivered without stranding", |s| {
+        s.cursor() == followup.seq
+    });
+    assert_eq!(scene.store.agent(&scene.agent).unwrap().state, "running");
 }

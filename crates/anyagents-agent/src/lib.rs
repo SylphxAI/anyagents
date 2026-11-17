@@ -63,6 +63,15 @@ pub struct Rejection {
     pub reason: String,
 }
 
+/// Custody of the latest mailbox delivery admitted by this loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnCustody {
+    /// Admitted `delivered_seq` whose terminal outcome is still open.
+    Open(i64),
+    /// Synchronous `turn_finished` already accepted `note_turn_completed_for(seq)`.
+    Completed(i64),
+}
+
 /// One running agent: the mailbox, the per-agent lock, and its harness.
 pub struct DeliveryLoop<H: Harness> {
     store: Store,
@@ -80,11 +89,17 @@ pub struct DeliveryLoop<H: Harness> {
     /// The same reason again means the vendor refuses everything, not one
     /// message: the breaker stops parking.
     last_rejection: Option<String>,
+    custody: Option<TurnCustody>,
 }
 
 /// Commit, in sequence order, every message past the cursor `harness`
 /// proved it took, stopping at the first it has not.
-fn commit_proofs<H: Harness>(store: &Store, agent_id: &AgentId, harness: &H) -> Result<u64, Error> {
+fn commit_proofs<H: Harness>(
+    store: &Store,
+    agent_id: &AgentId,
+    harness: &H,
+    mut custody: Option<&mut Option<TurnCustody>>,
+) -> Result<u64, Error> {
     let mut committed = 0;
     while let Some(message) = store.next_undelivered(agent_id)? {
         match harness.proven(message.id.as_str()) {
@@ -94,11 +109,19 @@ fn commit_proofs<H: Harness>(store: &Store, agent_id: &AgentId, harness: &H) -> 
                     && harness.health().sign_in_fault.is_none()
                     && priority::may_complete(store, agent_id, harness, &message)?
                 {
-                    store.note_turn_completed(agent_id)?;
+                    let accepted = store.note_turn_completed_for(agent_id, message.seq)?;
+                    if let Some(slot) = custody.as_deref_mut() {
+                        *slot = accepted.then_some(TurnCustody::Completed(message.seq));
+                    }
+                } else if let Some(slot) = custody.as_deref_mut() {
+                    *slot = Some(TurnCustody::Open(message.seq));
                 }
             }
             Some(Proof::Duplicate) => {
                 store.note_delivered(agent_id, message.seq)?;
+                if let Some(slot) = custody.as_deref_mut() {
+                    *slot = Some(TurnCustody::Open(message.seq));
+                }
             }
             None => break,
         }
@@ -159,6 +182,7 @@ impl<H: Harness> DeliveryLoop<H> {
             recovery: None,
             rejections: Vec::new(),
             last_rejection,
+            custody: None,
         }
     }
 
@@ -183,6 +207,7 @@ impl<H: Harness> DeliveryLoop<H> {
             recovery: None,
             rejections: Vec::new(),
             last_rejection: None,
+            custody: None,
         })
     }
 
@@ -372,6 +397,7 @@ impl<H: Harness> DeliveryLoop<H> {
                     // Part of the turn the earlier process ran: it extends
                     // that turn and never completes it.
                     self.store.note_delivered(&self.agent_id, seq)?;
+                    self.custody = Some(TurnCustody::Open(seq));
                     self.quota_reset_at_ms = None;
                     self.last_rejection = None;
                 }
@@ -387,7 +413,10 @@ impl<H: Harness> DeliveryLoop<H> {
                             &message,
                         )?
                     {
-                        self.store.note_turn_completed(&self.agent_id)?;
+                        let accepted = self.store.note_turn_completed_for(&self.agent_id, seq)?;
+                        self.custody = accepted.then_some(TurnCustody::Completed(seq));
+                    } else {
+                        self.custody = Some(TurnCustody::Open(seq));
                     }
                     delivered += 1;
                     self.quota_reset_at_ms = None;
@@ -417,7 +446,12 @@ impl<H: Harness> DeliveryLoop<H> {
     /// written, so this is safe on a process about to be replaced, a dead
     /// one, or one held by a quota. Returns how many were committed.
     pub fn commit_proven(&mut self) -> Result<u64, Error> {
-        let committed = commit_proofs(&self.store, &self.agent_id, &self.harness)?;
+        let committed = commit_proofs(
+            &self.store,
+            &self.agent_id,
+            &self.harness,
+            Some(&mut self.custody),
+        )?;
         if committed > 0 {
             self.last_rejection = None;
         }
@@ -430,7 +464,7 @@ impl<H: Harness> DeliveryLoop<H> {
     /// What it took is never handed to this loop's process again.
     pub fn retire_other(&mut self, mut other: H) -> Result<u64, Error> {
         other.stop();
-        let committed = commit_proofs(&self.store, &self.agent_id, &other)?;
+        let committed = commit_proofs(&self.store, &self.agent_id, &other, None)?;
         if committed > 0 {
             self.last_rejection = None;
         }
@@ -447,6 +481,9 @@ impl<H: Harness> DeliveryLoop<H> {
     fn reject(&mut self, message: &Message, reason: &str) -> Result<(), Error> {
         self.store
             .reject_message(&self.agent_id, message.seq, reason)?;
+        if matches!(self.custody, Some(TurnCustody::Open(_))) {
+            self.custody = Some(TurnCustody::Open(message.seq));
+        }
         self.rejections.push(Rejection {
             message_id: message.id.as_str().to_string(),
             seq: message.seq,
@@ -504,12 +541,59 @@ impl<H: Harness> DeliveryLoop<H> {
         self.harness = harness;
         self.quota_reset_at_ms = None;
         self.recovery = None;
+        self.custody = None;
     }
 
     /// Clear a quota wait on the loop and on the harness.
     pub fn clear_quota(&mut self) {
         self.quota_reset_at_ms = None;
         self.harness.clear_quota();
+    }
+
+    /// Admitted `delivered_seq` for an in-progress turn held by this loop.
+    pub fn admitted_seq(&self) -> Option<i64> {
+        match self.custody {
+            Some(TurnCustody::Open(seq)) => Some(seq),
+            _ => None,
+        }
+    }
+
+    /// Restore open turn custody carried across a detached process takeover.
+    pub fn restore_admitted_seq(&mut self, delivered_seq: Option<i64>) {
+        self.custody = delivered_seq.filter(|&seq| seq > 0).map(TurnCustody::Open);
+    }
+
+    /// Complete callback-owned delivery custody. Returns `Ok(false)` without
+    /// mutating recovery or error state when custody is absent, stale, or
+    /// already consumed.
+    pub fn complete_turn(&mut self) -> Result<bool, Error> {
+        match self.custody {
+            Some(TurnCustody::Open(seq)) => {
+                let accepted = self.store.note_turn_completed_for(&self.agent_id, seq)?;
+                self.custody = None;
+                Ok(accepted)
+            }
+            Some(TurnCustody::Completed(seq)) => {
+                let current = self.store.delivered_cursor(&self.agent_id)? == seq;
+                self.custody = None;
+                Ok(current)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Record an errored turn only when this loop holds exact open custody for
+    /// `delivered_seq`. Returns `Ok(false)` when stale, duplicate, or unowned.
+    pub fn error_turn(&mut self, error: &str, strike: bool) -> Result<bool, Error> {
+        let Some(TurnCustody::Open(seq)) = self.custody else {
+            self.custody = None;
+            return Ok(false);
+        };
+        let accepted = self
+            .store
+            .note_turn_errored_for(&self.agent_id, seq, error, strike)?;
+        self.custody = None;
+        Ok(accepted)
     }
 
     pub fn store(&self) -> &Store {
@@ -539,6 +623,10 @@ impl<H: Harness> DeliveryLoop<H> {
         match &outcome {
             // A note an earlier process already consumed was delivered then.
             DeliverOutcome::Duplicate | DeliverOutcome::Accepted { .. } => {
+                let seq = self
+                    .store
+                    .delivered_cursor(&self.agent_id)?
+                    .max(open.opened_seq);
                 self.store
                     .note_turn_recovered(&self.agent_id, open.opened_seq)?;
                 // A recovered turn that ended in an error is not completed:
@@ -556,7 +644,10 @@ impl<H: Harness> DeliveryLoop<H> {
                         note.seq,
                     )?;
                 if turn_finished {
-                    self.store.note_turn_completed(&self.agent_id)?;
+                    let accepted = self.store.note_turn_completed_for(&self.agent_id, seq)?;
+                    self.custody = accepted.then_some(TurnCustody::Completed(seq));
+                } else {
+                    self.custody = Some(TurnCustody::Open(seq));
                 }
                 self.recovery = None;
                 self.quota_reset_at_ms = None;
@@ -1260,6 +1351,47 @@ mod tests {
         ));
         assert!(loop_.recovery.is_none());
         assert!(loop_.harness().written_ids().contains(&note.id));
+    }
+
+    #[test]
+    fn checked_turn_custody_rejects_unowned_stale_and_duplicate_callbacks() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        assert!(!loop_.complete_turn().unwrap());
+        assert!(!loop_.error_turn("unowned", true).unwrap());
+        assert!(loop_.store().turn_errors(&id).unwrap().is_none());
+        assert_eq!(loop_.store().agent_turn_snapshot(&id).unwrap().turn_seq, 0);
+
+        let first = recv(loop_.store(), &id, "first");
+        assert_eq!(
+            loop_.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 1 }
+        );
+        assert_eq!(loop_.admitted_seq(), Some(first));
+
+        // Simulate a newer delivery advancing the mailbox cursor past this loop's
+        // admitted sequence: stale completion and error callbacks must return false
+        // without closing the newer turn or recording strikes.
+        let second = recv(loop_.store(), &id, "second");
+        loop_.store().note_delivered(&id, second).unwrap();
+        assert!(!loop_.complete_turn().unwrap());
+        assert!(loop_.store().has_open_turn(&id).unwrap());
+        assert_eq!(loop_.store().agent_turn_snapshot(&id).unwrap().turn_seq, 0);
+
+        loop_.restore_admitted_seq(Some(first));
+        assert!(!loop_.error_turn("stale strike", true).unwrap());
+        assert!(loop_.store().turn_errors(&id).unwrap().is_none());
+        assert!(loop_.store().has_open_turn(&id).unwrap());
+
+        // Exact current custody succeeds once and suppresses duplicates.
+        loop_.restore_admitted_seq(Some(second));
+        assert!(loop_.complete_turn().unwrap());
+        assert!(!loop_.store().has_open_turn(&id).unwrap());
+        let done = loop_.store().agent_turn_snapshot(&id).unwrap();
+        assert_eq!(done.turn_seq, 1);
+        assert_eq!(done.outcome.as_deref(), Some("completed"));
+        assert!(!loop_.complete_turn().unwrap());
+        assert!(!loop_.error_turn("late error", true).unwrap());
+        assert_eq!(loop_.store().agent_turn_snapshot(&id).unwrap(), done);
     }
 }
 

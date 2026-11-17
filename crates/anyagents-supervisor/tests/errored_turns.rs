@@ -621,3 +621,108 @@ fn systemic_errors_back_off_and_never_park() {
         .unwrap()));
     support::stop(fx.supervisor);
 }
+
+#[test]
+fn stale_custody_error_callback_suppresses_strikes_and_followup_side_effects() {
+    #[derive(Default)]
+    struct StaleState {
+        admitted: bool,
+        fire_error: bool,
+        given: Vec<String>,
+    }
+
+    struct StaleHarness(Arc<Mutex<StaleState>>);
+
+    impl Harness for StaleHarness {
+        fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+            let mut state = self.0.lock().unwrap();
+            if !state.admitted {
+                state.admitted = true;
+                state.given.push(message.id.clone());
+                return Ok(DeliverOutcome::Accepted {
+                    turn_finished: false,
+                });
+            }
+            Ok(DeliverOutcome::Deferred)
+        }
+        fn background(&mut self) -> Result<(), HarnessError> {
+            Ok(())
+        }
+        fn resume(&mut self, _: &str) -> Result<(), HarnessError> {
+            Ok(())
+        }
+        fn cancel(&mut self) -> Result<(), HarnessError> {
+            Ok(())
+        }
+        fn health(&self) -> HarnessHealth {
+            let state = self.0.lock().unwrap();
+            HarnessHealth {
+                process_alive: true,
+                turn_state: if state.admitted && !state.fire_error {
+                    TurnState::InTurn
+                } else {
+                    TurnState::Idle
+                },
+                delivery: Delivery {
+                    level: DeliveryLevel::MidTurn,
+                    idempotent: false,
+                    proof: std::borrow::Cow::Borrowed("stale-double"),
+                    peer: None,
+                },
+                quota_reset_at_ms: None,
+                sign_in_fault: state.fire_error.then(|| OVERFLOW.to_string()),
+            }
+        }
+        fn turns_served(&self) -> u32 {
+            u32::from(self.0.lock().unwrap().fire_error)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let worker = store
+        .create_agent(NewAgent::new("worker", "spiron"))
+        .unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    store
+        .set_agent_running(&worker.id, &work.display().to_string())
+        .unwrap();
+    let shared = Arc::new(Mutex::new(StaleState::default()));
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(SystemClock::new()),
+        {
+            let shared = Arc::clone(&shared);
+            Arc::new(move |_: LaunchRequest| Ok(StaleHarness(Arc::clone(&shared))))
+        },
+        Vec::new(),
+    )
+    .unwrap();
+
+    let first = received(&store, &worker, "first turn");
+    assert!(wait_until(
+        || store.delivered_cursor(&worker.id).unwrap() == first.seq
+    ));
+
+    // Advance durable custody to a newer message before the old turn's error arrives.
+    let second = received(&store, &worker, "newer turn");
+    store.note_delivered(&worker.id, second.seq).unwrap();
+    shared.lock().unwrap().fire_error = true;
+    store.poke(anyagents_core::Wake::Agent {
+        agent_id: worker.id.clone(),
+    });
+    std::thread::sleep(Duration::from_millis(400));
+
+    assert!(
+        store.turn_errors(&worker.id).unwrap().is_none(),
+        "stale error callback must not record strikes"
+    );
+    assert_eq!(store.agent_turn_snapshot(&worker.id).unwrap().turn_seq, 0);
+    assert_eq!(
+        store.open_turn(&worker.id).unwrap().map(|o| o.opened_seq),
+        Some(second.seq)
+    );
+    assert_eq!(store.inbox(&worker.id, None).unwrap().len(), 2);
+    support::stop(supervisor);
+}

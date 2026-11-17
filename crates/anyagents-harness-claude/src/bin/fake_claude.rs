@@ -170,7 +170,17 @@ fn main() {
             let _ = writeln!(stdout, "{SYNTHETIC_401_ASSISTANT}");
             let _ = writeln!(stdout, "{SYNTHETIC_401_RESULT}");
         }
-        if mode == "finish" && users == 1 {
+        if (mode == "finish" || mode == "mid_turn_quota") && users == 1 {
+            if mode == "mid_turn_quota"
+                && let Some(transcript) = &transcript
+                && let Ok(mut file) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(transcript)
+            {
+                let row = json!({"type": "cost-state", "sessionId": session, "totalCostUSD": 0.25});
+                let _ = writeln!(file, "{row}");
+            }
             let _ = writeln!(stdout, "{QUOTA}");
         }
         let _ = stdout.flush();
