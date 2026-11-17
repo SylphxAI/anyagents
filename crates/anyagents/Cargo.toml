@@ -51,6 +51,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tokio-stream = "0.1"
 toml = "0.9"
 ureq = { version = "3", features = ["json"] }
+url = "2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 roxmltree = "0.21"
 
@@ -63,7 +64,6 @@ roxmltree = "0.21"
 agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "ec73f6cf0d36d42cf02b3a19e0d0765a3d9082a6" }
 async-trait = "0.1"
 tower = { version = "0.5", features = ["util"] }
-url = "2"
 
 [dev-dependencies]
 anyagents-agent = { path = "../anyagents-agent" }

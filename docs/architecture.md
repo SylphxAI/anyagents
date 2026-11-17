@@ -30,7 +30,7 @@ The established pattern for running vendor agents is a long-lived gateway that d
 
 AnyAgents never runs an internal LLM loop. Every agent is a pure composition of three orthogonal axes:
 
-- **Harness (`anyagents-harness`, `spiron`, `cloud_harness`):** Which external single-agent loop executes turns (`spiron` CLI / `spiron-cloud` at `https://spiron.ai`, `claude-code` / `claude-cloud`, `codex` / `openai-cloud`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, `cursor-cloud`).
+- **Harness (`anyagents-harness`, `spiron`, `cloud_harness`):** Which external single-agent loop executes turns (`spiron` CLI / `spiron-cloud` at `https://api.spiron.ai`, `claude-code` / `claude-cloud`, `codex` / `openai-cloud`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, `cursor-cloud`).
 - **Profile (`profiles/<provider>/<profile>`):** Which upstream subscription or API key authenticates (`anthropic`, `openai`, `google-antigravity`, `muse`, `openrouter`, `sylphx`, Coding Plans). Profile-to-harness resolution is strictly **fail-closed**: if a bound profile has no mapping for the target harness (for example, binding an OAuth-only subscription profile to `opencode` without an OpenCode provider/auth/key mapping), AnyAgents refuses configuration rather than writing an empty config that silently degrades to an external free tier.
 - **Sandbox (`anyagents_tools::WorkspaceBackend` trait):** Where filesystem and shell operations execute—`LocalWorkspace` (default host directory or git worktree), `RemoteSandboxWorkspace` (Cloud Sandbox / E2B HTTP APIs), `DockerWorkspace` (`docker://<host>`), or custom trait implementations.
 
