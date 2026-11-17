@@ -17,6 +17,7 @@ use clap::Args;
 use serde_json::{Value, json};
 
 mod acp;
+mod spiron;
 
 #[derive(Args, Clone, Debug)]
 pub struct CloudHarnessArgs {
@@ -430,7 +431,7 @@ fn resolve_cloud_base_url(config: &Path, harness: &str) -> String {
             .or_else(|| std::env::var("SPIRON_CLOUD_URL").ok())
             .filter(|s| !s.trim().is_empty())
             .or(json_url)
-            .unwrap_or_else(|| "https://spiron.ai".to_string())
+            .unwrap_or_else(|| "https://api.spiron.ai".to_string())
             .trim_end_matches('/')
             .to_string(),
         "claude-cloud" => std::env::var("ANYAGENTS_ANTHROPIC_API_URL")
@@ -697,6 +698,16 @@ pub fn dispatch_cloud_turn_with_cancel(
     // The remote session token the server issued for this agent, read before
     // every turn so a rotation takes effect at once. The agent's local mailbox
     // capability is never handed to a vendor.
+    if normalize_harness_name(harness) == "spiron-cloud" {
+        return spiron::dispatch(
+            config,
+            model,
+            session_id,
+            prompt_text,
+            cancel_flag,
+            active_job_id,
+        );
+    }
     let capability = crate::remote::session_token(config)?;
     let mcp_base_url = resolve_public_mcp_url(config)?;
     let base_url = resolve_cloud_base_url(config, harness);
@@ -708,25 +719,6 @@ pub fn dispatch_cloud_turn_with_cancel(
     let disabled_tools = resolve_cloud_disabled_tools(config);
 
     let (endpoint, payload) = match canonical {
-        "spiron-cloud" => {
-            let mut body = json!({
-                "prompt": prompt_text,
-                "model": model.unwrap_or("claude-sonnet-4.6"),
-                "session_id": session_id,
-                "mcp_servers": [
-                    {
-                        "name": "anyagents",
-                        "url": mcp_url,
-                        "bearer_token": capability,
-                    }
-                ],
-                "disabled_tools": disabled_tools,
-            });
-            if let Some(sys) = system_prompt {
-                body["system_prompt"] = Value::String(sys);
-            }
-            (format!("{base_url}/api/agent-runs"), body)
-        }
         "claude-cloud" => {
             let mut body = json!({
                 "model": model.unwrap_or("claude-sonnet-4-6"),
@@ -919,15 +911,18 @@ fn extract_cloud_job_id(parsed: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-pub fn cloud_job_status_url(base_url: &str, harness: &str, job_id: &str) -> String {
+pub fn cloud_job_status_url(base_url: &str, harness: &str, job_id: &str) -> Result<String, String> {
     let base = base_url.trim_end_matches('/');
-    match normalize_harness_name(harness) {
-        "spiron-cloud" => format!("{base}/api/agent-runs/{job_id}"),
+    Ok(match normalize_harness_name(harness) {
+        "spiron-cloud" => {
+            let job_id = spiron::validate_id(job_id, "job_id")?;
+            format!("{base}/v1/message-receipts/{job_id}")
+        }
         "claude-cloud" => format!("{base}/v1/messages/{job_id}"),
         "openai-cloud" => format!("{base}/v1/responses/{job_id}"),
         "cursor-cloud" => format!("{base}/v0/agents/{job_id}"),
-        _ => format!("{base}/api/agent-runs/{job_id}"),
-    }
+        _ => return Err("unsupported cloud harness".into()),
+    })
 }
 
 pub fn cancel_cloud_turn(
@@ -936,9 +931,17 @@ pub fn cancel_cloud_turn(
     auth_token: Option<&str>,
     job_id: &str,
 ) -> Result<(), String> {
-    let status_url = cloud_job_status_url(base_url, harness, job_id);
-    let cancel_url = format!("{status_url}/cancel");
     let canonical = normalize_harness_name(harness);
+    let cancel_url = if canonical == "spiron-cloud" {
+        let base = base_url.trim_end_matches('/');
+        let job_id = spiron::validate_id(job_id, "job_id")?;
+        format!("{base}/v1/message-receipts/{job_id}:cancel")
+    } else {
+        format!(
+            "{}/cancel",
+            cloud_job_status_url(base_url, canonical, job_id)?
+        )
+    };
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .http_status_as_error(false)
@@ -953,10 +956,41 @@ pub fn cancel_cloud_turn(
             req = req.header("x-api-key", tok);
         }
     }
-    let mut resp = req
-        .send_json(json!({ "action": "cancel" }))
-        .map_err(|e| format!("cancel request to {cancel_url} failed: {e}"))?;
+    let mut resp = if canonical == "spiron-cloud" {
+        req.send_empty()
+    } else {
+        req.send_json(json!({ "action": "cancel" }))
+    }
+    .map_err(|e| format!("cancel request to {cancel_url} failed: {e}"))?;
     let status = resp.status().as_u16();
+    if canonical == "spiron-cloud" {
+        if status == 409 {
+            return Ok(());
+        } // Completion won the cancellation race.
+        if status != 200 {
+            return Err(format!("Spiron cancellation returned HTTP {status}"));
+        }
+        let receipt: Value = resp
+            .body_mut()
+            .read_json()
+            .map_err(|_| "invalid Spiron cancel receipt")?;
+        if receipt.get("id").and_then(Value::as_str) != Some(job_id)
+            || !matches!(
+                receipt.get("status").and_then(Value::as_str),
+                Some(
+                    "submitted"
+                        | "working"
+                        | "input_required"
+                        | "canceled"
+                        | "completed"
+                        | "failed"
+                )
+            )
+        {
+            return Err("Spiron cancellation was not confirmed".into());
+        }
+        return Ok(());
+    }
     if !(200..300).contains(&status) {
         let body = resp.body_mut().read_to_string().unwrap_or_default();
         return Err(format!("cancel returned HTTP {status}: {}", body.trim()));
@@ -1010,7 +1044,7 @@ fn poll_cloud_job_until_done(
     job_id: &str,
     cancel_flag: &TurnCancel,
 ) -> Result<Value, String> {
-    let status_url = cloud_job_status_url(base_url, canonical, job_id);
+    let status_url = cloud_job_status_url(base_url, canonical, job_id)?;
     let first = Duration::from_millis(
         std::env::var("ANYAGENTS_CLOUD_POLL_INTERVAL_MS")
             .ok()
@@ -1303,7 +1337,6 @@ mod tests {
     async fn cloud_harness_dispatches_spiron_claude_openai_and_cursor_turns_with_mcp_capability() {
         #[derive(Default)]
         struct RecordedCalls {
-            spiron: Mutex<Vec<Value>>,
             claude: Mutex<Vec<(String, Value)>>,
             openai: Mutex<Vec<Value>>,
             cursor: Mutex<Vec<Value>>,
@@ -1311,26 +1344,6 @@ mod tests {
 
         let recorded = Arc::new(RecordedCalls::default());
         let app = Router::new()
-            .route(
-                "/api/agent-runs",
-                post({
-                    let rec = Arc::clone(&recorded);
-                    move |axum::Json(payload): axum::Json<Value>| {
-                        let rec = Arc::clone(&rec);
-                        async move {
-                            rec.spiron.lock().unwrap().push(payload);
-                            (
-                                StatusCode::OK,
-                                axum::Json(json!({
-                                    "session_id": "spiron-sess-99",
-                                    "result": "spiron cloud turn ok",
-                                    "usage": { "input_tokens": 11, "output_tokens": 22 }
-                                })),
-                            )
-                        }
-                    }
-                }),
-            )
             .route(
                 "/v1/messages",
                 post({
@@ -1437,41 +1450,6 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-
-        // 1. spiron-cloud (treated uniformly with other cloud harnesses)
-        let cfg_clone = cfg.clone();
-        let spiron_out = tokio::task::spawn_blocking(move || {
-            dispatch_cloud_turn(
-                &cfg_clone,
-                "spiron-cloud",
-                Some("claude-sonnet-4.6"),
-                None,
-                "ping spiron",
-            )
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(spiron_out.session_id, "spiron-sess-99");
-        assert_eq!(spiron_out.reply_text, "spiron cloud turn ok");
-        {
-            let calls = recorded.spiron.lock().unwrap();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0]["prompt"], "ping spiron");
-            assert_eq!(
-                calls[0]["mcp_servers"][0]["url"],
-                "https://mcp.example.test/mcp?profile=remote"
-            );
-            assert_eq!(calls[0]["mcp_servers"][0]["bearer_token"], remote.as_str());
-            assert_eq!(calls[0]["disabled_tools"], json!(["bash", "write"]));
-            let sys = calls[0]["system_prompt"].as_str().unwrap();
-            assert!(sys.contains("<learned_memory>"), "{sys}");
-            assert!(sys.contains("<available_skills>"), "{sys}");
-            assert!(
-                sys.contains("- `prove-it`: Use when verifying a live status"),
-                "{sys}"
-            );
-        }
 
         // 2. claude-cloud
         let cfg_clone = cfg.clone();
@@ -1639,11 +1617,11 @@ mod tests {
                     )
                 }),
             )
-            // 3. Spiron async job polling (`queued` -> `running` -> `completed`) & cancel (`POST /api/agent-runs/{id}/cancel`)
+            // 3. Cursor async job polling (`queued` -> `running` -> `completed`) & cancel (`POST /v0/agents/{id}/cancel`)
             .route(
-                "/api/agent-runs",
+                "/v0/agents",
                 post(|axum::Json(payload): axum::Json<Value>| async move {
-                    let prompt = payload.get("prompt").and_then(Value::as_str).unwrap_or("");
+                    let prompt = payload.pointer("/prompt/text").and_then(Value::as_str).unwrap_or("");
                     if prompt.contains("slow-cancel") {
                         (
                             StatusCode::ACCEPTED,
@@ -1664,7 +1642,7 @@ mod tests {
                 }),
             )
             .route(
-                "/api/agent-runs/run_poll_44",
+                "/v0/agents/run_poll_44",
                 get({
                     let pc = Arc::clone(&poll_count);
                     move || {
@@ -1696,7 +1674,7 @@ mod tests {
                 }),
             )
             .route(
-                "/api/agent-runs/run_cancel_55",
+                "/v0/agents/run_cancel_55",
                 get(|| async move {
                     (
                         StatusCode::OK,
@@ -1708,7 +1686,7 @@ mod tests {
                 }),
             )
             .route(
-                "/api/agent-runs/run_cancel_55/cancel",
+                "/v0/agents/run_cancel_55/cancel",
                 post({
                     let cr = Arc::clone(&cancel_recorded);
                     move || {
@@ -1783,7 +1761,7 @@ mod tests {
         // 3. Verify Async Job Polling (`queued` -> `running` -> `completed`)
         let cfg_clone = cfg.clone();
         let polled = tokio::task::spawn_blocking(move || {
-            dispatch_cloud_turn(&cfg_clone, "spiron-cloud", None, None, "poll test").unwrap()
+            dispatch_cloud_turn(&cfg_clone, "cursor-cloud", None, None, "poll test").unwrap()
         })
         .await
         .unwrap();
@@ -1836,7 +1814,7 @@ mod tests {
             run_with_io(
                 CloudHarnessArgs {
                     config: Some(cfg_clone),
-                    harness: Some("spiron-cloud".into()),
+                    harness: Some("cursor-cloud".into()),
                     model: None,
                     resume: None,
                 },
@@ -1851,7 +1829,7 @@ mod tests {
         let recorded_cancels = cancel_recorded.lock().unwrap().clone();
         assert!(
             recorded_cancels.contains(&"run_cancel_55".to_string()),
-            "expected POST /api/agent-runs/run_cancel_55/cancel to be invoked, got {recorded_cancels:?}"
+            "expected POST /v0/agents/run_cancel_55/cancel to be invoked, got {recorded_cancels:?}"
         );
         let stdout_str = String::from_utf8(out_buf.0.lock().unwrap().clone()).unwrap();
         assert!(
@@ -1862,7 +1840,7 @@ mod tests {
         server_handle.abort();
     }
     #[test]
-    fn spiron_cloud_defaults_to_spiron_ai_and_reads_spiron_credentials() {
+    fn spiron_cloud_defaults_to_api_spiron_ai_and_reads_spiron_credentials() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path();
         std::fs::create_dir_all(cfg.join(".spiron")).unwrap();
@@ -1875,7 +1853,7 @@ mod tests {
         if std::env::var("ANYAGENTS_SPIRON_CLOUD_URL").is_err()
             && std::env::var("SPIRON_CLOUD_URL").is_err()
         {
-            assert_eq!(url, "https://spiron.ai");
+            assert_eq!(url, "https://api.spiron.ai");
         }
         let tok = resolve_cloud_auth_token(cfg, "spiron-cloud");
         if std::env::var("ANYAGENTS_SPIRON_API_KEY").is_err()
@@ -1949,7 +1927,7 @@ mod tests {
         let done = poll_cloud_job_until_done(
             &poll_agent(),
             &base,
-            "spiron-cloud",
+            "cursor-cloud",
             None,
             "run_1",
             &TurnCancel::default(),
@@ -2013,7 +1991,7 @@ mod tests {
             Instant::now()
         });
         let error =
-            poll_cloud_job_until_done(&poll_agent(), &base, "spiron-cloud", None, "run_1", &cancel)
+            poll_cloud_job_until_done(&poll_agent(), &base, "cursor-cloud", None, "run_1", &cancel)
                 .unwrap_err();
         let ended = Instant::now();
         let interrupted = interrupter.join().unwrap();

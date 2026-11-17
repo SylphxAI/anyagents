@@ -336,7 +336,7 @@ fn create_with_seat(
         );
         let wd_is_private_keyword = matches!(
             wd_lower.as_str(),
-            "private" | "sandbox" | "self" | "cloud" | "cloud-agent"
+            "remote" | "private" | "sandbox" | "self" | "cloud" | "cloud-agent"
         );
         let wd_is_inherit_keyword = matches!(wd_lower.as_str(), "inherit" | "parent");
         let parent_has_git_workdir = agent
@@ -401,12 +401,20 @@ fn create_with_seat(
         let workdir_created =
             explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
         let managed_abs = std::path::absolute(&managed)?;
+        // Cloud harnesses run only a small HTTP launcher here, never a local checkout.
+        // Explicit filesystem paths and explicit inheritance keep their local semantics.
+        let remote_placement = crate::vendor::is_cloud_harness(&agent.harness)
+            && explicit_workdir.is_none()
+            && !wd_is_inherit_keyword;
         // Record the allocation before any checkout or cloud provisioning can
         // block. This does not admit the agent to the runtime.
-        if effective_repo.is_some()
-            || wd_is_private_keyword
-            || wd_is_worktree_keyword
-            || (explicit_workdir.is_none() && !wd_is_inherit_keyword && agent.parent_id.is_some())
+        if !remote_placement
+            && (effective_repo.is_some()
+                || wd_is_private_keyword
+                || wd_is_worktree_keyword
+                || (explicit_workdir.is_none()
+                    && !wd_is_inherit_keyword
+                    && agent.parent_id.is_some()))
         {
             let target = match &explicit_workdir {
                 Some(path) => std::path::absolute(path)?,
@@ -414,7 +422,19 @@ fn create_with_seat(
             };
             store.set_agent_workdir_if_missing(&agent.id, &target.display().to_string())?;
         }
-        let cwd = if let Some(repo_raw) = effective_repo {
+        let cwd = if remote_placement {
+            provision_cloud_sandbox_worktree_marker(
+                store,
+                &agent,
+                &config,
+                effective_repo.unwrap_or(""),
+                request.branch.as_deref(),
+                request.base.as_deref(),
+            )?;
+            let launcher = root.join("launcher");
+            create_dir_all_recorded(&launcher, &made)?;
+            launcher
+        } else if let Some(repo_raw) = effective_repo {
             if crate::vendor::is_spiron_harness(&agent.harness)
                 && is_cloud_agent_mode
                 && explicit_workdir.is_none()
@@ -538,13 +558,14 @@ fn create_with_seat(
                 None,
             ),
         };
-        if workdir_created || cwd == managed_abs {
+        if remote_placement || workdir_created || cwd == managed_abs {
             crate::sandbox::share_worktree_with_seat(&cwd, gid)?;
         }
         crate::repo::verify(&cwd, uid, gid, launch.as_deref())?;
         crate::operator::mint(store, &agent.id)?;
         store.set_agent_launch_env(&agent.id, &pairs)?;
-        if anyagents_tools::SandboxConfig::from_config_dir(&config).is_none()
+        if !remote_placement
+            && anyagents_tools::SandboxConfig::from_config_dir(&config).is_none()
             && let Some(provider) = anyagents_tools::SandboxProviderConfig::resolve(Some(&data))
             && let Ok(sbx) = anyagents_tools::SandboxProvider::provision(
                 &provider,
@@ -12374,6 +12395,68 @@ stderr: {}",
             instructions: None,
             parent_id: None,
         }
+    }
+
+    #[test]
+    fn cloud_workers_use_launcher_without_checkout_allocation() {
+        let tmp = crate::test_tempdir();
+        let fixture = crate::repo::tests::Fixture::new(tmp.path());
+        let store = Store::open(tmp.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        for (name, harness, wd_mode) in [
+            ("spiron-wt", "spiron-cloud", Some(PathBuf::from("worktree"))),
+            ("spiron-omitted", "spiron-cloud", None),
+            (
+                "spiron-remote",
+                "spiron-cloud",
+                Some(PathBuf::from("remote")),
+            ),
+            ("claude-wt", "claude-cloud", Some(PathBuf::from("worktree"))),
+            ("openai-wt", "openai-cloud", Some(PathBuf::from("worktree"))),
+            ("cursor-wt", "cursor-cloud", Some(PathBuf::from("worktree"))),
+        ] {
+            let mut request = worktree_request(name, Some("ExampleOrg/demo".into()));
+            request.harness = harness.into();
+            request.workdir = wd_mode;
+            request.branch = Some("feature".into());
+            request.base = Some("main".into());
+            let agent =
+                create_with_consumer(&store, tmp.path(), request, &fixture.checkouts).unwrap();
+            let workdir = Path::new(agent.workdir.as_deref().unwrap());
+            assert!(workdir.is_dir());
+            assert_eq!(workdir.file_name().unwrap(), "launcher");
+            assert!(!workdir.join(".git").exists());
+            assert!(!agent_work_dir(tmp.path(), &agent.id).exists());
+            assert!(
+                !fixture.log.exists(),
+                "remote placement reached checkout provider"
+            );
+            let marker_path = tmp
+                .path()
+                .join("agents")
+                .join(agent.id.as_str())
+                .join("config/.anyagents-managed-worktree.json");
+            let marker: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(marker_path).unwrap()).unwrap();
+            assert_eq!(marker["repo"], "ExampleOrg/demo");
+            assert_eq!(marker["branch"], "feature");
+            assert_eq!(marker["base"], "main");
+            assert_eq!(marker["cloud_sandbox"], true);
+        }
+
+        let explicit_local = tmp.path().join("explicit-local-spiron-cloud");
+        let mut local_req = worktree_request("spiron-explicit-local", None);
+        local_req.harness = "spiron-cloud".into();
+        local_req.workdir = Some(explicit_local.clone());
+        let local_agent =
+            create_with_consumer(&store, tmp.path(), local_req, &fixture.checkouts).unwrap();
+        assert_eq!(
+            Path::new(local_agent.workdir.as_deref().unwrap()),
+            std::path::absolute(&explicit_local).unwrap()
+        );
+        assert!(!agent_work_dir(tmp.path(), &local_agent.id).exists());
     }
 
     #[test]
