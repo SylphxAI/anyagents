@@ -443,8 +443,7 @@ impl ClaudeHarness {
         if let Some(dir) = &self.work_dir {
             cmd.current_dir(dir);
         }
-        let mut child = cmd
-            .spawn()
+        let mut child = anyagents_harness::spawn_child(&mut cmd)
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
         let Some(child_stdin) = child.stdin.take() else {
             anyagents_harness::kill_child(&mut child, &self.environment);

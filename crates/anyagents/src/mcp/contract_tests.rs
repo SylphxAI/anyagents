@@ -28,6 +28,181 @@ fn agent_with_limits(dir: &Path, limits: Option<CodeLimits>) -> AgentMcp {
     }
 }
 
+#[test]
+fn skills_list_read_get_resolve_synced_buckets_and_direct_collisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mcp = agent_with_limits(dir.path(), None);
+    let view = mcp.client.config.parent().unwrap().join("skills-view");
+    for (relative, body) in [
+        ("synced/z/bucketed", "later bucket"),
+        ("synced/a/bucketed", "bucket body"),
+        ("synced/a/collision", "wrong body"),
+        ("collision", "direct body"),
+        ("synced/.bucket-temp/hidden", "hidden"),
+        ("synced/a/.hidden", "hidden"),
+    ] {
+        let path = view.join(relative);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("SKILL.md"), body).unwrap();
+    }
+    std::fs::write(view.join("synced/manifest.json"), "{}").unwrap();
+    std::fs::write(view.join("synced/.last-complete-round"), "1").unwrap();
+    for via_http in [false, true] {
+        mcp.client.via_http = via_http;
+        let list = mcp.execute_skills_tool(SkillsArgs::default()).unwrap();
+        let names: Vec<_> = list["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|skill| skill["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["bucketed", "collision"]);
+        for action in ["read", "get"] {
+            for (name, body) in [("bucketed", "bucket body"), ("collision", "direct body")] {
+                let answer = mcp
+                    .execute_skills_tool(SkillsArgs {
+                        action: Some(action.into()),
+                        name: Some(name.into()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                assert_eq!(answer["content"], body);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn http_skills_allow_synced_root_projection_but_reject_escaping_links() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mcp = agent_with_limits(dir.path(), None);
+    mcp.client.via_http = true;
+    let shared = dir.path().join("skills");
+    let view = mcp.client.config.parent().unwrap().join("skills-view");
+    let leaf = shared.join("synced/a/trusted");
+    std::fs::create_dir_all(leaf.join("references")).unwrap();
+    std::fs::write(leaf.join("SKILL.md"), "trusted body").unwrap();
+    std::fs::write(leaf.join("references/ok.md"), "trusted reference").unwrap();
+    std::fs::create_dir_all(&view).unwrap();
+    symlink(shared.join("synced"), view.join("synced")).unwrap();
+    std::fs::create_dir_all(mcp.client.config.join(".agents")).unwrap();
+    symlink(&view, mcp.client.config.join(".agents/skills")).unwrap();
+    let read = |name: &str, file: Option<&str>| SkillsArgs {
+        action: Some("get".into()),
+        name: Some(name.into()),
+        file: file.map(str::to_string),
+        ..Default::default()
+    };
+    assert_eq!(
+        mcp.execute_skills_tool(read("trusted", None)).unwrap()["content"],
+        "trusted body"
+    );
+    assert_eq!(
+        mcp.execute_skills_tool(read("trusted", Some("references/ok.md")))
+            .unwrap()["content"],
+        "trusted reference"
+    );
+    let outside = dir.path().join("private");
+    std::fs::create_dir_all(outside.join("escaped")).unwrap();
+    std::fs::write(outside.join("escaped/SKILL.md"), "private body").unwrap();
+    symlink(outside.join("escaped"), shared.join("synced/a/leaf-escape")).unwrap();
+    symlink(&outside, shared.join("synced/escape-bucket")).unwrap();
+    for name in ["leaf-escape", "escaped"] {
+        assert!(mcp.execute_skills_tool(read(name, None)).is_err(), "{name}");
+    }
+    symlink(outside.join("escaped/SKILL.md"), leaf.join("secret.md")).unwrap();
+    symlink(outside.join("escaped"), leaf.join("references/escaped")).unwrap();
+    for file in ["secret.md", "references/escaped/SKILL.md", "../SKILL.md"] {
+        assert!(
+            mcp.execute_skills_tool(read("trusted", Some(file)))
+                .is_err(),
+            "{file}"
+        );
+    }
+    // Root redirection cannot turn an allowed lexical prefix into an escape.
+    std::fs::remove_file(view.join("synced")).unwrap();
+    symlink(&outside, view.join("synced")).unwrap();
+    assert!(
+        mcp.read_skill_text(&view.join("synced/escaped"), Path::new("SKILL.md"))
+            .is_err()
+    );
+    std::fs::remove_file(view.join("synced")).unwrap();
+    symlink(view.join("synced"), view.join("synced")).unwrap();
+    assert!(
+        mcp.read_skill_text(&view.join("synced/escaped"), Path::new("SKILL.md"))
+            .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn http_skills_tolerate_symlinked_host_mount_roots_while_rejecting_seat_escapes() {
+    use std::os::unix::fs::symlink;
+    let phys = tempfile::tempdir().unwrap();
+    let real_root = phys.path().join("private/var/folders/fixture");
+    std::fs::create_dir_all(&real_root).unwrap();
+    let var_alias = phys.path().join("var");
+    symlink(phys.path().join("private/var"), &var_alias).unwrap();
+    let aliased_data = var_alias.join("folders/fixture");
+
+    let mut mcp = agent_with_limits(&aliased_data, None);
+    mcp.client.via_http = true;
+    let shared = aliased_data.join("skills");
+    let view = mcp.client.config.parent().unwrap().join("skills-view");
+    let leaf = shared.join("synced/a/trusted");
+    std::fs::create_dir_all(leaf.join("references")).unwrap();
+    std::fs::write(leaf.join("SKILL.md"), "mounted trusted body").unwrap();
+    std::fs::write(leaf.join("references/ok.md"), "mounted reference").unwrap();
+    std::fs::create_dir_all(&view).unwrap();
+    symlink(shared.join("synced"), view.join("synced")).unwrap();
+    std::fs::create_dir_all(mcp.client.config.join(".agents")).unwrap();
+    symlink(&view, mcp.client.config.join(".agents/skills")).unwrap();
+
+    let work_skill = aliased_data.join("work/.agents/skills/local-work");
+    std::fs::create_dir_all(&work_skill).unwrap();
+    std::fs::write(work_skill.join("SKILL.md"), "work skill body").unwrap();
+
+    let read = |name: &str, file: Option<&str>| SkillsArgs {
+        action: Some("get".into()),
+        name: Some(name.into()),
+        file: file.map(str::to_string),
+        ..Default::default()
+    };
+    assert_eq!(
+        mcp.execute_skills_tool(read("trusted", None)).unwrap()["content"],
+        "mounted trusted body"
+    );
+    assert_eq!(
+        mcp.execute_skills_tool(read("trusted", Some("references/ok.md")))
+            .unwrap()["content"],
+        "mounted reference"
+    );
+    assert_eq!(
+        mcp.execute_skills_tool(read("local-work", None)).unwrap()["content"],
+        "work skill body"
+    );
+
+    let outside = phys.path().join("outside");
+    std::fs::create_dir_all(outside.join("secret")).unwrap();
+    std::fs::write(outside.join("secret/SKILL.md"), "secret").unwrap();
+    symlink(
+        outside.join("secret"),
+        aliased_data.join("work/.agents/skills/escape"),
+    )
+    .unwrap();
+    assert!(mcp.execute_skills_tool(read("escape", None)).is_err());
+
+    // Replacing workdir itself with a symlink to outside must still fail closed.
+    std::fs::remove_dir_all(aliased_data.join("work")).unwrap();
+    symlink(&outside, aliased_data.join("work")).unwrap();
+    assert!(
+        mcp.read_skill_text(&aliased_data.join("work/secret"), Path::new("SKILL.md"))
+            .is_err()
+    );
+}
+
 fn limits(default_ms: u64, max_ms: u64) -> Option<CodeLimits> {
     Some(CodeLimits { default_ms, max_ms })
 }

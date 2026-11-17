@@ -170,7 +170,8 @@ impl SpironHarness {
             .stdin(Stdio::null())
             .stdout(Stdio::from(output))
             .stderr(Stdio::from(errors));
-        let mut child = command.spawn().map_err(|err| failed(err.to_string()))?;
+        let mut child =
+            anyagents_harness::spawn_child(&mut command).map_err(|err| failed(err.to_string()))?;
         if let Err(error) = spawned(child.id()) {
             anyagents_harness::kill_child(&mut child, &launch.environment);
             return Err(failed(error));

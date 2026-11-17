@@ -1152,7 +1152,17 @@ impl Client {
     }
 
     async fn get_agents(&self) -> Result<AgentsResponse, String> {
-        self.get("/v1/agents", None).await
+        self.get_agents_for_state(None).await
+    }
+
+    async fn get_agents_for_state(&self, state: Option<&str>) -> Result<AgentsResponse, String> {
+        // The daemon defaults to live rows; turn-state filters stay local.
+        let path = match state.map(str::trim) {
+            Some(s) if s.eq_ignore_ascii_case("archived") => "/v1/agents?state=archived",
+            Some(s) if s.eq_ignore_ascii_case("all") => "/v1/agents?state=all",
+            _ => "/v1/agents",
+        };
+        self.get(path, None).await
     }
 }
 
@@ -2525,12 +2535,12 @@ impl AgentMcp {
                 Ok(rmcp::handler::server::wrapper::Json(response))
             }
             "list" | "ls" => {
-                let mut response: AgentsResponse = self.client.get_agents().await?;
                 let state_trimmed = args
                     .state
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
+                let mut response = self.client.get_agents_for_state(state_trimmed).await?;
                 match state_trimmed {
                     Some(state_filter) if !state_filter.eq_ignore_ascii_case("all") => {
                         response.agents.retain(|a| {
@@ -3067,7 +3077,10 @@ impl AgentMcp {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .unwrap_or("self");
-                let mut resp: AgentsResponse = self.client.get_agents().await?;
+                let mut resp = self
+                    .client
+                    .get_agents_for_state(args.state.as_deref())
+                    .await?;
                 if parent_arg.eq_ignore_ascii_case("all") {
                     resp.agents.retain(|a| a.parent.is_some());
                 } else {
@@ -5090,36 +5103,114 @@ impl AgentMcp {
     /// One skill file's text. Over stdio this tool server runs as the agent
     /// and reads what the agent can read. Over HTTP it runs as the server, and
     /// the skill directories it scans are writable by the agent's seat, so it
-    /// never follows a link the seat could have planted: a linked skill
-    /// directory (a `skills-view` entry) is followed once and only into the
-    /// shared or the agent's own skill root, and every component from there
-    /// is opened without following links.
+    /// resolves directory links only into shared/own skill roots (or the exact
+    /// own view from a vendor projection). The final descriptor-relative open
+    /// rejects links in every component, including resource files.
     fn read_skill_text(&self, dir: &Path, rel: &Path) -> std::io::Result<String> {
         if !self.client.via_http {
             return std::fs::read_to_string(dir.join(rel));
         }
-        let base = if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
-            let link = std::fs::read_link(dir)?;
-            let target = match dir.parent() {
-                Some(parent) if link.is_relative() => parent.join(link),
-                _ => link,
-            };
-            let mut roots = Vec::new();
-            if let Some(data_dir) = self.client.socket.parent() {
-                roots.push(data_dir.join("skills"));
+        // Canonicalize trusted host-level roots (`data_dir`, `agent_root`, and
+        // `workdir`'s parent) so system symlinks above them (such as macOS
+        // `/var -> private/var` or `/tmp -> private/tmp`) do not trip the
+        // seat-planted symlink guards or descriptor-relative `O_NOFOLLOW` walk.
+        let mut trusted_bases: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut register_trusted_base = |raw: &Path| {
+            if let (Ok(abs), Ok(canon)) = (std::path::absolute(raw), std::fs::canonicalize(raw))
+                && !trusted_bases.iter().any(|(existing, _)| existing == &abs)
+            {
+                trusted_bases.push((abs, canon));
             }
-            if let Some(agent_root) = self.client.config.parent() {
-                roots.push(agent_root.join("skills"));
-            }
-            if !roots.iter().any(|root| target.starts_with(root)) {
-                return Err(std::io::Error::other(
-                    "a linked skill directory points outside the skill roots",
-                ));
-            }
-            target
-        } else {
-            dir.to_path_buf()
         };
+        if let Some(data_dir) = self.client.socket.parent() {
+            register_trusted_base(data_dir);
+        }
+        if let Some(agent_root) = self.client.config.parent() {
+            register_trusted_base(agent_root);
+        }
+        let wd = self.resolve_workdir();
+        if let Some(wd_parent) = wd.parent() {
+            register_trusted_base(wd_parent);
+        }
+        trusted_bases.sort_by_key(|(a, _)| std::cmp::Reverse(a.as_os_str().len()));
+        let normalize_host_prefix = |p: &Path| -> PathBuf {
+            let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+            for (raw_base, canon_base) in &trusted_bases {
+                if let Ok(suffix) = abs.strip_prefix(raw_base) {
+                    return canon_base.join(suffix);
+                }
+            }
+            abs
+        };
+
+        let mut roots = Vec::new();
+        if let Some(data_dir) = self.client.socket.parent() {
+            roots.push(normalize_host_prefix(&data_dir.join("skills")));
+        }
+        if let Some(agent_root) = self.client.config.parent() {
+            roots.push(normalize_host_prefix(&agent_root.join("skills")));
+        }
+        let view = self
+            .client
+            .config
+            .parent()
+            .map(|root| normalize_host_prefix(&root.join("skills-view")));
+        let vendor_projections = [
+            normalize_host_prefix(&self.client.config.join("skills")),
+            normalize_host_prefix(&self.client.config.join(".agents/skills")),
+        ];
+        // Resolve projection directories only. Every link destination stays in
+        // the shared/own roots; resources below the skill remain no-follow.
+        let mut base = normalize_host_prefix(dir);
+        let mut links = std::collections::BTreeSet::new();
+        loop {
+            let mut prefix = PathBuf::new();
+            let mut next = None;
+            for component in base.components() {
+                prefix.push(component.as_os_str());
+                if !std::fs::symlink_metadata(&prefix)?.file_type().is_symlink() {
+                    continue;
+                }
+                if links.len() >= 40 || !links.insert(prefix.clone()) {
+                    return Err(std::io::Error::other("cyclic skill projection"));
+                }
+                let link = std::fs::read_link(&prefix)?;
+                let raw_target = if link.is_relative() {
+                    prefix
+                        .parent()
+                        .ok_or_else(|| std::io::Error::other("skill parent missing"))?
+                        .join(link)
+                } else {
+                    link
+                };
+                if raw_target.components().any(|c| {
+                    !matches!(
+                        c,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                }) {
+                    return Err(std::io::Error::other(
+                        "a linked skill directory points outside the skill roots",
+                    ));
+                }
+                let target = normalize_host_prefix(&raw_target);
+                if !(roots.iter().any(|root| target.starts_with(root))
+                    || (view.as_ref().is_some_and(|view| target == *view)
+                        && vendor_projections.contains(&prefix)))
+                {
+                    return Err(std::io::Error::other(
+                        "a linked skill directory points outside the skill roots",
+                    ));
+                }
+                next =
+                    Some(target.join(base.strip_prefix(&prefix).map_err(std::io::Error::other)?));
+                break;
+            }
+            match next {
+                Some(path) => base = path,
+                None => break,
+            }
+        }
         let mut file = anyagents_core::raw_segment::open_readonly(&base.join(rel))?;
         let mut text = String::new();
         std::io::Read::read_to_string(&mut file, &mut text)?;
@@ -5127,7 +5218,6 @@ impl AgentMcp {
     }
 
     fn collect_skill_directories(&self) -> std::collections::BTreeMap<String, PathBuf> {
-        let mut map = std::collections::BTreeMap::new();
         let mut roots = Vec::new();
         if let Some(data_dir) = self.client.socket.parent() {
             roots.push(data_dir.join("skills"));
@@ -5142,23 +5232,7 @@ impl AgentMcp {
         roots.push(wd.join(".agents/skills"));
         roots.push(wd.join("skills"));
 
-        for root in roots {
-            let Ok(entries) = std::fs::read_dir(&root) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() || !path.join("SKILL.md").is_file() {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.is_empty() || name.starts_with('.') {
-                    continue;
-                }
-                map.insert(name, path);
-            }
-        }
-        map
+        anyagents_core::host_skills::discover(&roots)
     }
 
     /// Tell the server which skill file this agent read and the digest of the
@@ -11021,7 +11095,6 @@ mod spawn_args_tests {
         }
         server.await.unwrap();
     }
-
     #[tokio::test]
     async fn inspect_preserves_full_view_without_duplicate_alias_or_top_level_schedules() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11131,6 +11204,109 @@ mod spawn_args_tests {
         assert_eq!(legacy["subagent"]["schedules"].as_array().unwrap().len(), 1);
         assert!(legacy.get("agent").is_none());
         assert!(legacy.get("schedules").is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_lifecycle_states_fetch_the_requested_daemon_population() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let parent_id = AgentId::generate();
+        let mut live = vec![
+            dummy_agent_view("idle", "idle", "running", "idle", None),
+            dummy_agent_view("working", "working", "running", "working", None),
+        ];
+        let mut archived = vec![dummy_agent_view(
+            "archived", "archived", "archived", "idle", None,
+        )];
+        for row in live.iter_mut().chain(archived.iter_mut()) {
+            row.parent = Some(parent_id.to_string());
+        }
+        // The mock has the daemon's live-only default, not an all-rows response
+        // that could hide a missing lifecycle query in either public tool.
+        let server = tokio::spawn(async move {
+            for _ in 0..16 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    request.push(stream.read_u8().await.unwrap());
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = std::str::from_utf8(&request).unwrap();
+                let mut parts = request.lines().next().unwrap().split_whitespace();
+                assert_eq!(parts.next(), Some("GET"));
+                let uri: hyper::Uri = parts.next().unwrap().parse().unwrap();
+                assert_eq!(uri.path(), "/v1/agents");
+                let agents = match uri.query() {
+                    None => live.clone(),
+                    Some("state=archived") => archived.clone(),
+                    Some("state=all") => live.iter().chain(archived.iter()).cloned().collect(),
+                    query => panic!("unexpected population query: {query:?}"),
+                };
+                let body = serde_json::to_vec(&AgentsResponse {
+                    agents,
+                    archived_count: 1,
+                    gateway: None,
+                })
+                .unwrap();
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        });
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: parent_id,
+                name: "parent".into(),
+                workdir: None,
+            },
+            client: Client::new(
+                socket,
+                dir.path().join("config"),
+                "synthetic-test-capability".into(),
+            ),
+            profile: McpProfile::Full,
+        };
+        for legacy in [false, true] {
+            for (state, expected) in [
+                (None, vec!["idle", "working"]),
+                (Some("  "), vec!["idle", "working"]),
+                (Some("archived"), vec!["archived"]),
+                (Some(" ARCHIVED "), vec!["archived"]),
+                (Some("all"), vec!["archived", "idle", "working"]),
+                (Some(" ALL "), vec!["archived", "idle", "working"]),
+                (Some("working"), vec!["working"]),
+                (Some(" WORKING "), vec!["working"]),
+            ] {
+                let args = json!({ "action": "list", "state": state });
+                let result = if legacy {
+                    mcp.subagents(Parameters(serde_json::from_value(args).unwrap()))
+                        .await
+                        .unwrap()
+                        .0
+                } else {
+                    mcp.agents(Parameters(serde_json::from_value(args).unwrap()))
+                        .await
+                        .unwrap()
+                        .0
+                };
+                let mut actual: Vec<_> = result[if legacy { "subagents" } else { "agents" }]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["id"].as_str().unwrap())
+                    .collect();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "legacy={legacy}, state={state:?}");
+            }
+        }
         server.await.unwrap();
     }
 

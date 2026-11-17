@@ -594,35 +594,15 @@ pub fn collect_agent_skills_catalog(config: &Path) -> Vec<(String, String)> {
     dirs_to_scan.push(config.join(".agents/skills"));
     dirs_to_scan.push(config.join("skills"));
 
+    // Discovery's later roots win; retain this catalog's first-root priority.
+    dirs_to_scan.reverse();
     let mut seen = std::collections::BTreeMap::new();
-    for base in dirs_to_scan {
-        let Ok(entries) = std::fs::read_dir(&base) else {
+    for (slug, path) in anyagents_core::host_skills::discover(&dirs_to_scan) {
+        let Ok(raw_md) = std::fs::read_to_string(path.join("SKILL.md")) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let skill_md = path.join("SKILL.md");
-            if !skill_md.is_file() {
-                continue;
-            }
-            let Some(slug) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            if seen.contains_key(&slug) {
-                continue;
-            }
-            let Ok(raw_md) = std::fs::read_to_string(&skill_md) else {
-                continue;
-            };
-            let (_, desc) = anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &raw_md);
-            seen.insert(slug, desc);
-        }
+        let (_, desc) = anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &raw_md);
+        seen.insert(slug, desc);
     }
     seen.into_iter().collect()
 }
@@ -1284,6 +1264,40 @@ mod tests {
     };
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn cloud_prompt_discovers_synced_skills_and_prefers_direct_slugs() {
+        let dir = crate::test_tempdir();
+        let config = dir.path().join("config");
+        let view = dir.path().join("skills-view");
+        std::fs::create_dir_all(&config).unwrap();
+        for (relative, description) in [
+            ("synced/z/bucketed", "later bucket"),
+            ("synced/a/bucketed", "synced trigger"),
+            ("synced/a/collision", "must not win"),
+            ("collision", "direct trigger"),
+            ("synced/.bucket-temp/hidden", "hidden bucket"),
+            ("synced/a/.hidden", "hidden skill"),
+        ] {
+            let path = view.join(relative);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("SKILL.md"),
+                format!("---\ndescription: {description}\n---\nBody"),
+            )
+            .unwrap();
+        }
+        std::fs::write(view.join("synced/manifest.json"), "{}").unwrap();
+        std::fs::write(view.join("synced/.last-complete-round"), "1").unwrap();
+        let prompt = build_cloud_system_prompt(&config).unwrap();
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("- `bucketed`: synced trigger"));
+        assert!(prompt.contains("- `collision`: direct trigger"));
+        assert!(!prompt.contains("must not win"));
+        assert!(!prompt.contains("later bucket"));
+        assert!(!prompt.contains("hidden"));
+        assert!(!prompt.contains("manifest.json"));
+    }
 
     #[tokio::test]
     async fn cloud_harness_dispatches_spiron_claude_openai_and_cursor_turns_with_mcp_capability() {

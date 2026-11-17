@@ -1,12 +1,66 @@
 //! Non-destructive global + per-agent skill views. Existing seat-local skill
 //! directories win collisions and are never removed. Only symlinks created by
 //! this host (and the previous global mount) may be replaced.
-#[cfg(unix)]
 use std::{
     collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
 };
+
+/// Discover direct skills and the bounded synced/<bucket>/<skill> layout.
+/// Later roots win within a class; direct skills always win over synced ones.
+/// Buckets are sorted by name, with the first bucket winning a duplicate slug.
+/// Hidden entries, files, and directories without SKILL.md are not skills.
+pub fn discover(roots: &[PathBuf]) -> BTreeMap<String, PathBuf> {
+    fn visible_dirs(root: &Path) -> Vec<(String, PathBuf)> {
+        let mut dirs: Vec<_> = fs::read_dir(root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                (!name.is_empty() && !name.starts_with('.') && entry.path().is_dir())
+                    .then(|| (name, entry.path()))
+            })
+            .collect();
+        dirs.sort_by(|a, b| a.0.cmp(&b.0));
+        dirs
+    }
+    let mut synced = BTreeMap::new();
+    let mut direct = BTreeMap::new();
+    for root in roots {
+        let mut in_root = BTreeMap::new();
+        for (_, bucket) in visible_dirs(&root.join("synced")) {
+            for (name, path) in visible_dirs(&bucket) {
+                if path.join("SKILL.md").is_file() {
+                    in_root.entry(name).or_insert(path);
+                }
+            }
+        }
+        synced.extend(in_root);
+        for (name, path) in visible_dirs(root) {
+            if path.join("SKILL.md").is_file() {
+                direct.insert(name, path);
+            }
+        }
+    }
+    synced.extend(direct);
+    synced
+}
+
+#[cfg(unix)]
+fn managed_source(path: &Path, roots: &[&Path]) -> bool {
+    roots.iter().any(|root| {
+        let Ok(relative) = path.strip_prefix(root) else {
+            return false;
+        };
+        let parts: Vec<_> = relative.components().collect();
+        parts
+            .iter()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+            && (parts.len() == 1 || (parts.len() == 3 && parts[0].as_os_str() == "synced"))
+    })
+}
 
 #[cfg(unix)]
 pub fn mount(agent_root: &Path, global: &Path, config: &Path) -> io::Result<()> {
@@ -69,7 +123,7 @@ pub fn mount_with_fallback(
                     for child in children {
                         let child = child?;
                         let path = child.path();
-                        if path.is_dir() {
+                        if path.is_dir() && !child.file_name().to_string_lossy().starts_with('.') {
                             entries.insert(child.file_name(), path);
                         }
                     }
@@ -77,6 +131,9 @@ pub fn mount_with_fallback(
                 Err(e) if e.kind() == io::ErrorKind::NotFound => (),
                 Err(e) => return Err(e),
             }
+        }
+        for (name, path) in discover(&[global.to_path_buf(), overlay.clone()]) {
+            entries.insert(name.into(), path);
         }
         sync_entries(&view, &entries, &[global, &overlay])?;
         Ok(entries)
@@ -174,9 +231,7 @@ fn sync_entries(
         let path = child.path();
         if child.file_type()?.is_symlink() {
             let old = fs::read_link(&path)?;
-            if managed.iter().any(|root| old.parent() == Some(*root))
-                && !entries.contains_key(&child.file_name())
-            {
+            if managed_source(&old, managed) && !entries.contains_key(&child.file_name()) {
                 fs::remove_file(path)?;
             }
         }
@@ -186,7 +241,7 @@ fn sync_entries(
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 let old = fs::read_link(&path)?;
-                if old != *source && managed.iter().any(|root| old.parent() == Some(*root)) {
+                if old != *source && managed_source(&old, managed) {
                     replace_link(&path, source)?;
                 }
             }
@@ -218,6 +273,59 @@ mod tests {
         fs::create_dir_all(root.join(name)).unwrap();
         fs::write(root.join(name).join("SKILL.md"), text).unwrap();
     }
+    #[test]
+    fn synced_skills_project_flat_to_agy_with_direct_precedence_and_stale_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("skills");
+        let agent = dir.path().join("agent");
+        let config = agent.join("config");
+        let agy = config.join(".gemini/config/skills");
+        fs::create_dir_all(&agy).unwrap();
+        skill(&agy, "local", b"seat local");
+        skill(&global.join("synced/z"), "bucketed", b"later bucket");
+        skill(&global.join("synced/a"), "bucketed", b"first bucket");
+        skill(
+            &global.join("synced/.bucket-temp"),
+            "hidden-bucket",
+            b"hidden",
+        );
+        skill(&global.join("synced/a"), ".hidden-skill", b"hidden");
+        skill(&global, "bucketed", b"direct wins");
+        skill(
+            &agent.join("skills/synced/a"),
+            "bucketed",
+            b"overlay synced",
+        );
+        fs::write(global.join("synced/manifest.json"), b"{}").unwrap();
+        fs::write(global.join("synced/.last-complete-round"), b"1").unwrap();
+        mount(&agent, &global, &config).unwrap();
+        assert_eq!(
+            fs::read(agy.join("bucketed/SKILL.md")).unwrap(),
+            b"direct wins"
+        );
+        assert_eq!(fs::read(agy.join("local/SKILL.md")).unwrap(), b"seat local");
+        assert!(!agy.join("hidden-bucket").exists());
+        assert!(!agy.join(".hidden-skill").exists());
+        assert!(!agy.join("manifest.json").exists());
+        fs::remove_dir_all(global.join("bucketed")).unwrap();
+        mount(&agent, &global, &config).unwrap();
+        assert_eq!(
+            fs::read(agy.join("bucketed/SKILL.md")).unwrap(),
+            b"overlay synced"
+        );
+        fs::remove_dir_all(agent.join("skills/synced/a/bucketed")).unwrap();
+        mount(&agent, &global, &config).unwrap();
+        assert_eq!(
+            fs::read(agy.join("bucketed/SKILL.md")).unwrap(),
+            b"first bucket"
+        );
+        fs::remove_dir_all(global.join("synced/a/bucketed")).unwrap();
+        fs::remove_dir_all(global.join("synced/z/bucketed")).unwrap();
+        mount(&agent, &global, &config).unwrap();
+        assert!(fs::symlink_metadata(agy.join("bucketed")).is_err());
+        assert_eq!(fs::read(agy.join("local/SKILL.md")).unwrap(), b"seat local");
+    }
+
     #[test]
     fn overlay_preserves_global_bytes_and_local_skills_across_all_mirrors() {
         let dir = crate::test_tempdir();

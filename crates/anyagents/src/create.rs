@@ -1494,6 +1494,113 @@ pub(crate) fn ensure_seat_skills(target_config: &Path, _host_home: &Path) {
 /// Only a refused mirror is delegated, and all effects run as the existing
 /// parent owner. No daemon chmod, broad home grant or foreign-link replacement.
 #[cfg(unix)]
+const SKILL_PROJECTION_OWNER_SCRIPT: &str = r#"set -eu
+config=$1; relative=$2; view=$3; global=$4; overlay=$5
+  managed_source() {
+    for src_root in "$global" "$overlay"; do
+      case $1 in
+        "$src_root"/*)
+          rest=${1#"$src_root"/}
+          case "/$rest/" in *"/./"*|*"/../"*|*"//"*) continue;; esac
+          case $rest in
+            synced/*/*) rest=${rest#synced/}; rest=${rest#*/}; case $rest in */*) ;; *) return 0;; esac;;
+            */*) ;;
+            *) return 0;;
+          esac;;
+      esac
+    done
+    return 1
+  }
+if [ "$relative" = "skills-view" ]; then
+  if [ -L "$overlay" ] || [ -L "$view" ]; then exit 1; fi
+  mkdir -p -m 02770 "$overlay"
+  chmod 02770 "$overlay"
+  mkdir -p "$view"
+  chmod 0755 "$view"
+  # Same bounded layout and precedence as host_skills::discover. Shell glob
+  # order is deterministic under C; the first synced bucket wins.
+  LC_ALL=C; export LC_ALL
+  desired_for() {
+    name=$1; desired=""
+    for src_root in "$global" "$overlay"; do
+      for bucket in "$src_root"/synced/*; do
+        [ -d "$bucket" ] || continue
+        case ${bucket##*/} in .*) continue;; esac
+        if [ -d "$bucket/$name" ] && [ -f "$bucket/$name/SKILL.md" ]; then
+          desired=$bucket/$name; break
+        fi
+      done
+    done
+    # Direct skills override synced skills, irrespective of source root.
+    for src_root in "$global" "$overlay"; do
+      if [ -d "$src_root/$name" ] && [ -f "$src_root/$name/SKILL.md" ]; then desired=$src_root/$name; fi
+    done
+    # Keep visible legacy containers, without letting them mask a skill.
+    if [ -z "$desired" ]; then
+      for src_root in "$global" "$overlay"; do
+        if [ -d "$src_root/$name" ]; then desired=$src_root/$name; fi
+      done
+    fi
+  }
+  for item in "$view"/*; do
+    [ -L "$item" ] || continue
+    old=$(readlink "$item")
+    if managed_source "$old"; then
+      desired_for "${item##*/}"
+      if [ "$old" != "$desired" ]; then rm "$item"; fi
+    fi
+  done
+  for item in "$global"/* "$overlay"/* "$global"/synced/*/* "$overlay"/synced/*/*; do
+    [ -d "$item" ] || continue
+    name=${item##*/}
+    case $name in .*) continue;; esac
+    desired_for "$name"
+    [ -n "$desired" ] || continue
+    link=$view/$name
+    if [ -L "$link" ] || [ -e "$link" ]; then continue; fi
+    ln -s "$desired" "$link"
+  done
+  exit 0
+fi
+# Every existing component is inspected by its actual owner, not the daemon
+# which was denied traversal. Foreign parent links are preserved untouched.
+parent=$config
+old_ifs=$IFS; IFS=/; set -- $relative; IFS=$old_ifs
+while [ "$#" -gt 1 ]; do
+  parent=$parent/$1; shift
+  if [ -L "$parent" ]; then exit 0; fi
+  mkdir -p "$parent"
+done
+target=$parent/$1
+if [ -L "$target" ]; then
+  old=$(readlink "$target")
+  if [ "$old" = "$view" ]; then exit 0; fi
+  if [ "$old" != "$global" ]; then exit 0; fi
+  temp=$parent/.skills-owner-$$
+  trap 'rm -f "$temp"' EXIT HUP INT TERM
+  ln -s "$view" "$temp"
+  mv -fT "$temp" "$target"
+elif [ -d "$target" ]; then
+  for item in "$target"/*; do
+    [ -L "$item" ] || continue
+    old=$(readlink "$item")
+    if managed_source "$old" && [ ! -e "$view/${item##*/}" ]; then rm "$item"; fi
+  done
+  for item in "$view"/*; do
+    [ -L "$item" ] || continue
+    link=$target/${item##*/}; source=$(readlink "$item")
+    if [ -L "$link" ]; then
+      old=$(readlink "$link")
+      if ! managed_source "$old"; then continue; fi
+      if [ "$old" = "$source" ]; then continue; fi
+      rm "$link"
+    elif [ -e "$link" ]; then continue; fi
+    ln -s "$source" "$link"
+  done
+elif [ ! -e "$target" ]; then ln -s "$view" "$target"; fi
+"#;
+
+#[cfg(unix)]
 fn install_skill_projection_as_owner(
     config: &Path,
     target: &Path,
@@ -1551,83 +1658,30 @@ fn install_skill_projection_as_owner(
         Some(sg) if sg != eff_gid && sg != 0 => format!("{eff_gid},{sg}"),
         _ => eff_gid.to_string(),
     };
-    let output = std::process::Command::new(launcher).args([
-        "--reuid", &eff_uid.to_string(), "--regid", &eff_gid.to_string(),
-        "--groups", &groups, "--no-new-privs", "--", "/bin/sh", "-c",
-        r#"set -eu
-config=$1; relative=$2; view=$3; global=$4; overlay=$5
-if [ "$relative" = "skills-view" ]; then
-  if [ -L "$overlay" ] || [ -L "$view" ]; then exit 1; fi
-  mkdir -p -m 02770 "$overlay"
-  chmod 02770 "$overlay"
-  mkdir -p "$view"
-  chmod 0755 "$view"
-  for item in "$view"/*; do
-    [ -L "$item" ] || continue
-    old=$(readlink "$item"); source_parent=${old%/*}; name=${item##*/}
-    if [ "$source_parent" = "$global" ] || [ "$source_parent" = "$overlay" ]; then
-      if [ -d "$overlay/$name" ]; then expected="$overlay/$name"
-      elif [ -d "$global/$name" ]; then expected="$global/$name"
-      else expected=""; fi
-      if [ "$old" != "$expected" ]; then rm "$item"; fi
-    fi
-  done
-  for src_root in "$global" "$overlay"; do
-    [ -d "$src_root" ] || continue
-    for item in "$src_root"/*; do
-      [ -d "$item" ] || continue
-      name=${item##*/}; link="$view/$name"
-      if [ -d "$overlay/$name" ]; then desired="$overlay/$name"; else desired="$item"; fi
-      if [ -L "$link" ]; then
-        old=$(readlink "$link"); source_parent=${old%/*}
-        if [ "$source_parent" != "$global" ] && [ "$source_parent" != "$overlay" ]; then continue; fi
-        if [ "$old" = "$desired" ]; then continue; fi
-        rm "$link"
-      elif [ -e "$link" ]; then continue; fi
-      ln -s "$desired" "$link"
-    done
-  done
-  exit 0
-fi
-# Every existing component is inspected by its actual owner, not the daemon
-# which was denied traversal. Foreign parent links are preserved untouched.
-parent=$config
-old_ifs=$IFS; IFS=/; set -- $relative; IFS=$old_ifs
-while [ "$#" -gt 1 ]; do
-  parent=$parent/$1; shift
-  if [ -L "$parent" ]; then exit 0; fi
-  mkdir -p "$parent"
-done
-target=$parent/$1
-if [ -L "$target" ]; then
-  old=$(readlink "$target")
-  if [ "$old" = "$view" ]; then exit 0; fi
-  if [ "$old" != "$global" ]; then exit 0; fi
-  temp=$parent/.skills-owner-$$
-  trap 'rm -f "$temp"' EXIT HUP INT TERM
-  ln -s "$view" "$temp"
-  mv -fT "$temp" "$target"
-elif [ -d "$target" ]; then
-  for item in "$target"/*; do
-    [ -L "$item" ] || continue
-    old=$(readlink "$item"); source_parent=${old%/*}
-    if { [ "$source_parent" = "$global" ] || [ "$source_parent" = "$overlay" ]; } && [ ! -e "$view/${item##*/}" ]; then rm "$item"; fi
-  done
-  for item in "$view"/*; do
-    [ -L "$item" ] || continue
-    link=$target/${item##*/}; source=$(readlink "$item")
-    if [ -L "$link" ]; then
-      old=$(readlink "$link"); source_parent=${old%/*}
-      if [ "$source_parent" != "$global" ] && [ "$source_parent" != "$overlay" ]; then continue; fi
-      if [ "$old" = "$source" ]; then continue; fi
-      rm "$link"
-    elif [ -e "$link" ]; then continue; fi
-    ln -s "$source" "$link"
-  done
-elif [ ! -e "$target" ]; then ln -s "$view" "$target"; fi
-"#, "skill-projection-owner",
-    ]).args([config.as_os_str(), relative.as_os_str(), view.as_os_str(), global.as_os_str(), overlay.as_os_str()])
-        .stdin(std::process::Stdio::null()).output()?;
+    let output = std::process::Command::new(launcher)
+        .args([
+            "--reuid",
+            &eff_uid.to_string(),
+            "--regid",
+            &eff_gid.to_string(),
+            "--groups",
+            &groups,
+            "--no-new-privs",
+            "--",
+            "/bin/sh",
+            "-c",
+            SKILL_PROJECTION_OWNER_SCRIPT,
+            "skill-projection-owner",
+        ])
+        .args([
+            config.as_os_str(),
+            relative.as_os_str(),
+            view.as_os_str(),
+            global.as_os_str(),
+            overlay.as_os_str(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1983,20 +2037,31 @@ fn seat_sanitized_anthropic_credentials(src_bytes: &[u8], now_ms: i64) -> Vec<u8
     src_bytes.to_vec()
 }
 
+// Both paths are aliases within one selected profile, not independent accounts.
+// Prefer the usable token with the latest expiry rather than a stale root alias.
+fn read_anthropic_profile_credentials(profile_root: &Path) -> Option<Vec<u8>> {
+    [".credentials.json", ".claude/.credentials.json"]
+        .into_iter()
+        .filter_map(|rel| std::fs::read(profile_root.join(rel)).ok())
+        .reduce(|current, candidate| {
+            if json_oauth_expires_at(&candidate) > json_oauth_expires_at(&current) {
+                candidate
+            } else {
+                current
+            }
+        })
+}
+
 fn refresh_anthropic_profile_oauth_if_due(data: &Path, profile_root: &Path) -> Result<(), Error> {
     if crate::sandbox::is_isolated_test_env()
         && std::env::var_os("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL").is_none()
     {
         return Ok(());
     }
-    let cred_path = profile_root.join(".credentials.json");
-    let sub_cred_path = profile_root.join(".claude/.credentials.json");
-    let Ok(cred_text) =
-        std::fs::read_to_string(&cred_path).or_else(|_| std::fs::read_to_string(&sub_cred_path))
-    else {
+    let Some(cred_bytes) = read_anthropic_profile_credentials(profile_root) else {
         return Ok(());
     };
-    let Ok(mut cred) = serde_json::from_str::<serde_json::Value>(&cred_text) else {
+    let Ok(mut cred) = serde_json::from_slice::<serde_json::Value>(&cred_bytes) else {
         return Ok(());
     };
     let now_ms = anyagents_core::now_ms();
@@ -2031,7 +2096,7 @@ fn refresh_anthropic_profile_oauth_if_due(data: &Path, profile_root: &Path) -> R
     let reservation = OAuthRefreshDiskReservation::acquire(
         profile_root,
         &[".credentials.json", ".claude/.credentials.json"],
-        cred_text.len(),
+        cred_bytes.len(),
         now_ms,
     )?;
     let http = ureq::Agent::config_builder()
@@ -2235,14 +2300,7 @@ pub(crate) fn sync_anthropic_agent_credentials_from_profile(
             profile_root.display()
         );
     }
-    let src = if profile_root.join(".credentials.json").is_file() {
-        profile_root.join(".credentials.json")
-    } else if profile_root.join(".claude/.credentials.json").is_file() {
-        profile_root.join(".claude/.credentials.json")
-    } else {
-        return;
-    };
-    let Ok(raw_src_bytes) = std::fs::read(&src) else {
+    let Some(raw_src_bytes) = read_anthropic_profile_credentials(profile_root) else {
         return;
     };
     let now_ms = anyagents_core::now_ms();
@@ -2535,10 +2593,17 @@ pub(crate) fn seed_harness_credentials(
                     }
                 }
             }
-            if src.is_file() {
-                let Ok(raw_src_bytes) = std::fs::read(&src) else {
-                    continue;
-                };
+            let source = if is_anthropic_cred {
+                read_anthropic_profile_credentials(profile_root)
+            } else if src.is_file() {
+                match std::fs::read(&src) {
+                    Ok(bytes) => Some(bytes),
+                    Err(_) => continue,
+                }
+            } else {
+                None
+            };
+            if let Some(raw_src_bytes) = source {
                 let now_ms = anyagents_core::now_ms();
                 let src_bytes = if is_anthropic_cred {
                     seat_sanitized_anthropic_credentials(&raw_src_bytes, now_ms)
@@ -2560,6 +2625,28 @@ pub(crate) fn seed_harness_credentials(
                     }
                     if let Ok(dst_bytes) = std::fs::read(&dst) {
                         if src_bytes == dst_bytes {
+                            found_in_profile = true;
+                            break;
+                        }
+                        // Do not regress a newer isolated seat token to an expired
+                        // or older profile snapshot. A profile/account cutover must
+                        // still replace it, and retained seat bytes stay sanitized.
+                        if !profile_changed
+                            && is_anthropic_cred
+                            && json_oauth_expires_at(&dst_bytes).is_some_and(|dst_exp| {
+                                dst_exp > now_ms
+                                    && Some(dst_exp) > json_oauth_expires_at(&src_bytes)
+                            })
+                            && !matches!(
+                                (json_oauth_identity(&src_bytes), json_oauth_identity(&dst_bytes)),
+                                (Some(src_id), Some(dst_id)) if src_id != dst_id
+                            )
+                        {
+                            let sanitized =
+                                seat_sanitized_anthropic_credentials(&dst_bytes, now_ms);
+                            if sanitized != dst_bytes {
+                                write_required_file(&dst, &sanitized, 0o660)?;
+                            }
                             found_in_profile = true;
                             break;
                         }
@@ -10215,13 +10302,25 @@ pub(crate) fn effective_agent_instructions(
         .as_ref()
         .map(|(_, tpl)| tpl.body.trim())
         .filter(|s| !s.is_empty());
-    let custom = strip_known_baked_role_prefixes(agent.instructions.as_deref(), role_body);
-    match (role_body, custom.as_deref()) {
-        (Some(role), Some(custom)) => Some(format!("{role}\n\n{custom}")),
-        (Some(role), None) => Some(role.to_string()),
-        (None, Some(custom)) => Some(custom.to_string()),
-        (None, None) => None,
+    let mut custom = agent.instructions.clone();
+    loop {
+        let next = strip_known_baked_role_prefixes(custom.as_deref(), role_body);
+        if next == custom {
+            break;
+        }
+        custom = next;
     }
+    // Execution discipline is a runtime baseline, not a role-name policy.
+    // Role templates stay caller-owned and are reloaded from their source.
+    let mut sections = vec![BUILTIN_GENERAL_ROLE_BODY.to_string()];
+    for section in [role_body, custom.as_deref()].into_iter().flatten() {
+        let section = strip_role_prefix_match(section, BUILTIN_GENERAL_ROLE_BODY)
+            .unwrap_or_else(|| Some(section.to_string()));
+        if let Some(section) = section {
+            sections.push(section);
+        }
+    }
+    Some(sections.join("\n\n"))
 }
 
 pub(crate) fn backfill_historical_agent_roles(
@@ -10432,7 +10531,28 @@ pub(crate) fn apply_archetype_defaults(
     {
         body.workdir = Some(wd);
     }
-    if body.harness.as_deref().is_none_or(|h| h.trim().is_empty())
+    let caller_harness = body
+        .harness
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(|h| {
+            if h.eq_ignore_ascii_case("inherit") {
+                resolve_subagent_defaults(data_dir, parent, "inherit", None, None).0
+            } else {
+                normalize_harness_name(h).to_string()
+            }
+        });
+    let tpl_harness = tpl
+        .harness
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(|h| normalize_harness_name(h).to_string());
+    let harness_overridden = caller_harness
+        .as_deref()
+        .is_some_and(|ch| tpl_harness.as_deref().is_some_and(|th| ch != th));
+    if caller_harness.is_none()
         && let Some(h) = tpl.harness
     {
         body.harness = Some(h);
@@ -10442,6 +10562,7 @@ pub(crate) fn apply_archetype_defaults(
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
+        && !harness_overridden
         && let Some(m) = tpl.model
     {
         body.model = Some(m);
@@ -10451,9 +10572,33 @@ pub(crate) fn apply_archetype_defaults(
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
+        && !harness_overridden
         && let Some(p) = tpl.profile
     {
-        body.profile = Some(p);
+        let (effective_harness, effective_model, _) = resolve_subagent_defaults(
+            data_dir,
+            parent,
+            body.harness.as_deref().unwrap_or("claude-code"),
+            body.model.clone(),
+            None,
+        );
+        let expected_provider =
+            upstream_provider_of(&effective_harness, effective_model.as_deref());
+        let tpl_provider = p
+            .split_once('/')
+            .map(|(prov, _)| prov.trim())
+            .unwrap_or(expected_provider.as_str());
+        if tpl_provider == expected_provider
+            && ensure_harness_runs_profile(
+                data_dir,
+                &effective_harness,
+                Some(&p),
+                effective_model.as_deref(),
+            )
+            .is_ok()
+        {
+            body.profile = Some(p);
+        }
     }
     let canonical_role = tpl
         .role
@@ -10657,6 +10802,88 @@ pub(crate) fn resolve_subagent_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_projection_script_flattens_synced_skills_without_touching_local_or_foreign_data() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("skills");
+        let agent = dir.path().join("agent");
+        let config = agent.join("config");
+        let overlay = agent.join("skills");
+        let view = agent.join("skills-view");
+        let agy = config.join(".gemini/config/skills");
+        let skill = |root: &Path, name: &str, body: &str| {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join("SKILL.md"), body).unwrap();
+        };
+        skill(&global.join("synced/z"), "sample", "later");
+        skill(&global.join("synced/a"), "sample", "first");
+        skill(&global.join("synced/.bucket-temp"), "hidden", "hidden");
+        skill(&global.join("synced/a"), ".hidden", "hidden");
+        skill(&overlay.join("synced/a"), "sample", "overlay");
+        skill(&global, "sample", "direct");
+        skill(&agy, "local", "local bytes");
+        let foreign = dir.path().join("foreign");
+        skill(&foreign, "sample", "foreign bytes");
+        symlink(foreign.join("sample"), agy.join("foreign")).unwrap();
+        std::fs::write(global.join("synced/manifest.json"), "{}").unwrap();
+        let project = || {
+            for relative in ["skills-view", ".gemini/config/skills"] {
+                let result = std::process::Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        SKILL_PROJECTION_OWNER_SCRIPT,
+                        "skill-projection-owner",
+                    ])
+                    .arg(&config)
+                    .arg(relative)
+                    .arg(&view)
+                    .arg(&global)
+                    .arg(&overlay)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        };
+        project();
+        assert_eq!(
+            std::fs::read_to_string(agy.join("sample/SKILL.md")).unwrap(),
+            "direct"
+        );
+        assert!(!agy.join("hidden").exists());
+        assert!(!agy.join(".hidden").exists());
+        assert!(!agy.join("manifest.json").exists());
+        std::fs::remove_dir_all(global.join("sample")).unwrap();
+        project();
+        assert_eq!(
+            std::fs::read_to_string(agy.join("sample/SKILL.md")).unwrap(),
+            "overlay"
+        );
+        std::fs::remove_dir_all(overlay.join("synced/a/sample")).unwrap();
+        project();
+        assert_eq!(
+            std::fs::read_to_string(agy.join("sample/SKILL.md")).unwrap(),
+            "first"
+        );
+        std::fs::remove_dir_all(global.join("synced/a/sample")).unwrap();
+        std::fs::remove_dir_all(global.join("synced/z/sample")).unwrap();
+        project();
+        assert!(std::fs::symlink_metadata(agy.join("sample")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(agy.join("local/SKILL.md")).unwrap(),
+            "local bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(agy.join("foreign/SKILL.md")).unwrap(),
+            "foreign bytes"
+        );
+    }
 
     #[test]
     fn a_model_change_on_an_unconfigured_harness_installs_nothing() {
@@ -13450,7 +13677,7 @@ mod archetype_tests {
             preview_agent.workdir = Some(dir.path().display().to_string());
             assert_eq!(
                 effective_agent_instructions(None, dir.path(), &preview_agent).as_deref(),
-                Some(format!("{expected_body}\n\nCustom assignment instructions.").as_str())
+                Some(format!("{BUILTIN_GENERAL_ROLE_BODY}\n\n{expected_body}\n\nCustom assignment instructions.").as_str())
             );
         }
 
@@ -13834,11 +14061,20 @@ mod archetype_tests {
         );
         assert_eq!(
             effective_agent_instructions(Some(&store), &data, &agent).as_deref(),
-            Some("Role SSOT v1 instructions.\n\nKeep only custom task assignment.")
+            Some(format!("{BUILTIN_GENERAL_ROLE_BODY}\n\nRole SSOT v1 instructions.\n\nKeep only custom task assignment.").as_str())
         );
         let cfg = agent_config_dir(&data, &agent.id);
         let prompt_v1 = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
         assert!(prompt_v1.contains("Role SSOT v1 instructions."));
+        assert_eq!(prompt_v1.matches(BUILTIN_GENERAL_ROLE_BODY).count(), 1);
+        // Old composed instructions do not duplicate either runtime baseline
+        // or the current caller template when rendered again.
+        let mut baked = agent.clone();
+        baked.instructions = effective_agent_instructions(Some(&store), &data, &agent);
+        assert_eq!(
+            effective_agent_instructions(Some(&store), &data, &baked),
+            baked.instructions
+        );
         assert!(prompt_v1.contains("Keep only custom task assignment."));
         assert!(!cfg.join(INSTRUCTIONS_ROTATED_MARKER).exists());
 
@@ -15114,6 +15350,271 @@ Connection: close
         let _ = stream.read(&mut chunk);
     }
 
+    // Exercise production sanitization without changing the environment of parallel tests.
+    fn claude_projection_test_worker(test: &str) -> bool {
+        const WORKER: &str = "ANYAGENTS_CLAUDE_PROJECTION_TEST";
+        if std::env::var_os(WORKER).is_some() {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(WORKER, "1")
+            .env(
+                "ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL",
+                "http://127.0.0.1:1/oauth/token",
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        false
+    }
+
+    fn claude_projection_credentials(token: &str, expiry: i64, refresh: bool) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"claudeAiOauth": {
+            "accessToken": token,
+            "refreshToken": if refresh { Some("profile-only-refresh") } else { None },
+            "expiresAt": expiry,
+            "accountUuid": "selected-account"
+        }}))
+        .unwrap()
+    }
+
+    fn assert_claude_projection(config: &Path, token: &str, expiry: i64) {
+        for rel in [".credentials.json", ".claude/.credentials.json"] {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(config.join(rel)).unwrap()).unwrap();
+            assert_eq!(value["claudeAiOauth"]["accessToken"], token, "{rel}");
+            assert_eq!(value["claudeAiOauth"]["expiresAt"], expiry, "{rel}");
+            assert!(value["claudeAiOauth"]["refreshToken"].is_null(), "{rel}");
+        }
+    }
+
+    #[test]
+    fn claude_projection_seed_respects_source_target_expiry_and_isolation() {
+        if !claude_projection_test_worker(
+            "create::runtime_config_tests::claude_projection_seed_respects_source_target_expiry_and_isolation",
+        ) {
+            return;
+        }
+        let now = anyagents_core::now_ms();
+        // Each alias can be the only authoritative source; an absent or expired
+        // source must never regress a valid seat or borrow another profile.
+        for source_rel in [".credentials.json", ".claude/.credentials.json"] {
+            for source_exp in [None, Some(now - 1_000), Some(now + 7_200_000)] {
+                for target_exp in [
+                    None,
+                    Some(now - 2_000),
+                    Some(now + 3_600_000),
+                    Some(now + 10_800_000),
+                ] {
+                    for target_identity in ["selected-account", "other-account"] {
+                        let dir = tempfile::tempdir().unwrap();
+                        let store = Store::open(dir.path().join("state.db")).unwrap();
+                        let agent = store
+                            .create_agent(anyagents_core::NewAgent::new("sample", "claude-code"))
+                            .unwrap();
+                        let profile = dir.path().join("profiles/anthropic/selected");
+                        let other = dir.path().join("profiles/anthropic/default");
+                        let cfg = agent_config_dir(dir.path(), &agent.id);
+                        for root in [&profile, &other, &cfg] {
+                            std::fs::create_dir_all(root.join(".claude")).unwrap();
+                        }
+                        // Suppress a network refresh, not the production sanitizer.
+                        write_profile_marker(
+                            &profile,
+                            OAUTH_REFRESH_ATTEMPT_FILE,
+                            &now.to_string(),
+                        )
+                        .unwrap();
+                        write_profile_marker(&cfg, ".anyagents-profile", "anthropic/selected\n")
+                            .unwrap();
+                        write_profile_marker(
+                            &cfg,
+                            ".anyagents-seeded-profile",
+                            "anthropic/selected\n",
+                        )
+                        .unwrap();
+                        let foreign =
+                            claude_projection_credentials("other-profile", now + 14_400_000, true);
+                        std::fs::write(other.join(".credentials.json"), &foreign).unwrap();
+                        let source = source_exp
+                            .map(|exp| claude_projection_credentials("source", exp, true));
+                        if let Some(ref bytes) = source {
+                            std::fs::write(profile.join(source_rel), bytes).unwrap();
+                        }
+                        if let Some(exp) = target_exp {
+                            let mut value: serde_json::Value = serde_json::from_slice(
+                                &claude_projection_credentials("target", exp, false),
+                            )
+                            .unwrap();
+                            value["claudeAiOauth"]["accountUuid"] = target_identity.into();
+                            if source.is_some() {
+                                // A retained token must also have its refresh field sanitized.
+                                value["claudeAiOauth"]["refreshToken"] = "".into();
+                            }
+                            let bytes = serde_json::to_vec(&value).unwrap();
+                            for rel in [".credentials.json", ".claude/.credentials.json"] {
+                                std::fs::write(cfg.join(rel), &bytes).unwrap();
+                            }
+                        }
+                        seed_harness_credentials(&store, dir.path(), &agent, &cfg).unwrap();
+                        let expected = match (source_exp, target_exp) {
+                            (None, target) => target.map(|exp| ("target", exp)),
+                            (Some(src), Some(dst))
+                                if dst > now
+                                    && dst > src
+                                    && target_identity == "selected-account" =>
+                            {
+                                Some(("target", dst))
+                            }
+                            (Some(src), _) if src > now => Some(("source", src)),
+                            _ => Some(("", 0)),
+                        };
+                        if let Some((token, expiry)) = expected {
+                            assert_claude_projection(&cfg, token, expiry);
+                            let projected: serde_json::Value = serde_json::from_slice(
+                                &std::fs::read(cfg.join(".credentials.json")).unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                projected["claudeAiOauth"]["accountUuid"],
+                                if token == "target" {
+                                    target_identity
+                                } else {
+                                    "selected-account"
+                                }
+                            );
+                        } else {
+                            assert!(!cfg.join(".credentials.json").exists());
+                            assert!(!cfg.join(".claude/.credentials.json").exists());
+                        }
+                        if let Some(bytes) = source {
+                            assert_eq!(std::fs::read(profile.join(source_rel)).unwrap(), bytes);
+                        }
+                        assert_eq!(
+                            std::fs::read(other.join(".credentials.json")).unwrap(),
+                            foreign
+                        );
+                        assert_eq!(
+                            bound_profile_name(&cfg).as_deref(),
+                            Some("anthropic/selected")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn claude_projection_switch_and_launch_choose_fresh_selected_profile_alias() {
+        if !claude_projection_test_worker(
+            "create::runtime_config_tests::claude_projection_switch_and_launch_choose_fresh_selected_profile_alias",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sample", "codex"))
+            .unwrap();
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        let profile = dir.path().join("profiles/anthropic/selected");
+        for root in [&cfg, &profile] {
+            std::fs::create_dir_all(root.join(".claude")).unwrap();
+        }
+        let now = anyagents_core::now_ms();
+        let stale = claude_projection_credentials("expired", now - 1_000, true);
+        let fresh = claude_projection_credentials("selected-fresh", now + 7_200_000, true);
+        let previous = claude_projection_credentials("previous-profile", now + 14_400_000, false);
+        std::fs::write(profile.join(".credentials.json"), &stale).unwrap();
+        std::fs::write(profile.join(".claude/.credentials.json"), &fresh).unwrap();
+        for rel in [".credentials.json", ".claude/.credentials.json"] {
+            std::fs::write(cfg.join(rel), &previous).unwrap();
+        }
+        write_profile_marker(&cfg, ".anyagents-profile", "openai/default\n").unwrap();
+        write_profile_marker(&cfg, ".anyagents-seeded-profile", "openai/default\n").unwrap();
+        // The stale alias must not trigger refresh while a fresh alias exists.
+        let result = configure_agent_runtime(
+            &store,
+            dir.path(),
+            "operator",
+            &agent.name,
+            Some("claude-code"),
+            Some("anthropic/claude-opus-4-6"),
+            Some("anthropic/selected"),
+        )
+        .unwrap();
+        assert_eq!(result["harness"], "claude-code");
+        assert_eq!(result["profile"], "anthropic/selected");
+        assert_claude_projection(&cfg, "selected-fresh", now + 7_200_000);
+        assert!(!profile.join(OAUTH_REFRESH_ATTEMPT_FILE).exists());
+        assert_eq!(
+            std::fs::read(profile.join(".credentials.json")).unwrap(),
+            stale
+        );
+        assert_eq!(
+            std::fs::read(profile.join(".claude/.credentials.json")).unwrap(),
+            fresh
+        );
+
+        // Ordinary launch reconciles via the same owner, with the other alias fresh.
+        std::fs::write(profile.join(".credentials.json"), &fresh).unwrap();
+        std::fs::write(profile.join(".claude/.credentials.json"), &stale).unwrap();
+        for rel in [".credentials.json", ".claude/.credentials.json"] {
+            std::fs::write(
+                cfg.join(rel),
+                claude_projection_credentials("expired-seat", now - 2_000, false),
+            )
+            .unwrap();
+        }
+        let updated = store.agent(&agent.id).unwrap();
+        reconcile_agent_runtime_config_for_launch(
+            &store,
+            dir.path(),
+            &updated,
+            &cfg,
+            &agent_work_dir(dir.path(), &agent.id),
+        )
+        .unwrap();
+        assert_claude_projection(&cfg, "selected-fresh", now + 7_200_000);
+        assert_eq!(
+            std::fs::read(profile.join(".credentials.json")).unwrap(),
+            fresh
+        );
+        assert_eq!(
+            std::fs::read(profile.join(".claude/.credentials.json")).unwrap(),
+            stale
+        );
+
+        // Required credential writes still fail closed on an unwritable destination.
+        std::fs::remove_file(cfg.join(".credentials.json")).unwrap();
+        std::fs::create_dir(cfg.join(".credentials.json")).unwrap();
+        assert!(seed_harness_credentials(&store, dir.path(), &updated, &cfg).is_err());
+        std::fs::remove_dir(cfg.join(".credentials.json")).unwrap();
+
+        // A profile switch with no credentials clears old-profile credentials,
+        // rather than retaining a valid token from a different account.
+        let empty = dir.path().join("profiles/anthropic/empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "anthropic/empty\n").unwrap();
+        seed_harness_credentials(&store, dir.path(), &updated, &cfg).unwrap();
+        assert!(!cfg.join(".credentials.json").exists());
+        assert!(!cfg.join(".claude/.credentials.json").exists());
+        assert_eq!(
+            seeded_profile_name(&cfg).as_deref(),
+            Some("anthropic/empty")
+        );
+    }
+
     #[test]
     fn mid_session_anthropic_oauth_refresh_updates_profile_and_sanitized_agent_credentials() {
         const WORKER: &str = "ANYAGENTS_ANTHROPIC_REFRESH_TEST";
@@ -15374,6 +15875,127 @@ Connection: close
         );
         // Nothing to roll back: no row was written.
         assert!(store.agent_by_name("agy-on-sylphx").is_err());
+    }
+
+    #[test]
+    fn archetype_profile_inherits_when_compatible_and_skips_on_harness_override() {
+        let dir = crate::test_tempdir();
+        let data = dir.path().join("data");
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(ws.join(".agents/agents")).unwrap();
+        std::fs::write(
+            ws.join(".agents/agents/general.md"),
+            "---\nrole: general\nscope: private\nharness: spiron\nmodel: sylphx/openai/gpt-6.1-sol#xhigh\nprofile: sylphx/default\ndescription: General worker\n---\nGeneral body.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join(".agents/agents/profile-only.md"),
+            "---\nrole: profile-only\nscope: private\nprofile: sylphx/default\ndescription: Profile-only worker\n---\nProfile body.\n",
+        )
+        .unwrap();
+
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let mut parent_new = NewAgent::new("parent", "spiron");
+        parent_new.workdir = Some(ws.to_string_lossy().into_owned());
+        let parent = store.create_agent(parent_new).unwrap();
+
+        // 1. Omitted harness/model/profile inherits the matching template defaults.
+        let mut default_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "default-general",
+                "role": "general",
+                "harness": "",
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data, Some(&parent), &mut default_req).unwrap();
+        assert_eq!(default_req.harness.as_deref(), Some("spiron"));
+        assert_eq!(
+            default_req.model.as_deref(),
+            Some("sylphx/openai/gpt-6.1-sol#xhigh")
+        );
+        assert_eq!(default_req.profile.as_deref(), Some("sylphx/default"));
+
+        // 2. Explicit `harness: "claude-code"` with omitted `profile` skips `tpl.profile`
+        //    so `claude-code` resolves its own native default profile cleanly.
+        let mut cc_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "cc-override",
+                "role": "general",
+                "harness": "claude-code",
+                "model": "claude-opus-5-5#high",
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data, Some(&parent), &mut cc_req).unwrap();
+        assert_eq!(cc_req.harness.as_deref(), Some("claude-code"));
+        assert_eq!(cc_req.model.as_deref(), Some("claude-opus-5-5#high"));
+        assert_eq!(cc_req.profile, None);
+
+        // 3. Explicit `harness: "claude-code"` with omitted `model` and `profile` skips both.
+        let mut cc_bare: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "cc-bare",
+                "role": "general",
+                "harness": "claude-code",
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data, Some(&parent), &mut cc_bare).unwrap();
+        assert_eq!(cc_bare.harness.as_deref(), Some("claude-code"));
+        assert_eq!(cc_bare.model, None);
+        assert_eq!(cc_bare.profile, None);
+
+        // 4. Template without `harness` whose `profile` provider prefix mismatches
+        //    `effective_harness` also skips `tpl.profile` when omitted.
+        let mut mismatch_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "cc-profile-only",
+                "role": "profile-only",
+                "harness": "claude-code",
+                "model": "claude-opus-5-5#high",
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data, Some(&parent), &mut mismatch_req).unwrap();
+        assert_eq!(mismatch_req.profile, None);
+
+        // 5. Explicit incompatible `profile` from the caller still fails closed in `create()`.
+        let mut explicit_bad: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "explicit-incompatible",
+                "role": "general",
+                "harness": "agy",
+                "profile": "sylphx/default",
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data, Some(&parent), &mut explicit_bad).unwrap();
+        assert_eq!(explicit_bad.profile.as_deref(), Some("sylphx/default"));
+        let err = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: explicit_bad.name,
+                role: explicit_bad.role,
+                harness: "agy".to_string(),
+                model: explicit_bad.model,
+                profile: explicit_bad.profile,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: Some(ws),
+                description: explicit_bad.description,
+                instructions: explicit_bad.instructions,
+                parent_id: Some(parent.id),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("not compatible with provider profile `sylphx/default`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -15954,7 +16576,7 @@ Connection: close
             probe.workdir = None;
             assert_eq!(
                 effective_agent_instructions(Some(&store), &data_dir, &probe).as_deref(),
-                Some(expected_body)
+                Some(format!("{BUILTIN_GENERAL_ROLE_BODY}\n\n{expected_body}").as_str())
             );
         }
 
@@ -16016,7 +16638,7 @@ Connection: close
         override_probe.workdir = None;
         assert_eq!(
             effective_agent_instructions(Some(&store), &data_dir, &override_probe).as_deref(),
-            Some("L1 local writer override.")
+            Some(format!("{BUILTIN_GENERAL_ROLE_BODY}\n\nL1 local writer override.").as_str())
         );
 
         {
