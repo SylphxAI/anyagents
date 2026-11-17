@@ -853,6 +853,10 @@ impl anyagents_harness::Harness for ContractHarness {
         self.inner.health()
     }
 
+    fn pending_input_owner(&self) -> Option<String> {
+        self.inner.pending_input_owner()
+    }
+
     fn input_ready(&self) -> bool {
         self.inner.input_ready()
     }
@@ -2695,6 +2699,21 @@ impl Harness for LocalAdapter {
         }
     }
 
+    fn pending_input_owner(&self) -> Option<String> {
+        match self {
+            Self::Claude(harness) => harness.pending_input_owner(),
+            Self::Codex(harness) => harness.pending_input_owner(),
+            Self::OpenCode(harness) => harness.pending_input_owner(),
+            Self::Agy(harness) => harness.pending_input_owner(),
+            Self::Muse(harness) => harness.pending_input_owner(),
+            Self::Omp(harness) => harness.pending_input_owner(),
+            Self::Dsh(harness) => harness.pending_input_owner(),
+            Self::Grok(harness) => harness.pending_input_owner(),
+            Self::Spiron(harness) => harness.pending_input_owner(),
+            Self::Contract(harness) => harness.pending_input_owner(),
+        }
+    }
+
     fn input_ready(&self) -> bool {
         match self {
             Self::Claude(harness) => harness.input_ready(),
@@ -2879,6 +2898,10 @@ impl Harness for VendorHarness {
             eprintln!("session synchronization failed: {error}");
         }
         self.adapter().health()
+    }
+
+    fn pending_input_owner(&self) -> Option<String> {
+        self.adapter().pending_input_owner()
     }
 
     fn input_ready(&self) -> bool {

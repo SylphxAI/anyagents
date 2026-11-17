@@ -215,6 +215,10 @@ impl Harness for AgyHarness {
         self.inner.cancel(&cancel_line(&self.spec))
     }
 
+    fn pending_input_owner(&self) -> Option<String> {
+        self.inner.pending_input_owner()
+    }
+
     fn input_ready(&self) -> bool {
         self.inner.input_ready()
     }

@@ -168,6 +168,7 @@ sys.stdin.buffer.read()
         Ok(anyagents_harness::DeliverOutcome::Accepted { .. })
     ));
     assert!(harness.wait_finished("large", Duration::from_secs(3)));
+    assert_eq!(harness.pending_input_owner(), None);
     assert_eq!(harness.written_ids(), ["large"]);
 }
 
@@ -260,6 +261,7 @@ for line in sys.stdin:
         anyagents_harness::DeliverOutcome::Accepted { .. }
     ));
     assert!(harness.wait_finished("large", Duration::from_secs(3)));
+    assert_eq!(harness.pending_input_owner(), None);
     assert_eq!(harness.written_ids(), ["large"]);
 }
 
@@ -288,6 +290,7 @@ for line in sys.stdin:
         harness.deliver(&message, &line).unwrap(),
         anyagents_harness::DeliverOutcome::Deferred
     );
+    assert_eq!(harness.pending_input_owner().as_deref(), Some("large"));
     assert!(!harness.input_ready());
     let (tx, rx) = mpsc::channel();
     let shared = Arc::clone(&harness.shared);
@@ -313,6 +316,7 @@ for line in sys.stdin:
             other => panic!("unexpected outcome: {other:?}"),
         }
     }
+    assert_eq!(harness.pending_input_owner(), None);
     assert_eq!(harness.written_ids(), ["large"]);
 }
 
