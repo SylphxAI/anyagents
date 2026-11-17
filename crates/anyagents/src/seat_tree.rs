@@ -538,6 +538,26 @@ fn tighten_op_dir(dir: BorrowedFd<'_>) -> io::Result<()> {
     #[cfg(not(target_os = "linux"))]
     let directory = File::from(dir.try_clone_to_owned()?);
     for name in names(&directory)? {
+        // Op tokens are provisioned as symlinks (auto-refresh) and the op
+        // daemon socket lives here; both are legitimate non-regular entries.
+        // Skip them (as share_open does) instead of failing ELOOP/ENXIO.
+        let c_name = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                c_name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            continue;
+        }
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            continue;
+        }
         let file = open_child(&directory, &name, false)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.nlink() != 1 {
