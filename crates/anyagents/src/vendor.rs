@@ -2632,6 +2632,21 @@ impl Harness for LocalAdapter {
         }
     }
 
+    fn stop_verified(&mut self) -> Result<(), HarnessError> {
+        match self {
+            Self::Claude(harness) => harness.stop_verified(),
+            Self::Codex(harness) => harness.stop_verified(),
+            Self::OpenCode(harness) => harness.stop_verified(),
+            Self::Agy(harness) => harness.stop_verified(),
+            Self::Muse(harness) => harness.stop_verified(),
+            Self::Omp(harness) => harness.stop_verified(),
+            Self::Dsh(harness) => harness.stop_verified(),
+            Self::Grok(harness) => harness.stop_verified(),
+            Self::Spiron(harness) => harness.stop_verified(),
+            Self::Contract(harness) => harness.stop_verified(),
+        }
+    }
+
     fn background(&mut self) -> Result<(), HarnessError> {
         match self {
             Self::Claude(harness) => harness.background(),
@@ -2873,6 +2888,11 @@ impl Harness for VendorHarness {
 
     fn stop(&mut self) {
         self.adapter_mut().stop();
+    }
+
+    fn stop_verified(&mut self) -> Result<(), HarnessError> {
+        self.adapter_mut().stop_verified()?;
+        self.sync_session().map_err(HarnessError::Failed)
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {

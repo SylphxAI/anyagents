@@ -5848,6 +5848,16 @@ fn remove_agent_identity_files(
     }
 }
 
+struct CancelWakeOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelWakeOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+const WAKE_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn wake_agent_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -5855,7 +5865,10 @@ async fn wake_agent_route(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<AgentView>, ApiError> {
     let via_http = via_http_mcp(&headers);
-    spawn_store(move || {
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_guard = CancelWakeOnDrop(Arc::clone(&cancelled));
+    let out = spawn_store(move || {
+        use std::sync::atomic::Ordering;
         let found = state
             .store
             .agent_by_name(&name)
@@ -5882,8 +5895,101 @@ async fn wake_agent_route(
             .store
             .lock_agent_lifecycle(&found.id)
             .map_err(ApiError::from_store)?;
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(ApiError::conflict("wake recovery cancelled"));
+        }
         let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
-        prepare_agent_wake(&state.store, &found)?;
+        let now = now_ms();
+        let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &found.id);
+        let files = file_cache::cache();
+        files.catch_up();
+        let markers = Markers { files, cfg: &cfg };
+        let rotated_ms = markers.ms(PROFILE_ROTATED);
+        let (session_quota, session_error) =
+            persisted_fault(&found.harness, &markers, rotated_ms, now);
+        let live = state.health.get(&found.id);
+        let live_quota_active = live
+            .as_ref()
+            .and_then(|l| l.quota_reset_at_ms)
+            .is_some_and(|ms| ms > now);
+        let persisted_quota_active = session_quota.is_some_and(|ms| ms > now);
+        let live_err = live.as_ref().and_then(|l| l.last_error.clone());
+        let live_err_kind = live_err
+            .as_deref()
+            .and_then(|err| compute_block_reason(None, Some(err), now));
+        let persisted_err_kind = session_error
+            .as_deref()
+            .and_then(|err| compute_block_reason(None, Some(err), now));
+        let live_delivery_err = if live_err_kind.as_deref() == Some("delivery_error") {
+            live_err
+        } else {
+            None
+        };
+        let persisted_delivery_err = persisted_err_kind.as_deref() == Some("delivery_error");
+        let has_unrelated_fault = live_quota_active
+            || persisted_quota_active
+            || matches!(
+                live_err_kind.as_deref(),
+                Some("sign_in_required" | "quota_exhausted" | "memory_migration_wait")
+            )
+            || matches!(
+                persisted_err_kind.as_deref(),
+                Some("sign_in_required" | "quota_exhausted" | "memory_migration_wait")
+            );
+
+        if live_delivery_err.is_some() || persisted_delivery_err {
+            if let Some(ref expected) = live_delivery_err {
+                state
+                    .health
+                    .stop_for_wake_cancellable(
+                        &found.id,
+                        expected,
+                        WAKE_RECOVERY_TIMEOUT,
+                        &cancelled,
+                    )
+                    .map_err(ApiError::conflict)?;
+            }
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(ApiError::conflict("wake recovery cancelled"));
+            }
+            let custody = state.store.try_lock_agent(&found.id).map_err(|_| {
+                ApiError::conflict("agent process lock is still held; refusing wake recovery")
+            })?;
+            let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
+            if let Some(ref expected) = live_delivery_err {
+                state
+                    .health
+                    .clear_wake_fault(&found.id, expected)
+                    .map_err(ApiError::conflict)?;
+            }
+            prepare_agent_wake_with_options(
+                &state.store,
+                &found,
+                persisted_delivery_err || session_error.is_none(),
+                false,
+                !has_unrelated_fault,
+            )?;
+            drop(custody);
+            let agent = state
+                .store
+                .set_agent_state(&found.id, "running")
+                .map_err(ApiError::from_store)?;
+            create::poke_agent_wake_socket(state.store.data_dir(), &agent.id);
+            return Ok(Json(agent_view(&state.store, &state.health, &agent)?));
+        }
+
+        if found.state == "running" {
+            create::poke_agent_wake_socket(state.store.data_dir(), &found.id);
+            return Ok(Json(agent_view(&state.store, &state.health, &found)?));
+        }
+
+        prepare_agent_wake_with_options(
+            &state.store,
+            &found,
+            !has_unrelated_fault,
+            !has_unrelated_fault,
+            !has_unrelated_fault,
+        )?;
         let agent = state
             .store
             .set_agent_state(&found.id, "running")
@@ -5891,13 +5997,25 @@ async fn wake_agent_route(
         create::poke_agent_wake_socket(state.store.data_dir(), &agent.id);
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
-    .await
+    .await;
+    drop(cancel_guard);
+    out
 }
 
 /// Restore the same runtime and archive-marker state for an explicit wake or
 /// an intentional direct send. The caller commits `running` only after this
 /// succeeds; direct sends commit it atomically with their mailbox append.
 fn prepare_agent_wake(store: &Store, found: &Agent) -> Result<(), ApiError> {
+    prepare_agent_wake_with_options(store, found, true, true, true)
+}
+
+fn prepare_agent_wake_with_options(
+    store: &Store,
+    found: &Agent,
+    clear_delivery_fault: bool,
+    clear_quota: bool,
+    rotate_profile: bool,
+) -> Result<(), ApiError> {
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &found.id);
     if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&cfg) {
         let _ = anyagents_tools::SandboxProvider::resume(&sbx);
@@ -5916,12 +6034,16 @@ fn prepare_agent_wake(store: &Store, found: &Agent) -> Result<(), ApiError> {
         create::reconcile_agent_runtime_config(store, store.data_dir(), found, &cfg, &work_dir)
             .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()))?;
     }
-    let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
-    let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
+    if clear_delivery_fault {
+        let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
+        let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
+    }
     let now = now_ms();
-    create::write_profile_marker(&cfg, ".anyagents-quota-cleared-ms", &format!("{now}\n"))
-        .map_err(ApiError::from_store)?;
-    if !store.has_open_turn(&found.id).unwrap_or(false) {
+    if clear_quota {
+        create::write_profile_marker(&cfg, ".anyagents-quota-cleared-ms", &format!("{now}\n"))
+            .map_err(ApiError::from_store)?;
+    }
+    if rotate_profile && !store.has_open_turn(&found.id).unwrap_or(false) {
         create::write_profile_marker(&cfg, ".anyagents-profile-rotated-ms", &format!("{now}\n"))
             .map_err(ApiError::from_store)?;
     }
@@ -9040,6 +9162,10 @@ impl ApiError {
 
     fn forbidden(message: impl Into<String>) -> Self {
         Self::new(StatusCode::FORBIDDEN, message)
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, message)
     }
 
     fn from_store(err: Error) -> Self {
@@ -16978,6 +17104,517 @@ exec '{}' "$@"
             "archived",
             "pause overwrote archived state"
         );
+    }
+
+    struct RouteWakeHarness {
+        generation: usize,
+        alive: bool,
+        in_turn: bool,
+        diagnostic: Option<String>,
+        allow_verified_stop: Arc<std::sync::atomic::AtomicBool>,
+        stop_entered_tx: Option<std::sync::mpsc::Sender<()>>,
+        stop_release_rx: Option<Arc<Mutex<std::sync::mpsc::Receiver<()>>>>,
+        delivered: Arc<Mutex<Vec<(usize, String)>>>,
+        active_processes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for RouteWakeHarness {
+        fn drop(&mut self) {
+            if self.alive {
+                self.active_processes
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                self.alive = false;
+            }
+        }
+    }
+
+    impl anyagents_harness::Harness for RouteWakeHarness {
+        fn deliver(
+            &mut self,
+            message: &anyagents_harness::OutboundMessage,
+        ) -> Result<anyagents_harness::DeliverOutcome, anyagents_harness::HarnessError> {
+            self.delivered
+                .lock()
+                .unwrap()
+                .push((self.generation, message.text.clone()));
+            self.in_turn = false;
+            Ok(anyagents_harness::DeliverOutcome::Accepted {
+                turn_finished: true,
+            })
+        }
+
+        fn proven(&self, _message_id: &str) -> Option<anyagents_harness::Proof> {
+            Some(anyagents_harness::Proof::Taken {
+                turn_finished: true,
+            })
+        }
+
+        fn stop_verified(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+            if let Some(tx) = self.stop_entered_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = &self.stop_release_rx {
+                let _ = rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+            }
+            if !self
+                .allow_verified_stop
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(anyagents_harness::HarnessError::Failed(
+                    "checked harness retirement is unsupported".into(),
+                ));
+            }
+            if self.alive {
+                self.active_processes
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                self.alive = false;
+            }
+            self.in_turn = false;
+            Ok(())
+        }
+
+        fn background(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+            Ok(())
+        }
+        fn resume(&mut self, _session: &str) -> Result<(), anyagents_harness::HarnessError> {
+            Ok(())
+        }
+        fn cancel(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+            Ok(())
+        }
+        fn exit_diagnostic(&self) -> Option<String> {
+            self.diagnostic.clone()
+        }
+        fn health(&self) -> anyagents_harness::HarnessHealth {
+            anyagents_harness::HarnessHealth {
+                process_alive: self.alive,
+                turn_state: if self.in_turn {
+                    anyagents_harness::TurnState::InTurn
+                } else {
+                    anyagents_harness::TurnState::Idle
+                },
+                delivery: anyagents_harness::Delivery {
+                    level: anyagents_harness::DeliveryLevel::NextStep,
+                    idempotent: true,
+                    proof: "test".into(),
+                    peer: None,
+                },
+                quota_reset_at_ms: None,
+                sign_in_fault: None,
+            }
+        }
+    }
+
+    struct FakeModeGuard(Option<std::ffi::OsString>);
+    impl FakeModeGuard {
+        fn enter() -> Self {
+            let prev = std::env::var_os("ANYAGENTS_FAKE_MODE");
+            unsafe {
+                std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+            }
+            Self(prev)
+        }
+    }
+    impl Drop for FakeModeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("ANYAGENTS_FAKE_MODE", v),
+                    None => std::env::remove_var("ANYAGENTS_FAKE_MODE"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wake_route_recovers_delivery_error_in_one_step_and_keeps_repeat_wake_idempotent() {
+        let _env = env_lock();
+        let _fake = FakeModeGuard::enter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            let dir = crate::test_tempdir();
+            let mut state = archetype_validation_state(dir.path());
+            let launches = Arc::new(AtomicUsize::new(0));
+            let active_processes = Arc::new(AtomicUsize::new(0));
+            let max_concurrent = Arc::new(AtomicUsize::new(0));
+            let delivered = Arc::new(Mutex::new(Vec::<(usize, String)>::new()));
+
+            let launches_l = Arc::clone(&launches);
+            let active_l = Arc::clone(&active_processes);
+            let max_l = Arc::clone(&max_concurrent);
+            let delivered_l = Arc::clone(&delivered);
+
+            let sup = anyagents_supervisor::Supervisor::start(
+                Arc::clone(&state.store),
+                Arc::new(anyagents_supervisor::SystemClock::new()),
+                Arc::new(move |_| {
+                    let gen_no = launches_l.fetch_add(1, Ordering::SeqCst) + 1;
+                    let cur = active_l.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_l.fetch_max(cur, Ordering::SeqCst);
+                    Ok(RouteWakeHarness {
+                        generation: gen_no,
+                        alive: true,
+                        in_turn: false,
+                        // Generation 1 surfaces a terminal delivery_error; generation 2+ is healthy.
+                        diagnostic: (gen_no == 1).then(|| "broken transport pipe".into()),
+                        allow_verified_stop: Arc::new(AtomicBool::new(true)),
+                        stop_entered_tx: None,
+                        stop_release_rx: None,
+                        delivered: Arc::clone(&delivered_l),
+                        active_processes: Arc::clone(&active_l),
+                    })
+                }),
+                Vec::new(),
+            )
+            .unwrap();
+            state.health = sup.board();
+
+            let created = state
+                .store
+                .create_agent(anyagents_core::NewAgent::new("wake-target", "claude-code"))
+                .unwrap();
+            let cfg = anyagents_core::agent_config_dir(dir.path(), &created.id);
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(
+                cfg.join(".anyagents-last-error.json"),
+                r#"{"error":"broken transport pipe","timestamp_ms":9999999999999}"#,
+            )
+            .unwrap();
+            let work = dir.path().join("work");
+            std::fs::create_dir_all(&work).unwrap();
+            let running = state
+                .store
+                .set_agent_running(&created.id, &work.display().to_string())
+                .unwrap();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while sup.live(&running.id).and_then(|l| l.last_error).as_deref()
+                != Some("broken transport pipe")
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fault never published"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let before = agent_view(&state.store, &state.health, &running).unwrap();
+            assert_eq!(before.block_reason.as_deref(), Some("delivery_error"));
+
+            let Json(woken) = wake_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath(running.name.clone()),
+                axum::http::HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(woken.state, "running");
+            assert_eq!(woken.block_reason, None);
+            assert_eq!(woken.last_error, None);
+            assert!(!cfg.join(".anyagents-last-error.json").exists());
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while launches.load(Ordering::SeqCst) < 2 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "replacement generation never launched"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            // Repeat wake while the healthy replacement worker is running must be
+            // idempotent and must not rotate markers or spawn a third generation.
+            let Json(repeat) = wake_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath(running.name.clone()),
+                axum::http::HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(repeat.state, "running");
+            assert_eq!(repeat.block_reason, None);
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            assert_eq!(
+                launches.load(Ordering::SeqCst),
+                2,
+                "repeat wake restarted healthy replacement worker"
+            );
+
+            state
+                .store
+                .receive(
+                    &running.id,
+                    anyagents_core::Incoming::new("post-wake message"),
+                )
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !delivered
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, text)| text.contains("post-wake message"))
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "replacement generation never delivered post-wake mail"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(launches.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                max_concurrent.load(Ordering::SeqCst),
+                1,
+                "old generation must retire before replacement launches"
+            );
+            assert_eq!(delivered.lock().unwrap()[0].0, 2);
+            drop(sup);
+        });
+    }
+
+    #[test]
+    fn wake_route_refuses_unproven_termination_and_cancellation_without_clearing_faults() {
+        let _env = env_lock();
+        let _fake = FakeModeGuard::enter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            let dir = crate::test_tempdir();
+            let mut state = archetype_validation_state(dir.path());
+            let launches = Arc::new(AtomicUsize::new(0));
+            let active = Arc::new(AtomicUsize::new(0));
+            let allow_stop = Arc::new(AtomicBool::new(false));
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = Arc::new(Mutex::new(release_rx));
+            let entered_slot = Arc::new(Mutex::new(Some(entered_tx)));
+
+            let launches_l = Arc::clone(&launches);
+            let active_l = Arc::clone(&active);
+            let allow_l = Arc::clone(&allow_stop);
+            let entered_l = Arc::clone(&entered_slot);
+            let release_l = Arc::clone(&release_rx);
+
+            let sup = anyagents_supervisor::Supervisor::start(
+                Arc::clone(&state.store),
+                Arc::new(anyagents_supervisor::SystemClock::new()),
+                Arc::new(move |_| {
+                    let gen_no = launches_l.fetch_add(1, Ordering::SeqCst) + 1;
+                    active_l.fetch_add(1, Ordering::SeqCst);
+                    Ok(RouteWakeHarness {
+                        generation: gen_no,
+                        alive: true,
+                        in_turn: false,
+                        diagnostic: (gen_no == 1).then(|| "remote keeper stop unproven".into()),
+                        allow_verified_stop: Arc::clone(&allow_l),
+                        stop_entered_tx: entered_l.lock().unwrap().take(),
+                        stop_release_rx: (gen_no == 1).then(|| Arc::clone(&release_l)),
+                        delivered: Arc::new(Mutex::new(Vec::new())),
+                        active_processes: Arc::clone(&active_l),
+                    })
+                }),
+                Vec::new(),
+            )
+            .unwrap();
+            state.health = sup.board();
+
+            let created = state
+                .store
+                .create_agent(anyagents_core::NewAgent::new(
+                    "unproven-agent",
+                    "claude-code",
+                ))
+                .unwrap();
+            let cfg = anyagents_core::agent_config_dir(dir.path(), &created.id);
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(
+                cfg.join(".anyagents-last-error.json"),
+                r#"{"error":"remote keeper stop unproven","timestamp_ms":9999999999999}"#,
+            )
+            .unwrap();
+            let work = dir.path().join("work");
+            std::fs::create_dir_all(&work).unwrap();
+            let running = state
+                .store
+                .set_agent_running(&created.id, &work.display().to_string())
+                .unwrap();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while sup.live(&running.id).and_then(|l| l.last_error).as_deref()
+                != Some("remote keeper stop unproven")
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fault never published"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            // 1. Cancellation while stop_for_wake is waiting must fail closed before
+            // clearing any fault or starting a replacement.
+            let cancel_state = state.clone();
+            let cancel_name = running.name.clone();
+            let wake_fut = wake_agent_route(
+                Principal::Operator,
+                State(cancel_state),
+                AxumPath(cancel_name),
+                axum::http::HeaderMap::new(),
+            );
+            let timed = tokio::time::timeout(std::time::Duration::from_millis(60), wake_fut).await;
+            assert!(
+                timed.is_err(),
+                "wake should still be waiting on gated stop_verified"
+            );
+
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            release_tx.send(()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+            assert_eq!(state.store.agent(&running.id).unwrap().state, "paused");
+            assert!(cfg.join(".anyagents-last-error.json").exists());
+            assert_eq!(
+                sup.live(&running.id).and_then(|l| l.last_error).as_deref(),
+                Some("remote keeper stop unproven")
+            );
+            assert!(matches!(
+                state.store.try_lock_agent(&running.id),
+                Err(anyagents_core::Error::AgentBusy)
+            ));
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+
+            // 2. Subsequent wake while stop_verified still returns Err refuses with
+            // 409 Conflict and preserves both fault and quarantined custody.
+            let _ = release_tx.send(());
+            let err = wake_agent_route(
+                Principal::Operator,
+                State(state.clone()),
+                AxumPath(running.name.clone()),
+                axum::http::HeaderMap::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::CONFLICT);
+            assert!(err.message.contains("unsupported"), "{}", err.message);
+            assert!(cfg.join(".anyagents-last-error.json").exists());
+            assert!(matches!(
+                state.store.try_lock_agent(&running.id),
+                Err(anyagents_core::Error::AgentBusy)
+            ));
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+            drop(sup);
+        });
+    }
+
+    #[test]
+    fn wake_route_preserves_unrelated_auth_quota_and_migration_faults() {
+        let _env = env_lock();
+        let _fake = FakeModeGuard::enter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = crate::test_tempdir();
+            let state = archetype_validation_state(dir.path());
+            for (idx, (fault_text, quota_ms, expected_reason)) in [
+                ("not logged in to provider", None, "sign_in_required"),
+                (
+                    "rate_limit quota exceeded",
+                    Some(now_ms() + 600_000),
+                    "quota_exhausted",
+                ),
+                (
+                    "memory_migration_wait: indexing host memory",
+                    None,
+                    "memory_migration_wait",
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let msg = fault_text;
+                let agent = state
+                    .store
+                    .create_agent(anyagents_core::NewAgent::new(
+                        format!("unrelated-{idx}"),
+                        "claude-code",
+                    ))
+                    .unwrap();
+                let cfg = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+                std::fs::create_dir_all(&cfg).unwrap();
+                std::fs::write(
+                    cfg.join(".anyagents-last-error.json"),
+                    serde_json::json!({
+                        "error": msg,
+                        "timestamp_ms": now_ms() + 1_000,
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                let work = dir.path().join(format!("work-{idx}"));
+                std::fs::create_dir_all(&work).unwrap();
+                state.store.set_agent_state(&agent.id, "paused").unwrap();
+                state.health.publish(
+                    &agent.id,
+                    anyagents_supervisor::LiveState {
+                        process_alive: true,
+                        turn_state: anyagents_harness::TurnState::Idle,
+                        delivery: None,
+                        quota_reset_at_ms: quota_ms,
+                        restart_at_ms: None,
+                        pid: Some(1000 + idx as u32),
+                        live_harness: Some("claude-code".into()),
+                        live_model: None,
+                        process_started_at_ms: Some(now_ms()),
+                        last_error: Some(msg.to_string()),
+                    },
+                );
+
+                let Json(woken) = wake_agent_route(
+                    Principal::Operator,
+                    State(state.clone()),
+                    AxumPath(agent.name.clone()),
+                    axum::http::HeaderMap::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(woken.state, "running");
+                assert_eq!(
+                    woken.block_reason.as_deref(),
+                    Some(expected_reason),
+                    "unrelated fault cleared on paused->running wake for {expected_reason}"
+                );
+                assert!(cfg.join(".anyagents-last-error.json").exists());
+                assert!(!cfg.join(".anyagents-quota-cleared-ms").exists());
+
+                let Json(woken_again) = wake_agent_route(
+                    Principal::Operator,
+                    State(state.clone()),
+                    AxumPath(agent.name.clone()),
+                    axum::http::HeaderMap::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    woken_again.block_reason.as_deref(),
+                    Some(expected_reason),
+                    "unrelated fault cleared on running wake for {expected_reason}"
+                );
+                assert!(cfg.join(".anyagents-last-error.json").exists());
+            }
+        });
     }
 
     #[test]
