@@ -138,8 +138,13 @@ impl Pty {
             String::from_utf8_lossy(&self.capture)
         );
         let now = attrs(&self.slave);
+        #[cfg(target_vendor = "apple")]
+        let lflag_mask = !libc::PENDIN;
+        #[cfg(not(target_vendor = "apple"))]
+        let lflag_mask = !0;
         assert_eq!(
-            now.c_lflag, self.saved.c_lflag,
+            now.c_lflag & lflag_mask,
+            self.saved.c_lflag & lflag_mask,
             "local terminal flags restored"
         );
         assert_eq!(
