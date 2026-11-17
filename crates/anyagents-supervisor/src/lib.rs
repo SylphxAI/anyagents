@@ -404,14 +404,35 @@ pub struct LiveState {
 }
 
 /// Latest [`LiveState`] for each agent the supervisor has touched.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct HealthBoard {
     inner: Arc<Mutex<HashMap<AgentId, LiveState>>>,
+    changes: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl Default for HealthBoard {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+            changes: Arc::new(tokio::sync::watch::channel(0).0),
+        }
+    }
 }
 
 impl HealthBoard {
+    /// Subscribe before reading health to avoid missing a concurrent transition.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
     pub fn publish(&self, id: &AgentId, state: LiveState) {
-        lock(&self.inner).insert(id.clone(), state);
+        let mut states = lock(&self.inner);
+        if states.get(id) == Some(&state) {
+            return;
+        }
+        states.insert(id.clone(), state);
+        self.changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     pub fn get(&self, id: &AgentId) -> Option<LiveState> {

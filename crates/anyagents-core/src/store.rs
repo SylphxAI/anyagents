@@ -49,6 +49,7 @@ mod server_ops;
 mod steer_ops;
 pub use mail_notices::SYSTEM_SENDER;
 mod turn_errors;
+mod turn_events;
 pub use credentials::{
     CredentialBinding, CredentialBindingAudit, CredentialKind, CredentialObservation,
     CredentialSlot, CredentialTarget,
@@ -73,6 +74,7 @@ pub use runtime::{
     TurnOutcome, TurnState,
 };
 pub use turn_errors::{ErroredTurn, MAX_ERRORED_TURNS, TurnErrors, is_session_turn_error};
+pub use turn_events::AgentTurnSnapshot;
 
 /// Run in the owner's archive transaction, never in a second Store write.
 /// Cancelled history and coalesced counts remain available for inspection.
@@ -1187,11 +1189,17 @@ impl Store {
             // before backing off. Never replay a closure with external effects.
             let error = {
                 let mut conn = self.conn();
+                let before = conn.total_changes();
                 let attempt = conn.transaction_with_behavior(TransactionBehavior::Immediate);
                 match attempt {
                     Ok(tx) => {
                         let result = (op.take().expect("write_tx closure called once"))(&tx)?;
+                        let changed = tx.total_changes() != before;
                         tx.commit()?;
+                        if changed {
+                            self.poke_changes();
+                            self.notify_changes();
+                        }
                         return Ok(result);
                     }
                     Err(err) => Error::from(err),
@@ -1376,8 +1384,31 @@ impl Store {
 
     /// A channel for later mailbox inserts and running transitions.
     ///
-    /// Events already committed are not replayed. Scan current state after
-    /// subscribing.
+    /// Subscribe before scanning durable state. Generations are coalesced hints,
+    /// never proof that any particular predicate became true.
+    pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.shared.changes.subscribe()
+    }
+
+    /// Import a cross-process state invalidation without starting any worker.
+    pub fn poke_changes(&self) {
+        self.shared
+            .changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    fn notify_changes(&self) {
+        let path = self.data_dir().join("wake.sock");
+        if path.as_os_str().len() > 107 {
+            return;
+        }
+        if let Ok(socket) = UnixDatagram::unbound() {
+            let _ = socket.set_nonblocking(true);
+            let _ = socket.send_to(b"s", path);
+        }
+    }
+
+    /// Subscribe to mailbox/agent hints; committed events are not replayed.
     pub fn subscribe(&self) -> Receiver<Wake> {
         let (sender, receiver) = mpsc::channel();
         self.shared
@@ -5045,6 +5076,7 @@ impl Store {
                  WHERE agent_id = ?1 AND completed_seq < opened_seq",
                 [agent_id.as_str()],
             )?;
+            turn_events::record_terminal(tx, agent_id, "completed")?;
             turn_errors::end_run(tx, agent_id)?;
             Ok(())
         })
