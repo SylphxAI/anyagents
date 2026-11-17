@@ -1157,6 +1157,10 @@ fn resolve_data_dir(raw: PathBuf, _is_serve: bool) -> PathBuf {
 fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
     let data = resolve_data_dir(cli.data, matches!(cli.command, Command::Serve));
     sandbox::load_principal_registry(&data)?;
+    // Helpers a command runs use the deployment's manifest, as the server's do.
+    if !matches!(cli.command, Command::Serve) {
+        anyagents_toolchain::init_cli(&data, sandbox::host_home_dir());
+    }
     match cli.command {
         Command::Serve => server::run(&data),
         Command::Status { json } => status_cmd(&data, json),
@@ -2414,40 +2418,27 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             .and_then(|p| p.split_once('/').map(|(_, r)| r.trim()).or(Some(p)))
             .filter(|s| !s.is_empty());
         let provider = create::upstream_provider_of(target, None);
-        let staging_dir = data
-            .join("profiles")
-            .join(&provider)
-            .join(format!(".signin-staging-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&staging_dir);
-        std::fs::create_dir_all(&staging_dir)?;
+        // Empty staging is removed on return; unique credentials survive failures.
+        let staging =
+            create::SigninStaging::create(data, &provider, &anyagents_core::now_ms().to_string())?;
+        let staging_dir = staging.path();
         let use_native_agy_pkce = target == "agy"
             && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none();
         let outcome = if use_native_agy_pkce {
-            match signin::google_antigravity_pkce_sign_in(&staging_dir, &mut sink) {
-                Ok(o) => o,
-                Err(err) => {
-                    let _ = std::fs::remove_dir_all(&staging_dir);
-                    return Err(err);
-                }
-            }
+            signin::google_antigravity_pkce_sign_in(staging_dir, &mut sink)?
         } else {
-            match anyagents_installer::sign_in_at(
+            anyagents_installer::sign_in_at(
                 &anyagents_installer::builtin_catalog(),
-                &staging_dir,
+                staging_dir,
                 target,
                 &mut runner,
                 &mut sink,
-            ) {
-                Ok(o) => o,
-                Err(err) => {
-                    let _ = std::fs::remove_dir_all(&staging_dir);
-                    return Err(anyagents_core::Error::Message(err.to_string()));
-                }
-            }
+            )
+            .map_err(|err| anyagents_core::Error::Message(err.to_string()))?
         };
         let (resolved_prof, final_dir, resolved_acct) =
-            create::resolve_and_commit_staged_signin(data, &provider, &staging_dir, explicit_prof)?;
+            create::resolve_and_commit_staged_signin(data, &provider, staging_dir, explicit_prof)?;
         if ui::is_pretty() {
             match resolved_acct
                 .as_deref()

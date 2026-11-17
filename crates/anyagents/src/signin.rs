@@ -1180,10 +1180,9 @@ mod tests {
             r#"{"email":"bob@example.com","token":{"access_token":"ya29.bob","refresh_token":"1//bob"}}"#,
         )
         .unwrap();
-        let staging = data
-            .path()
-            .join("profiles/google-antigravity/.signin-staging-test");
-        std::fs::create_dir_all(&staging).unwrap();
+        let held = crate::create::SigninStaging::create(data.path(), "google-antigravity", "test")
+            .unwrap();
+        let staging = held.path().to_path_buf();
         let endpoints = GooglePkceEndpoints {
             authorize_url: format!("http://{addr}/auth"),
             token_url: format!("http://{addr}/token"),
