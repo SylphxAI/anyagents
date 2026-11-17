@@ -914,6 +914,13 @@ impl StreamHarness {
         Ok(())
     }
 
+    /// The retained transport write, including a reserved write whose first
+    /// attempt hit backpressure before any bytes. Only reoffering this ID can
+    /// advance it; readiness or a vendor-held input does not imply ownership.
+    pub fn pending_input_owner(&self) -> Option<String> {
+        self.pending.as_ref().map(|pending| pending.id.clone())
+    }
+
     /// What this harness already proved about `id`, whether or not its
     /// process still runs, without writing anything (`Harness::proven`). A
     /// read of the state the stdout reader and the cascade watcher keep: it
@@ -1013,6 +1020,9 @@ impl StreamHarness {
                 let other = state.agy_steer.as_ref().is_some_and(|steer| steer.id != id);
                 state.agy_steer = None;
                 if outcome == AgySteered::Returned && other {
+                    state.touch();
+                    drop(state);
+                    self.wake.notify_all();
                     return Ok(DeliverOutcome::Deferred);
                 }
             }

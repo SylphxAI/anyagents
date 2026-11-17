@@ -1,7 +1,11 @@
-//! Delivery loop. It hands each message past the delivery cursor to the
-//! harness, in sequence order, and moves the cursor only over the contiguous
-//! prefix the harness's own input or steer API has taken. A line the vendor
-//! holds in flight never stops the lines behind it. It never looks at a turn.
+//! Delivery loop. External-user mail can be offered ahead of trusted child or
+//! schedule mail, within bounded causal spans. The cursor and accounting still
+//! move only over the contiguous prefix proved taken by the harness. In-flight
+//! input never prevents later offers; hard admission gates stop the pass.
+
+mod priority;
+#[cfg(test)]
+mod priority_tests;
 
 use anyagents_core::{AgentId, Message, Store};
 use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage};
@@ -86,7 +90,10 @@ fn commit_proofs<H: Harness>(store: &Store, agent_id: &AgentId, harness: &H) -> 
         match harness.proven(message.id.as_str()) {
             Some(Proof::Taken { turn_finished }) => {
                 store.note_delivered(agent_id, message.seq)?;
-                if turn_finished && harness.health().sign_in_fault.is_none() {
+                if turn_finished
+                    && harness.health().sign_in_fault.is_none()
+                    && priority::may_complete(store, agent_id, harness, &message)?
+                {
                     store.note_turn_completed(agent_id)?;
                 }
             }
@@ -193,8 +200,8 @@ impl<H: Harness> DeliveryLoop<H> {
         }
     }
 
-    /// One pass over the mailbox, in sequence order. Every line the harness
-    /// can take is handed over in this pass; the cursor moves only over the
+    /// One pass over bounded causal spans, offering external-user mail before
+    /// background mail. The cursor moves only over the
     /// contiguous prefix the harness proved consumed. Behind a line it holds
     /// in flight, the pass keeps writing, so the vendor takes the whole inbox
     /// at its next step, and the next pass commits what it consumed.
@@ -205,7 +212,8 @@ impl<H: Harness> DeliveryLoop<H> {
     /// but it woke nothing, so an interrupted turn still gets its recovery note.
     pub fn run_once(&mut self) -> Result<RunOutcome, Error> {
         let mut delivered = 0u64;
-        if self.harness.health().turn_state == TurnState::Idle
+        if self.harness.pending_input_owner().is_none()
+            && self.harness.health().turn_state == TurnState::Idle
             && !self.store.has_actionable_undelivered(&self.agent_id)?
         {
             return Ok(RunOutcome::Idle);
@@ -214,6 +222,51 @@ impl<H: Harness> DeliveryLoop<H> {
         // later lines are written behind it and none of them is committed.
         let mut behind: Option<i64> = None;
         let mut rejected = 0u32;
+        let mut scanned_through = 0;
+        let mut offered = std::collections::HashMap::new();
+        // A write already started cannot be preempted with another line.
+        // Resume only its exact owner, never a guessed head/background input.
+        // Its result is cached, not committed out of sequence. Recovery notes
+        // have synthetic IDs and stay on their own accounting path.
+        if let Some(owner) = self.harness.pending_input_owner() {
+            let (seq, outcome) = if self.recovery.as_ref().is_some_and(|n| n.id == owner) {
+                let open = self.store.open_turn(&self.agent_id)?.ok_or_else(|| {
+                    Error::HarnessFailed("pending recovery input has no open turn".into())
+                })?;
+                (None, self.recover_open_turn(&open)?)
+            } else {
+                let cursor = self.store.delivered_cursor(&self.agent_id)?;
+                let message =
+                    self.store
+                        .message(&self.agent_id, &owner)?
+                        .filter(|m| m.seq > cursor)
+                        .ok_or_else(|| {
+                            Error::HarnessFailed(
+                        "pending input is not owned by undelivered mail or the recovery note".into()
+                    )
+                        })?;
+                let outcome =
+                    self.harness
+                        .deliver(&outbound(&message))
+                        .map_err(|err| match err {
+                            HarnessError::Dead => Error::HarnessDown,
+                            HarnessError::Failed(reason) => Error::HarnessFailed(reason),
+                        })?;
+                (Some(message.seq), outcome)
+            };
+            match outcome {
+                DeliverOutcome::Deferred => return Ok(RunOutcome::Idle),
+                DeliverOutcome::Quota { reset_at_ms } => {
+                    self.quota_reset_at_ms = Some(reset_at_ms);
+                    return Ok(RunOutcome::Quota { reset_at_ms });
+                }
+                outcome => {
+                    if let Some(seq) = seq {
+                        offered.insert(seq, outcome);
+                    }
+                }
+            }
+        }
         loop {
             if delivered > 0
                 && behind.is_none()
@@ -234,7 +287,48 @@ impl<H: Harness> DeliveryLoop<H> {
                 });
             };
             let seq = message.seq;
-            match self.harness.deliver(&outbound(&message)) {
+            if seq > scanned_through {
+                let (through, external) = priority::ahead(&self.store, &self.agent_id, &message)?;
+                scanned_through = through;
+                for urgent in external {
+                    if offered.contains_key(&urgent.seq) {
+                        continue;
+                    }
+                    match self.harness.deliver(&outbound(&urgent)) {
+                        Ok(DeliverOutcome::Deferred) => {
+                            return Ok(if delivered == 0 {
+                                RunOutcome::Idle
+                            } else {
+                                RunOutcome::Delivered { delivered }
+                            });
+                        }
+                        Ok(DeliverOutcome::Quota { reset_at_ms }) => {
+                            self.quota_reset_at_ms = Some(reset_at_ms);
+                            return Ok(RunOutcome::Quota { reset_at_ms });
+                        }
+                        Err(HarnessError::Dead) => return Err(Error::HarnessDown),
+                        Err(HarnessError::Failed(reason)) => {
+                            return Err(Error::HarnessFailed(reason));
+                        }
+                        Ok(outcome) => {
+                            offered.insert(urgent.seq, outcome);
+                        }
+                    }
+                }
+            }
+            // Cache offers only for this pass. Vendor proofs, not the cache,
+            // survive interruption; every store mutation still occurs at head.
+            let outcome = match offered.remove(&seq) {
+                Some(cached) => Ok(match self.harness.proven(message.id.as_str()) {
+                    Some(Proof::Taken { turn_finished }) => {
+                        DeliverOutcome::Accepted { turn_finished }
+                    }
+                    Some(Proof::Duplicate) => DeliverOutcome::Duplicate,
+                    None => cached,
+                }),
+                None => self.harness.deliver(&outbound(&message)),
+            };
+            match outcome {
                 // Consumed, but an older line is not yet: the pass that sees
                 // that one consumed commits both, in order.
                 // A rejection behind an unproven line is answered again when
@@ -284,7 +378,15 @@ impl<H: Harness> DeliveryLoop<H> {
                 Ok(DeliverOutcome::Accepted { turn_finished }) => {
                     self.store.note_delivered(&self.agent_id, seq)?;
                     self.last_rejection = None;
-                    if turn_finished && self.harness.health().sign_in_fault.is_none() {
+                    if turn_finished
+                        && self.harness.health().sign_in_fault.is_none()
+                        && priority::may_complete(
+                            &self.store,
+                            &self.agent_id,
+                            &self.harness,
+                            &message,
+                        )?
+                    {
                         self.store.note_turn_completed(&self.agent_id)?;
                     }
                     delivered += 1;
@@ -441,25 +543,24 @@ impl<H: Harness> DeliveryLoop<H> {
                     .note_turn_recovered(&self.agent_id, open.opened_seq)?;
                 // A recovered turn that ended in an error is not completed:
                 // the host closes it with that outcome and counts it.
-                if matches!(
+                let turn_finished = matches!(
                     outcome,
                     DeliverOutcome::Accepted {
                         turn_finished: true
                     }
                 ) && self.harness.health().sign_in_fault.is_none()
-                {
+                    && priority::recovery_covers(
+                        &self.store,
+                        &self.agent_id,
+                        &self.harness,
+                        note.seq,
+                    )?;
+                if turn_finished {
                     self.store.note_turn_completed(&self.agent_id)?;
                 }
                 self.recovery = None;
                 self.quota_reset_at_ms = None;
-                Ok(DeliverOutcome::Accepted {
-                    turn_finished: matches!(
-                        outcome,
-                        DeliverOutcome::Accepted {
-                            turn_finished: true
-                        }
-                    ),
-                })
+                Ok(DeliverOutcome::Accepted { turn_finished })
             }
             // A note the harness can never take is not offered again.
             DeliverOutcome::Rejected { .. } => {
@@ -1227,5 +1328,122 @@ mod stream_custody_tests {
         assert_eq!(delivery.harness().written_ids(), ids);
         assert_eq!(delivery.run_once().unwrap(), RunOutcome::Idle);
         assert_eq!(delivery.harness().written_ids(), ids);
+    }
+
+    #[test]
+    fn partial_background_pipe_write_resumes_in_place_then_prioritizes_external_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let program = dir.path().join("vendor");
+        let gate = dir.path().join("gate.fifo");
+        let ready = dir.path().join("ready");
+        let order = dir.path().join("order.log");
+        fs::write(
+            &program,
+            r#"#!/usr/bin/python3
+import json, os, re, sys
+gate = os.environ["TEST_GATE"]
+ready = os.environ["TEST_READY"]
+order = os.environ["TEST_ORDER"]
+os.mkfifo(gate)
+with open(ready, "w") as f:
+    f.write("1")
+with open(gate, "r") as f:
+    f.read()
+for raw in sys.stdin:
+    obj = json.loads(raw)
+    match = re.search(r"anyagents-message:([A-Za-z0-9_:-]+)", json.dumps(obj))
+    assert match is not None
+    with open(order, "a") as out:
+        print(match.group(1), file=out, flush=True)
+    print('{"type":"result","response":"ok"}', flush=True)
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let store = Store::open(&db).unwrap();
+        let agent = store.create_agent(NewAgent::new("custody", "agy")).unwrap();
+        let mut child_spec = NewAgent::new("child", "agy");
+        child_spec.parent_id = Some(agent.id.clone());
+        let child = store.create_agent(child_spec).unwrap();
+        let child_sender = format!("agent:{}", child.id);
+
+        let recv = |store: &Store, sender: &str, text: String| match store
+            .receive(&agent.id, {
+                let mut inc = Incoming::new(text);
+                inc.sender = Some(sender.to_string());
+                inc
+            })
+            .unwrap()
+        {
+            anyagents_core::ReceiveOutcome::New(m) => m,
+            anyagents_core::ReceiveOutcome::Duplicate(_) => panic!("unexpected duplicate"),
+        };
+
+        let b1 = recv(&store, &child_sender, "x".repeat(2 * 1024 * 1024));
+        let env = [
+            ("TEST_GATE", gate.to_str().unwrap()),
+            ("TEST_READY", ready.to_str().unwrap()),
+            ("TEST_ORDER", order.to_str().unwrap()),
+        ];
+        let harness = AgyHarness::start(&program, None, &env).unwrap();
+        let mut delivery = DeliveryLoop::start(store, agent.id.clone(), harness).unwrap();
+
+        // First pass lazily spawns the child, fills the OS pipe partway with b1, and retains it.
+        assert_eq!(delivery.run_once().unwrap(), RunOutcome::Idle);
+        let wait_ready = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(Instant::now() < wait_ready, "vendor script did not ready");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            delivery.harness().pending_input_owner().as_deref(),
+            Some(b1.id.as_str())
+        );
+        assert!(!delivery.harness().input_ready());
+        assert_eq!(delivery.delivered_cursor().unwrap(), 0);
+        assert!(delivery.harness().written_ids().is_empty());
+
+        // Queue another background message plus two urgent external messages.
+        let b2 = recv(delivery.store(), &child_sender, "background-2".into());
+        let u1 = recv(delivery.store(), "telegram:user:10", "urgent-1".into());
+        let u2 = recv(delivery.store(), "telegram:user:11", "urgent-2".into());
+
+        // While the pipe remains blocked, urgent mail cannot preempt or clear b1.
+        assert_eq!(delivery.run_once().unwrap(), RunOutcome::Idle);
+        assert_eq!(
+            delivery.harness().pending_input_owner().as_deref(),
+            Some(b1.id.as_str())
+        );
+        assert_eq!(delivery.delivered_cursor().unwrap(), 0);
+
+        // Release the child reader in the same process (no replacement).
+        fs::write(&gate, b"go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while delivery.delivered_cursor().unwrap() < 4 {
+            delivery.run_once().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "same-process pending write + priority mail must drain without deadlock"
+            );
+            thread::yield_now();
+        }
+
+        let expected = vec![
+            b1.id.as_str().to_string(),
+            u1.id.as_str().to_string(),
+            u2.id.as_str().to_string(),
+            b2.id.as_str().to_string(),
+        ];
+        assert_eq!(delivery.harness().pending_input_owner(), None);
+        assert_eq!(delivery.harness().written_ids(), expected);
+        let wire_order: Vec<String> = fs::read_to_string(&order)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(wire_order, expected);
+        assert!(delivery.store().open_turn(&agent.id).unwrap().is_none());
     }
 }

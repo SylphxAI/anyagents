@@ -971,6 +971,17 @@ pub trait Harness: Send {
         None
     }
 
+    /// The input whose transport write this adapter retains and must resume
+    /// before starting another input. This is custody, not consumption proof
+    /// or general readiness: queued/vendor-held inputs are not partial writes.
+    /// Reoffering this exact ID continues the retained write idempotently,
+    /// with normal liveness, quota and failure gates. Clear it when the write
+    /// completes, is abandoned, or its process is replaced. The default
+    /// adapter retains no such transport write.
+    fn pending_input_owner(&self) -> Option<String> {
+        None
+    }
+
     /// Stop the vendor process and read everything it already wrote, so
     /// every proof it gave is known to `proven` before the host replaces it.
     /// The adapter stays usable for `proven` afterwards. Called once, right

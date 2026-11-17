@@ -1547,6 +1547,10 @@ impl Harness for RemoteHarness {
         health
     }
 
+    fn pending_input_owner(&self) -> Option<String> {
+        self.plain("pending_input_owner", Value::Null, None, None)
+    }
+
     fn input_ready(&self) -> bool {
         self.plain("input_ready", Value::Null, true, false)
     }

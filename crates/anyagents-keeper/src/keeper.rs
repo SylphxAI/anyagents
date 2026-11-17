@@ -868,6 +868,7 @@ fn dispatch<A: Hosted>(adapter: &mut A, op: &str, args: &Value) -> Result<Value,
         "resume" => harness(adapter.resume(&arg::<String>(args, "session")?)),
         "cancel" => harness(adapter.cancel()),
         "health" => value(adapter.health()),
+        "pending_input_owner" => value(adapter.pending_input_owner()),
         "input_ready" => value(adapter.input_ready()),
         "ends_on_quiet" => value(
             adapter
@@ -916,5 +917,46 @@ mod tests {
             "{current} {rotated}"
         );
         assert_eq!(current + rotated, LOG_LIMIT + LOG_LIMIT / 2);
+    }
+
+    #[test]
+    fn dispatch_forwards_pending_input_owner() {
+        struct Pending(Option<String>);
+        impl anyagents_harness::Harness for Pending {
+            fn deliver(
+                &mut self,
+                _: &anyagents_harness::OutboundMessage,
+            ) -> Result<anyagents_harness::DeliverOutcome, anyagents_harness::HarnessError>
+            {
+                Ok(anyagents_harness::DeliverOutcome::Deferred)
+            }
+            fn pending_input_owner(&self) -> Option<String> {
+                self.0.clone()
+            }
+            fn background(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+                Ok(())
+            }
+            fn resume(&mut self, _: &str) -> Result<(), anyagents_harness::HarnessError> {
+                Ok(())
+            }
+            fn cancel(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+                Ok(())
+            }
+            fn health(&self) -> anyagents_harness::HarnessHealth {
+                anyagents_harness::FakeHarness::new(anyagents_harness::DeliveryMode::Steer).health()
+            }
+        }
+        impl crate::Hosted for Pending {}
+
+        let mut none = Pending(None);
+        assert_eq!(
+            dispatch(&mut none, "pending_input_owner", &Value::Null).unwrap(),
+            Value::Null
+        );
+        let mut owned = Pending(Some("msg_partial".into()));
+        assert_eq!(
+            dispatch(&mut owned, "pending_input_owner", &Value::Null).unwrap(),
+            serde_json::json!("msg_partial")
+        );
     }
 }
