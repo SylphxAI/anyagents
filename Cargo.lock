@@ -204,6 +204,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "uuid",
+ "tokio",
 ]
 
 [[package]]
@@ -391,6 +392,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

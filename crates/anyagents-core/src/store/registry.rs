@@ -35,6 +35,7 @@ pub(super) struct Shared {
     pub(super) memory_index: Arc<MemoryIndex>,
     /// In-process wake subscribers shared across every handle on this file.
     wakes: Mutex<Vec<Sender<Wake>>>,
+    pub(super) changes: tokio::sync::watch::Sender<u64>,
     /// Total time a bounded write may keep retrying transient lock errors.
     pub(super) write_retry_budget_ms: AtomicU64,
     /// The writer connection's configured busy timeout.
@@ -170,6 +171,7 @@ impl Shared {
             readers: Arc::new(Mutex::new(Vec::new())),
             memory_index,
             wakes: Mutex::new(Vec::new()),
+            changes: tokio::sync::watch::channel(0).0,
             write_retry_budget_ms: AtomicU64::new(WRITE_RETRY_BUDGET.as_millis() as u64),
             busy_timeout_ms: AtomicU64::new(BUSY_TIMEOUT.as_millis() as u64),
             repairs_pending: AtomicBool::new(!complete),
