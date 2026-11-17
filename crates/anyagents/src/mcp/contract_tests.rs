@@ -136,6 +136,73 @@ fn http_skills_allow_synced_root_projection_but_reject_escaping_links() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn http_skills_tolerate_symlinked_host_mount_roots_while_rejecting_seat_escapes() {
+    use std::os::unix::fs::symlink;
+    let phys = tempfile::tempdir().unwrap();
+    let real_root = phys.path().join("private/var/folders/fixture");
+    std::fs::create_dir_all(&real_root).unwrap();
+    let var_alias = phys.path().join("var");
+    symlink(phys.path().join("private/var"), &var_alias).unwrap();
+    let aliased_data = var_alias.join("folders/fixture");
+
+    let mut mcp = agent_with_limits(&aliased_data, None);
+    mcp.client.via_http = true;
+    let shared = aliased_data.join("skills");
+    let view = mcp.client.config.parent().unwrap().join("skills-view");
+    let leaf = shared.join("synced/a/trusted");
+    std::fs::create_dir_all(leaf.join("references")).unwrap();
+    std::fs::write(leaf.join("SKILL.md"), "mounted trusted body").unwrap();
+    std::fs::write(leaf.join("references/ok.md"), "mounted reference").unwrap();
+    std::fs::create_dir_all(&view).unwrap();
+    symlink(shared.join("synced"), view.join("synced")).unwrap();
+    std::fs::create_dir_all(mcp.client.config.join(".agents")).unwrap();
+    symlink(&view, mcp.client.config.join(".agents/skills")).unwrap();
+
+    let work_skill = aliased_data.join("work/.agents/skills/local-work");
+    std::fs::create_dir_all(&work_skill).unwrap();
+    std::fs::write(work_skill.join("SKILL.md"), "work skill body").unwrap();
+
+    let read = |name: &str, file: Option<&str>| SkillsArgs {
+        action: Some("get".into()),
+        name: Some(name.into()),
+        file: file.map(str::to_string),
+        ..Default::default()
+    };
+    assert_eq!(
+        mcp.execute_skills_tool(read("trusted", None)).unwrap()["content"],
+        "mounted trusted body"
+    );
+    assert_eq!(
+        mcp.execute_skills_tool(read("trusted", Some("references/ok.md")))
+            .unwrap()["content"],
+        "mounted reference"
+    );
+    assert_eq!(
+        mcp.execute_skills_tool(read("local-work", None)).unwrap()["content"],
+        "work skill body"
+    );
+
+    let outside = phys.path().join("outside");
+    std::fs::create_dir_all(outside.join("secret")).unwrap();
+    std::fs::write(outside.join("secret/SKILL.md"), "secret").unwrap();
+    symlink(
+        outside.join("secret"),
+        aliased_data.join("work/.agents/skills/escape"),
+    )
+    .unwrap();
+    assert!(mcp.execute_skills_tool(read("escape", None)).is_err());
+
+    // Replacing workdir itself with a symlink to outside must still fail closed.
+    std::fs::remove_dir_all(aliased_data.join("work")).unwrap();
+    symlink(&outside, aliased_data.join("work")).unwrap();
+    assert!(
+        mcp.read_skill_text(&aliased_data.join("work/secret"), Path::new("SKILL.md"))
+            .is_err()
+    );
+}
+
 fn limits(default_ms: u64, max_ms: u64) -> Option<CodeLimits> {
     Some(CodeLimits { default_ms, max_ms })
 }

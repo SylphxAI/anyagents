@@ -5106,21 +5106,58 @@ impl AgentMcp {
         if !self.client.via_http {
             return std::fs::read_to_string(dir.join(rel));
         }
-        let mut roots = Vec::new();
+        // Canonicalize trusted host-level roots (`data_dir`, `agent_root`, and
+        // `workdir`'s parent) so system symlinks above them (such as macOS
+        // `/var -> private/var` or `/tmp -> private/tmp`) do not trip the
+        // seat-planted symlink guards or descriptor-relative `O_NOFOLLOW` walk.
+        let mut trusted_bases: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut register_trusted_base = |raw: &Path| {
+            if let (Ok(abs), Ok(canon)) = (std::path::absolute(raw), std::fs::canonicalize(raw))
+                && !trusted_bases.iter().any(|(existing, _)| existing == &abs)
+            {
+                trusted_bases.push((abs, canon));
+            }
+        };
         if let Some(data_dir) = self.client.socket.parent() {
-            roots.push(data_dir.join("skills"));
+            register_trusted_base(data_dir);
         }
         if let Some(agent_root) = self.client.config.parent() {
-            roots.push(agent_root.join("skills"));
+            register_trusted_base(agent_root);
+        }
+        let wd = self.resolve_workdir();
+        if let Some(wd_parent) = wd.parent() {
+            register_trusted_base(wd_parent);
+        }
+        trusted_bases.sort_by_key(|(a, _)| std::cmp::Reverse(a.as_os_str().len()));
+        let normalize_host_prefix = |p: &Path| -> PathBuf {
+            let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+            for (raw_base, canon_base) in &trusted_bases {
+                if let Ok(suffix) = abs.strip_prefix(raw_base) {
+                    return canon_base.join(suffix);
+                }
+            }
+            abs
+        };
+
+        let mut roots = Vec::new();
+        if let Some(data_dir) = self.client.socket.parent() {
+            roots.push(normalize_host_prefix(&data_dir.join("skills")));
+        }
+        if let Some(agent_root) = self.client.config.parent() {
+            roots.push(normalize_host_prefix(&agent_root.join("skills")));
         }
         let view = self
             .client
             .config
             .parent()
-            .map(|root| root.join("skills-view"));
+            .map(|root| normalize_host_prefix(&root.join("skills-view")));
+        let vendor_projections = [
+            normalize_host_prefix(&self.client.config.join("skills")),
+            normalize_host_prefix(&self.client.config.join(".agents/skills")),
+        ];
         // Resolve projection directories only. Every link destination stays in
         // the shared/own roots; resources below the skill remain no-follow.
-        let mut base = dir.to_path_buf();
+        let mut base = normalize_host_prefix(dir);
         let mut links = std::collections::BTreeSet::new();
         loop {
             let mut prefix = PathBuf::new();
@@ -5134,7 +5171,7 @@ impl AgentMcp {
                     return Err(std::io::Error::other("cyclic skill projection"));
                 }
                 let link = std::fs::read_link(&prefix)?;
-                let target = if link.is_relative() {
+                let raw_target = if link.is_relative() {
                     prefix
                         .parent()
                         .ok_or_else(|| std::io::Error::other("skill parent missing"))?
@@ -5142,18 +5179,20 @@ impl AgentMcp {
                 } else {
                     link
                 };
-                if target.components().any(|c| {
+                if raw_target.components().any(|c| {
                     !matches!(
                         c,
                         std::path::Component::RootDir | std::path::Component::Normal(_)
                     )
-                }) || !(roots.iter().any(|root| target.starts_with(root))
+                }) {
+                    return Err(std::io::Error::other(
+                        "a linked skill directory points outside the skill roots",
+                    ));
+                }
+                let target = normalize_host_prefix(&raw_target);
+                if !(roots.iter().any(|root| target.starts_with(root))
                     || (view.as_ref().is_some_and(|view| target == *view)
-                        && [
-                            self.client.config.join("skills"),
-                            self.client.config.join(".agents/skills"),
-                        ]
-                        .contains(&prefix)))
+                        && vendor_projections.contains(&prefix)))
                 {
                     return Err(std::io::Error::other(
                         "a linked skill directory points outside the skill roots",

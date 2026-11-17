@@ -1473,8 +1473,7 @@ impl StreamHarness {
         if let Some(dir) = &self.work_dir {
             command.current_dir(dir);
         }
-        let mut child = command
-            .spawn()
+        let mut child = anyagents_harness::spawn_child(&mut command)
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
         let Some(child_stdin) = child.stdin.take() else {
             let _ = child.kill();

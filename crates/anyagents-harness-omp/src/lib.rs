@@ -270,8 +270,7 @@ impl OmpHarness {
         if let Some(dir) = &self.work_dir {
             command.current_dir(dir);
         }
-        let mut child = command
-            .spawn()
+        let mut child = anyagents_harness::spawn_child(&mut command)
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())

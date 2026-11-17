@@ -4811,7 +4811,7 @@ async fn create_agent_route(
         let (harness, model, profile) = create::resolve_subagent_defaults(
             state.store.data_dir(),
             parent_agent.as_ref(),
-            body.harness.as_deref().unwrap_or(""),
+            body.harness.as_deref().unwrap_or("claude-code"),
             body.model,
             body.profile,
         );
@@ -5213,15 +5213,17 @@ fn reap_subagent_ephemeral_dirs_in(
     // copy. Remove only runtime-designated cache and temporary directories.
     for rel in ["cache-home", ".cache", "tmp"] {
         let target = config_dir.join(rel);
-        complete &= remove_path_with_seat(&target, seat_ids);
+        complete &= remove_path_with_seat_under(data_dir, &target, seat_ids);
     }
-    complete &= remove_path_with_seat(&agent_root.join("tmp"), seat_ids);
+    complete &= remove_path_with_seat_under(data_dir, &agent_root.join("tmp"), seat_ids);
     if let Some(scratch_dir) = anyagents_core::configured_scratch_dir() {
-        complete &= remove_path_with_seat(
+        complete &= remove_path_with_seat_under(
+            &scratch_dir,
             &anyagents_core::agent_scratch_build_dir(&scratch_dir, agent_id),
             seat_ids,
         );
-        complete &= remove_path_with_seat(
+        complete &= remove_path_with_seat_under(
+            &scratch_dir,
             &anyagents_core::agent_scratch_tmp_dir(&scratch_dir, agent_id),
             seat_ids,
         );
@@ -5258,17 +5260,20 @@ fn reap_subagent_ephemeral_dirs_in(
         shared_workdirs.insert(wd_path);
     }
     let marker_path = config_dir.join(".anyagents-managed-worktree.json");
-    let mut managed_work_dirs =
-        vec![std::path::absolute(&configured_work).unwrap_or_else(|_| configured_work.clone())];
+    let configured_work_base =
+        anyagents_core::configured_workspaces_dir().unwrap_or_else(|| data_dir.to_path_buf());
+    let configured_abs =
+        std::path::absolute(&configured_work).unwrap_or_else(|_| configured_work.clone());
+    let mut managed_work_dirs = vec![(configured_work_base, configured_abs)];
     let legacy_abs = std::path::absolute(&legacy_work).unwrap_or_else(|_| legacy_work.clone());
-    if !managed_work_dirs.contains(&legacy_abs) && legacy_abs.exists() {
-        managed_work_dirs.push(legacy_abs);
+    if !managed_work_dirs.iter().any(|(_, dir)| dir == &legacy_abs) && legacy_abs.exists() {
+        managed_work_dirs.push((data_dir.to_path_buf(), legacy_abs));
     }
     // Never reap an external `explicit-worktree` (`wt_path != &work_dir`) such as `/scratch/wt/...`
     // that a parent or operator created and lent to a child agent. Only reap the agent's own
     // managed workspace directory when not shared with another agent.
     let seat = seat_ids.map(|(uid, gid, _)| (uid, gid));
-    for work_dir in managed_work_dirs {
+    for (work_base, work_dir) in managed_work_dirs {
         // A live agent may work inside this directory, or this one inside its.
         if shared_workdirs
             .iter()
@@ -5276,7 +5281,7 @@ fn reap_subagent_ephemeral_dirs_in(
         {
             continue;
         }
-        if !real_directory_path(&work_dir) {
+        if !real_directory_path_under(&work_base, &work_dir) {
             continue;
         }
         let dotgit = work_dir.join(".git");
@@ -5294,7 +5299,7 @@ fn reap_subagent_ephemeral_dirs_in(
         if dotgit.symlink_metadata().is_ok() && is_git_worktree_safe_to_reap(&work_dir, seat) {
             // Keep pool recovery refs: removing them before checkout
             // deletion succeeds would discard recovery on an I/O error.
-            if remove_path_with_seat(&work_dir, seat_ids) {
+            if remove_path_with_seat_under(&work_base, &work_dir, seat_ids) {
                 let _ = std::fs::remove_file(&marker_path);
             } else {
                 complete = false;
@@ -5306,13 +5311,34 @@ fn reap_subagent_ephemeral_dirs_in(
     complete
 }
 
-/// Reject symlinks and unreadable ancestors while deleting.
-fn real_directory_path(path: &Path) -> bool {
-    let Ok(path) = std::path::absolute(path) else {
+/// Reject symlinks and unreadable ancestors beneath a trusted root `base`
+/// while tolerating host/system mount symlinks above `base` (such as macOS
+/// `/var -> private/var` or `/tmp -> private/tmp`).
+fn real_directory_path_under(base: &Path, path: &Path) -> bool {
+    let (Ok(base_abs), Ok(path_abs)) = (std::path::absolute(base), std::path::absolute(path))
+    else {
         return false;
     };
-    path.ancestors()
-        .all(|part| std::fs::symlink_metadata(part).is_ok_and(|meta| meta.is_dir()))
+    if !std::fs::metadata(&base_abs).is_ok_and(|meta| meta.is_dir()) {
+        return false;
+    }
+    let Ok(rel) = path_abs.strip_prefix(&base_abs) else {
+        return false;
+    };
+    let mut cur = base_abs;
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => {
+                cur.push(part);
+                if !std::fs::symlink_metadata(&cur).is_ok_and(|meta| meta.is_dir()) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Either directory contains the other, including aliases.
@@ -5507,12 +5533,19 @@ fn detect_seat_ids(_config_dir: &Path) -> Option<(u32, u32, u32)> {
     None
 }
 
-fn remove_path_with_seat(target: &Path, seat_ids: Option<(u32, u32, u32)>) -> bool {
+fn remove_path_with_seat_under(
+    base: &Path,
+    target: &Path,
+    seat_ids: Option<(u32, u32, u32)>,
+) -> bool {
     let meta = match std::fs::symlink_metadata(target) {
         Ok(meta) => meta,
         Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
     };
-    if !target.parent().is_some_and(real_directory_path) {
+    if !target
+        .parent()
+        .is_some_and(|parent| real_directory_path_under(base, parent))
+    {
         return false;
     }
     if meta.file_type().is_symlink() || meta.is_file() {
@@ -5725,7 +5758,7 @@ async fn delete_agent_route(
 
         );
         if !agent_dir.join("work").exists() {
-            remove_path_with_seat(&agent_dir, seat_ids);
+            remove_path_with_seat_under(data_dir, &agent_dir, seat_ids);
             let _ = std::fs::remove_dir_all(&agent_dir);
         }
         Ok(Json(serde_json::json!({
@@ -5749,13 +5782,14 @@ fn remove_agent_identity_files(
 ) {
     #[cfg(target_os = "linux")]
     crate::workstation::session::stop_agent_blocking(data_dir, &agent.name);
-    remove_path_with_seat(
+    remove_path_with_seat_under(
+        data_dir,
         &data_dir.join("browser-profiles").join(&agent.name),
         seat_ids,
     );
     for private_tree in ["config", "memory", "skills"] {
         let tree_path = agent_dir.join(private_tree);
-        remove_path_with_seat(&tree_path, seat_ids);
+        remove_path_with_seat_under(data_dir, &tree_path, seat_ids);
         let _ = std::fs::remove_dir_all(&tree_path);
     }
 }
@@ -13048,6 +13082,62 @@ exec '{}' "$@"
         assert!(work_dir.join("dirty.rs").exists());
         assert!(work_dir.join("target").exists());
         assert!(work_dir.join("apps/web/node_modules").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reap_and_delete_tolerate_symlinked_host_mount_roots_and_reject_inner_symlinks() {
+        use std::os::unix::fs::symlink;
+        let phys = tempfile::tempdir().unwrap();
+        let real_data = phys.path().join("private/var/folders/data");
+        let outside = phys.path().join("outside-keep");
+        std::fs::create_dir_all(&real_data).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("precious"), b"must stay").unwrap();
+        let var_alias = phys.path().join("var");
+        symlink(phys.path().join("private/var"), &var_alias).unwrap();
+        let data = var_alias.join("folders/data");
+
+        let store = Store::open(data.join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let cfg = anyagents_core::agent_config_dir(&data, &child.id);
+        std::fs::create_dir_all(cfg.join(".cache")).unwrap();
+        std::fs::create_dir_all(cfg.join("cache-home")).unwrap();
+        std::fs::create_dir_all(cfg.join("tmp")).unwrap();
+        reap_archived_agents(&store, &data, &HealthBoard::default());
+        assert!(!cfg.join(".cache").exists());
+        assert!(!cfg.join("cache-home").exists());
+        assert!(!cfg.join("tmp").exists());
+        assert!(cfg.join(".anyagents-reaped").exists());
+
+        // A symlink planted beneath `data_dir` is still rejected fail-closed.
+        let tampered = archived_reap_fixture(&store, "tampered", &parent);
+        let tampered_root = data.join("agents").join(tampered.id.as_str());
+        std::fs::remove_dir_all(&tampered_root).unwrap_or(());
+        std::fs::create_dir_all(&tampered_root).unwrap();
+        std::fs::create_dir_all(outside.join(".cache")).unwrap();
+        symlink(&outside, tampered_root.join("config")).unwrap();
+        assert!(!reap_subagent_ephemeral_dirs(&data, &tampered.id));
+        assert!(outside.join(".cache").exists());
+        assert_eq!(
+            std::fs::read(outside.join("precious")).unwrap(),
+            b"must stay"
+        );
+
+        // Identity removal also works under symlinked host mount roots.
+        let shopper = store
+            .create_agent(anyagents_core::NewAgent::new("shopper", "codex"))
+            .unwrap();
+        let shopper_dir = data.join("agents").join(shopper.id.as_str());
+        let profile = data.join("browser-profiles").join("shopper");
+        std::fs::create_dir_all(shopper_dir.join("config")).unwrap();
+        std::fs::create_dir_all(profile.join("user-data")).unwrap();
+        remove_agent_identity_files(&data, &shopper, &shopper_dir, None);
+        assert!(!profile.exists());
+        assert!(!shopper_dir.join("config").exists());
     }
     fn mark_explicitly_archived(store: &Store, data_dir: &Path, agent: &Agent) {
         let Ok(_lifecycle) = store.lock_agent_lifecycle(&agent.id) else {

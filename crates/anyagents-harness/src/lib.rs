@@ -374,6 +374,16 @@ pub fn spawn_command(
     Ok(command)
 }
 
+/// Serialize child launches so pipe descriptors created without atomic
+/// `O_CLOEXEC` (for example `pipe()` + `FIOCLEX` on macOS) are marked
+/// close-on-exec and closed in the parent before another child forks.
+static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn spawn_child(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    let _guard = SPAWN_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    command.spawn()
+}
+
 /// Where the process groups this process starts are reported, before each
 /// runs anything: a keeper records them, so that what a keeper that died
 /// left can be ended by what it recorded, never by guesswork. Each child
@@ -414,6 +424,9 @@ mod spawn_report {
 
     impl Waiting {
         pub(super) fn new() -> std::io::Result<Self> {
+            let _guard = super::SPAWN_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             let (answer, writer) = std::io::pipe()?;
             let token = NEXT.fetch_add(1, Ordering::SeqCst);
             answers().insert(token, writer.into());

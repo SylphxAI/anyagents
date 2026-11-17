@@ -10531,7 +10531,28 @@ pub(crate) fn apply_archetype_defaults(
     {
         body.workdir = Some(wd);
     }
-    if body.harness.as_deref().is_none_or(|h| h.trim().is_empty())
+    let caller_harness = body
+        .harness
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(|h| {
+            if h.eq_ignore_ascii_case("inherit") {
+                resolve_subagent_defaults(data_dir, parent, "inherit", None, None).0
+            } else {
+                normalize_harness_name(h).to_string()
+            }
+        });
+    let tpl_harness = tpl
+        .harness
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(|h| normalize_harness_name(h).to_string());
+    let harness_overridden = caller_harness
+        .as_deref()
+        .is_some_and(|ch| tpl_harness.as_deref().is_some_and(|th| ch != th));
+    if caller_harness.is_none()
         && let Some(h) = tpl.harness
     {
         body.harness = Some(h);
@@ -10541,6 +10562,7 @@ pub(crate) fn apply_archetype_defaults(
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
+        && !harness_overridden
         && let Some(m) = tpl.model
     {
         body.model = Some(m);
@@ -10550,9 +10572,33 @@ pub(crate) fn apply_archetype_defaults(
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
+        && !harness_overridden
         && let Some(p) = tpl.profile
     {
-        body.profile = Some(p);
+        let (effective_harness, effective_model, _) = resolve_subagent_defaults(
+            data_dir,
+            parent,
+            body.harness.as_deref().unwrap_or("claude-code"),
+            body.model.clone(),
+            None,
+        );
+        let expected_provider =
+            upstream_provider_of(&effective_harness, effective_model.as_deref());
+        let tpl_provider = p
+            .split_once('/')
+            .map(|(prov, _)| prov.trim())
+            .unwrap_or(expected_provider.as_str());
+        if tpl_provider == expected_provider
+            && ensure_harness_runs_profile(
+                data_dir,
+                &effective_harness,
+                Some(&p),
+                effective_model.as_deref(),
+            )
+            .is_ok()
+        {
+            body.profile = Some(p);
+        }
     }
     let canonical_role = tpl
         .role
@@ -15829,6 +15875,127 @@ Connection: close
         );
         // Nothing to roll back: no row was written.
         assert!(store.agent_by_name("agy-on-sylphx").is_err());
+    }
+
+    #[test]
+    fn archetype_profile_inherits_when_compatible_and_skips_on_harness_override() {
+        let dir = crate::test_tempdir();
+        let data = dir.path().join("data");
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(ws.join(".agents/agents")).unwrap();
+        std::fs::write(
+            ws.join(".agents/agents/general.md"),
+            "---\nrole: general\nscope: private\nharness: spiron\nmodel: sylphx/openai/gpt-6.1-sol#xhigh\nprofile: sylphx/default\ndescription: General worker\n---\nGeneral body.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join(".agents/agents/profile-only.md"),
+            "---\nrole: profile-only\nscope: private\nprofile: sylphx/default\ndescription: Profile-only worker\n---\nProfile body.\n",
+        )
+        .unwrap();
+
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let mut parent_new = NewAgent::new("parent", "spiron");
+        parent_new.workdir = Some(ws.to_string_lossy().into_owned());
+        let parent = store.create_agent(parent_new).unwrap();
+
+        // 1. Omitted harness/model/profile inherits the matching template defaults.
+        let mut default_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "default-general",
+                "role": "general",
+                "harness": "",
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data, Some(&parent), &mut default_req).unwrap();
+        assert_eq!(default_req.harness.as_deref(), Some("spiron"));
+        assert_eq!(
+            default_req.model.as_deref(),
+            Some("sylphx/openai/gpt-6.1-sol#xhigh")
+        );
+        assert_eq!(default_req.profile.as_deref(), Some("sylphx/default"));
+
+        // 2. Explicit `harness: "claude-code"` with omitted `profile` skips `tpl.profile`
+        //    so `claude-code` resolves its own native default profile cleanly.
+        let mut cc_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "cc-override",
+                "role": "general",
+                "harness": "claude-code",
+                "model": "claude-opus-5-5#high",
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data, Some(&parent), &mut cc_req).unwrap();
+        assert_eq!(cc_req.harness.as_deref(), Some("claude-code"));
+        assert_eq!(cc_req.model.as_deref(), Some("claude-opus-5-5#high"));
+        assert_eq!(cc_req.profile, None);
+
+        // 3. Explicit `harness: "claude-code"` with omitted `model` and `profile` skips both.
+        let mut cc_bare: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "cc-bare",
+                "role": "general",
+                "harness": "claude-code",
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data, Some(&parent), &mut cc_bare).unwrap();
+        assert_eq!(cc_bare.harness.as_deref(), Some("claude-code"));
+        assert_eq!(cc_bare.model, None);
+        assert_eq!(cc_bare.profile, None);
+
+        // 4. Template without `harness` whose `profile` provider prefix mismatches
+        //    `effective_harness` also skips `tpl.profile` when omitted.
+        let mut mismatch_req: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "cc-profile-only",
+                "role": "profile-only",
+                "harness": "claude-code",
+                "model": "claude-opus-5-5#high",
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data, Some(&parent), &mut mismatch_req).unwrap();
+        assert_eq!(mismatch_req.profile, None);
+
+        // 5. Explicit incompatible `profile` from the caller still fails closed in `create()`.
+        let mut explicit_bad: crate::api::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "explicit-incompatible",
+                "role": "general",
+                "harness": "agy",
+                "profile": "sylphx/default",
+            }))
+            .unwrap();
+        apply_archetype_defaults(Some(&store), &data, Some(&parent), &mut explicit_bad).unwrap();
+        assert_eq!(explicit_bad.profile.as_deref(), Some("sylphx/default"));
+        let err = create(
+            &store,
+            &data,
+            CreateRequest {
+                name: explicit_bad.name,
+                role: explicit_bad.role,
+                harness: "agy".to_string(),
+                model: explicit_bad.model,
+                profile: explicit_bad.profile,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: Some(ws),
+                description: explicit_bad.description,
+                instructions: explicit_bad.instructions,
+                parent_id: Some(parent.id),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("not compatible with provider profile `sylphx/default`"),
+            "{err}"
+        );
     }
 
     #[test]
