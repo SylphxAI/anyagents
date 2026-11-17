@@ -434,7 +434,9 @@ async fn existing_profile_opens_with_logins_and_every_operation_works() {
         .unwrap();
     assert_eq!(other.leaseholder().as_deref(), Some("agent-b"));
     drop(other);
-    super::session::stop(data, "agent-a").await;
+    super::session::stop_authorized(data, "agent-a", "agent-b")
+        .await
+        .unwrap();
     call(data, json!({"action": "open", "url": url})).await;
     let read = call(data, json!({"action": "read"})).await;
     assert!(

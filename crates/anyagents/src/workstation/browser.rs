@@ -885,6 +885,7 @@ async fn run(
     }
 
     let live = session::acquire(data, &profile, &caller.principal, req.proxy.as_deref()).await?;
+    let _operation = live.operation().await?;
     let agent = live
         .session
         .lease(&caller.principal)
@@ -905,7 +906,6 @@ async fn run(
         files,
     )
     .await?;
-    live.touch();
     Ok(out)
 }
 
@@ -1376,6 +1376,7 @@ async fn status(
     let fingerprint = read_fingerprint(&p.fingerprint_path())?;
     match super::session::running(data, profile) {
         Some(live) => {
+            let _operation = live.operation().await?;
             // Never impersonate or acquire another caller's session to read tabs or token.
             let is_holder = live.leaseholder().as_deref() == Some(principal);
             let agent = is_holder
