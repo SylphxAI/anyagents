@@ -446,14 +446,15 @@ fn a_poison_message_is_parked_its_sender_told_and_the_mail_behind_it_flows() {
         .store
         .create_agent(NewAgent::new("alice", "codex"))
         .unwrap();
-    let poison = scene.receive_from("a message the vendor can never take", Some("agent:alice"));
-    scene
-        .vendor
-        .process(0)
-        .lock()
-        .unwrap()
-        .refused
-        .insert(poison.id.to_string(), "malformed request (-32602)".into());
+    let poison = {
+        let proc0 = scene.vendor.process(0);
+        let mut proc0 = proc0.lock().unwrap();
+        let poison = scene.receive_from("a message the vendor can never take", Some("agent:alice"));
+        proc0
+            .refused
+            .insert(poison.id.to_string(), "malformed request (-32602)".into());
+        poison
+    };
     let after = scene.receive("the next message");
     scene.poke();
     scene.until_ticking("the mail behind the poison is committed", |s| {
