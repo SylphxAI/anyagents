@@ -11,7 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-workstation"
 version = "0.2.0"
-source = "git+https://github.com/SylphxAI/agent-workstation?rev=a97eb35acebaf6f5f8cb97c0e57c44b3cdb5e13f#a97eb35acebaf6f5f8cb97c0e57c44b3cdb5e13f"
+source = "git+https://github.com/SylphxAI/agent-workstation?rev=9737417b6b0328a1d7893b80ec0d928fc6e5151b#9737417b6b0328a1d7893b80ec0d928fc6e5151b"
 dependencies = [
  "async-trait",
  "axum",
@@ -204,8 +204,8 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
- "uuid",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -970,7 +970,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2038,7 +2038,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2335,7 +2335,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2677,7 +2677,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
