@@ -42,19 +42,25 @@ pub const MCP_PATH: &str = "/v1/webhooks/mcp";
 pub const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60);
 /// How often the maintenance pass looks for tokens to rotate.
 pub const ROTATION_INTERVAL: Duration = Duration::from_secs(60);
-/// The longest a remote turn may hold the token it started with: the cloud
-/// adapter's 300 s request timeout plus its default 300 s job-poll window
-/// (`cloud_harness.rs`). A remote sandbox turn is bounded at 305 s.
-pub const LONGEST_TURN: Duration = Duration::from_secs(600);
-/// Bounds on `remote_session_ttl_secs`. A turn reads the token when it
-/// starts; rotation happens within one interval of half the lifetime, so a
-/// token read at turn start has at least `ttl / 2 - ROTATION_INTERVAL` left.
-/// The floor keeps that above the longest turn.
+/// The longest supported remote turn. The Spiron REST adapter uses this
+/// same budget instead of maintaining a separate, potentially larger limit.
+pub const LONGEST_TURN: Duration = Duration::from_secs(30 * 60);
+/// A blocking REST request can finish this long after a turn deadline.
+pub const REQUEST_MARGIN: Duration = Duration::from_secs(30);
+/// Bounds on the configured lifetime. Existing 1800-second configurations
+/// remain valid; issuance applies `MIN_SAFE_TTL` without changing the config.
 pub const MIN_TTL: Duration = Duration::from_secs(30 * 60);
 pub const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// A token read just before the next rotation pass has at least half its
+/// issued lifetime minus one maintenance interval left. Include a blocking
+/// request margin, and keep that remainder strictly above the turn budget.
+pub const MIN_SAFE_TTL: Duration = Duration::from_secs(
+    2 * (LONGEST_TURN.as_secs() + ROTATION_INTERVAL.as_secs() + REQUEST_MARGIN.as_secs() + 1),
+);
 const _: () = assert!(
-    MIN_TTL.as_secs() / 2 > ROTATION_INTERVAL.as_secs() + LONGEST_TURN.as_secs(),
-    "a token read at turn start must outlive the longest turn"
+    MIN_SAFE_TTL.as_secs() / 2
+        > ROTATION_INTERVAL.as_secs() + LONGEST_TURN.as_secs() + REQUEST_MARGIN.as_secs(),
+    "a token read at turn start must outlive the longest turn and request margin"
 );
 /// Revoked and expired token rows are forgotten after this long.
 const PRUNE_AFTER_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -194,7 +200,7 @@ impl Settings {
     }
 
     fn ttl_ms(&self) -> i64 {
-        i64::try_from(self.remote_session_ttl.as_millis()).unwrap_or(i64::MAX)
+        i64::try_from(self.remote_session_ttl.max(MIN_SAFE_TTL).as_millis()).unwrap_or(i64::MAX)
     }
 }
 
@@ -423,6 +429,118 @@ mod tests {
         );
         // Other tables are left to their own readers.
         assert!(parse("[agents]\nanything = 1\n").is_ok());
+    }
+
+    #[test]
+    fn configured_lifetimes_remain_valid_and_issuance_covers_the_turn_budget() {
+        for secs in [1800, 3600, 3782, 7200, 86400] {
+            let settings = parse(&format!(
+                "[server]
+remote_session_ttl_secs = {secs}
+"
+            ))
+            .unwrap();
+            assert_eq!(settings.remote_session_ttl, Duration::from_secs(secs));
+            let issued_secs = u64::try_from(settings.ttl_ms()).unwrap() / 1000;
+            assert_eq!(issued_secs, secs.max(3782));
+            assert!(
+                issued_secs / 2 - ROTATION_INTERVAL.as_secs()
+                    > LONGEST_TURN.as_secs() + REQUEST_MARGIN.as_secs()
+            );
+        }
+        assert_eq!(Settings::default().ttl_ms(), 3_782_000);
+    }
+
+    #[test]
+    fn newly_issued_token_authenticates_through_the_latest_start_and_whole_turn() {
+        let dir = crate::test_tempdir();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[server]
+public_url = 'https://agents.example.com'
+remote_session_ttl_secs = 1800
+",
+        )
+        .unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("cloud", "spiron-cloud"))
+            .unwrap();
+        begin_session(&store, &agent).unwrap();
+        let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        let token = session_token(&config).unwrap();
+        let grant = store.authenticate_remote_session(&token).unwrap();
+        let issued_ms = 3_782_000;
+        let created = grant.expires_at_ms - issued_ms;
+        // A maintenance pass can lag the half-life boundary by one interval.
+        let latest_read = created + issued_ms / 2 + 60_000;
+        let turn_end = latest_read + 1_800_000 + 30_000;
+        assert_eq!(grant.expires_at_ms - turn_end, 1000);
+        assert!(
+            store
+                .authenticate_remote_session_at(&token, turn_end)
+                .is_ok()
+        );
+        assert!(
+            store
+                .authenticate_remote_session_at(&token, grant.expires_at_ms)
+                .is_err()
+        );
+        revoke(&store, &agent.id, None).unwrap();
+        assert!(
+            store
+                .authenticate_remote_session_at(&token, turn_end)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rotation_upgrades_legacy_short_tokens_without_extending_or_reviving_them() {
+        let dir = crate::test_tempdir();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[server]
+public_url = 'https://agents.example.com'
+remote_session_ttl_secs = 1800
+",
+        )
+        .unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("cloud", "spiron-cloud"))
+            .unwrap();
+        // A token issued by the old daemon keeps its original expiry.
+        let legacy = store.begin_remote_session(&agent.id, 1_800_000).unwrap();
+        assert_eq!(rotate_due(&store).unwrap(), 1);
+        let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        let fresh = session_token(&config).unwrap();
+        assert_ne!(fresh, legacy.token);
+        let old_grant = store.authenticate_remote_session(&legacy.token).unwrap();
+        let new_grant = store.authenticate_remote_session(&fresh).unwrap();
+        assert_eq!(old_grant.expires_at_ms, legacy.expires_at_ms);
+        assert_eq!(old_grant.session_id, new_grant.session_id);
+        assert!(new_grant.expires_at_ms >= legacy.expires_at_ms + 1_982_000);
+        assert_eq!(rotate_due(&store).unwrap(), 0);
+        assert!(
+            store
+                .authenticate_remote_session_at(&legacy.token, legacy.expires_at_ms)
+                .is_err()
+        );
+        assert!(
+            store
+                .authenticate_remote_session_at(&fresh, legacy.expires_at_ms)
+                .is_ok()
+        );
+        assert_eq!(revoke(&store, &agent.id, None).unwrap(), 2);
+        assert!(store.authenticate_remote_session(&legacy.token).is_err());
+        assert!(store.authenticate_remote_session(&fresh).is_err());
+        assert_eq!(rotate_due(&store).unwrap(), 0);
+        assert!(
+            store
+                .rotate_remote_session(&agent.id, &legacy.session_id, 3_782_000)
+                .is_err()
+        );
+        assert!(!config.join(TOKEN_FILE).exists());
     }
 
     #[test]
