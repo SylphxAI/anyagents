@@ -884,8 +884,7 @@ impl CodexHarness {
         if let Some(dir) = work_dir {
             cmd.current_dir(dir);
         }
-        let mut child = cmd
-            .spawn()
+        let mut child = anyagents_harness::spawn_child(&mut cmd)
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
         let (Some(child_stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             anyagents_harness::kill_child(&mut child, &env_pairs);

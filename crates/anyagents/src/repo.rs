@@ -946,6 +946,7 @@ pub(crate) fn discard(checkout: &Path) -> std::io::Result<()> {
 
 /// The store stops keeping a converted repository's borrowed objects. Called
 /// when that repository is removed; a no-op for any other checkout.
+#[cfg(test)]
 pub(crate) fn forget(checkout: &Path) {
     let Ok(name) = keep_ref(checkout) else {
         return;

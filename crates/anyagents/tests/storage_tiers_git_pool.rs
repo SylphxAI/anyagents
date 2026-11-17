@@ -111,7 +111,10 @@ if [ -n "${{CARGO_TARGET_DIR:-}}" ]; then
   printf 'compiled-artifact' > "$CARGO_TARGET_DIR/debug/deps/libdemo.rlib"
   python3 -c 'import json, os, sys
 keys = ["CARGO_TARGET_DIR", "GRADLE_USER_HOME", "DERIVED_DATA_PATH", "TMPDIR", "BUN_TMPDIR", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE", "ANYAGENTS_STATE_DIR", "ANYAGENTS_WORKSPACES_DIR", "ANYAGENTS_SCRATCH_DIR", "ANYAGENTS_GIT_POOL_DIR"]
-json.dump({{k: os.environ.get(k) for k in keys}}, open(sys.argv[1], "w"))
+tmp = f"{{sys.argv[1]}}.{{os.getpid()}}.tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump({{k: os.environ.get(k) for k in keys}}, fh)
+os.replace(tmp, sys.argv[1])
 ' "$CARGO_TARGET_DIR/env-receipt.json"
 fi
 if [ -n "${{TMPDIR:-}}" ]; then

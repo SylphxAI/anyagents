@@ -484,8 +484,7 @@ impl OpenCodeHarness {
             state.password = None;
             state.launch
         };
-        let mut child = command
-            .spawn()
+        let mut child = anyagents_harness::spawn_child(&mut command)
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
         self.write_service_pid(child.id());
         let collision = port::watch_collision(child.stderr.take().expect("piped stderr"));
@@ -1004,8 +1003,7 @@ impl Vendor {
         if let Some(password) = password {
             command.env("OPENCODE_PASSWORD", password);
         }
-        let mut child = command
-            .spawn()
+        let mut child = anyagents_harness::spawn_child(&mut command)
             .map_err(|err| ApiError::local(method, path, err.to_string()))?;
         // Both pipes are read while the call runs: an answer larger than a pipe
         // buffer must never hold the child.

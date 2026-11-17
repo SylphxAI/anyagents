@@ -85,7 +85,8 @@ pub(super) fn admitted_command(
         command
     };
     let script = admission_script(checks);
-    let mut child = prefix()
+    let mut admission_cmd = prefix();
+    admission_cmd
         .args(["/bin/sh", "-s", "seat-admission"])
         .envs(
             environment
@@ -97,9 +98,8 @@ pub(super) fn admitted_command(
         .env_remove(crate::SEAT_PEERS_ENV)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| refuse(e.to_string()))?;
+        .stderr(std::process::Stdio::piped());
+    let mut child = crate::spawn_child(&mut admission_cmd).map_err(|e| refuse(e.to_string()))?;
     let mut stdin = child
         .stdin
         .take()

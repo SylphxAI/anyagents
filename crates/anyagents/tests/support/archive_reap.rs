@@ -31,7 +31,11 @@ fn production_archive_reap_does_not_recreate_seat_directories() {
     let child = store.create_agent(new).unwrap();
     let cfg = anyagents_core::agent_config_dir(&data, &child.id);
     std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+    std::fs::create_dir_all(cfg.join("cache-home")).unwrap();
     std::fs::create_dir_all(cfg.join(".gemini")).unwrap();
+    std::fs::create_dir_all(cfg.join("tmp")).unwrap();
+    std::fs::write(cfg.join(".claude/session.json"), b"native session").unwrap();
+    std::fs::write(cfg.join(".gemini/history.json"), b"native history").unwrap();
     let archived = command(&data, &home)
         .args(["agents", "archive", "worker"])
         .output()
@@ -42,9 +46,19 @@ fn production_archive_reap_does_not_recreate_seat_directories() {
         String::from_utf8_lossy(&archived.stderr)
     );
     assert_eq!(store.agent(&child.id).unwrap().state, "archived");
-    for rel in [".claude", ".gemini", "cache-home", "tmp"] {
+    for rel in ["cache-home", "tmp"] {
         assert!(!cfg.join(rel).exists(), "archive reap recreated {rel}");
     }
+    assert!(cfg.join(".claude").exists());
+    assert!(cfg.join(".gemini").exists());
+    assert_eq!(
+        std::fs::read(cfg.join(".claude/session.json")).unwrap(),
+        b"native session"
+    );
+    assert_eq!(
+        std::fs::read(cfg.join(".gemini/history.json")).unwrap(),
+        b"native history"
+    );
     let archive_generation = std::fs::read(cfg.join(".anyagents-archived")).unwrap();
     let reaped_generation = std::fs::read(cfg.join(".anyagents-reaped")).unwrap();
     assert_eq!(reaped_generation, archive_generation);
@@ -137,12 +151,20 @@ fn production_maintenance_reaps_legacy_archive_once_across_restart() {
     store.set_agent_state(&child.id, "archived").unwrap();
     let cfg = anyagents_core::agent_config_dir(&data, &child.id);
     std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+    std::fs::create_dir_all(cfg.join("cache-home")).unwrap();
     std::fs::create_dir_all(cfg.join(".gemini")).unwrap();
     let stderr = root.path().join("server.stderr");
     let mut first = server(&data, &home, &stderr);
     wait_for_reap(&mut first, &cfg, &stderr, "initial");
-    assert!(!cfg.join(".claude").exists());
-    assert!(!cfg.join(".gemini").exists());
+    assert!(
+        cfg.join(".claude").exists(),
+        "native home must survive archive"
+    );
+    assert!(!cfg.join("cache-home").exists());
+    assert!(
+        cfg.join(".gemini").exists(),
+        "native home must survive archive"
+    );
     let generation = std::fs::read(cfg.join(".anyagents-archived")).unwrap();
     assert!(!generation.is_empty());
     assert_eq!(
@@ -152,7 +174,7 @@ fn production_maintenance_reaps_legacy_archive_once_across_restart() {
     drop(first);
     // A second pending legacy row proves the restarted worker has completed a
     // real pass. A sentinel left under the completed row must not be reaped.
-    std::fs::create_dir_all(cfg.join("shell-snapshots")).unwrap();
+    std::fs::create_dir_all(cfg.join("cache-home")).unwrap();
     let mut new = anyagents_core::NewAgent::new("second-worker", "opencode");
     new.parent_id = child.parent_id.clone();
     let second = store.create_agent(new).unwrap();
@@ -161,7 +183,7 @@ fn production_maintenance_reaps_legacy_archive_once_across_restart() {
     let mut restarted = server(&data, &home, &stderr);
     wait_for_reap(&mut restarted, &second_cfg, &stderr, "restarted");
     assert!(
-        cfg.join("shell-snapshots").exists(),
+        cfg.join("cache-home").exists(),
         "completed archive was reaped again"
     );
     assert_eq!(
@@ -194,6 +216,7 @@ fn production_maintenance_skips_busy_archive_then_reaps_it_on_restart() {
     let busy_lock = store.lock_agent_lifecycle(&busy.id).unwrap();
     let cfg = anyagents_core::agent_config_dir(&data, &busy.id);
     std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+    std::fs::create_dir_all(cfg.join("cache-home")).unwrap();
     let canary_cfg = anyagents_core::agent_config_dir(&data, &canary.id);
     let stderr = root.path().join("server.stderr");
     let mut first = server(&data, &home, &stderr);
@@ -204,7 +227,20 @@ fn production_maintenance_skips_busy_archive_then_reaps_it_on_restart() {
     assert!(cfg.join(".claude").exists());
     drop(first);
     drop(busy_lock);
+    // Contention debt survives restart. Advance only this fixture's persisted
+    // deadline so the real restarted worker can retry without a minute sleep.
+    let pending = data.join("reap-pending").join(busy.id.as_str());
+    let mut debt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&pending).unwrap()).unwrap();
+    assert!(debt["attempts"].as_u64().unwrap() >= 1);
+    assert!(debt["next_at_ms"].as_i64().unwrap() > chrono::Utc::now().timestamp_millis());
+    debt["next_at_ms"] = serde_json::json!(0);
+    std::fs::write(&pending, serde_json::to_vec(&debt).unwrap()).unwrap();
     let mut restarted = server(&data, &home, &stderr);
     wait_for_reap(&mut restarted, &cfg, &stderr, "unblocked restart");
-    assert!(!cfg.join(".claude").exists());
+    assert!(
+        cfg.join(".claude").exists(),
+        "native home must survive archive"
+    );
+    assert!(!cfg.join("cache-home").exists());
 }
