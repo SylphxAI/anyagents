@@ -125,6 +125,7 @@ struct State {
     /// costs what it added.
     cost_seen: Option<i64>,
     failures: Vec<(String, String)>,
+    errored_turns: u32,
     turns: std::collections::BTreeMap<String, u64>,
     request_seq: u64,
     /// The mailbox id behind each uuid this process wrote.
@@ -183,6 +184,7 @@ struct Observed {
     duplicates: usize,
     finished: usize,
     failures: usize,
+    errored_turns: u32,
     usages: usize,
     declared: Option<Delivery>,
     quota_reset_at_ms: Option<i64>,
@@ -213,6 +215,7 @@ impl State {
             duplicates: self.duplicates.len(),
             finished: self.finished.len(),
             failures: self.failures.len(),
+            errored_turns: self.errored_turns,
             usages: self.usages.len(),
             declared: self.peer_declares.then(|| self.declared.clone()).flatten(),
             quota_reset_at_ms: self.quota_reset_at_ms,
@@ -753,12 +756,7 @@ impl Harness for ClaudeHarness {
 
     fn turns_served(&self) -> u32 {
         let state = lock(&self.shared);
-        let non_auth_failures = if state.sign_in_fault.is_some() {
-            0
-        } else {
-            state.failures.len()
-        };
-        (state.usages.len() + non_auth_failures) as u32
+        (state.usages.len() as u32).saturating_add(state.errored_turns)
     }
 
     /// The total of every turn this process has finished. A total rather than
@@ -784,7 +782,9 @@ impl Harness for ClaudeHarness {
     }
 
     fn clear_quota(&mut self) {
-        lock(&self.shared).quota_reset_at_ms = None;
+        let mut state = lock(&self.shared);
+        state.quota_reset_at_ms = None;
+        state.sign_in_fault = None;
     }
 
     fn process_id(&self) -> Option<u32> {
@@ -836,6 +836,7 @@ fn accept_message(state: &mut State, id: &str) {
     *state.turns.entry(id.to_string()).or_insert(0) += 1;
     if state.open.is_empty() {
         state.turns_started += 1;
+        state.sign_in_fault = None;
         state.open.push(id.to_string());
     } else {
         state.followups.push(id.to_string());
@@ -1087,6 +1088,10 @@ fn apply_result(state: &mut State, value: &Value) {
         for id in ids {
             state.finished.insert(id.clone());
             state.failures.push((id, reason.clone()));
+        }
+        if state.quota_reset_at_ms.is_none() {
+            state.sign_in_fault = Some(reason);
+            state.errored_turns = state.errored_turns.saturating_add(1);
         }
         promote_followups(state);
         return;

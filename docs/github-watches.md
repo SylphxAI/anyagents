@@ -1,17 +1,33 @@
 # GitHub watches
 
-GitHub watches share a process-wide observation per normalized repository and
-PR number or check ref. Each schedule retains its own baseline, last observation
-and delivery state. A PR observation reads the PR, the head's Check Runs and
-legacy commit statuses; each list is completely paginated. Duplicate watches do
-not multiply those endpoint reads. This is O(distinct targets × pages), not a
-promise of one HTTP request for a composite PR observation.
+GitHub watches are webhook-first with low-frequency REST reconciliation.
+`POST /v1/webhooks/github` verifies the raw request body with HMAC-SHA256
+(`X-Hub-Signature-256`) in constant time using `[server] github_webhook_secret`
+(or `ANYAGENTS_GITHUB_WEBHOOK_SECRET` when unset); an empty or missing secret
+disables webhook intake (`404 Not Found`) and never accepts unauthenticated
+deliveries. Supported deliveries (`pull_request`, `check_run`, `check_suite`,
+`workflow_run`) are deduplicated by `X-GitHub-Delivery`, update the shared
+target cache, and notify `schedules_changed` only when a watched target changes.
 
-Unchanged observations back off from 60 to 120, 240 and 300 seconds. These are
-AnyAgents intervals, not GitHub-mandated intervals. Changed aggregate state or
-head SHA or a newly registered watch resets the interval to 60 seconds. PR watches remain active after
-checks complete, because the merge/close transition is still outstanding.
-Merged/closed PR watches and completed check watches settle after delivery.
+`github:check:<owner>/<repo>@<ref>#<check_name>` selects one exact Check Run
+name instead of the whole commit check population, waking watchers as soon as
+every latest run with that name completes even while unrelated checks continue.
+Aggregate watches (`github:pr:<owner>/<repo>#<number>` and
+`github:check:<owner>/<repo>@<ref>`) never infer whole-population completion
+from a partial webhook view: an incomplete or replaced head stays
+`checks_in_progress` until a complete paginated REST snapshot establishes the
+full run population.
+
+Watches share a process-wide observation per normalized target key (including
+any `#<check_name>` selector). Each schedule retains its own baseline, last
+observation and delivery state. A REST PR observation reads the PR, the head's
+Check Runs and (for aggregate PR watches) legacy commit statuses; each list is
+completely paginated, so duplicate watches do not multiply endpoint reads.
+Registered schedule targets reconcile over REST every 15 minutes as a
+disconnected/missed-delivery backstop, while newly registered watches reconcile
+immediately. PR watches remain active after checks complete because the
+merge/close transition is still outstanding; merged/closed PR watches and
+completed check watches settle after delivery.
 
 A PR watch's `merged`, `closed` and `review_failed` transitions are also
 outcomes of the owner's work ([ADR 0008](adr/0008-quality-loop.md)). Each is

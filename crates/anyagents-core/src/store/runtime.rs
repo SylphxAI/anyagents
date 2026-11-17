@@ -1046,5 +1046,8 @@ fn transition_runtime_tx(
         "UPDATE agents SET state = ?2 WHERE id = ?1",
         params![agent_id.as_str(), to.legacy()],
     )?;
+    if to == RuntimeState::Archived {
+        super::cancel_archived_schedules(tx, agent_id)?;
+    }
     runtime_of(tx, agent_id)?.ok_or_else(|| Error::AgentNotFound(agent_id.to_string()))
 }

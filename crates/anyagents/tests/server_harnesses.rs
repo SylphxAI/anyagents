@@ -1051,51 +1051,61 @@ while True:
     stream, _ = listener.accept()
     # A readiness connection sends nothing; an attachment must speak first.
     reader = stream.makefile('r')
-    line = reader.readline()
-    if not line:
-        stream.close()
-        continue
-    attach = json.loads(line)
-    assert attach['type'] == 'attach' and attach['protocol'] == 'spiron.headless/v2', attach
-    assert isinstance(attach['request_id'], str) and attach['request_id']
-    while (root / 'hold-ready').exists():
-        time.sleep(.005)
-    with lock:
-        append(root / 'wire.jsonl', dict(launch=launch, msg=attach))
-        if client is not None:
-            client.close()
-        client = stream
-        after = attach.get('after_seq')
-        if after is not None:
-            for frame in frames:
-                if frame['seq'] > after:
-                    write(frame)
-        emit('ready', attach['request_id'], protocol='spiron.headless/v2',
-             replay=dict(after_seq=after, complete=True))
-    for line in reader:
-        msg = json.loads(line)
-        kind, request_id = msg['type'], msg.get('request_id')
-        assert kind in ('prompt', 'steer', 'cancel', 'stop'), msg
-        assert isinstance(request_id, str) and request_id, msg
+    try:
+        line = reader.readline()
+        if not line:
+            continue
+        attach = json.loads(line)
+        assert attach['type'] == 'attach' and attach['protocol'] == 'spiron.headless/v2', attach
+        assert isinstance(attach['request_id'], str) and attach['request_id']
+        while (root / 'hold-ready').exists():
+            time.sleep(.005)
         with lock:
-            append(root / 'wire.jsonl', dict(launch=launch, msg=msg))
-            if kind in ('cancel', 'stop'):
-                if kind == 'cancel':
-                    emit('cancel_ack', request_id, turn_id=active, status='cancelling')
-                if active is not None:
-                    finish('cancelled')
-                if kind == 'stop':
-                    emit('stopped', request_id)
-                    os.unlink(path)
-                    os._exit(0)
-            elif active is not None:
-                pending.append(request_id)
-                emit('steer_ack', request_id, accepted=True, turn_id=active)
-            elif kind == 'steer':
-                emit('rejected', request_id, code='no_active_turn')
-            else:
-                active = request_id
-    stream.close()
+            append(root / 'wire.jsonl', dict(launch=launch, msg=attach))
+            if client is not None:
+                client.close()
+            client = stream
+            after = attach.get('after_seq')
+            if after is not None:
+                for frame in frames:
+                    if frame['seq'] > after:
+                        write(frame)
+            emit('ready', attach['request_id'], protocol='spiron.headless/v2',
+                 replay=dict(after_seq=after, complete=True))
+        for line in reader:
+            msg = json.loads(line)
+            kind, request_id = msg['type'], msg.get('request_id')
+            assert kind in ('prompt', 'steer', 'cancel', 'stop'), msg
+            assert isinstance(request_id, str) and request_id, msg
+            with lock:
+                append(root / 'wire.jsonl', dict(launch=launch, msg=msg))
+                if kind in ('cancel', 'stop'):
+                    if kind == 'cancel':
+                        emit('cancel_ack', request_id, turn_id=active, status='cancelling')
+                    if active is not None:
+                        finish('cancelled')
+                    if kind == 'stop':
+                        emit('stopped', request_id)
+                        os.unlink(path)
+                        os._exit(0)
+                elif active is not None:
+                    pending.append(request_id)
+                    emit('steer_ack', request_id, accepted=True, turn_id=active)
+                elif kind == 'steer':
+                    emit('rejected', request_id, code='no_active_turn')
+                else:
+                    active = request_id
+    except OSError:
+        pass
+    finally:
+        try:
+            reader.close()
+        except OSError:
+            pass
+        try:
+            stream.close()
+        except OSError:
+            pass
 "#;
 
 #[cfg(target_os = "linux")]

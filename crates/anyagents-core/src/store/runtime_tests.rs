@@ -2,14 +2,14 @@
 //! and schedule coalescing, through the production Store API.
 use super::*;
 
-fn setup() -> (tempfile::TempDir, Store, Agent) {
+pub(super) fn setup() -> (tempfile::TempDir, Store, Agent) {
     let dir = crate::test_tempdir();
     let store = Store::open(dir.path().join("state.db")).unwrap();
     let agent = store.create_agent(NewAgent::new("worker", "test")).unwrap();
     (dir, store, agent)
 }
 
-fn receive(store: &Store, agent: &Agent, text: &str) -> Message {
+pub(super) fn receive(store: &Store, agent: &Agent, text: &str) -> Message {
     match store.receive(&agent.id, Incoming::new(text)).unwrap() {
         ReceiveOutcome::New(message) | ReceiveOutcome::Duplicate(message) => message,
     }

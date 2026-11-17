@@ -77,16 +77,32 @@ struct ServerTable {
     public_url: Option<String>,
     public_listen: Option<String>,
     remote_session_ttl_secs: Option<u64>,
+    github_webhook_secret: Option<String>,
 }
 
 /// The server settings remote sessions depend on.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Settings {
     /// The normalized public origin (and optional base path), no trailing `/`.
     pub public_url: Option<String>,
     /// Where the public listener binds, when it is configured.
     pub public_listen: Option<SocketAddr>,
     pub remote_session_ttl: Duration,
+    github_webhook_secret: Option<String>,
+}
+
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("public_url", &self.public_url)
+            .field("public_listen", &self.public_listen)
+            .field("remote_session_ttl", &self.remote_session_ttl)
+            .field(
+                "github_webhook_secret",
+                &self.github_webhook_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 impl Default for Settings {
@@ -95,6 +111,7 @@ impl Default for Settings {
             public_url: None,
             public_listen: None,
             remote_session_ttl: DEFAULT_TTL,
+            github_webhook_secret: None,
         }
     }
 }
@@ -153,7 +170,20 @@ impl Settings {
             public_url,
             public_listen,
             remote_session_ttl,
+            github_webhook_secret: file.server.github_webhook_secret,
         })
+    }
+
+    /// Explicit config (including empty = disabled) overrides the environment.
+    pub fn github_webhook_secret(&self) -> Option<String> {
+        self.resolve_github_webhook_secret(std::env::var("ANYAGENTS_GITHUB_WEBHOOK_SECRET").ok())
+    }
+
+    fn resolve_github_webhook_secret(&self, environment: Option<String>) -> Option<String> {
+        self.github_webhook_secret
+            .clone()
+            .or(environment)
+            .filter(|secret| !secret.is_empty())
     }
 
     /// The MCP URL a remote session calls back to, when `public_url` is set.
@@ -538,6 +568,47 @@ mod tests {
                 .unwrap()
                 .session_id,
             grant.session_id
+        );
+    }
+}
+
+#[cfg(test)]
+mod github_secret_tests {
+    use super::*;
+    #[test]
+    fn config_overrides_environment_and_empty_disables() {
+        let settings = Settings::parse(
+            "[server]
+github_webhook_secret = 'configured-secret'",
+            Path::new("config"),
+        )
+        .unwrap();
+        assert_eq!(
+            settings
+                .resolve_github_webhook_secret(Some("environment".into()))
+                .as_deref(),
+            Some("configured-secret")
+        );
+        assert!(!format!("{settings:?}").contains("configured-secret"));
+        let disabled = Settings::parse(
+            "[server]
+github_webhook_secret = ''",
+            Path::new("config"),
+        )
+        .unwrap();
+        assert_eq!(
+            disabled.resolve_github_webhook_secret(Some("environment".into())),
+            None
+        );
+        assert_eq!(
+            Settings::default()
+                .resolve_github_webhook_secret(Some("environment".into()))
+                .as_deref(),
+            Some("environment")
+        );
+        assert_eq!(
+            Settings::default().resolve_github_webhook_secret(None),
+            None
         );
     }
 }

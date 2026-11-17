@@ -1,16 +1,27 @@
-//! REST-only, process-wide GitHub watch observations. The mutex is an intentional
-//! single-flight/serial request gate (not a database lock): GitHub recommends
-//! serial requests to avoid secondary limits. Cached pages retain summaries, not
-//! full Check Run objects; IDs are retained to validate distinct populations.
+//! Webhook-first, process-wide GitHub watch observations. REST reconciles missed
+//! deliveries through a serial request gate. Distinct run IDs validate complete
+//! populations; run metadata lets authenticated events update those populations.
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
+mod events;
+
+pub(super) fn event(
+    event: &str,
+    payload: &Value,
+    delivery: &str,
+    now: i64,
+) -> Result<bool, String> {
+    let mut probes = PROBES.lock().map_err(|_| "GitHub cache unavailable")?;
+    events::apply(&mut probes, event, payload, delivery, now)
+}
 
 const MIN_INTERVAL: i64 = 60_000;
 const MAX_INTERVAL: i64 = 300_000;
 const MAX_PAGES: usize = 1_000;
+const DISCONNECTED_INTERVAL: i64 = 15 * 60_000;
 
 type Observation = (bool, String);
 
@@ -26,6 +37,7 @@ struct Checks {
     ids: HashSet<u64>,
     pending: bool,
     review_failed: bool,
+    runs: HashMap<u64, Value>,
 }
 
 impl Checks {
@@ -34,6 +46,30 @@ impl Checks {
         self.ids.extend(&other.ids);
         self.pending |= other.pending;
         self.review_failed |= other.review_failed;
+        self.runs.extend(other.runs.clone());
+    }
+
+    fn selected(&self, name: &str) -> Observation {
+        let runs: Vec<_> = self
+            .runs
+            .values()
+            .filter(|run| run["name"].as_str() == Some(name))
+            .collect();
+        if runs.is_empty() {
+            return (false, "no_checks_yet".into());
+        }
+        let complete = runs
+            .iter()
+            .all(|run| run["status"].as_str() == Some("completed"));
+        (
+            complete,
+            if complete {
+                "checks_completed"
+            } else {
+                "checks_in_progress"
+            }
+            .into(),
+        )
     }
 
     fn observation(&self, pr: bool) -> Observation {
@@ -66,8 +102,65 @@ struct Page {
     used_at: i64,
 }
 
+#[derive(Clone, Debug)]
+struct Spec {
+    owner: String,
+    repo: String,
+    reference: String,
+    pr: bool,
+    check_name: Option<String>,
+}
+
+impl Spec {
+    fn from_watch(watch: &super::WatchTarget) -> Option<Self> {
+        let (owner, repo, reference, check_name) = match watch {
+            super::WatchTarget::GitHubPr {
+                owner,
+                repo,
+                number,
+            } => (owner, repo, number.to_string(), None),
+            super::WatchTarget::GitHubCheck {
+                owner,
+                repo,
+                reference,
+                check_name,
+            } => (
+                owner,
+                repo,
+                reference.trim_start_matches('#').to_string(),
+                check_name.clone(),
+            ),
+            _ => return None,
+        };
+        let pr = reference.parse::<u64>().is_ok();
+        Some(Self {
+            owner: owner.to_ascii_lowercase(),
+            repo: repo.to_ascii_lowercase(),
+            reference,
+            pr,
+            check_name,
+        })
+    }
+    fn key(&self, base: &str) -> String {
+        let key = target_key(base, &self.owner, &self.repo, &self.reference, self.pr);
+        match &self.check_name {
+            Some(name) => format!("{key}#{}", encode(name)),
+            None => key,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Target {
+    spec: Option<Spec>,
+    snapshot: Option<Checks>,
+    snapshot_complete: bool,
+    legacy_pending: bool,
+    legacy_review_failed: bool,
+    event_ready: bool,
+    event_observation: bool,
+    event_versions: HashMap<String, String>,
+    head_sha: Option<String>,
     watchers: HashSet<String>,
     settled: bool,
     changed: bool,
@@ -86,6 +179,7 @@ struct Target {
 #[derive(Default)]
 struct Probes {
     targets: HashMap<String, Target>,
+    deliveries: HashMap<String, i64>,
     limited_until: i64,
     limit_interval: i64,
     auth_until: HashMap<String, i64>,
@@ -132,6 +226,13 @@ pub(super) fn probe(
     let base = std::env::var("ANYAGENTS_GITHUB_API_BASE").unwrap_or_default();
     let key = target_key(&base, owner, repo, reference, pr);
     let mut probes = PROBES.lock().ok()?;
+    probes.targets.entry(key.clone()).or_default().spec = Some(Spec {
+        owner: owner.to_ascii_lowercase(),
+        repo: repo.to_ascii_lowercase(),
+        reference: reference.to_string(),
+        pr,
+        check_name: None,
+    });
     Some(probes.probe_with_clock(
         &key,
         owner,
@@ -154,6 +255,13 @@ pub(super) fn probe_pr(
     let base = std::env::var("ANYAGENTS_GITHUB_API_BASE").unwrap_or_default();
     let key = target_key(&base, owner, repo, reference, true);
     let mut probes = PROBES.lock().ok()?;
+    probes.targets.entry(key.clone()).or_default().spec = Some(Spec {
+        owner: owner.to_ascii_lowercase(),
+        repo: repo.to_ascii_lowercase(),
+        reference: reference.to_string(),
+        pr: true,
+        check_name: None,
+    });
     let (terminal, state_desc) = probes.probe_with_clock(
         &key,
         owner,
@@ -166,6 +274,37 @@ pub(super) fn probe_pr(
     );
     let head = probes.targets.get(&key).and_then(|t| t.head.clone());
     Some((terminal, state_desc, head))
+}
+
+pub(super) fn probe_selected(
+    owner: &str,
+    repo: &str,
+    reference: &str,
+    name: &str,
+    agent_id: &str,
+    now: i64,
+) -> Option<Observation> {
+    let base = std::env::var("ANYAGENTS_GITHUB_API_BASE").unwrap_or_default();
+    let spec = Spec {
+        owner: owner.to_ascii_lowercase(),
+        repo: repo.to_ascii_lowercase(),
+        reference: reference.trim_start_matches('#').to_string(),
+        pr: reference.trim_start_matches('#').parse::<u64>().is_ok(),
+        check_name: Some(name.to_string()),
+    };
+    let key = spec.key(&base);
+    let mut probes = PROBES.lock().ok()?;
+    probes.targets.entry(key.clone()).or_default().spec = Some(spec.clone());
+    Some(probes.probe_with_clock(
+        &key,
+        owner,
+        repo,
+        &spec.reference,
+        spec.pr,
+        now,
+        |path, etag, modified| request(&base, path, etag, modified, agent_id, owner),
+        completed_now,
+    ))
 }
 
 #[cfg(test)]
@@ -211,26 +350,7 @@ fn target_key(base: &str, owner: &str, repo: &str, reference: &str, pr: bool) ->
 
 /// The probe target of a GitHub watch: a numeric check reference is its PR.
 fn target_of(base: &str, target: &super::WatchTarget) -> Option<String> {
-    let (owner, repo, reference, pr) = match target {
-        super::WatchTarget::GitHubPr {
-            owner,
-            repo,
-            number,
-        } => (owner, repo, number.to_string(), true),
-        super::WatchTarget::GitHubCheck {
-            owner,
-            repo,
-            reference,
-        } => {
-            let clean = reference.strip_prefix('#').unwrap_or(reference);
-            match clean.parse::<u64>() {
-                Ok(number) => (owner, repo, number.to_string(), true),
-                Err(_) => (owner, repo, clean.to_string(), false),
-            }
-        }
-        _ => return None,
-    };
-    Some(target_key(base, owner, repo, &reference, pr))
+    Some(Spec::from_watch(target)?.key(base))
 }
 
 /// Register this cycle's watchers, `(schedule id, target)`, of each target.
@@ -240,13 +360,18 @@ pub(super) fn begin_cycle<'a>(
 ) {
     let base = std::env::var("ANYAGENTS_GITHUB_API_BASE").unwrap_or_default();
     let mut watchers: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut specs = Vec::new();
     for (id, target) in watches {
         if let Some(key) = target_of(&base, target) {
+            specs.push((key.clone(), Spec::from_watch(target).unwrap()));
             watchers.entry(key).or_default().insert(id.to_string());
         }
     }
     if let Ok(mut probes) = PROBES.lock() {
         probes.register(watchers, now);
+        for (key, spec) in specs {
+            probes.targets.entry(key).or_default().spec = Some(spec);
+        }
     }
 }
 
@@ -260,6 +385,9 @@ pub(super) fn next_probe_at(target: &super::WatchTarget) -> Option<i64> {
     let Some(state) = probes.targets.get(&key) else {
         return Some(0);
     };
+    if state.event_ready {
+        return Some(0);
+    }
     if state.settled && state.successful.is_some() {
         return Some(i64::MAX);
     }
@@ -371,6 +499,15 @@ impl Probes {
         mut request: impl FnMut(&str, Option<&str>, Option<&str>) -> Result<Response, Error>,
         completed_at: impl FnOnce() -> i64,
     ) -> Observation {
+        if let Some(target) = self.targets.get_mut(key) {
+            if target.event_observation && (target.event_ready || now < target.next_at) {
+                target.event_ready = false;
+                if let Some(result) = &target.result {
+                    return result.clone();
+                }
+            }
+            target.event_ready = false;
+        }
         let auth_owner = owner.to_ascii_lowercase();
         if now < self.auth_until.get(&auth_owner).copied().unwrap_or(0) {
             return Error::Auth.observation();
@@ -401,6 +538,8 @@ impl Probes {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(1500);
+        target.event_observation = false;
+        target.snapshot_complete = false;
         let result = read_target(
             target,
             &root,
@@ -440,7 +579,11 @@ impl Probes {
                 };
                 target.successful = Some(observation.clone());
                 target.result = Some(observation.clone());
-                target.next_at = completed_at.saturating_add(target.interval);
+                target.next_at = completed_at.saturating_add(if target.spec.is_some() {
+                    target.interval.max(DISCONNECTED_INTERVAL)
+                } else {
+                    target.interval
+                });
                 self.limit_interval = 0;
                 observation
             }
@@ -457,7 +600,11 @@ impl Probes {
                         self.auth_until
                             .insert(auth_owner, now.saturating_add(MIN_INTERVAL));
                     }
-                    target.next_at = completed_at.saturating_add(MIN_INTERVAL);
+                    target.next_at = completed_at.saturating_add(if target.spec.is_some() {
+                        DISCONNECTED_INTERVAL
+                    } else {
+                        MIN_INTERVAL
+                    });
                     target.result = Some(error.observation());
                 }
                 error.observation()
@@ -516,15 +663,44 @@ fn read_target(
         now,
         request,
     )?;
-    if pr {
-        checks.add(&read_checks(
+    target.legacy_pending = false;
+    target.legacy_review_failed = false;
+    if pr
+        && target
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.check_name.as_ref())
+            .is_none()
+    {
+        let legacy = read_checks(
             target,
             &format!("{root}/commits/{}/status", encode(&head)),
             now,
             request,
-        )?);
+        )?;
+        target.legacy_pending = legacy.pending;
+        target.legacy_review_failed = legacy.review_failed;
+        checks.add(&legacy);
     }
-    Ok(checks.observation(pr))
+    target.snapshot_complete = !checks.runs.is_empty() || checks.count > 0;
+    target.head_sha = checks
+        .runs
+        .values()
+        .find_map(|run| run["head_sha"].as_str().map(str::to_string))
+        .or_else(|| {
+            (pr || (head.len() == 40 && head.bytes().all(|b| b.is_ascii_hexdigit())))
+                .then_some(head)
+        });
+    let observation = match target
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.check_name.as_deref())
+    {
+        Some(name) => checks.selected(name),
+        None => checks.observation(pr),
+    };
+    target.snapshot = Some(checks);
+    Ok(observation)
 }
 
 fn read_checks(
@@ -687,6 +863,9 @@ fn read_page(
         };
         for item in runs {
             if check_runs {
+                checks
+                    .runs
+                    .insert(item["id"].as_u64().ok_or(Error::Payload)?, item.clone());
                 checks.ids.insert(
                     item.get("id")
                         .and_then(Value::as_u64)
@@ -1461,6 +1640,7 @@ mod tests {
                     ids: HashSet::from([1]),
                     pending: true,
                     review_failed: false,
+                    runs: HashMap::new(),
                 }),
                 used_at: 0,
             },

@@ -583,6 +583,20 @@ mod tests {
                 .spawn()
                 .unwrap()
         };
+        let group_pid = i32::try_from(ours.id()).unwrap();
+        let settled = (0..250).any(|_| {
+            let ready = members(group_pid).is_ok_and(|procs| {
+                procs.len() >= 2
+                    && procs
+                        .iter()
+                        .any(|p| p.pid != group_pid && !names_profile(p, &user_data))
+            });
+            if !ready {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            ready
+        });
+        assert!(settled, "detached shell group settled on sleep");
         // Not ours: a live process whose pid the file might name after reuse.
         let mut other = std::process::Command::new("sleep")
             .arg("30")

@@ -42,10 +42,15 @@ mod runtime;
 #[cfg(test)]
 #[path = "store/runtime_tests.rs"]
 mod runtime_tests;
+#[cfg(test)]
+#[path = "store/schedule_archive_tests.rs"]
+mod schedule_archive_tests;
+
 mod server_ops;
 mod steer_ops;
 pub use mail_notices::SYSTEM_SENDER;
 mod turn_errors;
+mod turn_events;
 pub use credentials::{
     CredentialBinding, CredentialBindingAudit, CredentialKind, CredentialObservation,
     CredentialSlot, CredentialTarget,
@@ -70,6 +75,18 @@ pub use runtime::{
     TurnOutcome, TurnState,
 };
 pub use turn_errors::{ErroredTurn, MAX_ERRORED_TURNS, TurnErrors, is_session_turn_error};
+pub use turn_events::AgentTurnSnapshot;
+
+/// Run in the owner's archive transaction, never in a second Store write.
+/// Cancelled history and coalesced counts remain available for inspection.
+fn cancel_archived_schedules(conn: &Connection, id: &AgentId) -> Result<(), Error> {
+    conn.execute(
+        "UPDATE agent_schedules SET state = 'cancelled', next_fire_at_ms = NULL
+         WHERE agent_id = ?1 AND state = 'active'",
+        [id.as_str()],
+    )?;
+    Ok(())
+}
 
 /// A line's provider coordinates: the chat, the forum topic and the message id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1173,11 +1190,17 @@ impl Store {
             // before backing off. Never replay a closure with external effects.
             let error = {
                 let mut conn = self.conn();
+                let before = conn.total_changes();
                 let attempt = conn.transaction_with_behavior(TransactionBehavior::Immediate);
                 match attempt {
                     Ok(tx) => {
                         let result = (op.take().expect("write_tx closure called once"))(&tx)?;
+                        let changed = tx.total_changes() != before;
                         tx.commit()?;
+                        if changed {
+                            self.poke_changes();
+                            self.notify_changes();
+                        }
                         return Ok(result);
                     }
                     Err(err) => Error::from(err),
@@ -1362,8 +1385,31 @@ impl Store {
 
     /// A channel for later mailbox inserts and running transitions.
     ///
-    /// Events already committed are not replayed. Scan current state after
-    /// subscribing.
+    /// Subscribe before scanning durable state. Generations are coalesced hints,
+    /// never proof that any particular predicate became true.
+    pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.shared.changes.subscribe()
+    }
+
+    /// Import a cross-process state invalidation without starting any worker.
+    pub fn poke_changes(&self) {
+        self.shared
+            .changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    fn notify_changes(&self) {
+        let path = self.data_dir().join("wake.sock");
+        if path.as_os_str().len() > 107 {
+            return;
+        }
+        if let Ok(socket) = UnixDatagram::unbound() {
+            let _ = socket.set_nonblocking(true);
+            let _ = socket.send_to(b"s", path);
+        }
+    }
+
+    /// Subscribe to mailbox/agent hints; committed events are not replayed.
     pub fn subscribe(&self) -> Receiver<Wake> {
         let (sender, receiver) = mpsc::channel();
         self.shared
@@ -3050,6 +3096,8 @@ impl Store {
             }
             if state == "running" {
                 turn_errors::clear_parking(tx, id)?;
+            } else if state == "archived" {
+                cancel_archived_schedules(tx, id)?;
             }
             agent_by_id(tx, id)
         })?;
@@ -3204,6 +3252,7 @@ impl Store {
                     "agent {id} was admitted; its name is not a failed reservation"
                 )));
             }
+            cancel_archived_schedules(tx, id)?;
             agent_by_id(tx, id)
         })?;
         self.notify(Wake::Agent {
@@ -5068,6 +5117,7 @@ impl Store {
                  WHERE agent_id = ?1 AND completed_seq < opened_seq",
                 [agent_id.as_str()],
             )?;
+            turn_events::record_terminal(tx, agent_id, "completed")?;
             turn_errors::end_run(tx, agent_id)?;
             Ok(())
         })
@@ -5473,7 +5523,13 @@ impl Store {
         }
         let id = format!("sch_{:012x}{}", now, hex(&rand_bytes));
         self.write_tx(|tx| {
-            agent_exists(tx, &input.agent_id)?;
+            let owner = agent_by_id(tx, &input.agent_id)?;
+            if owner.state == "archived" {
+                return Err(Error::Precondition {
+                    machine: "schedule",
+                    reason: format!("agent {} is archived", input.agent_id),
+                });
+            }
             // Deduplicate identical active recurring/watch schedules for the same agent.
             if (input.kind == "every" || input.kind == "watch")
                 && let Some(existing_id) = tx
@@ -5730,6 +5786,9 @@ impl Store {
                      watch_baseline = 'checks_completed'
                  WHERE kind = 'watch'
                    AND state = 'fired'
+                   AND EXISTS (SELECT 1 FROM agents a
+                               WHERE a.id = agent_schedules.agent_id
+                                 AND a.state <> 'archived')
                    AND last_observed = 'checks_completed'
                    AND (
                        spec LIKE 'github:pr:%'

@@ -983,3 +983,49 @@ fn a_superseded_kernel_stands_down() {
     ));
     support::stop(supervisor);
 }
+
+#[test]
+fn detached_completion_with_stale_process_note_custody_is_rejected() {
+    let fx = Fixture::new();
+    let agent = fx.running("alpha", "claude-code");
+    fx.store.receive(&agent, Incoming::new("first")).unwrap();
+    let first = fx.store.next_undelivered(&agent).unwrap().unwrap();
+    fx.store.note_delivered(&agent, first.seq).unwrap();
+    fx.store.note_turn_completed_for(&agent, first.seq).unwrap();
+
+    fx.store.receive(&agent, Incoming::new("second")).unwrap();
+    let second = fx.store.next_undelivered(&agent).unwrap().unwrap();
+    fx.store.note_delivered(&agent, second.seq).unwrap();
+    assert!(fx.store.has_open_turn(&agent).unwrap());
+
+    let kept = Kept::new();
+    *kept.usage.lock().unwrap() = (
+        TurnUsage {
+            input_tokens: 4,
+            output_tokens: 2,
+            ..TurnUsage::default()
+        },
+        1,
+    );
+    // ProcessNote carries stale custody (seq 1) while mailbox cursor is on seq 2.
+    let note = format!(
+        r#"{{"served":null,"turns_recorded":0,"written":1,"profile_rotated_ms":0,"completed_turn":false,"pending_recovery":false,"custody_recorded":true,"admitted_seq":{}}}"#,
+        first.seq
+    );
+    fx.leave(&agent, &kept, "claude-code", Some(&note));
+    let supervisor = fx.start();
+    assert!(
+        wait_until(|| kept.given().iter().any(|id| id.starts_with("recovery_"))),
+        "stale detached custody must not close seq 2's open turn: {:?}",
+        kept.given()
+    );
+    assert!(fx.store.has_open_turn(&agent).unwrap());
+    assert_eq!(
+        fx.store
+            .agent_turn_snapshot(&agent)
+            .unwrap()
+            .terminal_delivered_seq,
+        first.seq
+    );
+    support::stop(supervisor);
+}

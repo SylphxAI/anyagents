@@ -850,14 +850,11 @@ fn mark_archive_generation_locked(store: &Store, data_dir: &Path, agent: &Agent)
         reap_queue::enqueue(data_dir, &agent.id);
     }
     if let Ok(schedules) = store.list_schedules(Some(&agent.id), true) {
-        let any = !schedules.is_empty();
         for sched in schedules {
             let _ = store.cancel_schedule(Some(&agent.id), &sched.id);
         }
-        if any {
-            crate::schedule::schedules_changed(store.data_dir());
-        }
     }
+    crate::schedule::schedules_changed(store.data_dir());
     crate::telegram::detach_archived_agent_from_telegram_groups(store, data_dir, agent, true);
 }
 
@@ -1146,9 +1143,36 @@ async fn public_healthz() -> impl IntoResponse {
     )
 }
 
-/// `POST /v1/webhooks/telegram/{channel_id}`: receives one update pushed by
-/// Telegram, verifies `X-Telegram-Bot-Api-Secret-Token` against the channel's
-/// derived HMAC-SHA256 secret, and routes the update into the durable mailbox.
+/// `POST /v1/webhooks/github`: GitHub signs original bytes, not reserialized JSON.
+async fn github_webhook(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> StatusCode {
+    let settings = match crate::remote::Settings::load(state.store.data_dir()) {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
+    };
+    let result = crate::github_webhook::receive(
+        settings.github_webhook_secret().as_deref(),
+        &headers,
+        &body,
+        |event, payload, delivery| {
+            crate::schedule::github_event(event, payload, delivery, anyagents_core::now_ms())
+        },
+    );
+    match result {
+        Ok(changed) => {
+            if changed {
+                crate::schedule::schedules_changed(state.store.data_dir());
+            }
+            StatusCode::ACCEPTED
+        }
+        Err(status) => status,
+    }
+}
+
+/// `POST /v1/webhooks/telegram/{channel_id}`: authenticated channel intake.
 async fn telegram_webhook(
     State(state): State<AppState>,
     AxumPath(channel_id): AxumPath<String>,
@@ -1256,6 +1280,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
         .route("/healthz", get(public_healthz))
         .route("/v1/webhooks/healthz", get(public_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
+        .route("/v1/webhooks/github", post(github_webhook))
         .route(
             "/v1/webhooks/mcp",
             get(public_mcp_get_route).post(public_mcp_post_route),
@@ -1324,6 +1349,7 @@ fn build_webhook_router(state: AppState) -> Router {
         .route("/healthz", get(public_healthz))
         .route("/v1/webhooks/healthz", get(public_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
+        .route("/v1/webhooks/github", post(github_webhook))
         .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
@@ -1408,6 +1434,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/outbound/{key}/discard", post(outbound_discard_route))
         .route("/v1/webhooks/healthz", get(webhook_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
+        .route("/v1/webhooks/github", post(github_webhook))
         .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
@@ -15423,6 +15450,39 @@ exec '{}' "$@"
                 crate::auth::Presented::of(&parts)
             });
             assert!(principal.is_err(), "{principal:?}");
+        });
+    }
+
+    #[test]
+    fn github_webhook_routes_authenticate_original_bytes() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let config = state.store.data_dir().join("anyagents.toml");
+        std::fs::write(&config, "[server]\ngithub_webhook_secret = 'secret'\n").unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use hyper::service::Service as _;
+            for router in [build_router(state.clone()), build_public_router(state.clone()), build_webhook_router(state.clone())] {
+                let service = hyper_util::service::TowerToHyperService::new(router);
+                for (body, signed, event, expected) in [
+                    (" {\n\"repository\":{\"full_name\":\"nobody/unused\"},\"check_run\":{\"head_sha\":\"sha\",\"id\":1,\"name\":\"build\",\"status\":\"completed\"}}", true, "check_run", StatusCode::ACCEPTED),
+                    ("{", false, "check_run", StatusCode::UNAUTHORIZED),
+                    ("{", true, "check_run", StatusCode::BAD_REQUEST),
+                    ("{", true, "ping", StatusCode::ACCEPTED),
+                ] {
+                    let signature = if signed { format!("sha256={}", crate::github_webhook::hmac_sha256_hex(b"secret", body.as_bytes())) } else { "sha256=invalid".into() };
+                    let request = hyper::Request::builder().method("POST").uri("/v1/webhooks/github")
+                        .header("x-hub-signature-256", signature).header("x-github-event", event)
+                        .header("x-github-delivery", format!("route-{event}-{}", body.len()))
+                        .body(http_body_util::Full::new(bytes::Bytes::copy_from_slice(body.as_bytes()))).unwrap();
+                    assert_eq!(service.call(request).await.unwrap().status(), expected);
+                }
+            }
+            std::fs::write(&config, "[server]\ngithub_webhook_secret = ''\n").unwrap();
+            let service = hyper_util::service::TowerToHyperService::new(build_webhook_router(state));
+            let request = hyper::Request::builder().method("POST").uri("/v1/webhooks/github")
+                .body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
+            assert_eq!(service.call(request).await.unwrap().status(), StatusCode::NOT_FOUND);
         });
     }
 

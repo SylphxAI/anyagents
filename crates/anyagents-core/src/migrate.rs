@@ -75,6 +75,7 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         35,
         include_str!("../migrations/036_normalize_agent_roles.sql"),
     ),
+    (36, include_str!("../migrations/037_turn_events.sql")),
 ];
 
 /// The version that moves the mailbox search index out of the state
@@ -211,7 +212,10 @@ mod tests {
         .unwrap();
 
         migrate(&mut conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 35);
+        assert_eq!(
+            current_version(&conn).unwrap(),
+            MIGRATIONS.last().unwrap().0
+        );
 
         let fetch = |id: &str| -> (Option<String>, Option<String>) {
             conn.query_row(

@@ -982,7 +982,11 @@ for request_num, msg in enumerate(inputs(), 1):
             "1"
         );
         clock.set_ms(deadline);
-        eventually(|| read_wire().len() == 3 && !store.has_open_turn(&agent.id).unwrap());
+        eventually(|| {
+            read_wire().len() == 3
+                && store.delivered_cursor(&agent.id).unwrap() == 3
+                && !store.has_open_turn(&agent.id).unwrap()
+        });
         assert!(!cfg.join(".anyagents-last-error.json").exists());
         let wire: Vec<serde_json::Value> = std::fs::read_to_string(cfg.join("wire.jsonl"))
             .unwrap()
