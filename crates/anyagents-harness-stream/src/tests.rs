@@ -3341,6 +3341,190 @@ sys.stdin.read()
     );
 }
 
+// A clean process exit is not a completed turn or permission to retry it.
+#[test]
+#[cfg(target_os = "linux")]
+fn agy_empty_eof_faults_without_finishing_and_preserves_input_proof() {
+    use std::time::Duration;
+    for step in [
+        "",
+        r#"print('{"step_update":{"step_type":"user_input"}}', flush=True)"#,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = pipe_harness(&format!("import sys; sys.stdin.readline(); {step}"));
+        super::lock(&harness.shared).state_dir = Some(dir.path().into());
+        let message = plain_message("empty-eof");
+        let line = super::message_line(&harness.spec, &message);
+        let _ = harness.deliver(&message, &line);
+        assert!(harness.wait_pred(Duration::from_secs(5), |s| !s.alive));
+        assert!(super::lock(&harness.shared).exit_status.unwrap().success());
+        assert!(
+            harness
+                .health()
+                .sign_in_fault
+                .as_deref()
+                .is_some_and(|f| f.contains("agy_empty_turn"))
+        );
+        let expected = (!step.is_empty()).then_some(super::Proof::Taken {
+            turn_finished: false,
+        });
+        assert_eq!(
+            harness.proven("empty-eof"),
+            expected,
+            "retain only real input-taking evidence"
+        );
+        assert!(super::lock(&harness.shared).finished.is_empty());
+        assert_eq!(harness.turns_served(), 0);
+        assert!(
+            std::fs::read_to_string(dir.path().join(".anyagents-last-error.json"))
+                .unwrap()
+                .contains("agy_empty_turn")
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn agy_eof_does_not_reclassify_work_other_protocols_or_real_errors() {
+    use std::time::Duration;
+    for (program, frame, status, fault, quota) in [
+        (
+            "agy",
+            r#"{"step_update":{"step_type":"planner_response"}}"#,
+            0,
+            false,
+            None,
+        ),
+        (
+            "agy",
+            r#"{"step_update":{"step_type":"agent_response","text_delta":"useful work"}}"#,
+            0,
+            false,
+            None,
+        ),
+        ("agy", "{}", 1, true, None),
+        (
+            "agy",
+            r#"{"type":"rate_limit","resets_at_ms":4102444800000}"#,
+            0,
+            false,
+            Some(4102444800000),
+        ),
+        ("omp", "{}", 0, false, None),
+    ] {
+        let script = format!(
+            "import sys; sys.stdin.readline(); print({}, flush=True); sys.exit({status})",
+            serde_json::to_string(frame).unwrap()
+        );
+        let mut harness = pipe_harness_for(program, &script);
+        let message = plain_message("not-empty");
+        let line = super::message_line(&harness.spec, &message);
+        let _ = harness.deliver(&message, &line);
+        assert!(harness.wait_pred(Duration::from_secs(5), |s| !s.alive));
+        let health = harness.health();
+        assert_eq!(health.sign_in_fault.is_some(), fault, "{frame}");
+        assert!(
+            !health
+                .sign_in_fault
+                .as_deref()
+                .unwrap_or_default()
+                .contains("agy_empty_turn")
+        );
+        assert_eq!(health.quota_reset_at_ms, quota);
+        assert_eq!(
+            harness.turns_served(),
+            0,
+            "EOF alone never finishes useful work"
+        );
+    }
+    let harness = pipe_harness("pass");
+    assert!(harness.wait_pred(Duration::from_secs(5), |s| !s.alive));
+    assert!(
+        harness.health().sign_in_fault.is_none(),
+        "no invocation was open"
+    );
+}
+
+// A descendant holds stdout after the fault: EOF must not be required to
+// evict the transport or prevent resume's live same-session fast path.
+#[test]
+#[cfg(target_os = "linux")]
+fn agy_empty_turn_invalidates_before_eof_and_next_resume_spawns_fresh() {
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let launches = dir.path().join("launches");
+    let inputs = dir.path().join("inputs");
+    let release = dir.path().join("release");
+    let script = format!(
+        r#"#!/usr/bin/python3
+import sys, os, time, json
+launches, inputs, release = {}, {}, {}
+fresh = os.path.exists(launches)
+with open(launches, "a") as f: f.write(str(os.getpid()) + "\n")
+line = sys.stdin.readline()
+with open(inputs, "a") as f: f.write(line)
+if fresh:
+    print(json.dumps({{"step_update":{{"step_type":"planner_response"}}}}), flush=True)
+else:
+    if os.fork() == 0:
+        deadline = time.monotonic() + 10
+        while not os.path.exists(release) and time.monotonic() < deadline: time.sleep(0.01)
+        os._exit(0)
+print(json.dumps({{"type":"result","result":{{"status":"SUCCESS"}}}}), flush=True)
+sys.stdin.read()
+"#,
+        serde_json::to_string(&launches).unwrap(),
+        serde_json::to_string(&inputs).unwrap(),
+        serde_json::to_string(&release).unwrap()
+    );
+    let program = dir.path().join("fake-agy");
+    std::fs::write(&program, script).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut harness = super::StreamHarness::launch(super::Launch {
+        spec: StreamSpec::for_program("agy"),
+        program,
+        args: vec![],
+        environment: vec![],
+        work_dir: None,
+        session_id: Some("same-session".into()),
+        mode: anyagents_harness::DeliveryMode::Followup,
+        delivery: crate::LINE_PER_TURN,
+    })
+    .unwrap();
+    let message = plain_message("failed-input");
+    let line = super::message_line(&harness.spec, &message);
+    let _ = harness.deliver(&message, &line);
+    assert!(harness.wait_pred(Duration::from_secs(5), |s| s.failure().is_some()));
+    // Release before asserting so the red run can also clean up.
+    let alive_at_fault = super::lock(&harness.shared).alive;
+    std::fs::write(&release, "").unwrap();
+    assert!(
+        !alive_at_fault,
+        "a faulted AGY transport must be evicted before EOF"
+    );
+    let next = plain_message("next-input");
+    let line = super::message_line(&harness.spec, &next);
+    assert!(matches!(
+        harness.deliver(&next, &line),
+        Err(anyagents_harness::HarnessError::Dead)
+    ));
+    assert_eq!(harness.proven("failed-input"), None);
+    assert_eq!(harness.turns_served(), 0);
+    harness.resume("same-session").unwrap();
+    let _ = harness.deliver(&next, &line);
+    assert!(harness.wait_finished("next-input", Duration::from_secs(5)));
+    let pids = std::fs::read_to_string(&launches).unwrap();
+    let pids: Vec<_> = pids.lines().collect();
+    assert_eq!(pids.len(), 2);
+    assert_ne!(pids[0], pids[1]);
+    let received = std::fs::read_to_string(&inputs).unwrap();
+    let received: Vec<_> = received.lines().collect();
+    assert_eq!(received.len(), 2, "the failed invocation was not replayed");
+    assert!(received[0].contains("failed-input"));
+    assert!(received[1].contains("next-input"));
+    assert!(harness.health().sign_in_fault.is_none());
+}
+
 // A completed pipe write and a successful empty result prove neither work
 // nor consumption. Hold the writer until stdout closes to exercise the race.
 #[test]
@@ -3389,7 +3573,7 @@ time.sleep(30)
         );
         let fault = std::fs::read_to_string(dir.path().join(".anyagents-last-error.json")).unwrap();
         assert!(fault.contains("agy_empty_turn"));
-        assert!(super::lock(&harness.shared).exit_status.is_some());
+        assert!(harness.wait_pred(Duration::from_secs(5), |s| s.exit_status.is_some()));
     }
 }
 
@@ -3550,7 +3734,7 @@ fn agy_rpc_idle_close_without_work_faults_and_retires_instead_of_finishing() {
     );
     let fault = std::fs::read_to_string(dir.join(".anyagents-last-error.json")).unwrap();
     assert!(fault.contains("agy_empty_turn"));
-    assert!(super::lock(&harness.shared).exit_status.is_some());
+    assert!(harness.wait_pred(Duration::from_secs(5), |s| s.exit_status.is_some()));
 }
 
 #[test]
@@ -3679,7 +3863,7 @@ fn agy_rpc_steer_after_idle_without_work_faults_and_refuses_bypass() {
     );
     let fault = std::fs::read_to_string(dir.join(".anyagents-last-error.json")).unwrap();
     assert!(fault.contains("agy_empty_turn"));
-    assert!(super::lock(&harness.shared).exit_status.is_some());
+    assert!(harness.wait_pred(Duration::from_secs(5), |s| s.exit_status.is_some()));
 }
 
 #[test]
@@ -3855,5 +4039,5 @@ fn agy_empty_turn_preserves_real_prior_proofs_and_never_fabricates_unproven() {
     );
     let fault = std::fs::read_to_string(dir.join(".anyagents-last-error.json")).unwrap();
     assert!(fault.contains("agy_empty_turn"));
-    assert!(super::lock(&harness.shared).exit_status.is_some());
+    assert!(harness.wait_pred(Duration::from_secs(5), |s| s.exit_status.is_some()));
 }
