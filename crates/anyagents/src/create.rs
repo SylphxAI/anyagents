@@ -4430,7 +4430,8 @@ const MERGED_PROFILE_PREFIX: &str = ".merged-";
 
 /// A sign-in's staging directory, `profiles/<provider>/.signin-staging-<suffix>`.
 /// An exclusive `flock` on the directory marks it in flight for as long as this
-/// value lives; dropping it removes the directory, committed or not.
+/// value lives. Successful commits remove it; failed sign-ins retain nonempty
+/// staging for recovery rather than discarding potentially unique credentials.
 pub(crate) struct SigninStaging {
     path: PathBuf,
     #[cfg(unix)]
@@ -4444,7 +4445,10 @@ impl SigninStaging {
         let parent = data.join("profiles").join(provider);
         std::fs::create_dir_all(&parent)?;
         reap_abandoned_signin_staging(&parent);
-        let path = parent.join(format!("{SIGNIN_STAGING_PREFIX}{suffix}"));
+        let path = parent.join(format!(
+            "{SIGNIN_STAGING_PREFIX}{}-{suffix}",
+            std::process::id()
+        ));
         std::fs::create_dir(&path)?;
         #[cfg(unix)]
         let _lock = match lock_signin_staging(&path) {
@@ -4474,11 +4478,18 @@ impl SigninStaging {
 
 impl Drop for SigninStaging {
     fn drop(&mut self) {
-        match std::fs::remove_dir_all(&self.path) {
-            Err(err) if err.kind() != std::io::ErrorKind::NotFound => eprintln!(
-                "sign-in staging {} was not removed: {err}",
-                self.path.display()
-            ),
+        match std::fs::remove_dir(&self.path) {
+            Err(err)
+                if !matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                eprintln!(
+                    "sign-in staging {} was not removed: {err}",
+                    self.path.display()
+                )
+            }
             _ => {}
         }
     }
@@ -4504,31 +4515,44 @@ fn lock_signin_staging(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     Ok((named.is_dir() && held.dev() == named.dev() && held.ino() == named.ino()).then_some(dir))
 }
 
-/// Remove the staging directories under one provider that no running sign-in
-/// holds: one whose process exited, failed or was killed before committing.
-fn reap_abandoned_signin_staging(provider_dir: &Path) {
+/// Legacy interactive staging names also carry a PID. Unknown formats and any
+/// process whose absence cannot be proved are retained, including older agent
+/// sign-ins that did not take a directory lock. A live PID also closes the
+/// creation-before-flock window for new staging directories.
+fn signin_staging_owner_exited(name: &str) -> bool {
     #[cfg(unix)]
     {
-        let Ok(entries) = std::fs::read_dir(provider_dir) else {
-            return;
+        let Some(pid) = name
+            .strip_prefix(SIGNIN_STAGING_PREFIX)
+            .and_then(|suffix| suffix.split('-').next())
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            return false;
         };
+        // SAFETY: signal zero probes existence without sending a signal.
+        (unsafe { libc::kill(pid, 0) }) == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+/// Reap only empty, provably abandoned staging. Nonempty copies are considered
+/// below, where deletion also requires verified recovery in a live profile.
+fn reap_abandoned_signin_staging(provider_dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(entries) = std::fs::read_dir(provider_dir) {
         for entry in entries.flatten() {
-            if !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(SIGNIN_STAGING_PREFIX)
-                || !entry.file_type().is_ok_and(|t| t.is_dir())
-            {
+            if !signin_staging_owner_exited(&entry.file_name().to_string_lossy()) {
                 continue;
             }
             let path = entry.path();
-            if let Ok(Some(_held)) = lock_signin_staging(&path)
-                && let Err(err) = std::fs::remove_dir_all(&path)
-            {
-                eprintln!(
-                    "abandoned sign-in staging {} was not removed: {err}",
-                    path.display()
-                );
+            if let Ok(Some(_held)) = lock_signin_staging(&path) {
+                let _ = std::fs::remove_dir(&path);
             }
         }
     }
@@ -4549,8 +4573,9 @@ fn profile_identity_keys(dir: &Path, provider: &str) -> Vec<String> {
 
 /// Remove `.merged-*` recovery copies that hold nothing a live profile lacks: a
 /// live profile with credentials holds the same account and has every declared
-/// sign-in file the copy has, and the copy holds nothing else but AnyAgents'
-/// own bookkeeping. A copy holding anything more is kept.
+/// sign-in file the copy has, byte for byte. Unknown files, symlinks, unreadable
+/// contents and differing credentials are retained. Abandoned staging is subject
+/// to the same recovery check in addition to its PID and lock checks.
 fn reap_superseded_merged_profiles(provider_dir: &Path, provider: &str) {
     let Ok((primary, companion)) = staged_signin_manifest(provider) else {
         return;
@@ -4560,21 +4585,26 @@ fn reap_superseded_merged_profiles(provider_dir: &Path, provider: &str) {
     };
     let is_file = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
     let mut live = Vec::new();
-    let mut copies = Vec::new();
+    let mut copies: Vec<(PathBuf, Option<std::fs::File>)> = Vec::new();
     for entry in entries.flatten() {
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with(MERGED_PROFILE_PREFIX) {
-            copies.push(entry.path());
+            copies.push((entry.path(), None));
+        } else if signin_staging_owner_exited(&name) {
+            #[cfg(unix)]
+            if let Ok(Some(lock)) = lock_signin_staging(&entry.path()) {
+                copies.push((entry.path(), Some(lock)));
+            }
         } else if !name.starts_with('.')
             && primary.iter().any(|rel| is_file(&entry.path().join(rel)))
         {
             live.push((profile_identity_keys(&entry.path(), provider), entry.path()));
         }
     }
-    for copy in copies {
+    for (copy, _held) in copies {
         let keys = profile_identity_keys(&copy, provider);
         let Some((_, holder)) = live
             .iter()
@@ -4589,7 +4619,11 @@ fn reap_superseded_merged_profiles(provider_dir: &Path, provider: &str) {
                 superseded = false;
                 break;
             };
-            for entry in entries.flatten() {
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    superseded = false;
+                    break;
+                };
                 let path = entry.path();
                 let Ok(rel) = path.strip_prefix(&copy) else {
                     superseded = false;
@@ -4601,17 +4635,24 @@ fn reap_superseded_merged_profiles(provider_dir: &Path, provider: &str) {
                         pending.push(path.clone());
                         true
                     }
-                    Ok(t) if t.is_symlink() => true,
+                    Ok(t) if t.is_symlink() => false,
                     Ok(_)
                         if primary.contains(&rel_str.as_ref())
                             || companion.contains(&rel_str.as_ref()) =>
                     {
                         is_file(&holder.join(rel))
+                            && std::fs::read(&path)
+                                .ok()
+                                .zip(std::fs::read(holder.join(rel)).ok())
+                                .is_some_and(|(source, live)| source == live)
                     }
-                    Ok(_) => {
-                        rel == Path::new("profile.json")
-                            || (rel.components().count() == 1 && rel_str.starts_with(".anyagents-"))
+                    Ok(t) if t.is_file() => {
+                        matches!(
+                            rel_str.as_ref(),
+                            "profile.json" | ".anyagents-last-usage.txt"
+                        )
                     }
+                    Ok(_) => false,
                     Err(_) => false,
                 };
                 if !superseded {
@@ -15043,7 +15084,21 @@ mod runtime_config_tests {
             provider.join(".merged-d-1/auth.json"),
             br#"{"tokens":{"account_id":"other-account","access_token":"fixture"}}"#,
         );
+        // Same identity, different credential bytes: never discard the backup.
+        write(
+            provider.join(".merged-e-1/auth.json"),
+            br#"{"tokens":{"account_id":"same-account","access_token":"different-fixture"}}"#,
+        );
+        #[cfg(unix)]
+        {
+            write(provider.join(".merged-f-1/auth.json"), same);
+            std::os::unix::fs::symlink("auth.json", provider.join(".merged-f-1/unknown-link"))
+                .unwrap();
+        }
         deduplicate_same_account_profiles(dir.path());
+        assert!(provider.join(".merged-e-1").is_dir());
+        #[cfg(unix)]
+        assert!(provider.join(".merged-f-1").is_dir());
         assert!(!provider.join(".merged-a-1").exists());
         for kept in [".merged-b-1", ".merged-c-1", ".merged-d-1"] {
             assert!(provider.join(kept).is_dir(), "{kept} was removed");
@@ -15059,25 +15114,60 @@ mod runtime_config_tests {
     fn abandoned_signin_staging_is_reaped_and_a_held_one_is_kept() {
         let dir = tempfile::tempdir().unwrap();
         let provider = dir.path().join("profiles/openai");
-        let abandoned = provider.join(".signin-staging-1-1");
-        std::fs::create_dir_all(abandoned.join(".codex")).unwrap();
-        std::fs::write(abandoned.join("cli.log"), b"vendor residue").unwrap();
-        let held = SigninStaging::create(dir.path(), "openai", "2-2").unwrap();
+        // PID_MAX_LIMIT is lower than this on supported Unix hosts.
+        let abandoned = provider.join(".signin-staging-2147483647-1");
+        assert!(signin_staging_owner_exited(".signin-staging-2147483647-1"));
+        std::fs::create_dir_all(&abandoned).unwrap();
+        let held = SigninStaging::create(dir.path(), "openai", "test").unwrap();
         assert!(
             !abandoned.exists(),
-            "creating a staging reaps abandoned ones"
+            "creating a staging reaps empty abandoned ones"
         );
-        std::fs::write(held.path().join("auth.json"), b"{}").unwrap();
+        // Legacy processes and the window before a new process acquires its
+        // lock must be protected even without a flock.
+        let unlocked = provider.join(format!(".signin-staging-{}", std::process::id()));
+        let unknown = provider.join(".signin-staging-agent-legacy-1");
+        std::fs::create_dir_all(&unlocked).unwrap();
+        std::fs::create_dir_all(&unknown).unwrap();
         std::fs::create_dir_all(&abandoned).unwrap();
+        std::fs::write(held.path().join("auth.json"), b"unique fixture").unwrap();
         deduplicate_same_account_profiles(dir.path());
         assert!(!abandoned.exists());
-        assert!(
-            held.path().join("auth.json").is_file(),
-            "a held staging is in flight"
-        );
+        assert!(unlocked.is_dir());
+        assert!(unknown.is_dir());
+        assert!(held.path().join("auth.json").is_file());
         let path = held.path().to_path_buf();
         drop(held);
-        assert!(!path.exists(), "a dropped staging is removed");
+        assert_eq!(
+            std::fs::read(path.join("auth.json")).unwrap(),
+            b"unique fixture",
+            "failed sign-in credentials remain recoverable"
+        );
+        let empty = SigninStaging::create(dir.path(), "openai", "empty").unwrap();
+        let path = empty.path().to_path_buf();
+        drop(empty);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_staging_requires_byte_identical_live_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("profiles/openai");
+        let live = provider.join("default");
+        let copy = provider.join(".signin-staging-2147483647-1");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&copy).unwrap();
+        let bytes = br#"{"tokens":{"account_id":"same","access_token":"fixture"}}"#;
+        std::fs::write(live.join("auth.json"), bytes).unwrap();
+        std::fs::write(copy.join("auth.json"), bytes).unwrap();
+        std::fs::write(copy.join("unknown"), b"unique").unwrap();
+        deduplicate_same_account_profiles(dir.path());
+        assert!(copy.is_dir());
+        std::fs::remove_file(copy.join("unknown")).unwrap();
+        deduplicate_same_account_profiles(dir.path());
+        assert!(!copy.exists());
+        assert_eq!(std::fs::read(live.join("auth.json")).unwrap(), bytes);
     }
 
     #[test]

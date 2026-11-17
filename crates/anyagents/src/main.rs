@@ -2418,12 +2418,9 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             .and_then(|p| p.split_once('/').map(|(_, r)| r.trim()).or(Some(p)))
             .filter(|s| !s.is_empty());
         let provider = create::upstream_provider_of(target, None);
-        // Removed when this function returns, whether or not the sign-in commits.
-        let staging = create::SigninStaging::create(
-            data,
-            &provider,
-            &format!("{}-{}", std::process::id(), anyagents_core::now_ms()),
-        )?;
+        // Empty staging is removed on return; unique credentials survive failures.
+        let staging =
+            create::SigninStaging::create(data, &provider, &anyagents_core::now_ms().to_string())?;
         let staging_dir = staging.path();
         let use_native_agy_pkce = target == "agy"
             && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()

@@ -259,19 +259,19 @@ fn exposed_tools_are_linked_and_stale_links_removed() {
 #[test]
 fn an_undeclared_tool_resolves_from_the_declared_tail_before_the_inherited_path() {
     let dir = tempfile::tempdir().unwrap();
-    // `sh` is also on the inherited `PATH`; the declared tail must win.
-    let tail_sh = fake_tool(dir.path(), "sh", "tail");
+    // `git` is also on the inherited `PATH`; the declared tail must win.
+    let tail_git = fake_tool(dir.path(), "git", "tail");
     let tc = toolchain(&format!(
         "schema = 1\nchild_path_tail = [\"{}\"]\n",
         dir.path().display()
     ));
-    let resolved = tc.tool("sh", "checkout").unwrap();
+    let resolved = tc.tool("git", "checkout").unwrap();
     assert_eq!(resolved.provenance, Provenance::Legacy);
-    assert_eq!(resolved.path, tail_sh);
+    assert_eq!(resolved.path, tail_git);
     let report = tc.report();
     assert_eq!(
         report.legacy[0].resolved.as_deref(),
-        Some(tail_sh.as_path())
+        Some(tail_git.as_path())
     );
 }
 
