@@ -187,6 +187,8 @@ pub struct Client<H: Write, P: Write> {
     requests: HashMap<String, String>,
     /// The host's line for each item id, echoed as its proof.
     lines: HashMap<String, Value>,
+    /// Host arrival order of unproved items in `lines`, so cancellations return in FIFO order.
+    arrival: Vec<String>,
     proven: HashSet<String>,
     /// The peer's running turn.
     turn: Option<String>,
@@ -194,6 +196,8 @@ pub struct Client<H: Write, P: Write> {
     duplicate_turn: bool,
     /// A turn-opening `deliver` (`mode: "turn"`) is out and unanswered.
     opening: bool,
+    /// An unanswered `interrupt` sent for the current turn; holds new steers until settled.
+    interrupt_req: Option<String>,
     /// The in-flight `deliver` (`(request_id, item_id)`), one at a time.
     delivering: Option<(String, String)>,
     /// Items waiting for the opening `accepted`, prior `steer_ack`, or turn end.
@@ -221,10 +225,12 @@ impl<H: Write, P: Write> Client<H, P> {
             next_request: 0,
             requests: HashMap::new(),
             lines: HashMap::new(),
+            arrival: Vec::new(),
             proven: HashSet::new(),
             turn: None,
             duplicate_turn: false,
             opening: false,
+            interrupt_req: None,
             delivering: None,
             waiting: VecDeque::new(),
             cancelled_batch: Vec::new(),
@@ -321,7 +327,9 @@ impl<H: Write, P: Write> Client<H, P> {
         if self.turn.is_none() && !self.opening {
             return Ok(());
         }
-        self.control("interrupt", json!({})).map(|_| ())
+        let req = self.control("interrupt", json!({}))?;
+        self.interrupt_req = Some(req);
+        Ok(())
     }
 
     fn on_user(&mut self, event: Value) -> Result<(), String> {
@@ -342,6 +350,9 @@ impl<H: Write, P: Write> Client<H, P> {
         if text.is_empty() {
             // `acp/v1` takes no empty item; the host is told it never will.
             return self.lifecycle(&event, "refused");
+        }
+        if !self.lines.contains_key(&id) {
+            self.arrival.push(id.clone());
         }
         self.lines.insert(id.clone(), event);
         if !self.cancelled_batch.is_empty() {
@@ -381,6 +392,7 @@ impl<H: Write, P: Write> Client<H, P> {
         }
         if self.next_step
             && !self.duplicate_turn
+            && self.interrupt_req.is_none()
             && let Some(id) = self.waiting.pop_front()
         {
             return self.send_deliver(&id, "steer", false);
@@ -395,6 +407,7 @@ impl<H: Write, P: Write> Client<H, P> {
         let Some(mut echo) = self.lines.remove(id) else {
             return Ok(());
         };
+        self.arrival.retain(|entry| entry != id);
         echo["isReplay"] = Value::Bool(true);
         if duplicate {
             echo["duplicate"] = Value::Bool(true);
@@ -709,6 +722,7 @@ impl<H: Write, P: Write> Client<H, P> {
         self.turn = None;
         self.duplicate_turn = false;
         self.opening = false;
+        self.interrupt_req = None;
         if self
             .delivering
             .as_ref()
@@ -775,6 +789,7 @@ impl<H: Write, P: Write> Client<H, P> {
     fn flush_cancelled(&mut self) -> Result<(), String> {
         let batch = std::mem::take(&mut self.cancelled_batch);
         for id in batch {
+            self.arrival.retain(|entry| entry != &id);
             if let Some(line) = self.lines.remove(&id) {
                 self.lifecycle(&line, "cancelled")?;
             }
@@ -784,14 +799,18 @@ impl<H: Write, P: Write> Client<H, P> {
 
     fn on_rejected(&mut self, frame: &Value) -> Result<(), String> {
         let code = non_empty_str(frame, "code")?;
-        let item = frame
-            .get("request_id")
-            .and_then(Value::as_str)
-            .and_then(|request| self.requests.remove(request));
+        let req_id = frame.get("request_id").and_then(Value::as_str);
+        let item = req_id.and_then(|request| self.requests.remove(request));
         match code {
             // The running turn's state refused it: the host offers it again,
             // and what waits behind it goes back too so mailbox FIFO holds.
             "turn_open" | "turn_closed" | "no_active_turn" | "turn_not_started" => {
+                if req_id.is_some() && self.interrupt_req.as_deref() == req_id {
+                    self.interrupt_req = None;
+                    if item.is_none() {
+                        return self.advance();
+                    }
+                }
                 let Some(item) = item else { return Ok(()) };
                 if code == "turn_open" && self.turn.is_none() {
                     self.turn = Some(String::new());
@@ -799,11 +818,20 @@ impl<H: Write, P: Write> Client<H, P> {
                 } else if matches!(code, "no_active_turn" | "turn_not_started") {
                     self.turn = None;
                     self.duplicate_turn = false;
+                    self.interrupt_req = None;
                 }
                 self.opening = false;
                 self.delivering = None;
-                self.cancelled_batch.push(item);
-                self.cancelled_batch.extend(self.waiting.drain(..));
+                let mut returning: HashSet<String> = self.waiting.drain(..).collect();
+                returning.insert(item);
+                for id in &self.arrival {
+                    if returning.remove(id) {
+                        self.cancelled_batch.push(id.clone());
+                    }
+                }
+                for id in returning {
+                    self.cancelled_batch.push(id);
+                }
                 if !self.defer_cancel {
                     self.flush_cancelled()?;
                 }
@@ -1684,6 +1712,153 @@ mod tests {
         assert_eq!(sent_m4.len(), 1);
         assert_eq!(sent_m4[0]["mode"], "steer");
         assert_eq!(sent_m4[0]["items"][0]["id"], "m4");
+    }
+
+    #[test]
+    fn cancelling_turn_holds_fresh_steer_and_returns_rejections_in_fifo_order() {
+        // Race 1: a fresh item arriving after interrupt (before result) stays
+        // in waiting so undelivered steers from the cancelled turn precede it.
+        let mut rig = live();
+        rig.client.on_host(&user("m1")).unwrap();
+        let req_m1 = rig.peer.take()[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        rig.client
+            .on_peer(&frame(
+                2,
+                1,
+                Some(&req_m1),
+                json!({"type": "accepted", "turn_id": "t1", "mode": "turn"}),
+            ))
+            .unwrap();
+        let _ = rig.host.take();
+
+        rig.client.on_host(&user("m2")).unwrap();
+        let req_m2 = rig.peer.take()[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        rig.client
+            .on_peer(&frame(
+                3,
+                1,
+                Some(&req_m2),
+                json!({"type": "steer_ack", "turn_id": "t1", "item_ids": ["m2"]}),
+            ))
+            .unwrap();
+
+        rig.client
+            .on_host(r#"{"type":"control_request","request":{"subtype":"interrupt"}}"#)
+            .unwrap();
+        let sent_int = rig.peer.take();
+        assert_eq!(sent_int.len(), 1);
+        assert_eq!(sent_int[0]["type"], "interrupt");
+
+        rig.client.on_host(&user("m3")).unwrap();
+        assert!(
+            rig.peer.take().is_empty(),
+            "fresh m3 must not steer into a cancelling turn"
+        );
+
+        rig.client
+            .on_peer(&frame(
+                4,
+                1,
+                None,
+                json!({
+                    "type": "result",
+                    "turn_id": "t1",
+                    "status": "cancelled",
+                    "is_error": true,
+                    "duplicate": false,
+                    "undelivered_ids": ["m2"]
+                }),
+            ))
+            .unwrap();
+        let reopened = rig.peer.take();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0]["mode"], "turn");
+        assert_eq!(reopened[0]["items"][0]["id"], "m2");
+
+        // Race 2: if a steer (m4) was already in flight before turn end and is
+        // rejected with no_active_turn after result prepended m2, cancelled
+        // lifecycle notifications still emit in arrival order [m2, m3, m4].
+        let mut rig = live();
+        rig.client.on_host(&user("m1")).unwrap();
+        let req_m1 = rig.peer.take()[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        rig.client
+            .on_peer(&frame(
+                2,
+                1,
+                Some(&req_m1),
+                json!({"type": "accepted", "turn_id": "t1", "mode": "turn"}),
+            ))
+            .unwrap();
+        let _ = rig.host.take();
+
+        rig.client.on_host(&user("m2")).unwrap();
+        let req_m2 = rig.peer.take()[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        rig.client
+            .on_peer(&frame(
+                3,
+                1,
+                Some(&req_m2),
+                json!({"type": "steer_ack", "turn_id": "t1", "item_ids": ["m2"]}),
+            ))
+            .unwrap();
+
+        rig.client.on_host(&user("m4")).unwrap();
+        let req_m4 = rig.peer.take()[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        rig.client.on_host(&user("m5")).unwrap();
+
+        rig.client
+            .on_peer(&frame(
+                4,
+                1,
+                None,
+                json!({
+                    "type": "result",
+                    "turn_id": "t1",
+                    "status": "cancelled",
+                    "is_error": true,
+                    "duplicate": false,
+                    "undelivered_ids": ["m2"]
+                }),
+            ))
+            .unwrap();
+        let _ = rig.host.take();
+        rig.client
+            .on_peer(
+                &json!({
+                    "type": "rejected",
+                    "seq": null,
+                    "session_id": SESSION,
+                    "lease_epoch": 1,
+                    "request_id": req_m4,
+                    "code": "no_active_turn",
+                    "error": null
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let cancelled: Vec<String> = rig
+            .host
+            .take()
+            .into_iter()
+            .filter(|v| v["type"] == "command_lifecycle" && v["state"] == "cancelled")
+            .map(|v| v["uuid"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(cancelled, ["u-m2", "u-m4", "u-m5"]);
     }
 
     #[test]
