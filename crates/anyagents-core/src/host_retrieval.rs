@@ -734,7 +734,7 @@ enum Job {
 }
 
 /// Jobs by data directory, for the background indexer; and its pre-warm
-/// pass over every agent after the process starts.
+/// pass over live agents after the process starts.
 struct Backlog {
     queue: std::collections::VecDeque<Job>,
     prewarm: Option<Vec<String>>,
@@ -779,8 +779,8 @@ impl Store {
 
     /// One bounded step of background indexing: a queued job first (a class
     /// a search left incomplete, or a source due for verification),
-    /// otherwise the next agent of the pre-warm pass that covers every agent
-    /// once per process, live agents first. A class still incomplete after
+    /// otherwise the next live agent of the pre-warm pass. Archived history is
+    /// indexed on demand by a search, never bulk-walked during daemon startup. A class still incomplete after
     /// `budget` bytes is queued again behind the others. Returns whether
     /// there was work.
     pub fn index_host_history_step(&self, budget: u64) -> Result<bool, IndexError> {
@@ -794,15 +794,12 @@ impl Store {
                     Some(list) => list,
                     None => {
                         let mut live = Vec::new();
-                        let mut archived = Vec::new();
-                        for agent in self.list_agents().map_err(store_error)? {
-                            if agent.state == "archived" {
-                                archived.push(agent.id.to_string());
-                            } else {
-                                live.push(agent.id.to_string());
-                            }
+                        for agent in self.list_live_agents().map_err(store_error)? {
+                            live.push(agent.id.to_string());
                         }
-                        live.extend(archived);
+                        // Archived agents can have arbitrarily large transcript trees.
+                        // Do not turn a daemon startup/tick into an archive-wide read;
+                        // a targeted history search enqueues an archived owner instead.
                         backlog_entry(&mut backlog(), &data).prewarm = Some(live.clone());
                         live
                     }
@@ -916,7 +913,7 @@ impl Store {
 
     /// Run the background indexer on the calling thread for as long as the
     /// process lives: classes searches left incomplete, then a pre-warm pass
-    /// over every agent, then nothing until a search queues more. The caller
+    /// over live agents only, then nothing until a search queues more. The caller
     /// runs it at the lowest CPU priority. A failing class is reported and
     /// left for the next search to queue again.
     pub fn run_host_history_indexer(&self) {
@@ -3421,6 +3418,19 @@ mod tests {
     /// says what is pending; once the indexer has run, the same search finds
     /// everything and nothing is pending. The pre-warm pass covers an agent
     /// no search has touched.
+    #[test]
+    fn prewarm_does_not_open_archived_history() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let archived = store
+            .create_agent(NewAgent::new("archived", "spiron"))
+            .unwrap();
+        store.set_agent_state(&archived.id, "archived").unwrap();
+
+        assert!(!store.index_host_history_step(u64::MAX).unwrap());
+        assert!(!dir.path().join(INDEX_FILE).exists());
+    }
+
     #[test]
     fn a_search_indexes_a_bounded_delta_and_the_background_indexes_the_rest() {
         BATCH_BYTES_OVERRIDE.with(|b| b.set(Some(4096)));

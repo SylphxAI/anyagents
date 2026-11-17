@@ -168,7 +168,7 @@ fn capability_key() -> Result<String, Error> {
 }
 
 /// Index host history in the background: what searches left for later,
-/// sources due for full verification, and a pre-warm pass over every agent
+/// sources due for full verification, and a bounded pre-warm pass over live agents
 /// after the daemon starts. It runs on its own thread at the lowest CPU and
 /// I/O priority, so it reads only when nothing else wants the machine.
 fn start_host_history_indexer(store: Arc<Store>) {
