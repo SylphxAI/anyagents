@@ -1260,7 +1260,7 @@ impl Linked {
             if !out.status.success() {
                 return Err(format!(
                     "cannot copy this checkout's own objects: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
+                    failure_detail(&out)
                 ));
             }
         }
@@ -1421,7 +1421,7 @@ impl Linked {
         cmd.args(["update-ref", "--stdin"]);
         let out = output_with_input(&mut cmd, &updates).map_err(|e| e.to_string())?;
         if !out.status.success() {
-            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+            return Err(format!("git update-ref: {}", failure_detail(&out)));
         }
         for (name, target) in symbolic {
             store_git(staging, None, &["symbolic-ref", &name, &target])?;
@@ -1643,10 +1643,23 @@ fn store_git(git_dir: &Path, work_tree: Option<&Path>, args: &[&str]) -> Result<
         return Err(format!(
             "git {}: {}",
             args.first().copied().unwrap_or_default(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            failure_detail(&out)
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Why a git child failed: its stderr, or, when it wrote none (killed by a
+/// signal, or exited without a message), its exit status. An empty reason
+/// cannot be diagnosed after the fact.
+fn failure_detail(out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!("no error output ({})", out.status)
+    } else {
+        stderr.to_string()
+    }
 }
 
 /// Git that reads a repository an agent may control: run as that agent's
@@ -2732,6 +2745,27 @@ fn github_repo(raw: &str) -> Option<String> {
 pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn a_silent_git_failure_still_names_why_it_failed() {
+        let run = |script: &str| Command::new("sh").args(["-c", script]).output().unwrap();
+        // A message on stderr is the reason, as before.
+        assert_eq!(
+            failure_detail(&run("echo 'fatal: bad object' >&2; exit 128")),
+            "fatal: bad object"
+        );
+        // No message: the exit code or the killing signal, never an empty reason.
+        let exited = failure_detail(&run("exit 3"));
+        assert!(
+            exited.starts_with("no error output (") && exited.contains('3'),
+            "{exited}"
+        );
+        let killed = failure_detail(&run("kill -9 $$"));
+        assert!(
+            killed.starts_with("no error output (") && killed.contains('9'),
+            "{killed}"
+        );
+    }
 
     pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
