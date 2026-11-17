@@ -1559,7 +1559,7 @@ for raw in sys.stdin:
                 Instant::now() < deadline,
                 "same-process pending write + priority mail must drain without deadlock"
             );
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
 
         let expected = vec![
