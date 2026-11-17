@@ -1723,7 +1723,15 @@ fn switch_at_dispatch(state: &str, retiring: RetiringTurn, model_only: bool) {
     let updated = store.agent(&agent.id).unwrap();
     assert_eq!(updated.id, agent.id);
     assert_eq!(updated.instructions, agent.instructions);
-    assert_eq!(store.get_schedule(&schedule.id).unwrap(), Some(schedule));
+    let mut expected_schedule = schedule;
+    if state == "archived" {
+        expected_schedule.state = "cancelled".into();
+        expected_schedule.next_fire_at_ms = None;
+    }
+    assert_eq!(
+        store.get_schedule(&expected_schedule.id).unwrap(),
+        Some(expected_schedule)
+    );
     assert!(old.lock().unwrap().given.is_empty());
     let replacement = Arc::clone(probes.lock().unwrap().last().unwrap());
     assert!(replacement.lock().unwrap().given.is_empty());

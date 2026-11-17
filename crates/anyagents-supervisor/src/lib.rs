@@ -353,6 +353,10 @@ struct ProcessNote {
     completed_turn: bool,
     #[serde(default)]
     pending_recovery: bool,
+    #[serde(default)]
+    custody_recorded: bool,
+    #[serde(default)]
+    admitted_seq: Option<i64>,
 }
 
 /// Whether served totals grew past `before`, field by field: a token count
@@ -666,6 +670,7 @@ fn listen_wake<H: Harness>(socket: UnixDatagram, inner: Arc<Inner<H>>) {
         }
         match buf[0] {
             b'x' => break,
+            b's' => inner.store.poke_changes(),
             b'm' | b'a' => {
                 let Ok(text) = std::str::from_utf8(&buf[1..count]) else {
                     continue;
@@ -1078,9 +1083,9 @@ impl<H: Harness + 'static> Session<H> {
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 self.record_usage();
+                self.sync_note();
                 self.end_delivery();
-                self.publish();
-                return false;
+                return self.finish_run(false);
             }
             if self.delivery.is_none() {
                 match self.boot() {
@@ -1102,21 +1107,18 @@ impl<H: Harness + 'static> Session<H> {
                     Boot::Busy => {
                         self.delivery = None;
                         self.restart_at = None;
-                        self.publish();
-                        return true;
+                        return self.finish_run(true);
                     }
                     Boot::Stopped => {
                         self.delivery = None;
                         self.restart_at = None;
-                        self.publish();
-                        return false;
+                        return self.finish_run(false);
                     }
                     Boot::Retry => {
                         if !self.wait_backoff() {
                             self.delivery = None;
                             self.restart_at = None;
-                            self.publish();
-                            return false;
+                            return self.finish_run(false);
                         }
                     }
                 }
@@ -1130,6 +1132,9 @@ impl<H: Harness + 'static> Session<H> {
                 .as_ref()
                 .is_some_and(|delivery| self.inner.custody.superseded(delivery.harness()))
             {
+                let _workers = lock(&self.inner.workers);
+                self.stop.store(true, Ordering::SeqCst);
+                drop(_workers);
                 self.stand_down();
                 return false;
             }
@@ -1148,8 +1153,7 @@ impl<H: Harness + 'static> Session<H> {
                 if !self.wait_backoff() {
                     self.end_delivery();
                     self.restart_at = None;
-                    self.publish();
-                    return false;
+                    return self.finish_run(false);
                 }
                 self.replace_process();
                 continue;
@@ -1157,10 +1161,48 @@ impl<H: Harness + 'static> Session<H> {
             if self.deliver_once() {
                 self.stop_delivery();
                 self.restart_at = None;
-                self.publish();
-                return true;
+                return self.finish_run(true);
             }
         }
+    }
+
+    /// Serialize ordinary worker retirement with router wakes after dropping
+    /// `AgentLock`: mark this slot stopping under `inner.workers` so no later
+    /// `wake_live_worker` consumes a wake into an exiting thread, and re-poke
+    /// `Wake::Agent` when the agent is `running`, no live slot remains, and
+    /// the process lock is free.
+    fn finish_run(&mut self, busy: bool) -> bool {
+        let has_live_worker = {
+            let workers = lock(&self.inner.workers);
+            self.stop.store(true, Ordering::SeqCst);
+            workers
+                .get(&self.id)
+                .is_some_and(|slot| !slot.done.is_set() && !slot.stop.load(Ordering::SeqCst))
+        };
+        self.publish();
+        if !has_live_worker
+            && !self.inner.stop.load(Ordering::SeqCst)
+            && !self.inner.retain.load(Ordering::SeqCst)
+            && is_running(&self.inner.store, &self.id)
+        {
+            let lock_free = if busy {
+                match self.inner.store.try_lock_agent(&self.id) {
+                    Ok(guard) => {
+                        drop(guard);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            } else {
+                true
+            };
+            if lock_free {
+                self.inner.store.poke(Wake::Agent {
+                    agent_id: self.id.clone(),
+                });
+            }
+        }
+        busy
     }
 
     /// The worker stops: its process ends with it, or, while the kernel
@@ -1219,6 +1261,8 @@ impl<H: Harness + 'static> Session<H> {
             instructions_rotated_ms: self.process_instructions_rotated_ms,
             completed_turn: self.completed_turn_in_session,
             pending_recovery: self.pending_recovery,
+            custody_recorded: true,
+            admitted_seq: delivery.admitted_seq(),
         };
         if self.kept_note.as_ref() == Some(&note) {
             return;
@@ -1310,6 +1354,19 @@ impl<H: Harness + 'static> Session<H> {
         // itself answered (its keeper's link open), or usage that grew while
         // the process lives. A keeper that is gone, before or after they are
         // read, reads as idle with nothing new, and is owed its recovery.
+        let admitted_seq = if replaced || note.pending_recovery {
+            None
+        } else if note.custody_recorded {
+            note.admitted_seq
+        } else if delivery.store().has_open_turn(&self.id).unwrap_or(false) {
+            delivery
+                .store()
+                .delivered_cursor(&self.id)
+                .ok()
+                .filter(|&seq| seq > 0)
+        } else {
+            None
+        };
         let harness = delivery.harness();
         let health = harness.health();
         let turns = harness.turns_served();
@@ -1321,18 +1378,28 @@ impl<H: Harness + 'static> Session<H> {
             && !note.pending_recovery
             && idle
             && ((answered && turns > note.turns_recorded)
-                || (live && usage_advanced(&usage, &note.served.clone().unwrap_or_default())));
-        let store = delivery.store();
-        let completed = finished_detached && store.note_turn_completed(&self.id).is_ok();
+                || (live
+                    && health.quota_reset_at_ms.is_none()
+                    && usage_advanced(&usage, &note.served.clone().unwrap_or_default())));
+        let completed = finished_detached
+            && admitted_seq.is_some_and(|seq| {
+                delivery
+                    .store()
+                    .note_turn_completed_for(&self.id, seq)
+                    .unwrap_or(false)
+            });
+        if !finished_detached {
+            delivery.restore_admitted_seq(admitted_seq);
+        }
         let idle_with_open_turn = health.turn_state == TurnState::Idle
             && !completed
-            && store.has_open_turn(&self.id).unwrap_or(false);
+            && delivery.store().has_open_turn(&self.id).unwrap_or(false);
         self.served = note.served;
         self.turns_recorded = note.turns_recorded;
         self.written = note.written;
         self.process_profile_rotated_ms = note.profile_rotated_ms;
         self.process_instructions_rotated_ms = note.instructions_rotated_ms;
-        self.completed_turn_in_session = note.completed_turn;
+        self.completed_turn_in_session = note.completed_turn || completed;
         self.process_started_at = Some(started_at_ms.unwrap_or_else(|| self.inner.clock.now_ms()));
         self.host_lock = Some(host_lock);
         self.adopted = Some(replaced || note.pending_recovery || idle_with_open_turn);
@@ -1694,14 +1761,21 @@ impl<H: Harness + 'static> Session<H> {
         let config_switched = self.runtime_switch_pending() == Some(true);
         if rotated_after_start || cleared_after_start || config_switched || now >= reset_at {
             self.quota_started_at = None;
+            // Replace before clearing the old harness's quota hold so pre-swap
+            // usage accounting sees that any partial token growth stopped on
+            // quota rather than completing the open turn.
+            let should_replace =
+                rotated_after_start || config_switched || self.instructions_rotation_pending();
+            if should_replace && self.replace_process() {
+                return true;
+            }
             if let Some(delivery) = self.delivery.as_mut() {
                 delivery.clear_quota();
             }
-            // A new process makes this pass's snapshot stale: start over.
-            return (rotated_after_start
-                || config_switched
-                || self.instructions_rotation_pending())
-                && self.replace_process();
+            if health.turn_state == TurnState::Idle {
+                self.pending_recovery = true;
+            }
+            return false;
         }
         self.commit_proven();
         // What the harness served before the hold is recorded on the day it
@@ -1726,6 +1800,9 @@ impl<H: Harness + 'static> Session<H> {
                 self.written = self
                     .written
                     .saturating_add(committed.clamp(0, u64::from(u32::MAX)) as u32);
+                if committed > 0 {
+                    self.sync_note();
+                }
                 true
             }
             Err(err) => {
@@ -1815,6 +1892,7 @@ impl<H: Harness + 'static> Session<H> {
                     .saturating_add(delivered.clamp(0, u64::from(u32::MAX)) as u32);
                 self.attempt = 0;
                 self.idle_review_ms = IDLE_REVIEW_MS;
+                self.sync_note();
                 self.wake_unless_more();
                 false
             }
@@ -2029,7 +2107,11 @@ impl<H: Harness + 'static> Session<H> {
         let served_turn = turns_served > self.turns_recorded
             && self.inner.custody.answers_live(delivery.harness());
         let advanced = usage_advanced(&served, &before);
-        let ended = (served_turn || (advanced && health.process_alive))
+        // Partial usage served before a mid-turn quota hold is recorded below
+        // (#273) without closing the interrupted open turn unless the adapter
+        // explicitly reported a finished turn (`served_turn`).
+        let ended = (served_turn
+            || (advanced && health.process_alive && health.quota_reset_at_ms.is_none()))
             && health.turn_state == TurnState::Idle;
         // A line the harness took and finished while `deliver` still answered
         // `Deferred` is proven, not yet committed: the store holds no open
@@ -2040,59 +2122,88 @@ impl<H: Harness + 'static> Session<H> {
         if ended && !self.commit_proven() {
             return false;
         }
-        let Some(delivery) = self.delivery.as_ref() else {
-            return true;
-        };
-        let completed = ended && health.sign_in_fault.is_none();
+        let completed_candidate = ended && health.sign_in_fault.is_none();
         // A turn the harness saw end with an error (not a quota wait) never
         // holds the mailbox: it is counted now, and `follow_errored_turn`
         // retries its work and closes it, or parks the agent at the limit
         // (docs/delivery.md).
-        let errored = ended
+        let errored_candidate = ended
             .then(|| health.sign_in_fault.clone())
             .flatten()
             .filter(|_| health.quota_reset_at_ms.is_none());
         // Persist completion before publishing progress or resetting the usage
-        // baseline. On failure the same turn remains eligible for another pass.
-        if completed && let Err(err) = delivery.store().note_turn_completed(&self.id) {
-            eprintln!(
-                "anyagents-supervisor: {}: persist turn completion failed: {err}",
-                self.id
-            );
-            self.last_error = Some(format!("persist turn completion: {err}"));
-            return false;
+        // baseline. False rejects stale/duplicate/unowned custody without
+        // mutating terminal state; Err retries on the next pass.
+        let mut completed = false;
+        if completed_candidate {
+            let Some(delivery) = self.delivery.as_mut() else {
+                return true;
+            };
+            match delivery.complete_turn() {
+                Ok(accepted) => completed = accepted,
+                Err(err) => {
+                    eprintln!(
+                        "anyagents-supervisor: {}: persist turn completion failed: {err}",
+                        self.id
+                    );
+                    self.last_error = Some(format!("persist turn completion: {err}"));
+                    return false;
+                }
+            }
         }
-        if let Some(error) = &errored {
+        let mut errored = None;
+        if let Some(error) = &errored_candidate {
             // Only an error of the session's own is a strike; anything else
             // is the fleet's and backs off instead (docs/delivery.md).
             let strike = is_session_turn_error(error);
-            // The turn the store holds open now is the one the follow-up
-            // may close; a turn completed or replaced by then is left alone.
-            let opened_seq = match delivery.store().open_turn(&self.id) {
-                Ok(open) => open.map(|open| open.opened_seq),
-                Err(err) => {
-                    self.last_error = Some(format!("read errored turn: {err}"));
-                    return false;
+            let admitted_seq = self.delivery.as_ref().and_then(|d| d.admitted_seq());
+            let opened_seq = if let Some(seq) = admitted_seq {
+                let Some(delivery) = self.delivery.as_ref() else {
+                    return true;
+                };
+                match delivery.store().open_turn(&self.id) {
+                    Ok(open) => open
+                        .filter(|open| open.opened_seq <= seq)
+                        .map(|open| open.opened_seq),
+                    Err(err) => {
+                        self.last_error = Some(format!("read errored turn: {err}"));
+                        return false;
+                    }
                 }
+            } else {
+                None
             };
-            match delivery.store().note_turn_errored(&self.id, error, strike) {
-                Ok(streak) => {
+            let observed_at = self.inner.clock.now_ms();
+            let Some(delivery) = self.delivery.as_mut() else {
+                return true;
+            };
+            match delivery.error_turn(error, strike) {
+                Ok(true) => {
+                    let streak = match delivery.store().turn_errors(&self.id) {
+                        Ok(Some(errors)) => errors.streak,
+                        Ok(None) => i64::from(strike),
+                        Err(err) => {
+                            self.last_error = Some(format!("read errored turn streak: {err}"));
+                            return false;
+                        }
+                    };
                     if !strike {
                         self.systemic_errors = self.systemic_errors.saturating_add(1);
                     }
-                    let now = self.inner.clock.now_ms();
                     self.errored_turn = Some(ErroredFollowUp {
                         streak,
                         strike,
                         error: error.clone(),
                         opened_seq,
                         not_before: if strike {
-                            now
+                            observed_at
                         } else {
-                            now.saturating_add(systemic_backoff_ms(self.systemic_errors))
+                            observed_at.saturating_add(systemic_backoff_ms(self.systemic_errors))
                         },
                     });
+                    errored = Some(error.clone());
                 }
+                Ok(false) => {}
                 Err(err) => {
                     eprintln!(
                         "anyagents-supervisor: {}: persist errored turn failed: {err}",
@@ -2103,6 +2214,9 @@ impl<H: Harness + 'static> Session<H> {
                 }
             }
         }
+        let Some(delivery) = self.delivery.as_ref() else {
+            return true;
+        };
         let served_changed = advanced;
         if served_changed {
             let turns = turns_served
@@ -2125,15 +2239,16 @@ impl<H: Harness + 'static> Session<H> {
             self.served = Some(served);
             self.written = 0;
         }
-        if completed {
+        if ended {
             self.turns_recorded = turns_served;
+        }
+        if completed {
             self.completed_turn_in_session = true;
             self.consecutive_turn_errors = 0;
             self.systemic_errors = 0;
             self.last_error = None;
         }
         if let Some(error) = errored {
-            self.turns_recorded = turns_served;
             self.last_error = Some(error);
         }
         if ended || served_changed {
