@@ -1413,6 +1413,27 @@ fn post_json_curl(
     Ok((code, body))
 }
 
+/// Convert explicit OpenAI selectors at the chat-completions boundary only.
+/// Storage and custom/opaque model namespaces remain caller-owned. The gateway
+/// expects openai/... plus a separate reasoning_effort, not the harness route
+/// sylphx/ or a #effort fragment.
+fn sleep_request_model(selector: &str) -> (&str, Option<&str>) {
+    let routed = selector.strip_prefix("sylphx/").unwrap_or(selector);
+    let Some(openai) = routed.strip_prefix("openai/") else {
+        return (selector, None);
+    };
+    match routed.split_once('#') {
+        Some((base, effort))
+            if base != "openai/"
+                && matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") =>
+        {
+            (base, Some(effort))
+        }
+        None if !openai.is_empty() => (routed, None),
+        _ => (selector, None),
+    }
+}
+
 pub fn request_sleep_consolidation_plan(
     endpoint: &SleepModelEndpoint,
     agent_root: &Path,
@@ -1423,14 +1444,18 @@ pub fn request_sleep_consolidation_plan(
 ) -> Result<SleepConsolidationPlan, String> {
     let (system_prompt, user_prompt) =
         build_sleep_consolidation_messages_internal(agent_root, agent_name, role, topics, turns);
-    let body = serde_json::json!({
-        "model": endpoint.model,
+    let (model, effort) = sleep_request_model(&endpoint.model);
+    let mut body = serde_json::json!({
+        "model": model,
         "temperature": 0.1,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ]
     });
+    if let Some(effort) = effort {
+        body["reasoning_effort"] = serde_json::json!(effort);
+    }
     let payload = serde_json::to_string(&body).map_err(|e| e.to_string())?;
     let (status, resp_body) = if endpoint.url.starts_with("http://127.0.0.1:")
         || endpoint.url.starts_with("http://localhost:")
@@ -1458,6 +1483,25 @@ fn build_sleep_consolidation_messages_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opaque_sleep_model_selectors_are_unchanged() {
+        for selector in [
+            "vendor/model#high",
+            "sylphx/vendor/model#max",
+            "unknown",
+            "openai/",
+            "openai/#high",
+            "openai/custom#future",
+            "openai/custom#high#max",
+        ] {
+            assert_eq!(sleep_request_model(selector), (selector, None));
+        }
+        assert_eq!(
+            sleep_request_model("openai/gpt-6.1-sol"),
+            ("openai/gpt-6.1-sol", None)
+        );
+    }
+
     #[test]
     fn consolidation_archives_every_replaced_version_and_keeps_its_citations() {
         let root = tempfile::tempdir().unwrap();

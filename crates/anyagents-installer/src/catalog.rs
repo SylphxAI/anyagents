@@ -186,7 +186,7 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             id: "codex",
             sign_in: &["codex", "login"],
             api_key: Some("OPENAI_API_KEY"),
-            models: &["gpt"],
+            models: &["gpt", "gpt-6.2-sol", "gpt-6.2-astra"],
             terms: "",
             source: npm("@openai/codex", Some("@openai/codex-{os}-{cpu}")),
             launcher: "node_modules/@openai/codex-{os}-{cpu}/vendor/{target}/bin/codex",
@@ -266,7 +266,13 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             "spiron-cloud",
             &["spiron", "login"],
             "SYLPHX_API_KEY",
-            &["claude-opus-4.6", "claude-sonnet-4.6", "gpt-5.4"],
+            &[
+                "claude-opus-4.6",
+                "claude-sonnet-4.6",
+                "gpt-5.4",
+                "gpt-6.2-sol",
+                "gpt-6.2-astra",
+            ],
             "https://sylphx.com/terms",
         ),
         cloud(
@@ -280,7 +286,13 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             "openai-cloud",
             &["codex", "login"],
             "OPENAI_API_KEY",
-            &["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"],
+            &[
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+                "gpt-6.2-sol",
+                "gpt-6.2-astra",
+            ],
             "https://openai.com/policies/row-terms-of-use/",
         ),
         cloud(
@@ -523,6 +535,25 @@ fn merge(entries: &mut Vec<CatalogEntry>, id: &str, change: EntryOverride) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sol_and_astra_are_discoverable_without_removing_existing_models() {
+        let catalog = Catalog::builtin();
+        for (id, legacy) in [
+            ("codex", "gpt"),
+            ("openai-cloud", "gpt-5.4"),
+            ("spiron-cloud", "gpt-5.4"),
+        ] {
+            let entry = catalog.get(id).unwrap();
+            for model in ["gpt-6.2-sol", "gpt-6.2-astra", legacy] {
+                assert!(
+                    entry.subscription.models.iter().any(|m| m == model),
+                    "{id}: {model}"
+                );
+            }
+        }
+        assert!(catalog.get("unknown-model").is_none());
+    }
 
     #[test]
     fn every_managed_harness_has_a_launcher_and_every_runtime_is_in_the_catalog() {
