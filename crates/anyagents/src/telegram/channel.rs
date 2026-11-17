@@ -116,9 +116,11 @@ impl Drop for ChangedOnDrop {
     }
 }
 
-/// Seconds one `getUpdates` may hold the connection open.
-pub const LONG_POLL_S: u64 = 30;
-/// A call that answers at once gets this long; a long poll gets its own plus ten.
+/// Seconds one `getUpdates` may hold the connection open. Telegram answers at
+/// once when an update arrives, so this bounds only how long a connection a
+/// network path dropped silently can hide updates before it is replaced.
+pub const LONG_POLL_S: u64 = 15;
+/// A call that answers at once gets this long; a long poll gets its own plus five.
 const SHORT_TIMEOUT_S: u64 = 30;
 
 fn api_base() -> String {
@@ -360,8 +362,14 @@ fn resolve_chat_title_and_type(
 /// Proactively reconcile `channel`'s group chat bindings (`chat_id < 0`) and
 /// missing chat titles against Telegram's authoritative `getChatMember` and `getChat`.
 /// Runs in both webhook mode and long-polling mode.
-pub fn reconcile_channel_groups(store: &Store, secrets: &FileCredentialStore, channel: &Channel) {
-    if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some()
+pub fn reconcile_channel_groups(
+    store: &Store,
+    secrets: &FileCredentialStore,
+    channel: &Channel,
+    cancelled: &dyn Fn() -> bool,
+) {
+    if cancelled()
+        || std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some()
         || std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
         || channel.kind != "telegram"
     {
@@ -373,7 +381,10 @@ pub fn reconcile_channel_groups(store: &Store, secrets: &FileCredentialStore, ch
     let Some(agent_id) = channel.agents.first() else {
         return;
     };
-    if let Ok(agent) = store.agent(agent_id) {
+    let Ok(agent) = store.agent(agent_id) else {
+        return;
+    };
+    {
         if agent.state == "archived"
             || agent.state == "paused"
             || is_agent_explicitly_archived(store.data_dir(), &agent)
@@ -381,6 +392,9 @@ pub fn reconcile_channel_groups(store: &Store, secrets: &FileCredentialStore, ch
             return;
         }
         sync_agent_telegram_bot_name(store, store.data_dir(), &agent);
+    }
+    if cancelled() {
+        return;
     }
     let Ok(token) = token_of(secrets, credential_ref) else {
         return;
@@ -402,9 +416,6 @@ pub fn reconcile_channel_groups(store: &Store, secrets: &FileCredentialStore, ch
         changed = true;
     }
     let Some(bot_tag) = memory.bot.clone().filter(|b| !b.is_empty()) else {
-        if changed {
-            let _ = save_channel_memory_merged(store, &channel.id, &mut memory, &[]);
-        }
         return;
     };
 
@@ -418,7 +429,10 @@ pub fn reconcile_channel_groups(store: &Store, secrets: &FileCredentialStore, ch
         };
         candidate_groups.insert(gid, (Some(default_kind.to_string()), None));
     }
-    if let Ok(all_channels) = store.list_channels() {
+    let Ok(all_channels) = store.list_channels() else {
+        return;
+    };
+    {
         for ch in all_channels {
             if ch.kind != "telegram" {
                 continue;
@@ -450,6 +464,9 @@ pub fn reconcile_channel_groups(store: &Store, secrets: &FileCredentialStore, ch
     }
 
     for (gid, (known_type, known_title)) in candidate_groups {
+        if cancelled() {
+            return;
+        }
         let already_attached = memory
             .chats
             .iter()
@@ -502,6 +519,9 @@ pub fn reconcile_channel_groups(store: &Store, secrets: &FileCredentialStore, ch
         .map(|c| c.chat_id)
         .collect();
     for cid in missing_title_ids {
+        if cancelled() {
+            return;
+        }
         let Some((resolved_title, resolved_type)) =
             resolve_chat_title_and_type(&token, &channel.id, cid)
         else {
@@ -519,7 +539,83 @@ pub fn reconcile_channel_groups(store: &Store, secrets: &FileCredentialStore, ch
     }
 
     if changed {
-        let _ = save_channel_memory_merged(store, &channel.id, &mut memory, &removed_chats);
+        commit_group_discovery(store, channel, &agent, &memory, &removed_chats, cancelled);
+    }
+}
+
+/// Merge discovered group metadata onto the current channel state and commit
+/// atomically only if channel routing, credentials and owner lifecycle still
+/// match the pre-I/O snapshot. Concurrent offset advances are preserved.
+fn commit_group_discovery(
+    store: &Store,
+    channel: &Channel,
+    agent: &anyagents_core::Agent,
+    memory: &Memory,
+    removed_chats: &[i64],
+    cancelled: &dyn Fn() -> bool,
+) {
+    if cancelled() {
+        return;
+    }
+    if agent.state == "paused"
+        || agent.state == "archived"
+        || is_agent_explicitly_archived(store.data_dir(), agent)
+    {
+        return;
+    }
+    let fresh = match store.channel(&channel.id) {
+        Ok(Some(fresh)) => fresh,
+        Ok(None) => return,
+        Err(err) => {
+            eprintln!("Telegram group discovery read failed: {err}");
+            return;
+        }
+    };
+    if fresh.kind != channel.kind
+        || fresh.config != channel.config
+        || fresh.identity != channel.identity
+        || fresh.credential_ref != channel.credential_ref
+        || fresh.agents != channel.agents
+    {
+        return;
+    }
+    let fresh_mem = match Memory::try_from_state(&fresh.state) {
+        Ok(mem) => mem,
+        Err(err) => {
+            eprintln!("{err}");
+            return;
+        }
+    };
+    let mut merged = memory.clone();
+    merged.offset = merged.offset.max(fresh_mem.offset);
+    if merged.bot.as_deref().unwrap_or("").is_empty() && fresh_mem.bot.is_some() {
+        merged.bot = fresh_mem.bot;
+    }
+    for (k, v) in fresh_mem.pending_managed_bots {
+        merged.pending_managed_bots.entry(k).or_insert(v);
+    }
+    for link in fresh_mem.chats {
+        if removed_chats.contains(&link.chat_id) {
+            continue;
+        }
+        if let Some(existing) = merged
+            .chats
+            .iter_mut()
+            .find(|l| l.agent == link.agent && l.chat_id == link.chat_id)
+        {
+            if existing.chat_type.is_none() {
+                existing.chat_type = link.chat_type;
+            }
+            if existing.title.is_none() {
+                existing.title = link.title;
+            }
+        } else {
+            merged.chats.push(link);
+        }
+    }
+    merged.chats.retain(|l| !removed_chats.contains(&l.chat_id));
+    if let Err(err) = store.compare_set_channel_state(&fresh, agent, &merged.to_state()) {
+        eprintln!("Telegram group discovery commit failed: {err}");
     }
 }
 
@@ -695,12 +791,11 @@ fn poll_channel(
         memory.bot = Some(format!("{}:{}", identity.id, identity.username));
         save_channel_memory_merged(store, &channel.id, &mut memory, &[])?;
     }
-    reconcile_channel_groups(store, secrets, channel);
     let poll = Poll::resume(memory.offset);
     let response = call_api(
         &token,
         &poll.get_updates(timeout_s),
-        timeout_s + 10,
+        timeout_s + 5,
         Some(&channel.id),
     )?;
     let body = updates_payload(&response)?;
@@ -3925,6 +4020,20 @@ fn sent_metadata(response: &str) -> (Option<i64>, Option<anyagents_core::Quote>)
 /// Errors expose stable fields, never ureq's URL-bearing Display/Debug or a
 /// provider body. An exact description allowlist prevents arbitrary echoed
 /// credentials, URLs and personal message text from entering diagnostics.
+/// The wait Telegram asked for when it refused a call with `429 Too Many
+/// Requests` (`parameters.retry_after`, in seconds), read from the error
+/// [`api_error`] built. `None` for any other error.
+pub(super) fn retry_after_s(err: &anyagents_core::Error) -> Option<u64> {
+    let text = err.to_string();
+    let detail: serde_json::Value = serde_json::from_str(text.strip_prefix("telegram ")?).ok()?;
+    if detail.get("class").and_then(serde_json::Value::as_str) != Some("rate_limited") {
+        return None;
+    }
+    detail
+        .get("retry_after")
+        .and_then(serde_json::Value::as_u64)
+}
+
 fn api_error(
     method: &str,
     channel: Option<&anyagents_core::ChannelId>,
@@ -4164,33 +4273,42 @@ fn call_api(
     channel: Option<&anyagents_core::ChannelId>,
 ) -> Result<String, anyagents_core::Error> {
     let url = format!("{}/bot{token}/{}", api_base(), call.method);
-    let agent = ureq::Agent::config_builder()
+    // Share the pool, not the request deadline: getUpdates and outbound sends
+    // have different budgets. Redirect refusal protects the bot token/body.
+    static HTTP: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    let agent = HTTP.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(5)))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .build()
+            .new_agent()
+    });
+    let response = agent
+        .post(&url)
+        .config()
         .timeout_global(Some(Duration::from_secs(timeout_s)))
-        .http_status_as_error(false)
-        // A Telegram API request must never follow a redirect with a token or
-        // message body. Refusal is returned once, without a retry.
-        .max_redirects(0)
-        .max_redirects_will_error(false)
         .build()
-        .new_agent();
-    let response = agent.post(&url).send_json(&call.body).map_err(|err| {
-        let (class, description) = match err {
-            ureq::Error::Timeout(_) => (
-                "timeout",
-                "Telegram request timed out; delivery may be uncertain",
-            ),
-            ureq::Error::HostNotFound => ("network", "Telegram hostname could not be resolved"),
-            ureq::Error::Io(_) | ureq::Error::ConnectionFailed => (
-                "network",
-                "Telegram connection failed; delivery may be uncertain",
-            ),
-            _ => (
-                "transport",
-                "Telegram transport failed; delivery may be uncertain",
-            ),
-        };
-        api_error(&call.method, channel, class, None, None, description, None)
-    })?;
+        .send_json(&call.body)
+        .map_err(|err| {
+            let (class, description) = match err {
+                ureq::Error::Timeout(_) => (
+                    "timeout",
+                    "Telegram request timed out; delivery may be uncertain",
+                ),
+                ureq::Error::HostNotFound => ("network", "Telegram hostname could not be resolved"),
+                ureq::Error::Io(_) | ureq::Error::ConnectionFailed => (
+                    "network",
+                    "Telegram connection failed; delivery may be uncertain",
+                ),
+                _ => (
+                    "transport",
+                    "Telegram transport failed; delivery may be uncertain",
+                ),
+            };
+            api_error(&call.method, channel, class, None, None, description, None)
+        })?;
     let status = response.status().as_u16();
     let body = response.into_body().read_to_string().map_err(|_| {
         api_error(
@@ -5432,5 +5550,51 @@ pub(crate) mod tests {
                 .contains(&"x".repeat(MAX_TELEGRAM_CHUNK_CHARS))
         );
         assert!(!messages[0].text.contains(&text));
+    }
+
+    #[test]
+    fn group_discovery_commit_preserves_concurrent_offset_and_refuses_stale_authority() {
+        let _env = env_lock();
+        let (_dir, store, agent, snapshot) = custody_fixture();
+        // Simulate webhook/poll advancing offset while group discovery I/O was in flight.
+        let mut live_mem = Memory::try_from_state(&snapshot.state).unwrap();
+        live_mem.offset = 42;
+        live_mem.attach_typed(agent.id.as_str(), 888, Some("private"));
+        store
+            .set_channel_state(&snapshot.id, &live_mem.to_state())
+            .unwrap();
+
+        let mut discovered = Memory::try_from_state(&snapshot.state).unwrap();
+        discovered.attach_typed_titled(
+            agent.id.as_str(),
+            -10077,
+            Some("supergroup"),
+            Some("Ops Room"),
+        );
+        commit_group_discovery(&store, &snapshot, &agent, &discovered, &[], &|| false);
+
+        let after = store.channel(&snapshot.id).unwrap().unwrap();
+        let after_mem = Memory::try_from_state(&after.state).unwrap();
+        assert_eq!(after_mem.offset, 42);
+        assert!(after_mem.chats.iter().any(|c| c.chat_id == 888));
+        assert_eq!(after_mem.title_of(-10077), Some("Ops Room"));
+
+        // If the agent paused during I/O, stale running snapshot cannot write.
+        let snapshot2 = store.channel(&snapshot.id).unwrap().unwrap();
+        store.set_agent_state(&agent.id, "paused").unwrap();
+        let mut stale_discovery = after_mem.clone();
+        stale_discovery.attach_typed_titled(
+            agent.id.as_str(),
+            -10088,
+            Some("supergroup"),
+            Some("Should Not Commit"),
+        );
+        commit_group_discovery(&store, &snapshot2, &agent, &stale_discovery, &[], &|| false);
+        let unchanged = store.channel(&snapshot.id).unwrap().unwrap();
+        assert!(
+            !Memory::try_from_state(&unchanged.state)
+                .unwrap()
+                .is_room(-10088)
+        );
     }
 }
