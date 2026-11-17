@@ -18,6 +18,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_selectors_are_not_harness_aliases() {
+        for model in [
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "gpt-6.1-sol",
+            "unknown-model",
+        ] {
+            for prefix in ["openai/", "sylphx/openai/"] {
+                for effort in ["low", "medium", "high", "xhigh", "max"] {
+                    let selector = format!("{prefix}{model}#{effort}");
+                    assert_eq!(normalize_harness_name(&selector), selector);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn legacy_first_party_harness_names_are_canonical() {
         for harness in [
             "spiron",

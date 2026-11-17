@@ -215,6 +215,10 @@ pub fn write_codex_with_model(
                 "model_reasoning_effort",
                 &format!("\"{}\"", toml_escape(eff)),
             );
+        } else {
+            // An explicit bare selector restores the model/provider default,
+            // rather than inheriting an effort from the previously selected model.
+            existing = remove_top_key(&existing, "model_reasoning_effort");
         }
     }
     if use_sylphx {
@@ -541,6 +545,62 @@ mod tests {
             text.contains("experimental_bearer_token = \"test-sylphx-key\""),
             "{text}"
         );
+    }
+
+    #[test]
+    fn codex_model_selector_matrix_preserves_native_provider_adaptation() {
+        for base in [
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "gpt-6.1-sol",
+            "unknown-model",
+        ] {
+            for prefix in ["openai/", "sylphx/openai/"] {
+                for effort in ["low", "medium", "high", "xhigh", "max"] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("config.toml");
+                    let original = "# retained\nmodel_reasoning_effort = \"low\"\n[caller]\nlabel = \"保留\"\n";
+                    std::fs::write(&path, original).unwrap();
+                    let selector = format!("{prefix}{base}#{effort}");
+                    write_codex_with_model(
+                        &path,
+                        Some(&selector),
+                        Path::new("/bin/anyagents"),
+                        &[],
+                    )
+                    .unwrap();
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let cfg: toml::Value = toml::from_str(&text).unwrap();
+                    assert_eq!(cfg["model"].as_str(), Some(base), "{selector}");
+                    assert_eq!(cfg["model_reasoning_effort"].as_str(), Some(effort));
+                    if prefix.starts_with("sylphx/") {
+                        assert_eq!(cfg["model_provider"].as_str(), Some("sylphx"));
+                        assert!(cfg["model_providers"]["sylphx"].is_table());
+                    } else {
+                        assert!(cfg.get("model_provider").is_none());
+                    }
+                    assert_eq!(cfg["caller"]["label"].as_str(), Some("保留"));
+                    // No selector means leave caller-owned defaults alone.
+                    write_codex_with_model(&path, None, Path::new("/bin/anyagents"), &[]).unwrap();
+                    let cfg: toml::Value =
+                        toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                    assert_eq!(cfg["model_reasoning_effort"].as_str(), Some(effort));
+                    // Explicitly removing the suffix must not leave a stale effort.
+                    write_codex_with_model(
+                        &path,
+                        Some(&format!("{prefix}{base}")),
+                        Path::new("/bin/anyagents"),
+                        &[],
+                    )
+                    .unwrap();
+                    let cfg: toml::Value =
+                        toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                    assert_eq!(cfg["model"].as_str(), Some(base));
+                    assert!(cfg.get("model_reasoning_effort").is_none());
+                    assert_eq!(cfg["caller"]["label"].as_str(), Some("保留"));
+                }
+            }
+        }
     }
 
     #[test]

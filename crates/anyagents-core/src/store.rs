@@ -8673,6 +8673,46 @@ mod tests {
     }
 
     #[test]
+    fn model_selector_matrix_survives_create_update_harness_switch_and_reopen() {
+        let (dir, store) = setup();
+        let mut expected = Vec::new();
+        for base in [
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "gpt-6.1-sol",
+            "unknown-model",
+        ] {
+            for prefix in ["openai/", "sylphx/openai/"] {
+                for effort in ["low", "medium", "high", "xhigh", "max"] {
+                    let selector = format!("{prefix}{base}#{effort}");
+                    let mut new =
+                        NewAgent::new(format!("selector-{}", expected.len()), "sylphx/default");
+                    new.model = Some(selector.clone());
+                    let created = store.create_agent(new).unwrap();
+                    assert_eq!(created.model.as_deref(), Some(selector.as_str()));
+                    let switched = store.set_agent_harness(&created.id, "codex").unwrap();
+                    assert_eq!(switched.model, created.model);
+                    store
+                        .set_agent_model(&created.id, "vendor/unknown#future")
+                        .unwrap();
+                    store.set_agent_model(&created.id, &selector).unwrap();
+                    let updated = store.agent(&created.id).unwrap();
+                    assert_eq!(updated.model.as_deref(), Some(selector.as_str()));
+                    expected.push((created.id, selector));
+                }
+            }
+        }
+        drop(store);
+        let reopened = Store::open(dir.path().join("state.db")).unwrap();
+        for (id, selector) in expected {
+            assert_eq!(
+                reopened.agent(&id).unwrap().model.as_deref(),
+                Some(selector.as_str())
+            );
+        }
+    }
+
+    #[test]
     fn inbox_query_limits_unread_and_sender_before_materializing() {
         let (_dir, store) = setup();
         let own = agent(&store, "limited");
@@ -11760,6 +11800,75 @@ mod tests {
         let sleep = crate::learned_memory::read_sleep_state(&root);
         assert_eq!(sleep.last_inbound_seq, 1);
         assert_eq!(sleep.consolidated_topics, 1);
+    }
+
+    #[test]
+    fn sleep_model_selector_matrix_reaches_chat_completions_without_route_or_fragment() {
+        use crate::learned_memory::{SleepModelEndpoint, request_sleep_consolidation_plan};
+        let root = crate::test_tempdir();
+        let mut cases = Vec::new();
+        for base in [
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "gpt-6.1-sol",
+            "unknown-model",
+        ] {
+            for prefix in ["openai/", "sylphx/openai/"] {
+                for effort in ["low", "medium", "high", "xhigh", "max"] {
+                    cases.push((
+                        format!("{prefix}{base}#{effort}"),
+                        format!("openai/{base}"),
+                        Some(effort),
+                    ));
+                }
+            }
+        }
+        for opaque in [
+            "vendor/custom#future",
+            "sylphx/vendor/custom#high",
+            "openai/custom#future",
+            "openai/gpt-6.1-sol",
+        ] {
+            cases.push((opaque.into(), opaque.into(), None));
+        }
+        for (selector, model, effort) in cases {
+            let (url, requests, handle) =
+                spawn_mock_sleep_model_server(r#"{"operations":[]}"#.into());
+            let endpoint = SleepModelEndpoint {
+                url,
+                bearer_key: None,
+                model: selector.clone(),
+            };
+            request_sleep_consolidation_plan(&endpoint, root.path(), "worker", None, &[], &[])
+                .unwrap();
+            handle.join().unwrap();
+            let captured = requests.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert!(captured[0].starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+            let (_, payload) = captured[0].split_once("\r\n\r\n").unwrap();
+            let body: serde_json::Value = serde_json::from_str(payload).unwrap();
+            assert_eq!(body["model"].as_str(), Some(model.as_str()), "{selector}");
+            assert_eq!(
+                body.get("reasoning_effort").and_then(|v| v.as_str()),
+                effort
+            );
+            assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                endpoint.model, selector,
+                "wire conversion must not rewrite the stored selector"
+            );
+        }
+        let (url, _, handle) = spawn_mock_sleep_model_server("not a consolidation plan".into());
+        let endpoint = SleepModelEndpoint {
+            url,
+            bearer_key: None,
+            model: "sylphx/openai/gpt-6.2-sol#max".into(),
+        };
+        assert!(
+            request_sleep_consolidation_plan(&endpoint, root.path(), "worker", None, &[], &[])
+                .is_err()
+        );
+        handle.join().unwrap();
     }
 
     #[test]

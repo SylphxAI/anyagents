@@ -535,3 +535,64 @@ fn a_proof_given_just_before_stop_is_proven_after_it() {
     );
     assert_eq!(harness.deliver(&msg("m2")), Err(HarnessError::Dead));
 }
+
+/// Config effort is inherited by Codex itself; thread/start and thread/resume
+/// must preserve the writer's native model/provider, not a harness selector.
+#[test]
+fn model_selector_matrix_reaches_app_server_start_and_resume() {
+    assert!(
+        std::env::var_os("ANYAGENTS_FAKE_MODE").is_none(),
+        "parent fake mode would skip production configuration"
+    );
+    for model in [
+        "gpt-6.2-sol",
+        "gpt-6.2-astra",
+        "gpt-6.1-sol",
+        "unknown-model",
+    ] {
+        for provider in ["openai", "sylphx"] {
+            for effort in ["low", "medium", "high", "xhigh", "max"] {
+                for session in [None, Some("thread-existing")] {
+                    let dir = TempDir::new().unwrap();
+                    let config = format!(
+                        "model = \"{model}\"\nmodel_provider = \"{provider}\"\nmodel_reasoning_effort = \"{effort}\"\n[caller]\nmodel = \"not-the-top-level-model\"\n"
+                    );
+                    std::fs::write(dir.path().join("config.toml"), &config).unwrap();
+                    let log = log_path(&dir);
+                    let harness = CodexHarness::start(
+                        env!("CARGO_BIN_EXE_fake_codex"),
+                        session,
+                        &[
+                            ("CODEX_HOME", dir.path().to_str().unwrap()),
+                            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+                            ("ANYAGENTS_FAKE_MODE", "hold"),
+                        ],
+                    )
+                    .unwrap();
+                    let method = if session.is_some() {
+                        "thread/resume"
+                    } else {
+                        "thread/start"
+                    };
+                    let requests = read_log(&log);
+                    let request = requests
+                        .lines()
+                        .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                        .find(|v| v["method"] == method)
+                        .expect("thread request recorded by child");
+                    assert_eq!(request["params"]["model"], model);
+                    assert_eq!(request["params"]["modelProvider"], provider);
+                    assert_eq!(request["params"]["approvalPolicy"], "never");
+                    if let Some(session) = session {
+                        assert_eq!(request["params"]["threadId"], session);
+                    }
+                    assert_eq!(
+                        std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+                        config
+                    );
+                    drop(harness);
+                }
+            }
+        }
+    }
+}
