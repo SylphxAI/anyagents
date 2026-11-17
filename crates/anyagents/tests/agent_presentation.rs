@@ -195,7 +195,7 @@ fn parked_messages_hide_internal_reasons_except_in_verbose_output() {
     );
     assert!(run(data, true, &["--verbose", "requeue", "worker"]).contains(&reason));
     human(
-        &run(data, true, &["requeue", "worker", &message.id.to_string()]),
+        &run(data, true, &["requeue", "worker", message.id.as_ref()]),
         "Requeued message for worker",
         data,
     );

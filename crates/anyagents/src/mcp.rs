@@ -9181,12 +9181,12 @@ fn compact_agent_row(row: &mut serde_json::Value) {
                 | "has_open_turn"
         )
     });
-    if let Some(description) = row.get("description").and_then(|v| v.as_str()) {
-        if description.chars().count() > 160 {
-            let preview: String = description.chars().take(160).collect();
-            row.insert("description".into(), serde_json::json!(preview));
-            row.insert("description_truncated".into(), serde_json::json!(true));
-        }
+    if let Some(description) = row.get("description").and_then(|v| v.as_str())
+        && description.chars().count() > 160
+    {
+        let preview: String = description.chars().take(160).collect();
+        row.insert("description".into(), serde_json::json!(preview));
+        row.insert("description_truncated".into(), serde_json::json!(true));
     }
 }
 

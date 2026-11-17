@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::io::IsTerminal as _;
 
-use crate::api::{AgentView, ConversationTurnView, MessageView};
+use crate::api::AgentView;
 
 mod presentation;
 pub use presentation::{error, heading, is_verbose, note, schedules, set_verbose, success, value};
@@ -1610,74 +1610,6 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
 
     table.print();
     println!();
-}
-
-/// Pretty-print an agent's inbox messages.
-pub fn print_inbox_pretty(agent_name: &str, messages: &[MessageView]) {
-    if messages.is_empty() {
-        println!("  {} {}", bold_cyan(agent_name), dim("inbox is empty."));
-        return;
-    }
-    println!(
-        "\n  {}  {} messages\n",
-        bold_cyan(&format!("Inbox · {agent_name}")),
-        bold(&messages.len().to_string())
-    );
-    let mut table = Table::new(&[
-        ("SEQ", true),
-        ("STATUS", false),
-        ("TIME", false),
-        ("FROM", false),
-        ("MESSAGE", false),
-    ]);
-    for m in messages {
-        let seq = dim(&format!("[#{}]", m.seq));
-        let ack = match m.ack.as_str() {
-            "delivered" => green("✓ delivered"),
-            "received" => yellow("● queued"),
-            other => dim(other),
-        };
-        let time = dim(&format_timestamp_ms(m.received_at_ms));
-        let sender = cyan(m.sender.as_deref().unwrap_or("-"));
-        let preview = m.text.replace('\n', " ↵ ");
-        table.add_row(vec![seq, ack, time, sender, preview]);
-    }
-    table.print();
-    println!();
-}
-
-/// Pretty-print two-way conversation turns (`conversation` and `search`).
-pub fn print_conversation_pretty(
-    target: &str,
-    query: Option<&str>,
-    turns: &[ConversationTurnView],
-) {
-    if turns.is_empty() {
-        println!("  {}", dim("No conversation turns matched."));
-        return;
-    }
-    let header = match query {
-        Some(q) => format!("Search \"{q}\" · {target} ({} turns)", turns.len()),
-        None => format!("Conversation · {target} ({} turns)", turns.len()),
-    };
-    println!("\n  {}\n", bold_cyan(&header));
-    for turn in turns {
-        let ts = dim(&turn
-            .timestamp_ms
-            .map_or_else(|| "unknown".into(), format_timestamp_ms));
-        let dir = if turn.direction == "out" {
-            bold_green("→ out")
-        } else {
-            cyan("← in ")
-        };
-        let route = format!("{} {} {}", bold(&turn.from), dim("→"), bold(&turn.to));
-        let id = dim(&format!("[{}]", turn.id));
-        println!("  [#{}] {ts}  {dir}  {route}  {id}", turn.seq);
-        for line in turn.text.lines() {
-            println!("      {line}");
-        }
-        println!();
-    }
 }
 
 #[cfg(test)]
