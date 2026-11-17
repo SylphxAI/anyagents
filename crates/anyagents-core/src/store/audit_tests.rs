@@ -97,7 +97,11 @@ fn upgrading_moves_search_out_of_state_keeping_tool_summaries_and_outbound_order
                     ('out_old1', 'agt_old', 'veteran', 'out', 'agent:veteran', 'peer', 2, 'h',
                      'legacyoutboundneedle', 'message', '', 7, 2),
                     ('tool_old1', 'agt_old', 'veteran', 'out', 'agent:veteran', 'tool:bash', 3,
-                     'h', '[tool:bash] legacytoolneedle', 'tool', 'bash', 1, 2);";
+                     'h', '[tool:bash] legacytoolneedle', 'tool', 'bash', 1, 2);
+         INSERT INTO rag_chunks_fts (chunk_id, agent_name, sender, destination, kind, tool_name,
+                 text, search_tokens)
+             SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text, text
+             FROM rag_chunks;";
     conn.execute_batch(
         &fixture
             .replace("agt_old", old.as_str())
@@ -107,21 +111,35 @@ fn upgrading_moves_search_out_of_state_keeping_tool_summaries_and_outbound_order
     drop(conn);
 
     let store = Store::open(&path).unwrap();
-    for table in ["rag_chunks", "rag_chunks_fts"] {
-        let present: bool = store
+    let in_state = |table: &str| -> bool {
+        store
             .conn()
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+                "SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE name = ?1)",
                 [table],
                 |r| r.get(0),
             )
-            .unwrap();
-        assert!(!present, "{table} left in state");
+            .unwrap()
+    };
+    for table in ["rag_chunks", "rag_chunks_fts"] {
+        assert!(!in_state(table), "{table} left in state");
     }
     assert_eq!(
         store.memory_index_path(),
         dir.path().join("memory-index.db")
     );
+    // Opening only renamed the old tables (their pages are not visited before
+    // the server answers); they are dismantled afterwards, and the outbound
+    // turn's position is read from its retired chunk until it is moved.
+    super::retired_search::finish(&mut store.shared.writer()).unwrap();
+    for table in [
+        "retired_rag_chunks",
+        "retired_rag_chunks_fts",
+        "retired_rag_chunks_fts_data",
+        "retired_rag_chunks_fts_content",
+    ] {
+        assert!(!in_state(table), "{table} left in state");
+    }
     // The mailbox is re-projected in full (the legacy prefix is gone), the
     // tool summary is kept, and the outbound turn keeps its position.
     assert_eq!(count(&store, "rag_chunks"), 3);
@@ -1364,4 +1382,45 @@ fn fts_chunk_lookup_intersects_composite_tokens_and_handles_shared_prefix_upsert
         )
         .unwrap();
     assert_eq!(after_remove, 0);
+}
+
+#[test]
+fn redaction_waits_for_retired_search_tables_to_be_dismantled() {
+    use crate::redaction::{Actor, Request};
+    let (_dir, store, agent) = setup();
+    let ReceiveOutcome::New(message) = store
+        .receive(&agent.id, Incoming::new("retiredcanary body"))
+        .unwrap()
+    else {
+        panic!("new message expected");
+    };
+    let id = message.id.to_string();
+    store.set_agent_state(&agent.id, "archived").unwrap();
+    let request = Request {
+        message_id: Some(id),
+        seq: None,
+        span: None,
+        reason: "remove".into(),
+    };
+    // A retired copy of mailbox bodies is still in state: nothing is erased.
+    store
+        .conn()
+        .execute_batch("CREATE TABLE retired_rag_chunks (chunk_id TEXT PRIMARY KEY, text TEXT)")
+        .unwrap();
+    let error = store
+        .redact_conversation(Actor::Operator, &agent.id, &request)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("pre-split search tables"),
+        "{error:?}"
+    );
+    assert_eq!(count(&store, "conversation_redactions"), 0);
+    store
+        .conn()
+        .execute_batch("DROP TABLE retired_rag_chunks")
+        .unwrap();
+    store
+        .redact_conversation(Actor::Operator, &agent.id, &request)
+        .unwrap();
+    assert_eq!(count(&store, "conversation_redactions"), 1);
 }
