@@ -15875,7 +15875,7 @@ Connection: close
         let tpl = resolve_archetype_template_with_ancestors(
             "general",
             Some(&child_wd),
-            &[parent_wd.clone()],
+            std::slice::from_ref(&parent_wd),
             &data_dir,
         )
         .unwrap()
