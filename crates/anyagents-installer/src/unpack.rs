@@ -174,9 +174,10 @@ fn unpack_zip(artifact: &Path, strip: usize, dest: &Path) -> Result<(), InstallE
     let mut archive = zip::ZipArchive::new(file).map_err(unpack_error)?;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(unpack_error)?;
+        let name = entry.name().map_err(unpack_error)?.into_owned();
         let path = entry
             .enclosed_name()
-            .ok_or_else(|| unpack_error(format!("entry escapes: {}", entry.name())))?;
+            .ok_or_else(|| unpack_error(format!("entry escapes: {name}")))?;
         let Some(relative) = stripped(&path, strip)? else {
             continue;
         };
@@ -280,6 +281,50 @@ pub(crate) mod tests {
         let dest = dir.path().join("out");
         unpack(&artifact, Format::Zip, 1, &dest, "").unwrap();
         assert_eq!(std::fs::read(dest.join("tool")).unwrap(), b"bin");
+    }
+
+    #[test]
+    fn a_zip_with_a_traversing_entry_is_refused_without_outside_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("a.zip");
+        std::fs::write(&artifact, zip(&[("../outside", b"bad", 0o644)])).unwrap();
+        let dest = dir.path().join("out");
+        assert!(matches!(
+            unpack(&artifact, Format::Zip, 0, &dest, ""),
+            Err(InstallError::Unpack(_))
+        ));
+        assert!(!dir.path().join("outside").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zip_symlinks_preserve_contained_targets_but_refuse_escapes() {
+        for (link, allowed) in [("tool", true), ("../../outside", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let artifact = dir.path().join("a.zip");
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            writer
+                .add_symlink(
+                    "package/link",
+                    link,
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            std::fs::write(&artifact, writer.finish().unwrap().into_inner()).unwrap();
+            let dest = dir.path().join("out");
+            let result = unpack(&artifact, Format::Zip, 1, &dest, "");
+            if allowed {
+                result.unwrap();
+                assert_eq!(
+                    std::fs::read_link(dest.join("link")).unwrap(),
+                    Path::new(link)
+                );
+            } else {
+                assert!(matches!(result, Err(InstallError::Unpack(_))));
+                assert!(!dest.join("link").is_symlink());
+            }
+            assert!(!dir.path().join("outside").exists());
+        }
     }
 
     #[test]
