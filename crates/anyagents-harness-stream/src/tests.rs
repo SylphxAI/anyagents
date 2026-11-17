@@ -2754,6 +2754,51 @@ fn quota_of_parses_rfc3339_resets_at_timestamp() {
     assert_eq!(super::quota_of(&offset_ev), Some(1_794_787_200_250));
 }
 
+#[test]
+fn quota_of_reads_multi_day_waits_and_object_errors() {
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let wait = |ms: i64| ms - before;
+    let agy = serde_json::json!({
+        "event": "result",
+        "result": {"status": "ERROR", "error": "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 86h43m28s."}
+    });
+    let reset = super::quota_of(&agy).expect("86h43m28s names a reset");
+    let expected = ((86 * 60 + 43) * 60 + 28) * 1_000;
+    assert!(
+        (expected..expected + 5_000).contains(&wait(reset)),
+        "{reset}"
+    );
+
+    let object = serde_json::json!({
+        "type": "result",
+        "is_error": true,
+        "error": {"code": "RESOURCE_EXHAUSTED", "message": "Quota exhausted. Resets in 3d14h."}
+    });
+    let reset = super::quota_of(&object).expect("an object error's message names a reset");
+    let expected = (3 * 24 + 14) * 3_600_000;
+    assert!(
+        (expected..expected + 5_000).contains(&wait(reset)),
+        "{reset}"
+    );
+
+    let nested = serde_json::json!({
+        "event": "result",
+        "result": {"status": "ERROR", "error": {"message": "Resets in 45m12s"}}
+    });
+    let reset = super::quota_of(&nested).expect("a result error object names a reset");
+    let expected = (45 * 60 + 12) * 1_000;
+    assert!(
+        (expected..expected + 5_000).contains(&wait(reset)),
+        "{reset}"
+    );
+
+    let plain = serde_json::json!({"type": "result", "error": {"message": "quota exhausted"}});
+    assert_eq!(super::quota_of(&plain), None);
+}
+
 /// A language server for one cascade, as `agy` 1.5.8 answers the requests
 /// the adapter makes: `GetAllCascadeTrajectories` with the cascade's run
 /// status, its planner config, and `SendUserCascadeMessage`, which writes the
