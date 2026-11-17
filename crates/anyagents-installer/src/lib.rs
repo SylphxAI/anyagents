@@ -36,22 +36,18 @@ pub enum AuthMode {
 /// A subscription whose terms have not been read is not offered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Combination {
-    /// Valid. Subscription names the vendor models it covers.
+    /// The authentication mode is configured; model availability is upstream-owned.
     Allowed,
     /// The vendor's terms were not read, so only an API key is offered.
     TermsUnread,
-    /// A subscription does not cover this model.
-    ModelNotCovered,
 }
 
-pub fn combination(entry: &CatalogEntry, model: &str, auth: AuthMode) -> Combination {
+/// Model IDs are opaque and never used to restrict an authentication mode.
+pub fn combination(entry: &CatalogEntry, _model: &str, auth: AuthMode) -> Combination {
     match auth {
         AuthMode::ApiKey => Combination::Allowed,
         AuthMode::Subscription if entry.subscription.source.is_empty() => Combination::TermsUnread,
-        AuthMode::Subscription if entry.subscription.models.iter().any(|m| m == model) => {
-            Combination::Allowed
-        }
-        AuthMode::Subscription => Combination::ModelNotCovered,
+        AuthMode::Subscription => Combination::Allowed,
     }
 }
 
@@ -341,33 +337,48 @@ mod tests {
     }
 
     #[test]
-    fn an_unread_subscription_is_not_offered() {
-        let entry = catalog()
-            .into_iter()
-            .find(|e| e.id == "claude-code")
-            .unwrap();
-        assert_eq!(
-            combination(&entry, "claude-opus", AuthMode::Subscription),
-            Combination::TermsUnread
-        );
-        assert_eq!(
-            combination(&entry, "anything", AuthMode::ApiKey),
-            Combination::Allowed
-        );
-    }
-
-    #[test]
-    fn a_read_subscription_covers_only_its_own_models() {
-        let mut entry = catalog().into_iter().find(|e| e.id == "codex").unwrap();
-        entry.subscription.source = "vendor terms, read".to_string();
-        assert_eq!(
-            combination(&entry, "gpt", AuthMode::Subscription),
-            Combination::Allowed
-        );
-        assert_eq!(
-            combination(&entry, "claude-opus", AuthMode::Subscription),
-            Combination::ModelNotCovered
-        );
+    fn opaque_model_ids_do_not_change_authentication_eligibility() {
+        for mut entry in catalog() {
+            for model in [
+                "gpt-6.2-sol",
+                "gpt-6.2-astra",
+                "unknown-model",
+                "future-vendor/arbitrary-model#future-effort",
+                "sylphx/future-vendor/new-model#max",
+            ] {
+                assert_eq!(
+                    combination(&entry, model, AuthMode::ApiKey),
+                    Combination::Allowed,
+                    "{}: {model}",
+                    entry.id
+                );
+                let expected = if entry.subscription.source.is_empty() {
+                    Combination::TermsUnread
+                } else {
+                    Combination::Allowed
+                };
+                assert_eq!(
+                    combination(&entry, model, AuthMode::Subscription),
+                    expected,
+                    "{}: {model}",
+                    entry.id
+                );
+            }
+            entry.subscription.source = "vendor terms, read".into();
+            assert_eq!(
+                combination(&entry, "not-in-any-static-catalog", AuthMode::Subscription),
+                Combination::Allowed,
+                "{}",
+                entry.id
+            );
+            entry.subscription.source.clear();
+            assert_eq!(
+                combination(&entry, "not-in-any-static-catalog", AuthMode::Subscription),
+                Combination::TermsUnread,
+                "{}",
+                entry.id
+            );
+        }
     }
 
     #[test]

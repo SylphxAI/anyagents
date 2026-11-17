@@ -144,7 +144,6 @@ fn make_entry(
         sign_in_command: sign_in_command.into_iter().map(str::to_string).collect(),
         api_key_variable: None,
         subscription: SubscriptionTerms {
-            models: Vec::new(),
             source: String::new(),
         },
         source,

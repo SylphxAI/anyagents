@@ -16,11 +16,9 @@ use crate::unpack::Format;
 /// The caller-owned override file, relative to the data directory.
 pub const OVERRIDES: &str = "harnesses.toml";
 
-/// Which models a subscription on this harness may run, and where that was read.
+/// Where subscription authentication terms were read. Model availability is upstream-owned.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionTerms {
-    /// The models the vendor's own terms allow under a subscription.
-    pub models: Vec<String>,
     /// Where the terms were read. Empty means unread: offer an API key only.
     pub source: String,
 }
@@ -97,7 +95,6 @@ struct Spec<'a> {
     id: &'a str,
     sign_in: &'a [&'a str],
     api_key: Option<&'a str>,
-    models: &'a [&'a str],
     terms: &'a str,
     source: Source,
     launcher: &'a str,
@@ -111,7 +108,6 @@ fn harness(spec: Spec<'_>) -> CatalogEntry {
         sign_in_command: strings(spec.sign_in),
         api_key_variable: spec.api_key.map(str::to_string),
         subscription: SubscriptionTerms {
-            models: strings(spec.models),
             source: spec.terms.to_string(),
         },
         source: spec.source,
@@ -143,12 +139,11 @@ fn npm_tree(package: &str) -> Source {
 
 /// The harness catalog shipped with the binary.
 pub fn builtin_catalog() -> Vec<CatalogEntry> {
-    let cloud = |id: &str, sign_in: &[&str], key: &str, models: &[&str], terms: &str| {
+    let cloud = |id: &str, sign_in: &[&str], key: &str, terms: &str| {
         harness(Spec {
             id,
             sign_in,
             api_key: Some(key),
-            models,
             terms,
             source: Source::Builtin,
             launcher: "",
@@ -161,7 +156,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             id: "spiron",
             sign_in: &["spiron", "login"],
             api_key: Some("SYLPHX_API_KEY"),
-            models: &[],
             terms: "",
             source: Source::Unconfigured,
             launcher: "spiron",
@@ -172,7 +166,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             id: "claude-code",
             sign_in: &["claude", "auth", "login"],
             api_key: Some("ANTHROPIC_API_KEY"),
-            models: &["claude-opus", "claude-sonnet"],
             terms: "",
             source: npm(
                 "@anthropic-ai/claude-code",
@@ -186,7 +179,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             id: "codex",
             sign_in: &["codex", "login"],
             api_key: Some("OPENAI_API_KEY"),
-            models: &["gpt", "gpt-6.2-sol", "gpt-6.2-astra"],
             terms: "",
             source: npm("@openai/codex", Some("@openai/codex-{os}-{cpu}")),
             launcher: "node_modules/@openai/codex-{os}-{cpu}/vendor/{target}/bin/codex",
@@ -197,7 +189,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             id: "opencode",
             sign_in: &["opencode", "auth", "login"],
             api_key: Some("OPENAI_API_KEY"),
-            models: &[],
             terms: "",
             source: npm("opencode-ai", Some("opencode-{os}-{cpu}")),
             launcher: "node_modules/opencode-{os}-{cpu}/bin/opencode",
@@ -211,7 +202,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             id: "agy",
             sign_in: &["agy", "--print", "reply with the word signed-in"],
             api_key: Some("ANTIGRAVITY_API_KEY"),
-            models: &["gemini"],
             terms: "",
             source: Source::Unconfigured,
             launcher: "agy",
@@ -222,7 +212,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             id: "muse",
             sign_in: &["muse", "login"],
             api_key: Some("META_API_KEY"),
-            models: &["muse-wonder-full-1.0"],
             terms: "",
             source: Source::Unconfigured,
             launcher: "muse",
@@ -233,7 +222,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             id: "omp",
             sign_in: &["omp", "login"],
             api_key: Some("OPENAI_API_KEY"),
-            models: &[],
             terms: "",
             source: npm_tree("@oh-my-pi/pi-coding-agent"),
             launcher: "node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
@@ -244,7 +232,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             id: "dsh",
             sign_in: &["dsh", "--profile", "web"],
             api_key: Some("DEEPSEEK_API_KEY"),
-            models: &["deepseek-v3.2-exp-think"],
             terms: "",
             source: npm_tree("@deepseek-ai/dsh"),
             launcher: "node_modules/@deepseek-ai/dsh/lib/bin.js",
@@ -255,7 +242,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             id: "grok",
             sign_in: &["grok", "login"],
             api_key: Some("XAI_API_KEY"),
-            models: &["grok-4.20"],
             terms: "",
             source: Source::Unconfigured,
             launcher: "grok",
@@ -266,40 +252,24 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             "spiron-cloud",
             &["spiron", "login"],
             "SYLPHX_API_KEY",
-            &[
-                "claude-opus-4.6",
-                "claude-sonnet-4.6",
-                "gpt-5.4",
-                "gpt-6.2-sol",
-                "gpt-6.2-astra",
-            ],
             "https://sylphx.com/terms",
         ),
         cloud(
             "claude-cloud",
             &["claude", "auth", "login"],
             "ANTHROPIC_API_KEY",
-            &["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
             "https://www.anthropic.com/legal/consumer-terms",
         ),
         cloud(
             "openai-cloud",
             &["codex", "login"],
             "OPENAI_API_KEY",
-            &[
-                "gpt-5.4",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex",
-                "gpt-6.2-sol",
-                "gpt-6.2-astra",
-            ],
             "https://openai.com/policies/row-terms-of-use/",
         ),
         cloud(
             "cursor-cloud",
             &["cursor", "login"],
             "CURSOR_API_KEY",
-            &["claude-4.6-opus", "gpt-5.4"],
             "https://www.cursor.com/terms-of-service",
         ),
     ]
@@ -311,7 +281,6 @@ fn runtime(id: &str, source: Source, launcher: &str) -> CatalogEntry {
         sign_in_command: Vec::new(),
         api_key_variable: None,
         subscription: SubscriptionTerms {
-            models: Vec::new(),
             source: String::new(),
         },
         source,
@@ -537,22 +506,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sol_and_astra_are_discoverable_without_removing_existing_models() {
-        let catalog = Catalog::builtin();
-        for (id, legacy) in [
-            ("codex", "gpt"),
-            ("openai-cloud", "gpt-5.4"),
-            ("spiron-cloud", "gpt-5.4"),
-        ] {
-            let entry = catalog.get(id).unwrap();
-            for model in ["gpt-6.2-sol", "gpt-6.2-astra", legacy] {
-                assert!(
-                    entry.subscription.models.iter().any(|m| m == model),
-                    "{id}: {model}"
-                );
-            }
-        }
-        assert!(catalog.get("unknown-model").is_none());
+    fn legacy_model_lists_are_ignored_without_losing_authentication_terms() {
+        let terms: SubscriptionTerms = toml::from_str(
+            r#"models = ["legacy-only-model"]
+source = "vendor terms, read""#,
+        )
+        .unwrap();
+        assert_eq!(terms.source, "vendor terms, read");
+        let serialized = toml::to_string(&terms).unwrap();
+        assert!(!serialized.contains("models"), "{serialized}");
     }
 
     #[test]
@@ -575,7 +537,7 @@ mod tests {
             .apply(
                 r#"
 [harness.grok]
-source = { kind = "local", version = "1.0.0", path = "/opt/x/grok", sha256 = "aa" }
+source = { kind = "local", version = "1.0.0", path = "/optgrok", sha256 = "aa" }
 
 [harness.newtool]
 source = { kind = "pinned", version = "2", artifacts = { linux-x64 = { url = "https://x/{version}", sha256 = "bb" } } }
