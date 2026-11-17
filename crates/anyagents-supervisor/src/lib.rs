@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use anyagents_agent::recovery_outbound;
 use anyagents_agent::{DeliveryLoop, RunOutcome};
@@ -407,7 +407,11 @@ pub struct LiveState {
 #[derive(Clone, Default)]
 pub struct HealthBoard {
     inner: Arc<Mutex<HashMap<AgentId, LiveState>>>,
+    wake_stop: Arc<Mutex<Option<WakeStop>>>,
 }
+
+type WakeStop =
+    Arc<dyn Fn(&AgentId, &str, Duration, &AtomicBool) -> Result<(), String> + Send + Sync>;
 
 impl HealthBoard {
     pub fn publish(&self, id: &AgentId, state: LiveState) {
@@ -417,6 +421,47 @@ impl HealthBoard {
     pub fn get(&self, id: &AgentId) -> Option<LiveState> {
         lock(&self.inner).get(id).cloned()
     }
+
+    /// Clear only the stopped fault the caller explicitly retried. The caller
+    /// has waited for stop_for_wake and holds both lifecycle and process locks.
+    pub fn clear_wake_fault(&self, id: &AgentId, expected: &str) -> Result<(), String> {
+        let mut board = lock(&self.inner);
+        let live = board
+            .get_mut(id)
+            .ok_or("agent fault disappeared during wake recovery")?;
+        if live.process_alive || live.last_error.as_deref() != Some(expected) {
+            return Err("agent fault or process changed during wake recovery".into());
+        }
+        live.last_error = None;
+        live.restart_at_ms = None;
+        Ok(())
+    }
+
+    /// Quiesce every old worker before an explicitly authorized fault retry.
+    /// Success acknowledges retirement/proof commit and final publication, not
+    /// just an available process lock. The caller holds the lifecycle lock,
+    /// then acquires process custody before clearing the expected fault.
+    pub fn stop_for_wake(
+        &self,
+        id: &AgentId,
+        expected: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.stop_for_wake_cancellable(id, expected, timeout, &AtomicBool::new(false))
+    }
+
+    pub fn stop_for_wake_cancellable(
+        &self,
+        id: &AgentId,
+        expected: &str,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<(), String> {
+        let stop = lock(&self.wake_stop)
+            .clone()
+            .ok_or("wake recovery requires a live supervisor")?;
+        stop(id, expected, timeout, cancelled)
+    }
 }
 
 struct Slot {
@@ -425,8 +470,35 @@ struct Slot {
     /// Set before `woken` when the agent row changed: the worker reads the
     /// row again instead of on every pass.
     agent_changed: Arc<AtomicBool>,
-    done: Arc<Finished>,
+    done: Arc<WorkerExit>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// Kept independently of the workers map: `ensure` can reap a stopping
+/// generation while it still owns a process or owes a final publication.
+#[derive(Default)]
+struct WorkerExit {
+    finished: Finished,
+    wake_stop: AtomicBool,
+    retirement: Mutex<Option<Result<(), String>>>,
+    unchecked_retirement: AtomicBool,
+}
+
+impl WorkerExit {
+    fn is_set(&self) -> bool {
+        self.finished.is_set()
+    }
+    fn wait(&self, timeout: Duration) -> bool {
+        self.finished.wait(timeout)
+    }
+}
+
+struct FinishWorker(Arc<WorkerExit>);
+
+impl Drop for FinishWorker {
+    fn drop(&mut self) {
+        self.0.finished.set();
+    }
 }
 
 /// Set once when a worker thread has returned; a stopper waits on it instead
@@ -461,7 +533,7 @@ impl Finished {
 #[cfg(test)]
 type IdleReleaseHook = Arc<dyn Fn(&AgentId) + Send + Sync>;
 
-struct Inner<H> {
+struct Inner<H: Harness> {
     store: Arc<Store>,
     clock: Arc<dyn Clock>,
     launch: Launch<H>,
@@ -473,8 +545,31 @@ struct Inner<H> {
     /// processes to the next kernel instead of ending them.
     retain: AtomicBool,
     workers: Mutex<HashMap<AgentId, Slot>>,
+    exits: Mutex<HashMap<AgentId, Vec<Arc<WorkerExit>>>>,
+    quarantine: Mutex<Vec<Quarantined<H>>>,
     #[cfg(test)]
     idle_release_hook: Option<IdleReleaseHook>,
+}
+
+/// A failed retirement still owns both the delivery proofs and the process
+/// lock. Never replace a different generation's custody. If the last supervisor
+/// owner disappears, preserve these resources for the rest of this process:
+/// dropping an unchecked harness/lock would assert retirement without evidence.
+struct Quarantined<H: Harness> {
+    generation: Arc<WorkerExit>,
+    delivery: Option<DeliveryLoop<H>>,
+    host_lock: Option<Arc<AgentLock>>,
+}
+
+impl<H: Harness> Drop for Quarantined<H> {
+    fn drop(&mut self) {
+        if let Some(delivery) = self.delivery.take() {
+            std::mem::forget(delivery);
+        }
+        if let Some(host_lock) = self.host_lock.take() {
+            std::mem::forget(host_lock);
+        }
+    }
 }
 
 /// Keeps one harness process alive for every agent in state `running`.
@@ -523,9 +618,16 @@ impl<H: Harness + 'static> Supervisor<H> {
             stop: AtomicBool::new(false),
             retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
+            exits: Mutex::new(HashMap::new()),
+            quarantine: Mutex::new(Vec::new()),
             #[cfg(test)]
             idle_release_hook: None,
         });
+        let weak = Arc::downgrade(&inner);
+        *lock(&inner.board.wake_stop) = Some(Arc::new(move |id, expected, timeout, cancelled| {
+            let inner = weak.upgrade().ok_or("supervisor stopped")?;
+            stop_for_wake(&inner, id, expected, timeout, cancelled)
+        }));
         let (wake_path, listener) = bind_wake(&inner)?;
         let events = store.subscribe();
         let router_inner = Arc::clone(&inner);
@@ -751,9 +853,174 @@ fn is_running(store: &Store, id: &AgentId) -> bool {
     store.agent(id).is_ok_and(|agent| agent.state == "running")
 }
 
+/// Register retirement intent before pausing or signaling any worker. No
+/// wait holds `workers`: an exiting worker may need it for its idle recheck.
+fn stop_for_wake<H: Harness + 'static>(
+    inner: &Arc<Inner<H>>,
+    id: &AgentId,
+    expected: &str,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let generations = {
+        let workers = lock(&inner.workers);
+        if cancelled.load(Ordering::SeqCst) {
+            return Err("wake recovery cancelled".into());
+        }
+        if inner.stop.load(Ordering::SeqCst) || inner.retain.load(Ordering::SeqCst) {
+            return Err("supervisor is stopping or transferring custody".into());
+        }
+        if inner
+            .board
+            .get(id)
+            .and_then(|live| live.last_error)
+            .as_deref()
+            != Some(expected)
+        {
+            return Err("agent fault changed before wake recovery".into());
+        }
+        let generations: Vec<_> = lock(&inner.exits)
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter(|exit| !exit.is_set() || exit.wake_stop.load(Ordering::SeqCst))
+            .cloned()
+            .collect();
+        if generations.is_empty() {
+            return Err("no worker generation can acknowledge retirement".into());
+        }
+        inner
+            .store
+            .set_agent_state(id, "paused")
+            .map_err(|err| err.to_string())?;
+        for exit in &generations {
+            exit.wake_stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(slot) = workers.get(id) {
+            slot.stop.store(true, Ordering::SeqCst);
+            inner.clock.wake(&slot.woken);
+        }
+        generations
+    };
+    for exit in generations {
+        while !exit.is_set() {
+            if cancelled.load(Ordering::SeqCst) {
+                return Err("wake recovery cancelled; agent remains paused".into());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(
+                    "timed out waiting for wake recovery retirement; agent remains paused".into(),
+                );
+            }
+            exit.wait(remaining.min(Duration::from_millis(10)));
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            return Err("wake recovery cancelled; agent remains paused".into());
+        }
+        // A previous refused wake retains this exact generation. Retry it,
+        // never a newer worker or another agent's harness.
+        let mut quarantine = lock(&inner.quarantine);
+        if let Some(index) = quarantine
+            .iter()
+            .position(|held| Arc::ptr_eq(&held.generation, &exit))
+        {
+            let held = &mut quarantine[index];
+            let result = held
+                .delivery
+                .as_mut()
+                .expect("quarantined delivery")
+                .retire_harness_verified()
+                .map(|_| ())
+                .map_err(|err| err.to_string());
+            if result.is_ok() {
+                drop(held.delivery.take());
+                drop(held.host_lock.take());
+                quarantine.remove(index);
+            }
+            *lock(&exit.retirement) = Some(result);
+        }
+        drop(quarantine);
+        match lock(&exit.retirement).as_ref() {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Err(format!("wake recovery retirement: {error}")),
+            None => {
+                return Err("worker ended without acknowledging wake recovery retirement".into());
+            }
+        }
+    }
+    // Registration and generic stop publications take this same lock. The
+    // paused row excludes fresh workers, including queued stale running events.
+    let _workers = lock(&inner.workers);
+    if cancelled.load(Ordering::SeqCst) {
+        return Err("wake recovery cancelled; agent remains paused".into());
+    }
+    if inner.stop.load(Ordering::SeqCst) || inner.retain.load(Ordering::SeqCst) {
+        return Err("supervisor is stopping or transferring custody".into());
+    }
+    if lock(&inner.exits)
+        .get(id)
+        .is_some_and(|exits| exits.iter().any(|exit| !exit.is_set()))
+    {
+        return Err("another worker is still stopping".into());
+    }
+    if inner
+        .board
+        .get(id)
+        .and_then(|live| live.last_error)
+        .as_deref()
+        != Some(expected)
+    {
+        return Err("agent fault changed during wake recovery".into());
+    }
+    if let Some(exits) = lock(&inner.exits).get_mut(id) {
+        exits.retain(|exit| !exit.is_set() || !matches!(*lock(&exit.retirement), Some(Ok(()))));
+    }
+    let mut board = lock(&inner.board.inner);
+    let live = board
+        .get_mut(id)
+        .ok_or("agent fault disappeared during wake recovery")?;
+    live.process_alive = false;
+    live.turn_state = TurnState::Idle;
+    live.delivery = None;
+    live.pid = None;
+    live.live_harness = None;
+    live.live_model = None;
+    live.process_started_at_ms = None;
+    Ok(())
+}
+
 fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {
     let done = {
         let mut workers = lock(&inner.workers);
+        // A queued pause can arrive after an explicit wake resumed. Read
+        // under the same coordination used to register worker generations.
+        if is_running(&inner.store, id) {
+            return;
+        }
+        let recovering = lock(&inner.exits).get(id).is_some_and(|exits| {
+            exits
+                .iter()
+                .any(|exit| exit.wake_stop.load(Ordering::SeqCst))
+        });
+        if !recovering && inner.store.agent(id).is_ok() {
+            inner.board.publish(
+                id,
+                LiveState {
+                    process_alive: false,
+                    turn_state: TurnState::Idle,
+                    delivery: None,
+                    quota_reset_at_ms: None,
+                    restart_at_ms: None,
+                    pid: None,
+                    live_harness: None,
+                    live_model: None,
+                    process_started_at_ms: None,
+                    last_error: None,
+                },
+            );
+        }
         if let Some(slot) = workers.get_mut(id) {
             slot.stop.store(true, Ordering::SeqCst);
             inner.clock.wake(&slot.woken);
@@ -762,23 +1029,6 @@ fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {
             None
         }
     };
-    if inner.store.agent(id).is_ok() {
-        inner.board.publish(
-            id,
-            LiveState {
-                process_alive: false,
-                turn_state: TurnState::Idle,
-                delivery: None,
-                quota_reset_at_ms: None,
-                restart_at_ms: None,
-                pid: None,
-                live_harness: None,
-                live_model: None,
-                process_started_at_ms: None,
-                last_error: None,
-            },
-        );
-    }
     if let Some(done) = done {
         done.wait(Duration::from_millis(250));
         let finished_thread = {
@@ -828,28 +1078,37 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
         }
     }
     let mut workers = lock(&inner.workers);
-    if workers.contains_key(&id) {
+    if workers.contains_key(&id) || !is_running(&inner.store, &id) {
         return;
     }
     let stop = Arc::new(AtomicBool::new(false));
     let woken = Arc::new(AtomicBool::new(false));
     let agent_changed = Arc::new(AtomicBool::new(true));
-    let done = Arc::new(Finished::default());
+    let done = Arc::new(WorkerExit::default());
+    {
+        let mut exits = lock(&inner.exits);
+        let generations = exits.entry(id.clone()).or_default();
+        generations.retain(|exit| !exit.is_set() || exit.wake_stop.load(Ordering::SeqCst));
+        generations.push(Arc::clone(&done));
+    }
     let run_inner = Arc::clone(inner);
     let run_id = id.clone();
     let signals = Signals {
         stop: Arc::clone(&stop),
         woken: Arc::clone(&woken),
         agent_changed: Arc::clone(&agent_changed),
+        exit: Arc::clone(&done),
     };
     let run_done = Arc::clone(&done);
     let thread = thread::Builder::new()
         .name("anyagents-agent".into())
         .spawn(move || {
+            let _finished = FinishWorker(run_done);
             let _ = run_agent(run_inner, run_id, signals);
-            run_done.set();
         });
     let Ok(thread) = thread else {
+        *lock(&done.retirement) = Some(Ok(())); // no worker or process was launched
+        done.finished.set();
         return;
     };
     workers.insert(
@@ -873,6 +1132,7 @@ enum Boot<H: Harness> {
 
 /// The flags a worker shares with the router.
 struct Signals {
+    exit: Arc<WorkerExit>,
     stop: Arc<AtomicBool>,
     woken: Arc<AtomicBool>,
     agent_changed: Arc<AtomicBool>,
@@ -882,6 +1142,7 @@ impl Signals {
     #[cfg(test)]
     fn detached() -> Self {
         Self {
+            exit: Arc::new(WorkerExit::default()),
             stop: Arc::new(AtomicBool::new(false)),
             woken: Arc::new(AtomicBool::new(false)),
             agent_changed: Arc::new(AtomicBool::new(true)),
@@ -894,7 +1155,25 @@ fn run_agent<H: Harness + 'static>(inner: Arc<Inner<H>>, id: AgentId, signals: S
         return false;
     };
     let notify = activity_notify(Arc::clone(&inner.clock), Arc::clone(&signals.woken));
-    Session::new(inner, agent, notify, signals).run()
+    let mut session = Session::new(inner, agent, notify, signals);
+    let idle_released = session.run();
+    // Serialize final wake check/publication/completion with stop requests and
+    // generation registration. A stopper cannot miss a late final publisher.
+    let final_inner = Arc::clone(&session.inner);
+    let _workers = lock(&final_inner.workers);
+    if session.exit.wake_stop.load(Ordering::SeqCst) && lock(&session.exit.retirement).is_none() {
+        session.end_delivery();
+    }
+    session.publish();
+    if let Some(delivery) = session.delivery.take() {
+        lock(&final_inner.quarantine).push(Quarantined {
+            generation: Arc::clone(&session.exit),
+            delivery: Some(delivery),
+            host_lock: session.host_lock.take(),
+        });
+    }
+    session.exit.finished.set();
+    idle_released
 }
 
 struct AgentPaths {
@@ -925,6 +1204,7 @@ fn activity_notify(clock: Arc<dyn Clock>, woken: Arc<AtomicBool>) -> Arc<dyn Fn(
 }
 
 struct Session<H: Harness> {
+    exit: Arc<WorkerExit>,
     inner: Arc<Inner<H>>,
     id: AgentId,
     agent: Agent,
@@ -1013,6 +1293,7 @@ impl<H: Harness + 'static> Session<H> {
             paths,
             notify,
             stop: signals.stop,
+            exit: signals.exit,
             woken: signals.woken,
             agent_changed: signals.agent_changed,
             configured: None,
@@ -1145,6 +1426,32 @@ impl<H: Harness + 'static> Session<H> {
     /// The worker stops: its process ends with it, or, while the kernel
     /// stops with [`Supervisor::retain_processes`], is left to the next one.
     fn end_delivery(&mut self) {
+        if self.exit.wake_stop.load(Ordering::SeqCst) {
+            if let Some(delivery) = &self.delivery {
+                self.last_error = delivery
+                    .harness()
+                    .health()
+                    .sign_in_fault
+                    .or_else(|| delivery.harness().exit_diagnostic())
+                    .or_else(|| self.last_error.clone());
+            }
+            let result = if self.exit.unchecked_retirement.load(Ordering::SeqCst) {
+                Err("worker already released a process without checked retirement".into())
+            } else {
+                match self.delivery.as_mut() {
+                    Some(delivery) => delivery
+                        .retire_harness_verified()
+                        .map(|_| ())
+                        .map_err(|err| err.to_string()),
+                    None => Ok(()),
+                }
+            };
+            if result.is_ok() {
+                self.stop_delivery();
+            }
+            *lock(&self.exit.retirement) = Some(result);
+            return;
+        }
         if !self.inner.retain.load(Ordering::SeqCst) {
             self.stop_delivery();
             return;
@@ -1161,6 +1468,9 @@ impl<H: Harness + 'static> Session<H> {
 
     /// End the process and release the agent's lock.
     fn stop_delivery(&mut self) {
+        if self.delivery.is_some() && !self.exit.wake_stop.load(Ordering::SeqCst) {
+            self.exit.unchecked_retirement.store(true, Ordering::SeqCst);
+        }
         self.delivery = None;
         self.host_lock = None;
     }
@@ -1465,11 +1775,9 @@ impl<H: Harness + 'static> Session<H> {
     }
 
     fn publish(&self) {
-        let state = match self
-            .delivery
-            .as_ref()
-            .filter(|_| !self.stop.load(Ordering::SeqCst))
-        {
+        let state = match self.delivery.as_ref().filter(|_| {
+            !self.stop.load(Ordering::SeqCst) || self.exit.wake_stop.load(Ordering::SeqCst)
+        }) {
             Some(delivery) => {
                 let health = delivery.harness().health();
                 LiveState {
@@ -3090,6 +3398,8 @@ mod tests {
             stop: AtomicBool::new(false),
             retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
+            exits: Mutex::new(HashMap::new()),
+            quarantine: Mutex::new(Vec::new()),
             idle_release_hook: Some(Arc::new(move |_| {
                 at_idle_tx.send(()).unwrap();
                 lock(&resume_rx)
@@ -3209,10 +3519,7 @@ mod tests {
             .args(["-c", "sleep 30 & wait"])
             .spawn()
             .unwrap();
-        assert!(
-            proc_children(bare.id()).is_some(),
-            "this kernel exposes /proc/<pid>/task/<tid>/children"
-        );
+        let has_proc_children = proc_children(bare.id()).is_some();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while harness_inflight_processes(Some(parent.id()), &mut false).is_empty()
             && std::time::Instant::now() < deadline
@@ -3230,18 +3537,32 @@ mod tests {
             "a harness with no children has nothing in flight"
         );
         assert!(harness_inflight_processes(None, &mut scanned).is_empty());
-        assert!(
-            !scanned,
-            "the subtree read must not fall back to a full scan"
+        assert_eq!(
+            scanned, !has_proc_children,
+            "subtree read scans /proc only when /proc/<pid>/task/<tid>/children is absent"
         );
         assert_eq!(
-            proc_children(u32::MAX - 1),
-            Some(Vec::new()),
-            "a process that is gone has no children and needs no scan"
+            harness_inflight_processes_by_scan(parent.id()).len(),
+            1,
+            "fallback /proc scan finds the running child under the harness"
         );
-        let _ = Command::new("pkill")
-            .args(["-P", &parent.id().to_string()])
-            .status();
+        assert!(
+            harness_inflight_processes_by_scan(bare.id()).is_empty(),
+            "fallback /proc scan finds nothing under a bare process"
+        );
+        if has_proc_children {
+            assert_eq!(
+                proc_children(u32::MAX - 1),
+                Some(Vec::new()),
+                "a process that is gone has no children and needs no scan"
+            );
+        }
+        for child_pid in harness_inflight_processes_by_scan(parent.id()) {
+            // SAFETY: child_pid was spawned by this test's sh child above.
+            unsafe {
+                let _ = libc::kill(child_pid as i32, libc::SIGKILL);
+            }
+        }
         let _ = parent.kill();
         let _ = bare.kill();
         let _ = parent.wait();
@@ -3331,6 +3652,8 @@ mod tests {
             stop: AtomicBool::new(false),
             retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
+            exits: Mutex::new(HashMap::new()),
+            quarantine: Mutex::new(Vec::new()),
             idle_release_hook: None,
         });
         let mut session = Session::new(inner, agent.clone(), Arc::new(|| {}), Signals::detached());
@@ -3449,6 +3772,8 @@ mod persistence_tests {
             stop: AtomicBool::new(false),
             retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
+            exits: Mutex::new(HashMap::new()),
+            quarantine: Mutex::new(Vec::new()),
             idle_release_hook: None,
         });
         let delivery = DeliveryLoop::start(
@@ -3789,6 +4114,8 @@ mod persistence_tests {
             stop: AtomicBool::new(false),
             retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
+            exits: Mutex::new(HashMap::new()),
+            quarantine: Mutex::new(Vec::new()),
             idle_release_hook: None,
         });
         let mut session = Session::new(inner, agent, Arc::new(|| {}), Signals::detached());
@@ -3948,6 +4275,8 @@ mod custody_tests {
             stop: AtomicBool::new(false),
             retain: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
+            exits: Mutex::new(HashMap::new()),
+            quarantine: Mutex::new(Vec::new()),
             idle_release_hook: None,
         });
         let mut session = Session::new(inner, agent.clone(), Arc::new(|| {}), Signals::detached());
@@ -3958,5 +4287,253 @@ mod custody_tests {
             "the lock was released before the process ended"
         );
         store.try_lock_agent(&agent.id).unwrap();
+    }
+
+    struct GateHarness {
+        alive: bool,
+        allow_verified_stop: Arc<AtomicBool>,
+        stop_entered_tx: Option<std::sync::mpsc::Sender<()>>,
+        stop_release_rx: Option<Arc<Mutex<std::sync::mpsc::Receiver<()>>>>,
+        diagnostic: Option<String>,
+    }
+
+    impl Harness for GateHarness {
+        fn deliver(&mut self, _message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+            Ok(DeliverOutcome::Deferred)
+        }
+        fn stop_verified(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+            if let Some(tx) = self.stop_entered_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = &self.stop_release_rx {
+                let _ = lock(rx).recv_timeout(Duration::from_secs(5));
+            }
+            if !self.allow_verified_stop.load(Ordering::SeqCst) {
+                return Err(anyagents_harness::HarnessError::Failed(
+                    "checked harness retirement is unsupported".into(),
+                ));
+            }
+            self.alive = false;
+            Ok(())
+        }
+        fn background(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+            Ok(())
+        }
+        fn resume(&mut self, _session: &str) -> Result<(), anyagents_harness::HarnessError> {
+            Ok(())
+        }
+        fn cancel(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+            Ok(())
+        }
+        fn exit_diagnostic(&self) -> Option<String> {
+            self.diagnostic.clone()
+        }
+        fn health(&self) -> HarnessHealth {
+            HarnessHealth {
+                process_alive: self.alive,
+                turn_state: TurnState::Idle,
+                delivery: anyagents_harness::Delivery {
+                    level: anyagents_harness::DeliveryLevel::TurnEnd,
+                    idempotent: false,
+                    proof: "none".into(),
+                    peer: None,
+                },
+                quota_reset_at_ms: None,
+                sign_in_fault: None,
+            }
+        }
+    }
+
+    #[test]
+    fn stop_for_wake_fences_reaped_generation_final_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("reaped-gen", "claude-code"))
+            .unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        store
+            .set_agent_running(&agent.id, &work.display().to_string())
+            .unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let entered_slot = Mutex::new(Some(entered_tx));
+
+        let sup = Supervisor::start(
+            Arc::clone(&store),
+            Arc::new(SystemClock::new()),
+            Arc::new(move |_| {
+                Ok(GateHarness {
+                    alive: true,
+                    allow_verified_stop: Arc::new(AtomicBool::new(true)),
+                    stop_entered_tx: lock(&entered_slot).take(),
+                    stop_release_rx: Some(Arc::clone(&release_rx)),
+                    diagnostic: Some("mid-turn transport fault".into()),
+                })
+            }),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sup.live(&agent.id).and_then(|l| l.last_error).as_deref()
+            != Some("mid-turn transport fault")
+        {
+            assert!(Instant::now() < deadline, "fault never published");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let board = sup.board();
+        let agent_id = agent.id.clone();
+        let stopper = thread::spawn(move || {
+            board.stop_for_wake(
+                &agent_id,
+                "mid-turn transport fault",
+                Duration::from_secs(5),
+            )
+        });
+
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Simulate ensure() having reaped the stopping slot from inner.workers
+        // before the worker finishes retirement and final publication.
+        let reaped = lock(&sup.inner.workers).remove(&agent.id);
+        assert!(reaped.is_some(), "expected active slot to reap");
+        release_tx.send(()).unwrap();
+
+        stopper.join().unwrap().unwrap();
+        let custody = store.try_lock_agent(&agent.id).unwrap();
+        sup.board()
+            .clear_wake_fault(&agent.id, "mid-turn transport fault")
+            .unwrap();
+        drop(custody);
+        if let Some(mut slot) = reaped
+            && let Some(handle) = slot.thread.take()
+        {
+            let _ = handle.join();
+        }
+        assert_eq!(
+            sup.live(&agent.id).and_then(|l| l.last_error),
+            None,
+            "reaped generation overwrote cleared fault after stop_for_wake"
+        );
+    }
+
+    #[test]
+    fn quarantined_generation_retains_custody_across_unsupported_stop_and_owner_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("quarantine-retry", "claude-code"))
+            .unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        store
+            .set_agent_running(&agent.id, &work.display().to_string())
+            .unwrap();
+
+        let allow = Arc::new(AtomicBool::new(false));
+        let allow_launch = Arc::clone(&allow);
+        let sup = Supervisor::start(
+            Arc::clone(&store),
+            Arc::new(SystemClock::new()),
+            Arc::new(move |_| {
+                Ok(GateHarness {
+                    alive: true,
+                    allow_verified_stop: Arc::clone(&allow_launch),
+                    stop_entered_tx: None,
+                    stop_release_rx: None,
+                    diagnostic: Some("unproven adapter fault".into()),
+                })
+            }),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sup.live(&agent.id).and_then(|l| l.last_error).as_deref()
+            != Some("unproven adapter fault")
+        {
+            assert!(Instant::now() < deadline, "fault never published");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let err = sup
+            .board()
+            .stop_for_wake(&agent.id, "unproven adapter fault", Duration::from_secs(5))
+            .unwrap_err();
+        assert!(err.contains("unsupported"), "{err}");
+        assert!(
+            matches!(
+                store.try_lock_agent(&agent.id),
+                Err(anyagents_core::Error::AgentBusy)
+            ),
+            "quarantined generation must retain process lock when stop_verified fails"
+        );
+        assert_eq!(
+            sup.live(&agent.id).and_then(|l| l.last_error).as_deref(),
+            Some("unproven adapter fault")
+        );
+
+        // Retry on the exact quarantined generation once verified stop succeeds.
+        allow.store(true, Ordering::SeqCst);
+        sup.board()
+            .stop_for_wake(&agent.id, "unproven adapter fault", Duration::from_secs(5))
+            .unwrap();
+        let custody = store.try_lock_agent(&agent.id).unwrap();
+        sup.board()
+            .clear_wake_fault(&agent.id, "unproven adapter fault")
+            .unwrap();
+        drop(custody);
+        assert!(lock(&sup.inner.quarantine).is_empty());
+
+        // Subcase 2: Dropping the last Supervisor owner while quarantine holds an
+        // unproven generation retains the process lock rather than releasing it.
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2 = Arc::new(Store::open(dir2.path().join("state.db")).unwrap());
+        let agent2 = store2
+            .create_agent(NewAgent::new("quarantine-drop", "claude-code"))
+            .unwrap();
+        let work2 = dir2.path().join("work");
+        std::fs::create_dir_all(&work2).unwrap();
+        store2
+            .set_agent_running(&agent2.id, &work2.display().to_string())
+            .unwrap();
+
+        let sup2 = Supervisor::start(
+            Arc::clone(&store2),
+            Arc::new(SystemClock::new()),
+            Arc::new(move |_| {
+                Ok(GateHarness {
+                    alive: true,
+                    allow_verified_stop: Arc::new(AtomicBool::new(false)),
+                    stop_entered_tx: None,
+                    stop_release_rx: None,
+                    diagnostic: Some("drop fault".into()),
+                })
+            }),
+            Vec::new(),
+        )
+        .unwrap();
+        let deadline2 = Instant::now() + Duration::from_secs(5);
+        while sup2.live(&agent2.id).and_then(|l| l.last_error).as_deref() != Some("drop fault") {
+            assert!(Instant::now() < deadline2, "fault never published");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            sup2.board()
+                .stop_for_wake(&agent2.id, "drop fault", Duration::from_secs(5))
+                .is_err()
+        );
+        drop(sup2);
+        assert!(
+            matches!(
+                store2.try_lock_agent(&agent2.id),
+                Err(anyagents_core::Error::AgentBusy)
+            ),
+            "dropping supervisor before checked retirement must retain AgentLock custody"
+        );
     }
 }

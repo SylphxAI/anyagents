@@ -989,6 +989,16 @@ pub trait Harness: Send {
     /// still stop the process when this was never called.
     fn stop(&mut self) {}
 
+    /// Checked retirement for an explicit retry. Success means the owned
+    /// process (including descendants) has ended and all final output/proofs
+    /// have been drained. A unit-return stop or cached health is not evidence.
+    /// Unsupported adapters must leave custody unchanged and fail closed.
+    fn stop_verified(&mut self) -> Result<(), HarnessError> {
+        Err(HarnessError::Failed(
+            "checked harness retirement is unsupported".into(),
+        ))
+    }
+
     fn background(&mut self) -> Result<(), HarnessError>;
     fn resume(&mut self, session: &str) -> Result<(), HarnessError>;
     fn cancel(&mut self) -> Result<(), HarnessError>;

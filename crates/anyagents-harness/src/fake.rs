@@ -172,6 +172,11 @@ impl FakeHarness {
 }
 
 impl Harness for FakeHarness {
+    fn stop_verified(&mut self) -> Result<(), HarnessError> {
+        self.alive = false;
+        Ok(())
+    }
+
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         self.given.push(message.id.clone());
         if let Some(Proof::Taken { turn_finished }) = self.proven(&message.id) {
