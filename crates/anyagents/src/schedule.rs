@@ -40,6 +40,7 @@ pub enum WatchTarget {
         owner: String,
         repo: String,
         reference: String,
+        check_name: Option<String>,
     },
     SpironPromise {
         id: String,
@@ -411,7 +412,18 @@ fn parse_gh_pr_coords(spec: &str) -> Result<WatchTarget, String> {
 }
 
 fn parse_gh_check_coords(spec: &str) -> Result<WatchTarget, String> {
-    if let Some((repo_part, ref_part)) = spec.split_once('@').or_else(|| spec.split_once('#'))
+    let (coords, check_name) = if spec.contains('@') {
+        match spec.split_once('#') {
+            Some((coords, name)) if !name.trim().is_empty() => {
+                (coords, Some(name.trim().to_string()))
+            }
+            Some(_) => return Err("GitHub check name cannot be empty".to_string()),
+            None => (spec, None),
+        }
+    } else {
+        (spec, None)
+    };
+    if let Some((repo_part, ref_part)) = coords.split_once('@').or_else(|| spec.split_once('#'))
         && let Some((owner, repo)) = repo_part.split_once('/')
         && !owner.trim().is_empty()
         && !repo.trim().is_empty()
@@ -421,6 +433,7 @@ fn parse_gh_check_coords(spec: &str) -> Result<WatchTarget, String> {
             owner: owner.trim().to_string(),
             repo: repo.trim().to_string(),
             reference: ref_part.trim().to_string(),
+            check_name,
         });
     }
     Err(format!(
@@ -2287,10 +2300,16 @@ fn evaluate_watch(
             owner,
             repo,
             reference,
+            check_name,
         } => {
-            let Some((is_terminal, state_desc)) =
-                probe_github_check_terminal(owner, repo, reference, sched.agent_id.as_str(), now)
-            else {
+            let Some((is_terminal, state_desc)) = probe_github_check_terminal(
+                owner,
+                repo,
+                reference,
+                check_name.as_deref(),
+                sched.agent_id.as_str(),
+                now,
+            ) else {
                 return WatchEval::pending(sched.watch_baseline.clone(), None);
             };
             if is_terminal {
@@ -2578,6 +2597,16 @@ fn probe_spiron_at(
 
 mod github;
 
+/// Apply an authenticated GitHub delivery; caller notifies schedules_changed.
+pub fn github_event(
+    event: &str,
+    payload: &serde_json::Value,
+    delivery: &str,
+    now: i64,
+) -> Result<bool, String> {
+    github::event(event, payload, delivery, now)
+}
+
 fn probe_github_pr_state(
     owner: &str,
     repo: &str,
@@ -2615,9 +2644,13 @@ fn probe_github_check_terminal(
     owner: &str,
     repo: &str,
     reference: &str,
+    check_name: Option<&str>,
     agent_id: &str,
     now_ms: i64,
 ) -> Option<(bool, String)> {
+    if let Some(name) = check_name {
+        return github::probe_selected(owner, repo, reference, name, agent_id, now_ms);
+    }
     let clean_ref = reference.strip_prefix('#').unwrap_or(reference);
     if clean_ref.chars().all(|c| c.is_ascii_digit())
         && let Ok(pr_num) = clean_ref.parse::<u64>()
@@ -2938,6 +2971,19 @@ mod tests {
             woke.iter().any(|wake| matches!(wake, anyagents_core::Wake::Agent { agent_id } if agent_id == &owner.id)),
             "{woke:?}"
         );
+    }
+
+    #[test]
+    fn github_check_selectors_preserve_existing_syntax() {
+        assert!(
+            matches!(parse_gh_check_coords("owner/repo@main#build linux").unwrap(), WatchTarget::GitHubCheck { reference, check_name: Some(name), .. } if reference == "main" && name == "build linux")
+        );
+        assert!(
+            matches!(parse_gh_check_coords("owner/repo#452").unwrap(), WatchTarget::GitHubCheck { reference, check_name: None, .. } if reference == "452")
+        );
+        for invalid in ["owner/repo@main#", "owner/repo@#build", "owner/repo@main# "] {
+            assert!(parse_gh_check_coords(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
@@ -3426,6 +3472,123 @@ mod tests {
     }
 
     #[test]
+    fn signed_github_events_wake_each_selected_schedule_without_waiting_for_rest() {
+        use axum::http::{HeaderMap, HeaderValue};
+        use serde_json::json;
+        let _env_guard = crate::test_env::env_lock();
+        github::reset_probes_for_test();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                github::reset_probes_for_test();
+            }
+        }
+        let _reset = Reset;
+        let tmp = crate::test_env::test_tempdir("anyagents-signed-github-schedules-").unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let health = HealthBoard::default();
+        let now = now_ms();
+        let mut agents = Vec::new();
+        let mut schedules = Vec::new();
+        for (name, check) in [("build-a", "build"), ("build-b", "build"), ("lint", "lint")] {
+            let agent = store
+                .create_agent(NewAgent {
+                    name: name.into(),
+                    role: "general".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            let watch = format!("github:check:org/repo@7#{check}");
+            let schedule = create_agent_schedule(
+                &store,
+                &health,
+                &agent,
+                None,
+                None,
+                Some(&watch),
+                "report selected completion",
+            )
+            .unwrap();
+            agents.push(agent);
+            schedules.push(schedule);
+        }
+        let watches = store.list_schedules(None, true).unwrap();
+        let targets: Vec<_> = watches
+            .iter()
+            .map(|s| (s.id.as_str(), parse_watch_spec(&s.spec).unwrap()))
+            .collect();
+        github::begin_cycle(targets.iter().map(|(id, t)| (*id, t)), now);
+        let receive = |name: &str, status: &str, delivery: &str, at: i64| {
+            let body = serde_json::to_vec(&json!({
+                "repository":{"full_name":"ORG/repo"},
+                "check_run":{"id":if name == "build" {1} else {2}, "name":name,
+                    "app":{"id":1}, "status":status, "conclusion":"success",
+                    "head_sha":"abc", "pull_requests":[{"number":7}]}
+            }))
+            .unwrap();
+            let signature = format!(
+                "sha256={}",
+                crate::github_webhook::hmac_sha256_hex(b"secret", &body)
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-hub-signature-256",
+                HeaderValue::from_str(&signature).unwrap(),
+            );
+            headers.insert("x-github-event", HeaderValue::from_static("check_run"));
+            headers.insert(
+                "x-github-delivery",
+                HeaderValue::from_str(delivery).unwrap(),
+            );
+            crate::github_webhook::receive(
+                Some("secret"),
+                &headers,
+                &body,
+                |event, payload, delivery| github_event(event, payload, delivery, at),
+            )
+            .unwrap()
+        };
+        assert!(receive("build", "in_progress", "build-start", now));
+        assert!(receive("lint", "in_progress", "lint-start", now));
+        let tick =
+            |at| github::with_completion_clock(at, || tick_schedules_once(&store, &health, at));
+        assert_eq!(tick(now), 0);
+        assert!(receive("build", "completed", "build-done", now + 1));
+        assert_eq!(github::next_probe_at(&targets[0].1), Some(0));
+        assert_eq!(tick(now + 1), 2);
+        for agent in &agents[..2] {
+            let pending = store.pending_wakes(&agent.id).unwrap();
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].text.contains("transition=checks_completed]"));
+        }
+        assert!(store.pending_wakes(&agents[2].id).unwrap().is_empty());
+        assert!(!receive("build", "completed", "build-done", now + 2));
+        assert!(!receive("build", "completed", "same-observation", now + 2));
+        assert_eq!(tick(now + 2), 0);
+        assert!(
+            !store
+                .get_schedule(&schedules[0].id)
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        assert!(
+            !store
+                .get_schedule(&schedules[1].id)
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        assert!(
+            store
+                .get_schedule(&schedules[2].id)
+                .unwrap()
+                .unwrap()
+                .active
+        );
+    }
+
+    #[test]
     fn github_pr_watch_stays_active_across_checks_and_review_failure_until_merged() {
         let _env = crate::server::tests::env_lock();
         use std::io::{Read, Write};
@@ -3519,6 +3682,7 @@ mod tests {
                         "ExampleOrg",
                         "project",
                         "#452",
+                        None,
                         &format!("agent{i}"),
                         now,
                     )
@@ -3544,7 +3708,7 @@ mod tests {
             (3, "checks_completed"),
         ] {
             *stage.lock().unwrap() = stage_num;
-            let at = now + i64::from(stage_num) * 60_000;
+            let at = now + i64::from(stage_num) * 900_000;
             assert_eq!(tick(&store, &health, at), 1);
             let inbox = store.inbox(&owner.id, None).unwrap();
             let last = inbox.last().unwrap();
@@ -3558,7 +3722,7 @@ mod tests {
         // A shared secondary-limit window records one typed error, retains
         // the successful baseline, and rereads the terminal state on recovery.
         *stage.lock().unwrap() = 5;
-        assert_eq!(tick(&store, &health, now + 240_000), 0);
+        assert_eq!(tick(&store, &health, now + 3_600_000), 0);
         let active = store.list_schedules(Some(&owner.id), true).unwrap();
         assert_eq!(
             active[0].watch_baseline.as_deref(),
@@ -3570,12 +3734,12 @@ mod tests {
         );
         let before = calls.load(Ordering::SeqCst);
         *stage.lock().unwrap() = 4;
-        for at in [240_001, 300_000, 359_999, 360_000, 361_000] {
+        for at in [3_600_001, 3_660_000, 3_719_999, 3_720_000, 3_721_000] {
             assert_eq!(tick(&store, &health, now + at), 0);
         }
         assert_eq!(calls.load(Ordering::SeqCst), before);
         // Recovery is jittered across reset+60..300 seconds, not reset itself.
-        assert_eq!(tick(&store, &health, now + 660_000), 1);
+        assert_eq!(tick(&store, &health, now + 4_020_000), 1);
         assert_eq!(calls.load(Ordering::SeqCst), before + 1);
         let inbox = store.inbox(&owner.id, None).unwrap();
         assert!(inbox.last().unwrap().text.contains("transition=merged]"));
@@ -3594,7 +3758,7 @@ mod tests {
             .outcome_report(
                 std::slice::from_ref(&owner.id),
                 None,
-                now + 700_000,
+                now + 4_060_000,
                 anyagents_core::OutcomeGroupBy::Agent,
             )
             .unwrap();
@@ -3831,7 +3995,7 @@ Connection: close
 
         // New head_sha (sha222) also finishing as checks_completed triggers a new wake.
         *stage.lock().unwrap() = 1;
-        assert_eq!(tick(&store, &health, now + 180_000), 1);
+        assert_eq!(tick(&store, &health, now + 900_000), 1);
         let inbox = store.inbox(&owner.id, None).unwrap();
         assert_eq!(inbox.len(), 2);
         assert!(
