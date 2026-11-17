@@ -9802,6 +9802,18 @@ fn archetype_search_roots_for_owner(
             data_dir.to_path_buf(),
             PathBuf::from(".agents/agents"),
         );
+        // The data directory's `AGENTS.md` may link into the shared rules
+        // repository; that repository's catalog sits beside the file it names.
+        if let Some(rules_root) = std::fs::canonicalize(data_dir.join("AGENTS.md"))
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+        {
+            push_unique_search_root(
+                &mut search_roots,
+                rules_root,
+                PathBuf::from(".agents/agents"),
+            );
+        }
     }
     push_unique_search_root(
         &mut search_roots,
@@ -15833,6 +15845,63 @@ Connection: close
             std::env::remove_var("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL");
         }
     }
+    /// A worker in a repository without a role catalog still gets the shared
+    /// rules repository's template when the data directory's `AGENTS.md`
+    /// links into it, never the built-in fallback.
+    #[cfg(unix)]
+    #[test]
+    fn archetype_lookup_follows_the_data_dir_agents_md_into_its_rules_repo() {
+        let dir = crate::test_tempdir();
+        let rules = dir.path().join("rules-repo");
+        let data_dir = dir.path().join("data");
+        let parent_wd = dir.path().join("product-repo/parent");
+        let child_wd = dir.path().join("product-repo/child");
+        for path in [
+            rules.join(".agents/agents"),
+            data_dir.clone(),
+            parent_wd.clone(),
+            child_wd.clone(),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(rules.join("AGENTS.md"), "# Rules\n").unwrap();
+        std::fs::write(
+            rules.join(".agents/agents/general.md"),
+            "---\ndescription: Default worker\nharness: codex\nmodel: worker-model\n---\nShared worker template.\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(rules.join("AGENTS.md"), data_dir.join("AGENTS.md")).unwrap();
+
+        let tpl = resolve_archetype_template_with_ancestors(
+            "general",
+            Some(&child_wd),
+            &[parent_wd.clone()],
+            &data_dir,
+        )
+        .unwrap()
+        .expect("general template");
+        assert_eq!(tpl.harness.as_deref(), Some("codex"));
+        assert_eq!(tpl.model.as_deref(), Some("worker-model"));
+        assert!(tpl.body.contains("Shared worker template."));
+
+        // A workspace with its own catalog keeps precedence over the rules repo.
+        std::fs::create_dir_all(child_wd.join(".agents/agents")).unwrap();
+        std::fs::write(
+            child_wd.join(".agents/agents/general.md"),
+            "---\ndescription: Local worker\nharness: claude-code\n---\nLocal template.\n",
+        )
+        .unwrap();
+        let tpl = resolve_archetype_template_with_ancestors(
+            "general",
+            Some(&child_wd),
+            &[parent_wd],
+            &data_dir,
+        )
+        .unwrap()
+        .expect("general template");
+        assert_eq!(tpl.harness.as_deref(), Some("claude-code"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn archetype_lookup_allows_symlinked_trusted_base_roots_and_blocks_relative_escapes() {
