@@ -168,10 +168,19 @@ repaired by the next sync. A missing, damaged or older-layout file is
 recreated and refilled from state, more than one search's share in the
 background. Standalone tool summaries have no mailbox row and are kept in the
 index as recorded, across a rebuild of the layout. Opening a pre-split
-database copies those summaries into the index and moves each outbound turn's
-mailbox position onto its row (migration 34) before state's search tables are
-dropped; the space they held is reused by SQLite and returned to the file
-system only by a `VACUUM` of `state.db`, run while no process has it open.
+database copies those summaries into the index (deciding which chunks have no
+mailbox row from the chunk-id key alone) and renames state's search tables to
+`retired_rag_chunks` and `retired_rag_chunks_fts` (migration 34): nothing
+before the server answers reads or frees their pages, which on a large store
+would outlast any readiness window. After startup they are dismantled in short
+transactions, each holding the state writer at most half the time: each
+outbound turn's mailbox position moves onto its row (until then the projection
+reads it from the retired chunk), the rows are deleted in batches, and the
+emptied tables are dropped. A process that stops part way is resumed by the
+next open. Until they are gone, conversation redaction refuses, since they
+still hold copies of mailbox bodies it does not scrub. The space they held is
+reused by SQLite and returned to the file system only by a `VACUUM` of
+`state.db`, run while no process has it open.
 The host SQLite index stores metadata, cursors, call correlation and a
 contentless FTS index; authoritative host-file payloads stay in filesystem
 sources. Archive retrieval also reads the historical pre-upgrade directory

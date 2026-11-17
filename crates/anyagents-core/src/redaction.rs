@@ -581,6 +581,15 @@ impl Store {
         if request.message_id.is_some() == request.seq.is_some() {
             return Err(invalid("supply exactly one message_id or mailbox seq"));
         }
+        // Right after an upgrade, state's retired pre-split search tables
+        // still hold copies of mailbox bodies that this does not scrub, so no
+        // erasure is claimed until they are dismantled.
+        if self.retired_search_pending()? {
+            return Err(invalid(
+                "redaction is unavailable while the pre-split search tables are being dismantled \
+                 after an upgrade (they still hold copies of mailbox bodies); retry once that finishes",
+            ));
+        }
         let (_history_publication, history_dir) = lock_history_publication(self.data_dir())?;
         let _lifecycle = self.lock_agent_lifecycle(target)?;
         enum RedactPhase1 {

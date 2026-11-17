@@ -35,6 +35,7 @@ mod operator_inbox;
 mod outcomes;
 mod registry;
 mod remote_sessions;
+mod retired_search;
 pub use registry::holds_store_writer;
 mod mail_notices;
 mod runtime;
@@ -3570,6 +3571,12 @@ impl Store {
     /// The search index's file.
     pub fn memory_index_path(&self) -> &Path {
         self.shared.memory_index.path()
+    }
+
+    /// Whether state still has pre-split search tables left to dismantle
+    /// (`store/retired_search.rs`).
+    pub(crate) fn retired_search_pending(&self) -> Result<bool, Error> {
+        retired_search::pending(&self.read_conn())
     }
 
     /// The text of a standalone tool summary (a chunk with no mailbox row).

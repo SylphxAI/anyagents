@@ -119,6 +119,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks_fts USING fts5(
 );
 ";
 
+/// The rowids of the chunks in state's own (pre-split) `rag_chunks` that no
+/// mailbox row reproduces. Only `chunk_id` and the rowid are referenced, so
+/// SQLite answers it from the chunk-id key's index without reading a body.
+pub(super) const LEGACY_STANDALONE_IDS: &str = "SELECT r.rowid FROM rag_chunks r
+     WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = r.chunk_id)
+       AND NOT EXISTS (SELECT 1 FROM outbound_messages o WHERE o.id = r.chunk_id)";
+
 /// One searchable turn, as projected.
 pub(super) struct Chunk<'a> {
     pub id: &'a str,
@@ -362,7 +369,7 @@ impl MemoryIndex {
         Ok(())
     }
 
-    /// Before state drops its own search tables: keep the standalone tool
+    /// Before state retires its own search tables: keep the standalone tool
     /// summaries they hold, the rows no rebuild can reproduce. `state` is the
     /// state writer, used here only to read.
     pub(super) fn adopt_legacy(&self, state: &Connection) -> Result<(), Error> {
@@ -374,13 +381,15 @@ impl MemoryIndex {
         if !legacy {
             return Ok(());
         }
-        let mut stmt = state.prepare(
+        // This runs before the server answers. Which chunks have no mailbox
+        // row is decided from the chunk-id key alone ([`LEGACY_STANDALONE_IDS`]),
+        // so only those few rows' bodies are read, never the whole table.
+        let mut stmt = state.prepare(&format!(
             "SELECT c.chunk_id, c.agent_id, c.agent_name, c.direction, c.sender, c.destination,
                     c.timestamp_ms, c.text, c.kind, c.tool_name, c.seq
              FROM rag_chunks c
-             WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = c.chunk_id)
-               AND NOT EXISTS (SELECT 1 FROM outbound_messages o WHERE o.id = c.chunk_id)",
-        )?;
+             WHERE c.rowid IN ({LEGACY_STANDALONE_IDS})"
+        ))?;
         let rows = stmt
             .query_map([], StandaloneRow::read)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -913,7 +922,7 @@ fn max_rowids(state: &Connection) -> Result<(i64, i64), Error> {
 }
 
 /// One source row of a projected chunk: `(rowid, chunk)` fields owned.
-struct SourceRow {
+pub(super) struct SourceRow {
     rowid: i64,
     id: String,
     agent_id: String,
@@ -923,7 +932,7 @@ struct SourceRow {
     destination: String,
     timestamp_ms: i64,
     body: String,
-    seq: i64,
+    pub(super) seq: i64,
 }
 
 impl SourceRow {
@@ -951,6 +960,49 @@ const INBOUND_SELECT: &str =
 const OUTBOUND_SELECT: &str = "SELECT o.rowid, o.id, o.agent_id, a.name, 'agent:' || a.name,
         o.destination, o.sent_at_ms, o.body, o.seq
      FROM outbound_messages o JOIN agents a ON a.id = o.agent_id";
+/// [`OUTBOUND_SELECT`] while state still has its retired pre-split chunks: a
+/// turn whose mailbox position has not been moved onto its row yet
+/// (`retired_search.rs`) takes it from its retired chunk.
+const OUTBOUND_SELECT_RETIRING: &str = "SELECT o.rowid, o.id, o.agent_id, a.name,
+        'agent:' || a.name, o.destination, o.sent_at_ms, o.body,
+        COALESCE(NULLIF(o.seq, 0),
+                 (SELECT c.seq FROM retired_rag_chunks c WHERE c.chunk_id = o.id), 0)
+     FROM outbound_messages o JOIN agents a ON a.id = o.agent_id";
+
+/// Mailbox rows of one direction (`"in"`: `messages m`, `"out"`:
+/// `outbound_messages o`) matching `filter`, as projected.
+pub(super) fn read_source_rows(
+    state: &Connection,
+    direction: &'static str,
+    filter: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<SourceRow>, Error> {
+    if direction == "in" {
+        return read_rows(
+            state,
+            &format!("{INBOUND_SELECT} {filter}"),
+            direction,
+            params,
+        );
+    }
+    let retiring = super::retired_search::present(state)?;
+    let select = if retiring {
+        OUTBOUND_SELECT_RETIRING
+    } else {
+        OUTBOUND_SELECT
+    };
+    match read_rows(state, &format!("{select} {filter}"), direction, params) {
+        // The retired chunks were dropped since they were looked up; every
+        // position had been moved onto its row first.
+        Err(_) if retiring && !super::retired_search::present(state)? => read_rows(
+            state,
+            &format!("{OUTBOUND_SELECT} {filter}"),
+            direction,
+            params,
+        ),
+        other => other,
+    }
+}
 
 fn read_rows(
     state: &Connection,
@@ -980,23 +1032,13 @@ fn read_rows(
 
 /// The mailbox row a chunk id is projected from, if state has one.
 fn source_row(state: &Connection, id: &str) -> Result<Option<SourceRow>, Error> {
-    let inbound = read_rows(
-        state,
-        &format!("{INBOUND_SELECT} WHERE m.id = ?1"),
-        "in",
-        [id],
-    )?;
+    let inbound = read_source_rows(state, "in", "WHERE m.id = ?1", &[&id])?;
     if let Some(row) = inbound.into_iter().next() {
         return Ok(Some(row));
     }
-    Ok(read_rows(
-        state,
-        &format!("{OUTBOUND_SELECT} WHERE o.id = ?1"),
-        "out",
-        [id],
-    )?
-    .into_iter()
-    .next())
+    Ok(read_source_rows(state, "out", "WHERE o.id = ?1", &[&id])?
+        .into_iter()
+        .next())
 }
 
 fn sync_on(conn: &mut Connection, state: &Connection, budget: usize) -> Result<bool, Error> {
@@ -1021,9 +1063,9 @@ fn sync_on(conn: &mut Connection, state: &Connection, budget: usize) -> Result<b
         reset(conn, Some(state), true)?;
     }
     let mut left = budget;
-    for (key, select, rowid, direction) in [
-        ("messages_rowid", INBOUND_SELECT, "m.rowid", "in"),
-        ("outbound_rowid", OUTBOUND_SELECT, "o.rowid", "out"),
+    for (key, rowid, direction) in [
+        ("messages_rowid", "m.rowid", "in"),
+        ("outbound_rowid", "o.rowid", "out"),
     ] {
         loop {
             if left == 0 {
@@ -1051,11 +1093,11 @@ fn sync_on(conn: &mut Connection, state: &Connection, budget: usize) -> Result<b
                 tx.commit()?;
                 break;
             }
-            let rows = read_rows(
+            let rows = read_source_rows(
                 state,
-                &format!("{select} WHERE {rowid} > ?1 AND {rowid} <= ?2 ORDER BY {rowid}"),
                 direction,
-                params![mark, max],
+                &format!("WHERE {rowid} > ?1 AND {rowid} <= ?2 ORDER BY {rowid}"),
+                &[&mark, &max],
             )?;
             for row in &rows {
                 upsert_chunk(&tx, &row.chunk())?;

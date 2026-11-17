@@ -4,12 +4,15 @@
 -- every mailbox body two more times, and maintaining them held the state
 -- writer.
 --
--- An outbound turn's mailbox position was kept only in its chunk; it moves to
--- the outbound row it describes. The standalone tool summaries only these
--- tables held are copied to the index before this runs.
+-- This runs before the server answers, so it changes only the schema: no
+-- statement here reads or frees the old tables' pages, which on a large
+-- store would take longer than any readiness window. The old tables are
+-- renamed out of the way (search SQL then resolves `rag_chunks` to the
+-- attached index) and dismantled after startup in short transactions
+-- (store/retired_search.rs). Until then they still hold each outbound turn's
+-- mailbox position, which moves to the outbound row it describes; the
+-- standalone summaries only these tables held were copied to the index
+-- before this runs.
 ALTER TABLE outbound_messages ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
-UPDATE outbound_messages
-SET seq = (SELECT c.seq FROM rag_chunks c WHERE c.chunk_id = outbound_messages.id)
-WHERE EXISTS (SELECT 1 FROM rag_chunks c WHERE c.chunk_id = outbound_messages.id AND c.seq != 0);
-DROP TABLE IF EXISTS rag_chunks_fts;
-DROP TABLE IF EXISTS rag_chunks;
+ALTER TABLE rag_chunks RENAME TO retired_rag_chunks;
+ALTER TABLE rag_chunks_fts RENAME TO retired_rag_chunks_fts;

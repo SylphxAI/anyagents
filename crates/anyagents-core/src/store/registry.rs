@@ -68,7 +68,9 @@ pub(super) fn shared(path: &Path) -> Result<Arc<Shared>, Error> {
         std::fs::create_dir_all(parent)?;
     }
     if path.as_os_str().is_empty() {
-        return Ok(Arc::new(Shared::open(path)?));
+        let shared = Arc::new(Shared::open(path)?);
+        super::retired_search::start(&shared, true)?;
+        return Ok(shared);
     }
     let key = canonical(path)?;
     let slot = {
@@ -87,6 +89,9 @@ pub(super) fn shared(path: &Path) -> Result<Arc<Shared>, Error> {
     }
     let shared = Arc::new(Shared::open(&key)?);
     *current = Arc::downgrade(&shared);
+    // After the migration, before anything is served: what is left of
+    // state's pre-split search tables is dismantled from here on.
+    super::retired_search::start(&shared, false)?;
     Ok(shared)
 }
 
