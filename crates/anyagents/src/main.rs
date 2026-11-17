@@ -605,6 +605,9 @@ enum Command {
     /// Schedule one-off (`--at`), recurring (`--every`), or event-watch (`--watch`) wakes, or list/cancel (`--cancel`) schedules.
     #[command(visible_alias = "schedules", alias = "cron")]
     Schedule {
+        /// List visible schedules across all agents (read-only).
+        #[arg(long, conflicts_with_all = ["agent", "at", "every", "watch", "prompt", "cancel"])]
+        all: bool,
         /// Optional target agent name or `agt_...` id (defaults to this agent when run inside an agent).
         agent: Option<String>,
         /// One-off wake time (`1m`, `30s`, `2026-10-29T16:30:00Z`).
@@ -622,6 +625,12 @@ enum Command {
         /// Cancel schedule by `sch_...` ID or `all`.
         #[arg(long)]
         cancel: Option<String>,
+        /// Output machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List visible fleet automations (event watches and timed wakes).
+    Automations {
         /// Output machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -1623,6 +1632,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             },
         ),
         Command::Schedule {
+            all,
             agent,
             at,
             every,
@@ -1630,7 +1640,10 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             prompt,
             cancel,
             json,
-        } => schedule_cmd(&data, agent, at, every, watch, prompt, cancel, json),
+        } => schedule_cmd(&data, agent, at, every, watch, prompt, cancel, json, all),
+        Command::Automations { json } => {
+            schedule_cmd(&data, None, None, None, None, None, None, json, true)
+        }
         Command::Inspect { agent, limit, json } => inspect_cmd(&data, agent, limit, json),
         Command::Outbound { action, json } => match action.unwrap_or(OutboundCommand::List) {
             OutboundCommand::List => outbound::list(&data, json),
@@ -1653,13 +1666,18 @@ fn schedule_cmd(
     prompt: Option<String>,
     cancel: Option<String>,
     json: bool,
+    all: bool,
 ) -> Result<(), anyagents_core::Error> {
-    let target = agent
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
-        .or_else(|| client::agent_identity().map(|id| id.to_string()));
+    let target = if all {
+        Some("all".to_string())
+    } else {
+        agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
+            .or_else(|| client::agent_identity().map(|id| id.to_string()))
+    };
     let action = if cancel.is_some() {
         "cancel"
     } else if at.is_some() || every.is_some() || watch.is_some() {
@@ -1667,6 +1685,12 @@ fn schedule_cmd(
     } else {
         "list"
     };
+    let fleet = target.as_deref() == Some("all");
+    if fleet && (action != "list" || prompt.is_some()) {
+        return Err(anyagents_core::Error::Message(
+            "fleet automations are read-only; name one agent to change a schedule".into(),
+        ));
+    }
     let body = serde_json::json!({
         "action": action,
         "at": at,
@@ -1678,24 +1702,33 @@ fn schedule_cmd(
     });
     if client::can_call_server(data) {
         let path = match target.as_deref() {
+            Some("all") => "/v1/schedules".to_string(),
             Some(t) => format!("/v1/agents/{t}/schedules"),
             None => "/v1/schedules".to_string(),
         };
         let bytes = serde_json::to_vec(&body)
             .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
-        if let Ok(Some(val)) = client::call::<serde_json::Value>(
+        let response = client::call::<serde_json::Value>(
             data,
             "POST",
             &path,
             Some(bytes),
             &client::authority(data),
-        ) {
+        );
+        let response = if fleet {
+            response.map_err(anyagents_core::Error::Message)?
+        } else {
+            response.ok().flatten()
+        };
+        if let Some(val) = response {
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&val)
                         .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
                 );
+            } else if ui::is_pretty() {
+                ui::schedules(&val);
             } else if let Some(s) = val.get("schedule") {
                 println!(
                     "{}\t{}\t{}\t{}",
@@ -1721,6 +1754,11 @@ fn schedule_cmd(
             return Ok(());
         }
     }
+    if fleet {
+        return Err(anyagents_core::Error::Message(
+            "fleet automations require a running server".into(),
+        ));
+    }
     let store = anyagents_core::Store::open(data.join("state.db"))?;
     let target_name = target.ok_or_else(|| {
         anyagents_core::Error::Message("schedule requires an agent name or id".into())
@@ -1737,11 +1775,15 @@ fn schedule_cmd(
                 "cancelled": count,
                 "schedules": schedule::list_agent_schedules(&store, &rec.id, false).map_err(anyagents_core::Error::Message)?,
             });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&out)
-                    .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
-            );
+            if !json && ui::is_pretty() {
+                ui::schedules(&out);
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&out)
+                        .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+                );
+            }
         }
         "set" => {
             let prompt_text = prompt.unwrap_or_default();
@@ -1766,6 +1808,8 @@ fn schedule_cmd(
                     }))
                     .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
                 );
+            } else if ui::is_pretty() {
+                ui::schedules(&serde_json::json!({"schedule": created}));
             } else {
                 println!(
                     "{}\t{}\t{}\t{}",
@@ -1786,6 +1830,8 @@ fn schedule_cmd(
                     }))
                     .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
                 );
+            } else if ui::is_pretty() {
+                ui::schedules(&serde_json::json!({"schedules": list}));
             } else {
                 for s in list {
                     println!(
@@ -1800,7 +1846,6 @@ fn schedule_cmd(
 }
 
 fn inspect_cmd(data: &Path, agent: Option<String>, limit: usize, json: bool) -> Result<(), Error> {
-    use std::io::IsTerminal;
     let target = agent
         .or_else(|| client::agent_identity().map(|id| id.to_string()))
         .ok_or_else(|| Error::Message("inspect requires an agent name or id".into()))?;
@@ -1815,7 +1860,7 @@ fn inspect_cmd(data: &Path, agent: Option<String>, limit: usize, json: bool) -> 
         },
     )?
     .turns;
-    if json || !std::io::stdout().is_terminal() {
+    if json || !ui::is_pretty() {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -1824,64 +1869,28 @@ fn inspect_cmd(data: &Path, agent: Option<String>, limit: usize, json: bool) -> 
             .map_err(|e| Error::Message(e.to_string()))?
         );
     } else {
-        println!(
-            "{}  ({})\nState: {}   Process: {}   Turn: {}\nLag: {} ms   Block: {}\nRuntime: {}   Model: {}\nWorkdir: {}\nSeat: {}\nSchedules: {}",
-            view.name,
-            view.id,
-            view.state,
-            view.process,
-            view.turn_state,
-            view.oldest_undelivered_age_ms
-                .map_or_else(|| "-".into(), |n| n.to_string()),
-            view.block_reason.as_deref().unwrap_or("-"),
-            view.harness,
-            view.model.as_deref().unwrap_or("default"),
-            view.workdir.as_deref().unwrap_or("-"),
-            view.seat_user.as_deref().unwrap_or("-"),
-            view.schedules.len()
+        ui::value(
+            &view.name,
+            &serde_json::json!({
+                "id": view.id,
+                "state": view.state,
+                "process": view.process,
+                "turn": view.turn_state,
+                "lag_ms": view.oldest_undelivered_age_ms,
+                "block": view.block_reason,
+                "harness": view.harness,
+                "model": view.model,
+                "profile": view.profile,
+                "workdir": view.workdir,
+                "seat": view.seat_user,
+                "open_turn": view.has_open_turn,
+                "delivery": view.delivery,
+                "schedules": view.schedules,
+                "last_error": view.last_error,
+                "turn_errors": view.turn_errors,
+                "unsettled_outbound": view.unsettled_outbound,
+            }),
         );
-        println!(
-            "Open turn: {}   Profile: {}",
-            view.has_open_turn,
-            view.profile.as_deref().unwrap_or("default")
-        );
-        println!(
-            "Delivery: {} ({}){}",
-            view.delivery.label(),
-            view.delivery.proof,
-            view.delivery
-                .peer
-                .as_deref()
-                .map_or_else(String::new, |peer| format!("   Peer: {peer}"))
-        );
-        for schedule in &view.schedules {
-            println!("  {} {}: {}", schedule.kind, schedule.spec, schedule.prompt);
-        }
-        if let Some(error) = &view.last_error {
-            println!("Error: {error}");
-        }
-        if let Some(errors) = &view.turn_errors {
-            println!(
-                "Errored turns: {} in a row (parked at {}){}",
-                errors.streak,
-                errors.limit,
-                errors.faulted_at_ms.map_or_else(String::new, |ms| format!(
-                    "   Faulted since {} UTC: resume to clear",
-                    ui::format_timestamp_ms(ms)
-                ))
-            );
-        }
-        for held in &view.unsettled_outbound {
-            println!(
-                "Unconfirmed send {} to {} since {} UTC (anyagents outbound retry|discard {}): {}",
-                held.key,
-                held.destination,
-                held.since_ms
-                    .map_or_else(|| "-".to_string(), ui::format_timestamp_ms),
-                held.key,
-                held.excerpt
-            );
-        }
         channel::emit_turns(&turns, true, false)?;
     }
     Ok(())
@@ -2160,7 +2169,11 @@ fn store_key(
     let recorded = agent::named(data, agent)?;
     let data = std::path::absolute(data)?;
     gateway::store_key(&data, &recorded, base_url, model, key)?;
-    println!("key stored\t{}\t{}", recorded.name, model);
+    if ui::is_pretty() {
+        ui::success(&format!("Key stored for {} · {model}", recorded.name));
+    } else {
+        println!("key stored\t{}\t{}", recorded.name, model);
+    }
     Ok(())
 }
 
@@ -2207,10 +2220,13 @@ fn model_cmd(
             &client::authority(data),
         ) {
             Ok(result) => {
-                println!(
-                    "{}",
-                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
-                );
+                let result =
+                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?;
+                if ui::is_pretty() {
+                    ui::value("Model updated", &result);
+                } else {
+                    println!("{result}");
+                }
                 return Ok(());
             }
             Err(err) if err.contains("404") => {}
@@ -2234,7 +2250,11 @@ fn model_cmd(
             clean_model,
             clean_profile,
         )?;
-        println!("{out}");
+        if ui::is_pretty() {
+            ui::value("Model updated", &out);
+        } else {
+            println!("{out}");
+        }
         return Ok(());
     }
     let model = clean_model.ok_or_else(|| Error::Message("model is required".into()))?;
@@ -2265,10 +2285,17 @@ fn profiles_cmd(
                             .into(),
                     )
                 })?;
-            let kf = key_file.ok_or_else(|| {
-                Error::Message("--key-file <path> is required for `profiles set`".into())
-            })?;
-            let key = std::fs::read_to_string(kf)?;
+            let key = match key_file {
+                Some(kf) => std::fs::read_to_string(kf)?,
+                None if ui::is_pretty() && std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+                    signin::read_secret_line("API key", Some(std::time::Duration::from_secs(300)))?
+                }
+                None => {
+                    return Err(Error::Message(
+                        "--key-file <path> is required for `profiles set`".into(),
+                    ));
+                }
+            };
             if client::can_call_server(data) {
                 let body = serde_json::json!({"profile": profile, "key": key});
                 match client::call::<serde_json::Value>(
@@ -2279,12 +2306,13 @@ fn profiles_cmd(
                     &client::authority(data),
                 ) {
                     Ok(result) => {
-                        println!(
-                            "{}",
-                            result.ok_or_else(|| {
-                                Error::Message("the server answered nothing".into())
-                            })?
-                        );
+                        let result = result
+                            .ok_or_else(|| Error::Message("the server answered nothing".into()))?;
+                        if ui::is_pretty() {
+                            ui::success(&format!("Profile {profile} saved"));
+                        } else {
+                            println!("{result}");
+                        }
                         return Ok(());
                     }
                     Err(err) if err.contains("404") => {}
@@ -2292,7 +2320,11 @@ fn profiles_cmd(
                 }
             }
             let (prov, prof) = create::set_provider_profile(data, profile, &key)?;
-            println!("{}", serde_json::json!({"provider": prov, "profile": prof}));
+            if ui::is_pretty() {
+                ui::success(&format!("Profile {prov}/{prof} saved"));
+            } else {
+                println!("{}", serde_json::json!({"provider": prov, "profile": prof}));
+            }
             Ok(())
         }
         Some("refresh") | Some("reset") => {
@@ -2324,11 +2356,15 @@ fn profiles_cmd(
             } else {
                 create::probe_profile_models_catalog(data, target)
             };
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&catalogs)
-                    .map_err(|e| Error::Message(e.to_string()))?
-            );
+            if ui::is_pretty() {
+                ui::value("Profile models", &catalogs);
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&catalogs)
+                        .map_err(|e| Error::Message(e.to_string()))?
+                );
+            }
             Ok(())
         }
         Some("signin") | Some("sign-in") | Some("login") => {
@@ -2347,6 +2383,10 @@ fn profiles_cmd(
 /// (`<data>/profiles/<harness>/<profile>`) when `target` is a harness catalog
 /// ID or `profile` is specified, or against a recorded agent's own config directory.
 fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyagents_core::Error> {
+    if ui::is_pretty() {
+        ui::heading(&format!("Sign in · {target}"));
+        ui::note("Follow the provider's sign-in steps. Input is masked; Ctrl+C cancels.");
+    }
     let mut runner = signin::ProcessRunner;
     let mut sink = signin::TerminalSink;
     let raw_target = target.trim();
@@ -2407,14 +2447,31 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         };
         let (resolved_prof, final_dir, resolved_acct) =
             create::resolve_and_commit_staged_signin(data, &provider, &staging_dir, explicit_prof)?;
-        println!(
-            "signed in\tprofile:{provider}/{resolved_prof}\t{}\t{}",
-            final_dir.display(),
-            resolved_acct
+        if ui::is_pretty() {
+            match resolved_acct
                 .as_deref()
                 .or(outcome.account.as_deref())
-                .unwrap_or("-")
-        );
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "-")
+            {
+                Some(account) => ui::success(&format!(
+                    "Signed in · {provider}/{resolved_prof} · {account}"
+                )),
+                None => ui::success(&format!("Signed in · {provider}/{resolved_prof}")),
+            }
+            if ui::is_verbose() {
+                ui::note(&format!("Profile directory: {}", final_dir.display()));
+            }
+        } else {
+            println!(
+                "signed in\tprofile:{provider}/{resolved_prof}\t{}\t{}",
+                final_dir.display(),
+                resolved_acct
+                    .as_deref()
+                    .or(outcome.account.as_deref())
+                    .unwrap_or("-")
+            );
+        }
         return Ok(());
     }
     if let Some(prof) = effective_profile {
@@ -2434,7 +2491,14 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             if let Some((_, uid, gid, _)) = crate::sandbox::seat_for_agent(rec.id.as_str()) {
                 crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
             }
-            println!("signed in\t{target}\t{}\tprofile:{normalized}", rec.harness);
+            if ui::is_pretty() {
+                ui::success(&format!("Signed in · {target} · profile {normalized}"));
+                if ui::is_verbose() {
+                    ui::note(&format!("Harness: {} · Profile: {normalized}", rec.harness));
+                }
+            } else {
+                println!("signed in\t{target}\t{}\tprofile:{normalized}", rec.harness);
+            }
             return Ok(());
         }
     }
@@ -2478,10 +2542,22 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         let store = agent::open_with_key(data)?;
         operator::mint(&store, &rec.id)?;
     }
-    println!(
-        "signed in\t{target}\t{harness}\t{}",
-        outcome.account.as_deref().unwrap_or("-")
-    );
+    if ui::is_pretty() {
+        match outcome
+            .account
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "-")
+        {
+            Some(account) => ui::success(&format!("Signed in · {target} · {harness} · {account}")),
+            None => ui::success(&format!("Signed in · {target} · {harness}")),
+        }
+    } else {
+        println!(
+            "signed in\t{target}\t{harness}\t{}",
+            outcome.account.as_deref().unwrap_or("-")
+        );
+    }
     Ok(())
 }
 
@@ -2773,12 +2849,19 @@ fn interact_cmd(
         client::call(data, "POST", "/v1/interact", Some(payload), &authority)
             .map_err(anyagents_core::Error::Message)?
             .ok_or_else(|| anyagents_core::Error::Message("empty interact response".into()))?;
-    println!(
-        "{}\t{}\t{}",
-        resp.action,
-        resp.target,
-        resp.detail.as_deref().unwrap_or("ok")
-    );
+    if ui::is_pretty() {
+        ui::success(&format!("{} · {}", resp.action, resp.target));
+        if let Some(detail) = resp.detail.as_deref() {
+            ui::note(detail);
+        }
+    } else {
+        println!(
+            "{}\t{}\t{}",
+            resp.action,
+            resp.target,
+            resp.detail.as_deref().unwrap_or("ok")
+        );
+    }
     Ok(())
 }
 
@@ -2881,14 +2964,17 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         let tok_badge = if has_operator_token {
             ui::green("✓ ready")
         } else {
-            ui::yellow("⚠ missing")
+            ui::yellow("○ missing")
         };
         println!(
-            "\n  {}  {} {} {} {} {} {} {}\n",
+            "\n  {}  {}{} {} {} {} {}\n",
             ui::bold_cyan("Server"),
             srv_badge,
-            ui::dim("· socket"),
-            ui::dim(&sock.display().to_string()),
+            if ui::is_verbose() {
+                ui::dim(&format!(" · socket {}", sock.display()))
+            } else {
+                String::new()
+            },
             ui::dim("· webhook"),
             webhook_addr.as_deref().unwrap_or("-"),
             ui::dim("· token"),
@@ -2952,7 +3038,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             for agent in &faulted {
                 println!(
                     "  {} {} {}",
-                    ui::red("◐ faulted"),
+                    ui::red("✗ faulted"),
                     ui::bold(&agent.name),
                     ui::dim(
                         agent
@@ -3079,7 +3165,11 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
             };
             let agent = agent::named(data, &who)?;
             agent::join_group(data, &group, &agent.id)?;
-            println!("{group}\t{}", agent.name);
+            if ui::is_pretty() {
+                ui::success(&format!("{} joined {group}", agent.name));
+            } else {
+                println!("{group}\t{}", agent.name);
+            }
         }
         GroupsCommand::Leave { group, agent } => {
             let who = match agent
@@ -3095,7 +3185,11 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
             };
             let agent = agent::named(data, &who)?;
             agent::leave_group(data, &group, &agent.id)?;
-            println!("{group}\t{}", agent.name);
+            if ui::is_pretty() {
+                ui::success(&format!("{} left {group}", agent.name));
+            } else {
+                println!("{group}\t{}", agent.name);
+            }
         }
         GroupsCommand::Members { group } => {
             let members = agent::group_members(data, &group)?;

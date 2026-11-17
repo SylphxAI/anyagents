@@ -43,6 +43,21 @@ fn output(command: &mut Command) -> String {
 
 /// One bounded HTTP exchange; return the request to prove rendering didn't change it.
 fn remote(args: &[&str], pretty: bool, response: &Value) -> (String, String, Value) {
+    let (out, route, request) = exchange(args, pretty, response, "200 OK");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (String::from_utf8(out.stdout).unwrap(), route, request)
+}
+fn exchange(
+    args: &[&str],
+    pretty: bool,
+    response: &Value,
+    status: &str,
+) -> (std::process::Output, String, Value) {
+    let status = status.to_owned();
     let dir = tempfile::tempdir().unwrap();
     let token = dir.path().join("operator-token");
     std::fs::write(&token, "fixture-token").unwrap();
@@ -83,7 +98,7 @@ fn remote(args: &[&str], pretty: bool, response: &Value) -> (String, String, Val
             .unwrap_or(0);
         let mut request = vec![0; length];
         stream.read_exact(&mut request).unwrap();
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         (
             headers.lines().next().unwrap().to_owned(),
             if request.is_empty() {
@@ -93,11 +108,11 @@ fn remote(args: &[&str], pretty: bool, response: &Value) -> (String, String, Val
             },
         )
     });
-    let stdout = output(
-        command(dir.path(), pretty)
-            .env("ANYAGENTS_OPERATOR_TOKEN_FILE", token)
-            .args(args),
-    );
+    let stdout = command(dir.path(), pretty)
+        .env("ANYAGENTS_OPERATOR_TOKEN_FILE", token)
+        .args(args)
+        .output()
+        .unwrap();
     let (route, request) = server.join().unwrap();
     (stdout, route, request)
 }
@@ -314,4 +329,83 @@ fn empty_human_reads_are_explicit_and_raw_stays_empty() {
         output(command(dir.path(), true).args(["channels", "list"]))
             .contains("No channels recorded.")
     );
+}
+
+#[test]
+fn fleet_aliases_preserve_requests_raw_bytes_and_explicit_json() {
+    let response = json!({"schedules":[{"agent_name":"工作者","id":"schedule-private","kind":"watch","spec":"github:pr:example/repo#1","state":"active","prompt":"Review change"}]});
+    let (raw, route, request) = remote(&["schedules", "--all"], false, &response);
+    assert_eq!(
+        raw,
+        "schedule-private\twatch\tgithub:pr:example/repo#1\tactive\tReview change\n"
+    );
+    assert_eq!(route, "POST http://localhost/v1/schedules HTTP/1.1");
+    assert_eq!(request["agent"], "all");
+    assert_eq!(request["action"], "list");
+    for args in [
+        vec!["automations"],
+        vec!["schedules", "--all"],
+        vec!["schedule", "all"],
+    ] {
+        let (human, human_route, human_request) = remote(&args, true, &response);
+        assert_eq!(human_route, route);
+        assert_eq!(human_request, request);
+        assert!(human.contains("工作者"));
+        assert!(human.contains("AGENT"));
+        assert!(!human.contains("schedule-private"));
+        assert!(!human.contains('\t'));
+        let mut args = args;
+        args.push("--json");
+        let (json, _, json_request) = remote(&args, true, &response);
+        assert_eq!(serde_json::from_str::<Value>(&json).unwrap(), response);
+        assert_eq!(json_request, request);
+    }
+}
+
+#[test]
+fn fleet_errors_never_fall_back_to_offline_state() {
+    for args in [
+        vec!["automations"],
+        vec!["schedules", "--all"],
+        vec!["schedule", "all"],
+    ] {
+        let (out, _, _) = exchange(
+            &args,
+            true,
+            &json!({"error":"fleet permission denied"}),
+            "403 Forbidden",
+        );
+        assert!(!out.status.success());
+        assert!(out.stdout.is_empty());
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(err.contains("fleet permission denied"), "{err}");
+        let data = tempfile::tempdir().unwrap();
+        let out = command(data.path(), true).args(&args).output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("require a running server"));
+        assert!(!data.path().join("state.db").exists());
+    }
+}
+
+#[test]
+fn fleet_mutations_are_refused_before_io() {
+    for args in [
+        vec!["schedules", "--all", "--cancel", "schedule-private"],
+        vec!["schedule", "all", "--cancel", "schedule-private"],
+        vec![
+            "schedule",
+            "agent:all",
+            "--every",
+            "1h",
+            "--prompt",
+            "unsafe",
+        ],
+        vec!["schedule", "all", "--prompt", "unsafe"],
+    ] {
+        let data = tempfile::tempdir().unwrap();
+        let out = command(data.path(), true).args(&args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        assert!(out.stdout.is_empty());
+        assert!(!data.path().join("state.db").exists());
+    }
 }

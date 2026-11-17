@@ -11022,6 +11022,118 @@ mod spawn_args_tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn inspect_preserves_full_view_without_duplicate_alias_or_top_level_schedules() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let parent_id = AgentId::generate();
+        let mut child = dummy_agent_view("agt_child", "worker", "running", "working", None);
+        child.parent = Some(parent_id.to_string());
+        child.instructions = Some("FULL_PRIVATE_INSTRUCTIONS".into());
+        child.schedules = vec![crate::api::ScheduleView {
+            id: "sch_1".into(),
+            agent_id: child.id.clone(),
+            kind: "watch".into(),
+            spec: "github:pr:example/repo#1".into(),
+            prompt: "Verify checks".into(),
+            interval_ms: None,
+            next_fire_at_ms: None,
+            last_fired_at_ms: None,
+            watch_baseline: None,
+            last_observed: None,
+            state: "active".into(),
+            created_at_ms: 1_794_500_000_000,
+        }];
+        let agents_body = serde_json::to_vec(&AgentsResponse {
+            archived_count: 0,
+            agents: vec![child],
+            gateway: None,
+        })
+        .unwrap();
+        let conv_body = serde_json::to_vec(&ConversationResponse {
+            retrieval: None,
+            agent_id: "agt_child".into(),
+            agent: "worker".into(),
+            turns: Vec::new(),
+        })
+        .unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let byte = stream.read_u8().await.unwrap();
+                    request.push(byte);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let line = std::str::from_utf8(&request)
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap();
+                let path = line.split_whitespace().nth(1).unwrap();
+                let body = if path.contains("/conversation") {
+                    &conv_body
+                } else {
+                    &agents_body
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: parent_id,
+                name: "parent".into(),
+                workdir: None,
+            },
+            client: Client::new(
+                socket,
+                dir.path().join("config"),
+                "synthetic-test-capability".into(),
+            ),
+            profile: McpProfile::Full,
+        };
+        let inspected = mcp
+            .agents(Parameters(
+                serde_json::from_value(json!({"action": "inspect", "name": "worker"})).unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            inspected["agent"]["instructions"],
+            "FULL_PRIVATE_INSTRUCTIONS"
+        );
+        assert_eq!(inspected["agent"]["schedules"].as_array().unwrap().len(), 1);
+        assert!(inspected.get("subagent").is_none());
+        assert!(inspected.get("schedules").is_none());
+
+        let legacy = mcp
+            .subagents(Parameters(
+                serde_json::from_value(json!({"action": "inspect", "agent": "worker"})).unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            legacy["subagent"]["instructions"],
+            "FULL_PRIVATE_INSTRUCTIONS"
+        );
+        assert_eq!(legacy["subagent"]["schedules"].as_array().unwrap().len(), 1);
+        assert!(legacy.get("agent").is_none());
+        assert!(legacy.get("schedules").is_none());
+        server.await.unwrap();
+    }
+
     #[test]
     fn mcp_and_api_accept_singular_instruction_and_system_prompt_aliases() {
         for key in ["instruction", "system_prompt"] {

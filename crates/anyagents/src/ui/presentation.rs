@@ -49,7 +49,13 @@ fn value_at(value: &serde_json::Value, indent: usize) {
                 if !is_verbose()
                     && matches!(
                         key.as_str(),
-                        "path" | "workdir" | "config_dir" | "binary" | "socket" | "profile_dir"
+                        "id" | "agent_id"
+                            | "path"
+                            | "workdir"
+                            | "config_dir"
+                            | "binary"
+                            | "socket"
+                            | "profile_dir"
                     )
                 {
                     continue;
