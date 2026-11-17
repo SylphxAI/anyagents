@@ -974,9 +974,6 @@ fn stop_for_wake<H: Harness + 'static>(
     {
         return Err("agent fault changed during wake recovery".into());
     }
-    if let Some(exits) = lock(&inner.exits).get_mut(id) {
-        exits.retain(|exit| !exit.is_set() || !matches!(*lock(&exit.retirement), Some(Ok(()))));
-    }
     let mut board = lock(&inner.board.inner);
     let live = board
         .get_mut(id)
@@ -1088,7 +1085,11 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
     {
         let mut exits = lock(&inner.exits);
         let generations = exits.entry(id.clone()).or_default();
-        generations.retain(|exit| !exit.is_set() || exit.wake_stop.load(Ordering::SeqCst));
+        generations.retain(|exit| {
+            !exit.is_set()
+                || (exit.wake_stop.load(Ordering::SeqCst)
+                    && !matches!(*lock(&exit.retirement), Some(Ok(()))))
+        });
         generations.push(Arc::clone(&done));
     }
     let run_inner = Arc::clone(inner);
@@ -4418,6 +4419,45 @@ mod custody_tests {
             sup.live(&agent.id).and_then(|l| l.last_error),
             None,
             "reaped generation overwrote cleared fault after stop_for_wake"
+        );
+
+        // Regression for queued router Wake::Agent ("paused") running stop_slot
+        // between stop_for_wake returning Ok(()) and clear_wake_fault:
+        // stop_slot must still observe recovering==true and leave last_error
+        // intact for clear_wake_fault, then ensure() prunes the retired exit.
+        let agent2 = store
+            .create_agent(NewAgent::new("queued-stop-slot", "claude-code"))
+            .unwrap();
+        store
+            .set_agent_running(&agent2.id, &work.display().to_string())
+            .unwrap();
+        let deadline2 = Instant::now() + Duration::from_secs(5);
+        while sup.live(&agent2.id).and_then(|l| l.last_error).as_deref()
+            != Some("mid-turn transport fault")
+        {
+            assert!(Instant::now() < deadline2, "fault never published");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = release_tx.send(());
+        sup.board()
+            .stop_for_wake(
+                &agent2.id,
+                "mid-turn transport fault",
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        stop_slot(&sup.inner, &agent2.id);
+        let custody2 = store.try_lock_agent(&agent2.id).unwrap();
+        sup.board()
+            .clear_wake_fault(&agent2.id, "mid-turn transport fault")
+            .unwrap();
+        drop(custody2);
+        store.set_agent_state(&agent2.id, "running").unwrap();
+        ensure(&sup.inner, agent2.id.clone());
+        assert_eq!(
+            lock(&sup.inner.exits).get(&agent2.id).map(Vec::len),
+            Some(1),
+            "ensure must prune completed wake_stop Ok(()) generation when replacement starts"
         );
     }
 
