@@ -11,21 +11,21 @@ use std::{collections::VecDeque, sync::Arc, thread};
 const AGENT: &str = "00000000-0000-4000-8000-000000000001";
 const TASK: &str = "00000000-0000-4000-8000-000000000002";
 #[derive(Clone, Debug)]
-struct Request {
-    method: Method,
-    uri: String,
-    headers: HeaderMap,
-    body: Value,
+pub(super) struct Request {
+    pub(super) method: Method,
+    pub(super) uri: String,
+    pub(super) headers: HeaderMap,
+    pub(super) body: Value,
 }
 type Script = Arc<Mutex<(VecDeque<(u16, Value)>, Vec<Request>)>>;
-struct Mock {
-    base: String,
+pub(super) struct Mock {
+    pub(super) base: String,
     state: Script,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     join: Option<thread::JoinHandle<()>>,
 }
 impl Mock {
-    fn new(replies: Vec<(u16, Value)>) -> Self {
+    pub(super) fn new(replies: Vec<(u16, Value)>) -> Self {
         let state: Script = Arc::new(Mutex::new((replies.into(), Vec::new())));
         let (addr_tx, addr_rx) = std::sync::mpsc::channel();
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -52,7 +52,7 @@ impl Mock {
             join: Some(join),
         }
     }
-    fn config(&self) -> tempfile::TempDir {
+    pub(super) fn config(&self) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("cloud.json"),
@@ -61,10 +61,10 @@ impl Mock {
         .unwrap();
         dir
     }
-    fn requests(&self) -> Vec<Request> {
+    pub(super) fn requests(&self) -> Vec<Request> {
         self.state.lock().unwrap().1.clone()
     }
-    fn consumed(&self) {
+    pub(super) fn consumed(&self) {
         assert!(self.state.lock().unwrap().0.is_empty());
     }
 }

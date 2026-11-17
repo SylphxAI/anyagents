@@ -13,6 +13,12 @@ struct Pending {
     key: String,
     body: Value,
     receipt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mailbox_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_delivery: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed: Option<Value>,
 }
 
 fn save(path: &Path, value: &[u8]) -> Result<(), String> {
@@ -20,7 +26,7 @@ fn save(path: &Path, value: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("cannot persist Spiron state: {e}"))
 }
 
-fn pending(path: &Path, scope: &str, body: Value) -> Result<Pending, String> {
+fn pending(path: &Path, scope: &str, body: Value, key: Option<&str>) -> Result<Pending, String> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let p: Pending = serde_json::from_slice(&bytes)
@@ -48,16 +54,21 @@ fn pending(path: &Path, scope: &str, body: Value) -> Result<Pending, String> {
                 .collect::<String>();
             let p = Pending {
                 scope: scope.to_string(),
-                key: format!(
-                    "{}-{}-{}-{}-{}",
-                    &h[..8],
-                    &h[8..12],
-                    &h[12..16],
-                    &h[16..20],
-                    &h[20..]
-                ),
+                key: key.map(str::to_string).unwrap_or_else(|| {
+                    format!(
+                        "{}-{}-{}-{}-{}",
+                        &h[..8],
+                        &h[8..12],
+                        &h[12..16],
+                        &h[16..20],
+                        &h[20..]
+                    )
+                }),
                 body,
                 receipt: None,
+                mailbox_uuid: key.map(str::to_string),
+                input_delivery: None,
+                completed: None,
             };
             save(path, &serde_json::to_vec(&p).map_err(|e| e.to_string())?)?;
             Ok(p)
@@ -144,6 +155,159 @@ impl Api {
     }
 }
 
+mod controller;
+pub(super) use controller::serve;
+
+/// One controller owns the config lock and credential identity. Message requests
+/// do not compete for this lock, and key rotation cannot split a conversation.
+struct Session {
+    _lock: std::fs::File,
+    api: Api,
+    agent_id: String,
+    scope: String,
+}
+
+impl Session {
+    fn open(config: &Path, model: Option<&str>, resume: Option<&str>) -> Result<Self, String> {
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(config.join("spiron-cloud.lock"))
+            .map_err(|_| "cannot open Spiron turn lock")?;
+        lock.try_lock()
+            .map_err(|_| "another Spiron controller owns this config")?;
+        let api = Api::new(config);
+        // Bind persisted identities and capabilities to the endpoint that created them.
+        let origin = config.join("spiron-cloud-origin.json");
+        match std::fs::read(&origin) {
+            Ok(bytes) => {
+                let bound: String =
+                    serde_json::from_slice(&bytes).map_err(|_| "invalid Spiron origin state")?;
+                if bound != api.base {
+                    return Err("Spiron identity belongs to another API origin".into());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                save(
+                    &origin,
+                    &serde_json::to_vec(&api.base).map_err(|e| e.to_string())?,
+                )?;
+            }
+            Err(_) => return Err("cannot read Spiron origin state".into()),
+        }
+        // Changing API key changes the remote connection and conversation. Refuse
+        // silently rebinding an existing identity, including across restarts.
+        let credential = format!(
+            "{:x}",
+            Sha256::digest(api.token.as_deref().unwrap_or("").as_bytes())
+        );
+        let binding = config.join("spiron-cloud-credential.json");
+        match std::fs::read(&binding) {
+            Ok(bytes) => {
+                let previous: String = serde_json::from_slice(&bytes)
+                    .map_err(|_| "invalid Spiron credential binding")?;
+                if previous != credential {
+                    return Err(
+                        "Spiron API key changed; explicit conversation migration required".into(),
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => save(
+                &binding,
+                &serde_json::to_vec(&credential).map_err(|e| e.to_string())?,
+            )?,
+            Err(_) => return Err("cannot read Spiron credential binding".into()),
+        }
+        let identity_path = config.join(session_filename_for(HARNESS));
+        let agent_id = if let Some(id) = resume
+            .map(str::to_string)
+            .or_else(|| read_persisted_session_id(config, HARNESS))
+        {
+            identifier(&json!({"id": id}), "id")?
+        } else {
+            let path = config.join("spiron-cloud-create.json");
+            let mut body = json!({"name": "Remote worker", "tools": {"disabled": resolve_cloud_disabled_tools(config)}});
+            if let Some(model) = model {
+                body["model"] = json!(model);
+            }
+            if let Some(instructions) = build_cloud_system_prompt(config) {
+                body["instructions"] = json!(instructions);
+            }
+            if let Some(context) = workspace_context(config)?
+                && let Some(repo) = context
+                    .get("repo")
+                    .and_then(Value::as_str)
+                    .and_then(github_repository)
+            {
+                body["github"] = json!({"repositories": [repo]});
+            }
+            let request = pending(&path, &api.base, body, None)?;
+            let created = api.post("/v1/agents", &request)?;
+            let id = identifier(&created, "id")?;
+            save(&identity_path, format!("{id}\n").as_bytes())?;
+            std::fs::remove_file(path).map_err(|e| e.to_string())?;
+            id
+        };
+        save(
+            &identity_path,
+            format!(
+                "{agent_id}
+"
+            )
+            .as_bytes(),
+        )?;
+
+        let scope = format!("{}/{}/{}", api.base, agent_id, credential);
+        Ok(Self {
+            _lock: lock,
+            api,
+            agent_id,
+            scope,
+        })
+    }
+
+    fn body(config: &Path, prompt: &str) -> Result<Value, String> {
+        let content = if let Some(context) = workspace_context(config)? {
+            format!("Remote workspace context (repository, branch, base): {context}
+Prepare this checkout in your cloud workspace before repository work; never use the controller filesystem.
+
+{prompt}")
+        } else {
+            prompt.to_string()
+        };
+        let mut body = json!({"content": content});
+        // Never export the local mailbox capability. Re-read the expiring remote token each turn.
+        if config.join(crate::remote::TOKEN_FILE).exists() {
+            let url = resolve_public_mcp_url(config)?;
+            let parsed = url::Url::parse(&url).map_err(|_| "invalid Spiron MCP callback URL")?;
+            let loopback_test = cfg!(test)
+                && read_cloud_json(config)
+                    .and_then(|v| v.get("allow_loopback_mcp").and_then(Value::as_bool))
+                    == Some(true)
+                && parsed
+                    .host_str()
+                    .is_some_and(|h| matches!(h, "127.0.0.1" | "[::1]"));
+            if (parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback_test))
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err(
+                    "Spiron MCP callback requires HTTPS without credentials or fragment".into(),
+                );
+            }
+            let capability = crate::remote::session_token(config)?;
+            body["mcp_servers"] = json!([{"name": "anyagents", "url": mcp_url_with_profile(&url, remote_mcp_profile(config)), "bearer_token": capability}]);
+        }
+
+        Ok(body)
+    }
+}
+
+/// Synchronous callers use the same session/request engine. The stream
+/// controller supplies mailbox UUIDs; this older API retains its durable key.
 pub(super) fn dispatch(
     config: &Path,
     model: Option<&str>,
@@ -152,179 +316,35 @@ pub(super) fn dispatch(
     cancel: &TurnCancel,
     active: &Mutex<Option<String>>,
 ) -> Result<CloudTurnOutcome, String> {
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(config.join("spiron-cloud.lock"))
-        .map_err(|_| "cannot open Spiron turn lock")?;
-    lock.try_lock()
-        .map_err(|_| "another Spiron turn owns this config")?;
-    let api = Api::new(config);
-    // Bind persisted identities and capabilities to the endpoint that created them.
-    let origin = config.join("spiron-cloud-origin.json");
-    match std::fs::read(&origin) {
-        Ok(bytes) => {
-            let bound: String =
-                serde_json::from_slice(&bytes).map_err(|_| "invalid Spiron origin state")?;
-            if bound != api.base {
-                return Err("Spiron identity belongs to another API origin".into());
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            save(
-                &origin,
-                &serde_json::to_vec(&api.base).map_err(|e| e.to_string())?,
-            )?;
-        }
-        Err(_) => return Err("cannot read Spiron origin state".into()),
-    }
-    let deadline = Instant::now() + TURN_BUDGET;
-    let identity_path = config.join(session_filename_for(HARNESS));
-    let agent_id = if let Some(id) = resume
-        .map(str::to_string)
-        .or_else(|| read_persisted_session_id(config, HARNESS))
-    {
-        identifier(&json!({"id": id}), "id")?
-    } else {
-        let path = config.join("spiron-cloud-create.json");
-        let mut body = json!({"name": "Remote worker", "tools": {"disabled": resolve_cloud_disabled_tools(config)}});
-        if let Some(model) = model {
-            body["model"] = json!(model);
-        }
-        if let Some(instructions) = build_cloud_system_prompt(config) {
-            body["instructions"] = json!(instructions);
-        }
-        if let Some(context) = workspace_context(config)?
-            && let Some(repo) = context
-                .get("repo")
-                .and_then(Value::as_str)
-                .and_then(github_repository)
-        {
-            body["github"] = json!({"repositories": [repo]});
-        }
-        let request = pending(&path, &api.base, body)?;
-        let created = api.post("/v1/agents", &request)?;
-        let id = identifier(&created, "id")?;
-        save(&identity_path, format!("{id}\n").as_bytes())?;
-        std::fs::remove_file(path).map_err(|e| e.to_string())?;
-        id
-    };
-    save(
-        &identity_path,
-        format!(
-            "{agent_id}
-"
-        )
-        .as_bytes(),
-    )?;
+    let session = Session::open(config, model, resume)?;
     if cancel.is_cancelled() {
         return Err("cancelled before Spiron message submission".into());
     }
     let path = config.join("spiron-cloud-message.json");
-    let content = if let Some(context) = workspace_context(config)? {
-        format!("Remote workspace context (repository, branch, base): {context}
-Prepare this checkout in your cloud workspace before repository work; never use the controller filesystem.
-
-{prompt}")
-    } else {
-        prompt.to_string()
-    };
-    let mut body = json!({"content": content});
-    // Never export the local mailbox capability. Re-read the expiring remote token each turn.
-    if config.join(crate::remote::TOKEN_FILE).exists() {
-        let url = resolve_public_mcp_url(config)?;
-        let parsed = url::Url::parse(&url).map_err(|_| "invalid Spiron MCP callback URL")?;
-        let loopback_test = cfg!(test)
-            && read_cloud_json(config)
-                .and_then(|v| v.get("allow_loopback_mcp").and_then(Value::as_bool))
-                == Some(true)
-            && parsed
-                .host_str()
-                .is_some_and(|h| matches!(h, "127.0.0.1" | "[::1]"));
-        if (parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback_test))
-            || parsed.host_str().is_none()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.fragment().is_some()
-        {
+    let mut input = controller::Input::prepare(&session, config, path, None, prompt)?;
+    let deadline = Instant::now() + TURN_BUDGET;
+    let result = (|| loop {
+        if let Some(outcome) = input.advance(&session, false)? {
+            return Ok(outcome);
+        }
+        if let Some(reason) = input.failure.take() {
+            return Err(reason);
+        }
+        *active.lock().unwrap() = input.request.receipt.clone();
+        if cancel.is_cancelled() || Instant::now() >= deadline {
+            if let Some(task) = &input.request.receipt {
+                cancel_cloud_turn(
+                    &session.api.base,
+                    HARNESS,
+                    session.api.token.as_deref(),
+                    task,
+                )?;
+            }
             return Err(
-                "Spiron MCP callback requires HTTPS without credentials or fragment".into(),
+                "Spiron cancellation requested; receipt retained for reconciliation".into(),
             );
         }
-        let capability = crate::remote::session_token(config)?;
-        body["mcp_servers"] = json!([{"name": "anyagents", "url": mcp_url_with_profile(&url, remote_mcp_profile(config)), "bearer_token": capability}]);
-    }
-    let expected_content = body["content"].clone();
-    let mut request = pending(&path, &format!("{}/{}", api.base, agent_id), body)?;
-    if request.body.get("content") != Some(&expected_content) {
-        return Err(
-            "unfinished Spiron turn retained; resume it before submitting another prompt".into(),
-        );
-    }
-    let mut receipt = if let Some(task) = &request.receipt {
-        identifier(&json!({"id": task}), "id")?;
-        api.get(&format!("/v1/message-receipts/{task}"))?
-    } else {
-        let receipt = api.post(&format!("/v1/agents/{agent_id}/messages"), &request)?;
-        request.receipt = Some(identifier(&receipt, "id")?);
-        save(
-            &path,
-            &serde_json::to_vec(&request).map_err(|e| e.to_string())?,
-        )?;
-        receipt
-    };
-    let task = request.receipt.as_deref().ok_or("Spiron receipt missing")?;
-    *active.lock().unwrap() = Some(task.to_string());
-    let result = (|| {
-        loop {
-            if identifier(&receipt, "id")? != task
-                || receipt.get("agent_id").and_then(Value::as_str) != Some(&agent_id)
-            {
-                return Err("Spiron receipt identity mismatch".into());
-            }
-            match receipt.get("status").and_then(Value::as_str) {
-                Some("completed") => {
-                    // The receipt is the completion authority; conversation pages are a projection.
-                    let projection = conversation_reply(&api, &agent_id, task, cancel, deadline);
-                    // Receipt.reply contains every joined reply; a projection may still lag.
-                    let reply = match receipt
-                        .get("reply")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                    {
-                        Some(reply) => reply.to_string(),
-                        None => projection?
-                            .filter(|s| !s.is_empty())
-                            .ok_or("completed Spiron receipt has no reply")?,
-                    };
-                    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
-                    return Ok(CloudTurnOutcome {
-                        session_id: agent_id.clone(),
-                        reply_text: reply,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                    });
-                }
-                Some("failed" | "canceled") => {
-                    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
-                    return Err(format!(
-                        "Spiron turn {}",
-                        receipt["status"].as_str().unwrap()
-                    ));
-                }
-                Some("submitted" | "working" | "input_required") => {}
-                _ => return Err("Spiron receipt has missing or unknown status".into()),
-            }
-            if cancel.is_cancelled() || Instant::now() >= deadline {
-                cancel_cloud_turn(&api.base, HARNESS, api.token.as_deref(), task)?;
-                return Err(
-                    "Spiron cancellation requested; receipt retained for reconciliation".into(),
-                );
-            }
-            cancel.wait(Duration::from_millis(250));
-            receipt = api.get(&format!("/v1/message-receipts/{task}"))?;
-        }
+        cancel.wait(Duration::from_millis(250));
     })();
     *active.lock().unwrap() = None;
     result
