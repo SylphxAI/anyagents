@@ -31,24 +31,41 @@ fn attrs(fd: &File) -> libc::termios {
 impl Pty {
     fn start(scenario: &str) -> Self {
         let (mut master, mut slave) = (0, 0);
+        #[cfg(target_vendor = "apple")]
+        let mut size = libc::winsize {
+            ws_row: 24,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        #[cfg(not(target_vendor = "apple"))]
         let size = libc::winsize {
             ws_row: 24,
             ws_col: 100,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        assert_eq!(
-            unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    &size,
-                )
-            },
-            0
-        );
+        #[cfg(target_vendor = "apple")]
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut size,
+            )
+        };
+        #[cfg(not(target_vendor = "apple"))]
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &raw const size,
+            )
+        };
+        assert_eq!(opened, 0);
         let master = unsafe { File::from_raw_fd(master) };
         let slave = unsafe { File::from_raw_fd(slave) };
         let saved = attrs(&slave);
