@@ -4,6 +4,7 @@ CREATE TABLE task_turn_contexts (
     opener_id TEXT NOT NULL,
     opener_seq INTEGER NOT NULL,
     token TEXT NOT NULL UNIQUE,
+    synthetic_recovery INTEGER NOT NULL DEFAULT 0,
     sent_to_parent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
     closed_delivery_seq INTEGER,
     PRIMARY KEY (child_id, opener_id)

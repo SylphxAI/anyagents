@@ -85,6 +85,10 @@ fn cancel_archived_schedules(conn: &Connection, id: &AgentId) -> Result<(), Erro
          WHERE agent_id = ?1 AND state = 'active'",
         [id.as_str()],
     )?;
+    conn.execute(
+        "DELETE FROM task_turn_contexts WHERE child_id = ?1 AND closed_delivery_seq IS NULL",
+        [id.as_str()],
+    )?;
     Ok(())
 }
 
@@ -2652,12 +2656,14 @@ impl Store {
                 return Ok(ReceiveTx::Early(None));
             }
             if let Some((sender, token)) = turn {
-                let active: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM task_turn_contexts
-                      WHERE child_id = ?1 AND token = ?2 AND closed_delivery_seq IS NULL)",
-                    params![sender.as_str(), token],
-                    |row| row.get(0),
-                )?;
+                let sender_agent = agent_by_id(tx, sender)?;
+                let active = sender_agent.is_task_subagent() && sender_agent.state != "archived"
+                    && tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM task_turn_contexts
+                         WHERE child_id = ?1 AND token = ?2 AND closed_delivery_seq IS NULL)",
+                        params![sender.as_str(), token],
+                        |row| row.get::<_, bool>(0),
+                    )?;
                 if !active {
                     return Err(Error::PermissionDenied("invalid or closed task turn context".into()));
                 }

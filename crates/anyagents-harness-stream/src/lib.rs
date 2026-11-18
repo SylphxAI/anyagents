@@ -987,6 +987,9 @@ impl StreamHarness {
 
     pub fn task_turn_result(&self, input_id: &str) -> Option<(String, String)> {
         let state = lock(&self.shared);
+        if !state.turn_tool_context {
+            return None;
+        }
         let (opener, text, inputs) = state.task_turn_result.as_ref()?;
         inputs
             .contains(input_id)
@@ -2252,8 +2255,33 @@ fn read_stdout(
                         .to_string(),
                 );
             }
-            let consumption =
-                spec.protocol == LineProtocol::AcknowledgedResult && state.ready == Some(true);
+            // Attach replays before its own ready. A terminal receipt with
+            // durable membership can rebuild proofs even if all matching
+            // accepted frames precede the replay cursor. Ordinary live or
+            // legacy results still require the existing correlations.
+            let replay_receipt = if spec.protocol == LineProtocol::AcknowledgedResult
+                && state.v2_attach.is_some()
+                && !state.attached
+                && kind == Some("result")
+                && synthetic_401.is_none()
+                && let Some(opener) = value.get("request_id").and_then(Value::as_str)
+                && let Some(members) = bound_consumed(&value, opener)
+                && members.iter().all(|id| {
+                    !state.duplicates.contains(*id)
+                        && state
+                            .input_turns
+                            .get(*id)
+                            .is_none_or(|owner| owner == opener)
+                }) {
+                for id in members {
+                    settle_consumed(&mut state, id, opener);
+                }
+                true
+            } else {
+                false
+            };
+            let consumption = spec.protocol == LineProtocol::AcknowledgedResult
+                && (state.ready == Some(true) || replay_receipt);
             if consumption {
                 retry_after = note_consumption_receipt(&mut state, kind, &value);
             }
@@ -2995,6 +3023,39 @@ fn release_input(state: &mut State, id: &str) {
     state.seen.remove(id);
 }
 
+/// The sensitive context is never echoed; the peer attests it was bound to
+/// this opener and names the inputs it actually journaled, not merely acked.
+fn bound_consumed<'a>(value: &'a Value, opener: &str) -> Option<HashSet<&'a str>> {
+    if value.get("tool_context_bound").and_then(Value::as_bool) != Some(true)
+        || value.get("status").and_then(Value::as_str) != Some("completed")
+        || value.get("is_error").and_then(Value::as_bool) != Some(false)
+        || value.get("duplicate").and_then(Value::as_bool) != Some(false)
+        || value.get("error").is_some_and(|error| !error.is_null())
+    {
+        return None;
+    }
+    let items = value.get("consumed_request_ids")?.as_array()?;
+    if items.first()?.as_str() != Some(opener) || opener.is_empty() {
+        return None;
+    }
+    let ids: HashSet<_> = items.iter().map(Value::as_str).collect::<Option<_>>()?;
+    if ids.len() != items.len()
+        || ids.contains("")
+        || value
+            .get("undelivered_steer_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|id| ids.contains(id))
+            })
+    {
+        return None;
+    }
+    Some(ids)
+}
+
 /// The result that closes `turn` for a peer that proves consumption. Its
 /// consumed inputs are finished, the turn's usage on its opener; inputs it
 /// acknowledged but never consumed, and every id it lists undelivered, go
@@ -3029,18 +3090,21 @@ fn finish_consumed(state: &mut State, turn: &str, usage: TurnUsage, value: &Valu
         .filter(|(_, owner)| owner.as_str() == turn)
         .map(|(id, _)| id.clone())
         .collect();
-    if state.turn_tool_context
+    if (state.turn_tool_context || (state.v2_attach.is_some() && !state.attached))
         && state.sign_in_fault.is_none()
         && state.quota_reset_at_ms.is_none()
-        && !state.duplicates.contains(turn)
-        && value.get("duplicate").and_then(Value::as_bool) != Some(true)
+        && let Some(inputs) = bound_consumed(value, turn)
+        && inputs.iter().all(|id| {
+            state
+                .input_turns
+                .get(*id)
+                .is_some_and(|owner| owner == turn)
+                && state.consumed.contains(*id)
+                && !state.duplicates.contains(*id)
+        })
         && let Some(text) = value.get("final_text").and_then(Value::as_str)
     {
-        let inputs = members
-            .iter()
-            .filter(|id| state.consumed.contains(*id) && !state.duplicates.contains(*id))
-            .cloned()
-            .collect();
+        let inputs = inputs.into_iter().map(str::to_owned).collect();
         let text = anyagents_harness::masking::mask_known_secrets(text)
             .chars()
             .take(16384)

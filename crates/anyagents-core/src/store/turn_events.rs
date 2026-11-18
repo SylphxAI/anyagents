@@ -22,7 +22,9 @@ pub(super) fn record_terminal(
         [agent_id.as_str()],
         |row| row.get(0),
     )?;
-    record_terminal_for(conn, agent_id, seq, outcome)?;
+    if record_terminal_for(conn, agent_id, seq, outcome)? {
+        revoke_task_contexts_through(conn, agent_id, seq)?;
+    }
     Ok(())
 }
 
@@ -48,6 +50,18 @@ fn record_terminal_for(
         params![agent_id.as_str(), delivered_seq, outcome],
     )?;
     Ok(changed != 0)
+}
+
+fn revoke_task_contexts_through(
+    conn: &Connection,
+    child_id: &AgentId,
+    seq: i64,
+) -> Result<(), Error> {
+    conn.execute(
+        "DELETE FROM task_turn_contexts WHERE child_id = ?1 AND opener_seq <= ?2 AND closed_delivery_seq IS NULL",
+        params![child_id.as_str(), seq],
+    )?;
+    Ok(())
 }
 
 fn task_return_on(
@@ -114,19 +128,21 @@ fn task_return_on(
 }
 
 impl Store {
-    pub fn mailbox_message_id_at(
+    pub fn task_result_inputs_at(
         &self,
         agent_id: &AgentId,
         seq: i64,
-    ) -> Result<Option<String>, Error> {
-        Ok(self
-            .read_conn()
-            .query_row(
-                "SELECT id FROM messages WHERE agent_id = ?1 AND seq = ?2",
-                params![agent_id.as_str(), seq],
-                |row| row.get(0),
-            )
-            .optional()?)
+    ) -> Result<Vec<String>, Error> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id FROM messages WHERE agent_id = ?1 AND seq = ?2
+             UNION ALL SELECT opener_id FROM task_turn_contexts
+             WHERE child_id = ?1 AND opener_seq = ?2 AND synthetic_recovery = 1
+               AND closed_delivery_seq IS NULL",
+        )?;
+        Ok(stmt
+            .query_map(params![agent_id.as_str(), seq], |row| row.get(0))?
+            .collect::<Result<_, _>>()?)
     }
 
     /// Allocate transport-only context for a task mailbox opener before the
@@ -153,6 +169,36 @@ impl Store {
             Ok(tx.query_row(
                 "SELECT token FROM task_turn_contexts WHERE child_id = ?1 AND opener_id = ?2 AND closed_delivery_seq IS NULL",
                 params![child_id.as_str(), opener_id],
+                |row| row.get(0),
+            ).optional()?)
+        })
+    }
+
+    /// A crash-recovery note is a real new engine opener, but not an inbox
+    /// row. Bind it to the exact durable open turn snapshot it describes.
+    pub fn prepare_recovery_task_turn_context(
+        &self,
+        child_id: &AgentId,
+        opener_id: &str,
+        opened_seq: i64,
+        recovery_count: i64,
+    ) -> Result<Option<String>, Error> {
+        self.write_tx(|tx| {
+            let child = agent_by_id(tx, child_id)?;
+            if !child.is_task_subagent() || child.state != "running" {
+                return Ok(None);
+            }
+            tx.execute(
+                "INSERT INTO task_turn_contexts(child_id, opener_id, opener_seq, token, synthetic_recovery)
+                 SELECT agent_id, ?2, opened_seq, ?5, 1 FROM turn_recovery
+                 WHERE agent_id = ?1 AND opened_seq = ?3 AND recovery_count = ?4 AND opened_seq > completed_seq
+                 ON CONFLICT(child_id, opener_id) DO NOTHING",
+                params![child_id.as_str(), opener_id, opened_seq, recovery_count, uuid::Uuid::new_v4().simple().to_string()],
+            )?;
+            Ok(tx.query_row(
+                "SELECT token FROM task_turn_contexts WHERE child_id = ?1 AND opener_id = ?2
+                 AND opener_seq = ?3 AND synthetic_recovery = 1 AND closed_delivery_seq IS NULL",
+                params![child_id.as_str(), opener_id, opened_seq],
                 |row| row.get(0),
             ).optional()?)
         })
@@ -202,6 +248,7 @@ impl Store {
                 .map(|(opener, text)| task_return_on(tx, agent_id, delivered_seq, opener, text))
                 .transpose()?
                 .flatten();
+            revoke_task_contexts_through(tx, agent_id, delivered_seq)?;
             Ok((true, notice))
         })?;
         if let Some(notice) = notice {
@@ -224,6 +271,7 @@ impl Store {
             if !record_terminal_for(tx, agent_id, delivered_seq, "errored")? {
                 return Ok(false);
             }
+            revoke_task_contexts_through(tx, agent_id, delivered_seq)?;
             super::turn_errors::record_error(tx, agent_id, error, strike)?;
             Ok(true)
         })
@@ -397,6 +445,104 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(store.inbox(&parent.id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scheduled_archived_and_standing_children_do_not_return() {
+        for case in ["scheduled", "archived", "standing"] {
+            let (_dir, store, parent, child) = task_fixture();
+            let opener = super::super::runtime_tests::receive(&store, &child, case);
+            if case == "standing" {
+                store.set_agent_lifecycle(&child.id, "standing").unwrap();
+            }
+            let token = store
+                .prepare_task_turn_context(&child.id, opener.id.as_str())
+                .unwrap();
+            assert_eq!(token.is_some(), case != "standing");
+            store.note_delivered(&child.id, opener.seq).unwrap();
+            if case == "scheduled" {
+                store
+                    .create_schedule(NewSchedule {
+                        agent_id: child.id.clone(),
+                        kind: "at".into(),
+                        spec: "future".into(),
+                        prompt: "future work".into(),
+                        interval_ms: None,
+                        next_fire_at_ms: Some(now_ms() + 60_000),
+                        watch_baseline: None,
+                    })
+                    .unwrap();
+            } else if case == "archived" {
+                store.set_agent_state(&child.id, "archived").unwrap();
+                assert!(
+                    store
+                        .receive_turn_send(
+                            &parent.id,
+                            Incoming::new("revoked"),
+                            false,
+                            &child.id,
+                            token.as_deref().unwrap()
+                        )
+                        .is_err()
+                );
+            }
+            assert!(
+                store
+                    .note_turn_completed_with_output_for(
+                        &child.id,
+                        opener.seq,
+                        Some((opener.id.as_str(), "must not return"))
+                    )
+                    .unwrap()
+            );
+            assert!(store.inbox(&parent.id, None).unwrap().is_empty(), "{case}");
+        }
+    }
+
+    #[test]
+    fn synthetic_recovery_is_bound_to_its_durable_span() {
+        let (_dir, store, parent, child) = task_fixture();
+        let opener = super::super::runtime_tests::receive(&store, &child, "interrupted work");
+        store.note_delivered(&child.id, opener.seq).unwrap();
+        let open = store.open_turn(&child.id).unwrap().unwrap();
+        assert!(
+            store
+                .prepare_recovery_task_turn_context(
+                    &child.id,
+                    "recovery-stale",
+                    open.opened_seq,
+                    open.recovery_count + 1
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .prepare_recovery_task_turn_context(
+                    &child.id,
+                    "recovery-exact",
+                    open.opened_seq,
+                    open.recovery_count
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store.task_result_inputs_at(&child.id, opener.seq).unwrap(),
+            [opener.id.to_string(), "recovery-exact".into()]
+        );
+        assert!(
+            store
+                .note_turn_completed_with_output_for(
+                    &child.id,
+                    opener.seq,
+                    Some(("recovery-exact", "recovered answer"))
+                )
+                .unwrap()
+        );
+        let rows = store.inbox(&parent.id, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].text.contains(">recovered answer</task_return>"));
     }
 
     #[test]

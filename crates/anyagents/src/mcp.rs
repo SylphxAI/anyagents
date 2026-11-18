@@ -4080,7 +4080,18 @@ impl rmcp::ServerHandler for AgentMcp {
             ));
         }
         let ct = context.ct.clone();
-        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        // rmcp moves params._meta into RequestContext. Scope the opaque
+        // opener credential to this dispatch, including nested code calls.
+        let mut scoped = self.clone();
+        if !scoped.client.via_http {
+            scoped.client.turn_context = context
+                .meta
+                .get("io.spiron/turn-context")
+                .and_then(serde_json::Value::as_str)
+                .filter(|token| is_task_turn_context(token))
+                .map(str::to_owned);
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(&scoped, request, context);
         as_call(
             Call::new(Arc::new(move || ct.is_cancelled())),
             Self::tool_router().call(tcc),
@@ -5537,16 +5548,8 @@ impl AgentMcp {
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                let mut scoped = self.clone();
-                if !self.client.via_http {
-                    scoped.client.turn_context = params
-                        .pointer("/_meta/io.spiron~1turn-context")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|token| is_task_turn_context(token))
-                        .map(str::to_owned);
-                }
                 let call_result =
-                    match scoped.dispatch_any_tool(tool_name, args).await {
+                    match self.dispatch_any_tool(tool_name, args).await {
                         Ok((val, media)) => {
                             let mut res = rmcp::model::CallToolResult::structured(val);
                             res.content.extend(media);

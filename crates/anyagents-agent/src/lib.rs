@@ -20,8 +20,9 @@ fn complete_for<H: Harness>(
 ) -> Result<bool, Error> {
     let result = if harness.supports_turn_tool_context() {
         store
-            .mailbox_message_id_at(agent_id, seq)?
-            .and_then(|id| harness.task_turn_result(&id))
+            .task_result_inputs_at(agent_id, seq)?
+            .iter()
+            .find_map(|id| harness.task_turn_result(id))
     } else {
         None
     };
@@ -669,7 +670,22 @@ impl<H: Harness> DeliveryLoop<H> {
             .recovery
             .get_or_insert_with(|| recovery_outbound(open))
             .clone();
-        let outcome = match self.harness.deliver(&note) {
+        let context = if self.harness.supports_turn_tool_context()
+            && self.harness.proven(note.id.as_str()).is_none()
+        {
+            self.store.prepare_recovery_task_turn_context(
+                &self.agent_id,
+                &note.id,
+                open.opened_seq,
+                open.recovery_count,
+            )?
+        } else {
+            None
+        };
+        let outcome = match self
+            .harness
+            .deliver_with_turn_context(&note, context.as_deref())
+        {
             Ok(outcome) => outcome,
             Err(HarnessError::Dead) => return Err(Error::HarnessDown),
             Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
