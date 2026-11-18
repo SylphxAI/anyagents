@@ -159,12 +159,12 @@ impl Live {
 
     /// A person is asked to take over: the next hand-back completes it.
     pub fn expect_hand_back(&self, challenge_detected: bool) {
-        self.watch_challenge
-            .store(challenge_detected, Ordering::Release);
         let mut pending = self
             .hand_back_pending
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        self.watch_challenge
+            .store(challenge_detected, Ordering::Release);
         // The watcher may lag a previous release; never let that old
         // completion satisfy a newly requested takeover.
         let baseline = self.session.gate().hand_backs();
