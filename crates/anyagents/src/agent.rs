@@ -1007,6 +1007,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         automations,
         turn_errors: None,
         unsettled_outbound: Vec::new(),
+        retry_at_ms: None,
     })
 }
 
@@ -1168,6 +1169,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         automations,
         turn_errors: None,
         unsettled_outbound: Vec::new(),
+        retry_at_ms: None,
     })
 }
 

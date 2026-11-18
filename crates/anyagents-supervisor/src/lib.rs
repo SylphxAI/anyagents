@@ -405,6 +405,11 @@ pub struct LiveState {
     pub live_model: Option<String>,
     pub process_started_at_ms: Option<i64>,
     pub last_error: Option<String>,
+    /// The agent's pending turn met a transient provider capacity fault and
+    /// is retried automatically, no earlier than this time. While it is set
+    /// the work is in progress (`turn_state` is `InTurn`): the fault is no
+    /// error of the agent's, and nobody has to act on it.
+    pub retry_at_ms: Option<i64>,
 }
 
 /// Latest [`LiveState`] for each agent the supervisor has touched.
@@ -1073,6 +1078,7 @@ fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {
                     live_model: None,
                     process_started_at_ms: None,
                     last_error: None,
+                    retry_at_ms: None,
                 },
             );
         }
@@ -1315,6 +1321,11 @@ struct Session<H: Harness> {
     /// Systemic errored turns (the provider's, the host's) since the last
     /// completed turn: what their backoff doubles on.
     systemic_errors: i64,
+    /// The pending work met a transient provider capacity fault and is being
+    /// retried: from the errored turn until a turn completes or another fault
+    /// replaces it. While it lasts the work is published as in progress, never
+    /// as an error, so nobody is told to act on an outage that clears itself.
+    capacity_retry: Option<CapacityRetry>,
     /// Current idle review interval, between `IDLE_REVIEW_MS` and
     /// `IDLE_REVIEW_MAX_MS`.
     idle_review_ms: i64,
@@ -1375,6 +1386,7 @@ impl<H: Harness + 'static> Session<H> {
             consecutive_turn_errors: 0,
             errored_turn: None,
             systemic_errors: 0,
+            capacity_retry: None,
             idle_review_ms: IDLE_REVIEW_MS,
             process_scan_logged: false,
             exit_watch: None,
@@ -1899,9 +1911,23 @@ impl<H: Harness + 'static> Session<H> {
         }) {
             Some(delivery) => {
                 let health = delivery.harness().health();
+                // A capacity retry stands while the live process reports no
+                // fault but the one being retried, and this worker none of its
+                // own: any other is published.
+                let retry = self.capacity_retry.as_ref().filter(|retry| {
+                    health.process_alive
+                        && self.last_error.is_none()
+                        && health.quota_reset_at_ms.is_none()
+                        && health
+                            .sign_in_fault
+                            .as_deref()
+                            .is_none_or(|fault| fault == retry.error)
+                });
                 LiveState {
                     process_alive: health.process_alive,
-                    turn_state: if health.process_alive {
+                    turn_state: if retry.is_some() {
+                        TurnState::InTurn
+                    } else if health.process_alive {
                         health.turn_state
                     } else {
                         TurnState::Idle
@@ -1929,10 +1955,15 @@ impl<H: Harness + 'static> Session<H> {
                     } else {
                         None
                     },
-                    last_error: health
-                        .sign_in_fault
-                        .or_else(|| delivery.harness().exit_diagnostic())
-                        .or_else(|| self.last_error.clone()),
+                    last_error: if retry.is_some() {
+                        None
+                    } else {
+                        health
+                            .sign_in_fault
+                            .or_else(|| delivery.harness().exit_diagnostic())
+                            .or_else(|| self.last_error.clone())
+                    },
+                    retry_at_ms: retry.map(|retry| retry.at_ms),
                 }
             }
             None => LiveState {
@@ -1946,6 +1977,7 @@ impl<H: Harness + 'static> Session<H> {
                 live_model: None,
                 process_started_at_ms: None,
                 last_error: self.last_error.clone(),
+                retry_at_ms: None,
             },
         };
         self.inner.board.publish(&self.id, state);
@@ -2495,6 +2527,10 @@ impl<H: Harness + 'static> Session<H> {
         // mutating terminal state; Err retries on the next pass.
         let mut completed = false;
         if completed_candidate {
+            // A turn the harness saw end without an error ends any capacity
+            // retry, whether or not its custody is still this loop's: the
+            // work is not pending any more, so it is never shown as such.
+            self.capacity_retry = None;
             let Some(delivery) = self.delivery.as_mut() else {
                 return true;
             };
@@ -2513,8 +2549,11 @@ impl<H: Harness + 'static> Session<H> {
         let mut errored = None;
         if let Some(error) = &errored_candidate {
             // Only an error of the session's own is a strike; anything else
-            // is the fleet's and backs off instead (docs/delivery.md).
+            // is the fleet's and backs off instead (docs/delivery.md). A
+            // transient capacity fault ends no work: it is retried, with no
+            // terminal outcome and no error shown, until capacity returns.
             let strike = is_session_turn_error(error);
+            let capacity = !strike && is_transient_turn_fault(error);
             let admitted_seq = self.delivery.as_ref().and_then(|d| d.admitted_seq());
             let opened_seq = if let Some(seq) = admitted_seq {
                 let Some(delivery) = self.delivery.as_ref() else {
@@ -2536,7 +2575,12 @@ impl<H: Harness + 'static> Session<H> {
             let Some(delivery) = self.delivery.as_mut() else {
                 return true;
             };
-            match delivery.error_turn(error, strike) {
+            let recorded = if capacity {
+                delivery.retry_turn(error)
+            } else {
+                delivery.error_turn(error, strike)
+            };
+            match recorded {
                 Ok(true) => {
                     let streak = match delivery.store().turn_errors(&self.id) {
                         Ok(Some(errors)) => errors.streak,
@@ -2549,18 +2593,32 @@ impl<H: Harness + 'static> Session<H> {
                     if !strike {
                         self.systemic_errors = self.systemic_errors.saturating_add(1);
                     }
+                    let not_before = if strike {
+                        observed_at
+                    } else {
+                        let salt = salt_for(
+                            &self.id,
+                            u32::try_from(self.systemic_errors).unwrap_or(u32::MAX),
+                        );
+                        observed_at.saturating_add(systemic_backoff_ms(self.systemic_errors, salt))
+                    };
                     self.errored_turn = Some(ErroredFollowUp {
                         streak,
                         strike,
                         error: error.clone(),
                         opened_seq,
-                        not_before: if strike {
-                            observed_at
-                        } else {
-                            observed_at.saturating_add(systemic_backoff_ms(self.systemic_errors))
-                        },
+                        not_before,
                     });
-                    errored = Some(error.clone());
+                    self.capacity_retry = capacity.then(|| CapacityRetry {
+                        error: error.clone(),
+                        at_ms: not_before,
+                    });
+                    if capacity {
+                        // This turn's outcome supersedes an earlier turn's error.
+                        self.last_error = None;
+                    } else {
+                        errored = Some(error.clone());
+                    }
                 }
                 Ok(false) => {}
                 Err(err) => {
@@ -2683,6 +2741,7 @@ impl<H: Harness + 'static> Session<H> {
         // Only the turn that errored is carried: one the store no longer
         // holds open (completed since) or holds open past it is not.
         let Some(open) = open.filter(|open| Some(open.opened_seq) == follow.opened_seq) else {
+            self.capacity_retry = None;
             self.publish();
             return;
         };
@@ -2973,13 +3032,31 @@ struct ErroredFollowUp {
     not_before: i64,
 }
 
-/// The wait before following up the `n`th systemic errored turn since the
-/// last completed one: 15 s, doubling, at most 10 minutes.
-fn systemic_backoff_ms(n: i64) -> i64 {
-    let doublings = u32::try_from(n.saturating_sub(1).clamp(0, 16)).unwrap_or(16);
-    15_000i64.saturating_mul(1i64 << doublings).min(600_000)
+/// Pending work that a transient provider capacity fault interrupted.
+struct CapacityRetry {
+    /// The fault being retried: while the harness reports no other, the
+    /// work is published as in progress.
+    error: String,
+    /// The retry is not attempted before then.
+    at_ms: i64,
 }
 
+/// The wait before following up the `n`th systemic errored turn since the
+/// last completed one: 15 s, doubling, at most 10 minutes, each lengthened by
+/// up to a fifth from `salt`. Agents that one outage interrupted together
+/// spread their retries rather than all asking again at the same instant.
+fn systemic_backoff_ms(n: i64, salt: u64) -> i64 {
+    let doublings = u32::try_from(n.saturating_sub(1).clamp(0, 16)).unwrap_or(16);
+    let base = 15_000i64.saturating_mul(1i64 << doublings).min(600_000);
+    let percent = (salt % 21) as i64;
+    base.saturating_add(base.saturating_mul(percent) / 100)
+}
+
+/// Whether a provider fault clears by itself: capacity, rate limit, overload,
+/// a 5xx or a broken stream. The same request is expected to succeed later,
+/// so the work is retried and nobody is asked to act. A client fault (a 400,
+/// 401 or 403, a full context, no sign-in) or an exhausted balance is never
+/// transient, whatever else the text says.
 fn is_transient_turn_fault(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     if lower.contains("(400)")
@@ -2995,13 +3072,34 @@ fn is_transient_turn_fault(error: &str) -> bool {
         || lower.contains("http 403")
         || lower.contains("context limit")
         || lower.contains("not signed in")
+        // An exhausted balance answers 429 too, but only a payment clears it.
+        || lower.contains("insufficient_quota")
+        || lower.contains("billing")
     {
         return false;
     }
     [
+        // Capacity the provider will have again: retry later.
+        "included_capacity_unavailable",
+        "capacity_unavailable",
+        "model_unavailable",
+        "seat_429",
+        "too many requests",
+        "rate_limit",
+        "rate limit",
+        "(429)",
+        "http 429",
+        "status 429",
+        "(529)",
+        "http 529",
+        "status 529",
         "server_error",
         "internal_error",
         "overloaded",
+        "(500)",
+        "(502)",
+        "(503)",
+        "(504)",
         "http 500",
         "http 502",
         "http 503",
@@ -3454,6 +3552,52 @@ mod tests {
             }
         }
         assert!(!is_transient_turn_fault("unrecognized provider fault"));
+    }
+
+    #[test]
+    fn capacity_faults_are_retried_and_actionable_faults_are_not() {
+        for error in [
+            r#"Sylphx AI failure Some("included_capacity_unavailable"): Included capacity is not available right now. Retry later. (request req_1)"#,
+            r#"Sylphx AI failure Some("model_unavailable"): The model is not available right now."#,
+            "codex: seat_429: the seat is busy",
+            "HTTP 429 Too Many Requests",
+            "provider answered (429)",
+            "HTTP 502: bad gateway",
+            "HTTP 503",
+            "status 529: overloaded",
+            "HTTP 529",
+        ] {
+            assert!(is_transient_turn_fault(error), "{error}");
+            assert!(!is_session_turn_error(error), "never a strike: {error}");
+        }
+        for error in [
+            r#"Sylphx AI failure Some("model_not_found"): The model does not exist."#,
+            "HTTP 401: unauthorized",
+            "HTTP 400: the request names (429) in its body",
+            "HTTP 429: insufficient_quota: You exceeded your current quota, check your plan and billing details.",
+            r#"Sylphx AI failure Some("context_length_exceeded"): The request exceeds the model's context window."#,
+        ] {
+            assert!(!is_transient_turn_fault(error), "{error}");
+        }
+    }
+
+    #[test]
+    fn systemic_backoff_spreads_retries_and_never_shortens_the_wait() {
+        for n in 1..=12i64 {
+            let base = 15_000i64.saturating_mul(1 << (n - 1)).min(600_000);
+            let waits: std::collections::HashSet<i64> = (0..64u64)
+                .map(|salt| systemic_backoff_ms(n, salt))
+                .collect();
+            assert!(
+                waits
+                    .iter()
+                    .all(|wait| (base..=base + base / 5).contains(wait)),
+                "{n}: {waits:?}"
+            );
+            assert!(waits.len() > 10, "{n}: retries spread: {waits:?}");
+        }
+        // The cap holds at any count and salt.
+        assert!((600_000..=720_000).contains(&systemic_backoff_ms(i64::MAX, u64::MAX)));
     }
 
     #[test]

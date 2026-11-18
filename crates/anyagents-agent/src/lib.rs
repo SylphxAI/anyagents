@@ -651,6 +651,21 @@ impl<H: Harness> DeliveryLoop<H> {
         Ok(accepted)
     }
 
+    /// Record a turn a transient provider capacity fault ended, for its work
+    /// to be retried: only under exact open custody, and with no terminal
+    /// outcome. Returns `Ok(false)` when stale, duplicate, or unowned.
+    pub fn retry_turn(&mut self, error: &str) -> Result<bool, Error> {
+        let Some(TurnCustody::Open(seq)) = self.custody else {
+            self.custody = None;
+            return Ok(false);
+        };
+        let accepted = self
+            .store
+            .note_turn_retrying_for(&self.agent_id, seq, error)?;
+        self.custody = None;
+        Ok(accepted)
+    }
+
     pub fn store(&self) -> &Store {
         &self.store
     }

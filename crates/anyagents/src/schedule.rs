@@ -3218,6 +3218,7 @@ mod tests {
                 live_model: None,
                 process_started_at_ms: Some(1000),
                 last_error: quota_reset_at_ms.map(|_| "quota exceeded".to_string()),
+                retry_at_ms: None,
             },
         );
     }
@@ -3591,6 +3592,7 @@ mod tests {
                 live_model: None,
                 process_started_at_ms: Some(1000),
                 last_error: None,
+                retry_at_ms: None,
             };
             health.publish(&owner.id, live.clone());
             let now = anyagents_core::now_ms();
@@ -3795,6 +3797,7 @@ mod tests {
             live_model: None,
             process_started_at_ms: Some(1000),
             last_error: Some("HTTP 429: rate limit, quota exceeded".into()),
+            retry_at_ms: None,
         };
         health.publish(&owner.id, live.clone());
         let owner = store.agent(&owner.id).unwrap();
@@ -5676,6 +5679,7 @@ Connection: close
                     live_model: None,
                     process_started_at_ms: Some(1_000),
                     last_error: Some("HTTP 429: rate_limit".into()),
+                    retry_at_ms: None,
                 },
             );
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -5702,6 +5706,7 @@ Connection: close
                     live_model: None,
                     process_started_at_ms: Some(1_000),
                     last_error: Some("upstream unavailable".into()),
+                    retry_at_ms: None,
                 },
             );
             while store.inbox(&parent.id, None).unwrap().is_empty() {

@@ -155,6 +155,11 @@ pub struct AgentView {
     pub block_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// The pending turn met a transient provider capacity fault and AnyAgents
+    /// retries it automatically, no earlier than this time. The agent is
+    /// `working` meanwhile: nobody has to act on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at_ms: Option<i64>,
     /// Age of the oldest message the harness has not taken yet.
     pub oldest_undelivered_age_ms: Option<i64>,
     /// `installed`, `pending`, or `needed: <why>`: whether this agent's harness
