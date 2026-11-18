@@ -777,21 +777,27 @@ async fn active_tab_info<C: BrowserClient>(s: &C) -> (Option<String>, String) {
 fn with_profile(
     profile: &str,
     holder: &str,
-    takeover_url: Option<String>,
+    action: &str,
+    takeover_url: impl FnOnce() -> Option<String>,
     mut m: serde_json::Map<String, serde_json::Value>,
 ) -> serde_json::Value {
     m.insert("profile".into(), profile.into());
     m.insert("holder".into(), holder.into());
-    if m.get("captcha_detected")
+    let captcha_detected = m
+        .get("captcha_detected")
         .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
+        == Some(true);
+    if captcha_detected {
         let request = serde_json::json!({ "action": "takeover", "profile": profile, "reason": "solve CAPTCHA" });
         m.insert("takeover_hint".into(), format!(
             "Human verification / CAPTCHA detected. Call `browser({request})` and send `takeover_url` (and `screenshot_path`) to the user."
         ).into());
     }
-    if let Some(url) = takeover_url {
+    // The takeover link is a credential, not ordinary session metadata.
+    m.remove("takeover_url");
+    if (matches!(action, "takeover" | "human_takeover" | "user_takeover") || captcha_detected)
+        && let Some(url) = takeover_url()
+    {
         m.insert("takeover_url".into(), url.into());
     }
     serde_json::Value::Object(m)
@@ -924,7 +930,7 @@ async fn dispatch_action<C: BrowserClient>(
     use serde_json::json;
     use std::time::Duration;
 
-    match action {
+    let response = match action {
         "open" | "goto" | "navigate" => {
             let url = req
                 .url
@@ -937,7 +943,7 @@ async fn dispatch_action<C: BrowserClient>(
             pause(req.wait_ms).await;
             let mut m = snapshot_json(s).await?;
             m.insert("status".into(), "running".into());
-            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
+            m
         }
         "back" | "forward" | "reload" => {
             resolve_explicit_target(s, profile, explicit_target, true).await?;
@@ -947,29 +953,18 @@ async fn dispatch_action<C: BrowserClient>(
                 _ => s.reload().await?,
             };
             pause(req.wait_ms).await;
-            Ok(with_profile(
-                profile,
-                s.holder(),
-                s.takeover_url(),
-                json_map(json!({ "url": url })),
-            ))
+            json_map(json!({ "url": url }))
         }
         "snapshot" | "dom" => {
             resolve_explicit_target(s, profile, explicit_target, true).await?;
-            let m = snapshot_json(s).await?;
-            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
+            snapshot_json(s).await?
         }
         "read" | "text" | "content" => {
             resolve_explicit_target(s, profile, explicit_target, true).await?;
             require_readable_page(s).await?;
             let text = s.read().await?;
             let url = s.current_url().await?;
-            Ok(with_profile(
-                profile,
-                s.holder(),
-                s.takeover_url(),
-                json_map(json!({ "url": url, "text": text })),
-            ))
+            json_map(json!({ "url": url, "text": text }))
         }
         "html" => {
             let target = req
@@ -980,12 +975,7 @@ async fn dispatch_action<C: BrowserClient>(
             resolve_explicit_target(s, profile, explicit_target, true).await?;
             require_readable_page(s).await?;
             let (html, truncated) = bounded(s.html(target).await?);
-            Ok(with_profile(
-                profile,
-                s.holder(),
-                s.takeover_url(),
-                json_map(json!({ "html": html, "truncated": truncated })),
-            ))
+            json_map(json!({ "html": html, "truncated": truncated }))
         }
         "eval" | "evaluate" | "js" => {
             let script = req
@@ -1003,12 +993,7 @@ async fn dispatch_action<C: BrowserClient>(
             } else {
                 json!({ "result": value })
             };
-            Ok(with_profile(
-                profile,
-                s.holder(),
-                s.takeover_url(),
-                json_map(m),
-            ))
+            json_map(m)
         }
         "cookies" => {
             let parsed_cookies = if let Some(raw) = &req.cookies {
@@ -1028,12 +1013,7 @@ async fn dispatch_action<C: BrowserClient>(
             }
             let cookies: Vec<serde_json::Value> =
                 s.cookies(&[]).await?.into_iter().map(cookie_json).collect();
-            Ok(with_profile(
-                profile,
-                s.holder(),
-                s.takeover_url(),
-                json_map(json!({ "count": cookies.len(), "cookies": cookies })),
-            ))
+            json_map(json!({ "count": cookies.len(), "cookies": cookies }))
         }
         "click" => {
             let target = required_selector(&req, "click")?;
@@ -1043,12 +1023,7 @@ async fn dispatch_action<C: BrowserClient>(
             pause(req.wait_ms).await;
             let url = s.current_url().await?;
             let (_, title) = active_tab_info(s).await;
-            Ok(with_profile(
-                profile,
-                s.holder(),
-                s.takeover_url(),
-                json_map(json!({ "clicked": target, "url": url, "title": title })),
-            ))
+            json_map(json!({ "clicked": target, "url": url, "title": title }))
         }
         "fill" | "type" | "input" => {
             let target = required_selector(&req, "fill")?;
@@ -1081,7 +1056,7 @@ async fn dispatch_action<C: BrowserClient>(
             if req.submit.unwrap_or(false) {
                 m.insert("submitted".into(), true.into());
             }
-            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
+            m
         }
         "press" | "key" | "hold" => {
             let keys = requested_keys(&req)?;
@@ -1117,12 +1092,7 @@ async fn dispatch_action<C: BrowserClient>(
                 }
             }
             pause(req.wait_ms).await;
-            Ok(with_profile(
-                profile,
-                s.holder(),
-                s.takeover_url(),
-                json_map(json!({ "pressed": keys, "held_ms": hold.as_millis() as u64 })),
-            ))
+            json_map(json!({ "pressed": keys, "held_ms": hold.as_millis() as u64 }))
         }
         "key_down" | "keydown" | "key_up" | "keyup" => {
             let keys = requested_keys(&req)?;
@@ -1135,23 +1105,13 @@ async fn dispatch_action<C: BrowserClient>(
                     s.key_up(&k).await?;
                 }
             }
-            Ok(with_profile(
-                profile,
-                s.holder(),
-                s.takeover_url(),
-                json_map(json!({ "held_keys": s.held_keys().await? })),
-            ))
+            json_map(json!({ "held_keys": s.held_keys().await? }))
         }
         "release" | "release_keys" => {
             resolve_explicit_target(s, profile, explicit_target, true).await?;
             require_readable_page(s).await?;
             s.release_keys().await?;
-            Ok(with_profile(
-                profile,
-                s.holder(),
-                s.takeover_url(),
-                json_map(json!({ "held_keys": [] })),
-            ))
+            json_map(json!({ "held_keys": [] }))
         }
         "screenshot" | "shot" => {
             resolve_explicit_target(s, profile, explicit_target, true).await?;
@@ -1174,7 +1134,7 @@ async fn dispatch_action<C: BrowserClient>(
             if truncated {
                 m.insert("truncated".into(), true.into());
             }
-            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
+            m
         }
         "tabs" => {
             let sub = req
@@ -1233,7 +1193,7 @@ async fn dispatch_action<C: BrowserClient>(
                 m.insert("active_target_id".into(), active.id.clone().into());
             }
             m.insert("tabs".into(), json!(tabs));
-            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
+            m
         }
         "takeover" | "human_takeover" | "user_takeover" => {
             let nav_url = req
@@ -1286,7 +1246,7 @@ async fn dispatch_action<C: BrowserClient>(
                     .into(),
                 );
             }
-            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
+            m
         }
         "takeover_status" | "wait_for_user" | "wait_takeover" => {
             let wait = matches!(action, "wait_for_user" | "wait_takeover")
@@ -1302,7 +1262,7 @@ async fn dispatch_action<C: BrowserClient>(
                 resolve_explicit_target(s, profile, explicit_target, true).await?;
                 m.insert("url".into(), s.current_url().await?.into());
             }
-            Ok(with_profile(profile, s.holder(), s.takeover_url(), m))
+            m
         }
         "release_takeover" | "end_takeover" | "resume_agent" => {
             let note = req
@@ -1313,20 +1273,24 @@ async fn dispatch_action<C: BrowserClient>(
             let released = s.release_takeover(note.to_string());
             resolve_explicit_target(s, profile, explicit_target, true).await?;
             let url = s.current_url().await?;
-            Ok(with_profile(
-                profile,
-                s.holder(),
-                s.takeover_url(),
-                json_map(json!({ "released_takeover": released, "url": url })),
-            ))
+            json_map(json!({ "released_takeover": released, "url": url }))
         }
-        other => Err(ToolError::invalid(format!(
-            "unknown browser action `{other}`; expected `open`, `back`, `forward`, `reload`, \
+        other => {
+            return Err(ToolError::invalid(format!(
+                "unknown browser action `{other}`; expected `open`, `back`, `forward`, `reload`, \
              `snapshot`, `read`, `html`, `click`, `fill`, `press`, `hold`, `key_down`, `key_up`, \
              `release_keys`, `eval`, `cookies`, `screenshot`, `tabs`, `takeover`, \
              `takeover_status`, `wait_for_user`, `release_takeover`, `status`, `profiles`, or `close`"
-        ))),
-    }
+            )));
+        }
+    };
+    Ok(with_profile(
+        profile,
+        s.holder(),
+        action,
+        || s.takeover_url(),
+        response,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1341,17 +1305,6 @@ fn json_map(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> 
 #[cfg(target_os = "linux")]
 fn hand_back_wait(wait_ms: u64) -> std::time::Duration {
     std::time::Duration::from_millis(wait_ms.min(3_600_000))
-}
-
-#[cfg(target_os = "linux")]
-fn add_status_takeover(
-    metadata: &mut serde_json::Map<String, serde_json::Value>,
-    leased: bool,
-    takeover_url: impl FnOnce() -> Option<String>,
-) {
-    if leased && let Some(url) = takeover_url() {
-        metadata.insert("takeover_url".into(), url.into());
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1377,7 +1330,7 @@ async fn status(
     match super::session::running(data, profile) {
         Some(live) => {
             let _operation = live.operation().await?;
-            // Never impersonate or acquire another caller's session to read tabs or token.
+            // Never impersonate or acquire another caller's session to read tabs.
             let is_holder = live.leaseholder().as_deref() == Some(principal);
             let agent = is_holder
                 .then(|| live.session.lease(principal).ok())
@@ -1395,7 +1348,7 @@ async fn status(
                     live_target_summary(&tabs),
                 )));
             }
-            let mut metadata = json_map(json!({
+            Ok(json!({
                 "profile": profile,
                 "holder": live.holder(),
                 "status": "running",
@@ -1406,9 +1359,7 @@ async fn status(
                 "desktop": { "width": live.session.size().0, "height": live.session.size().1 },
                 "fingerprint": fingerprint,
                 "tabs": tabs,
-            }));
-            add_status_takeover(&mut metadata, agent.is_some(), || live.takeover_url());
-            Ok(serde_json::Value::Object(metadata))
+            }))
         }
         None => {
             if let Some(id) = explicit_target {
@@ -1705,19 +1656,6 @@ mod tests {
         }
         assert_eq!(url_scheme("javascript:123").as_deref(), Some("javascript"));
         assert_eq!(url_scheme("http:123").as_deref(), Some("http"));
-    }
-    #[test]
-    fn nonholder_status_omits_takeover_token() {
-        let mut metadata = json_map(serde_json::json!({"status":"running","tabs":[]}));
-        add_status_takeover(&mut metadata, false, || {
-            panic!("must not request another holder's token")
-        });
-        assert!(!metadata.contains_key("takeover_url"));
-        assert_eq!(metadata["tabs"], serde_json::json!([]));
-        add_status_takeover(&mut metadata, true, || {
-            Some("https://takeover.test/token".into())
-        });
-        assert_eq!(metadata["takeover_url"], "https://takeover.test/token");
     }
     #[test]
     fn profile_listing_isolates_corruption_and_skips_links() {
@@ -2275,6 +2213,7 @@ mod tests {
         actions_on_tab: Vec<(String, String)>,
         gate: std::sync::Arc<agent_workstation::ControlGate>,
         takeover_url: Option<String>,
+        captcha_detected: bool,
     }
 
     impl FakeBrowserState {
@@ -2284,6 +2223,7 @@ mod tests {
                 actions_on_tab: Vec::new(),
                 gate: agent_workstation::ControlGate::new(),
                 takeover_url: Some("https://takeover.test/?token=secret".into()),
+                captcha_detected: false,
             }
         }
 
@@ -2440,7 +2380,8 @@ mod tests {
         async fn eval(&self, _script: &str) -> Result<serde_json::Value, ToolError> {
             self.check_lease()?;
             let id = self.record("eval");
-            Ok(serde_json::json!({ "detected": false, "tab": id }))
+            let detected = self.state.lock().unwrap().captcha_detected;
+            Ok(serde_json::json!({ "detected": detected, "tab": id }))
         }
         async fn cookies(
             &self,
@@ -2562,6 +2503,62 @@ mod tests {
         )
         .await
         .map_err(|e| e.into_action_error(redact, mutating))
+    }
+
+    #[tokio::test]
+    async fn takeover_url_requires_explicit_takeover_or_detected_captcha() {
+        let dir = tempfile::tempdir().unwrap();
+        let caller = caller();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(FakeBrowserState::new(vec![
+            FakeTab {
+                id: "fixture-tab".into(),
+                url: "https://example.test/".into(),
+                title: "Fixture".into(),
+                active: true,
+                text: "Fixture".into(),
+            },
+        ])));
+        state
+            .lock()
+            .unwrap()
+            .gate
+            .acquire(&caller.principal)
+            .unwrap();
+        let client = FakeBrowserClient {
+            principal: caller.principal.clone(),
+            state: state.clone(),
+        };
+        let expected_url = client.takeover_url().unwrap();
+        let dispatch = async |action: &str| {
+            dispatch_fake(
+                &client,
+                dir.path(),
+                &caller,
+                &caller.profile,
+                json!({"action": action}),
+            )
+            .await
+            .unwrap()
+        };
+
+        let ordinary = dispatch("snapshot").await;
+        assert_eq!(ordinary["captcha_detected"], false);
+        assert!(ordinary.get("takeover_url").is_none());
+
+        let status = dispatch("takeover_status").await;
+        assert_eq!(status["completed"], true);
+        assert!(status.get("takeover_url").is_none());
+
+        for action in ["takeover", "human_takeover", "user_takeover"] {
+            let takeover = dispatch(action).await;
+            assert_eq!(takeover["captcha_detected"], false);
+            assert_eq!(takeover["takeover_url"], expected_url);
+        }
+
+        state.lock().unwrap().captcha_detected = true;
+        let challenge = dispatch("snapshot").await;
+        assert_eq!(challenge["captcha_detected"], true);
+        assert_eq!(challenge["takeover_url"], expected_url);
     }
 
     #[tokio::test]

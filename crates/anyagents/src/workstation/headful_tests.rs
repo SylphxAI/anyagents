@@ -233,7 +233,20 @@ async fn existing_profile_opens_with_logins_and_every_operation_works() {
     let text = read["text"].as_str().unwrap();
     assert!(text.contains("cookie=legacy=yes"), "{text}");
     assert!(text.contains("local=legacy-ok"), "{text}");
-    assert!(opened["takeover_url"].as_str().is_some());
+    assert_eq!(opened["captcha_detected"], false);
+    assert!(opened.get("takeover_url").is_none());
+
+    let live = super::session::running(data, "agent-a").unwrap();
+    assert!(live.takeover_url().is_some());
+    drop(live);
+    let status = call(data, json!({"action": "status"})).await;
+    assert_eq!(status["status"], "running");
+    assert!(
+        status["tabs"]
+            .as_array()
+            .is_some_and(|tabs| !tabs.is_empty())
+    );
+    assert!(status.get("takeover_url").is_none());
 
     // One agent drives a profile's desktop at a time.
     let err = refused(
