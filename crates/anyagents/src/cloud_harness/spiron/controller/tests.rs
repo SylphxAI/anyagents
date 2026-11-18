@@ -330,6 +330,9 @@ fn response_lost_after_receipt_creation_reuses_exact_key_and_body() {
                 }
                 Err(e) => panic!("{e}"),
             };
+            // Darwin can inherit the listener's nonblocking mode on accept.
+            // Keep the listener nonblocking, but let the read timeout bound this stream.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
