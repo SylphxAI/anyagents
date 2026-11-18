@@ -23,6 +23,77 @@ fn bin() -> Command {
 
 use support::machine_path;
 
+struct McpChild(Child);
+
+impl Drop for McpChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn stdio_exits_when_stdin_closes_during_whoami() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(config.join("mcp-capability"), "fixture-capability").unwrap();
+    let listener = UnixListener::bind(dir.path().join("anyagents.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut child = McpChild(
+        bin()
+            .arg("--data")
+            .arg(dir.path())
+            .arg("mcp")
+            .arg("--config")
+            .arg(&config)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut conn = loop {
+        match listener.accept() {
+            Ok((conn, _)) => break conn,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "exited before whoami"
+                );
+                assert!(Instant::now() < deadline, "MCP never connected for whoami");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => panic!("accept whoami: {err}"),
+        }
+    };
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut request = String::new();
+    BufReader::new(&mut conn).read_line(&mut request).unwrap();
+    assert!(matches!(
+        request.trim_end(),
+        "GET /v1/whoami HTTP/1.1" | "GET http://localhost/v1/whoami HTTP/1.1"
+    ));
+
+    // Leave the RPC stalled even after closing the harness's stdin writer.
+    drop(child.0.stdin.take().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "MCP exited with {status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "MCP survived stdin EOF during whoami"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[derive(Deserialize)]
 struct AgentsResponse {
     agents: Vec<AgentView>,

@@ -744,6 +744,70 @@ mod stdio_frame_cap_tests {
     }
 }
 
+/// Cancellation for the startup identity call. The startup `whoami` is a
+/// daemon RPC, not a stdio frame, so the MCP transport is not running yet and
+/// cannot observe the harness going away. A daemon that never answers would
+/// otherwise leave the tool server hung forever, holding a process slot and
+/// its memory. This watches the two signals that the harness is gone: its
+/// stdin writer closing, and its process exiting.
+#[cfg(unix)]
+type HarnessGone = tokio::sync::oneshot::Receiver<()>;
+#[cfg(not(unix))]
+type HarnessGone = std::future::Pending<()>;
+
+#[cfg(unix)]
+fn harness_gone() -> (
+    HarnessGone,
+    Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::oneshot;
+
+    let (gone_tx, gone_rx) = oneshot::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let parent = unsafe { libc::getppid() };
+    std::thread::Builder::new()
+        .name("mcp-startup-watch".into())
+        .spawn(move || {
+            let mut gone_tx = Some(gone_tx);
+            loop {
+                if thread_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Request POLLIN so BSD poll reports POLLHUP too; poll never
+                // consumes bytes, so an initialize frame buffered by the
+                // harness stays for the stdio transport to read after startup.
+                let mut stdin = libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll receives one live pollfd for the call's duration.
+                let ready = unsafe { libc::poll(&mut stdin, 1, 100) };
+                let stdin_closed = ready > 0
+                    && stdin.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+                if stdin_closed || unsafe { libc::getppid() } != parent {
+                    if let Some(tx) = gone_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    break;
+                }
+            }
+        })
+        .expect("spawn mcp startup watch");
+    (gone_rx, Some(stop))
+}
+
+#[cfg(not(unix))]
+fn harness_gone() -> (
+    HarnessGone,
+    Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) {
+    (std::future::pending(), None)
+}
+
 /// Run the tool server for the agent whose config directory is `config`. The
 /// server names the directory it started this agent with as
 /// `ANYAGENTS_AGENT_CONFIG`; a command line that omits it is read from there,
@@ -769,7 +833,18 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
     let config_buf = config.to_path_buf();
     tool_server_runtime()?.block_on(async {
         let client = Client::new(socket, config_buf.clone(), capability);
-        let (who, harness, limits) = client.whoami_with_harness().await.map_err(Error::Message)?;
+        let (gone, stop_watch) = harness_gone();
+        let who = tokio::select! {
+            who = client.whoami_with_harness() => who,
+            // The harness closed stdin or exited during startup; nothing is
+            // left to serve, so leave cleanly instead of hanging on the RPC.
+            _ = gone => return Ok(()),
+        };
+        if let Some(stop) = stop_watch {
+            use std::sync::atomic::Ordering;
+            stop.store(true, Ordering::Relaxed);
+        }
+        let (who, harness, limits) = who.map_err(Error::Message)?;
         // A call waits out a server restart only while its harness still
         // waits for the answer.
         let _ = SERVED_HARNESS.set(harness.clone());
