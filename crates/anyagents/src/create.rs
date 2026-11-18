@@ -179,9 +179,10 @@ fn create_dir_all_recorded(
 pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agent, Error> {
     let data = std::path::absolute(data)?;
     let checkouts = crate::repo::Checkouts::configured(&data);
-    create_with_consumer(store, &data, request, &checkouts)
+    create_with_seat(store, &data, request, &checkouts, None)
 }
 
+#[cfg(test)]
 fn create_with_consumer(
     store: &Store,
     data: &Path,
@@ -191,14 +192,23 @@ fn create_with_consumer(
     create_with_seat(store, data, request, consumer, None)
 }
 
-type WorkdirSeat = (String, u32, u32, Option<String>);
+pub(crate) fn create_operator_root(
+    store: &Store,
+    data: &Path,
+    request: CreateRequest,
+    seat: crate::sandbox::RootSeatRequest,
+) -> Result<Agent, Error> {
+    let data = std::path::absolute(data)?;
+    let checkouts = crate::repo::Checkouts::configured(&data);
+    create_with_seat(store, &data, request, &checkouts, Some(seat))
+}
 
 fn create_with_seat(
     store: &Store,
     data: &Path,
     request: CreateRequest,
     consumer: &crate::repo::Checkouts,
-    seat_override: Option<WorkdirSeat>,
+    root_seat: Option<crate::sandbox::RootSeatRequest>,
 ) -> Result<Agent, Error> {
     let normalized_harness = normalize_harness_name(&request.harness).to_string();
     // A harness is installed only if an adapter can start it.
@@ -265,8 +275,11 @@ fn create_with_seat(
     let provisioned: std::cell::RefCell<Option<PathBuf>> = std::cell::RefCell::new(None);
     // Every directory this call made; rollback removes exactly these.
     let made: std::cell::RefCell<MadeDirs> = std::cell::RefCell::new(MadeDirs::default());
+    let mut claimed_root_seat = false;
     let finish = (|| -> Result<Agent, Error> {
-        crate::sandbox::bind_principal(store, &agent)?;
+        if root_seat.is_none() {
+            crate::sandbox::bind_principal(store, &agent, None)?;
+        }
         // Nothing is installed until an agent needs it: this is that moment. A
         // failure is the reason the agent's first turn cannot start, reported here
         // and never retried in a loop.
@@ -545,13 +558,19 @@ fn create_with_seat(
         if cwd == managed_abs && !managed_abs.exists() {
             create_dir_all_recorded(&managed_abs, &made)?;
         }
+        // Reserve a named seat after workdir validation and before opening the tree to it.
+        if root_seat.is_some() {
+            claimed_root_seat = crate::sandbox::bind_principal(store, &agent, root_seat.as_ref())?;
+        }
         // The config is private; the seat may now traverse to its own tree.
         open_agent_root(&root)?;
-        let (uid, gid, launch) = match seat_override
-            .clone()
-            .or_else(|| resolved_agent_seat_info(store, &agent))
-        {
+        let (uid, gid, launch) = match resolved_agent_seat_info(store, &agent) {
             Some((_, uid, gid, launch)) => (uid, gid, launch),
+            None if claimed_root_seat => {
+                return Err(Error::PermissionDenied(
+                    "newly admitted seat could not be resolved for execution".into(),
+                ));
+            }
             None => (
                 crate::sandbox::server_uid(),
                 crate::sandbox::server_gid(),
@@ -588,6 +607,7 @@ fn create_with_seat(
             &agent,
             provisioned.into_inner().as_deref(),
             &made.into_inner(),
+            claimed_root_seat,
             error,
         ));
     }
@@ -604,6 +624,7 @@ fn roll_back_failed_creation(
     agent: &Agent,
     provisioned: Option<&Path>,
     made: &MadeDirs,
+    claimed_root_seat: bool,
     error: Error,
 ) -> Error {
     #[cfg(unix)]
@@ -643,6 +664,13 @@ fn roll_back_failed_creation(
         return error;
     }
     remove_made_dirs(made, kept_checkout, &agent.id);
+    if claimed_root_seat && let Err(cleanup) = crate::sandbox::rollback_root_seat(store, &agent.id)
+    {
+        eprintln!(
+            "warning: could not roll back the seat grant for {}: {cleanup}",
+            agent.id
+        );
+    }
     error
 }
 

@@ -55,6 +55,10 @@ AnyAgents is a **100% vendor-neutral multi-agent orchestrator**. It never implem
 - **Agents talk to each other.** Agents can list peers, join internal groups, spawn subagents and message reachable agents. Conversation reads are limited to the caller and its descendants; `agent: "all"` searches only that tree. Reading a parent, sibling, public peer or fellow group member’s private history is refused. Explicit operator and root-admin reads are unrestricted and audited.
 - **One place for cost.** Tokens, cost and quota state per agent, harness, model and day.
 
+## Configuration
+
+[Restrict Telegram callers and bootstrap pre-created OS seats](docs/channel-admission.md).
+
 ## How it works
 
 `anyagents serve` is one long-lived server. The CLI, an MCP server registered into each agent, and channels such as Telegram are its clients. Each agent is one vendor process in that vendor's programmatic mode, supervised by the server and held by its own keeper process, so restarting or upgrading the server does not stop any agent. Keepers are Linux-only for now: on macOS the server hosts each harness itself, so a server restart there restarts its agents ([ADR 0007](docs/adr/0007-process-architecture.md#9-where-in-process-hosting-remains)).
