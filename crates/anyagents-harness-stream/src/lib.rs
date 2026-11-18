@@ -976,11 +976,6 @@ impl StreamHarness {
         state.child.as_ref().map(Child::id).or(self.socket_pid)
     }
 
-    /// Write one line into the child and record it as taken.
-    ///
-    /// What the vendor already proved about the message answers first,
-    /// before liveness or a quota: a proof outlives the process that gave
-    /// it. A refusal for good is answered again for the same id.
     pub fn supports_turn_tool_context(&self) -> bool {
         lock(&self.shared).turn_tool_context
     }
@@ -996,6 +991,11 @@ impl StreamHarness {
             .then(|| (opener.clone(), text.clone()))
     }
 
+    /// Write one line into the child and record it as taken.
+    ///
+    /// What the vendor already proved about the message answers first,
+    /// before liveness or a quota: a proof outlives the process that gave
+    /// it. A refusal for good is answered again for the same id.
     pub fn deliver(
         &mut self,
         message: &OutboundMessage,
@@ -2227,18 +2227,22 @@ fn read_stdout(
                     continue;
                 }
                 state.ready = Some(true);
-                state.turn_tool_context = value
-                    .get("features")
-                    .and_then(Value::as_array)
-                    .is_some_and(|features| {
-                        features
-                            .iter()
-                            .any(|feature| feature.as_str() == Some("turn-tool-context-v1"))
-                    });
+                let answers_attach = state.v2_attach.as_deref().is_some_and(|attach| {
+                    value.get("request_id").and_then(Value::as_str) == Some(attach)
+                });
+                // Replayed ready frames do not negotiate this connection's features.
+                if state.v2_attach.is_none() || answers_attach {
+                    state.turn_tool_context = value
+                        .get("features")
+                        .and_then(Value::as_array)
+                        .is_some_and(|features| {
+                            features
+                                .iter()
+                                .any(|feature| feature.as_str() == Some("turn-tool-context-v1"))
+                        });
+                }
                 state.peer = Some(announced_peer(&value));
-                if let Some(attach) = &state.v2_attach
-                    && value.get("request_id").and_then(Value::as_str) == Some(attach.as_str())
-                {
+                if answers_attach {
                     state.attached = true;
                     state.attached_seq = value.get("seq").and_then(Value::as_u64);
                 }
@@ -3030,7 +3034,8 @@ fn bound_consumed<'a>(value: &'a Value, opener: &str) -> Option<HashSet<&'a str>
         || value.get("status").and_then(Value::as_str) != Some("completed")
         || value.get("is_error").and_then(Value::as_bool) != Some(false)
         || value.get("duplicate").and_then(Value::as_bool) != Some(false)
-        || value.get("error").is_some_and(|error| !error.is_null())
+        || value.get("error") != Some(&Value::Null)
+        || value.get("final_text").and_then(Value::as_str).is_none()
     {
         return None;
     }
