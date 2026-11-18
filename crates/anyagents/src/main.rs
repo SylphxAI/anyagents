@@ -2908,21 +2908,6 @@ fn interact_cmd(
     Ok(())
 }
 
-fn needs_status_attention(agent: &api::AgentView, now: i64) -> bool {
-    match agent.display_state() {
-        "faulted" | "paused" => true,
-        "running" | "idle" => {
-            ui::is_quota_held(agent, now)
-                || agent.block_reason.as_deref() == Some("sign_in_required")
-                || agent
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|error| !error.trim().is_empty())
-        }
-        _ => false,
-    }
-}
-
 fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> {
     let sock = server::socket_path(data);
     let live_agents = client::get::<api::AgentsResponse>(data, "/v1/agents")
@@ -3051,7 +3036,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         let now = anyagents_core::now_ms();
         let attention = agents_list
             .iter()
-            .filter(|agent| needs_status_attention(agent, now));
+            .filter(|agent| ui::agent_attention(agent, now).is_some());
         for (i, agent) in attention.enumerate() {
             if i == 0 {
                 println!("\n  {}", ui::bold_cyan("Attention"));
