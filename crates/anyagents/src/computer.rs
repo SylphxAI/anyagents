@@ -776,14 +776,14 @@ pub enum ComputerAction {
     },
     /// Press mouse button down at optional coordinate.
     MouseDown {
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         coordinate: Option<Point>,
         #[serde(default)]
         button: MouseButton,
     },
     /// Release mouse button at optional coordinate.
     MouseUp {
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         coordinate: Option<Point>,
         #[serde(default)]
         button: MouseButton,
@@ -849,22 +849,11 @@ impl ComputerAction {
         })?;
 
         let parse_coord = |field: &str| -> Result<Point, String> {
-            let arr = input
+            let value = input
                 .get(field)
-                .and_then(Value::as_array)
-                .ok_or_else(|| format!("missing `{field}: [x, y]` for action `{action}`"))?;
-            if arr.len() != 2 {
-                return Err(format!("`{field}` must have 2 elements `[x, y]`"));
-            }
-            let x = arr[0]
-                .as_i64()
-                .ok_or_else(|| format!("`{field}[0]` must be an integer"))?
-                as i32;
-            let y = arr[1]
-                .as_i64()
-                .ok_or_else(|| format!("`{field}[1]` must be an integer"))?
-                as i32;
-            Ok(Point { x, y })
+                .filter(|v| v.is_array())
+                .ok_or_else(|| format!("missing '{field}: [x, y]' for action '{action}'"))?;
+            coordinate_point(value, field)
         };
 
         let modifiers = input
@@ -927,11 +916,17 @@ impl ComputerAction {
                 modifiers,
             }),
             "left_mouse_down" => Ok(Self::MouseDown {
-                coordinate: parse_coord("coordinate").ok(),
+                coordinate: input
+                    .get("coordinate")
+                    .map(|_| parse_coord("coordinate"))
+                    .transpose()?,
                 button: MouseButton::Left,
             }),
             "left_mouse_up" => Ok(Self::MouseUp {
-                coordinate: parse_coord("coordinate").ok(),
+                coordinate: input
+                    .get("coordinate")
+                    .map(|_| parse_coord("coordinate"))
+                    .transpose()?,
                 button: MouseButton::Left,
             }),
             "left_click_drag" => Ok(Self::Drag {
@@ -1013,30 +1008,13 @@ impl ComputerAction {
                     duration_ms: (duration_secs * 1000.0).round() as u32,
                 })
             }
-            "zoom" => {
-                let arr = input
-                    .get("region")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| "missing `region: [x1, y1, x2, y2]` for `zoom`".to_string())?;
-                if arr.len() != 4 {
-                    return Err("`region` must have 4 elements `[x1, y1, x2, y2]`".to_string());
-                }
-                let x1 = arr[0].as_i64().unwrap_or(0) as i32;
-                let y1 = arr[1].as_i64().unwrap_or(0) as i32;
-                let x2 = arr[2].as_i64().unwrap_or(0) as i32;
-                let y2 = arr[3].as_i64().unwrap_or(0) as i32;
-                if x2 <= x1 || y2 <= y1 {
-                    return Err("`region` requires `x2 > x1` and `y2 > y1`".to_string());
-                }
-                Ok(Self::Zoom {
-                    region: Region {
-                        x: x1,
-                        y: y1,
-                        width: (x2 - x1) as u32,
-                        height: (y2 - y1) as u32,
-                    },
-                })
-            }
+            "zoom" => Ok(Self::Zoom {
+                region: endpoint_region(
+                    input
+                        .get("region")
+                        .ok_or_else(|| "missing region for zoom".to_string())?,
+                )?,
+            }),
             other => Err(format!("unsupported Anthropic computer action `{other}`")),
         }
     }
@@ -1049,17 +1027,18 @@ impl ComputerAction {
             .ok_or_else(|| "missing `type` string in OpenAI computer action".to_string())?;
 
         let point = |obj: &Value| -> Result<Point, String> {
-            let x = obj
-                .get("x")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| format!("missing integer `x` for `{kind}`"))?
-                as i32;
-            let y = obj
-                .get("y")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| format!("missing integer `y` for `{kind}`"))?
-                as i32;
-            Ok(Point { x, y })
+            Ok(Point {
+                x: coordinate_i32(
+                    obj.get("x").ok_or_else(|| "missing OpenAI x".to_string())?,
+                    "x",
+                    false,
+                )?,
+                y: coordinate_i32(
+                    obj.get("y").ok_or_else(|| "missing OpenAI y".to_string())?,
+                    "y",
+                    false,
+                )?,
+            })
         };
 
         let parse_button = |b: Option<&str>| -> MouseButton {
@@ -1097,8 +1076,9 @@ impl ComputerAction {
                 if path.len() < 2 {
                     return Err("`path` must contain at least 2 points".to_string());
                 }
-                let start = point(&path[0])?;
-                let end = point(path.last().expect("len >= 2"))?;
+                let points = path.iter().map(point).collect::<Result<Vec<_>, _>>()?;
+                let start = points[0];
+                let end = *points.last().expect("len >= 2");
                 Ok(Self::Drag {
                     start,
                     end,
@@ -1170,17 +1150,201 @@ impl ComputerAction {
     }
 }
 
+// Coordinate conversion is deliberately separate from non-coordinate counts and durations.
+// Flat scalar SDK coordinates historically round; provider and structured points require integers.
+fn coordinate_i32(value: &Value, field: &str, round: bool) -> Result<i32, String> {
+    if let Some(n) = value.as_i64() {
+        return i32::try_from(n)
+            .map_err(|_| format!("'{field}' is outside the i32 coordinate range"));
+    }
+    if round && let Some(n) = value.as_f64() {
+        let n = n.round();
+        if n.is_finite() && n >= f64::from(i32::MIN) && n <= f64::from(i32::MAX) {
+            return Ok(n as i32);
+        }
+    }
+    Err(format!(
+        "'{field}' must be a {}in-range coordinate",
+        if round { "numeric " } else { "integer " }
+    ))
+}
+
+fn coordinate_u32(value: &Value, field: &str) -> Result<u32, String> {
+    if let Some(n) = value.as_u64() {
+        return u32::try_from(n)
+            .map_err(|_| format!("'{field}' is outside the u32 dimension range"));
+    }
+    if let Some(n) = value.as_f64() {
+        let rounded = n.round();
+        if n >= 0.0 && rounded.is_finite() && rounded <= f64::from(u32::MAX) {
+            return Ok(rounded as u32);
+        }
+    }
+    Err(format!(
+        "'{field}' must be an in-range nonnegative dimension"
+    ))
+}
+
+fn coordinate_point(value: &Value, field: &str) -> Result<Point, String> {
+    let (x, y) = if let Some(arr) = value.as_array() {
+        if arr.len() != 2 {
+            return Err(format!("'{field}' must have 2 elements [x, y]"));
+        }
+        (&arr[0], &arr[1])
+    } else {
+        (
+            value
+                .get("x")
+                .ok_or_else(|| format!("missing '{field}.x'"))?,
+            value
+                .get("y")
+                .ok_or_else(|| format!("missing '{field}.y'"))?,
+        )
+    };
+    Ok(Point {
+        x: coordinate_i32(x, field, false)?,
+        y: coordinate_i32(y, field, false)?,
+    })
+}
+
+// Absence permits defaults/aliases; a supplied invalid representation never does.
+// Validate both encodings even when a higher-precedence encoding is also present.
+fn optional_coordinate(
+    input: &Value,
+    x: &str,
+    y: &str,
+    point: &str,
+) -> Result<Option<Point>, String> {
+    let scalar = if input.get(x).is_some() || input.get(y).is_some() {
+        Some(Point {
+            x: coordinate_i32(
+                input.get(x).ok_or_else(|| format!("missing '{x}'"))?,
+                x,
+                true,
+            )?,
+            y: coordinate_i32(
+                input.get(y).ok_or_else(|| format!("missing '{y}'"))?,
+                y,
+                true,
+            )?,
+        })
+    } else {
+        None
+    };
+    let structured = input
+        .get(point)
+        .map(|v| coordinate_point(v, point))
+        .transpose()?;
+    Ok(scalar.or(structured))
+}
+
+fn flat_region(input: &Value) -> Result<Option<Region>, String> {
+    if !["x", "y", "width", "height"]
+        .iter()
+        .any(|key| input.get(key).is_some())
+    {
+        return Ok(None);
+    }
+    let get = |key: &str| {
+        input
+            .get(key)
+            .ok_or_else(|| format!("missing zoom '{key}'"))
+    };
+    Ok(Some(Region {
+        x: coordinate_i32(get("x")?, "x", true)?,
+        y: coordinate_i32(get("y")?, "y", true)?,
+        width: coordinate_u32(get("width")?, "width")?,
+        height: coordinate_u32(get("height")?, "height")?,
+    }))
+}
+
+fn endpoint_region(value: &Value) -> Result<Region, String> {
+    let arr = value
+        .as_array()
+        .filter(|arr| arr.len() == 4)
+        .ok_or_else(|| "region must have 4 elements [x1, y1, x2, y2]".to_string())?;
+    let x1 = coordinate_i32(&arr[0], "region[0]", false)?;
+    let y1 = coordinate_i32(&arr[1], "region[1]", false)?;
+    let x2 = coordinate_i32(&arr[2], "region[2]", false)?;
+    let y2 = coordinate_i32(&arr[3], "region[3]", false)?;
+    let width = u32::try_from(i64::from(x2) - i64::from(x1))
+        .ok()
+        .filter(|n| *n > 0);
+    let height = u32::try_from(i64::from(y2) - i64::from(y1))
+        .ok()
+        .filter(|n| *n > 0);
+    Ok(Region {
+        x: x1,
+        y: y1,
+        width: width.ok_or_else(|| "region requires x2 > x1".to_string())?,
+        height: height.ok_or_else(|| "region requires y2 > y1".to_string())?,
+    })
+}
+
+// Neutral serde and provider fallbacks must not silently discard supplied coordinates.
+fn validate_coordinates(input: &Value) -> Result<(), String> {
+    let action = input
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match action.as_str() {
+        "move" | "mouse_move" | "click" | "left_click" | "right_click" | "middle_click"
+        | "double_click" | "triple_click" | "mouse_down" | "left_mouse_down" | "mouse_up"
+        | "left_mouse_up" | "scroll" => {
+            optional_coordinate(input, "x", "y", "coordinate")?;
+        }
+        "drag" | "left_click_drag" => {
+            optional_coordinate(input, "from_x", "from_y", "start")?;
+            optional_coordinate(input, "start_x", "start_y", "start_coordinate")?;
+            optional_coordinate(input, "to_x", "to_y", "end")?;
+            optional_coordinate(input, "x", "y", "coordinate")?;
+        }
+        "zoom" => {
+            flat_region(input)?;
+            if let Some(region) = input.get("region") {
+                if region.is_object() {
+                    serde_json::from_value::<Region>(region.clone()).map_err(|e| e.to_string())?;
+                } else {
+                    endpoint_region(region)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Parse an action payload that may be formatted in neutral `ComputerAction`,
 /// Anthropic `computer_20250124`, OpenAI CUA format, or flat SDK arguments
 /// (`{ action: "click", x: 100, y: 200, ... }`).
 pub fn parse_computer_action(input: &Value) -> Result<ComputerAction, String> {
-    if let Ok(neutral) = serde_json::from_value::<ComputerAction>(input.clone()) {
+    validate_coordinates(input)?;
+    // These optional neutral fields otherwise deserialize as None, ignoring flat x/y.
+    let scalar_button_position = matches!(
+        input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "mouse_down" | "mouse_up" | "left_mouse_down" | "left_mouse_up"
+    ) && (input.get("x").is_some() || input.get("y").is_some());
+    // Arrays encode provider endpoints, not serde's positional Region fields.
+    let endpoint_zoom = input.get("action").and_then(Value::as_str) == Some("zoom")
+        && input.get("region").is_some_and(Value::is_array);
+    if !scalar_button_position
+        && !endpoint_zoom
+        && let Ok(neutral) = serde_json::from_value::<ComputerAction>(input.clone())
+    {
         return Ok(neutral);
     }
     if input.get("type").is_some() && input.get("action").is_none() {
         return ComputerAction::from_openai(input);
     }
-    if let Ok(anth) = ComputerAction::from_anthropic(input) {
+    if !scalar_button_position && let Ok(anth) = ComputerAction::from_anthropic(input) {
         return Ok(anth);
     }
     parse_flat_computer_action(input)
@@ -1195,12 +1359,6 @@ fn parse_flat_computer_action(input: &Value) -> Result<ComputerAction, String> {
         .trim()
         .to_ascii_lowercase();
 
-    let get_i32 = |key: &str| -> Option<i32> {
-        input
-            .get(key)
-            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64)))
-            .map(|n| n as i32)
-    };
     let get_u32 = |key: &str| -> Option<u32> {
         input
             .get(key)
@@ -1208,32 +1366,8 @@ fn parse_flat_computer_action(input: &Value) -> Result<ComputerAction, String> {
             .map(|n| n as u32)
     };
     let parse_coord_pair = |x_key: &str, y_key: &str, arr_key: &str| -> Result<Point, String> {
-        if let (Some(x), Some(y)) = (get_i32(x_key), get_i32(y_key)) {
-            return Ok(Point { x, y });
-        }
-        if let Some(obj) = input.get(arr_key).and_then(Value::as_object)
-            && let (Some(x), Some(y)) = (
-                obj.get("x").and_then(Value::as_i64),
-                obj.get("y").and_then(Value::as_i64),
-            )
-        {
-            return Ok(Point {
-                x: x as i32,
-                y: y as i32,
-            });
-        }
-        if let Some(arr) = input.get(arr_key).and_then(Value::as_array)
-            && arr.len() == 2
-            && let (Some(x), Some(y)) = (arr[0].as_i64(), arr[1].as_i64())
-        {
-            return Ok(Point {
-                x: x as i32,
-                y: y as i32,
-            });
-        }
-        Err(format!(
-            "missing coordinates (`{x_key}`, `{y_key}` or `{arr_key}`) for computer action `{action}`"
-        ))
+        optional_coordinate(input, x_key, y_key, arr_key)?
+            .ok_or_else(|| format!("missing coordinates ('{x_key}', '{y_key}' or '{arr_key}') for computer action '{action}'"))
     };
 
     let parse_button = || -> MouseButton {
@@ -1301,18 +1435,33 @@ fn parse_flat_computer_action(input: &Value) -> Result<ComputerAction, String> {
             modifiers,
         }),
         "mouse_down" | "left_mouse_down" => Ok(ComputerAction::MouseDown {
-            coordinate: parse_coord_pair("x", "y", "coordinate").ok(),
-            button: parse_button(),
+            coordinate: optional_coordinate(input, "x", "y", "coordinate")?,
+            button: if action == "left_mouse_down" {
+                MouseButton::Left
+            } else {
+                parse_button()
+            },
         }),
         "mouse_up" | "left_mouse_up" => Ok(ComputerAction::MouseUp {
-            coordinate: parse_coord_pair("x", "y", "coordinate").ok(),
-            button: parse_button(),
+            coordinate: optional_coordinate(input, "x", "y", "coordinate")?,
+            button: if action == "left_mouse_up" {
+                MouseButton::Left
+            } else {
+                parse_button()
+            },
         }),
         "drag" | "left_click_drag" => {
-            let start = parse_coord_pair("from_x", "from_y", "start")
-                .or_else(|_| parse_coord_pair("start_x", "start_y", "start_coordinate"))?;
-            let end = parse_coord_pair("to_x", "to_y", "end")
-                .or_else(|_| parse_coord_pair("x", "y", "coordinate"))?;
+            let start = optional_coordinate(input, "from_x", "from_y", "start")?
+                .or(optional_coordinate(
+                    input,
+                    "start_x",
+                    "start_y",
+                    "start_coordinate",
+                )?)
+                .ok_or_else(|| "missing drag start coordinates".to_string())?;
+            let end = optional_coordinate(input, "to_x", "to_y", "end")?
+                .or(optional_coordinate(input, "x", "y", "coordinate")?)
+                .ok_or_else(|| "missing drag end coordinates".to_string())?;
             Ok(ComputerAction::Drag {
                 start,
                 end,
@@ -1321,7 +1470,7 @@ fn parse_flat_computer_action(input: &Value) -> Result<ComputerAction, String> {
         }
         "scroll" => {
             let coordinate =
-                parse_coord_pair("x", "y", "coordinate").unwrap_or(Point { x: 0, y: 0 });
+                optional_coordinate(input, "x", "y", "coordinate")?.unwrap_or(Point { x: 0, y: 0 });
             let dir_str = input
                 .get("direction")
                 .or_else(|| input.get("scroll_direction"))
@@ -1397,23 +1546,11 @@ fn parse_flat_computer_action(input: &Value) -> Result<ComputerAction, String> {
             Ok(ComputerAction::Wait { duration_ms })
         }
         "zoom" => {
-            if let (Some(x), Some(y), Some(width), Some(height)) = (
-                get_i32("x"),
-                get_i32("y"),
-                get_u32("width"),
-                get_u32("height"),
-            ) {
-                if width == 0 || height == 0 {
-                    return Err("zoom `width` and `height` must be > 0".to_string());
+            if let Some(region) = flat_region(input)? {
+                if region.width == 0 || region.height == 0 {
+                    return Err("zoom width and height must be > 0".to_string());
                 }
-                return Ok(ComputerAction::Zoom {
-                    region: Region {
-                        x,
-                        y,
-                        width,
-                        height,
-                    },
-                });
+                return Ok(ComputerAction::Zoom { region });
             }
             ComputerAction::from_anthropic(input)
         }
@@ -1938,6 +2075,252 @@ mod tests {
                 direction: ScrollDirection::Up,
                 amount: 3,
                 modifiers: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn coordinate_inputs_reject_overflow_and_malformed_values() {
+        let invalid = [
+            json!(2147483648_i64),
+            json!(-2147483649_i64),
+            json!(4294967415_i64),
+            json!(u64::MAX),
+            json!(1e100),
+            json!("119"),
+            json!(null),
+            json!(true),
+        ];
+        let mut accepted = Vec::new();
+        for bad in invalid {
+            let mut cases = Vec::new();
+            for action in [
+                "move",
+                "mouse_move",
+                "click",
+                "left_click",
+                "right_click",
+                "middle_click",
+                "double_click",
+                "triple_click",
+                "mouse_down",
+                "mouse_up",
+                "left_mouse_down",
+                "left_mouse_up",
+                "scroll",
+            ] {
+                cases.extend([
+                    json!({"action":action,"x":bad,"y":119}),
+                    json!({"action":action,"x":119,"y":bad}),
+                    json!({"action":action,"coordinate":[bad,119]}),
+                    json!({"action":action,"coordinate":{"x":119,"y":bad}}),
+                ]);
+            }
+            for kind in ["move", "click", "double_click", "scroll"] {
+                cases.extend([
+                    json!({"type":kind,"x":bad,"y":119}),
+                    json!({"type":kind,"x":119,"y":bad}),
+                ]);
+            }
+            cases.extend([
+                json!({"action":"drag","from_x":bad,"from_y":1,"to_x":2,"to_y":3}),
+                json!({"action":"drag","start_x":1,"start_y":bad,"x":2,"y":3}),
+                json!({"action":"drag","start":[1,2],"end":[bad,3]}),
+                json!({"action":"drag","start":{"x":bad,"y":1},"end":{"x":2,"y":3}}),
+                json!({"action":"left_click_drag","start_coordinate":[bad,1],"coordinate":[2,3]}),
+                json!({"action":"left_click_drag","start_coordinate":[1,2],"coordinate":[3,bad]}),
+                json!({"type":"drag","path":[{"x":bad,"y":1},{"x":2,"y":3}]}),
+                json!({"type":"drag","path":[{"x":1,"y":2},{"x":bad,"y":3},{"x":4,"y":5}]}),
+                json!({"type":"drag","path":[{"x":1,"y":2},{"x":3,"y":bad}]}),
+                json!({"action":"zoom","x":bad,"y":0,"width":10,"height":10}),
+                json!({"action":"zoom","region":[bad,0,100,100]}),
+                json!({"action":"zoom","region":[0,0,100,bad]}),
+            ]);
+            for input in cases {
+                if let Ok(action) = parse_computer_action(&input) {
+                    accepted.push(format!("{input} => {action:?}"));
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "invalid coordinates accepted ({}):\n{}",
+            accepted.len(),
+            accepted.join("\n")
+        );
+    }
+
+    #[test]
+    fn coordinate_inputs_do_not_fall_back_from_supplied_invalid_points() {
+        for input in [
+            json!({"action":"mouse_down","coordinate":null}),
+            json!({"action":"mouse_up","coordinate":null}),
+            json!({"action":"left_mouse_down","coordinate":[1]}),
+            json!({"action":"left_mouse_up","coordinate":"bad"}),
+            json!({"action":"scroll","coordinate":{}}),
+            json!({"action":"mouse_down","x":1}),
+            json!({"action":"mouse_up","y":1}),
+            json!({"action":"click","x":"bad","y":2,"coordinate":[1,2]}),
+            json!({"action":"scroll","x":"bad","y":2,"coordinate":{"x":1,"y":2}}),
+            json!({"action":"drag","from_x":"bad","from_y":2,"start_coordinate":[1,2],"end":[3,4]}),
+            json!({"action":"drag","start":[1,2],"end":[null,4],"coordinate":[3,4]}),
+            json!({"action":"zoom","x":"bad","y":0,"width":10,"height":10,"region":[0,0,10,10]}),
+        ] {
+            assert!(parse_computer_action(&input).is_err(), "accepted {input}");
+        }
+        for bad in [
+            json!(-1),
+            json!(4294967296_u64),
+            json!(1e100),
+            json!("10"),
+            json!(null),
+        ] {
+            for key in ["width", "height"] {
+                let mut input = json!({"action":"zoom","x":0,"y":0,"width":10,"height":10});
+                input[key] = bad.clone();
+                assert!(parse_computer_action(&input).is_err(), "accepted {input}");
+            }
+        }
+    }
+
+    #[test]
+    fn coordinate_inputs_preserve_valid_boundaries_rounding_and_defaults() {
+        for n in [i32::MIN, -1, 0, 119, i32::MAX] {
+            for input in [
+                json!({"action":"click","x":n,"y":n}),
+                json!({"action":"left_click","coordinate":[n,n]}),
+                json!({"action":"click","coordinate":{"x":n,"y":n}}),
+                json!({"type":"click","x":n,"y":n}),
+            ] {
+                assert!(matches!(parse_computer_action(&input).unwrap(),
+                    ComputerAction::Click{coordinate:Point{x,y},..} if x == n && y == n));
+            }
+        }
+        assert!(matches!(
+            parse_computer_action(&json!({"action":"click","x":118.6,"y":119.4})).unwrap(),
+            ComputerAction::Click {
+                coordinate: Point { x: 119, y: 119 },
+                ..
+            }
+        ));
+        for action in ["mouse_down", "left_mouse_down", "mouse_up", "left_mouse_up"] {
+            assert!(matches!(
+                parse_computer_action(&json!({"action":action})).unwrap(),
+                ComputerAction::MouseDown {
+                    coordinate: None,
+                    ..
+                } | ComputerAction::MouseUp {
+                    coordinate: None,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                parse_computer_action(&json!({"action":action,"x":12,"y":34})).unwrap(),
+                ComputerAction::MouseDown {
+                    coordinate: Some(Point { x: 12, y: 34 }),
+                    ..
+                } | ComputerAction::MouseUp {
+                    coordinate: Some(Point { x: 12, y: 34 }),
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            parse_computer_action(&json!({"action":"scroll"})).unwrap(),
+            ComputerAction::Scroll {
+                coordinate: Point { x: 0, y: 0 },
+                ..
+            }
+        ));
+        assert_eq!(
+            parse_computer_action(
+                &json!({"action":"zoom","region":[i32::MIN,i32::MIN,i32::MAX,i32::MAX]})
+            )
+            .unwrap(),
+            ComputerAction::Zoom {
+                region: Region {
+                    x: i32::MIN,
+                    y: i32::MIN,
+                    width: u32::MAX,
+                    height: u32::MAX
+                }
+            }
+        );
+        assert!(
+            parse_computer_action(
+                &json!({"action":"zoom","x":0,"y":0,"width":u32::MAX,"height":1})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn coordinate_inputs_preserve_neutral_round_trips_and_button_policy() {
+        for action in [
+            ComputerAction::MouseDown {
+                coordinate: None,
+                button: MouseButton::Right,
+            },
+            ComputerAction::MouseUp {
+                coordinate: None,
+                button: MouseButton::Middle,
+            },
+            ComputerAction::MouseDown {
+                coordinate: Some(Point { x: 12, y: 34 }),
+                button: MouseButton::Right,
+            },
+            ComputerAction::Zoom {
+                region: Region {
+                    x: 10,
+                    y: 20,
+                    width: 200,
+                    height: 100,
+                },
+            },
+        ] {
+            assert_eq!(
+                parse_computer_action(&serde_json::to_value(&action).unwrap()).unwrap(),
+                action
+            );
+        }
+        for name in ["left_mouse_down", "left_mouse_up"] {
+            assert!(matches!(
+                parse_computer_action(&json!({"action":name,"x":12,"y":34,"button":"right"}))
+                    .unwrap(),
+                ComputerAction::MouseDown {
+                    button: MouseButton::Left,
+                    ..
+                } | ComputerAction::MouseUp {
+                    button: MouseButton::Left,
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            parse_computer_action(&json!({"action":"mouse_down","x":12,"y":34,"button":"right"}))
+                .unwrap(),
+            ComputerAction::MouseDown {
+                button: MouseButton::Right,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_computer_action(&json!({"action":"click","x":12,"y":34,"button":"unknown"}))
+                .unwrap(),
+            ComputerAction::Click {
+                button: MouseButton::Left,
+                ..
+            }
+        ));
+        assert_eq!(
+            parse_computer_action(&json!({"action":"zoom","region":[10,20,210,120]})).unwrap(),
+            ComputerAction::Zoom {
+                region: Region {
+                    x: 10,
+                    y: 20,
+                    width: 200,
+                    height: 100
+                }
             }
         );
     }
