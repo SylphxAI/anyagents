@@ -1877,38 +1877,32 @@ async fn verdict_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
-        let actor = match &principal {
-            Principal::Operator => "operator".to_string(),
-            Principal::Agent { agent_id, .. } if *agent_id == target.id => {
-                return Err(ApiError::forbidden(
-                    "an agent cannot record a verdict on its own work",
-                ));
-            }
-            Principal::Agent { agent_id, name } => {
-                if is_self_or_ancestor(&state.store, agent_id, &target) {
-                    format!("agent:{name}")
-                } else {
-                    require_admin_or_operator(
-                        &state.store,
-                        &principal,
-                        "agents.verdict",
-                        &target.name,
-                    )?
-                }
-            }
-        };
-        let config = anyagents_core::agent_config_dir(state.store.data_dir(), &target.id);
-        let (outcome, _) = state
+        let _lifecycle = state
             .store
-            .record_outcome(anyagents_core::NewOutcome::verdict(
-                target.id.clone(),
-                kind,
-                actor,
-                body.reason,
-                now_ms(),
-                create::bound_profile_name(&config),
-            ))
+            .lock_agent_lifecycle(&target.id)
             .map_err(ApiError::from_store)?;
+        let config = anyagents_core::agent_config_dir(state.store.data_dir(), &target.id);
+        let actor_id = match &principal {
+            Principal::Operator => None,
+            Principal::Agent { agent_id, .. } => Some(agent_id),
+        };
+        let (outcome, changed) = state
+            .store
+            .apply_verdict(
+                actor_id,
+                &target.id,
+                kind,
+                body.reason,
+                create::bound_profile_name(&config),
+            )
+            .map_err(ApiError::from_store)?;
+        if let Some(agent) = changed {
+            if agent.state == "archived" {
+                finish_agent_archive_locked(&state, &agent, false)?;
+            } else {
+                clear_explicitly_archived(state.store.data_dir(), &agent.id);
+            }
+        }
         Ok(Json(outcome))
     })
     .await
@@ -5209,49 +5203,58 @@ async fn archive_agent_route(
             .store
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
-        mark_explicitly_archived_locked(&state.store, state.store.data_dir(), &agent)
-            .map_err(ApiError::from_store)?;
-        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(
-            &anyagents_core::agent_config_dir(state.store.data_dir(), &found.id),
-        ) {
-            let _ = anyagents_tools::SandboxProvider::pause(&sbx);
-        }
-        let mut process_guard = None;
-        if !is_self {
-            let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
-            while std::time::Instant::now() < deadline {
-                if state
-                    .health
-                    .get(&found.id)
-                    .is_none_or(|live| !live.process_alive)
-                    && let Ok(guard) = state.store.try_lock_agent(&found.id)
-                {
-                    process_guard = Some(guard);
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            if process_guard.is_none()
-                && state
-                    .health
-                    .get(&found.id)
-                    .is_none_or(|live| !live.process_alive)
-            {
-                process_guard = state.store.try_lock_agent(&found.id).ok();
-            }
-        }
-        if let Some(process) = process_guard.as_ref() {
-            reap_archived_agent_with_process_locked(
-                &state.store,
-                state.store.data_dir(),
-                &found.id,
-                process,
-            );
-        }
-        drop(process_guard);
+        finish_agent_archive_locked(&state, &agent, is_self)?;
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
     .await
+}
+
+fn finish_agent_archive_locked(
+    state: &AppState,
+    agent: &Agent,
+    is_self: bool,
+) -> Result<(), ApiError> {
+    mark_explicitly_archived_locked(&state.store, state.store.data_dir(), agent)
+        .map_err(ApiError::from_store)?;
+    if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(
+        &anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id),
+    ) {
+        let _ = anyagents_tools::SandboxProvider::pause(&sbx);
+    }
+    let mut process_guard = None;
+    if !is_self {
+        let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
+        while std::time::Instant::now() < deadline {
+            if state
+                .health
+                .get(&agent.id)
+                .is_none_or(|live| !live.process_alive)
+                && let Ok(guard) = state.store.try_lock_agent(&agent.id)
+            {
+                process_guard = Some(guard);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if process_guard.is_none()
+            && state
+                .health
+                .get(&agent.id)
+                .is_none_or(|live| !live.process_alive)
+        {
+            process_guard = state.store.try_lock_agent(&agent.id).ok();
+        }
+    }
+    if let Some(process) = process_guard.as_ref() {
+        reap_archived_agent_with_process_locked(
+            &state.store,
+            state.store.data_dir(),
+            &agent.id,
+            process,
+        );
+    }
+    drop(process_guard);
+    Ok(())
 }
 
 #[cfg(test)]

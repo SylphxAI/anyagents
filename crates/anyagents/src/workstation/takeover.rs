@@ -134,7 +134,8 @@ pub fn mounted(key: &str) -> Option<axum::Router> {
 /// tunnels are off, `cloudflared` is not in the toolchain, or it gave no URL.
 pub async fn start_tunnel(addr: std::net::SocketAddr) -> Option<(url::Url, Tunnel)> {
     // Workstation tests use the real loopback page, never a public tunnel.
-    if cfg!(test) || std::env::var("ANYAGENTS_TAKEOVER_TUNNEL").as_deref() == Ok("0")
+    if cfg!(test)
+        || std::env::var("ANYAGENTS_TAKEOVER_TUNNEL").as_deref() == Ok("0")
         || std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
         || crate::sandbox::is_isolated_test_env()
     {
