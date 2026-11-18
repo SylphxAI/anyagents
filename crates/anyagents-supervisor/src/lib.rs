@@ -595,6 +595,11 @@ impl Finished {
 #[cfg(test)]
 type IdleReleaseHook = Arc<dyn Fn(&AgentId) + Send + Sync>;
 
+/// Production callback invoked once an idle agent has cleanly released and
+/// drained its delivery loop (e.g. releasing its remote sandbox compute lease
+/// while keeping persistent volume state).
+pub type IdleReleasedHook = Arc<dyn Fn(&AgentId, &std::path::Path) + Send + Sync>;
+
 struct Inner<H: Harness> {
     store: Arc<Store>,
     clock: Arc<dyn Clock>,
@@ -611,6 +616,7 @@ struct Inner<H: Harness> {
     quarantine: Mutex<Vec<Quarantined<H>>>,
     #[cfg(test)]
     idle_release_hook: Option<IdleReleaseHook>,
+    on_idle_released: Mutex<Option<IdleReleasedHook>>,
 }
 
 /// A failed retirement still owns both the delivery proofs and the process
@@ -684,6 +690,7 @@ impl<H: Harness + 'static> Supervisor<H> {
             quarantine: Mutex::new(Vec::new()),
             #[cfg(test)]
             idle_release_hook: None,
+            on_idle_released: Mutex::new(None),
         });
         let weak = Arc::downgrade(&inner);
         *lock(&inner.board.wake_stop) = Some(Arc::new(move |id, expected, timeout, cancelled| {
@@ -711,6 +718,12 @@ impl<H: Harness + 'static> Supervisor<H> {
 
     pub fn board(&self) -> HealthBoard {
         self.inner.board.clone()
+    }
+
+    /// Register a callback invoked once an idle agent finishes scaling down and
+    /// stops delivery (used by Thin Coordinator mode to `:release` the compute lease).
+    pub fn set_on_idle_released(&self, hook: IdleReleasedHook) {
+        *lock(&self.inner.on_idle_released) = Some(hook);
     }
 
     /// Stop, leaving every harness process to the next kernel when the
@@ -2822,6 +2835,10 @@ impl<H: Harness + 'static> Session<H> {
         self.stop_delivery();
         self.restart_at = None;
         reap_ephemeral_dirs(&self.paths.config_dir, &self.paths.managed_work);
+        let released_cb = lock(&self.inner.on_idle_released).clone();
+        if let Some(cb) = released_cb {
+            cb(&self.id, &self.paths.config_dir);
+        }
         self.publish();
         true
     }
@@ -3737,6 +3754,7 @@ mod tests {
                     .recv_timeout(Duration::from_secs(30))
                     .unwrap();
             })),
+            on_idle_released: Mutex::new(None),
         });
         // Run the real worker and ensure() path without an asynchronous router:
         // consume every arrival wake explicitly at the exact blocked boundary.
@@ -3986,6 +4004,7 @@ mod tests {
             exits: Mutex::new(HashMap::new()),
             quarantine: Mutex::new(Vec::new()),
             idle_release_hook: None,
+            on_idle_released: Mutex::new(None),
         });
         let mut session = Session::new(inner, agent.clone(), Arc::new(|| {}), Signals::detached());
         session.delivery = Some(
@@ -4106,6 +4125,7 @@ mod persistence_tests {
             exits: Mutex::new(HashMap::new()),
             quarantine: Mutex::new(Vec::new()),
             idle_release_hook: None,
+            on_idle_released: Mutex::new(None),
         });
         let delivery = DeliveryLoop::start(
             Store::open(dir.path().join("state.db")).unwrap(),
@@ -4448,6 +4468,7 @@ mod persistence_tests {
             exits: Mutex::new(HashMap::new()),
             quarantine: Mutex::new(Vec::new()),
             idle_release_hook: None,
+            on_idle_released: Mutex::new(None),
         });
         let mut session = Session::new(inner, agent, Arc::new(|| {}), Signals::detached());
 
@@ -4609,6 +4630,7 @@ mod custody_tests {
             exits: Mutex::new(HashMap::new()),
             quarantine: Mutex::new(Vec::new()),
             idle_release_hook: None,
+            on_idle_released: Mutex::new(None),
         });
         let mut session = Session::new(inner, agent.clone(), Arc::new(|| {}), Signals::detached());
         assert!(matches!(session.boot(), Boot::Stopped));
