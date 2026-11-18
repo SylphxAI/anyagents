@@ -597,6 +597,9 @@ fn session_config(
     browser.clear_env = true;
     browser.extra_env = chromium_environment(&home, &tmp)?;
     let mut cfg = SessionConfig::new(Profile::new(profile, dir), browser, runtime_dir);
+    // A takeover is a custody transfer, not an idle lease. Only explicit
+    // hand-back may resume the agent, including after a browser failure.
+    cfg.human_idle_timeout = None;
     if let Some(languages) = std::env::var("ANYAGENTS_BROWSER_LANGUAGES")
         .ok()
         .map(|v| {
@@ -953,6 +956,7 @@ mod tests {
             !live.pending_hand_back(),
             "fresh sessions must still expire"
         );
+        assert_eq!(live.session.gate().human_idle_timeout(), None);
 
         // An old nomination waits for in-flight caller work (clipboard included),
         // then sees the completion timestamp rather than killing the browser.
@@ -1115,6 +1119,10 @@ mod tests {
             }
         }
         assert_eq!(cfg.profile.user_data_dir(), dir.path().join("user-data"));
+        assert_eq!(
+            cfg.human_idle_timeout, None,
+            "takeover requires explicit hand-back"
+        );
     }
 
     #[test]
