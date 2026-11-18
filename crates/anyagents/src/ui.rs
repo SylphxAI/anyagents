@@ -341,6 +341,7 @@ pub struct Table {
     rows: Vec<Vec<String>>,
     indent: &'static str,
     fit_terminal: bool,
+    preserve_cells: bool,
 }
 
 impl Table {
@@ -351,11 +352,18 @@ impl Table {
             rows: Vec::new(),
             indent: "  ",
             fit_terminal: true,
+            preserve_cells: false,
         }
     }
 
     pub fn with_fit_terminal(mut self, fit: bool) -> Self {
         self.fit_terminal = fit;
+        self
+    }
+
+    /// Fall back to labeled rows rather than chopping identities or status.
+    fn preserve_cells(mut self) -> Self {
+        self.preserve_cells = true;
         self
     }
 
@@ -388,7 +396,7 @@ impl Table {
                 .map(|(h, _)| visible_width(h).max(6))
                 .sum::<usize>()
                 + 2 * cols.saturating_sub(1);
-            if minimum > available {
+            if minimum > available || self.preserve_cells {
                 let mut lines = Vec::new();
                 for (n, row) in self.rows.iter().enumerate() {
                     if n > 0 {
@@ -398,7 +406,11 @@ impl Table {
                         let cell = row.get(i).map(String::as_str).unwrap_or("—");
                         let label = format!("{}{}  ", self.indent, dim(title));
                         let space = term_w.saturating_sub(visible_width(&label));
-                        lines.push(format!("{label}{}", truncate_visible(cell, space)));
+                        if self.preserve_cells {
+                            lines.push(format!("{label}{cell}"));
+                        } else {
+                            lines.push(format!("{label}{}", truncate_visible(cell, space)));
+                        }
                     }
                 }
                 return lines;
@@ -506,6 +518,7 @@ fn state_rank(state: &str, process: &str, turn_state: &str) -> u8 {
 /// Options controlling how the agent hierarchy table is rendered.
 #[derive(Clone, Copy, Debug)]
 pub struct AgentsTableOptions {
+    pub title: &'static str,
     pub include_archived: bool,
     pub archived_count: Option<usize>,
     /// Maximum sub-agent tree depth to expand (`Some(0)` = roots only with subtree summary;
@@ -520,6 +533,7 @@ pub struct AgentsTableOptions {
 impl Default for AgentsTableOptions {
     fn default() -> Self {
         Self {
+            title: "Agents",
             include_archived: false,
             archived_count: None,
             max_depth: Some(0),
@@ -556,21 +570,21 @@ fn compute_subtree_stats<'a>(
             let child_stats = compute_subtree_stats(&kid.id, children_by_parent, now, memo);
             stats.total += 1 + child_stats.total;
             stats.max_depth = stats.max_depth.max(1 + child_stats.max_depth);
+            let on_quota = is_quota_held(kid, now);
             match (
                 kid.state.as_str(),
                 kid.process.as_str(),
                 kid.turn_state.as_str(),
             ) {
-                ("running", "alive", "working") => stats.working += 1,
+                ("running", "alive", "working") if is_healthy_active_turn(kid, on_quota) => {
+                    stats.working += 1
+                }
                 ("running", _, _) => stats.ready_or_starting += 1,
                 ("idle", _, _) => stats.scaled_idle += 1,
                 ("paused", _, _) => stats.paused += 1,
                 ("archived", _, _) => stats.archived += 1,
                 _ => stats.scaled_idle += 1,
             }
-            let on_quota = kid
-                .quota_reset_at_ms
-                .is_some_and(|ms| ms > now && ms - now < 86_400_000 * 7);
             let is_blocked = kid
                 .block_reason
                 .as_deref()
@@ -668,36 +682,76 @@ fn is_expected_turn_queue(agent: &AgentView, on_quota: bool) -> bool {
         && (agent.delivery.level == "turn-end" || agent.pending_switch)
 }
 
-fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
-    let on_quota = agent
+fn quota_remaining_ms(agent: &AgentView, now: i64) -> Option<i64> {
+    agent
         .quota_reset_at_ms
-        .is_some_and(|ms| ms > now && ms - now < 86_400_000 * 7);
-    if agent.state == "running"
-        && on_quota
-        && let Some(reset_ms) = agent.quota_reset_at_ms
-    {
-        return yellow(&format!("○ quota ({})", format_duration_ms(reset_ms - now)));
+        .and_then(|reset| reset.checked_sub(now))
+        .filter(|ms| agent.state == "running" && (1..86_400_000 * 7).contains(ms))
+}
+
+fn is_quota_held(agent: &AgentView, now: i64) -> bool {
+    quota_remaining_ms(agent, now).is_some()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AgentAttention {
+    Faulted,
+    Paused,
+    Quota(i64),
+    SignIn,
+    Error,
+}
+
+pub(crate) fn agent_attention(agent: &AgentView, now: i64) -> Option<AgentAttention> {
+    match agent.display_state() {
+        "faulted" => Some(AgentAttention::Faulted),
+        "paused" => Some(AgentAttention::Paused),
+        "running" | "idle" => {
+            if let Some(ms) = quota_remaining_ms(agent, now) {
+                Some(AgentAttention::Quota(ms))
+            } else if agent.block_reason.as_deref() == Some("sign_in_required") {
+                Some(AgentAttention::SignIn)
+            } else if agent
+                .last_error
+                .as_deref()
+                .is_some_and(|error| !error.trim().is_empty())
+            {
+                Some(AgentAttention::Error)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
-    let mut base = format_agent_status(
-        &agent.state,
-        &agent.process,
-        &agent.turn_state,
-        agent.quota_reset_at_ms,
-        agent.block_reason.as_deref(),
-    );
-    if is_healthy_active_turn(agent, on_quota)
+}
+
+pub(crate) fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
+    let mut base = match agent_attention(agent, now) {
+        Some(AgentAttention::Quota(ms)) => {
+            return yellow(&format!("◐ quota ↻{}", format_duration_ms(ms)));
+        }
+        Some(AgentAttention::Faulted) => red("✕ faulted"),
+        Some(AgentAttention::Paused) => yellow("◐ paused"),
+        Some(AgentAttention::SignIn) => red("✕ sign-in required"),
+        Some(AgentAttention::Error) => red("✕ error"),
+        None => format_agent_status(
+            &agent.state,
+            &agent.process,
+            &agent.turn_state,
+            None,
+            agent.block_reason.as_deref(),
+        ),
+    };
+    if is_healthy_active_turn(agent, false)
         && let Some(turn_ms) = agent.open_turn_age_ms.filter(|&ms| ms >= 5_000)
     {
-        base = format!(
-            "{base} {}",
-            dim(&format!("({})", format_duration_ms(turn_ms)))
-        );
+        base = format!("{base} {}", dim(&format_duration_ms(turn_ms)));
     }
     if agent.state != "archived"
         && agent.state != "paused"
         && let Some(ms) = agent.oldest_undelivered_age_ms
     {
-        if is_expected_turn_queue(agent, on_quota) {
+        if is_expected_turn_queue(agent, false) {
             if ms >= 5_000 {
                 return format!(
                     "{base} {}",
@@ -828,50 +882,22 @@ fn clean_agent_description(
 }
 
 /// Render the agent list using default options (concise root overview with subtree depth/status summary).
-pub fn print_agents_table(
-    agents: &[AgentView],
-    profile_lookup: Option<&dyn Fn(&AgentView) -> String>,
-    include_archived: bool,
-) {
-    print_agents_table_with_options(
-        agents,
-        profile_lookup,
-        AgentsTableOptions {
-            include_archived,
-            ..AgentsTableOptions::default()
-        },
-    );
-}
-
-/// Render the agent list as a clean root overview or multi-level hierarchical tree (`L1 -> L2 -> L3+`).
 pub fn print_agents_table_with_options(
     agents: &[AgentView],
     profile_lookup: Option<&dyn Fn(&AgentView) -> String>,
     options: AgentsTableOptions,
 ) {
     if agents.is_empty() {
-        println!("  {}", dim("No agents found."));
+        println!(
+            "\n  {}\n  {}",
+            bold_cyan(options.title),
+            dim("No agents found.")
+        );
         return;
     }
 
     let include_archived = options.include_archived;
     let now = anyagents_core::now_ms();
-    let running = agents.iter().filter(|a| a.state == "running").count();
-    let working = agents
-        .iter()
-        .filter(|a| a.state == "running" && a.process == "alive" && a.turn_state == "working")
-        .count();
-    let quota_count = agents
-        .iter()
-        .filter(|a| {
-            a.state == "running"
-                && a.quota_reset_at_ms
-                    .is_some_and(|ms| ms > now && ms - now < 86_400_000 * 7)
-        })
-        .count();
-    let idle = running.saturating_sub(working).saturating_sub(quota_count);
-    let scaled_idle = agents.iter().filter(|a| a.state == "idle").count();
-    let paused = agents.iter().filter(|a| a.state == "paused").count();
     let archived = options
         .archived_count
         .unwrap_or_else(|| agents.iter().filter(|a| a.state == "archived").count());
@@ -963,62 +989,63 @@ pub fn print_agents_table_with_options(
         .max()
         .unwrap_or(0);
 
-    let mut summary = Vec::new();
-    if running > 0 {
-        let mut breakdown = Vec::new();
-        if working > 0 {
-            breakdown.push(format!("{working} working"));
-        }
-        if idle > 0 {
-            breakdown.push(format!("{idle} idle"));
-        }
-        if quota_count > 0 {
-            breakdown.push(format!("{quota_count} quota"));
-        }
-        let detail = if breakdown.is_empty() {
-            bold_green(&format!("{running} active"))
-        } else {
-            format!(
-                "{} ({})",
-                bold_green(&format!("{running} active")),
-                breakdown.join(", ")
-            )
-        };
-        summary.push(detail);
-    }
-    if scaled_idle > 0 {
-        summary.push(dim(&format!("{scaled_idle} idle (process released)")));
-    }
-    if paused > 0 {
-        summary.push(yellow(&format!("{paused} paused")));
-    }
-    if archived > 0 {
-        if include_archived {
-            summary.push(dim(&format!("{archived} archived")));
-        } else {
-            summary.push(dim(&format!("{archived} archived hidden (--state all)")));
+    let working = visible_agents
+        .iter()
+        .filter(|a| is_healthy_active_turn(a, is_quota_held(a, now)))
+        .count();
+    let quota = visible_agents
+        .iter()
+        .filter(|a| is_quota_held(a, now))
+        .count();
+    let paused = visible_agents
+        .iter()
+        .filter(|a| a.display_state() == "paused")
+        .count();
+    let faulted = visible_agents
+        .iter()
+        .filter(|a| a.display_state() == "faulted")
+        .count();
+    let mut counts = Vec::new();
+    for (count, label) in [
+        (working, "working"),
+        (quota, "quota-held"),
+        (paused, "paused"),
+        (faulted, "faulted"),
+    ] {
+        if count > 0 {
+            counts.push(format!("{count} {label}"));
         }
     }
-    println!("\n  {}  {}", bold_cyan("Agents"), summary.join(&dim(" · ")));
-    if total_subagents > 0 {
-        let view_hint = match options.max_depth {
-            Some(0) => "use --tree (-t) or --depth <N> (-d) to expand sub-agents".to_string(),
-            Some(d) if d < global_max_depth => {
-                format!(
-                    "showing depth ≤ {d} of {global_max_depth} · use --tree (-t) or -d {global_max_depth} for all"
-                )
+    let detail = if counts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", counts.join(", "))
+    };
+    let archive_note = if archived > 0 && (include_archived || options.wide) {
+        format!(
+            " · {archived} archived{}",
+            if include_archived {
+                ""
+            } else {
+                " hidden (--state all)"
             }
-            _ => format!("showing full tree ({global_max_depth} levels deep)"),
-        };
+        )
+    } else {
+        String::new()
+    };
+    println!(
+        "\n  {}  {} root agents · {total_subagents} sub-agents{detail}{archive_note}",
+        bold_cyan(options.title),
+        roots.len()
+    );
+    if options.title == "Agents"
+        && options
+            .max_depth
+            .is_some_and(|depth| depth < global_max_depth)
+    {
         println!(
-            "          {}",
-            dim(&format!(
-                "{} roots · {} sub-agents (up to {} deep) · {}",
-                roots.len(),
-                total_subagents,
-                global_max_depth,
-                view_hint
-            ))
+            "  {}",
+            dim("Use --tree or --depth <N> to expand sub-agents.")
         );
     }
     println!();
@@ -1120,33 +1147,24 @@ pub fn print_agents_table_with_options(
         );
     }
 
-    let has_descriptions = ordered.iter().any(|n| {
-        n.agent
-            .description
-            .as_deref()
-            .is_some_and(|d| !d.trim().is_empty())
-    });
-
     let mut headers = vec![
         ("AGENT", false),
-        ("ROLE", false),
         ("STATUS", false),
-        ("TREE", false),
-        ("RUNTIME", false),
-        ("DELIVERY", false),
-        ("AUTOMATIONS", false),
+        (if options.wide { "RUNTIME" } else { "MODEL" }, false),
+        ("SUBAGENTS", false),
+        ("ROLE", false),
     ];
-    if profile_lookup.is_some() {
-        headers.push(("PROFILE", false));
-    }
-    if has_descriptions {
-        headers.push(("DESCRIPTION", false));
-    }
     if options.wide {
-        headers.push(("ID", false));
+        headers.push(("AUTOMATIONS", false));
+        if profile_lookup.is_some() {
+            headers.push(("PROFILE", false));
+        }
+        headers.extend([("DESCRIPTION", false), ("ID", false)]);
     }
 
-    let mut table = Table::new(&headers).with_fit_terminal(!options.wide);
+    let mut table = Table::new(&headers)
+        .with_fit_terminal(!options.wide)
+        .preserve_cells();
     for node in ordered {
         let agent = node.agent;
         let is_dim = agent.state == "archived" || agent.state == "idle";
@@ -1156,7 +1174,13 @@ pub fn print_agents_table_with_options(
             .get(agent.id.as_str())
             .copied()
             .unwrap_or_default();
-        let tree_cell = if node.depth == 0 {
+        let tree_cell = if !options.wide {
+            match (stats.total, stats.working) {
+                (0, _) => dim("—"),
+                (total, 0) => total.to_string(),
+                (total, working) => format!("{total} ({working} working)"),
+            }
+        } else if node.depth == 0 {
             if stats.total == 0 {
                 dim("-")
             } else {
@@ -1186,8 +1210,23 @@ pub fn print_agents_table_with_options(
         };
 
         let model_raw = agent.model.as_deref().unwrap_or("-");
-        let mut short_model = short_model_name(model_raw);
-        if agent.harness == "claude-code"
+        let mut short_model = if options.wide {
+            std::borrow::Cow::Borrowed(model_raw)
+        } else {
+            short_model_name(
+                model_raw
+                    .strip_prefix("sylphx/openai/")
+                    .unwrap_or(model_raw),
+            )
+        };
+        if !options.wide
+            && agent.harness == "agy"
+            && let Some(stripped) = short_model.strip_prefix("gemini-4-")
+        {
+            short_model = std::borrow::Cow::Owned(stripped.to_string());
+        }
+        if !options.wide
+            && agent.harness == "claude-code"
             && let Some(stripped) = short_model.strip_prefix("claude-")
         {
             short_model = std::borrow::Cow::Owned(stripped.to_string());
@@ -1217,22 +1256,12 @@ pub fn print_agents_table_with_options(
             None => dim("-"),
         };
 
-        let delivery = agent.delivery.label();
-        let delivery_cell = if is_dim { dim(&delivery) } else { delivery };
-        let mut row = vec![
-            node.display_name,
-            role_cell,
-            status,
-            tree_cell,
-            runtime,
-            delivery_cell,
-            automation_summary(&agent.automations),
-        ];
-        if let Some(lookup) = profile_lookup {
-            let prof = lookup(agent);
-            row.push(if is_dim { dim(&prof) } else { prof });
-        }
-        if has_descriptions {
+        let mut row = vec![node.display_name, status, runtime, tree_cell, role_cell];
+        if options.wide {
+            row.push(automation_summary(&agent.automations));
+            if let Some(lookup) = profile_lookup {
+                row.push(lookup(agent));
+            }
             let cleaned = agent
                 .description
                 .as_deref()
@@ -1246,8 +1275,6 @@ pub fn print_agents_table_with_options(
             } else {
                 desc_text.to_string()
             });
-        }
-        if options.wide {
             row.push(dim(&agent.id));
         }
         table.add_row(row);
@@ -1331,55 +1358,22 @@ pub fn format_profile_usage(usage: Option<&str>) -> String {
     styled_segments.join(&dim(" · "))
 }
 
-/// Format a single rate-limit window segment (`5h: 94% left ↻4h44m` -> ` 94% ↻4h44m`)
-/// with right-aligned percentage so all rows align vertically.
-fn format_quota_window_cell(seg: &str, period_tag: Option<&str>) -> String {
-    if let Some((before_left, after_left)) = seg.split_once("% left") {
-        let pct_str = before_left
-            .split_once(':')
-            .map_or(before_left, |(_, p)| p)
-            .trim();
-        let pct = pct_str.parse::<i64>().unwrap_or(100);
-        let pct_badge = format!("{pct:>3}%");
-        let styled_pct = if pct <= 0 {
-            red(&bold(&pct_badge))
-        } else if pct <= 25 {
-            yellow(&pct_badge)
-        } else {
-            green(&pct_badge)
-        };
-        let styled_after = style_usage_suffix(after_left, pct <= 0);
-        let suffix = period_tag
-            .map(|t| dim(&format!(" ({t})")))
-            .unwrap_or_default();
-        return format!("{styled_pct}{styled_after}{suffix}");
-    }
-    green(seg)
-}
-
-/// Split a profile's `(kind, usage)` into `(plan_cell, window_5h_cell, window_7d_or_balance_cell)`.
-fn parse_profile_usage_columns(kind: &str, usage: Option<&str>) -> (String, String, String) {
-    let empty_dash = || dim("   -");
-    let default_plan = |k: &str| -> String {
-        match k {
-            "oauth" | "subscription" => green("sub"),
-            "coding-plan" => cyan("coding-plan"),
-            _ => yellow(k),
-        }
+fn profile_plan_and_status(kind: &str, usage: Option<&str>) -> (String, String) {
+    let default_plan = |kind: &str| match kind {
+        "oauth" | "subscription" => green("subscription"),
+        "coding-plan" => cyan("coding plan"),
+        "api-key" => dim("API key"),
+        _ => dim(kind),
     };
-    let style_plan_tier = |tier: &str| -> String {
-        match tier {
-            "ultra" | "max 20x" | "promax" => bold_cyan(tier),
-            "max 5x" | "pro" | "plus" | "max" | "team" | "enterprise" => green(tier),
-            "free" => dim("free"),
-            "api-key" => yellow("api-key"),
-            "coding-plan" => cyan("coding-plan"),
-            other => green(other),
-        }
+    let style_plan_tier = |tier: &str| match tier {
+        "ultra" | "max 20x" | "promax" => bold_cyan(tier),
+        "free" => dim(tier),
+        "api-key" => dim("API key"),
+        _ => green(tier),
     };
 
     let Some(raw) = usage.map(str::trim).filter(|s| !s.is_empty()) else {
-        return (default_plan(kind), empty_dash(), empty_dash());
+        return (default_plan(kind), dim("not reported"));
     };
 
     let mut core = raw;
@@ -1405,81 +1399,54 @@ fn parse_profile_usage_columns(kind: &str, usage: Option<&str>) -> (String, Stri
         None => default_plan(kind),
     };
 
-    let mut cell_5h: Option<String> = None;
-    let mut cell_long: Option<String> = None;
-    let mut extra_parts: Vec<String> = Vec::new();
-
-    for seg in core.split(" · ") {
-        let seg = seg.trim();
-        if seg.is_empty() {
-            continue;
-        }
-        if seg.starts_with("5h:") {
-            cell_5h = Some(format_quota_window_cell(seg, None));
-        } else if seg.starts_with("7d:") {
-            cell_long = Some(format_quota_window_cell(seg, None));
-        } else if seg.starts_with("mo:") {
-            cell_long = Some(format_quota_window_cell(seg, Some("mo")));
-        } else if seg.starts_with("opus:") {
-            if let Some((before_left, _)) = seg.split_once("% left")
-                && let Some((_, pct_str)) = before_left.split_once(':')
+    let windows = core
+        .split(" · ")
+        .map(str::trim)
+        .filter(|seg| !seg.is_empty() && *seg != "-")
+        .map(|seg| {
+            if let Some((head, suffix)) = seg.split_once("% left")
+                && let Some((label, number)) = head.split_once(':')
             {
-                let pct = pct_str.trim().parse::<i64>().unwrap_or(100);
-                let pct_badge = format!("{pct}%");
-                let styled_pct = if pct <= 0 {
-                    red(&pct_badge)
-                } else if pct <= 25 {
-                    yellow(&pct_badge)
-                } else {
-                    green(&pct_badge)
-                };
-                extra_parts.push(format!("{} {styled_pct}", dim("· opus")));
+                if let Ok(pct) = number.trim().parse::<u8>()
+                    && pct <= 100
+                {
+                    let value = format!("{pct}% left");
+                    let value = match pct {
+                        0 => red(&value),
+                        1..=25 => yellow(&value),
+                        _ => green(&value),
+                    };
+                    return format!("{label}: {value}{}", style_usage_suffix(suffix, pct == 0));
+                }
+                return format!(
+                    "{}{}",
+                    dim(&format!("{label}: unavailable")),
+                    style_usage_suffix(suffix, false)
+                );
             }
-        } else if let Some((rem_part, tail)) = seg.split_once(" left (") {
-            // e.g. "$15.56 left ($2981 / $2996)" -> "$15.56 / $2996"
-            let tail_clean = tail.trim_end_matches(')');
-            if let Some((_, total_part)) = tail_clean.split_once('/') {
-                extra_parts.push(format!(
-                    "{} {}",
-                    green(rem_part.trim()),
-                    dim(&format!("/ {}", total_part.trim()))
-                ));
+            if seg.starts_with("oauth expired") || seg.starts_with("limited") {
+                red(seg)
             } else {
-                extra_parts.push(format!(
-                    "{} {}",
-                    green(rem_part.trim()),
-                    dim(&format!("({tail_clean})"))
-                ));
+                dim(seg)
             }
-        } else if let Some(amt) = seg.strip_suffix(" left") {
-            extra_parts.push(green(amt.trim()));
-        } else if let Some(eta) = seg.strip_prefix(crate::create::USAGE_LIMITED_PREFIX) {
-            extra_parts.push(format!(
-                "{}{}",
-                red(&bold(crate::create::USAGE_LIMITED_PREFIX)),
-                style_usage_suffix(eta, true)
-            ));
-        } else if seg == "online (gateway-edge)" {
-            extra_parts.push(format!("{} {}", green("online"), dim("(gateway)")));
-        } else if let Some((head, tail)) = seg.split_once(" (") {
-            extra_parts.push(format!("{} {}", green(head), dim(&format!("({tail}"))));
-        } else {
-            extra_parts.push(green(seg));
-        }
-    }
-
-    let final_5h = cell_5h.unwrap_or_else(empty_dash);
-    let final_long = match (cell_long, extra_parts.is_empty()) {
-        (Some(long_s), true) => long_s,
-        (Some(long_s), false) => format!("{long_s} {}", extra_parts.join(" ")),
-        (None, false) => extra_parts.join(&dim(" · ")),
-        (None, true) => empty_dash(),
+        })
+        .collect::<Vec<_>>();
+    let status = if windows.is_empty() {
+        dim("not reported")
+    } else {
+        windows.join(&dim(" · "))
     };
-
-    (plan_cell, final_5h, final_long)
+    (plan_cell, status)
 }
 
-/// Pretty-print upstream provider profiles (`anyagents profiles`).
+fn profile_account_label(profile: &str, account: Option<&str>) -> String {
+    match account.map(str::trim).filter(|account| !account.is_empty()) {
+        Some(account) if profile == account => account.to_owned(),
+        Some(account) => format!("{account} · {profile}"),
+        None => format!("Profile: {profile}"),
+    }
+}
+
 pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEntry]) {
     if entries.is_empty() {
         println!(
@@ -1489,95 +1456,33 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
         );
         return;
     }
-    let total = entries.len();
-    let mut sub_count = 0usize;
-    let mut plan_count = 0usize;
-    let mut key_count = 0usize;
-    let mut in_use_count = 0usize;
-    let mut exhausted_count = 0usize;
-
-    for e in entries {
-        match e.kind.as_str() {
-            "subscription" | "oauth" => sub_count += 1,
-            "coding-plan" => plan_count += 1,
-            _ => key_count += 1,
-        }
-        if !e.assigned_agents.is_empty() || e.subagent_count > 0 {
-            in_use_count += 1;
-        }
-        if e.usage
-            .as_deref()
-            .is_some_and(|u| crate::create::parse_remaining_pct_from_usage(u, None) == Some(0))
-        {
-            exhausted_count += 1;
-        }
-    }
-
-    let health_summary = if exhausted_count > 0 {
-        format!(
-            "{} · {}",
-            green(&format!("{} ready", total.saturating_sub(exhausted_count))),
-            red(&format!("{exhausted_count} exhausted"))
-        )
-    } else {
-        green("all ready")
-    };
-
+    let in_use = entries
+        .iter()
+        .filter(|entry| !entry.assigned_agents.is_empty() || entry.subagent_count > 0)
+        .count();
     println!(
-        "\n  {}  {} {} · {} · {}\n",
+        "\n  {}  {} · {}\n",
         bold_cyan("Provider Profiles"),
-        bold(&format!("{total} configured")),
-        dim(&format!(
-            "({sub_count} subscription · {plan_count} coding-plan · {key_count} api-key)"
-        )),
-        cyan(&format!("{in_use_count} in use")),
-        health_summary,
+        bold(&format!("{} configured", entries.len())),
+        cyan(&format!("{in_use} in use")),
     );
 
     let mut table = Table::new(&[
         ("PROVIDER", false),
-        ("PROFILE", false),
         ("ACCOUNT", false),
         ("PLAN", false),
-        ("5H QUOTA", false),
-        ("7D / BALANCE", false),
+        ("QUOTA / STATUS", false),
         ("AGENTS", false),
-    ]);
+    ])
+    .preserve_cells();
 
     for e in entries {
-        let is_exhausted = e
-            .usage
-            .as_deref()
-            .is_some_and(|u| crate::create::parse_remaining_pct_from_usage(u, None) == Some(0));
-        let provider_cell = if is_exhausted {
-            red(&bold(&e.provider))
-        } else {
-            bold(&e.provider)
-        };
-        let profile_cell = if is_exhausted {
-            red(&e.profile)
-        } else if e.profile == "default" {
-            dim("default")
-        } else {
-            cyan(&e.profile)
-        };
-        let account_cell = match e
-            .account
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(acct) if acct.starts_with("user_") && acct.len() > 14 => {
-                dim(&format!("{}…", &acct[..11]))
-            }
-            Some(acct) => dim(acct),
-            None => dim("-"),
-        };
-        let (plan_cell, window_5h_cell, window_long_cell) =
-            parse_profile_usage_columns(&e.kind, e.usage.as_deref());
+        let provider_cell = bold(&e.provider);
+        let account_cell = profile_account_label(&e.profile, e.account.as_deref());
+        let (plan_cell, status_cell) = profile_plan_and_status(&e.kind, e.usage.as_deref());
 
         let agents_cell = if e.assigned_agents.is_empty() && e.subagent_count == 0 {
-            dim("-")
+            dim("none")
         } else {
             let mut parts = Vec::new();
             if !e.assigned_agents.is_empty() {
@@ -1605,11 +1510,9 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
 
         table.add_row(vec![
             provider_cell,
-            profile_cell,
             account_cell,
             plan_cell,
-            window_5h_cell,
-            window_long_cell,
+            status_cell,
             agents_cell,
         ]);
     }
@@ -1623,21 +1526,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_limit_outside_the_reported_windows_shows_in_no_5h_column() {
-        let (plan, five_hour, weekly) = parse_profile_usage_columns(
+    fn quota_status_preserves_every_period_and_reset() {
+        let (plan, status) = profile_plan_and_status(
             "subscription",
-            Some("limited ↻2h20m · 7d: 5% left ↻1d22h (ultra)"),
+            Some("limited ↻2h20m · 7d: 5% left ↻1d22h · mo: 80% left ↻9d (ultra)"),
         );
         assert!(plan.contains("ultra"), "{plan}");
-        assert!(!five_hour.contains('%'), "{five_hour}");
-        assert!(
-            weekly.contains("5%") && weekly.contains("↻1d22h"),
-            "{weekly}"
+        assert!(!status.contains("5h:"), "{status}");
+        for evidence in [
+            "7d:", "5% left", "↻1d22h", "mo:", "80% left", "↻9d", "limited", "↻2h20m",
+        ] {
+            assert!(status.contains(evidence), "{evidence} missing: {status}");
+        }
+    }
+
+    #[test]
+    fn profile_status_does_not_invent_quota_or_conflate_account_and_profile() {
+        let (_, missing) = profile_plan_and_status("oauth", None);
+        assert!(missing.contains("not reported"));
+        for usage in ["5h: ?% left", "5h: 150% left"] {
+            let (_, malformed) = profile_plan_and_status("oauth", Some(usage));
+            assert!(malformed.contains("5h: unavailable"));
+            assert!(!malformed.contains('%'));
+        }
+        assert_eq!(
+            profile_account_label("work", Some("u@example.test")),
+            "u@example.test · work"
         );
-        assert!(
-            weekly.contains("limited") && weekly.contains("↻2h20m"),
-            "{weekly}"
-        );
+        assert_eq!(profile_account_label("work", None), "Profile: work");
     }
 
     #[test]
@@ -1759,16 +1675,65 @@ mod tests {
         // 1. Healthy steered long turn: shows active turn duration, zero ! lag.
         let steered = sample_agent("working", "mid-turn", Some(56 * 60_000), None);
         let rendered_steered = format_status_with_alerts(&steered, 10_000_000);
-        assert!(rendered_steered.contains("working"));
-        assert!(rendered_steered.contains("(56m)"));
+        assert_eq!(
+            rendered_steered,
+            format!("{} {}", bold_green("● working"), dim("56m"))
+        );
         assert!(!rendered_steered.contains("! lag"));
 
         // 2. Healthy turn-end turn with queued mail: shows dim queued age, zero ! lag.
         let followup = sample_agent("working", "turn-end", Some(20 * 60_000), Some(180_000));
         let rendered_followup = format_status_with_alerts(&followup, 10_000_000);
-        assert!(rendered_followup.contains("(20m)"));
+        assert!(rendered_followup.starts_with(&format!(
+            "{} {}",
+            bold_green("● working"),
+            dim("20m")
+        )));
         assert!(rendered_followup.contains("queued 3m"));
         assert!(!rendered_followup.contains("! lag"));
+
+        let mut attention = steered.clone();
+        let now = 10_000_000;
+        assert_eq!(agent_attention(&attention, now), None);
+        attention.last_error = Some("private error details".into());
+        assert_eq!(
+            agent_attention(&attention, now),
+            Some(AgentAttention::Error)
+        );
+        assert_eq!(format_status_with_alerts(&attention, now), red("✕ error"));
+        attention.block_reason = Some("sign_in_required".into());
+        assert_eq!(
+            agent_attention(&attention, now),
+            Some(AgentAttention::SignIn)
+        );
+        assert_eq!(
+            format_status_with_alerts(&attention, now),
+            red("✕ sign-in required")
+        );
+        attention.quota_reset_at_ms = Some(now + 60_000);
+        assert_eq!(
+            agent_attention(&attention, now),
+            Some(AgentAttention::Quota(60_000))
+        );
+        assert_eq!(
+            format_status_with_alerts(&attention, now),
+            yellow("◐ quota ↻1m")
+        );
+        attention.state = "paused".into();
+        assert_eq!(
+            agent_attention(&attention, now),
+            Some(AgentAttention::Paused)
+        );
+        assert_eq!(
+            format_status_with_alerts(&attention, now),
+            yellow("◐ paused")
+        );
+        attention.state = "faulted".into();
+        assert_eq!(
+            agent_attention(&attention, now),
+            Some(AgentAttention::Faulted)
+        );
+        assert_eq!(format_status_with_alerts(&attention, now), red("✕ faulted"));
 
         // 3. Genuine undelivered backlog: renders ! lag and increments subtree lagging count.
         let stalled = sample_agent("idle", "mid-turn", None, Some(180_000));

@@ -54,8 +54,7 @@ mod workstation;
 #[command(
     name = "anyagents",
     version,
-    about = "Mailbox and delivery for long-lived coding agents",
-    arg_required_else_help = true
+    about = "Manage agents, accounts, and automations"
 )]
 struct Cli {
     /// Directory that holds the database.
@@ -65,7 +64,7 @@ struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -73,14 +72,21 @@ struct Cli {
 enum Command {
     /// Run the server.
     Serve,
-    /// Inspect server health, boundary/token state, installed harnesses, master profiles, and agents.
+    /// See server and fleet health (also the default).
+    #[command(display_order = 1)]
     Status {
         /// Output machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
+    /// View accounts, sign in, or configure provider keys.
+    #[command(display_order = 3)]
+    Auth {
+        #[command(subcommand)]
+        action: Option<AuthCommand>,
+    },
     /// Sign an agent's harness or a server master profile in through the vendor's own command.
-    #[command(visible_alias = "signin", alias = "login")]
+    #[command(hide = true, aliases = ["signin", "login"])]
     SignIn {
         /// Agent name, `<provider>/<profile>`, or harness ID (`spiron`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`).
         agent: String,
@@ -94,6 +100,7 @@ enum Command {
         action: HarnessesCommand,
     },
     /// Upstream provider profile pool (Subscriptions, Coding Plans, and API Keys) shared across harnesses.
+    #[command(hide = true)]
     Profiles {
         /// Optional action (`list`, `set`) or provider/harness filter.
         action: Option<String>,
@@ -103,14 +110,14 @@ enum Command {
         #[arg(long = "key-file")]
         key_file: Option<PathBuf>,
     },
-    /// Create and list agents.
-    #[command(visible_alias = "agent")]
+    /// List or manage agents.
+    #[command(display_order = 2, visible_alias = "agent")]
     Agents {
         #[command(subcommand)]
-        action: AgentsCommand,
+        action: Option<AgentsCommand>,
     },
-    /// List all agents and sub-agents with their parent, harness, model, state, and process health.
-    #[command(visible_aliases = ["ls", "ps"])]
+    /// List agents with optional state and tree filters.
+    #[command(name = "ls", aliases = ["peers", "ps"], display_order = 5)]
     Peers {
         /// Optional state filter: `running`, `archived`, or `all`.
         #[arg(short = 's', long)]
@@ -348,6 +355,7 @@ enum Command {
         article_author: Option<String>,
     },
     /// Perform an IM channel or message interaction (`react`, `vote`, `edit`, `delete`, `pin`, `unpin`, `stop_poll`).
+    #[command(hide = true)]
     Interact {
         /// Action: `react`, `vote`, `edit`, `delete`, `pin`, `unpin`, or `stop_poll`.
         action: String,
@@ -370,9 +378,10 @@ enum Command {
     #[command(visible_alias = "mail")]
     Inbox(InboxArgs),
     /// Read, search, or follow an agent's full conversation.
-    #[command(visible_aliases = ["logs", "messages", "msg"], aliases = ["conv", "history", "tail"])]
+    #[command(name = "logs", aliases = ["conversation", "messages", "msg", "conv", "history", "tail"], display_order = 4)]
     Conversation(ConversationArgs),
     /// Audited erasure (conversation.redact): ancestors/admin only; target must be quiescent.
+    #[command(hide = true)]
     Redact {
         agent: String,
         /// Inbound/outbound/tool id or transcript:<zero-based-line>.
@@ -451,6 +460,7 @@ enum Command {
     },
     /// Speak MCP for one agent. Its capability comes from its config
     /// directory, never from a name.
+    #[command(hide = true)]
     Mcp {
         /// The agent's own config directory. The server names it to every
         /// harness it starts, so a harness that omits it is read from there.
@@ -463,6 +473,7 @@ enum Command {
     },
     /// Start one agent command inside the deployment's OS boundary, or refuse
     /// and name the admission it needs. Never starts it unisolated.
+    #[command(hide = true)]
     AgentRun {
         /// The agent's own config directory.
         #[arg(long)]
@@ -473,6 +484,7 @@ enum Command {
     },
     /// The deployment's boundary contract: what an agent may read, and what it
     /// may write.
+    #[command(hide = true)]
     Boundary,
     /// The keepers that hold harness processes across server restarts, and the detached harness processes (v2 Spiron) that need none.
     Keepers {
@@ -484,6 +496,7 @@ enum Command {
     #[command(hide = true)]
     FakeOpencode,
     /// Switch an existing agent's harness while preserving its identity, model, profile, workdir, history, and lifecycle state (or run the hidden test double when given a single `adapter.json` path).
+    #[command(hide = true)]
     Harness {
         /// Agent name (`owner-anymd`) or `agt_...` ID (or `adapter.json` path for the test double).
         config: PathBuf,
@@ -502,6 +515,7 @@ enum Command {
     /// Put one agent's mailbox into its harness now, if the running server has
     /// not. Reads the store directly, so it also covers a server that was just
     /// upgraded and is still inside its restart backoff.
+    #[command(hide = true)]
     Flush {
         /// The agent name, or `all`.
         agent: String,
@@ -603,8 +617,8 @@ enum Command {
         #[arg(long)]
         key: Option<String>,
     },
-    /// Schedule one-off (`--at`), recurring (`--every`), or event-watch (`--watch`) wakes, or list/cancel (`--cancel`) schedules.
-    #[command(visible_alias = "schedules", alias = "cron")]
+    /// List, create, or cancel scheduled wakes.
+    #[command(name = "schedules", aliases = ["schedule", "cron"], display_order = 6)]
     Schedule {
         /// List visible schedules across all agents (read-only).
         #[arg(long, conflicts_with_all = ["agent", "at", "every", "watch", "prompt", "cancel"])]
@@ -658,10 +672,10 @@ enum Command {
         json: bool,
     },
     /// Run the outbound cloud harness adapter (`spiron-cloud`, `claude-cloud`, `openai-cloud`, `cursor-cloud`) speaking `stream-json`.
-    #[command(name = "cloud-harness")]
+    #[command(name = "cloud-harness", hide = true)]
     CloudHarness(cloud_harness::CloudHarnessArgs),
     /// Run a local CLI harness inside a remote sandbox (`POST /v1/sandboxes/{id}/exec`) speaking `stream-json`.
-    #[command(name = "sandbox-exec")]
+    #[command(name = "sandbox-exec", hide = true)]
     SandboxExec(sandbox_exec::SandboxExecArgs),
     /// Dense retrieval and reranking over raw history, as its own process.
     #[command(name = "memory-service")]
@@ -726,6 +740,27 @@ enum KeepersCommand {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// List accounts and quota (also the default).
+    #[command(visible_alias = "status")]
+    List { filter: Option<String> },
+    /// Sign in to an agent or provider profile.
+    Login {
+        target: String,
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Set the key for a provider profile.
+    Set {
+        target: String,
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+    },
+    /// List supported harnesses.
+    Harnesses,
 }
 
 #[derive(Subcommand)]
@@ -1114,7 +1149,7 @@ fn main() -> ExitCode {
     // an I/O error, not terminate the entire service. Only operator output uses
     // the default pipeline disposition installed above.
     #[cfg(unix)]
-    if matches!(cli.command, Command::Serve) {
+    if matches!(cli.command, Some(Command::Serve)) {
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         }
@@ -1155,15 +1190,26 @@ fn resolve_data_dir(raw: PathBuf, _is_serve: bool) -> PathBuf {
 }
 
 fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
-    let data = resolve_data_dir(cli.data, matches!(cli.command, Command::Serve));
+    let data = resolve_data_dir(cli.data, matches!(cli.command, Some(Command::Serve)));
     sandbox::load_principal_registry(&data)?;
     // Helpers a command runs use the deployment's manifest, as the server's do.
-    if !matches!(cli.command, Command::Serve) {
+    if !matches!(cli.command, Some(Command::Serve)) {
         anyagents_toolchain::init_cli(&data, sandbox::host_home_dir());
     }
-    match cli.command {
+    match cli.command.unwrap_or(Command::Status { json: false }) {
         Command::Serve => server::run(&data),
         Command::Status { json } => status_cmd(&data, json),
+        Command::Auth { action } => match action.unwrap_or(AuthCommand::List { filter: None }) {
+            AuthCommand::List { filter } => list_profiles_cmd(&data, filter.as_deref(), false),
+            AuthCommand::Login { target, profile } => sign_in(&data, &target, profile.as_deref()),
+            AuthCommand::Set { target, key_file } => {
+                profiles_cmd(&data, Some("set"), Some(&target), key_file.as_deref())
+            }
+            AuthCommand::Harnesses => {
+                list_harnesses(&data);
+                Ok(())
+            }
+        },
         Command::SignIn { agent, profile } => sign_in(&data, &agent, profile.as_deref()),
         Command::Harnesses { action } => match action {
             HarnessesCommand::List => {
@@ -1224,7 +1270,12 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 harness_double::run(&config)
             }
         }
-        Command::Agents { action } => agent::agents(&data, action),
+        Command::Agents {
+            action: Some(action),
+        } => agent::agents(&data, action),
+        Command::Agents { action: None } => {
+            agent::peers_with_options(&data, None, None, false, None, false)
+        }
         Command::Peers {
             state,
             parent,
@@ -2948,108 +2999,67 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
     }
 
     if ui::is_pretty() {
-        let srv_badge = if server_up {
+        let badge = if server_up {
             ui::bold_green("● running")
         } else {
             ui::red("○ stopped")
         };
-        let tok_badge = if has_operator_token {
-            ui::green("✓ ready")
-        } else {
-            ui::yellow("○ missing")
-        };
-        println!(
-            "\n  {}  {}{} {} {} {} {}\n",
-            ui::bold_cyan("Server"),
-            srv_badge,
-            if ui::is_verbose() {
-                ui::dim(&format!(" · socket {}", sock.display()))
-            } else {
-                String::new()
-            },
-            ui::dim("· webhook"),
-            webhook_addr.as_deref().unwrap_or("-"),
-            ui::dim("· token"),
-            tok_badge,
-        );
-
-        println!("  {}\n", ui::bold_cyan("Harnesses"));
-        let mut htable = ui::Table::new(&[
-            ("HARNESS", false),
-            ("STATUS", false),
-            ("VERSION", false),
-            ("DELIVERY", false),
-            ("PROFILES", false),
-        ]);
-        for h in &harness_rows {
-            let id = h["id"].as_str().unwrap_or("-");
-            let inst = if h["installed"].as_bool() == Some(true) {
-                ui::green("✓ ready")
-            } else {
-                ui::dim("on-demand")
-            };
-            let ver = h["version"].as_str().unwrap_or("-");
-            let ver_cell = if ver == "-" {
-                ui::dim("-")
-            } else {
-                ver.to_string()
-            };
-            let delivery = delivery_label(&h["delivery"]);
-            let profs = h["profiles"]
-                .as_array()
-                .map(|arr| {
-                    let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-                    if names.is_empty() {
-                        ui::dim("auto")
-                    } else {
-                        ui::dim(&names.join(", "))
-                    }
-                })
-                .unwrap_or_else(|| ui::dim("auto"));
-            htable.add_row(vec![
-                ui::bold(&ui::cyan(id)),
-                inst,
-                ver_cell,
-                delivery,
-                profs,
-            ]);
-        }
-        htable.print();
-
-        let profile_lookup = |a: &api::AgentView| -> String {
-            anyagents_core::AgentId::parse(&a.id)
+        // Older daemons may not expose identity. Don't substitute the CLI's version.
+        let version = if server_up {
+            client::get::<serde_json::Value>(data, "/v1/webhooks/healthz")
                 .ok()
-                .and_then(|id| {
-                    create::bound_profile_name(&anyagents_core::agent_config_dir(data, &id))
-                })
-                .unwrap_or_else(|| "default".to_string())
+                .flatten()
+                .and_then(|identity| identity.get("version")?.as_str().map(str::to_owned))
+                .map(|version| format!(" · {version}"))
+                .unwrap_or_default()
+        } else {
+            String::new()
         };
-        ui::print_agents_table(&agents_list, Some(&profile_lookup), false);
-        if !faulted.is_empty() || !unsettled.is_empty() {
-            println!("\n  {}\n", ui::bold_cyan("Attention"));
-            for agent in &faulted {
-                println!(
-                    "  {} {} {}",
-                    ui::red("✗ faulted"),
-                    ui::bold(&agent.name),
-                    ui::dim(
-                        agent
-                            .turn_errors
-                            .as_ref()
-                            .and_then(|errors| errors.last_error.as_deref())
-                            .unwrap_or("-")
-                    )
-                );
+        println!("\n  {}  {badge}{version}", ui::bold_cyan("Server"));
+        if ui::is_verbose() {
+            println!("  Socket: {}", sock.display());
+            if let Some(addr) = webhook_addr.as_deref() {
+                println!("  Webhook: {addr}");
             }
-            for held in &unsettled {
-                println!(
-                    "  {} {} → {} {}",
-                    ui::yellow("? unconfirmed send"),
-                    held.key,
-                    held.destination,
-                    ui::dim("(anyagents outbound retry|discard <key>)")
-                );
+            if let Some(addr) = public_addr.as_deref() {
+                println!("  Public listener: {addr}");
             }
+            println!(
+                "  Operator token: {}",
+                if has_operator_token {
+                    "ready"
+                } else {
+                    "missing"
+                }
+            );
+        }
+        let now = anyagents_core::now_ms();
+        let attention = agents_list
+            .iter()
+            .filter(|agent| ui::agent_attention(agent, now).is_some());
+        for (i, agent) in attention.enumerate() {
+            if i == 0 {
+                println!("\n  {}", ui::bold_cyan("Attention"));
+            }
+            println!(
+                "  {}  {}",
+                ui::bold(&agent.name),
+                ui::format_status_with_alerts(agent, now)
+            );
+        }
+        ui::print_agents_table_with_options(
+            &agents_list,
+            None,
+            ui::AgentsTableOptions {
+                title: "Departments",
+                ..ui::AgentsTableOptions::default()
+            },
+        );
+        if !unsettled.is_empty() {
+            println!(
+                "  {} unconfirmed sends · see anyagents outbound",
+                unsettled.len()
+            );
         }
         return Ok(());
     }
@@ -3280,6 +3290,34 @@ mod cli_query_tests {
     use clap::CommandFactory;
 
     #[test]
+    fn internal_commands_are_hidden_but_direct_help_still_parses() {
+        let help = Cli::command().render_help().to_string();
+        for command in [
+            "agent-run",
+            "fake-opencode",
+            "cloud-harness",
+            "sandbox-exec",
+            "boundary",
+            "flush",
+            "harness",
+            "mcp",
+            "interact",
+            "redact",
+        ] {
+            assert!(
+                !help
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(command)),
+                "{command}"
+            );
+            let Err(err) = Cli::try_parse_from(["anyagents", command, "--help"]) else {
+                panic!("expected help for {command}");
+            };
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp, "{command}");
+        }
+    }
+
+    #[test]
     fn command_tree_and_message_aliases_parse() {
         Cli::command().debug_assert();
         for alias in [
@@ -3295,37 +3333,37 @@ mod cli_query_tests {
                 Cli::try_parse_from(["anyagents", alias, "vulcan", "-n", "10"])
                     .unwrap()
                     .command,
-                Command::Conversation(_)
+                Some(Command::Conversation(_))
             ));
         }
         assert!(matches!(
             Cli::try_parse_from(["anyagents", "mail", "vulcan", "--unread"])
                 .unwrap()
                 .command,
-            Command::Inbox(_)
+            Some(Command::Inbox(_))
         ));
         for alias in ["ls", "ps"] {
             assert!(matches!(
                 Cli::try_parse_from(["anyagents", alias]).unwrap().command,
-                Command::Peers { .. }
+                Some(Command::Peers { .. })
             ));
         }
         // `resume` takes a name, or `--faulted` for every parked agent.
         let faulted = Cli::try_parse_from(["anyagents", "resume", "--faulted"]).unwrap();
         assert!(matches!(
             faulted.command,
-            Command::Resume {
+            Some(Command::Resume {
                 faulted: true,
                 name: None,
                 ..
-            }
+            })
         ));
         assert!(Cli::try_parse_from(["anyagents", "resume"]).is_err());
         assert!(Cli::try_parse_from(["anyagents", "resume", "vulcan", "--faulted"]).is_err());
         let inspected = Cli::try_parse_from(["anyagents", "inspect", "vulcan", "-n", "5"]).unwrap();
         assert!(matches!(
             inspected.command,
-            Command::Inspect { limit: 5, .. }
+            Some(Command::Inspect { limit: 5, .. })
         ));
         for subcommand in [
             "logs",
@@ -3367,7 +3405,7 @@ mod cli_query_tests {
             "--json",
         ])
         .unwrap();
-        let Command::Conversation(args) = cli.command else {
+        let Some(Command::Conversation(args)) = cli.command else {
             panic!()
         };
         assert!(args.options.inbound && args.options.full && args.options.json);
