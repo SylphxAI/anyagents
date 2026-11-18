@@ -935,7 +935,8 @@ for request_num, msg in enumerate(inputs(), 1):
         eventually(|| read_wire().len() == 1);
         // The pass that records the error may wait on the short timer the
         // worker installs after the delivery: fire it once it is installed,
-        // never past the second the backoff window allows for.
+        // never past the second the backoff window allows for. The backoff
+        // is 15 s lengthened by up to a fifth.
         eventually(|| {
             let errored = store
                 .turn_errors(&agent.id)
@@ -948,7 +949,7 @@ for request_num, msg in enumerate(inputs(), 1):
         });
         eventually(|| {
             recorded.waits.lock().unwrap().iter().any(|(_, deadline)| {
-                deadline.is_some_and(|at| (START + 15_000..=START + 16_000).contains(&at))
+                deadline.is_some_and(|at| (START + 15_000..=START + 19_000).contains(&at))
             }) || read_wire().len() > 1
         });
         assert_eq!(
@@ -962,9 +963,21 @@ for request_num, msg in enumerate(inputs(), 1):
             .unwrap()
             .iter()
             .find_map(|(_, deadline)| {
-                deadline.filter(|at| (START + 15_000..=START + 16_000).contains(at))
+                deadline.filter(|at| (START + 15_000..=START + 19_000).contains(at))
             })
             .expect("the systemic follow-up must install its backoff");
+        // A transient fault is pending work: shown working until its retry,
+        // never errored, although the adapter persisted the fault.
+        assert!(cfg.join(".anyagents-last-error.json").exists());
+        let view = crate::server::agent_view(
+            &store,
+            &supervisor.board(),
+            &store.agent(&agent.id).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(view.turn_state, "working");
+        assert_eq!(view.retry_at_ms, Some(deadline));
+        assert_eq!(view.last_error, None);
         // Time stands just before the deadline when the mail arrives, so the
         // wake the mail causes re-installs the backoff at that time.
         clock.set_ms(deadline - 1);
