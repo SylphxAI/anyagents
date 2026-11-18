@@ -546,3 +546,44 @@ async fn coordinate_inputs_dispatch_refuses_without_input_on_owned_desktop() {
     assert!(closed.unwrap(), "the fixture owned a desktop to close");
     assert!(session::running(data.path(), &caller.profile).is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unclaimed_takeover_can_be_released_or_closed() {
+    if std::env::var("ANYAGENTS_DESKTOP_HEADFUL").as_deref() != Ok("1") {
+        eprintln!("skipped: set ANYAGENTS_DESKTOP_HEADFUL=1");
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    for cancel_first in [true, false] {
+        call(path, json!({"action": "open", "url": "about:blank"})).await;
+        let live = super::session::running(path, "agent-a").unwrap();
+        let hand_backs = live.session.gate().hand_backs();
+        let ready = call(path, json!({"action": "takeover"})).await;
+        assert_eq!(ready["status"], "takeover_ready");
+        assert!(ready["takeover_url"].is_string());
+        // Never open the link or call the gate's take(): the human has not claimed custody.
+        let status = call(path, json!({"action": "takeover_status"})).await;
+        assert_eq!(status["completed"], true);
+        assert_eq!(status["holder"], "agent");
+
+        if cancel_first {
+            let released = call(path, json!({"action": "release_takeover"})).await;
+            assert_eq!(released["released_takeover"], true);
+            assert_eq!(released["holder"], "agent");
+            let again = call(path, json!({"action": "release_takeover"})).await;
+            assert_eq!(again["released_takeover"], false);
+            assert_eq!(live.session.gate().hand_backs(), hand_backs);
+        }
+        let closed = call(path, json!({"action": "close"})).await;
+        assert_eq!(closed["status"], "stopped");
+        assert_eq!(closed["was_running"], true);
+        assert_eq!(closed["user_data_preserved"], true);
+        assert!(live.session.is_closed());
+        assert_eq!(live.session.gate().hand_backs(), hand_backs);
+        assert!(super::session::running(path, "agent-a").is_none());
+    }
+}

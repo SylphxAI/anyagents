@@ -63,7 +63,7 @@ roxmltree = "0.21"
 # Pinned by git revision (agent-workstation 0.2.0, merged to main as #9)
 # until 0.2.0 is published; then this becomes `agent-workstation = "0.2"`.
 [target.'cfg(target_os = "linux")'.dependencies]
-agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "9737417b6b0328a1d7893b80ec0d928fc6e5151b" }
+agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "9587cbc7d0850afa315111b764cc9cde9d62e646" }
 async-trait = "0.1"
 tower = { version = "0.5", features = ["util"] }
 
