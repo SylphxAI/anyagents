@@ -2283,6 +2283,14 @@ fn evaluate_entry(
     }
 }
 
+/// Skip missed ticks in constant time while preserving the original cadence.
+fn next_recurring_slot(due: i64, interval: i64, now: i64) -> Option<i64> {
+    debug_assert!(due <= now && interval > 0);
+    let interval = i128::from(interval);
+    let elapsed = i128::from(now) - i128::from(due);
+    i64::try_from(i128::from(now) + interval - elapsed % interval).ok()
+}
+
 fn evaluate_timer(store: &Store, entry: &mut Entry, now: i64) -> EntryOutcome {
     let sched = &entry.sched;
     let Some(due) = sched.next_fire_at_ms else {
@@ -2308,10 +2316,14 @@ fn evaluate_timer(store: &Store, entry: &mut Entry, now: i64) -> EntryOutcome {
         };
     }
     let interval = sched.interval_ms.unwrap_or(60_000).max(1_000);
-    let mut next_due = due.saturating_add(interval);
-    while next_due <= now {
-        next_due = next_due.saturating_add(interval);
-    }
+    let next_due = next_recurring_slot(due, interval, now);
+    // An occurrence can be delivered even if no later slot fits in the
+    // stored timestamp type. Do not leave an active row with no deadline.
+    let next_state = if next_due.is_some() {
+        "active"
+    } else {
+        "fired"
+    };
     let Some(previous_pending) = previous_wake_pending(store, &agent, sched) else {
         return EntryOutcome::default();
     };
@@ -2321,8 +2333,8 @@ fn evaluate_timer(store: &Store, entry: &mut Entry, now: i64) -> EntryOutcome {
         if let Err(err) = store.claim_schedule_tick(
             &sched.id,
             Some(due),
-            "active",
-            Some(next_due),
+            next_state,
+            next_due,
             None,
             None,
             Some("coalesced"),
@@ -2337,8 +2349,8 @@ fn evaluate_timer(store: &Store, entry: &mut Entry, now: i64) -> EntryOutcome {
             &agent,
             sched,
             Some(due),
-            "active",
-            Some(next_due),
+            next_state,
+            next_due,
             None,
             Some("fired"),
             &sched.prompt,
@@ -3814,6 +3826,72 @@ mod tests {
         let inbox = store.inbox(&owner.id, None).unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].text, "recovered check");
+    }
+
+    #[test]
+    fn recurring_slot_is_strictly_future_and_never_saturates() {
+        assert_eq!(next_recurring_slot(10, 3, 10), Some(13));
+        assert_eq!(next_recurring_slot(10, 3, 15), Some(16));
+        assert_eq!(next_recurring_slot(10, 3, 16), Some(19));
+        assert_eq!(
+            next_recurring_slot(i64::MIN, 3, i64::MAX - 1),
+            Some(i64::MAX)
+        );
+        assert_eq!(next_recurring_slot(i64::MAX - 1, 2, i64::MAX - 1), None);
+        assert_eq!(next_recurring_slot(i64::MAX, 1, i64::MAX), None);
+    }
+
+    #[test]
+    fn recurring_timer_reopens_after_downtime_and_coalesces_an_unread_wake() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = Store::open(&path).unwrap();
+        let owner = store
+            .create_agent(NewAgent::new("timer-owner", "codex"))
+            .unwrap();
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        store.set_agent_state(&owner.id, "paused").unwrap();
+        let due = 60_000;
+        let interval = 3_600_000; // timer_schedule's every interval.
+        timer_schedule(&store, &owner.id, "every", "1h", Some(due));
+        drop(store);
+
+        let resumed = due + interval * 10_000_000_000 + 123;
+        let store = Store::open(&path).unwrap();
+        let health = HealthBoard::default();
+        assert_eq!(tick_schedules_once(&store, &health, resumed), 1);
+        assert_eq!(tick_schedules_once(&store, &health, resumed), 0);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        let wake = inbox[0].seq;
+        let next = resumed - 123 + interval;
+        assert_eq!(
+            store.list_schedules(Some(&owner.id), true).unwrap()[0].next_fire_at_ms,
+            Some(next)
+        );
+        drop(store);
+
+        // On another restart, a persisted unread wake stands for all missed slots.
+        let store = Store::open(&path).unwrap();
+        let health = HealthBoard::default();
+        let resumed_again = next + interval * 5;
+        assert_eq!(tick_schedules_once(&store, &health, resumed_again), 0);
+        let saved = &store.list_schedules(Some(&owner.id), true).unwrap()[0];
+        assert_eq!(saved.last_observed.as_deref(), Some("coalesced"));
+        assert_eq!(saved.next_fire_at_ms, Some(resumed_again + interval));
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        store.note_delivered(&owner.id, wake).unwrap();
+        assert_eq!(
+            tick_schedules_once(&store, &health, resumed_again + interval - 1),
+            0
+        );
+        assert_eq!(
+            tick_schedules_once(&store, &health, resumed_again + interval),
+            1
+        );
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 2);
     }
 
     #[test]
