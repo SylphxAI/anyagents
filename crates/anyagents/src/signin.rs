@@ -72,6 +72,39 @@ pub fn sign_in_agent(
     )
 }
 
+/// Native tools read credentials from this profile, not the invoking user's
+/// environment. Allow only command lookup, locale and interactive UI plumbing.
+pub(crate) fn configure_profile_environment(command: &mut Command, dir: &Path, interactive: bool) {
+    command.env_clear();
+    for key in ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    if interactive {
+        for key in [
+            "TERM",
+            "COLORTERM",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "BROWSER",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+    }
+    command
+        .env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir.join(".config"))
+        .env("XDG_DATA_HOME", dir.join(".local/share"))
+        .env("XDG_CACHE_HOME", dir.join(".cache"))
+        .env("XDG_STATE_HOME", dir.join(".local/state"));
+}
+
 pub struct ProcessRunner;
 
 impl CommandRunner for ProcessRunner {
@@ -106,16 +139,16 @@ impl CommandRunner for ProcessRunner {
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+            && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none()
+        {
+            configure_profile_environment(&mut command, dir, true);
+        }
         if std::env::var_os("DISPLAY").is_none()
             && std::env::var_os("WAYLAND_DISPLAY").is_none()
             && std::env::var_os("BROWSER").is_none()
         {
             command.env("BROWSER", "/bin/true");
-        }
-        if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
-            && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none()
-        {
-            command.env("HOME", dir);
         }
         for (key, value) in env {
             command.env(key, value);
@@ -346,5 +379,4 @@ mod tests {
         assert!(matches!(err, Error::AgentNotFound(_)), "{err}");
         assert!(runner.calls.is_empty());
     }
-
 }
