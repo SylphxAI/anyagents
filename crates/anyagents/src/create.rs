@@ -6572,15 +6572,14 @@ pub(crate) fn force_refresh_provider_profiles(
             let cfg = agent_config_dir(data, &agent.id);
             let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
             let selected = bound_profile_of_provider(&cfg, &provider);
-            if let Some(filter) = filter {
-                if filter != provider
-                    && selected.as_deref() != Some(filter)
-                    && selected
-                        .as_ref()
-                        .is_none_or(|p| format!("{provider}/{p}") != filter)
-                {
-                    continue;
-                }
+            if let Some(filter) = filter
+                && filter != provider
+                && selected.as_deref() != Some(filter)
+                && selected
+                    .as_ref()
+                    .is_none_or(|p| format!("{provider}/{p}") != filter)
+            {
+                continue;
             }
             let _ = std::fs::remove_file(cfg.join(".anyagents-last-quota-check-ms"));
             poke_agent_wake_socket(data, &agent.id);
@@ -7039,7 +7038,6 @@ pub(crate) fn bound_profile_of_provider(config_dir: &Path, provider: &str) -> Op
 }
 
 /// Only a future quota reset observed by the harness is evidence of a hold.
-
 fn profile_has_unhealthy_evidence(dir: &Path) -> bool {
     // Expiry is not failure: native harnesses can renew complete credentials.
     std::fs::read_to_string(dir.join(".anyagents-quota-reset-ms"))
