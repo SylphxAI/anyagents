@@ -7138,6 +7138,20 @@ async fn send(
     Json(body): Json<SendRequest>,
 ) -> Result<Json<SendResponse>, ApiError> {
     let via_http = via_http_mcp(&headers);
+    let turn_context = if let Some(header) = headers.get(crate::mcp::TASK_TURN_CONTEXT_HEADER) {
+        let token = header
+            .to_str()
+            .ok()
+            .filter(|token| crate::mcp::is_task_turn_context(token));
+        match (&principal, token, via_http) {
+            (Principal::Agent { agent_id, .. }, Some(token), false) => {
+                Some((agent_id.clone(), token.to_owned()))
+            }
+            _ => return Err(ApiError::forbidden("invalid task turn context")),
+        }
+    } else {
+        None
+    };
     if via_http {
         refuse_host_media_over_http(&body)?;
     }
@@ -7200,6 +7214,14 @@ async fn send(
         // refused for it with the reason, as any send that cannot wake an
         // archived recipient is.
         plan.revive_host_agents = !via_http;
+        if let Some((caller, token)) = turn_context {
+            if plan.sender_id.as_ref() != Some(&caller) {
+                return Err(ApiError::forbidden(
+                    "task turn context belongs to the authenticated author",
+                ));
+            }
+            plan.turn_context = Some(token);
+        }
         let key_body = SendRequest {
             sender: plan
                 .sender_id
@@ -7783,6 +7805,7 @@ struct SendPlan {
     /// Whether an authored send may revive an archived agent that runs on
     /// this host. False for a call made over HTTP MCP.
     revive_host_agents: bool,
+    turn_context: Option<String>,
 }
 
 #[derive(Debug)]
@@ -7997,6 +8020,7 @@ impl SendPlan {
             sender_id: sender.as_ref().map(|agent| agent.id.clone()),
             principal_id: None,
             revive_host_agents: true,
+            turn_context: None,
         })
     }
 }
@@ -8366,6 +8390,7 @@ fn send_sync(
                                 key.as_deref(),
                                 wake_archived,
                                 upload.as_ref(),
+                                plan.turn_context.as_deref().map(|token| (sid, token)),
                             )?])
                         },
                     )?
@@ -8377,6 +8402,7 @@ fn send_sync(
                         key.as_deref(),
                         wake_archived,
                         upload.as_ref(),
+                        None,
                     )?]
                 };
                 deliveries.extend(sent);
@@ -8784,6 +8810,7 @@ fn deliver_agent_with_media(
     key: Option<&str>,
     wake_archived: bool,
     upload: Option<&crate::telegram::MediaUpload>,
+    turn_context: Option<(&anyagents_core::AgentId, &str)>,
 ) -> Result<Delivery, ApiError> {
     let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
     let _lifecycle = store
@@ -8829,7 +8856,9 @@ fn deliver_agent_with_media(
         origin: None,
         received_at_ms: None,
     };
-    let outcome = if wake_archived {
+    let outcome = if let Some((sender, token)) = turn_context {
+        store.receive_turn_send(&agent.id, incoming, wake_archived, sender, token)
+    } else if wake_archived {
         store.receive_direct_send(&agent.id, incoming)
     } else {
         store.receive(&agent.id, incoming)

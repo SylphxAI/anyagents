@@ -1728,12 +1728,7 @@ impl<H: Harness + 'static> Session<H> {
                     && health.quota_reset_at_ms.is_none()
                     && usage_advanced(&usage, &note.served.clone().unwrap_or_default())));
         let completed = finished_detached
-            && admitted_seq.is_some_and(|seq| {
-                delivery
-                    .store()
-                    .note_turn_completed_for(&self.id, seq)
-                    .unwrap_or(false)
-            });
+            && admitted_seq.is_some_and(|seq| delivery.complete_delivery(seq).unwrap_or(false));
         if !finished_detached {
             delivery.restore_admitted_seq(admitted_seq);
         }

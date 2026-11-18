@@ -333,6 +333,8 @@ impl Write for Input {
 
 /// Shared by every harness over one child: the owner and any reader.
 struct State {
+    turn_tool_context: bool,
+    task_turn_result: Option<(String, String, HashSet<String>)>,
     child: Option<Child>,
     /// A listening v2 child outlives [`StreamHarness::stop`] unless reaped or
     /// stopped by its owning adapter.
@@ -974,6 +976,21 @@ impl StreamHarness {
         state.child.as_ref().map(Child::id).or(self.socket_pid)
     }
 
+    pub fn supports_turn_tool_context(&self) -> bool {
+        lock(&self.shared).turn_tool_context
+    }
+
+    pub fn task_turn_result(&self, input_id: &str) -> Option<(String, String)> {
+        let state = lock(&self.shared);
+        if !state.turn_tool_context {
+            return None;
+        }
+        let (opener, text, inputs) = state.task_turn_result.as_ref()?;
+        inputs
+            .contains(input_id)
+            .then(|| (opener.clone(), text.clone()))
+    }
+
     /// Write one line into the child and record it as taken.
     ///
     /// What the vendor already proved about the message answers first,
@@ -1272,6 +1289,11 @@ impl StreamHarness {
                 let mut line = line.clone();
                 line["type"] = json!(if starts_turn { "prompt" } else { "steer" });
                 line["request_id"] = json!(id);
+                if !starts_turn || !state.turn_tool_context {
+                    line.as_object_mut()
+                        .expect("prompt object")
+                        .remove("tool_context");
+                }
                 if starts_turn {
                     state.turns_started += 1;
                     state.turn_user_inputs = 0;
@@ -1975,6 +1997,8 @@ impl State {
 
     fn new(session_id: Option<&str>) -> Self {
         Self {
+            turn_tool_context: false,
+            task_turn_result: None,
             child: None,
             listening_child: false,
             log_path: None,
@@ -2203,10 +2227,22 @@ fn read_stdout(
                     continue;
                 }
                 state.ready = Some(true);
+                let answers_attach = state.v2_attach.as_deref().is_some_and(|attach| {
+                    value.get("request_id").and_then(Value::as_str) == Some(attach)
+                });
+                // Replayed ready frames do not negotiate this connection's features.
+                if state.v2_attach.is_none() || answers_attach {
+                    state.turn_tool_context = value
+                        .get("features")
+                        .and_then(Value::as_array)
+                        .is_some_and(|features| {
+                            features
+                                .iter()
+                                .any(|feature| feature.as_str() == Some("turn-tool-context-v1"))
+                        });
+                }
                 state.peer = Some(announced_peer(&value));
-                if let Some(attach) = &state.v2_attach
-                    && value.get("request_id").and_then(Value::as_str) == Some(attach.as_str())
-                {
+                if answers_attach {
                     state.attached = true;
                     state.attached_seq = value.get("seq").and_then(Value::as_u64);
                 }
@@ -2223,8 +2259,33 @@ fn read_stdout(
                         .to_string(),
                 );
             }
-            let consumption =
-                spec.protocol == LineProtocol::AcknowledgedResult && state.ready == Some(true);
+            // Attach replays before its own ready. A terminal receipt with
+            // durable membership can rebuild proofs even if all matching
+            // accepted frames precede the replay cursor. Ordinary live or
+            // legacy results still require the existing correlations.
+            let replay_receipt = if spec.protocol == LineProtocol::AcknowledgedResult
+                && state.v2_attach.is_some()
+                && !state.attached
+                && kind == Some("result")
+                && synthetic_401.is_none()
+                && let Some(opener) = value.get("request_id").and_then(Value::as_str)
+                && let Some(members) = bound_consumed(&value, opener)
+                && members.iter().all(|id| {
+                    !state.duplicates.contains(*id)
+                        && state
+                            .input_turns
+                            .get(*id)
+                            .is_none_or(|owner| owner == opener)
+                }) {
+                for id in members {
+                    settle_consumed(&mut state, id, opener);
+                }
+                true
+            } else {
+                false
+            };
+            let consumption = spec.protocol == LineProtocol::AcknowledgedResult
+                && (state.ready == Some(true) || replay_receipt);
             if consumption {
                 retry_after = note_consumption_receipt(&mut state, kind, &value);
             }
@@ -2966,6 +3027,40 @@ fn release_input(state: &mut State, id: &str) {
     state.seen.remove(id);
 }
 
+/// The sensitive context is never echoed; the peer attests it was bound to
+/// this opener and names the inputs it actually journaled, not merely acked.
+fn bound_consumed<'a>(value: &'a Value, opener: &str) -> Option<HashSet<&'a str>> {
+    if value.get("tool_context_bound").and_then(Value::as_bool) != Some(true)
+        || value.get("status").and_then(Value::as_str) != Some("completed")
+        || value.get("is_error").and_then(Value::as_bool) != Some(false)
+        || value.get("duplicate").and_then(Value::as_bool) != Some(false)
+        || value.get("error") != Some(&Value::Null)
+        || value.get("final_text").and_then(Value::as_str).is_none()
+    {
+        return None;
+    }
+    let items = value.get("consumed_request_ids")?.as_array()?;
+    if items.first()?.as_str() != Some(opener) || opener.is_empty() {
+        return None;
+    }
+    let ids: HashSet<_> = items.iter().map(Value::as_str).collect::<Option<_>>()?;
+    if ids.len() != items.len()
+        || ids.contains("")
+        || value
+            .get("undelivered_steer_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|id| ids.contains(id))
+            })
+    {
+        return None;
+    }
+    Some(ids)
+}
+
 /// The result that closes `turn` for a peer that proves consumption. Its
 /// consumed inputs are finished, the turn's usage on its opener; inputs it
 /// acknowledged but never consumed, and every id it lists undelivered, go
@@ -3000,6 +3095,27 @@ fn finish_consumed(state: &mut State, turn: &str, usage: TurnUsage, value: &Valu
         .filter(|(_, owner)| owner.as_str() == turn)
         .map(|(id, _)| id.clone())
         .collect();
+    if (state.turn_tool_context || (state.v2_attach.is_some() && !state.attached))
+        && state.sign_in_fault.is_none()
+        && state.quota_reset_at_ms.is_none()
+        && let Some(inputs) = bound_consumed(value, turn)
+        && inputs.iter().all(|id| {
+            state
+                .input_turns
+                .get(*id)
+                .is_some_and(|owner| owner == turn)
+                && state.consumed.contains(*id)
+                && !state.duplicates.contains(*id)
+        })
+        && let Some(text) = value.get("final_text").and_then(Value::as_str)
+    {
+        let inputs = inputs.into_iter().map(str::to_owned).collect();
+        let text = anyagents_harness::masking::mask_known_secrets(text)
+            .chars()
+            .take(16384)
+            .collect();
+        state.task_turn_result = Some((turn.to_owned(), text, inputs));
+    }
     // The opener first, so it carries the turn's usage.
     members.sort_by_key(|id| id != turn);
     for id in members {

@@ -262,6 +262,134 @@ fn ok_json<T: for<'de> Deserialize<'de>>(result: CallToolResult) -> T {
     serde_json::from_value(result.structured_content.expect("structured content")).unwrap()
 }
 
+#[tokio::test]
+async fn stdio_turn_metadata_scopes_direct_and_nested_parent_sends() {
+    use anyagents_core::{Incoming, NewAgent, ReceiveOutcome, Store};
+    use serde_json::json;
+
+    let dir = support::physical_tempdir();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let parent = store
+        .create_agent(NewAgent::new("lead", "claude-code"))
+        .unwrap();
+    let mut input = NewAgent::new("worker", "claude-code");
+    input.parent_id = Some(parent.id.clone());
+    let child = store.create_agent(input).unwrap();
+    for agent in [&parent, &child] {
+        store.set_agent_state(&agent.id, "paused").unwrap();
+    }
+    store.set_agent_state(&child.id, "running").unwrap();
+    let mut cases = Vec::new();
+    for (case, tool, args, tag) in [
+        (
+            "direct",
+            "send",
+            json!({"to": ["parent"], "text": "direct send"}),
+            true,
+        ),
+        (
+            "nested",
+            "code",
+            json!({"code": "return await anyagents.send({to:['parent'],text:'nested send'});"}),
+            true,
+        ),
+        (
+            "untagged",
+            "send",
+            json!({"to": ["parent"], "text": "unscoped send"}),
+            false,
+        ),
+    ] {
+        let ReceiveOutcome::New(opener) = store.receive(&child.id, Incoming::new(case)).unwrap()
+        else {
+            panic!("fresh opener expected");
+        };
+        let token = store
+            .prepare_task_turn_context(&child.id, opener.id.as_str())
+            .unwrap()
+            .unwrap();
+        cases.push((opener, token, tool, args, tag));
+    }
+    store.set_agent_state(&child.id, "paused").unwrap();
+    let _server = start_server(dir.path());
+    let worker = connect(dir.path(), "worker").await;
+    let lead = connect(dir.path(), "lead").await;
+    for (opener, token, tool, args, tag) in cases {
+        store.note_delivered(&child.id, opener.seq).unwrap();
+        let mut params =
+            CallToolRequestParams::new(tool).with_arguments(args.as_object().unwrap().clone());
+        if tag {
+            params.meta =
+                Some(serde_json::from_value(json!({"io.spiron/turn-context": &token})).unwrap());
+        } else {
+            // Another authenticated agent cannot mark this child's turn.
+            let mut wrong = CallToolRequestParams::new("send").with_arguments(
+                json!({"to": ["worker"], "text": "refused"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            wrong.meta =
+                Some(serde_json::from_value(json!({"io.spiron/turn-context": &token})).unwrap());
+            let pending_before = store.inbox(&child.id, None).unwrap().len();
+            let response = tokio::time::timeout(Duration::from_secs(10), lead.call_tool(wrong))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                response.is_error == Some(true)
+                    || response
+                        .structured_content
+                        .as_ref()
+                        .and_then(|value| value["deliveries"].as_array())
+                        .is_some_and(Vec::is_empty),
+                "wrong author was not refused: {response:?}"
+            );
+            assert_eq!(store.inbox(&child.id, None).unwrap().len(), pending_before);
+        }
+        let result = tokio::time::timeout(Duration::from_secs(10), worker.call_tool(params))
+            .await
+            .unwrap()
+            .unwrap();
+        let result: serde_json::Value = ok_json(result);
+        let sent = if tool == "code" {
+            &result["result"]
+        } else {
+            &result
+        };
+        assert_eq!(
+            sent["deliveries"].as_array().map(Vec::len),
+            Some(1),
+            "{result:?}"
+        );
+        assert!(
+            store
+                .note_turn_completed_with_output_for(
+                    &child.id,
+                    opener.seq,
+                    Some((opener.id.as_str(), "final answer"))
+                )
+                .unwrap()
+        );
+    }
+    let rows = store.inbox(&parent.id, None).unwrap();
+    for text in ["direct send", "nested send", "unscoped send"] {
+        assert_eq!(
+            rows.iter().filter(|row| row.text == text).count(),
+            1,
+            "{rows:?}"
+        );
+    }
+    let returns: Vec<_> = rows
+        .iter()
+        .filter(|row| row.text.starts_with("<task_return "))
+        .collect();
+    assert_eq!(returns.len(), 1, "{rows:?}");
+    assert!(returns[0].text.contains(">final answer</task_return>"));
+    worker.cancel().await.unwrap();
+    lead.cancel().await.unwrap();
+}
+
 fn error_text(result: &CallToolResult) -> String {
     assert_eq!(result.is_error, Some(true), "{result:?}");
     match result.content.first() {

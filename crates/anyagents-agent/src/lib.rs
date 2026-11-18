@@ -12,6 +12,29 @@ use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage};
 
 pub use anyagents_harness::{Delivery, DeliveryLevel, DeliveryMode, Proof, TurnState};
 
+fn complete_for<H: Harness>(
+    store: &Store,
+    agent_id: &AgentId,
+    harness: &H,
+    seq: i64,
+) -> Result<bool, Error> {
+    let result = if harness.supports_turn_tool_context() {
+        store
+            .task_result_inputs_at(agent_id, seq)?
+            .iter()
+            .find_map(|id| harness.task_turn_result(id))
+    } else {
+        None
+    };
+    Ok(store.note_turn_completed_with_output_for(
+        agent_id,
+        seq,
+        result
+            .as_ref()
+            .map(|(opener, text)| (opener.as_str(), text.as_str())),
+    )?)
+}
+
 /// Why one step of the loop stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -109,7 +132,7 @@ fn commit_proofs<H: Harness>(
                     && harness.health().sign_in_fault.is_none()
                     && priority::may_complete(store, agent_id, harness, &message)?
                 {
-                    let accepted = store.note_turn_completed_for(agent_id, message.seq)?;
+                    let accepted = complete_for(store, agent_id, harness, message.seq)?;
                     if let Some(slot) = custody.as_deref_mut() {
                         *slot = accepted.then_some(TurnCustody::Completed(message.seq));
                     }
@@ -218,7 +241,7 @@ impl<H: Harness> DeliveryLoop<H> {
         let Some(message) = self.store.next_undelivered(&self.agent_id)? else {
             return Ok(None);
         };
-        match self.harness.deliver(&outbound(&message)) {
+        match self.offer(&message) {
             Ok(outcome) => Ok(Some(outcome)),
             Err(HarnessError::Dead) => Err(Error::HarnessDown),
             Err(HarnessError::Failed(reason)) => Err(Error::HarnessFailed(reason)),
@@ -270,13 +293,10 @@ impl<H: Harness> DeliveryLoop<H> {
                         "pending input is not owned by undelivered mail or the recovery note".into()
                     )
                         })?;
-                let outcome =
-                    self.harness
-                        .deliver(&outbound(&message))
-                        .map_err(|err| match err {
-                            HarnessError::Dead => Error::HarnessDown,
-                            HarnessError::Failed(reason) => Error::HarnessFailed(reason),
-                        })?;
+                let outcome = self.offer(&message).map_err(|err| match err {
+                    HarnessError::Dead => Error::HarnessDown,
+                    HarnessError::Failed(reason) => Error::HarnessFailed(reason),
+                })?;
                 (Some(message.seq), outcome)
             };
             match outcome {
@@ -319,7 +339,7 @@ impl<H: Harness> DeliveryLoop<H> {
                     if offered.contains_key(&urgent.seq) {
                         continue;
                     }
-                    match self.harness.deliver(&outbound(&urgent)) {
+                    match self.offer(&urgent) {
                         Ok(DeliverOutcome::Deferred) => {
                             return Ok(if delivered == 0 {
                                 RunOutcome::Idle
@@ -351,7 +371,7 @@ impl<H: Harness> DeliveryLoop<H> {
                     Some(Proof::Duplicate) => DeliverOutcome::Duplicate,
                     None => cached,
                 }),
-                None => self.harness.deliver(&outbound(&message)),
+                None => self.offer(&message),
             };
             match outcome {
                 // Consumed, but an older line is not yet: the pass that sees
@@ -413,7 +433,7 @@ impl<H: Harness> DeliveryLoop<H> {
                             &message,
                         )?
                     {
-                        let accepted = self.store.note_turn_completed_for(&self.agent_id, seq)?;
+                        let accepted = self.complete_delivery(seq)?;
                         self.custody = accepted.then_some(TurnCustody::Completed(seq));
                     } else {
                         self.custody = Some(TurnCustody::Open(seq));
@@ -569,6 +589,31 @@ impl<H: Harness> DeliveryLoop<H> {
     }
 
     /// Restore open turn custody carried across a detached process takeover.
+    /// Commit a successful callback for its owned delivery. The exact v2 result
+    /// supplies output only if its acknowledged members include that delivery.
+    pub fn complete_delivery(&self, seq: i64) -> Result<bool, Error> {
+        complete_for(&self.store, &self.agent_id, &self.harness, seq)
+    }
+
+    fn offer(&mut self, message: &Message) -> Result<DeliverOutcome, HarnessError> {
+        let context = if self.harness.supports_turn_tool_context()
+            && self.harness.proven(message.id.as_str()).is_none()
+            && self
+                .store
+                .agent(&self.agent_id)
+                .map_err(|error| HarnessError::Failed(error.to_string()))?
+                .is_task_subagent()
+        {
+            self.store
+                .prepare_task_turn_context(&self.agent_id, message.id.as_str())
+                .map_err(|error| HarnessError::Failed(error.to_string()))?
+        } else {
+            None
+        };
+        self.harness
+            .deliver_with_turn_context(&outbound(message), context.as_deref())
+    }
+
     pub fn restore_admitted_seq(&mut self, delivered_seq: Option<i64>) {
         self.custody = delivered_seq.filter(|&seq| seq > 0).map(TurnCustody::Open);
     }
@@ -579,7 +624,7 @@ impl<H: Harness> DeliveryLoop<H> {
     pub fn complete_turn(&mut self) -> Result<bool, Error> {
         match self.custody {
             Some(TurnCustody::Open(seq)) => {
-                let accepted = self.store.note_turn_completed_for(&self.agent_id, seq)?;
+                let accepted = self.complete_delivery(seq)?;
                 self.custody = None;
                 Ok(accepted)
             }
@@ -625,7 +670,22 @@ impl<H: Harness> DeliveryLoop<H> {
             .recovery
             .get_or_insert_with(|| recovery_outbound(open))
             .clone();
-        let outcome = match self.harness.deliver(&note) {
+        let context = if self.harness.supports_turn_tool_context()
+            && self.harness.proven(note.id.as_str()).is_none()
+        {
+            self.store.prepare_recovery_task_turn_context(
+                &self.agent_id,
+                &note.id,
+                open.opened_seq,
+                open.recovery_count,
+            )?
+        } else {
+            None
+        };
+        let outcome = match self
+            .harness
+            .deliver_with_turn_context(&note, context.as_deref())
+        {
             Ok(outcome) => outcome,
             Err(HarnessError::Dead) => return Err(Error::HarnessDown),
             Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
@@ -654,7 +714,7 @@ impl<H: Harness> DeliveryLoop<H> {
                         note.seq,
                     )?;
                 if turn_finished {
-                    let accepted = self.store.note_turn_completed_for(&self.agent_id, seq)?;
+                    let accepted = self.complete_delivery(seq)?;
                     self.custody = accepted.then_some(TurnCustody::Completed(seq));
                 } else {
                     self.custody = Some(TurnCustody::Open(seq));
