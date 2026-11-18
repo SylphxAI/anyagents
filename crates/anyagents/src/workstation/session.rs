@@ -205,17 +205,35 @@ impl Live {
 
     /// A person is asked to take over: the next hand-back completes it.
     pub fn expect_hand_back(&self, challenge_detected: bool) {
-        self.watch_challenge
-            .store(challenge_detected, Ordering::Release);
         let mut pending = self
             .hand_back_pending
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        self.watch_challenge
+            .store(challenge_detected, Ordering::Release);
         // The watcher may lag a previous release; never let that old
         // completion satisfy a newly requested takeover.
         let baseline = self.session.gate().hand_backs();
         self.awaited.store(baseline, Ordering::Release);
         *pending = Some(baseline);
+    }
+
+    /// Release human custody or cancel an invitation that was never claimed.
+    pub fn release_takeover(&self, note: String) -> bool {
+        let mut pending = self
+            .hand_back_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let gate = self.session.gate();
+        let released = gate.release(Some(note));
+        // The watcher may not have observed a real hand-back yet. Don't
+        // report a second release or manufacture a hand-back notification.
+        let cancelled = pending.take().is_some_and(|n| gate.hand_backs() == n);
+        if cancelled {
+            self.watch_challenge.store(false, Ordering::Release);
+        }
+        self.touch();
+        released || cancelled
     }
 
     /// Wait up to `wait` for a hand-back after the latest takeover request;
@@ -464,17 +482,6 @@ fn authorize(live: &Live, principal: &str) -> Result<(), ToolError> {
         .acquire(principal)
         .map(|_| ())
         .map_err(|e| in_use(&live.profile, e))
-}
-
-fn takeover_pending() -> ToolError {
-    ToolError {
-        code: "TAKEOVER_PENDING",
-        message:
-            "a requested browser takeover is awaiting explicit hand-back; the desktop was preserved"
-                .into(),
-        hint: "Use wait_for_user or ask the person to hand control back before closing.",
-        retryable: false,
-    }
 }
 
 fn session_busy() -> ToolError {
@@ -861,9 +868,6 @@ pub async fn stop_authorized(
         };
         let _admission = live.admission.write().await;
         authorize(&live, &principal)?;
-        if live.pending_hand_back() {
-            return Err(takeover_pending());
-        }
         if !live.session.is_closed() {
             live.session
                 .gate()
@@ -913,14 +917,17 @@ async fn close_slot(mut guard: tokio::sync::OwnedMutexGuard<Option<Arc<Live>>>) 
 // Caller admission is held exclusively. The engine's conditional close is
 // atomic with human takeover; no mounts, watchers or tunnels change on refusal.
 async fn shutdown_if_agent(live: &Live) -> bool {
-    if live.pending_hand_back() {
-        return false;
-    }
     if live.session.is_closed() {
         live.session.close().await;
     } else if !live.session.close_if_agent().await {
         return false;
     }
+    // A published invitation is not custody. Clear it only after the
+    // engine wins the close-vs-Take control race.
+    *live
+        .hand_back_pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
     cleanup(live).await;
     true
 }
@@ -1183,13 +1190,8 @@ mod tests {
                 .unwrap(),
             &live
         ));
-        assert_eq!(
-            stop_authorized(data.path(), "old-owner", "old-owner")
-                .await
-                .unwrap_err()
-                .code,
-            "TAKEOVER_PENDING"
-        );
+        // Only implicit retirement honors a pending invitation; explicit
+        // close is covered separately through the browser tool surface.
         live.session.gate().take(Some("fixture".into()));
         assert!(
             live.session
