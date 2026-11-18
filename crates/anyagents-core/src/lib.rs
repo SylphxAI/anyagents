@@ -6,6 +6,7 @@
 
 mod address;
 pub mod boundary;
+pub mod db;
 mod error;
 mod host_cursor;
 pub mod host_index;

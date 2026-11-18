@@ -67,6 +67,9 @@ agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev
 async-trait = "0.1"
 tower = { version = "0.5", features = ["util"] }
 
+[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["background_threads_runtime_support"] }
+
 [dev-dependencies]
 anyagents-agent = { path = "../anyagents-agent" }
 anyagents-core = { path = "../anyagents-core" }

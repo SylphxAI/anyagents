@@ -1,5 +1,7 @@
 use super::*;
+use crate::db::{DbExecExt as _, db_params};
 use crate::{Agent, Incoming, NewAgent, ReceiveOutcome};
+use rusqlite::params;
 use serde_json::json;
 
 struct Fixture {
@@ -103,17 +105,17 @@ fn redaction_preserves_mailbox_order_metadata_other_rows_and_removes_search_term
     );
     let conn = f.store.read_conn();
     let count: i64 = conn
-        .query_row(
+        .db_query_one(
             "SELECT count(*) FROM rag_chunks_fts WHERE rag_chunks_fts MATCH 'fixturecanary'",
-            [],
+            &[],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(count, 0);
     let stored: (String, String) = conn
-        .query_row(
+        .db_query_one(
             "SELECT text, content_hash FROM rag_chunks WHERE chunk_id = ?1",
-            [target.id.as_str()],
+            &db_params![target.id.as_str()],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
@@ -1077,9 +1079,9 @@ fn redacted_provider_redelivery_and_edits_preserve_body_index_and_audit() {
                         assert_eq!(baseline, baseline_before);
                         let indexed: String = reopened
                             .read_conn()
-                            .query_row(
+                            .db_query_one(
                                 "SELECT text FROM rag_chunks WHERE chunk_id = ?1",
-                                [m.id.as_str()],
+                                &db_params![m.id.as_str()],
                                 |r| r.get(0),
                             )
                             .unwrap();
@@ -1285,12 +1287,12 @@ fn admin_operator_and_deep_ancestor_are_authorized() {
         .unwrap();
     let conn = f.store.read_conn();
     let all: Vec<String> = conn
-        .prepare("SELECT text FROM rag_chunks WHERE agent_id = ?1")
-        .unwrap()
-        .query_map([f.target.id.as_str()], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+        .db_query_vec(
+            "SELECT text FROM rag_chunks WHERE agent_id = ?1",
+            &db_params![f.target.id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(all, vec![TOMBSTONE, TOMBSTONE, TOMBSTONE]);
 }
 

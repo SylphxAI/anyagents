@@ -1,5 +1,9 @@
 //! The main command: parse, then run one verb.
 
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -60,6 +64,9 @@ struct Cli {
     /// Directory that holds the database.
     #[arg(long, global = true, default_value = ".anyagents")]
     data: PathBuf,
+    /// External PostgreSQL database URL (`postgres://...`); also reads `ANYAGENTS_DATABASE_URL`.
+    #[arg(long = "database-url", global = true)]
+    database_url: Option<String>,
     /// Show storage paths and additional diagnostic metadata.
     #[arg(long, global = true)]
     verbose: bool,
@@ -680,6 +687,37 @@ enum Command {
     /// Dense retrieval and reranking over raw history, as its own process.
     #[command(name = "memory-service")]
     MemoryService(memory_service::MemoryServiceArgs),
+    /// Database maintenance and PostgreSQL migration commands.
+    Db {
+        #[command(subcommand)]
+        action: DbCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbCommand {
+    /// Migrate local SQLite databases (`state.db`, `memory-index.db`, `host-history-index-v1.db`) into PostgreSQL.
+    #[command(name = "migrate-to-postgres")]
+    MigrateToPostgres {
+        /// Source AnyAgents data directory containing SQLite databases (defaults to `--data`).
+        #[arg(long)]
+        source: Option<PathBuf>,
+        /// Target PostgreSQL URL (defaults to `--database-url` / `ANYAGENTS_DATABASE_URL`).
+        #[arg(long)]
+        target: Option<String>,
+        /// Skip copying derived `memory-index.db` and `host-history-index-v1.db` search indexes.
+        #[arg(long)]
+        skip_index: bool,
+        /// Rows per batched PostgreSQL UNNEST insert transaction.
+        #[arg(long, default_value_t = 2500)]
+        batch_size: usize,
+        /// Align archived agent runtime states, clear legacy fault markers, and close unclosed turns.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        reconcile_stale_runtime: bool,
+        /// Output machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1190,6 +1228,7 @@ fn resolve_data_dir(raw: PathBuf, _is_serve: bool) -> PathBuf {
 }
 
 fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
+    anyagents_core::db::set_cli_database_url(cli.database_url.clone());
     let data = resolve_data_dir(cli.data, matches!(cli.command, Some(Command::Serve)));
     sandbox::load_principal_registry(&data)?;
     // Helpers a command runs use the deployment's manifest, as the server's do.
@@ -1709,6 +1748,57 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::CloudHarness(args) => cloud_harness::run(args),
         Command::SandboxExec(args) => sandbox_exec::run(args),
         Command::MemoryService(args) => memory_service::run(&data, args),
+        Command::Db { action } => db_cmd(&data, action),
+    }
+}
+
+fn db_cmd(data: &Path, action: DbCommand) -> Result<(), anyagents_core::Error> {
+    match action {
+        DbCommand::MigrateToPostgres {
+            source,
+            target,
+            skip_index,
+            batch_size,
+            reconcile_stale_runtime,
+            json,
+        } => {
+            let source_dir = source.unwrap_or_else(|| data.to_path_buf());
+            let target_url = target
+                .or_else(|| anyagents_core::db::configured_database_url_for_data_dir(&source_dir))
+                .ok_or_else(|| {
+                    anyagents_core::Error::Message(
+                        "missing --target PostgreSQL URL (or --database-url / ANYAGENTS_DATABASE_URL)"
+                            .into(),
+                    )
+                })?;
+            let opts = anyagents_core::db::MigrateToPostgresOptions {
+                source_dir,
+                target_url,
+                skip_index,
+                batch_size,
+                reconcile_stale_runtime,
+            };
+            let report = anyagents_core::db::migrate_sqlite_dir_to_postgres(&opts)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|e| {
+                        anyagents_core::Error::Message(format!("json encode failed: {e}"))
+                    })?
+                );
+            } else {
+                let total_rows: i64 = report.tables.iter().map(|t| t.pg_rows_after).sum();
+                println!(
+                    "Migrated {} tables ({total_rows} PG rows) in {} ms (reconciled: archived_runtime={}, legacy_faults={}, stale_turns={})",
+                    report.tables.len(),
+                    report.elapsed_ms,
+                    report.reconciled_archived_runtime,
+                    report.reconciled_legacy_faults,
+                    report.reconciled_stale_turns,
+                );
+            }
+            Ok(())
+        }
     }
 }
 

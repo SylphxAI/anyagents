@@ -5,6 +5,8 @@ use crate::address::AddressError;
 pub enum Error {
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
+    #[error("postgres database error: {0}")]
+    Postgres(#[from] sqlx::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("invalid identifier: {0}")]
@@ -75,16 +77,46 @@ pub enum Error {
 }
 
 impl Error {
-    /// Returns true if this error is a transient SQLite lock contention error
-    /// (`SQLITE_BUSY` or `SQLITE_LOCKED`) that callers can safely retry after backoff.
+    /// Returns true if this error is a transient database lock or contention error
+    /// (`SQLITE_BUSY` / `SQLITE_LOCKED` on SQLite, or SQLSTATE `40001` / `40P01` /
+    /// `55P03` / pool timeout on PostgreSQL) that callers can safely retry.
     pub fn is_transient_lock_error(&self) -> bool {
-        matches!(
-            self,
-            Self::Db(rusqlite::Error::SqliteFailure(err, _))
-                if matches!(
-                    err.code,
-                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                )
-        )
+        match self {
+            Self::Db(rusqlite::Error::SqliteFailure(err, _)) => matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ),
+            Self::Postgres(sqlx::Error::PoolTimedOut) => true,
+            Self::Postgres(sqlx::Error::Database(err)) => matches!(
+                err.code().as_deref(),
+                Some("40001" | "40P01" | "55P03")
+            ),
+            _ => false,
+        }
+    }
+
+    /// Returns true if this error indicates an undefined schema object (table/column)
+    /// when opening or probing older databases.
+    pub fn is_missing_schema_object(&self) -> bool {
+        match self {
+            Self::Db(rusqlite::Error::SqliteFailure(_, Some(msg))) => {
+                msg.contains("no such table") || msg.contains("no column named")
+            }
+            Self::Postgres(sqlx::Error::Database(err)) => {
+                matches!(err.code().as_deref(), Some("42P01" | "42703"))
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns true if this error is a UNIQUE constraint violation.
+    pub fn is_unique_violation(&self) -> bool {
+        match self {
+            Self::Db(rusqlite::Error::SqliteFailure(err, _)) => {
+                err.code == rusqlite::ErrorCode::ConstraintViolation
+            }
+            Self::Postgres(sqlx::Error::Database(err)) => err.code().as_deref() == Some("23505"),
+            _ => false,
+        }
     }
 }

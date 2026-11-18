@@ -6,11 +6,12 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::db::{DbExec, DbExecExt, DbTx};
 use crate::{
-    AgentId, Error, MessageId, Store, agent_config_dir, clean_rag_text, now_ms, rag_content_hash,
+    AgentId, Error, MessageId, Store, agent_config_dir, clean_rag_text, db_params, now_ms,
+    rag_content_hash,
 };
 
 pub const PERMISSION: &str = "conversation.redact";
@@ -81,25 +82,25 @@ fn invalid(text: &str) -> Error {
 }
 
 fn authorize(
-    conn: &rusqlite::Connection,
+    conn: &(impl DbExec + ?Sized),
     actor: &Actor,
     target: &AgentId,
 ) -> Result<String, Error> {
     match actor {
         Actor::Operator => Ok("operator".into()),
         Actor::Agent(id) => {
-            let (admin, parent, name): (bool, Option<String>, String) = conn.query_row(
+            let (admin, parent, name): (bool, Option<String>, String) = conn.db_query_one(
                 "SELECT is_admin, parent_id, name FROM agents WHERE id = ?1",
-                [id.as_str()],
+                &db_params![id.as_str()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?;
             if admin && parent.is_none() {
                 return Ok(format!("agent:{name}"));
             }
             let mut visited = HashSet::new();
-            let mut current: Option<String> = conn.query_row(
+            let mut current: Option<String> = conn.db_query_one(
                 "SELECT parent_id FROM agents WHERE id = ?1",
-                [target.as_str()],
+                &db_params![target.as_str()],
                 |r| r.get(0),
             )?;
             while let Some(pid) = current {
@@ -109,10 +110,11 @@ fn authorize(
                 if pid == id.as_str() {
                     return Ok(format!("agent:{name}"));
                 }
-                current =
-                    conn.query_row("SELECT parent_id FROM agents WHERE id = ?1", [pid], |r| {
-                        r.get(0)
-                    })?;
+                current = conn.db_query_one(
+                    "SELECT parent_id FROM agents WHERE id = ?1",
+                    &db_params![pid],
+                    |r| r.get(0),
+                )?;
             }
             Err(Error::PermissionDenied(
                 "conversation.redact requires a target ancestor or admin; self and peers are refused".into(),
@@ -493,18 +495,26 @@ struct Baseline {
 // Every retained origin is namespaced like the ordinary ingress matcher.
 // NULL ownership belongs to an older binary and is reported, not guessed.
 fn bound_versions(
-    conn: &rusqlite::Connection,
+    conn: &(impl DbExec + ?Sized),
     target: &AgentId,
     id: &str,
 ) -> Result<Vec<Baseline>, Error> {
-    Ok(conn.prepare(
+    conn.db_query_vec(
         "SELECT DISTINCT v.chat_id, v.message_id, v.body, v.origin_namespace FROM message_versions v
          JOIN message_origin_aliases a ON a.agent_id = v.agent_id AND a.chat_id = v.chat_id AND a.message_id = v.message_id
             AND (v.origin_namespace = a.namespace OR v.origin_namespace IS NULL)
          JOIN message_identities i ON i.agent_id = a.agent_id AND i.identity_id = a.identity_id
-         WHERE i.agent_id = ?1 AND i.target_id = ?2")?
-        .query_map(params![target.as_str(), id], |r| Ok(Baseline { chat: r.get(0)?, message: r.get(1)?, body: r.get(2)?, namespace: r.get(3)? }))?
-        .collect::<Result<_, _>>()?)
+         WHERE i.agent_id = ?1 AND i.target_id = ?2",
+        &db_params![target.as_str(), id],
+        |r| {
+            Ok(Baseline {
+                chat: r.get(0)?,
+                message: r.get(1)?,
+                body: r.get(2)?,
+                namespace: r.get(3)?,
+            })
+        },
+    )
 }
 
 fn baseline_path(db: &Path, target: &AgentId, chat: i64, message: i64) -> PathBuf {
@@ -515,7 +525,7 @@ fn baseline_path(db: &Path, target: &AgentId, chat: i64, message: i64) -> PathBu
 }
 
 fn unverified_full_versions(
-    conn: &rusqlite::Connection,
+    conn: &(impl DbExec + ?Sized),
     db: &Path,
     target: &AgentId,
     id: &str,
@@ -546,20 +556,47 @@ fn unverified_full_versions(
 /// Record a redaction's audit row, which freezes the target's retained
 /// alias set in the same transaction as the body rewrite.
 fn insert_audit(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &DbTx<'_>,
     target: &AgentId,
     id: &str,
     key: &str,
     receipt: &Receipt,
 ) -> Result<(), Error> {
-    tx.execute("INSERT INTO conversation_redactions (
+    let backend = tx.backend();
+    let extract_chat = backend.sql_json_extract_i64("origin", "chat_id");
+    let extract_msg = backend.sql_json_extract_i64("origin", "message_id");
+    let sql = format!(
+        "INSERT INTO conversation_redactions (
             id, agent_id, target_id, request_key, actor, permission, reason,
             created_at_ms, span_unit, span_start, span_end, removed_bytes,
             removed_chars, receipt, origin_chat_id, origin_message_id
         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
-            (SELECT json_extract(origin, '$.chat_id') FROM messages WHERE agent_id = ?2 AND id = ?3),
-            (SELECT json_extract(origin, '$.message_id') FROM messages WHERE agent_id = ?2 AND id = ?3))",
-        params![receipt.audit_id, target.as_str(), id, key, receipt.actor, PERMISSION, receipt.reason, receipt.timestamp_ms, if receipt.span.unit == SpanUnit::Bytes { "bytes" } else { "chars" }, receipt.span.start as i64, receipt.span.end as i64, receipt.removed_bytes as i64, receipt.removed_chars as i64, serde_json::to_string(receipt).map_err(|_| invalid("receipt serialization failed"))?])?;
+            (SELECT {extract_chat} FROM messages WHERE agent_id = ?2 AND id = ?3),
+            (SELECT {extract_msg} FROM messages WHERE agent_id = ?2 AND id = ?3))"
+    );
+    tx.db_execute(
+        &sql,
+        &db_params![
+            receipt.audit_id,
+            target.as_str(),
+            id,
+            key,
+            receipt.actor,
+            PERMISSION,
+            receipt.reason,
+            receipt.timestamp_ms,
+            if receipt.span.unit == SpanUnit::Bytes {
+                "bytes"
+            } else {
+                "chars"
+            },
+            receipt.span.start as i64,
+            receipt.span.end as i64,
+            receipt.removed_bytes as i64,
+            receipt.removed_chars as i64,
+            serde_json::to_string(receipt).map_err(|_| invalid("receipt serialization failed"))?
+        ],
+    )?;
     Ok(())
 }
 
@@ -608,14 +645,11 @@ impl Store {
         // state row; its text is read from, and rewritten in, the index.
         let index_id = match &request.message_id {
             Some(id) => Some(id.clone()),
-            None => self
-                .read_conn()
-                .query_row(
-                    "SELECT id FROM messages WHERE agent_id = ?1 AND seq = ?2",
-                    params![target.as_str(), request.seq],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?,
+            None => self.read_conn().db_query_opt(
+                "SELECT id FROM messages WHERE agent_id = ?1 AND seq = ?2",
+                &db_params![target.as_str(), request.seq],
+                |r| r.get::<String>(0),
+            )?,
         };
         let standalone = match &index_id {
             Some(id) => self.standalone_index_text(target, id)?,
@@ -640,23 +674,22 @@ impl Store {
         let id = if let Some(id) = &request.message_id {
             id.clone()
         } else {
-            tx.query_row(
+            tx.db_query_opt(
                 "SELECT id FROM messages WHERE agent_id = ?1 AND seq = ?2",
-                params![target.as_str(), request.seq],
+                &db_params![target.as_str(), request.seq],
                 |r| r.get(0),
-            )
-            .optional()?
+            )?
             .ok_or_else(|| invalid("redaction target not found"))?
         };
         let key = serde_json::to_string(&request.span).map_err(|_| invalid("invalid span"))?;
-        let replay = tx.query_row(
+        let replay = tx.db_query_opt(
             "SELECT receipt FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2 AND request_key = ?3",
-            params![target.as_str(), id, key], |r| r.get::<_, String>(0)).optional()?
+            &db_params![target.as_str(), id, key], |r| r.get::<String>(0))?
             .map(|raw| serde_json::from_str::<Receipt>(&raw).map_err(|_| invalid("unreadable redaction receipt")))
             .transpose()?;
-        let state: String = tx.query_row(
+        let state: String = tx.db_query_one(
             "SELECT state FROM agents WHERE id = ?1",
-            [target.as_str()],
+            &db_params![target.as_str()],
             |r| r.get(0),
         )?;
         if state == "running" {
@@ -702,7 +735,7 @@ impl Store {
         }
 
         let host_index = self.data_dir().join(crate::host_retrieval::INDEX_FILE);
-        if host_index.exists() {
+        if host_index.exists() || self.is_postgres() {
             let mut index = crate::host_index::HostIndex::open(&host_index)
                 .map_err(|e| invalid(&e.to_string()))?;
             index
@@ -750,10 +783,13 @@ impl Store {
                     .ok_or_else(|| invalid("transcript index out of range"))?,
             )?
         } else {
-            tx.query_row("SELECT body FROM messages WHERE agent_id = ?1 AND id = ?2 UNION ALL SELECT body FROM outbound_messages WHERE agent_id = ?1 AND id = ?2 LIMIT 1",
-                params![target.as_str(), id], |r| r.get::<_, String>(0)).optional()?
-                .or_else(|| standalone.clone().filter(|_| index_id.as_deref() == Some(id.as_str())))
-                .ok_or_else(|| invalid("redaction target not found"))?
+            tx.db_query_opt(
+                "SELECT body FROM messages WHERE agent_id = ?1 AND id = ?2 UNION ALL SELECT body FROM outbound_messages WHERE agent_id = ?1 AND id = ?2 LIMIT 1",
+                &db_params![target.as_str(), id],
+                |r| r.get::<String>(0),
+            )?
+            .or_else(|| standalone.clone().filter(|_| index_id.as_deref() == Some(id.as_str())))
+            .ok_or_else(|| invalid("redaction target not found"))?
         };
         if let Some(receipt) = replay {
             // A historical receipt is not evidence about today's body. Verify
@@ -791,9 +827,9 @@ impl Store {
         }
         let (span, start, end) = bounds(&original, request.span.as_ref())?;
         if original[start..end] == *TOMBSTONE
-            && let Some(raw) = tx.query_row(
+            && let Some(raw) = tx.db_query_opt(
                 "SELECT receipt FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2 AND (SELECT count(*) FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2) = 1 LIMIT 1",
-                params![target.as_str(), id], |r| r.get::<_, String>(0)).optional()? {
+                &db_params![target.as_str(), id], |r| r.get::<String>(0))? {
             if original == TOMBSTONE && !unverified_full_versions(tx, self.database_path(), target, &id)?.is_empty() {
                 return Err(invalid("redaction edit baseline changed or its account is unknown; existing receipt does not verify bound versions"));
             }
@@ -880,32 +916,32 @@ impl Store {
         // Seed still-available identities for a row created before alias
         // retention shipped. Already retained aliases are never replaced.
         // Old aliases discarded by an older binary cannot be reconstructed.
-        tx.execute(
+        tx.db_execute(
             "INSERT INTO message_identities (agent_id, target_id, identity_id)
              SELECT agent_id, id, id FROM messages WHERE agent_id = ?1 AND id = ?2 ON CONFLICT DO NOTHING",
-            params![target.as_str(), id],
+            &db_params![target.as_str(), id],
         )?;
-        let route: Option<(Option<String>, Option<String>, String)> = tx.query_row(
+        let route: Option<(Option<String>, Option<String>, String)> = tx.db_query_opt(
             "SELECT m.origin, m.source_key, i.identity_id FROM messages m
              JOIN message_identities i ON i.agent_id=m.agent_id AND i.target_id=m.id
              WHERE m.agent_id=?1 AND m.id=?2
                AND NOT EXISTS (SELECT 1 FROM message_origin_aliases a WHERE a.agent_id=i.agent_id AND a.identity_id=i.identity_id)",
-            params![target.as_str(), id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+            &db_params![target.as_str(), id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         if let Some((raw, source, identity)) = route
             && let Some(origin) = raw.and_then(|r| serde_json::from_str::<crate::Origin>(&r).ok())
             && let (Some(chat), Some(message)) = (origin.chat_id, origin.message_id)
         {
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO message_origin_aliases (agent_id, identity_id, namespace, chat_id, message_id) VALUES (?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING",
-                params![target.as_str(), identity, crate::store::origin_namespace(chat, source.as_deref()), chat, message])?;
+                &db_params![target.as_str(), identity, crate::store::origin_namespace(chat, source.as_deref()), chat, message])?;
         }
-        tx.execute(
+        tx.db_execute(
             "INSERT INTO message_source_aliases (agent_id, identity_id, source_key)
              SELECT m.agent_id, i.identity_id, m.source_key FROM messages m
              JOIN message_identities i ON i.agent_id = m.agent_id AND i.target_id = m.id
              WHERE m.agent_id = ?1 AND m.id = ?2 AND m.source_key IS NOT NULL AND m.source_key != ''
              ON CONFLICT DO NOTHING",
-            params![target.as_str(), id],
+            &db_params![target.as_str(), id],
         )?;
         // Pending paths are durable before touching any copy: an interruption is
         // never mistaken for success on replay, and no sensitive recovery payload is stored.
@@ -914,15 +950,17 @@ impl Store {
                 .unscrubbed
                 .push(failure(&file.path, "scrub pending/interrupted"));
         }
-        tx.pragma_update(None, "secure_delete", "ON")?;
+        if let DbTx::Sqlite(raw) = tx {
+            raw.pragma_update(None, "secure_delete", "ON")?;
+        }
         if transcript_index.is_none() {
-            tx.execute(
+            tx.db_execute(
                 "UPDATE messages SET body = ?3 WHERE agent_id = ?1 AND id = ?2",
-                params![target.as_str(), id, redacted],
+                &db_params![target.as_str(), id, redacted],
             )?;
-            tx.execute(
+            tx.db_execute(
                 "UPDATE outbound_messages SET body = ?3 WHERE agent_id = ?1 AND id = ?2",
-                params![target.as_str(), id, redacted],
+                &db_params![target.as_str(), id, redacted],
             )?;
             // Telegram's edit baseline is a second body copy for this same
             // provider message, not a separate mailbox entry. Preserve its keys/time.
@@ -949,11 +987,15 @@ impl Store {
                 } else {
                     body.replace(&original[start..end], TOMBSTONE)
                 };
-                tx.execute("UPDATE message_versions SET body = ?4 WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = ?3 AND origin_namespace = ?5",
-                    params![target.as_str(), chat, message, replacement, namespace])?;
-                let verified: String = tx.query_row(
+                tx.db_execute(
+                    "UPDATE message_versions SET body = ?4 WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = ?3 AND origin_namespace = ?5",
+                    &db_params![target.as_str(), chat, message, replacement, namespace],
+                )?;
+                let verified: String = tx.db_query_one(
                     "SELECT body FROM message_versions WHERE agent_id=?1 AND chat_id=?2 AND message_id=?3 AND origin_namespace=?4",
-                    params![target.as_str(), chat, message, namespace], |r| r.get(0))?;
+                    &db_params![target.as_str(), chat, message, namespace],
+                    |r| r.get(0),
+                )?;
                 if verified != replacement {
                     receipt.unscrubbed.push(failure(
                         &baseline_path(self.database_path(), target, chat, message),
@@ -1078,45 +1120,38 @@ impl Store {
                 }
             }
         }
-        let checkpoint = {
-            let conn = self.conn();
-            let _ = conn.busy_timeout(std::time::Duration::ZERO);
-            let res = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            });
-            let _ = conn.busy_timeout(self.busy_timeout());
-            res
-        };
-        match checkpoint {
-            Ok((0, 0, 0)) => {}
-            Ok(_) => receipt.unscrubbed.push(failure(
-                &PathBuf::from(format!("{}-wal", self.database_path().display())),
-                "SQLite reader prevented WAL truncation; old bytes may remain until the reader exits and a successful TRUNCATE checkpoint")),
-            Err(_) => receipt.unscrubbed.push(failure(
-                &PathBuf::from(format!("{}-wal", self.database_path().display())),
-                "SQLite WAL truncation failed; residual bytes are unverified")),
-        }
-        // The index's log can hold the old text the same way.
-        match self.truncate_index_wal() {
-            Ok(true) => {}
-            Ok(false) => receipt.unscrubbed.push(failure(
-                &PathBuf::from(format!("{}-wal", self.memory_index_path().display())),
-                "SQLite reader prevented WAL truncation; old bytes may remain until the reader exits and a successful TRUNCATE checkpoint")),
-            Err(_) => receipt.unscrubbed.push(failure(
-                &PathBuf::from(format!("{}-wal", self.memory_index_path().display())),
-                "SQLite WAL truncation failed; residual bytes are unverified")),
+        if let Some(checkpoint) = self.sqlite_wal_checkpoint_truncate() {
+            match checkpoint {
+                Ok((0, 0, 0)) => {}
+                Ok(_) => receipt.unscrubbed.push(failure(
+                    &PathBuf::from(format!("{}-wal", self.database_path().display())),
+                    "SQLite reader prevented WAL truncation; old bytes may remain until the reader exits and a successful TRUNCATE checkpoint",
+                )),
+                Err(_) => receipt.unscrubbed.push(failure(
+                    &PathBuf::from(format!("{}-wal", self.database_path().display())),
+                    "SQLite WAL truncation failed; residual bytes are unverified",
+                )),
+            }
+            // The index's log can hold the old text the same way.
+            match self.truncate_index_wal() {
+                Ok(true) => {}
+                Ok(false) => receipt.unscrubbed.push(failure(
+                    &PathBuf::from(format!("{}-wal", self.memory_index_path().display())),
+                    "SQLite reader prevented WAL truncation; old bytes may remain until the reader exits and a successful TRUNCATE checkpoint",
+                )),
+                Err(_) => receipt.unscrubbed.push(failure(
+                    &PathBuf::from(format!("{}-wal", self.memory_index_path().display())),
+                    "SQLite WAL truncation failed; residual bytes are unverified",
+                )),
+            }
         }
         receipt.full_scrub = receipt.unscrubbed.is_empty();
         let receipt_json =
             serde_json::to_string(&receipt).map_err(|_| invalid("receipt serialization failed"))?;
         self.write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "UPDATE conversation_redactions SET receipt = ?2 WHERE id = ?1",
-                params![receipt.audit_id, receipt_json],
+                &db_params![receipt.audit_id, receipt_json],
             )?;
             Ok(())
         })?;

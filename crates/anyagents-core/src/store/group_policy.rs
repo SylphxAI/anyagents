@@ -3,9 +3,8 @@
 
 use std::collections::HashSet;
 
-use rusqlite::{Connection, OptionalExtension, params};
-
 use super::{Agent, AgentId, Error, Store, agent_by_id, agent_exists, now_ms};
+use crate::db::{DbExec, DbExecExt as _, db_params};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Group {
@@ -75,14 +74,12 @@ impl Store {
     }
 }
 
-fn group(conn: &Connection, name: &str) -> Result<Option<Group>, Error> {
-    let row: Option<(Option<String>, bool)> = conn
-        .query_row(
-            "SELECT owner_agent_id, public FROM groups WHERE name = ?1",
-            [name],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
+fn group(conn: &(impl DbExec + ?Sized), name: &str) -> Result<Option<Group>, Error> {
+    let row: Option<(Option<String>, bool)> = conn.db_query_opt(
+        "SELECT owner_agent_id, public FROM groups WHERE name = ?1",
+        &db_params![name],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
     row.map(|(owner, public)| {
         Ok(Group {
             owner_agent_id: owner.as_deref().map(AgentId::parse).transpose()?,
@@ -92,7 +89,7 @@ fn group(conn: &Connection, name: &str) -> Result<Option<Group>, Error> {
     .transpose()
 }
 
-fn caller(conn: &Connection, actor: &GroupActor) -> Result<Option<Agent>, Error> {
+fn caller(conn: &dyn DbExec, actor: &GroupActor) -> Result<Option<Agent>, Error> {
     match actor {
         GroupActor::Operator => Ok(None),
         GroupActor::Agent(id) => agent_by_id(conn, id).map(Some),
@@ -113,7 +110,11 @@ fn forbidden(name: &str, reason: &'static str) -> Error {
     }
 }
 
-fn supervises(conn: &Connection, caller: &AgentId, target: &AgentId) -> Result<bool, Error> {
+fn supervises(
+    conn: &dyn DbExec,
+    caller: &AgentId,
+    target: &AgentId,
+) -> Result<bool, Error> {
     let mut cursor = Some(target.clone());
     let mut seen = HashSet::new();
     while let Some(id) = cursor {
@@ -129,7 +130,7 @@ fn supervises(conn: &Connection, caller: &AgentId, target: &AgentId) -> Result<b
 }
 
 fn authorize_join(
-    conn: &Connection,
+    conn: &dyn DbExec,
     name: &str,
     existing: Option<&Group>,
     caller: Option<&Agent>,
@@ -137,9 +138,9 @@ fn authorize_join(
     let (Some(existing), Some(caller)) = (existing, caller) else {
         return Ok(());
     };
-    let is_member: bool = conn.query_row(
+    let is_member: bool = conn.db_query_one(
         "SELECT EXISTS(SELECT 1 FROM group_agents WHERE group_name = ?1 AND agent_id = ?2)",
-        params![name, caller.id.as_str()],
+        &db_params![name, caller.id],
         |r| r.get(0),
     )?;
     if existing.public || is_member || existing.owner_agent_id.as_ref() == Some(&caller.id) {
@@ -152,7 +153,7 @@ fn authorize_join(
 }
 
 fn apply(
-    conn: &Connection,
+    conn: &dyn DbExec,
     caller: Option<&Agent>,
     name: &str,
     action: GroupAction,
@@ -202,14 +203,14 @@ fn apply(
         }
     }
     if existing.is_none() && (action == GroupAction::Join || public.is_some()) {
-        conn.execute(
+        conn.db_execute(
             "INSERT INTO groups (name, created_at_ms, public, owner_agent_id) VALUES (?1, ?2, ?3, ?4)",
-            params![name, now_ms(), public.unwrap_or(false), caller.map(|a| a.id.as_str())],
+            &db_params![name, now_ms(), public.unwrap_or(false), caller.map(|a| a.id.as_str())],
         )?;
     } else if visibility_change {
-        conn.execute(
+        conn.db_execute(
             "UPDATE groups SET public = ?2 WHERE name = ?1",
-            params![name, public],
+            &db_params![name, public],
         )?;
     }
     match action {
@@ -219,23 +220,23 @@ fn apply(
             if existing.is_none()
                 && let Some(caller) = caller
             {
-                conn.execute(
-                    "INSERT OR IGNORE INTO group_agents (group_name, agent_id) VALUES (?1, ?2)",
-                    params![name, caller.id.as_str()],
+                conn.db_execute(
+                    "INSERT INTO group_agents (group_name, agent_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                    &db_params![name, caller.id],
                 )?;
             }
             for target in targets {
-                conn.execute(
-                    "INSERT OR IGNORE INTO group_agents (group_name, agent_id) VALUES (?1, ?2)",
-                    params![name, target.as_str()],
+                conn.db_execute(
+                    "INSERT INTO group_agents (group_name, agent_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                    &db_params![name, target],
                 )?;
             }
         }
         GroupAction::Leave => {
             for target in targets {
-                conn.execute(
+                conn.db_execute(
                     "DELETE FROM group_agents WHERE group_name = ?1 AND agent_id = ?2",
-                    params![name, target.as_str()],
+                    &db_params![name, target],
                 )?;
             }
         }
@@ -285,7 +286,7 @@ mod tests {
     fn group_owner_migration_preserves_legacy_membership_without_inventing_ownership() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let mut conn = Connection::open(&path).unwrap();
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);").unwrap();
         for (version, sql) in migrate::MIGRATIONS.iter().filter(|(v, _)| *v < 23) {
             let tx = conn.transaction().unwrap();

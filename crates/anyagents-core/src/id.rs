@@ -140,6 +140,14 @@ macro_rules! identifier {
                 &self.0
             }
         }
+
+        impl std::str::FromStr for $name {
+            type Err = Error;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::parse(s)
+            }
+        }
     };
 }
 

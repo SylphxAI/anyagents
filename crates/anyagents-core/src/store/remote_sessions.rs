@@ -11,10 +11,10 @@
 
 use std::io::Read as _;
 
-use rusqlite::{OptionalExtension, params};
 use sha2::{Digest as _, Sha256};
 
 use super::{AgentId, Error, Store, agent_exists, now_ms};
+use crate::db::{DbExec, DbExecExt as _, db_params};
 
 /// Every remote session token starts with this, so a caller can tell the
 /// kinds apart before any lookup and a secret scanner can recognise one.
@@ -97,7 +97,7 @@ fn checked_ttl(ttl_ms: i64) -> Result<i64, Error> {
 }
 
 fn insert_token(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &(impl DbExec + ?Sized),
     agent_id: &AgentId,
     session_id: &str,
     now: i64,
@@ -105,17 +105,11 @@ fn insert_token(
 ) -> Result<RemoteSessionToken, Error> {
     let token = format!("{REMOTE_SESSION_TOKEN_PREFIX}{}", random_hex(TOKEN_BYTES)?);
     let expires_at_ms = now.saturating_add(ttl_ms);
-    tx.execute(
+    tx.db_execute(
         "INSERT INTO remote_session_tokens
             (token_hash, agent_id, session_id, created_at_ms, expires_at_ms, revoked_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-        params![
-            digest(&token),
-            agent_id.as_str(),
-            session_id,
-            now,
-            expires_at_ms
-        ],
+        &db_params![digest(&token), agent_id, session_id, now, expires_at_ms],
     )?;
     Ok(RemoteSessionToken {
         token,
@@ -138,10 +132,10 @@ impl Store {
         let now = now_ms();
         self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
-            tx.execute(
+            tx.db_execute(
                 "UPDATE remote_session_tokens SET revoked_at_ms = ?1
                  WHERE agent_id = ?2 AND revoked_at_ms IS NULL",
-                params![now, agent_id.as_str()],
+                &db_params![now, agent_id],
             )?;
             insert_token(tx, agent_id, &session_id, now, ttl_ms)
         })
@@ -160,11 +154,11 @@ impl Store {
         let ttl_ms = checked_ttl(ttl_ms)?;
         let now = now_ms();
         self.write_tx(|tx| {
-            let live: bool = tx.query_row(
+            let live: bool = tx.db_query_one(
                 "SELECT EXISTS(SELECT 1 FROM remote_session_tokens
                   WHERE agent_id = ?1 AND session_id = ?2
                     AND revoked_at_ms IS NULL AND expires_at_ms > ?3)",
-                params![agent_id.as_str(), session_id, now],
+                &db_params![agent_id, session_id, now],
                 |row| row.get(0),
             )?;
             if !live {
@@ -194,22 +188,21 @@ impl Store {
             return Err(rejected());
         }
         let conn = self.read_conn();
-        let found = conn
-            .prepare_cached(
-                "SELECT t.agent_id, t.session_id, t.expires_at_ms, a.state
-                   FROM remote_session_tokens t
-                   JOIN agents a ON a.id = t.agent_id
-                  WHERE t.token_hash = ?1 AND t.revoked_at_ms IS NULL AND t.expires_at_ms > ?2",
-            )?
-            .query_row(params![digest(token), now], |row| {
+        let found = conn.db_query_opt(
+            "SELECT t.agent_id, t.session_id, t.expires_at_ms, a.state
+               FROM remote_session_tokens t
+               JOIN agents a ON a.id = t.agent_id
+              WHERE t.token_hash = ?1 AND t.revoked_at_ms IS NULL AND t.expires_at_ms > ?2",
+            &db_params![digest(token), now],
+            |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<i64>(2)?,
+                    row.get::<String>(3)?,
                 ))
-            })
-            .optional()?;
+            },
+        )?;
         match found {
             Some((agent_id, session_id, expires_at_ms, state))
                 if !matches!(state.as_str(), "paused" | "archived") =>
@@ -234,12 +227,12 @@ impl Store {
         let now = now_ms();
         self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
-            Ok(tx.execute(
+            tx.db_execute(
                 "UPDATE remote_session_tokens SET revoked_at_ms = ?1
                  WHERE agent_id = ?2 AND revoked_at_ms IS NULL
                    AND (?3 IS NULL OR session_id = ?3)",
-                params![now, agent_id.as_str(), session_id],
-            )?)
+                &db_params![now, agent_id, session_id],
+            )
         })
     }
 
@@ -249,10 +242,10 @@ impl Store {
         let now = now_ms();
         let digest = digest(token);
         self.write_tx(|tx| {
-            Ok(tx.execute(
+            Ok(tx.db_execute(
                 "UPDATE remote_session_tokens SET revoked_at_ms = ?1
                  WHERE token_hash = ?2 AND revoked_at_ms IS NULL",
-                params![now, digest],
+                &db_params![now, digest],
             )? > 0)
         })
     }
@@ -261,50 +254,41 @@ impl Store {
     /// among its live tokens, oldest expiry first.
     pub fn live_remote_sessions(&self, now: i64) -> Result<Vec<RemoteSession>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached(
+        conn.db_query_vec(
             "SELECT agent_id, session_id, MAX(expires_at_ms) AS expires
                FROM remote_session_tokens
               WHERE revoked_at_ms IS NULL AND expires_at_ms > ?1
               GROUP BY agent_id, session_id
               ORDER BY expires, agent_id, session_id",
-        )?;
-        let rows = stmt.query_map([now], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
-        let mut sessions = Vec::new();
-        for row in rows {
-            let (agent_id, session_id, expires_at_ms) = row?;
-            sessions.push(RemoteSession {
-                agent_id: AgentId::parse(&agent_id)?,
-                session_id,
-                expires_at_ms,
-            });
-        }
-        Ok(sessions)
+            &db_params![now],
+            |row| {
+                Ok(RemoteSession {
+                    agent_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    expires_at_ms: row.get(2)?,
+                })
+            },
+        )
     }
 
     /// Forget tokens that expired or were revoked before `before_ms`. They
     /// authenticate nothing; this only bounds the table.
     pub fn prune_remote_session_tokens(&self, before_ms: i64) -> Result<usize, Error> {
-        let stale: bool = self.read_conn().query_row(
+        let stale: bool = self.read_conn().db_query_one(
             "SELECT EXISTS(SELECT 1 FROM remote_session_tokens
               WHERE expires_at_ms < ?1 OR revoked_at_ms < ?1)",
-            [before_ms],
+            &db_params![before_ms],
             |row| row.get(0),
         )?;
         if !stale {
             return Ok(0);
         }
         self.write_tx(|tx| {
-            Ok(tx.execute(
+            tx.db_execute(
                 "DELETE FROM remote_session_tokens
                  WHERE expires_at_ms < ?1 OR revoked_at_ms < ?1",
-                [before_ms],
-            )?)
+                &db_params![before_ms],
+            )
         })
     }
 }
@@ -338,16 +322,12 @@ mod tests {
         assert_eq!(grant.session_id, issued.session_id);
         assert_eq!(grant.expires_at_ms, issued.expires_at_ms);
 
-        let stored: Vec<String> = {
-            let conn = store.read_conn();
-            let mut stmt = conn
-                .prepare("SELECT token_hash FROM remote_session_tokens")
-                .unwrap();
-            stmt.query_map([], |row| row.get(0))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap()
-        };
+        let stored: Vec<String> = store
+            .read_conn()
+            .db_query_vec("SELECT token_hash FROM remote_session_tokens", &[], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(stored, vec![digest(&issued.token)]);
         assert!(!stored[0].contains(&issued.token[REMOTE_SESSION_TOKEN_PREFIX.len()..]));
     }
@@ -503,7 +483,7 @@ mod tests {
         store.delete_agent(&other.id).unwrap();
         let remaining: i64 = store
             .read_conn()
-            .query_row("SELECT COUNT(*) FROM remote_session_tokens", [], |row| {
+            .db_query_one("SELECT COUNT(*) FROM remote_session_tokens", &[], |row| {
                 row.get(0)
             })
             .unwrap();

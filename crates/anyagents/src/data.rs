@@ -34,7 +34,10 @@ pub fn data_dir() -> Option<PathBuf> {
             let trimmed = raw.trim();
             if !trimmed.is_empty() {
                 let candidate = PathBuf::from(trimmed);
-                if candidate.join("anyagents.sock").exists() || candidate.join("state.db").is_file()
+                if candidate.join("anyagents.sock").exists()
+                    || candidate.join("state.db").is_file()
+                    || anyagents_core::db::configured_database_url_for_data_dir(&candidate)
+                        .is_some()
                 {
                     return Some(candidate);
                 }

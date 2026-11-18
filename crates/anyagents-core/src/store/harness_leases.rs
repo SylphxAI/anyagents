@@ -4,10 +4,9 @@
 
 use std::collections::BTreeSet;
 
-use rusqlite::{OptionalExtension, params};
-
 use super::runtime::ProcessIdentity;
 use super::{AgentId, Error, Store, agent_exists, now_ms};
+use crate::db::{DbExecExt as _, DbRow, db_params};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HarnessLease {
@@ -20,12 +19,9 @@ pub struct HarnessLease {
 
 const COLS: &str = "agent_id, harness, version, holder_pid, holder_start_time, acquired_at_ms";
 
-fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HarnessLease> {
-    let agent: String = row.get(0)?;
+fn lease_from_row(row: &DbRow<'_>) -> Result<HarnessLease, Error> {
     Ok(HarnessLease {
-        agent_id: AgentId::parse(&agent).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
-        })?,
+        agent_id: row.get(0)?,
         harness: row.get(1)?,
         version: row.get(2)?,
         holder: ProcessIdentity {
@@ -52,14 +48,14 @@ impl Store {
         }
         self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
-            tx.execute(
+            tx.db_execute(
                 &format!(
                     "INSERT INTO harness_leases ({COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(agent_id, harness) DO UPDATE SET version = ?3, holder_pid = ?4,
                          holder_start_time = ?5, acquired_at_ms = ?6"
                 ),
-                params![
-                    agent_id.as_str(),
+                &db_params![
+                    agent_id,
                     harness,
                     version,
                     holder.pid,
@@ -68,14 +64,13 @@ impl Store {
                 ],
             )?;
             let lease = tx
-                .query_row(
+                .db_query_opt(
                     &format!(
                         "SELECT {COLS} FROM harness_leases WHERE agent_id = ?1 AND harness = ?2"
                     ),
-                    params![agent_id.as_str(), harness],
+                    &db_params![agent_id, harness],
                     lease_from_row,
-                )
-                .optional()?
+                )?
                 .ok_or_else(|| Error::Message("harness lease vanished".into()))?;
             Ok(lease)
         })
@@ -90,10 +85,10 @@ impl Store {
         holder: &ProcessIdentity,
     ) -> Result<bool, Error> {
         self.write_tx(|tx| {
-            Ok(tx.execute(
+            Ok(tx.db_execute(
                 "DELETE FROM harness_leases WHERE agent_id = ?1 AND harness = ?2
                  AND holder_pid = ?3 AND holder_start_time = ?4",
-                params![agent_id.as_str(), harness, holder.pid, holder.start_time],
+                &db_params![agent_id, harness, holder.pid, holder.start_time],
             )? > 0)
         })
     }
@@ -101,21 +96,23 @@ impl Store {
     /// Every lease on `harness`, ordered by agent.
     pub fn harness_leases(&self, harness: &str) -> Result<Vec<HarnessLease>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {COLS} FROM harness_leases WHERE harness = ?1 ORDER BY agent_id"
-        ))?;
-        let rows = stmt.query_map([harness], lease_from_row)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        conn.db_query_vec(
+            &format!("SELECT {COLS} FROM harness_leases WHERE harness = ?1 ORDER BY agent_id"),
+            &db_params![harness],
+            lease_from_row,
+        )
     }
 
     /// The versions of `harness` that some lease holds. An error is returned
     /// as an error, never as an empty set.
     pub fn leased_versions(&self, harness: &str) -> Result<BTreeSet<String>, Error> {
         let conn = self.read_conn();
-        let mut stmt =
-            conn.prepare("SELECT DISTINCT version FROM harness_leases WHERE harness = ?1")?;
-        let rows = stmt.query_map([harness], |row| row.get::<_, String>(0))?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let rows = conn.db_query_vec(
+            "SELECT DISTINCT version FROM harness_leases WHERE harness = ?1",
+            &db_params![harness],
+            |row| row.get::<String>(0),
+        )?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Drop every lease whose holder `is_alive` reports gone. Returns the count.
@@ -125,18 +122,18 @@ impl Store {
         is_alive: impl Fn(&ProcessIdentity) -> bool,
     ) -> Result<usize, Error> {
         self.write_tx(|tx| {
-            let leases: Vec<HarnessLease> = {
-                let mut stmt = tx.prepare(&format!("SELECT {COLS} FROM harness_leases"))?;
-                let rows = stmt.query_map([], lease_from_row)?;
-                rows.collect::<Result<_, _>>()?
-            };
+            let leases = tx.db_query_vec(
+                &format!("SELECT {COLS} FROM harness_leases"),
+                &[],
+                lease_from_row,
+            )?;
             let mut dropped = 0;
             for lease in leases.iter().filter(|lease| !is_alive(&lease.holder)) {
-                dropped += tx.execute(
+                dropped += tx.db_execute(
                     "DELETE FROM harness_leases WHERE agent_id = ?1 AND harness = ?2
                      AND holder_pid = ?3 AND holder_start_time = ?4",
-                    params![
-                        lease.agent_id.as_str(),
+                    &db_params![
+                        lease.agent_id,
                         lease.harness,
                         lease.holder.pid,
                         lease.holder.start_time

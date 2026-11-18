@@ -1194,9 +1194,9 @@ fn write_transaction_rolls_back_without_replaying_failed_body() {
     let calls = std::cell::Cell::new(0);
     let result: Result<(), Error> = store.write_tx(|tx| {
         calls.set(calls.get() + 1);
-        tx.execute(
+        tx.db_execute(
             "UPDATE agents SET description = 'rolled back' WHERE id = ?1",
-            [agent.id.as_str()],
+            &crate::db_params![agent.id.as_str()],
         )?;
         Err(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
@@ -1209,9 +1209,9 @@ fn write_transaction_rolls_back_without_replaying_failed_body() {
     assert_eq!(store.agent(&agent.id).unwrap().description, None);
     store
         .write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agents SET description = 'committed' WHERE id = ?1",
-                [agent.id.as_str()],
+                &crate::db_params![agent.id.as_str()],
             )?;
             Ok(())
         })

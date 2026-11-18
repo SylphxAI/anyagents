@@ -17,7 +17,7 @@ impl Store {
         let conn = self.read_conn();
         // One snapshot, as `next_undelivered`: a line committed between the
         // reads must not look like a hole.
-        let snapshot = conn.unchecked_transaction()?;
+        let snapshot = conn.snapshot()?;
         agent_exists(&snapshot, agent_id)?;
         let delivered = cursor(&snapshot, agent_id)?;
         let next = seq.max(delivered) + 1;

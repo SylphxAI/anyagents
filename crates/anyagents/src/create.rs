@@ -5394,7 +5394,8 @@ pub(crate) fn resolve_and_commit_staged_signin(
     let (final_email, final_id) = extract_profile_account_identity(&final_dir, provider);
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
         && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none()
-        && data.join("state.db").is_file()
+        && (data.join("state.db").is_file()
+            || anyagents_core::db::configured_database_url_for_data_dir(data).is_some())
         && let Ok(store) = Store::open(data.join("state.db"))
     {
         // Moving agents onto the new profile is the server's rebalance; a

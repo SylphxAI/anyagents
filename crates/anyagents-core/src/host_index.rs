@@ -3,11 +3,11 @@
 //! an explicit host-authorized agent set, including learned-memory results.
 use crate::{
     HistorySearchQuery, HistorySort,
+    db::{DbBackend, DbExec, DbExecExt, DbParam, PgTx, build_pg_tsquery},
+    db_params,
     raw_segment::{RawCoordinate, RawSource},
 };
-use rusqlite::{
-    Connection, OptionalExtension, TransactionBehavior, params, params_from_iter, types::Value,
-};
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -30,6 +30,8 @@ pub enum IndexError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Core(#[from] crate::error::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -80,14 +82,57 @@ pub struct IndexHit {
     pub lexical_score: f64,
 }
 
-fn decode_tool_names(value: String) -> rusqlite::Result<Vec<String>> {
-    serde_json::from_str(&value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
-    })
+fn decode_tool_names(value: String) -> Result<Vec<String>, crate::error::Error> {
+    serde_json::from_str(&value)
+        .map_err(|error| crate::error::Error::Message(format!("invalid tool_names json: {error}")))
+}
+
+enum HostIndexBackend {
+    Sqlite(Connection),
+    Postgres {
+        pool: sqlx::PgPool,
+        tx: Option<PgTx>,
+    },
 }
 
 pub struct HostIndex {
-    conn: Connection,
+    backend: HostIndexBackend,
+}
+
+impl HostIndex {
+    fn exec(&self) -> &dyn DbExec {
+        match &self.backend {
+            HostIndexBackend::Sqlite(conn) => conn,
+            HostIndexBackend::Postgres { tx: Some(tx), .. } => tx,
+            HostIndexBackend::Postgres { pool, tx: None } => pool,
+        }
+    }
+
+    fn sqlite_conn(&self) -> Option<&Connection> {
+        match &self.backend {
+            HostIndexBackend::Sqlite(conn) => Some(conn),
+            HostIndexBackend::Postgres { .. } => None,
+        }
+    }
+
+    fn sqlite_conn_mut(&mut self) -> Option<&mut Connection> {
+        match &mut self.backend {
+            HostIndexBackend::Sqlite(conn) => Some(conn),
+            HostIndexBackend::Postgres { .. } => None,
+        }
+    }
+
+    fn is_autocommit(&self) -> bool {
+        match &self.backend {
+            HostIndexBackend::Sqlite(conn) => conn.is_autocommit(),
+            HostIndexBackend::Postgres { tx, .. } => tx.is_none(),
+        }
+    }
+
+    #[cfg(test)]
+    fn conn(&self) -> &Connection {
+        self.sqlite_conn().expect("SQLite host index")
+    }
 }
 
 /// Index connections kept open for reuse by this process: opening one maps
@@ -118,23 +163,37 @@ fn idle_pool() -> MutexGuard<'static, Vec<IdleIndex>> {
     IDLE.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+enum SharedHostInner {
+    Sqlite(Option<IdleIndex>),
+    Postgres(HostIndex),
+}
+
 /// A [`HostIndex`] borrowed from this process's pool; returned on drop.
-pub(crate) struct SharedHostIndex(Option<IdleIndex>);
+pub(crate) struct SharedHostIndex(SharedHostInner);
 impl Deref for SharedHostIndex {
     type Target = HostIndex;
     fn deref(&self) -> &HostIndex {
-        &self.0.as_ref().expect("borrowed until drop").index
+        match &self.0 {
+            SharedHostInner::Sqlite(slot) => &slot.as_ref().expect("borrowed until drop").index,
+            SharedHostInner::Postgres(index) => index,
+        }
     }
 }
 impl DerefMut for SharedHostIndex {
     fn deref_mut(&mut self) -> &mut HostIndex {
-        &mut self.0.as_mut().expect("borrowed until drop").index
+        match &mut self.0 {
+            SharedHostInner::Sqlite(slot) => &mut slot.as_mut().expect("borrowed until drop").index,
+            SharedHostInner::Postgres(index) => index,
+        }
     }
 }
 impl Drop for SharedHostIndex {
     fn drop(&mut self) {
+        let SharedHostInner::Sqlite(ref mut slot) = self.0 else {
+            return;
+        };
         // A connection left inside a transaction is closed, never reused.
-        let Some(idle) = self.0.take().filter(|i| i.index.conn.is_autocommit()) else {
+        let Some(idle) = slot.take().filter(|i| i.index.is_autocommit()) else {
             return;
         };
         let closed: Vec<IdleIndex> = {
@@ -163,6 +222,13 @@ impl HostIndex {
     /// Borrow an idle connection to the index at `path`, opening (and
     /// creating) one only when none is idle.
     pub(crate) fn shared(path: &Path) -> Result<SharedHostIndex, IndexError> {
+        if let Some(url) = crate::db::configured_database_url_for_data_dir(
+            path.parent().unwrap_or_else(|| Path::new("")),
+        ) {
+            return Ok(SharedHostIndex(SharedHostInner::Postgres(
+                Self::open_postgres(&url)?,
+            )));
+        }
         let reused = file_identity(path)?.and_then(|identity| {
             let mut pool = idle_pool();
             let at = pool
@@ -171,16 +237,16 @@ impl HostIndex {
             Some(pool.remove(at))
         });
         if let Some(idle) = reused {
-            return Ok(SharedHostIndex(Some(idle)));
+            return Ok(SharedHostIndex(SharedHostInner::Sqlite(Some(idle))));
         }
         let index = Self::open(path)?;
         let identity = file_identity(path)?
             .ok_or_else(|| io::Error::other("host index vanished while opening"))?;
-        Ok(SharedHostIndex(Some(IdleIndex {
+        Ok(SharedHostIndex(SharedHostInner::Sqlite(Some(IdleIndex {
             path: path.to_owned(),
             identity,
             index,
-        })))
+        }))))
     }
 }
 
@@ -259,14 +325,11 @@ impl HostIndex {
     /// created, so a reader that keeps positions by rowid (the memory
     /// service's dense marks) can tell its rowids started over.
     pub fn generation(&self) -> Result<Option<String>, IndexError> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT generation FROM host_generation WHERE id=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?)
+        Ok(self.exec().db_query_opt(
+            "SELECT generation FROM host_generation WHERE id=1",
+            &[],
+            |r| r.get(0),
+        )?)
     }
 
     fn ensure_call_document_index(conn: &Connection) -> Result<(), IndexError> {
@@ -294,9 +357,28 @@ impl HostIndex {
         }
     }
 
+    pub fn open_postgres(url: &str) -> Result<Self, IndexError> {
+        let handle = crate::db::shared_pg_handle(url)?;
+        handle.pool.db_execute(
+            "INSERT INTO host_index.host_generation (id, generation) VALUES (1, ?1) ON CONFLICT (id) DO NOTHING",
+            &db_params![uuid::Uuid::now_v7().to_string()],
+        )?;
+        Ok(Self {
+            backend: HostIndexBackend::Postgres {
+                pool: handle.pool,
+                tx: None,
+            },
+        })
+    }
+
     pub fn open(path: &Path) -> Result<Self, IndexError> {
         #[cfg(test)]
         OPENS.with(|n| n.set(n.get() + 1));
+        if let Some(url) = crate::db::configured_database_url_for_data_dir(
+            path.parent().unwrap_or_else(|| Path::new("")),
+        ) {
+            return Self::open_postgres(&url);
+        }
         match Self::open_inner(path) {
             Err(IndexError::Sql(error))
                 if error.to_string().contains("malformed")
@@ -328,7 +410,9 @@ impl HostIndex {
         if already_initialized {
             Self::ensure_call_document_index(&conn)?;
             Self::ensure_generation(&conn)?;
-            return Ok(Self { conn });
+            return Ok(Self {
+                backend: HostIndexBackend::Sqlite(conn),
+            });
         }
         // Serialize first-time schema creation and disposable-schema upgrades so
         // concurrent readers/writers never race unserialized DDL or FTS config writes.
@@ -402,7 +486,9 @@ impl HostIndex {
                     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
                     conn.busy_timeout(std::time::Duration::from_secs(30))?;
                 }
-                Ok(Self { conn })
+                Ok(Self {
+                    backend: HostIndexBackend::Sqlite(conn),
+                })
             }
             Err(error) => {
                 let _ = conn.execute_batch("ROLLBACK;");
@@ -419,46 +505,48 @@ impl HostIndex {
         owner: &str,
         keep: &std::collections::HashSet<String>,
     ) -> Result<(), IndexError> {
-        let ids = self
-            .conn
-            .prepare("SELECT id FROM host_documents WHERE agent_id=?1")?
-            .query_map([owner], |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let ids: Vec<String> = self.exec().db_query_vec(
+            "SELECT id FROM host_documents WHERE agent_id=?1",
+            &db_params![owner],
+            |r| r.get(0),
+        )?;
         let stale: Vec<String> = ids.into_iter().filter(|id| !keep.contains(id)).collect();
         if stale.is_empty() {
-            let has_orphan_source: bool = self.conn.query_row(
+            let has_orphan_source: bool = self.exec().db_query_one(
                 "SELECT EXISTS(SELECT 1 FROM host_sources WHERE agent_id=?1 AND segment NOT IN (SELECT segment FROM host_documents WHERE agent_id=?1))",
-                [owner],
+                &db_params![owner],
                 |r| r.get(0),
             )?;
             if !has_orphan_source {
                 return Ok(());
             }
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for id in stale {
-            tx.execute("DELETE FROM host_documents WHERE id=?1", [id])?;
-        }
-        tx.execute(
-            "DELETE FROM host_sources WHERE agent_id=?1 AND segment NOT IN
-            (SELECT segment FROM host_documents WHERE agent_id=?1)",
-            [owner],
-        )?;
-        tx.execute("DELETE FROM host_agent_trees WHERE agent_id=?1", [owner])?;
-        tx.commit()?;
-        Ok(())
+        self.in_write_scope("host_retain_docs", |this| {
+            let exec = this.exec();
+            for id in stale {
+                exec.db_execute("DELETE FROM host_documents WHERE id=?1", &db_params![id])?;
+            }
+            exec.db_execute(
+                "DELETE FROM host_sources WHERE agent_id=?1 AND segment NOT IN
+                 (SELECT segment FROM host_documents WHERE agent_id=?1)",
+                &db_params![owner],
+            )?;
+            exec.db_execute(
+                "DELETE FROM host_agent_trees WHERE agent_id=?1",
+                &db_params![owner],
+            )?;
+            Ok(())
+        })
     }
 
     /// Every published source of one agent with its cursor: one row per file,
     /// never one per document.
     pub(crate) fn agent_sources(&self, owner: &str) -> Result<Vec<(String, String)>, IndexError> {
-        Ok(self
-            .conn
-            .prepare_cached("SELECT segment, cursor FROM host_sources WHERE agent_id=?1")?
-            .query_map([owner], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<Result<_, _>>()?)
+        Ok(self.exec().db_query_vec(
+            "SELECT segment, cursor FROM host_sources WHERE agent_id=?1",
+            &db_params![owner],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
     }
 
     /// Drop sources whose files a complete walk no longer finds, with all
@@ -471,21 +559,20 @@ impl HostIndex {
         if segments.is_empty() {
             return Ok(());
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for segment in segments {
-            tx.execute(
-                &format!("DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE}"),
-                params![owner, segment],
-            )?;
-            tx.execute(
-                "DELETE FROM host_sources WHERE agent_id=?1 AND segment=?2",
-                params![owner, segment],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.in_write_scope("host_forget_sources", |this| {
+            let exec = this.exec();
+            for segment in segments {
+                exec.db_execute(
+                    &format!("DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE}"),
+                    &db_params![owner, segment],
+                )?;
+                exec.db_execute(
+                    "DELETE FROM host_sources WHERE agent_id=?1 AND segment=?2",
+                    &db_params![owner, segment],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// The walk last recorded for one class of an agent: `(policy, tree)`.
@@ -494,13 +581,11 @@ impl HostIndex {
         owner: &str,
         class: &str,
     ) -> Result<Option<(String, String)>, IndexError> {
-        Ok(self
-            .conn
-            .prepare_cached(
-                "SELECT policy, tree FROM host_agent_trees WHERE agent_id=?1 AND class=?2",
-            )?
-            .query_row([owner, class], |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()?)
+        Ok(self.exec().db_query_opt(
+            "SELECT policy, tree FROM host_agent_trees WHERE agent_id=?1 AND class=?2",
+            &db_params![owner, class],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
     }
     pub(crate) fn save_agent_tree(
         &self,
@@ -509,12 +594,11 @@ impl HostIndex {
         policy: &str,
         tree: &str,
     ) -> Result<(), IndexError> {
-        self.conn
-            .prepare_cached(
-                "INSERT INTO host_agent_trees VALUES(?1,?2,?3,?4)
-                ON CONFLICT(agent_id,class) DO UPDATE SET policy=excluded.policy, tree=excluded.tree",
-            )?
-            .execute([owner, class, policy, tree])?;
+        self.exec().db_execute(
+            "INSERT INTO host_agent_trees (agent_id, class, policy, tree) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(agent_id,class) DO UPDATE SET policy=excluded.policy, tree=excluded.tree",
+            &db_params![owner, class, policy, tree],
+        )?;
         Ok(())
     }
 
@@ -525,22 +609,16 @@ impl HostIndex {
         &self,
         now_ms: i64,
     ) -> Result<Option<(String, std::path::PathBuf)>, IndexError> {
-        let mut due = self
-            .conn
-            .prepare("SELECT agent_id,segment,cursor FROM host_sources")?
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?
-            .map(|r| -> Result<_, IndexError> {
-                let (owner, path, raw) = r?;
-                let cursor: crate::host_cursor::SourceCursor = serde_json::from_str(&raw)?;
-                Ok((owner, std::path::PathBuf::from(path), cursor))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = self.exec().db_query_vec(
+            "SELECT agent_id,segment,cursor FROM host_sources",
+            &[],
+            |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?, r.get::<String>(2)?)),
+        )?;
+        let mut due = Vec::with_capacity(rows.len());
+        for (owner, path, raw) in rows {
+            let cursor: crate::host_cursor::SourceCursor = serde_json::from_str(&raw)?;
+            due.push((owner, std::path::PathBuf::from(path), cursor));
+        }
         due.retain(|(_, _, c)| {
             (c.policy.starts_with("native-jsonl-v4") || c.policy.starts_with("native-sqlite-v1"))
                 && c.full_verified_ms <= now_ms.saturating_sub(3_600_000)
@@ -560,14 +638,12 @@ impl HostIndex {
         owner: &str,
         path: &Path,
     ) -> Result<Option<crate::host_cursor::SourceCursor>, IndexError> {
-        let raw: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT cursor FROM host_sources WHERE agent_id=?1 AND segment=?2",
-                params![owner, path.to_string_lossy()],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let path_str = path.to_string_lossy().into_owned();
+        let raw: Option<String> = self.exec().db_query_opt(
+            "SELECT cursor FROM host_sources WHERE agent_id=?1 AND segment=?2",
+            &db_params![owner, path_str],
+            |r| r.get(0),
+        )?;
         raw.map(|s| serde_json::from_str(&s).map_err(IndexError::from))
             .transpose()
     }
@@ -577,20 +653,22 @@ impl HostIndex {
         owner: &str,
         path: &Path,
     ) -> Result<Vec<String>, IndexError> {
-        Ok(self
-            .conn
-            .prepare("SELECT id FROM host_documents WHERE agent_id=?1 AND segment=?2")?
-            .query_map(params![owner, path.to_string_lossy()], |r| r.get(0))?
-            .collect::<Result<Vec<_>, _>>()?)
+        let path_str = path.to_string_lossy().into_owned();
+        Ok(self.exec().db_query_vec(
+            "SELECT id FROM host_documents WHERE agent_id=?1 AND segment=?2",
+            &db_params![owner, path_str],
+            |r| r.get(0),
+        )?)
     }
     pub(crate) fn clear_source(&self, owner: &str, path: &Path) -> Result<(), IndexError> {
-        self.conn.execute(
+        let path_str = path.to_string_lossy().into_owned();
+        self.exec().db_execute(
             &format!("DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE}"),
-            params![owner, path.to_string_lossy()],
+            &db_params![owner, path_str],
         )?;
-        self.conn.execute(
+        self.exec().db_execute(
             "DELETE FROM host_sources WHERE agent_id=?1 AND segment=?2",
-            params![owner, path.to_string_lossy()],
+            &db_params![owner, path_str],
         )?;
         Ok(())
     }
@@ -600,14 +678,12 @@ impl HostIndex {
         path: &Path,
         call_id: &str,
     ) -> Result<Option<String>, IndexError> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT tool_name FROM host_calls WHERE agent_id=?1 AND segment=?2 AND call_id=?3",
-                params![owner, path.to_string_lossy(), call_id],
-                |r| r.get(0),
-            )
-            .optional()?)
+        let path_str = path.to_string_lossy().into_owned();
+        Ok(self.exec().db_query_opt(
+            "SELECT tool_name FROM host_calls WHERE agent_id=?1 AND segment=?2 AND call_id=?3",
+            &db_params![owner, path_str, call_id],
+            |r| r.get(0),
+        )?)
     }
     pub(crate) fn save_call(
         &self,
@@ -617,15 +693,21 @@ impl HostIndex {
         name: &str,
         document: &str,
     ) -> Result<(), IndexError> {
-        self.conn.execute("INSERT INTO host_calls VALUES(?1,?2,?3,?4,?5) ON CONFLICT(agent_id,segment,call_id) DO UPDATE SET tool_name=excluded.tool_name,document_id=excluded.document_id",
-            params![owner,path.to_string_lossy(),call_id,name,document])?;
+        let path_str = path.to_string_lossy().into_owned();
+        self.exec().db_execute(
+            "INSERT INTO host_calls (agent_id, segment, call_id, tool_name, document_id)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(agent_id,segment,call_id) DO UPDATE SET tool_name=excluded.tool_name,document_id=excluded.document_id",
+            &db_params![owner, path_str, call_id, name, document],
+        )?;
         Ok(())
     }
-    fn document_tools(&self, document: &str) -> Result<Vec<String>, rusqlite::Error> {
-        self.conn
-            .prepare("SELECT name FROM host_document_tools WHERE document_id=?1 ORDER BY name")?
-            .query_map([document], |r| r.get(0))?
-            .collect()
+    fn document_tools(&self, document: &str) -> Result<Vec<String>, IndexError> {
+        Ok(self.exec().db_query_vec(
+            "SELECT name FROM host_document_tools WHERE document_id=?1 ORDER BY name",
+            &db_params![document],
+            |r| r.get(0),
+        )?)
     }
     pub(crate) fn save_source(
         &self,
@@ -633,14 +715,12 @@ impl HostIndex {
         path: &Path,
         cursor: &crate::host_cursor::SourceCursor,
     ) -> Result<(), IndexError> {
-        self.conn.execute(
-            "INSERT INTO host_sources VALUES(?1,?2,?3)
-            ON CONFLICT(agent_id,segment) DO UPDATE SET cursor=excluded.cursor",
-            params![
-                owner,
-                path.to_string_lossy(),
-                serde_json::to_string(cursor)?
-            ],
+        let path_str = path.to_string_lossy().into_owned();
+        let cursor_json = serde_json::to_string(cursor)?;
+        self.exec().db_execute(
+            "INSERT INTO host_sources (agent_id, segment, cursor) VALUES(?1,?2,?3)
+             ON CONFLICT(agent_id,segment) DO UPDATE SET cursor=excluded.cursor",
+            &db_params![owner, path_str, cursor_json],
         )?;
         Ok(())
     }
@@ -651,32 +731,81 @@ impl HostIndex {
         savepoint: &str,
         apply: impl FnOnce(&mut Self) -> Result<T, IndexError>,
     ) -> Result<T, IndexError> {
-        let started_tx = self.conn.is_autocommit();
-        if started_tx {
-            self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        }
-        if let Err(error) = self.conn.execute_batch(&format!("SAVEPOINT {savepoint}")) {
-            if started_tx {
-                let _ = self.conn.execute_batch("ROLLBACK");
-            }
-            return Err(error.into());
-        }
-        match apply(self) {
-            Ok(value) => {
-                self.conn.execute_batch(&format!("RELEASE {savepoint}"))?;
+        match &mut self.backend {
+            HostIndexBackend::Sqlite(conn) => {
+                let started_tx = conn.is_autocommit();
                 if started_tx {
-                    self.conn.execute_batch("COMMIT")?;
+                    conn.execute_batch("BEGIN IMMEDIATE")?;
                 }
-                Ok(value)
+                if let Err(error) = conn.execute_batch(&format!("SAVEPOINT {savepoint}")) {
+                    if started_tx {
+                        let _ = conn.execute_batch("ROLLBACK");
+                    }
+                    return Err(error.into());
+                }
+                match apply(self) {
+                    Ok(value) => {
+                        let conn = self.sqlite_conn_mut().expect("sqlite");
+                        conn.execute_batch(&format!("RELEASE {savepoint}"))?;
+                        if started_tx {
+                            conn.execute_batch("COMMIT")?;
+                        }
+                        Ok(value)
+                    }
+                    Err(error) => {
+                        if let Some(conn) = self.sqlite_conn_mut() {
+                            let _ = conn.execute_batch(&format!(
+                                "ROLLBACK TO {savepoint}; RELEASE {savepoint}"
+                            ));
+                            if started_tx {
+                                let _ = conn.execute_batch("ROLLBACK");
+                            }
+                        }
+                        Err(error)
+                    }
+                }
             }
-            Err(error) => {
-                let _ = self
-                    .conn
-                    .execute_batch(&format!("ROLLBACK TO {savepoint}; RELEASE {savepoint}"));
+            HostIndexBackend::Postgres { pool, tx } => {
+                let started_tx = tx.is_none();
                 if started_tx {
-                    let _ = self.conn.execute_batch("ROLLBACK");
+                    *tx = Some(PgTx::begin(pool)?);
                 }
-                Err(error)
+                if let Err(error) = tx
+                    .as_ref()
+                    .unwrap()
+                    .db_execute_batch(&format!("SAVEPOINT {savepoint}"))
+                {
+                    if started_tx {
+                        *tx = None;
+                    }
+                    return Err(error.into());
+                }
+                match apply(self) {
+                    Ok(value) => {
+                        if let HostIndexBackend::Postgres { tx, .. } = &mut self.backend {
+                            tx.as_ref()
+                                .unwrap()
+                                .db_execute_batch(&format!("RELEASE SAVEPOINT {savepoint}"))?;
+                            if started_tx && let Some(pg_tx) = tx.take() {
+                                pg_tx.commit()?;
+                            }
+                        }
+                        Ok(value)
+                    }
+                    Err(error) => {
+                        if let HostIndexBackend::Postgres { tx, .. } = &mut self.backend {
+                            if let Some(pg_tx) = tx.as_ref() {
+                                let _ = pg_tx.db_execute_batch(&format!(
+                                    "ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint}"
+                                ));
+                            }
+                            if started_tx {
+                                *tx = None;
+                            }
+                        }
+                        Err(error)
+                    }
+                }
             }
         }
     }
@@ -689,13 +818,15 @@ impl HostIndex {
     }
 
     pub fn checkpoint(&self) -> Result<(), IndexError> {
-        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let Some(conn) = self.sqlite_conn() else {
+            return Ok(());
+        };
+        conn.busy_timeout(std::time::Duration::ZERO)?;
         let result: Result<(i64, i64, i64), _> =
-            self.conn
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                });
-        let restored = self.conn.busy_timeout(std::time::Duration::from_secs(30));
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            });
+        let restored = conn.busy_timeout(std::time::Duration::from_secs(30));
         match result {
             Ok((0, _, _)) => {
                 restored?;
@@ -768,17 +899,75 @@ impl HostIndex {
             .source
             .source()
             .ok_or_else(|| io::Error::other("an indexed document needs one source"))?;
-        let old: Option<(String, String, String)> = self.conn.query_row(
-            "SELECT json_array(segment,offset,length,sha256,seq),json_array(agent_id,source,timestamp_ms,direction,sender,destination,tool_name,role),agent_id FROM host_documents WHERE id=?1",
-            [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-        let Some((raw_identity, meta_identity, owner)) = old else {
+        #[allow(clippy::type_complexity)]
+        let old: Option<(
+            String,
+            u64,
+            u64,
+            String,
+            u64,
+            String,
+            String,
+            Option<i64>,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        )> = self.exec().db_query_opt(
+            "SELECT segment,\"offset\",length,sha256,seq,agent_id,source,timestamp_ms,direction,sender,destination,tool_name,role FROM host_documents WHERE id=?1",
+            &db_params![id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                    r.get(10)?,
+                    r.get(11)?,
+                    r.get(12)?,
+                ))
+            },
+        )?;
+        let Some((
+            old_seg,
+            old_off,
+            old_len,
+            old_sha,
+            old_seq,
+            old_owner,
+            old_src,
+            old_ts,
+            old_dir,
+            old_snd,
+            old_dst,
+            old_tool,
+            old_role,
+        )) = old
+        else {
             return Ok(false);
         };
-        if owner != metadata.agent_id {
+        if old_owner != metadata.agent_id {
             return Err(io::Error::other("indexed document owner cannot change").into());
         }
-        Ok(raw_identity == raw_json(raw)
-            && meta_identity == meta_json(metadata, source)
+        Ok(old_seg == raw.segment.to_string_lossy().as_ref()
+            && old_off == raw.offset
+            && old_len == raw.length
+            && old_sha == raw.sha256
+            && old_seq == raw.seq
+            && old_src == source
+            && old_ts == metadata.timestamp_ms
+            && old_dir == metadata.direction
+            && old_snd == metadata.sender
+            && old_dst == metadata.destination
+            && old_tool == metadata.tool_name
+            && old_role == metadata.role
             && self.document_tools(id)? == tool_set(metadata))
     }
 
@@ -796,46 +985,94 @@ impl HostIndex {
         if self.is_current(id, metadata, raw)? {
             return Ok(false);
         }
-        let tx = self.conn.savepoint()?;
-        tx.execute("DELETE FROM host_documents WHERE id=?1", [id])?;
-        tx.execute(
-            "INSERT INTO host_documents VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-            params![
-                id,
-                metadata.agent_id,
-                source,
-                metadata.timestamp_ms,
-                metadata.direction,
-                metadata.sender,
-                metadata.destination,
-                metadata.tool_name,
-                metadata.role,
-                raw.segment.to_string_lossy(),
-                raw.offset,
-                raw.length,
-                raw.sha256,
-                raw.seq
-            ],
-        )?;
-        for name in tool_set(metadata) {
-            tx.execute(
-                "INSERT INTO host_document_tools VALUES(?1,?2)",
-                params![id, name],
-            )?;
-        }
-        for window in &doc.windows {
-            tx.execute(
-                "INSERT INTO host_windows(document_id,offset,length,sha256) VALUES(?1,?2,?3,?4)",
-                params![id, window.offset, window.length, window.sha256],
-            )?;
-            let row = tx.last_insert_rowid();
-            tx.execute(
-                "INSERT INTO host_fts(rowid,tokens) VALUES(?1,?2)",
-                params![row, window.tokens],
-            )?;
-        }
-        tx.commit()?;
-        Ok(true)
+        let seg_str = raw.segment.to_string_lossy().into_owned();
+        let tools = tool_set(metadata);
+        let windows = &doc.windows;
+        self.in_write_scope("host_publish_doc", |this| {
+            match &this.backend {
+                HostIndexBackend::Sqlite(conn) => {
+                    conn.execute("DELETE FROM host_documents WHERE id=?1", [id])?;
+                    conn.execute(
+                        "INSERT INTO host_documents(id,agent_id,source,timestamp_ms,direction,sender,destination,tool_name,role,segment,\"offset\",length,sha256,seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                        rusqlite::params![
+                            id,
+                            metadata.agent_id,
+                            source,
+                            metadata.timestamp_ms,
+                            metadata.direction,
+                            metadata.sender,
+                            metadata.destination,
+                            metadata.tool_name,
+                            metadata.role,
+                            seg_str,
+                            raw.offset,
+                            raw.length,
+                            raw.sha256,
+                            raw.seq
+                        ],
+                    )?;
+                    for name in &tools {
+                        conn.execute(
+                            "INSERT INTO host_document_tools VALUES(?1,?2)",
+                            rusqlite::params![id, name],
+                        )?;
+                    }
+                    for window in windows {
+                        conn.execute(
+                            "INSERT INTO host_windows(document_id,\"offset\",length,sha256) VALUES(?1,?2,?3,?4)",
+                            rusqlite::params![id, window.offset, window.length, window.sha256],
+                        )?;
+                        let row = conn.last_insert_rowid();
+                        conn.execute(
+                            "INSERT INTO host_fts(rowid,tokens) VALUES(?1,?2)",
+                            rusqlite::params![row, window.tokens],
+                        )?;
+                    }
+                }
+                HostIndexBackend::Postgres { .. } => {
+                    let exec = this.exec();
+                    exec.db_execute("DELETE FROM host_documents WHERE id=?1", &db_params![id])?;
+                    exec.db_execute(
+                        "INSERT INTO host_documents(id,agent_id,source,timestamp_ms,direction,sender,destination,tool_name,role,segment,\"offset\",length,sha256,seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                        &db_params![
+                            id,
+                            metadata.agent_id,
+                            source,
+                            metadata.timestamp_ms,
+                            metadata.direction,
+                            metadata.sender,
+                            metadata.destination,
+                            metadata.tool_name,
+                            metadata.role,
+                            seg_str,
+                            raw.offset,
+                            raw.length,
+                            raw.sha256,
+                            raw.seq
+                        ],
+                    )?;
+                    for name in &tools {
+                        exec.db_execute(
+                            "INSERT INTO host_document_tools(document_id,name) VALUES(?1,?2)",
+                            &db_params![id, name],
+                        )?;
+                    }
+                    for window in windows {
+                        exec.db_execute(
+                            "INSERT INTO host_windows(document_id,\"offset\",length,sha256,tokens,tokens_tsv) VALUES(?1,?2,?3,?4,?5,to_tsvector('simple',coalesce(?5,'')))",
+                            &db_params![
+                                id,
+                                window.offset,
+                                window.length,
+                                window.sha256,
+                                window.tokens
+                            ],
+                        )?;
+                    }
+                }
+            }
+            Ok(true)
+        })
     }
 
     /// Delete one source's documents numbered `from_seq` and above: what a
@@ -846,9 +1083,10 @@ impl HostIndex {
         source: &Path,
         from_seq: u64,
     ) -> Result<usize, IndexError> {
-        Ok(self.conn.execute(
+        let source_str = source.to_string_lossy().into_owned();
+        Ok(self.exec().db_execute(
             &format!("DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE} AND seq>=?3"),
-            params![owner, source.to_string_lossy(), from_seq as i64],
+            &db_params![owner, source_str, from_seq as i64],
         )?)
     }
 
@@ -858,15 +1096,12 @@ impl HostIndex {
         owner: &str,
         source: &Path,
     ) -> Result<Vec<u64>, IndexError> {
-        Ok(self
-            .conn
-            .prepare(&format!(
-                "SELECT seq FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE}"
-            ))?
-            .query_map(params![owner, source.to_string_lossy()], |r| {
-                r.get::<_, i64>(0).map(|v| v as u64)
-            })?
-            .collect::<Result<_, _>>()?)
+        let source_str = source.to_string_lossy().into_owned();
+        Ok(self.exec().db_query_vec(
+            &format!("SELECT seq FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE}"),
+            &db_params![owner, source_str],
+            |r| r.get::<u64>(0),
+        )?)
     }
 
     /// Delete the named documents of one source.
@@ -876,11 +1111,11 @@ impl HostIndex {
         source: &Path,
         seqs: &[u64],
     ) -> Result<(), IndexError> {
-        let mut statement = self.conn.prepare(&format!(
-            "DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE} AND seq=?3"
-        ))?;
+        let source_str = source.to_string_lossy().into_owned();
+        let sql = format!("DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE} AND seq=?3");
+        let exec = self.exec();
         for seq in seqs {
-            statement.execute(params![owner, source.to_string_lossy(), *seq as i64])?;
+            exec.db_execute(&sql, &db_params![owner, source_str, *seq as i64])?;
         }
         Ok(())
     }
@@ -896,55 +1131,60 @@ impl HostIndex {
         if visible.is_empty() {
             return Ok(None);
         }
-        let mut values: Vec<Value> = visible.iter().cloned().map(Value::Text).collect();
+        let mut values: Vec<DbParam> = visible
+            .iter()
+            .map(|v| DbParam::Text(Some(v.clone())))
+            .collect();
         let placeholders = vec!["?"; values.len()].join(",");
-        values.push(id.to_owned().into());
-        values.push(
-            scope
-                .source()
-                .map_or(Value::Null, |s| Value::Text(s.into())),
-        );
+        values.push(DbParam::Text(Some(id.to_owned())));
+        let src = DbParam::Text(scope.source().map(str::to_owned));
+        values.push(src.clone());
+        values.push(src);
+        let tools_expr = match self.exec().backend() {
+            DbBackend::Sqlite => {
+                "(SELECT json_group_array(name) FROM (SELECT name FROM host_document_tools WHERE document_id=d.id ORDER BY name))"
+            }
+            DbBackend::Postgres => {
+                "COALESCE((SELECT json_agg(name ORDER BY name)::text FROM host_document_tools WHERE document_id=d.id), '[]')"
+            }
+        };
         let sql = format!(
             "SELECT id,agent_id,source,timestamp_ms,direction,sender,destination,tool_name,role,
-                segment,offset,length,sha256,seq,
-                (SELECT json_group_array(name) FROM (SELECT name FROM host_document_tools WHERE document_id=d.id ORDER BY name))
+                segment,\"offset\",length,sha256,seq,
+                {tools_expr}
                 FROM host_documents d
                 WHERE agent_id IN ({placeholders}) AND id=? AND (? IS NULL OR source=?)"
         );
-        values.push(values.last().unwrap().clone());
-        Ok(self
-            .conn
-            .query_row(&sql, params_from_iter(values), |r| {
-                let raw = RawCoordinate {
-                    segment: r.get::<_, String>(9)?.into(),
-                    offset: r.get(10)?,
-                    length: r.get(11)?,
-                    sha256: r.get(12)?,
-                    seq: r.get(13)?,
-                };
-                Ok(IndexHit {
-                    id: r.get(0)?,
-                    metadata: IndexMetadata {
-                        agent_id: r.get(1)?,
-                        source: if r.get::<_, String>(2)? == "memory" {
-                            MemoryScope::Memory
-                        } else {
-                            MemoryScope::Transcripts
-                        },
-                        timestamp_ms: r.get(3)?,
-                        direction: r.get(4)?,
-                        sender: r.get(5)?,
-                        destination: r.get(6)?,
-                        tool_name: r.get(7)?,
-                        tool_names: decode_tool_names(r.get(14)?)?,
-                        role: r.get(8)?,
+        Ok(self.exec().db_query_opt(&sql, &values, |r| {
+            let raw = RawCoordinate {
+                segment: r.get::<String>(9)?.into(),
+                offset: r.get(10)?,
+                length: r.get(11)?,
+                sha256: r.get(12)?,
+                seq: r.get(13)?,
+            };
+            Ok(IndexHit {
+                id: r.get(0)?,
+                metadata: IndexMetadata {
+                    agent_id: r.get(1)?,
+                    source: if r.get::<String>(2)? == "memory" {
+                        MemoryScope::Memory
+                    } else {
+                        MemoryScope::Transcripts
                     },
-                    window: raw.clone(),
-                    raw,
-                    lexical_score: 0.0,
-                })
+                    timestamp_ms: r.get(3)?,
+                    direction: r.get(4)?,
+                    sender: r.get(5)?,
+                    destination: r.get(6)?,
+                    tool_name: r.get(7)?,
+                    tool_names: decode_tool_names(r.get(14)?)?,
+                    role: r.get(8)?,
+                },
+                window: raw.clone(),
+                raw,
+                lexical_score: 0.0,
             })
-            .optional()?)
+        })?)
     }
 
     /// ACL selection precedes ranking and LIMIT. An empty visibility set has no
@@ -992,7 +1232,11 @@ impl HostIndex {
         if visible_agents.is_empty() {
             return Ok(Vec::new());
         }
-        let mut values: Vec<Value> = visible_agents.iter().cloned().map(Value::Text).collect();
+        let backend = self.exec().backend();
+        let mut values: Vec<DbParam> = visible_agents
+            .iter()
+            .map(|s| DbParam::Text(Some(s.clone())))
+            .collect();
         let placeholders = vec!["?"; values.len()].join(",");
         let mut where_sql = format!("d.agent_id IN ({placeholders})");
         if let Some(ids) = ids {
@@ -1000,7 +1244,7 @@ impl HostIndex {
                 " AND d.id IN ({})",
                 vec!["?"; ids.len()].join(",")
             ));
-            values.extend(ids.iter().cloned().map(Value::Text));
+            values.extend(ids.iter().map(|s| DbParam::Text(Some(s.clone()))));
         }
         let terms: Vec<String> = query
             .query
@@ -1015,27 +1259,27 @@ impl HostIndex {
             let source = crate::host_sqlite::source_of(segment);
             let source = source.to_string_lossy().to_string();
             where_sql.push_str(" AND (d.segment=? OR substr(d.segment,1,length(?)+1)=?||'/')");
-            values.extend([source.clone().into(), source.clone().into(), source.into()]);
+            values.push(DbParam::Text(Some(source.clone())));
+            values.push(DbParam::Text(Some(source.clone())));
+            values.push(DbParam::Text(Some(source)));
         }
-        let mut push = |clause: &str, value: Value| {
+        let mut push = |clause: &str, value: DbParam| {
             where_sql.push_str(" AND ");
             where_sql.push_str(clause);
             values.push(value);
         };
         if let Some(agent) = query.agent.as_deref().filter(|a| *a != "all") {
-            push("d.agent_id=?", agent.to_owned().into());
+            push("d.agent_id=?", DbParam::Text(Some(agent.to_owned())));
         }
         if let Some(source) = scope.source() {
-            push("d.source=?", source.to_owned().into());
+            push("d.source=?", DbParam::Text(Some(source.to_owned())));
         }
         if let Some(direction) = query.direction.as_deref().filter(|s| *s != "all") {
-            push("d.direction=?", direction.to_owned().into());
+            push("d.direction=?", DbParam::Text(Some(direction.to_owned())));
         }
         if let Some(sender) = &query.sender {
-            push(
-                "instr(lower(d.sender),lower(?))>0",
-                sender.trim().to_owned().into(),
-            );
+            let clause = backend.sql_instr_ci("d.sender", "?");
+            push(&clause, DbParam::Text(Some(sender.trim().to_owned())));
         }
         if let Some(peer) = &query.with_peer {
             let peer = peer.trim();
@@ -1046,11 +1290,11 @@ impl HostIndex {
             };
             push(
                 "(d.sender=? OR d.destination=? OR d.sender=? OR d.destination=?)",
-                peer.to_owned().into(),
+                DbParam::Text(Some(peer.to_owned())),
             );
-            values.push(peer.to_owned().into());
-            values.push(address.clone().into());
-            values.push(address.into());
+            values.push(DbParam::Text(Some(peer.to_owned())));
+            values.push(DbParam::Text(Some(address.clone())));
+            values.push(DbParam::Text(Some(address)));
         }
         // Tool filters apply identically to both sources; memory does not gain
         // a bypass merely because it is a filesystem document.
@@ -1062,8 +1306,8 @@ impl HostIndex {
         }
         if let Some(tool) = &query.tool_name {
             where_sql.push_str(" AND (lower(d.tool_name)=lower(?) OR EXISTS(SELECT 1 FROM host_document_tools t WHERE t.document_id=d.id AND lower(t.name)=lower(?)))");
-            values.push(tool.trim().to_owned().into());
-            values.push(tool.trim().to_owned().into());
+            values.push(DbParam::Text(Some(tool.trim().to_owned())));
+            values.push(DbParam::Text(Some(tool.trim().to_owned())));
         }
         for (clause, value) in [
             ("d.timestamp_ms>?", query.since_ms),
@@ -1074,19 +1318,32 @@ impl HostIndex {
             if let Some(value) = value {
                 where_sql.push_str(" AND ");
                 where_sql.push_str(clause);
-                values.push(value.into());
+                values.push(DbParam::I64(Some(value)));
             }
         }
+        let mut pg_tsquery_opt: Option<String> = None;
         if lexical {
-            where_sql.push_str(" AND host_fts MATCH ?");
-            values.push(
-                terms
-                    .into_iter()
-                    .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
-                    .collect::<Vec<_>>()
-                    .join(" OR ")
-                    .into(),
-            );
+            match backend {
+                DbBackend::Sqlite => {
+                    where_sql.push_str(" AND host_fts MATCH ?");
+                    values.push(DbParam::Text(Some(
+                        terms
+                            .into_iter()
+                            .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
+                            .collect::<Vec<_>>()
+                            .join(" OR "),
+                    )));
+                }
+                DbBackend::Postgres => {
+                    let q = build_pg_tsquery(&terms).unwrap_or_default();
+                    if q.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    pg_tsquery_opt = Some(q.clone());
+                    where_sql.push_str(" AND w.tokens_tsv @@ to_tsquery('simple', ?)");
+                    values.push(DbParam::Text(Some(q)));
+                }
+            }
         }
         let tail_default = !lexical && query.sort == HistorySort::Relevance;
         let order = if query.sort == HistorySort::Oldest {
@@ -1096,63 +1353,104 @@ impl HostIndex {
         } else {
             "score ASC,d.timestamp_ms DESC,d.seq DESC"
         };
-        let score = if lexical { "bm25(host_fts)" } else { "0.0" };
-        let join = if lexical {
+        let score = if lexical {
+            match backend {
+                DbBackend::Sqlite => "bm25(host_fts)",
+                DbBackend::Postgres => "-ts_rank_cd(w.tokens_tsv, to_tsquery('simple', ?))::float8",
+            }
+        } else {
+            match backend {
+                DbBackend::Sqlite => "0.0",
+                DbBackend::Postgres => "0.0::float8",
+            }
+        };
+        if let Some(pg_q) = pg_tsquery_opt {
+            // `?` inside `{score}` appears first in the SELECT projection.
+            values.insert(0, DbParam::Text(Some(pg_q)));
+        }
+        let join = if lexical && backend == DbBackend::Sqlite {
             "JOIN host_fts ON host_fts.rowid=w.id"
         } else {
             ""
         };
-        let sql = format!("SELECT d.id,d.agent_id,d.source,d.timestamp_ms,d.direction,d.sender,d.destination,d.tool_name,d.role,
-            d.segment,d.offset,d.length,d.sha256,d.seq,w.offset,w.length,w.sha256,{score} AS score,
-            (SELECT json_group_array(name) FROM (SELECT name FROM host_document_tools WHERE document_id=d.id ORDER BY name))
-            FROM host_documents d JOIN host_windows w ON w.document_id=d.id {join}
-            WHERE {where_sql} ORDER BY {order}");
-        let mut statement = self.conn.prepare(&sql)?;
-        let mut rows = statement.query(params_from_iter(values))?;
-        let mut seen = std::collections::HashSet::new();
-        let mut hits = Vec::new();
-        while let Some(row) = rows.next()? {
-            let id: String = row.get(0)?;
-            if !seen.insert(id.clone()) {
-                continue;
+        let tools_expr = match backend {
+            DbBackend::Sqlite => {
+                "(SELECT json_group_array(name) FROM (SELECT name FROM host_document_tools WHERE document_id=d.id ORDER BY name))"
             }
+            DbBackend::Postgres => {
+                "COALESCE((SELECT json_agg(name ORDER BY name)::text FROM host_document_tools WHERE document_id=d.id), '[]')"
+            }
+        };
+        let sql = format!(
+            "SELECT d.id,d.agent_id,d.source,d.timestamp_ms,d.direction,d.sender,d.destination,d.tool_name,d.role,
+             d.segment,d.\"offset\",d.length,d.sha256,d.seq,w.\"offset\",w.length,w.sha256,{score} AS score,
+             {tools_expr}
+             FROM host_documents d JOIN host_windows w ON w.document_id=d.id {join}
+             WHERE {where_sql} ORDER BY {order}"
+        );
+        struct Candidate {
+            id: String,
+            metadata: IndexMetadata,
+            window: RawCoordinate,
+            raw: RawCoordinate,
+            lexical_score: f64,
+        }
+        let candidates = self.exec().db_query_vec(&sql, &values, |row| {
             let raw = RawCoordinate {
-                segment: row.get::<_, String>(9)?.into(),
+                segment: row.get::<String>(9)?.into(),
                 offset: row.get(10)?,
                 length: row.get(11)?,
                 sha256: row.get(12)?,
                 seq: row.get(13)?,
             };
-            if has_excluded_text(&raw, &query.exclude)? {
+            let id: String = row.get(0)?;
+            let metadata = IndexMetadata {
+                agent_id: row.get(1)?,
+                source: match row.get::<String>(2)?.as_str() {
+                    "memory" => MemoryScope::Memory,
+                    _ => MemoryScope::Transcripts,
+                },
+                timestamp_ms: row.get(3)?,
+                direction: row.get(4)?,
+                sender: row.get(5)?,
+                destination: row.get(6)?,
+                tool_name: row.get(7)?,
+                tool_names: decode_tool_names(row.get(18)?)?,
+                role: row.get(8)?,
+            };
+            let window = RawCoordinate {
+                segment: raw.segment.clone(),
+                offset: row.get(14)?,
+                length: row.get(15)?,
+                sha256: row.get(16)?,
+                seq: raw.seq,
+            };
+            Ok(Candidate {
+                id,
+                metadata,
+                window,
+                raw,
+                lexical_score: row.get(17)?,
+            })
+        })?;
+        let mut seen = std::collections::HashSet::new();
+        let mut hits = Vec::new();
+        let limit = query.limit.clamp(1, 200);
+        for c in candidates {
+            if !seen.insert(c.id.clone()) {
+                continue;
+            }
+            if has_excluded_text(&c.raw, &query.exclude)? {
                 continue;
             }
             hits.push(IndexHit {
-                id,
-                metadata: IndexMetadata {
-                    agent_id: row.get(1)?,
-                    source: match row.get::<_, String>(2)?.as_str() {
-                        "memory" => MemoryScope::Memory,
-                        _ => MemoryScope::Transcripts,
-                    },
-                    timestamp_ms: row.get(3)?,
-                    direction: row.get(4)?,
-                    sender: row.get(5)?,
-                    destination: row.get(6)?,
-                    tool_name: row.get(7)?,
-                    tool_names: decode_tool_names(row.get(18)?)?,
-                    role: row.get(8)?,
-                },
-                window: RawCoordinate {
-                    segment: raw.segment.clone(),
-                    offset: row.get(14)?,
-                    length: row.get(15)?,
-                    sha256: row.get(16)?,
-                    seq: raw.seq,
-                },
-                raw,
-                lexical_score: row.get(17)?,
+                id: c.id,
+                metadata: c.metadata,
+                window: c.window,
+                raw: c.raw,
+                lexical_score: c.lexical_score,
             });
-            if hits.len() >= query.limit.clamp(1, 200) {
+            if hits.len() >= limit {
                 break;
             }
         }
@@ -1518,10 +1816,10 @@ mod tests {
         // A connection dropped inside a transaction is closed, not pooled.
         let start = opens();
         let borrowed = HostIndex::shared(&path).unwrap();
-        borrowed.conn.execute_batch("BEGIN").unwrap();
+        borrowed.conn().execute_batch("BEGIN").unwrap();
         drop(borrowed);
         let next = HostIndex::shared(&path).unwrap();
-        assert!(next.conn.is_autocommit());
+        assert!(next.conn().is_autocommit());
         assert_eq!(opens() - start, 1);
     }
     #[test]
@@ -1534,10 +1832,10 @@ mod tests {
         conn.execute_batch("CREATE TABLE host_documents (timestamp_ms INTEGER NOT NULL); INSERT INTO host_documents VALUES (123);").unwrap();
         drop(conn);
         let index = HostIndex::open(&path).unwrap();
-        let required: i64 = index.conn.query_row("SELECT [notnull] FROM pragma_table_info('host_documents') WHERE name='timestamp_ms'", [], |r| r.get(0)).unwrap();
+        let required: i64 = index.conn().query_row("SELECT [notnull] FROM pragma_table_info('host_documents') WHERE name='timestamp_ms'", [], |r| r.get(0)).unwrap();
         assert_eq!(required, 0);
         let journal: String = index
-            .conn
+            .conn()
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(journal, "wal");
@@ -1563,15 +1861,15 @@ mod tests {
             .unwrap()
         };
         let fresh = HostIndex::open(&path).unwrap();
-        assert!(plan(&fresh.conn).contains("host_calls_document"));
+        assert!(plan(fresh.conn()).contains("host_calls_document"));
         fresh
-            .conn
+            .conn()
             .execute_batch("DROP INDEX host_calls_document")
             .unwrap();
-        assert!(plan(&fresh.conn).starts_with("SCAN host_calls"));
+        assert!(plan(fresh.conn()).starts_with("SCAN host_calls"));
         drop(fresh);
         let upgraded = HostIndex::open(&path).unwrap();
-        assert!(plan(&upgraded.conn).contains("host_calls_document"));
+        assert!(plan(upgraded.conn()).contains("host_calls_document"));
         // The cascade still removes a deleted document's calls.
         let segment = RawSegment::open(&dir.path().join("events.raw")).unwrap();
         let raw = segment.append(b"callneedle").unwrap();
@@ -1583,11 +1881,11 @@ mod tests {
             .save_call("a", &raw.segment, "call-1", "shell", "doc")
             .unwrap();
         upgraded
-            .conn
+            .conn()
             .execute("DELETE FROM host_documents WHERE id = 'doc'", [])
             .unwrap();
         let calls: i64 = upgraded
-            .conn
+            .conn()
             .query_row("SELECT COUNT(*) FROM host_calls", [], |r| r.get(0))
             .unwrap();
         assert_eq!(calls, 0);
@@ -1602,7 +1900,7 @@ mod tests {
         let index = HostIndex::open(&path).unwrap();
         // The rebuilt projection is queryable (empty).
         let count: i64 = index
-            .conn
+            .conn()
             .query_row("SELECT COUNT(*) FROM host_documents", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
@@ -1827,7 +2125,7 @@ mod tests {
         );
         // The FTS table has no recoverable text/token payload column.
         let stored: Option<String> = index
-            .conn
+            .conn()
             .query_row("SELECT tokens FROM host_fts LIMIT 1", [], |r| r.get(0))
             .unwrap();
         assert!(stored.is_none());

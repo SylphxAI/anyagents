@@ -8,9 +8,8 @@
 use std::fmt;
 use std::str::FromStr;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
-
 use super::{AgentId, Error, Store, agent_exists, now_ms};
+use crate::db::{DbExec, DbExecExt as _, DbRow, db_params};
 
 macro_rules! ordered_enum {
     ($(#[$meta:meta])* $name:ident, $what:literal { $($variant:ident => $text:literal),+ $(,)? }) => {
@@ -117,27 +116,16 @@ pub struct SchedulePending {
 const OP_COLS: &str = "op_id, agent_id, agent_name, kind, phase, actor, reason, evidence, error, \
      started_at_ms, updated_at_ms, finished_at_ms";
 
-fn conversion(
-    index: usize,
-    err: impl std::error::Error + Send + Sync + 'static,
-) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(err))
-}
-
-fn op_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LifecycleOp> {
-    let agent: String = row.get(1)?;
-    let kind: String = row.get(3)?;
-    let phase: String = row.get(4)?;
-    let evidence: String = row.get(7)?;
+fn op_from_row(row: &DbRow<'_>) -> Result<LifecycleOp, Error> {
     Ok(LifecycleOp {
         op_id: row.get(0)?,
-        agent_id: AgentId::parse(&agent).map_err(|err| conversion(1, err))?,
+        agent_id: row.get(1)?,
         agent_name: row.get(2)?,
-        kind: kind.parse().map_err(|err| conversion(3, err))?,
-        phase: phase.parse().map_err(|err| conversion(4, err))?,
+        kind: row.parse_str(3)?,
+        phase: row.parse_str(4)?,
         actor: row.get(5)?,
         reason: row.get(6)?,
-        evidence: serde_json::from_str(&evidence).map_err(|err| conversion(7, err))?,
+        evidence: row.json(7)?,
         error: row.get(8)?,
         started_at_ms: row.get(9)?,
         updated_at_ms: row.get(10)?,
@@ -145,39 +133,40 @@ fn op_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LifecycleOp> {
     })
 }
 
-fn op_by_id(conn: &Connection, op_id: &str) -> Result<LifecycleOp, Error> {
-    conn.query_row(
+fn op_by_id(conn: &(impl DbExec + ?Sized), op_id: &str) -> Result<LifecycleOp, Error> {
+    conn.db_query_opt(
         &format!("SELECT {OP_COLS} FROM lifecycle_ops WHERE op_id = ?1"),
-        [op_id],
+        &db_params![op_id],
         op_from_row,
-    )
-    .optional()?
+    )?
     .ok_or_else(|| Error::Message(format!("lifecycle op `{op_id}` not found")))
 }
 
-fn active_op_for(conn: &Connection, agent_id: &AgentId) -> Result<Option<LifecycleOp>, Error> {
-    Ok(conn
-        .query_row(
-            &format!(
-                "SELECT {OP_COLS} FROM lifecycle_ops
-                 WHERE agent_id = ?1 AND phase NOT IN ('done', 'rolled_back')"
-            ),
-            [agent_id.as_str()],
-            op_from_row,
-        )
-        .optional()?)
+fn active_op_for(
+    conn: &(impl DbExec + ?Sized),
+    agent_id: &AgentId,
+) -> Result<Option<LifecycleOp>, Error> {
+    conn.db_query_opt(
+        &format!(
+            "SELECT {OP_COLS} FROM lifecycle_ops
+             WHERE agent_id = ?1 AND phase NOT IN ('done', 'rolled_back')"
+        ),
+        &db_params![agent_id],
+        op_from_row,
+    )
 }
 
 /// The op id of an unfinished spawn that reserves `name`, if any.
-pub(super) fn spawn_reservation(conn: &Connection, name: &str) -> Result<Option<String>, Error> {
-    Ok(conn
-        .query_row(
-            "SELECT op_id FROM lifecycle_ops
-             WHERE agent_name = ?1 AND kind = 'spawn' AND phase NOT IN ('done', 'rolled_back')",
-            [name],
-            |row| row.get(0),
-        )
-        .optional()?)
+pub(super) fn spawn_reservation(
+    conn: &(impl DbExec + ?Sized),
+    name: &str,
+) -> Result<Option<String>, Error> {
+    conn.db_query_opt(
+        "SELECT op_id FROM lifecycle_ops
+         WHERE agent_name = ?1 AND kind = 'spawn' AND phase NOT IN ('done', 'rolled_back')",
+        &db_params![name],
+        |row| row.get(0),
+    )
 }
 
 fn evidence_entry(
@@ -189,13 +178,6 @@ fn evidence_entry(
 }
 
 impl Store {
-    fn lifecycle_write<T>(
-        &self,
-        op: impl FnOnce(&Transaction<'_>) -> Result<T, Error>,
-    ) -> Result<T, Error> {
-        self.write_tx(op)
-    }
-
     /// Record a lifecycle command's intent. A spawn reserves `agent_name`: it is
     /// refused when an agent or another unfinished spawn already has it. Any
     /// other kind needs the agent to exist. One unfinished op per agent.
@@ -208,11 +190,11 @@ impl Store {
                 "a lifecycle op needs an agent name, an actor and a reason".into(),
             ));
         }
-        self.lifecycle_write(|tx| {
+        self.write_tx(|tx| {
             if new.kind == LifecycleKind::Spawn {
-                let taken: bool = tx.query_row(
+                let taken: bool = tx.db_query_one(
                     "SELECT EXISTS(SELECT 1 FROM agents WHERE name = ?1 OR id = ?2)",
-                    params![new.agent_name, new.agent_id.as_str()],
+                    &db_params![new.agent_name, new.agent_id],
                     |row| row.get(0),
                 )?;
                 if taken {
@@ -237,11 +219,11 @@ impl Store {
                 now,
                 new.evidence.clone(),
             )]);
-            tx.execute(
+            tx.db_execute(
                 &format!("INSERT INTO lifecycle_ops ({OP_COLS}) VALUES (?1, ?2, ?3, ?4, 'intent', ?5, ?6, ?7, NULL, ?8, ?8, NULL)"),
-                params![
+                &db_params![
                     op_id,
-                    new.agent_id.as_str(),
+                    new.agent_id,
                     new.agent_name,
                     new.kind.as_str(),
                     new.actor,
@@ -262,7 +244,7 @@ impl Store {
         to: LifecyclePhase,
         evidence: serde_json::Value,
     ) -> Result<LifecycleOp, Error> {
-        self.lifecycle_write(|tx| {
+        self.write_tx(|tx| {
             let op = op_by_id(tx, op_id)?;
             if op.phase != from {
                 return Err(Error::StateConflict {
@@ -281,11 +263,11 @@ impl Store {
             let now = now_ms();
             let mut entries = op.evidence.clone();
             entries.push(evidence_entry(to, now, evidence.clone()));
-            tx.execute(
+            tx.db_execute(
                 "UPDATE lifecycle_ops SET phase = ?2, evidence = ?3, updated_at_ms = ?4,
                      finished_at_ms = CASE WHEN ?2 IN ('done', 'rolled_back') THEN ?4 ELSE NULL END
                  WHERE op_id = ?1",
-                params![
+                &db_params![
                     op_id,
                     to.as_str(),
                     serde_json::Value::Array(entries).to_string(),
@@ -298,7 +280,7 @@ impl Store {
 
     /// Record the latest failure of an unfinished op without moving its phase.
     pub fn note_lifecycle_op_error(&self, op_id: &str, error: &str) -> Result<LifecycleOp, Error> {
-        self.lifecycle_write(|tx| {
+        self.write_tx(|tx| {
             let op = op_by_id(tx, op_id)?;
             if op.phase.is_finished() {
                 return Err(Error::InvalidTransition {
@@ -307,9 +289,9 @@ impl Store {
                     to: "error".into(),
                 });
             }
-            tx.execute(
+            tx.db_execute(
                 "UPDATE lifecycle_ops SET error = ?2, updated_at_ms = ?3 WHERE op_id = ?1",
-                params![op_id, error, now_ms()],
+                &db_params![op_id, error, now_ms()],
             )?;
             op_by_id(tx, op_id)
         })
@@ -322,12 +304,14 @@ impl Store {
     /// Ops that a crash left unfinished, oldest first, for startup resume.
     pub fn unfinished_lifecycle_ops(&self) -> Result<Vec<LifecycleOp>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {OP_COLS} FROM lifecycle_ops WHERE phase NOT IN ('done', 'rolled_back')
-             ORDER BY started_at_ms, op_id"
-        ))?;
-        let rows = stmt.query_map([], op_from_row)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        conn.db_query_vec(
+            &format!(
+                "SELECT {OP_COLS} FROM lifecycle_ops WHERE phase NOT IN ('done', 'rolled_back')
+                 ORDER BY started_at_ms, op_id"
+            ),
+            &[],
+            op_from_row,
+        )
     }
 
     /// An agent's ops, newest first.
@@ -337,15 +321,14 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<LifecycleOp>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {OP_COLS} FROM lifecycle_ops WHERE agent_id = ?1
-             ORDER BY started_at_ms DESC, op_id DESC LIMIT ?2"
-        ))?;
-        let rows = stmt.query_map(
-            params![agent_id.as_str(), i64::try_from(limit).unwrap_or(i64::MAX)],
+        conn.db_query_vec(
+            &format!(
+                "SELECT {OP_COLS} FROM lifecycle_ops WHERE agent_id = ?1
+                 ORDER BY started_at_ms DESC, op_id DESC LIMIT ?2"
+            ),
+            &db_params![agent_id, i64::try_from(limit).unwrap_or(i64::MAX)],
             op_from_row,
-        )?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        )
     }
 
     /// Count one tick of `schedule_id` that came due at `due_ms` while its agent
@@ -358,23 +341,21 @@ impl Store {
         due_ms: i64,
         next_fire_at_ms: i64,
     ) -> Result<SchedulePending, Error> {
-        self.lifecycle_write(|tx| {
-            let updated = tx.execute(
+        self.write_tx(|tx| {
+            let updated = tx.db_execute(
                 "UPDATE agent_schedules
                  SET pending_since_ms = COALESCE(pending_since_ms, ?2),
                      pending_count = pending_count + 1,
                      next_fire_at_ms = ?3
                  WHERE id = ?1 AND next_fire_at_ms = ?2 AND state = 'active'",
-                params![schedule_id, due_ms, next_fire_at_ms],
+                &db_params![schedule_id, due_ms, next_fire_at_ms],
             )?;
             if updated == 0 {
-                let actual: Option<Option<i64>> = tx
-                    .query_row(
-                        "SELECT next_fire_at_ms FROM agent_schedules WHERE id = ?1",
-                        [schedule_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
+                let actual: Option<Option<i64>> = tx.db_query_opt(
+                    "SELECT next_fire_at_ms FROM agent_schedules WHERE id = ?1",
+                    &db_params![schedule_id],
+                    |row| row.get(0),
+                )?;
                 return Err(match actual {
                     None => Error::Message(format!("schedule `{schedule_id}` not found")),
                     Some(next) => Error::StateConflict {
@@ -400,10 +381,10 @@ impl Store {
         &self,
         schedule_id: &str,
     ) -> Result<Option<SchedulePending>, Error> {
-        self.lifecycle_write(|tx| {
-            let cancelled: bool = tx.query_row(
+        self.write_tx(|tx| {
+            let cancelled: bool = tx.db_query_one(
                 "SELECT EXISTS(SELECT 1 FROM agent_schedules WHERE id = ?1 AND state = 'cancelled')",
-                [schedule_id],
+                &db_params![schedule_id],
                 |row| row.get(0),
             )?;
             if cancelled {
@@ -411,9 +392,9 @@ impl Store {
             }
             let pending = pending_of(tx, schedule_id)?;
             if pending.is_some() {
-                tx.execute(
+                tx.db_execute(
                     "UPDATE agent_schedules SET pending_since_ms = NULL, pending_count = 0 WHERE id = ?1",
-                    [schedule_id],
+                    &db_params![schedule_id],
                 )?;
             }
             Ok(pending)
@@ -421,14 +402,15 @@ impl Store {
     }
 }
 
-fn pending_of(conn: &Connection, schedule_id: &str) -> Result<Option<SchedulePending>, Error> {
-    let row: Option<(Option<i64>, i64)> = conn
-        .query_row(
-            "SELECT pending_since_ms, pending_count FROM agent_schedules WHERE id = ?1",
-            [schedule_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
+fn pending_of(
+    conn: &(impl DbExec + ?Sized),
+    schedule_id: &str,
+) -> Result<Option<SchedulePending>, Error> {
+    let row: Option<(Option<i64>, i64)> = conn.db_query_opt(
+        "SELECT pending_since_ms, pending_count FROM agent_schedules WHERE id = ?1",
+        &db_params![schedule_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
     Ok(match row {
         Some((Some(since_ms), count)) if count > 0 => Some(SchedulePending { since_ms, count }),
         _ => None,

@@ -31,12 +31,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior};
 
 use super::{
     classify_chunk_kind_and_tool, clean_rag_text, rag_content_hash, tokenize_hybrid_search_tokens,
     tune_connection,
 };
+use crate::db::{DbBackend, DbExec, DbExecExt, DbParam, DbTx, PgTx};
+use crate::db_params;
 use crate::error::Error;
 
 /// The index file beside a state database named `state.db`.
@@ -141,17 +143,26 @@ pub(super) struct Chunk<'a> {
     pub seq: i64,
 }
 
-/// The process's one writer on an index file.
+enum MemoryIndexBackend {
+    Sqlite {
+        writer: Mutex<Connection>,
+    },
+    Postgres {
+        pool: sqlx::PgPool,
+    },
+}
+
+/// The process's one writer on a SQLite index file, or pooled connection on PostgreSQL.
 pub(super) struct MemoryIndex {
     path: PathBuf,
-    writer: Mutex<Connection>,
+    backend: MemoryIndexBackend,
     /// Chunks a non-blocking re-projection found the index busy for; the
     /// next sync queues them as pending entries.
     deferred: Mutex<Vec<String>>,
 }
 
 impl MemoryIndex {
-    /// Open (creating or rebuilding when needed) the index at `path`. An empty
+    /// Open (creating or rebuilding when needed) the SQLite index at `path`. An empty
     /// path is a private in-memory index, for a private in-memory state.
     pub(super) fn open(path: &Path) -> Result<Self, Error> {
         owner_only(path)?;
@@ -179,7 +190,23 @@ impl MemoryIndex {
         };
         Ok(Self {
             path: path.to_path_buf(),
-            writer: Mutex::new(conn),
+            backend: MemoryIndexBackend::Sqlite {
+                writer: Mutex::new(conn),
+            },
+            deferred: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub(super) fn open_postgres(path: &Path, pool: sqlx::PgPool) -> Result<Self, Error> {
+        pool.db_execute(
+            "INSERT INTO memory_index.index_meta (key, value)
+             VALUES ('layout', ?1), ('messages_rowid', 0), ('outbound_rowid', 0)
+             ON CONFLICT (key) DO NOTHING",
+            &db_params![LAYOUT],
+        )?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            backend: MemoryIndexBackend::Postgres { pool },
             deferred: Mutex::new(Vec::new()),
         })
     }
@@ -188,15 +215,90 @@ impl MemoryIndex {
         &self.path
     }
 
-    pub(super) fn writer(&self) -> MutexGuard<'_, Connection> {
-        self.writer.lock().unwrap_or_else(|p| p.into_inner())
+    pub(super) fn sqlite_writer(&self) -> Option<MutexGuard<'_, Connection>> {
+        match &self.backend {
+            MemoryIndexBackend::Sqlite { writer } => {
+                Some(writer.lock().unwrap_or_else(|p| p.into_inner()))
+            }
+            MemoryIndexBackend::Postgres { .. } => None,
+        }
     }
 
-    fn try_writer(&self) -> Option<MutexGuard<'_, Connection>> {
-        match self.writer.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
-            Err(TryLockError::WouldBlock) => None,
+    fn try_sqlite_writer(&self) -> Option<MutexGuard<'_, Connection>> {
+        match &self.backend {
+            MemoryIndexBackend::Sqlite { writer } => match writer.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            },
+            MemoryIndexBackend::Postgres { .. } => None,
+        }
+    }
+
+    fn run_read<T>(&self, f: impl FnOnce(&dyn DbExec) -> Result<T, Error>) -> Result<T, Error> {
+        match &self.backend {
+            MemoryIndexBackend::Sqlite { writer } => {
+                let conn = writer.lock().unwrap_or_else(|p| p.into_inner());
+                f(&*conn)
+            }
+            MemoryIndexBackend::Postgres { pool } => f(pool),
+        }
+    }
+
+    fn run_write_tx<T>(
+        &self,
+        wait: bool,
+        f: impl FnOnce(&DbTx<'_>) -> Result<T, Error>,
+    ) -> Result<Option<T>, Error> {
+        match &self.backend {
+            MemoryIndexBackend::Sqlite { writer } => {
+                let Some(mut conn) = (if wait {
+                    Some(writer.lock().unwrap_or_else(|p| p.into_inner()))
+                } else {
+                    self.try_sqlite_writer()
+                }) else {
+                    return Ok(None);
+                };
+                conn.busy_timeout(if wait { BUSY } else { Duration::ZERO })?;
+                let res = (|| -> Result<T, Error> {
+                    let raw = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let wrapped = DbTx::Sqlite(&raw);
+                    let out = f(&wrapped)?;
+                    raw.commit()?;
+                    Ok(out)
+                })();
+                let _ = conn.busy_timeout(BUSY);
+                match res {
+                    Ok(v) => Ok(Some(v)),
+                    Err(err) if !wait && err.is_transient_lock_error() => Ok(None),
+                    Err(err) => Err(err),
+                }
+            }
+            MemoryIndexBackend::Postgres { pool } => {
+                let tx = PgTx::begin(pool)?;
+                if !wait {
+                    let got: bool = tx.db_query_one(
+                        "SELECT pg_try_advisory_xact_lock(78697969)", // "memory_idx"
+                        &[],
+                        |r| r.get(0),
+                    )?;
+                    if !got {
+                        return Ok(None);
+                    }
+                } else {
+                    let _: () = tx.db_query_one(
+                        "SELECT pg_advisory_xact_lock(78697969)",
+                        &[],
+                        |_| Ok(()),
+                    )?;
+                }
+                let wrapped = DbTx::Postgres(tx);
+                let out = f(&wrapped)?;
+                if let DbTx::Postgres(tx) = wrapped {
+                    tx.commit()?;
+                }
+                Ok(Some(out))
+            }
         }
     }
 
@@ -206,32 +308,69 @@ impl MemoryIndex {
     /// Returns `true` when nothing is left to project.
     pub(super) fn sync(
         &self,
-        state: &Connection,
+        state: &dyn DbExec,
         wait: bool,
         budget: usize,
     ) -> Result<bool, Error> {
-        let Some(mut conn) = (if wait {
-            Some(self.writer())
-        } else {
-            self.try_writer()
-        }) else {
-            return Ok(false);
-        };
-        conn.busy_timeout(if wait { BUSY } else { Duration::ZERO })?;
-        let deferred =
-            std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|p| p.into_inner()));
-        let outcome =
-            queue_chunks(&mut conn, &deferred).and_then(|()| sync_on(&mut conn, state, budget));
-        if outcome.is_err() && !deferred.is_empty() {
-            self.deferred
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .extend(deferred);
-        }
-        conn.busy_timeout(BUSY)?;
-        match outcome {
-            Err(error) if !wait && error.is_transient_lock_error() => Ok(false),
-            other => other,
+        match &self.backend {
+            MemoryIndexBackend::Sqlite { .. } => {
+                let Some(mut conn) = (if wait {
+                    self.sqlite_writer()
+                } else {
+                    self.try_sqlite_writer()
+                }) else {
+                    return Ok(false);
+                };
+                conn.busy_timeout(if wait { BUSY } else { Duration::ZERO })?;
+                let deferred = std::mem::take(
+                    &mut *self.deferred.lock().unwrap_or_else(|p| p.into_inner()),
+                );
+                let mut outcome = Ok(true);
+                if !deferred.is_empty() {
+                    let tx_res = (|| -> Result<(), Error> {
+                        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                        let wrapped = DbTx::Sqlite(&tx);
+                        queue_chunks(&wrapped, &deferred)?;
+                        tx.commit()?;
+                        Ok(())
+                    })();
+                    if let Err(err) = tx_res {
+                        outcome = Err(err);
+                    }
+                }
+                if outcome.is_ok() {
+                    outcome = sync_on_sqlite(&mut conn, state, budget);
+                }
+                if outcome.is_err() && !deferred.is_empty() {
+                    self.deferred
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .extend(deferred);
+                }
+                conn.busy_timeout(BUSY)?;
+                match outcome {
+                    Err(error) if !wait && error.is_transient_lock_error() => Ok(false),
+                    other => other,
+                }
+            }
+            MemoryIndexBackend::Postgres { pool } => {
+                let deferred = std::mem::take(
+                    &mut *self.deferred.lock().unwrap_or_else(|p| p.into_inner()),
+                );
+                let res = sync_on_postgres(pool, state, &deferred, wait, budget);
+                if res.is_err() && !deferred.is_empty() {
+                    self.deferred
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .extend(deferred);
+                }
+                match res {
+                    Ok(Some(done)) => Ok(done),
+                    Ok(None) => Ok(false),
+                    Err(error) if !wait && error.is_transient_lock_error() => Ok(false),
+                    Err(error) => Err(error),
+                }
+            }
         }
     }
 
@@ -241,58 +380,15 @@ impl MemoryIndex {
     /// [`MemoryIndex::sync`] afterwards.
     pub(super) fn invalidate(
         &self,
-        state: &Connection,
+        state: &(impl DbExec + ?Sized),
         chunks: &[&str],
         agents: &[&str],
         wait: bool,
     ) -> Result<(), Error> {
-        let Some(mut conn) = (if wait {
-            Some(self.writer())
-        } else {
-            self.try_writer()
-        }) else {
+        let ran = self.run_write_tx(wait, |tx| invalidate_on(tx, state, chunks, agents))?;
+        if ran.is_none() {
             return Err(Error::Message("the search index is busy; retry".into()));
-        };
-        conn.busy_timeout(if wait { BUSY } else { Duration::ZERO })?;
-        let result = Self::invalidate_on(&mut conn, state, chunks, agents);
-        conn.busy_timeout(BUSY)?;
-        result
-    }
-
-    fn invalidate_on(
-        conn: &mut Connection,
-        state: &Connection,
-        chunks: &[&str],
-        agents: &[&str],
-    ) -> Result<(), Error> {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for id in chunks {
-            tx.execute(
-                "INSERT OR IGNORE INTO index_pending (kind, id) VALUES ('chunk', ?1)",
-                [id],
-            )?;
-            // A standalone summary has nothing to be re-projected from.
-            if source_row(state, id)?.is_some() {
-                remove_chunk(&tx, id)?;
-            }
         }
-        for id in agents {
-            let (cap_messages, cap_outbound): (i64, i64) = state.query_row(
-                "SELECT (SELECT COALESCE(MAX(rowid), 0) FROM messages WHERE agent_id != ?1),
-                        (SELECT COALESCE(MAX(rowid), 0) FROM outbound_messages WHERE agent_id != ?1)",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            tx.execute(
-                "INSERT INTO index_pending (kind, id, cap_messages, cap_outbound)
-                 VALUES ('agent', ?1, ?2, ?3)
-                 ON CONFLICT (kind, id) DO UPDATE SET
-                     cap_messages = MIN(COALESCE(cap_messages, excluded.cap_messages), excluded.cap_messages),
-                     cap_outbound = MIN(COALESCE(cap_outbound, excluded.cap_outbound), excluded.cap_outbound)",
-                params![id, cap_messages, cap_outbound],
-            )?;
-        }
-        tx.commit()?;
         Ok(())
     }
 
@@ -301,9 +397,17 @@ impl MemoryIndex {
     /// redaction). Taken before the state writer, so the state transaction
     /// never waits on the index.
     pub(super) fn begin_staged(&self) -> Result<Staged<'_>, Error> {
-        let conn = self.writer();
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        Ok(Staged { conn, open: true })
+        match &self.backend {
+            MemoryIndexBackend::Sqlite { .. } => {
+                let conn = self.sqlite_writer().expect("sqlite backend");
+                conn.execute_batch("BEGIN IMMEDIATE")?;
+                Ok(Staged::Sqlite { conn, open: true })
+            }
+            MemoryIndexBackend::Postgres { pool } => {
+                let tx = PgTx::begin(pool)?;
+                Ok(Staged::Postgres { tx: Some(tx) })
+            }
+        }
     }
 
     /// Remove a deleted agent's rows. `max_rowids` are the highest
@@ -315,32 +419,28 @@ impl MemoryIndex {
         agent_id: &str,
         max_rowids: (i64, i64),
     ) -> Result<(), Error> {
-        let mut conn = self.writer();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        forget_agent(&tx, agent_id)?;
-        for (key, max) in [
-            ("messages_rowid", max_rowids.0),
-            ("outbound_rowid", max_rowids.1),
-        ] {
-            tx.execute(
-                "UPDATE index_meta SET value = MIN(value, ?2) WHERE key = ?1",
-                params![key, max],
+        self.run_write_tx(true, |tx| {
+            forget_agent(tx, agent_id)?;
+            let least = tx.backend().sql_least("value", "?2");
+            let sql = format!("UPDATE index_meta SET value = {least} WHERE key = ?1");
+            for (key, max) in [
+                ("messages_rowid", max_rowids.0),
+                ("outbound_rowid", max_rowids.1),
+            ] {
+                tx.db_execute(&sql, &db_params![key, max])?;
+            }
+            tx.db_execute(
+                "DELETE FROM index_pending WHERE kind = 'agent' AND id = ?1",
+                &db_params![agent_id],
             )?;
-        }
-        tx.execute(
-            "DELETE FROM index_pending WHERE kind = 'agent' AND id = ?1",
-            [agent_id],
-        )?;
-        tx.commit()?;
+            Ok(())
+        })?;
         Ok(())
     }
 
     /// Store a standalone tool summary, which has no mailbox row.
     pub(super) fn record_standalone(&self, chunk: &Chunk<'_>) -> Result<(), Error> {
-        let mut conn = self.writer();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        upsert_chunk(&tx, chunk)?;
-        tx.commit()?;
+        self.run_write_tx(true, |tx| upsert_chunk(tx, chunk))?;
         Ok(())
     }
 
@@ -350,22 +450,24 @@ impl MemoryIndex {
         agent_id: &str,
         chunk_id: &str,
     ) -> Result<Option<String>, Error> {
-        Ok(self
-            .writer()
-            .query_row(
+        self.run_read(|conn| {
+            conn.db_query_opt(
                 "SELECT text FROM rag_chunks WHERE agent_id = ?1 AND chunk_id = ?2",
-                params![agent_id, chunk_id],
+                &db_params![agent_id, chunk_id],
                 |r| r.get(0),
             )
-            .optional()?)
+        })
     }
 
     /// Forget a standalone redaction's staged receipt.
     pub(super) fn clear_staged_redaction(&self, chunk_id: &str) -> Result<(), Error> {
-        self.writer().execute(
-            "DELETE FROM index_redactions WHERE chunk_id = ?1",
-            [chunk_id],
-        )?;
+        self.run_write_tx(true, |tx| {
+            tx.db_execute(
+                "DELETE FROM index_redactions WHERE chunk_id = ?1",
+                &db_params![chunk_id],
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -393,7 +495,9 @@ impl MemoryIndex {
         let rows = stmt
             .query_map([], StandaloneRow::read)?
             .collect::<Result<Vec<_>, _>>()?;
-        let mut conn = self.writer();
+        let Some(mut conn) = self.sqlite_writer() else {
+            return Ok(());
+        };
         // State drops its copy right after this returns: the index's copy
         // must be on disk first, not only in a WAL a power loss can cut.
         conn.pragma_update(None, "synchronous", "FULL")?;
@@ -412,65 +516,73 @@ impl MemoryIndex {
     /// Queue the most recent mailbox rows whose projection is missing, which
     /// only a writer interrupted between its state commit and its index sync
     /// leaves behind.
-    pub(super) fn check_tail(&self, state: &Connection) -> Result<(), Error> {
-        let marks = marks(&self.writer())?;
+    pub(super) fn check_tail(&self, state: &(impl DbExec + ?Sized)) -> Result<(), Error> {
+        let marks = self.run_read(|c| marks(c))?;
         let mut missing = Vec::new();
         // Rows past a mark are projected by the next sync anyway; a body too
         // short to search never has a row (the few the SQL length lets
         // through are dropped again by the drain).
         for (table, mark) in [("messages", marks.0), ("outbound_messages", marks.1)] {
-            let ids: Vec<String> = state
-                .prepare(&format!(
+            let ids: Vec<String> = state.db_query_vec(
+                &format!(
                     "SELECT id FROM {table} WHERE rowid <= ?1 AND length(body) >= 2
                      ORDER BY rowid DESC LIMIT ?2"
-                ))?
-                .query_map(params![mark, TAIL_CHECK], |r| r.get(0))?
-                .collect::<Result<_, _>>()?;
-            let conn = self.writer();
-            let mut probe = conn.prepare_cached("SELECT 1 FROM rag_chunks WHERE chunk_id = ?1")?;
-            for id in ids {
-                if probe.query_row([&id], |_| Ok(())).optional()?.is_none() {
-                    missing.push(id);
+                ),
+                &db_params![mark, TAIL_CHECK],
+                |r| r.get(0),
+            )?;
+            self.run_read(|conn| {
+                for id in &ids {
+                    let exists: Option<i64> = conn.db_query_opt(
+                        "SELECT 1 FROM rag_chunks WHERE chunk_id = ?1",
+                        &db_params![id],
+                        |r| r.get(0),
+                    )?;
+                    if exists.is_none() {
+                        missing.push(id.clone());
+                    }
                 }
-            }
+                Ok(())
+            })?;
         }
         // A channel message's stored body can be merged with a fuller copy
         // after it was projected; a writer stopped before re-projecting it
         // leaves a row whose text no longer matches.
-        let merged: Vec<(String, String)> = state
-            .prepare(
-                "SELECT id, body FROM messages WHERE rowid <= ?1 AND origin IS NOT NULL
-                 ORDER BY rowid DESC LIMIT ?2",
-            )?
-            .query_map(params![marks.0, TAIL_CHECK], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<Result<_, _>>()?;
-        {
-            let conn = self.writer();
-            let mut probe =
-                conn.prepare_cached("SELECT content_hash FROM rag_chunks WHERE chunk_id = ?1")?;
-            for (id, body) in merged {
-                let cleaned = clean_rag_text(&body);
+        let merged: Vec<(String, String)> = state.db_query_vec(
+            "SELECT id, body FROM messages WHERE rowid <= ?1 AND origin IS NOT NULL
+             ORDER BY rowid DESC LIMIT ?2",
+            &db_params![marks.0, TAIL_CHECK],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        self.run_read(|conn| {
+            for (id, body) in &merged {
+                let cleaned = clean_rag_text(body);
                 if cleaned.chars().count() < 2 {
                     continue;
                 }
-                let hash: Option<String> = probe.query_row([&id], |r| r.get(0)).optional()?;
+                let hash: Option<String> = conn.db_query_opt(
+                    "SELECT content_hash FROM rag_chunks WHERE chunk_id = ?1",
+                    &db_params![id],
+                    |r| r.get(0),
+                )?;
                 if hash.is_some_and(|h| h != rag_content_hash(&cleaned)) {
-                    missing.push(id);
+                    missing.push(id.clone());
                 }
             }
-        }
+            Ok(())
+        })?;
         if missing.is_empty() {
             return Ok(());
         }
-        let mut conn = self.writer();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for id in &missing {
-            tx.execute(
-                "INSERT OR IGNORE INTO index_pending (kind, id) VALUES ('chunk', ?1)",
-                [id],
-            )?;
-        }
-        tx.commit()?;
+        self.run_write_tx(true, |tx| {
+            for id in &missing {
+                tx.db_execute(
+                    "INSERT INTO index_pending (kind, id) VALUES ('chunk', ?1) ON CONFLICT DO NOTHING",
+                    &db_params![id],
+                )?;
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -486,28 +598,24 @@ impl MemoryIndex {
     /// writer holds the index, and nothing was done.
     pub(super) fn try_reproject(
         &self,
-        state: &Connection,
+        state: &(impl DbExec + ?Sized),
         chunks: &[String],
     ) -> Result<bool, Error> {
-        let Some(mut conn) = self.try_writer() else {
-            self.defer(chunks);
-            return Ok(false);
-        };
-        conn.busy_timeout(Duration::ZERO)?;
-        let result = (|| -> Result<(), Error> {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let res = self.run_write_tx(false, |tx| {
             for id in chunks {
                 match source_row(state, id)? {
-                    Some(row) => upsert_chunk(&tx, &row.chunk())?,
-                    None => remove_chunk(&tx, id)?,
+                    Some(row) => upsert_chunk(tx, &row.chunk())?,
+                    None => remove_chunk(tx, id)?,
                 }
             }
-            tx.commit()?;
             Ok(())
-        })();
-        conn.busy_timeout(BUSY)?;
-        match result {
-            Ok(()) => Ok(true),
+        });
+        match res {
+            Ok(Some(())) => Ok(true),
+            Ok(None) => {
+                self.defer(chunks);
+                Ok(false)
+            }
             Err(error) => {
                 self.defer(chunks);
                 if error.is_transient_lock_error() {
@@ -520,30 +628,82 @@ impl MemoryIndex {
     }
 
     /// Whether more than one read's budget of rows waits to be projected.
-    pub(super) fn far_behind(&self, state: &Connection) -> Result<bool, Error> {
-        let marks = marks(&self.writer())?;
+    pub(super) fn far_behind(&self, state: &(impl DbExec + ?Sized)) -> Result<bool, Error> {
+        let marks = self.run_read(|c| marks(c))?;
         let (messages, outbound) = max_rowids(state)?;
         Ok((messages - marks.0).max(0) + (outbound - marks.1).max(0) > READ_BUDGET as i64)
     }
 }
 
+fn invalidate_on(
+    tx: &DbTx<'_>,
+    state: &(impl DbExec + ?Sized),
+    chunks: &[&str],
+    agents: &[&str],
+) -> Result<(), Error> {
+    for id in chunks {
+        tx.db_execute(
+            "INSERT INTO index_pending (kind, id) VALUES ('chunk', ?1) ON CONFLICT DO NOTHING",
+            &db_params![id],
+        )?;
+        // A standalone summary has nothing to be re-projected from.
+        if source_row(state, id)?.is_some() {
+            remove_chunk(tx, id)?;
+        }
+    }
+    let least_msg = tx.backend().sql_least(
+        "COALESCE(index_pending.cap_messages, excluded.cap_messages)",
+        "excluded.cap_messages",
+    );
+    let least_out = tx.backend().sql_least(
+        "COALESCE(index_pending.cap_outbound, excluded.cap_outbound)",
+        "excluded.cap_outbound",
+    );
+    let agent_sql = format!(
+        "INSERT INTO index_pending (kind, id, cap_messages, cap_outbound)
+         VALUES ('agent', ?1, ?2, ?3)
+         ON CONFLICT (kind, id) DO UPDATE SET
+             cap_messages = {least_msg},
+             cap_outbound = {least_out}"
+    );
+    for id in agents {
+        let (cap_messages, cap_outbound): (i64, i64) = state.db_query_one(
+            "SELECT (SELECT COALESCE(MAX(rowid), 0) FROM messages WHERE agent_id != ?1),
+                    (SELECT COALESCE(MAX(rowid), 0) FROM outbound_messages WHERE agent_id != ?1)",
+            &db_params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        tx.db_execute(&agent_sql, &db_params![id, cap_messages, cap_outbound])?;
+    }
+    Ok(())
+}
+
 /// An open index write transaction, rolled back unless committed.
-pub(crate) struct Staged<'a> {
-    conn: MutexGuard<'a, Connection>,
-    open: bool,
+pub(crate) enum Staged<'a> {
+    Sqlite {
+        conn: MutexGuard<'a, Connection>,
+        open: bool,
+    },
+    Postgres {
+        tx: Option<PgTx>,
+    },
 }
 
 impl Staged<'_> {
+    fn as_exec(&self) -> &dyn DbExec {
+        match self {
+            Self::Sqlite { conn, .. } => &**conn,
+            Self::Postgres { tx } => tx.as_ref().expect("staged postgres transaction open"),
+        }
+    }
+
     /// Any receipt staged for this chunk; a different selector must be refused.
     pub(crate) fn staged_receipt(&self, chunk_id: &str) -> Result<Option<(String, String)>, Error> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT request_key, receipt FROM index_redactions WHERE chunk_id = ?1",
-                [chunk_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?)
+        self.as_exec().db_query_opt(
+            "SELECT request_key, receipt FROM index_redactions WHERE chunk_id = ?1",
+            &db_params![chunk_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
     }
 
     /// Scrub a standalone summary to `text` and stage its receipt.
@@ -555,19 +715,32 @@ impl Staged<'_> {
         request_key: &str,
         receipt: &str,
     ) -> Result<(), Error> {
-        rewrite_standalone_on(&self.conn, agent_id, chunk_id, text)?;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO index_redactions (chunk_id, request_key, receipt)
-             VALUES (?1, ?2, ?3)",
-            params![chunk_id, request_key, receipt],
+        let exec = self.as_exec();
+        rewrite_standalone_on(exec, agent_id, chunk_id, text)?;
+        exec.db_execute(
+            "INSERT INTO index_redactions (chunk_id, request_key, receipt)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (chunk_id) DO UPDATE SET
+                 request_key = excluded.request_key,
+                 receipt = excluded.receipt",
+            &db_params![chunk_id, request_key, receipt],
         )?;
         Ok(())
     }
 
     pub(crate) fn commit(&mut self) -> Result<(), Error> {
-        if self.open {
-            self.conn.execute_batch("COMMIT")?;
-            self.open = false;
+        match self {
+            Self::Sqlite { conn, open } => {
+                if *open {
+                    conn.execute_batch("COMMIT")?;
+                    *open = false;
+                }
+            }
+            Self::Postgres { tx } => {
+                if let Some(tx) = tx.take() {
+                    tx.commit()?;
+                }
+            }
         }
         Ok(())
     }
@@ -575,27 +748,32 @@ impl Staged<'_> {
 
 impl Drop for Staged<'_> {
     fn drop(&mut self) {
-        if self.open {
-            let _ = self.conn.execute_batch("ROLLBACK");
+        match self {
+            Self::Sqlite { conn, open } => {
+                if *open {
+                    let _ = conn.execute_batch("ROLLBACK");
+                }
+            }
+            Self::Postgres { tx } => {
+                drop(tx.take());
+            }
         }
     }
 }
 
 fn rewrite_standalone_on(
-    conn: &Connection,
+    conn: &dyn DbExec,
     agent_id: &str,
     chunk_id: &str,
     text: &str,
 ) -> Result<(), Error> {
-    let row = conn
-        .query_row(
-            "SELECT chunk_id, agent_id, agent_name, direction, sender, destination,
-                    timestamp_ms, text, kind, tool_name, seq
-             FROM rag_chunks WHERE agent_id = ?1 AND chunk_id = ?2",
-            params![agent_id, chunk_id],
-            StandaloneRow::read,
-        )
-        .optional()?;
+    let row = conn.db_query_opt(
+        "SELECT chunk_id, agent_id, agent_name, direction, sender, destination,
+                timestamp_ms, text, kind, tool_name, seq
+         FROM rag_chunks WHERE agent_id = ?1 AND chunk_id = ?2",
+        &db_params![agent_id, chunk_id],
+        StandaloneRow::read_db,
+    )?;
     remove_chunk(conn, chunk_id)?;
     if let Some(mut row) = row {
         row.text = text.to_string();
@@ -606,9 +784,9 @@ fn rewrite_standalone_on(
 
 /// Fill the index in the background until it has caught up with state or the
 /// last handle on it is gone. `open_state` opens a state reader.
-pub(super) fn spawn_rebuild(
+pub(super) fn spawn_rebuild<S: DbExec + Send + 'static>(
     index: &Arc<MemoryIndex>,
-    open_state: impl Fn() -> Option<Connection> + Send + 'static,
+    open_state: impl Fn() -> Option<S> + Send + 'static,
 ) {
     let weak: Weak<MemoryIndex> = Arc::downgrade(index);
     let _ = std::thread::Builder::new()
@@ -719,14 +897,15 @@ fn open_checked(path: &Path) -> Result<Connection, Error> {
     Ok(conn)
 }
 
-/// Drop everything and create the current layout, empty, with marks at zero.
+/// Drop everything and create the current SQLite layout, empty, with marks at zero.
 /// Unless `force`, a file another process brought to the current layout
 /// meanwhile is left as it is.
 pub(super) fn reset(
     conn: &Connection,
-    state: Option<&Connection>,
+    state: Option<&dyn DbExec>,
     force: bool,
 ) -> Result<(), Error> {
+    use rusqlite::params;
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<(), Error> {
         let current = conn
@@ -756,12 +935,14 @@ pub(super) fn reset(
         // nothing removes.
         let kept: Vec<StandaloneRow> = match state {
             Some(state) => {
-                let mut live = state.prepare_cached("SELECT 1 FROM agents WHERE id = ?1")?;
                 let mut alive = Vec::new();
                 for row in kept {
-                    if live
-                        .query_row([&row.agent_id], |_| Ok(()))
-                        .optional()?
+                    if state
+                        .db_query_opt(
+                            "SELECT 1 FROM agents WHERE id = ?1",
+                            &db_params![row.agent_id],
+                            |_| Ok(()),
+                        )?
                         .is_some()
                     {
                         alive.push(row);
@@ -849,6 +1030,36 @@ pub(super) fn reset(
     Ok(())
 }
 
+fn reset_postgres(tx: &DbTx<'_>, state: &(impl DbExec + ?Sized)) -> Result<(), Error> {
+    tx.db_execute(
+        "DELETE FROM memory_index.rag_chunks WHERE chunk_id NOT LIKE 'tool\\_%' ESCAPE '\\'",
+        &[],
+    )?;
+    let tool_agents: Vec<String> = tx.db_query_vec(
+        "SELECT DISTINCT agent_id FROM memory_index.rag_chunks",
+        &[],
+        |r| r.get(0),
+    )?;
+    for agent_id in tool_agents {
+        let alive: Option<i64> = state.db_query_opt(
+            "SELECT 1 FROM agents WHERE id = ?1",
+            &db_params![agent_id],
+            |r| r.get(0),
+        )?;
+        if alive.is_none() {
+            tx.db_execute(
+                "DELETE FROM memory_index.rag_chunks WHERE agent_id = ?1",
+                &db_params![agent_id],
+            )?;
+        }
+    }
+    tx.db_execute(
+        "UPDATE memory_index.index_meta SET value = 0 WHERE key IN ('messages_rowid', 'outbound_rowid')",
+        &[],
+    )?;
+    Ok(())
+}
+
 /// A chunk read back from an index or legacy table, with its own kind.
 struct StandaloneRow {
     id: String,
@@ -883,6 +1094,22 @@ impl StandaloneRow {
         })
     }
 
+    fn read_db(r: &crate::db::DbRow<'_>) -> Result<Self, Error> {
+        Ok(Self {
+            id: r.get(0)?,
+            agent_id: r.get(1)?,
+            agent_name: r.get(2)?,
+            direction: r.get(3)?,
+            sender: r.get(4)?,
+            destination: r.get(5)?,
+            timestamp_ms: r.get(6)?,
+            text: r.get(7)?,
+            kind: r.get(8)?,
+            tool: r.get(9)?,
+            seq: r.get(10)?,
+        })
+    }
+
     fn chunk(&self) -> Chunk<'_> {
         Chunk {
             id: &self.id,
@@ -900,25 +1127,26 @@ impl StandaloneRow {
     }
 }
 
-fn marks(conn: &Connection) -> Result<(i64, i64), Error> {
+fn marks(conn: &(impl DbExec + ?Sized)) -> Result<(i64, i64), Error> {
     let get = |key: &str| -> Result<i64, Error> {
         Ok(conn
-            .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |r| {
-                r.get(0)
-            })
-            .optional()?
+            .db_query_opt(
+                "SELECT value FROM index_meta WHERE key = ?1",
+                &db_params![key],
+                |r| r.get(0),
+            )?
             .unwrap_or(0))
     };
     Ok((get("messages_rowid")?, get("outbound_rowid")?))
 }
 
-fn max_rowids(state: &Connection) -> Result<(i64, i64), Error> {
-    Ok(state.query_row(
+fn max_rowids(state: &(impl DbExec + ?Sized)) -> Result<(i64, i64), Error> {
+    state.db_query_one(
         "SELECT (SELECT COALESCE(MAX(rowid), 0) FROM messages),
                 (SELECT COALESCE(MAX(rowid), 0) FROM outbound_messages)",
-        [],
+        &[],
         |r| Ok((r.get(0)?, r.get(1)?)),
-    )?)
+    )
 }
 
 /// One source row of a projected chunk: `(rowid, chunk)` fields owned.
@@ -972,10 +1200,10 @@ const OUTBOUND_SELECT_RETIRING: &str = "SELECT o.rowid, o.id, o.agent_id, a.name
 /// Mailbox rows of one direction (`"in"`: `messages m`, `"out"`:
 /// `outbound_messages o`) matching `filter`, as projected.
 pub(super) fn read_source_rows(
-    state: &Connection,
+    state: &(impl DbExec + ?Sized),
     direction: &'static str,
     filter: &str,
-    params: &[&dyn rusqlite::ToSql],
+    params: &[DbParam],
 ) -> Result<Vec<SourceRow>, Error> {
     if direction == "in" {
         return read_rows(
@@ -985,7 +1213,8 @@ pub(super) fn read_source_rows(
             params,
         );
     }
-    let retiring = super::retired_search::present(state)?;
+    let retiring = state.backend() == DbBackend::Sqlite
+        && super::retired_search::present_db(state)?;
     let select = if retiring {
         OUTBOUND_SELECT_RETIRING
     } else {
@@ -994,59 +1223,65 @@ pub(super) fn read_source_rows(
     match read_rows(state, &format!("{select} {filter}"), direction, params) {
         // The retired chunks were dropped since they were looked up; every
         // position had been moved onto its row first.
-        Err(_) if retiring && !super::retired_search::present(state)? => read_rows(
-            state,
-            &format!("{OUTBOUND_SELECT} {filter}"),
-            direction,
-            params,
-        ),
+        Err(_)
+            if retiring
+                && !super::retired_search::present_db(state)? =>
+        {
+            read_rows(
+                state,
+                &format!("{OUTBOUND_SELECT} {filter}"),
+                direction,
+                params,
+            )
+        }
         other => other,
     }
 }
 
 fn read_rows(
-    state: &Connection,
+    state: &(impl DbExec + ?Sized),
     sql: &str,
     direction: &'static str,
-    params: impl rusqlite::Params,
+    params: &[DbParam],
 ) -> Result<Vec<SourceRow>, Error> {
-    let mut stmt = state.prepare_cached(sql)?;
-    let rows = stmt
-        .query_map(params, |r| {
-            Ok(SourceRow {
-                rowid: r.get(0)?,
-                id: r.get(1)?,
-                agent_id: r.get(2)?,
-                agent_name: r.get(3)?,
-                direction,
-                sender: r.get(4)?,
-                destination: r.get(5)?,
-                timestamp_ms: r.get(6)?,
-                body: r.get(7)?,
-                seq: r.get(8)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows)
+    state.db_query_vec(sql, params, |r| {
+        Ok(SourceRow {
+            rowid: r.get(0)?,
+            id: r.get(1)?,
+            agent_id: r.get(2)?,
+            agent_name: r.get(3)?,
+            direction,
+            sender: r.get(4)?,
+            destination: r.get(5)?,
+            timestamp_ms: r.get(6)?,
+            body: r.get(7)?,
+            seq: r.get(8)?,
+        })
+    })
 }
 
 /// The mailbox row a chunk id is projected from, if state has one.
-fn source_row(state: &Connection, id: &str) -> Result<Option<SourceRow>, Error> {
-    let inbound = read_source_rows(state, "in", "WHERE m.id = ?1", &[&id])?;
+fn source_row(state: &(impl DbExec + ?Sized), id: &str) -> Result<Option<SourceRow>, Error> {
+    let inbound = read_source_rows(state, "in", "WHERE m.id = ?1", &db_params![id])?;
     if let Some(row) = inbound.into_iter().next() {
         return Ok(Some(row));
     }
-    Ok(read_source_rows(state, "out", "WHERE o.id = ?1", &[&id])?
-        .into_iter()
-        .next())
+    Ok(
+        read_source_rows(state, "out", "WHERE o.id = ?1", &db_params![id])?
+            .into_iter()
+            .next(),
+    )
 }
 
-fn sync_on(conn: &mut Connection, state: &Connection, budget: usize) -> Result<bool, Error> {
+fn sync_on_sqlite(
+    conn: &mut Connection,
+    state: &dyn DbExec,
+    budget: usize,
+) -> Result<bool, Error> {
     let (messages, outbound) = marks(conn)?;
     let (max_messages, max_outbound) = max_rowids(state)?;
-    let pending: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM index_pending)", [], |r| {
-        r.get(0)
-    })?;
+    let pending: bool =
+        conn.db_query_one("SELECT EXISTS(SELECT 1 FROM index_pending)", &[], |r| r.get(0))?;
     // Caught up: answered by reads, without the index's write lock.
     if !pending && messages == max_messages && outbound == max_outbound {
         return Ok(true);
@@ -1054,7 +1289,7 @@ fn sync_on(conn: &mut Connection, state: &Connection, budget: usize) -> Result<b
     // First the pending changes: a deleted agent's entry lowers the marks
     // past the rowids it held, which is not state moving backwards.
     if pending {
-        drain_pending(conn, state)?;
+        drain_pending_on_sqlite(conn, state)?;
     }
     // State moved backwards (restored, replaced): the projection describes
     // rows state no longer has. Start over.
@@ -1074,20 +1309,25 @@ fn sync_on(conn: &mut Connection, state: &Connection, budget: usize) -> Result<b
             let take = left.min(BATCH);
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let mark: i64 = tx
-                .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |r| {
-                    r.get(0)
-                })
-                .optional()?
+                .db_query_opt(
+                    "SELECT value FROM index_meta WHERE key = ?1",
+                    &db_params![key],
+                    |r| r.get(0),
+                )?
                 .unwrap_or(0);
             // Rows whose agent is gone have no owner to file them under;
             // they are skipped by the join and covered by the mark.
-            let (max,): (i64,) = state.query_row(
+            let max: i64 = state.db_query_one(
                 &format!(
-                    "SELECT COALESCE(MAX(rowid), 0) FROM (SELECT rowid FROM {} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2)",
-                    if direction == "in" { "messages" } else { "outbound_messages" }
+                    "SELECT COALESCE(MAX(rowid), 0) FROM (SELECT rowid FROM {} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2) AS _batch",
+                    if direction == "in" {
+                        "messages"
+                    } else {
+                        "outbound_messages"
+                    }
                 ),
-                params![mark, take as i64],
-                |r| Ok((r.get(0)?,)),
+                &db_params![mark, take as i64],
+                |r| r.get(0),
             )?;
             if max <= mark {
                 tx.commit()?;
@@ -1097,15 +1337,15 @@ fn sync_on(conn: &mut Connection, state: &Connection, budget: usize) -> Result<b
                 state,
                 direction,
                 &format!("WHERE {rowid} > ?1 AND {rowid} <= ?2 ORDER BY {rowid}"),
-                &[&mark, &max],
+                &db_params![mark, max],
             )?;
             for row in &rows {
                 upsert_chunk(&tx, &row.chunk())?;
             }
             debug_assert!(rows.iter().all(|r| r.rowid <= max));
-            tx.execute(
+            tx.db_execute(
                 "UPDATE index_meta SET value = ?2 WHERE key = ?1",
-                params![key, max],
+                &db_params![key, max],
             )?;
             tx.commit()?;
             left = left.saturating_sub(take);
@@ -1114,99 +1354,308 @@ fn sync_on(conn: &mut Connection, state: &Connection, budget: usize) -> Result<b
     Ok(true)
 }
 
-fn queue_chunks(conn: &mut Connection, chunks: &[String]) -> Result<(), Error> {
+fn sync_on_postgres(
+    pool: &sqlx::PgPool,
+    state: &(impl DbExec + ?Sized),
+    deferred: &[String],
+    wait: bool,
+    budget: usize,
+) -> Result<Option<bool>, Error> {
+    if deferred.is_empty() {
+        let (messages, outbound) = marks(pool)?;
+        let (max_messages, max_outbound) = max_rowids(state)?;
+        let pending: bool =
+            pool.db_query_one("SELECT EXISTS(SELECT 1 FROM index_pending)", &[], |r| r.get(0))?;
+        if !pending && messages == max_messages && outbound == max_outbound {
+            return Ok(Some(true));
+        }
+    }
+    // Acquire advisory sync lock per-batch so other pods aren't blocked for the whole rebuild.
+    if !deferred.is_empty() {
+        let queued = with_pg_sync_lock(pool, wait, |tx| queue_chunks(tx, deferred))?;
+        if queued.is_none() {
+            return Ok(None);
+        }
+    }
+    loop {
+        let Some(drained_more) = with_pg_sync_lock(pool, wait, |tx| drain_pending_step(tx, state))?
+        else {
+            return Ok(None);
+        };
+        if !drained_more {
+            break;
+        }
+    }
+    let Some(()) = with_pg_sync_lock(pool, wait, |tx| {
+        let (messages, outbound) = marks(tx)?;
+        let (max_messages, max_outbound) = max_rowids(state)?;
+        if messages > max_messages || outbound > max_outbound {
+            reset_postgres(tx, state)?;
+        }
+        Ok(())
+    })?
+    else {
+        return Ok(None);
+    };
+
+    let mut left = budget;
+    for (key, rowid, direction) in [
+        ("messages_rowid", "m.rowid", "in"),
+        ("outbound_rowid", "o.rowid", "out"),
+    ] {
+        loop {
+            if left == 0 {
+                return Ok(Some(false));
+            }
+            let take = left.min(BATCH);
+            let Some(advanced) = with_pg_sync_lock(pool, wait, |tx| {
+                let mark: i64 = tx
+                    .db_query_opt(
+                        "SELECT value FROM index_meta WHERE key = ?1",
+                        &db_params![key],
+                        |r| r.get(0),
+                    )?
+                    .unwrap_or(0);
+                let max: i64 = state.db_query_one(
+                    &format!(
+                        "SELECT COALESCE(MAX(rowid), 0) FROM (SELECT rowid FROM {} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2) AS _batch",
+                        if direction == "in" {
+                            "messages"
+                        } else {
+                            "outbound_messages"
+                        }
+                    ),
+                    &db_params![mark, take as i64],
+                    |r| r.get(0),
+                )?;
+                if max <= mark {
+                    return Ok(false);
+                }
+                let rows = read_source_rows(
+                    state,
+                    direction,
+                    &format!("WHERE {rowid} > ?1 AND {rowid} <= ?2 ORDER BY {rowid}"),
+                    &db_params![mark, max],
+                )?;
+                for row in &rows {
+                    upsert_chunk(tx, &row.chunk())?;
+                }
+                tx.db_execute(
+                    "UPDATE index_meta SET value = ?2 WHERE key = ?1",
+                    &db_params![key, max],
+                )?;
+                Ok(true)
+            })?
+            else {
+                return Ok(None);
+            };
+            if !advanced {
+                break;
+            }
+            left = left.saturating_sub(take);
+        }
+    }
+    Ok(Some(true))
+}
+
+fn with_pg_sync_lock<T>(
+    pool: &sqlx::PgPool,
+    wait: bool,
+    f: impl FnOnce(&DbTx<'_>) -> Result<T, Error>,
+) -> Result<Option<T>, Error> {
+    let tx = PgTx::begin(pool)?;
+    if !wait {
+        let got: bool = tx.db_query_one("SELECT pg_try_advisory_xact_lock(78697969)", &[], |r| r.get(0))?;
+        if !got {
+            return Ok(None);
+        }
+    } else {
+        let _: () = tx.db_query_one("SELECT pg_advisory_xact_lock(78697969)", &[], |_| Ok(()))?;
+    }
+    let wrapped = DbTx::Postgres(tx);
+    let res = f(&wrapped)?;
+    if let DbTx::Postgres(tx) = wrapped {
+        tx.commit()?;
+    }
+    Ok(Some(res))
+}
+
+fn queue_chunks(tx: &(impl DbExec + ?Sized), chunks: &[String]) -> Result<(), Error> {
     if chunks.is_empty() {
         return Ok(());
     }
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for id in chunks {
-        tx.execute(
-            "INSERT OR IGNORE INTO index_pending (kind, id) VALUES ('chunk', ?1)",
-            [id],
+        tx.db_execute(
+            "INSERT INTO index_pending (kind, id) VALUES ('chunk', ?1) ON CONFLICT DO NOTHING",
+            &db_params![id],
         )?;
     }
-    tx.commit()?;
     Ok(())
 }
 
-fn drain_pending(conn: &mut Connection, state: &Connection) -> Result<(), Error> {
+fn drain_pending_on_sqlite(
+    conn: &mut Connection,
+    state: &(impl DbExec + ?Sized),
+) -> Result<(), Error> {
     loop {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        type Pending = (String, String, Option<i64>, Option<i64>);
-        let pending: Vec<Pending> = tx
-            .prepare_cached(
-                "SELECT kind, id, cap_messages, cap_outbound FROM index_pending LIMIT 256",
-            )?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-            .collect::<Result<_, _>>()?;
-        if pending.is_empty() {
-            tx.commit()?;
+        let wrapped = DbTx::Sqlite(&tx);
+        let more = drain_pending_step(&wrapped, state)?;
+        tx.commit()?;
+        if !more {
             return Ok(());
         }
-        for (kind, id, cap_messages, cap_outbound) in &pending {
-            match kind.as_str() {
-                // A standalone summary keeps its row; a mailbox row leaves
-                // state only with its agent, below.
-                "chunk" => {
-                    if let Some(row) = source_row(state, id)? {
-                        upsert_chunk(&tx, &row.chunk())?;
-                    }
-                }
-                "agent" => {
-                    let name: Option<String> = state
-                        .query_row("SELECT name FROM agents WHERE id = ?1", [id], |r| r.get(0))
-                        .optional()?;
-                    match name {
-                        Some(name) => {
-                            rewrite_agent_fts_rows(&tx, id, Some(&name))?;
-                            tx.execute(
-                                "UPDATE rag_chunks SET agent_name = ?2 WHERE agent_id = ?1 AND agent_name != ?2",
-                                params![id, name],
-                            )?;
-                        }
-                        None => {
-                            forget_agent(&tx, id)?;
-                            // The bound read before the delete: rows a new
-                            // agent added since may reuse the rowids.
-                            let (now_messages, now_outbound) = max_rowids(state)?;
-                            let messages = cap_messages.unwrap_or(now_messages).min(now_messages);
-                            let outbound = cap_outbound.unwrap_or(now_outbound).min(now_outbound);
-                            for (key, max) in
-                                [("messages_rowid", messages), ("outbound_rowid", outbound)]
-                            {
-                                tx.execute(
-                                    "UPDATE index_meta SET value = MIN(value, ?2) WHERE key = ?1",
-                                    params![key, max],
-                                )?;
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-            tx.execute(
-                "DELETE FROM index_pending WHERE kind = ?1 AND id = ?2",
-                params![kind, id],
-            )?;
-        }
-        tx.commit()?;
     }
 }
 
-fn forget_agent(conn: &Connection, agent_id: &str) -> Result<(), Error> {
+fn drain_pending_step(tx: &DbTx<'_>, state: &(impl DbExec + ?Sized)) -> Result<bool, Error> {
+    type Pending = (String, String, Option<i64>, Option<i64>);
+    let pending: Vec<Pending> = tx.db_query_vec(
+        "SELECT kind, id, cap_messages, cap_outbound FROM index_pending LIMIT 256",
+        &[],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    if pending.is_empty() {
+        return Ok(false);
+    }
+    let least_sql = format!(
+        "UPDATE index_meta SET value = {} WHERE key = ?1",
+        tx.backend().sql_least("value", "?2")
+    );
+    for (kind, id, cap_messages, cap_outbound) in &pending {
+        match kind.as_str() {
+            // A standalone summary keeps its row; a mailbox row leaves
+            // state only with its agent, below.
+            "chunk" => {
+                if let Some(row) = source_row(state, id)? {
+                    upsert_chunk(tx, &row.chunk())?;
+                }
+            }
+            "agent" => {
+                let name: Option<String> = state.db_query_opt(
+                    "SELECT name FROM agents WHERE id = ?1",
+                    &db_params![id],
+                    |r| r.get(0),
+                )?;
+                match name {
+                    Some(name) => {
+                        rewrite_agent_fts_rows(tx, id, Some(&name))?;
+                        if tx.backend() == DbBackend::Sqlite {
+                            tx.db_execute(
+                                "UPDATE rag_chunks SET agent_name = ?2 WHERE agent_id = ?1 AND agent_name != ?2",
+                                &db_params![id, name],
+                            )?;
+                        }
+                    }
+                    None => {
+                        forget_agent(tx, id)?;
+                        // The bound read before the delete: rows a new
+                        // agent added since may reuse the rowids.
+                        let (now_messages, now_outbound) = max_rowids(state)?;
+                        let messages = cap_messages.unwrap_or(now_messages).min(now_messages);
+                        let outbound = cap_outbound.unwrap_or(now_outbound).min(now_outbound);
+                        for (key, max) in
+                            [("messages_rowid", messages), ("outbound_rowid", outbound)]
+                        {
+                            tx.db_execute(&least_sql, &db_params![key, max])?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        tx.db_execute(
+            "DELETE FROM index_pending WHERE kind = ?1 AND id = ?2",
+            &db_params![kind, id],
+        )?;
+    }
+    Ok(true)
+}
+
+fn forget_agent(conn: &(impl DbExec + ?Sized), agent_id: &str) -> Result<(), Error> {
     rewrite_agent_fts_rows(conn, agent_id, None)?;
-    conn.execute("DELETE FROM rag_chunks WHERE agent_id = ?1", [agent_id])?;
+    conn.db_execute(
+        "DELETE FROM rag_chunks WHERE agent_id = ?1",
+        &db_params![agent_id],
+    )?;
     Ok(())
 }
 
 /// Write one chunk and its full-text row, replacing any earlier projection.
 /// A turn with fewer than two characters of text is not searchable and
 /// leaves no row.
-pub(super) fn upsert_chunk(conn: &Connection, chunk: &Chunk<'_>) -> Result<(), Error> {
+pub(super) fn upsert_chunk(conn: &(impl DbExec + ?Sized), chunk: &Chunk<'_>) -> Result<(), Error> {
     let cleaned = clean_rag_text(chunk.text);
-    let existed: bool = conn
-        .prepare_cached("SELECT EXISTS(SELECT 1 FROM rag_chunks WHERE chunk_id = ?1)")?
-        .query_row([chunk.id], |r| r.get(0))?;
+    if conn.backend() == DbBackend::Postgres {
+        if cleaned.chars().count() < 2 {
+            return remove_chunk(conn, chunk.id);
+        }
+        let (kind, tool_name) = classify_chunk_kind_and_tool(
+            chunk.kind,
+            chunk.tool,
+            chunk.sender,
+            chunk.destination,
+            &cleaned,
+        );
+        let search_tokens = tokenize_hybrid_search_tokens(&cleaned).join(" ");
+        conn.db_execute(
+            "INSERT INTO memory_index.rag_chunks (
+                chunk_id, agent_id, agent_name, direction, sender, destination,
+                timestamp_ms, content_hash, text, kind, tool_name, seq,
+                search_tokens, search_tsv
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                to_tsvector(
+                    'simple',
+                    coalesce(?1, '') || ' ' || coalesce(?3, '') || ' ' || coalesce(?5, '')
+                    || ' ' || coalesce(?6, '') || ' ' || coalesce(?10, '') || ' '
+                    || coalesce(?11, '') || ' ' || coalesce(?9, '') || ' ' || coalesce(?13, '')
+                )
+             )
+             ON CONFLICT (chunk_id) DO UPDATE SET
+                agent_id = excluded.agent_id,
+                agent_name = excluded.agent_name,
+                direction = excluded.direction,
+                sender = excluded.sender,
+                destination = excluded.destination,
+                timestamp_ms = excluded.timestamp_ms,
+                content_hash = excluded.content_hash,
+                text = excluded.text,
+                kind = excluded.kind,
+                tool_name = excluded.tool_name,
+                seq = excluded.seq,
+                search_tokens = excluded.search_tokens,
+                search_tsv = excluded.search_tsv",
+            &db_params![
+                chunk.id,
+                chunk.agent_id,
+                chunk.agent_name,
+                chunk.direction,
+                chunk.sender,
+                chunk.destination,
+                chunk.timestamp_ms,
+                rag_content_hash(&cleaned),
+                cleaned,
+                kind,
+                tool_name,
+                chunk.seq,
+                search_tokens,
+            ],
+        )?;
+        if chunk.seq <= 0 {
+            conn.db_execute(
+                "UPDATE memory_index.rag_chunks SET seq = rowid WHERE chunk_id = ?1 AND seq <= 0",
+                &db_params![chunk.id],
+            )?;
+        }
+        return Ok(());
+    }
+
+    let existed: bool = conn.db_query_one(
+        "SELECT EXISTS(SELECT 1 FROM rag_chunks WHERE chunk_id = ?1)",
+        &db_params![chunk.id],
+        |r| r.get(0),
+    )?;
     if existed {
         remove_chunk(conn, chunk.id)?;
     }
@@ -1220,60 +1669,65 @@ pub(super) fn upsert_chunk(conn: &Connection, chunk: &Chunk<'_>) -> Result<(), E
         chunk.destination,
         &cleaned,
     );
-    conn.prepare_cached(
+    conn.db_execute(
         "INSERT INTO rag_chunks (
             chunk_id, agent_id, agent_name, direction, sender, destination,
             timestamp_ms, content_hash, text, kind, tool_name, seq
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-    )?
-    .execute(params![
-        chunk.id,
-        chunk.agent_id,
-        chunk.agent_name,
-        chunk.direction,
-        chunk.sender,
-        chunk.destination,
-        chunk.timestamp_ms,
-        rag_content_hash(&cleaned),
-        cleaned,
-        kind,
-        tool_name,
-        chunk.seq,
-    ])?;
+        &db_params![
+            chunk.id,
+            chunk.agent_id,
+            chunk.agent_name,
+            chunk.direction,
+            chunk.sender,
+            chunk.destination,
+            chunk.timestamp_ms,
+            rag_content_hash(&cleaned),
+            cleaned,
+            kind,
+            tool_name,
+            chunk.seq,
+        ],
+    )?;
     if chunk.seq <= 0 {
-        conn.execute(
+        conn.db_execute(
             "UPDATE rag_chunks SET seq = rowid WHERE chunk_id = ?1 AND seq <= 0",
-            [chunk.id],
+            &db_params![chunk.id],
         )?;
     }
-    conn.prepare_cached(
+    conn.db_execute(
         "INSERT INTO rag_chunks_fts (
             chunk_id, agent_name, sender, destination, kind, tool_name, text, search_tokens
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-    )?
-    .execute(params![
-        chunk.id,
-        chunk.agent_name,
-        chunk.sender,
-        chunk.destination,
-        kind,
-        tool_name,
-        cleaned,
-        tokenize_hybrid_search_tokens(&cleaned).join(" "),
-    ])?;
+        &db_params![
+            chunk.id,
+            chunk.agent_name,
+            chunk.sender,
+            chunk.destination,
+            kind,
+            tool_name,
+            cleaned,
+            tokenize_hybrid_search_tokens(&cleaned).join(" "),
+        ],
+    )?;
     Ok(())
 }
 
 /// Remove one chunk and its full-text row (and any duplicate of it).
-pub(super) fn remove_chunk(conn: &Connection, chunk_id: &str) -> Result<(), Error> {
-    match fts_chunk_lookup(chunk_id) {
-        Some(lookup) => conn
-            .prepare_cached(FTS_DELETE_CHUNK)?
-            .execute(params![chunk_id, lookup])?,
-        None => conn.execute("DELETE FROM rag_chunks_fts WHERE chunk_id = ?1", [chunk_id])?,
-    };
-    conn.prepare_cached("DELETE FROM rag_chunks WHERE chunk_id = ?1")?
-        .execute([chunk_id])?;
+pub(super) fn remove_chunk(conn: &(impl DbExec + ?Sized), chunk_id: &str) -> Result<(), Error> {
+    if conn.backend() == DbBackend::Sqlite {
+        match fts_chunk_lookup(chunk_id) {
+            Some(lookup) => conn.db_execute(FTS_DELETE_CHUNK, &db_params![chunk_id, lookup])?,
+            None => conn.db_execute(
+                "DELETE FROM rag_chunks_fts WHERE chunk_id = ?1",
+                &db_params![chunk_id],
+            )?,
+        };
+    }
+    conn.db_execute(
+        "DELETE FROM rag_chunks WHERE chunk_id = ?1",
+        &db_params![chunk_id],
+    )?;
     Ok(())
 }
 
@@ -1355,14 +1809,33 @@ pub(crate) fn fts_chunk_lookup(chunk_id: &str) -> Option<String> {
 /// statement per name its chunks are filed under, chunk by chunk only for a
 /// name that has no token to match.
 pub(super) fn rewrite_agent_fts_rows(
-    conn: &Connection,
+    conn: &(impl DbExec + ?Sized),
     agent_id: &str,
     rename_to: Option<&str>,
 ) -> Result<usize, Error> {
-    let names: Vec<String> = conn
-        .prepare_cached("SELECT DISTINCT agent_name FROM rag_chunks WHERE agent_id = ?1")?
-        .query_map([agent_id], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
+    if conn.backend() == DbBackend::Postgres {
+        return match rename_to {
+            None => Ok(0),
+            Some(new) => conn.db_execute(
+                "UPDATE memory_index.rag_chunks
+                 SET agent_name = ?2,
+                     search_tsv = to_tsvector(
+                         'simple',
+                         coalesce(chunk_id, '') || ' ' || coalesce(?2, '') || ' ' || coalesce(sender, '')
+                         || ' ' || coalesce(destination, '') || ' ' || coalesce(kind, '') || ' '
+                         || coalesce(tool_name, '') || ' ' || coalesce(text, '') || ' ' || coalesce(search_tokens, '')
+                     )
+                 WHERE agent_id = ?1 AND agent_name != ?2",
+                &db_params![agent_id, new],
+            ),
+        };
+    }
+
+    let names: Vec<String> = conn.db_query_vec(
+        "SELECT DISTINCT agent_name FROM rag_chunks WHERE agent_id = ?1",
+        &db_params![agent_id],
+        |row| row.get(0),
+    )?;
     let mut changed = 0;
     for name in names {
         if rename_to == Some(name.as_str()) {
@@ -1371,34 +1844,33 @@ pub(super) fn rewrite_agent_fts_rows(
         if fts_tokens(&name).next().is_some() {
             let phrase = fts_exact_phrase(&name);
             changed += match rename_to {
-                None => conn.execute(FTS_DELETE_AGENT_ROWS, params![name, phrase, agent_id])?,
+                None => conn.db_execute(FTS_DELETE_AGENT_ROWS, &db_params![name, phrase, agent_id])?,
                 Some(new) => {
-                    conn.execute(FTS_RENAME_AGENT_ROWS, params![name, phrase, agent_id, new])?
+                    conn.db_execute(FTS_RENAME_AGENT_ROWS, &db_params![name, phrase, agent_id, new])?
                 }
             };
             continue;
         }
-        let ids: Vec<String> = conn
-            .prepare_cached(
-                "SELECT chunk_id FROM rag_chunks WHERE agent_id = ?1 AND agent_name = ?2",
-            )?
-            .query_map(params![agent_id, name], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
+        let ids: Vec<String> = conn.db_query_vec(
+            "SELECT chunk_id FROM rag_chunks WHERE agent_id = ?1 AND agent_name = ?2",
+            &db_params![agent_id, name],
+            |row| row.get(0),
+        )?;
         for chunk_id in ids {
             changed += match (rename_to, fts_chunk_lookup(&chunk_id)) {
                 (None, Some(lookup)) => {
-                    conn.execute(FTS_DELETE_CHUNK, params![chunk_id, lookup])?
+                    conn.db_execute(FTS_DELETE_CHUNK, &db_params![chunk_id, lookup])?
                 }
-                (None, None) => conn.execute(
+                (None, None) => conn.db_execute(
                     "DELETE FROM rag_chunks_fts WHERE chunk_id = ?1",
-                    [&chunk_id],
+                    &db_params![chunk_id],
                 )?,
                 (Some(new), Some(lookup)) => {
-                    conn.execute(FTS_RENAME_CHUNK, params![chunk_id, lookup, new])?
+                    conn.db_execute(FTS_RENAME_CHUNK, &db_params![chunk_id, lookup, new])?
                 }
-                (Some(new), None) => conn.execute(
+                (Some(new), None) => conn.db_execute(
                     "UPDATE rag_chunks_fts SET agent_name = ?2 WHERE chunk_id = ?1",
-                    params![chunk_id, new],
+                    &db_params![chunk_id, new],
                 )?,
             };
         }

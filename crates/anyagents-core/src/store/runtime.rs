@@ -10,9 +10,8 @@
 use std::fmt;
 use std::str::FromStr;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
-
 use super::{AgentId, Error, Store, agent_exists, cursor, now_ms};
+use crate::db::{DbExec, DbExecExt as _, DbRow, db_params};
 
 /// A process, identified so that a reused pid never inherits a lease: the pid
 /// plus the kernel's start time for that pid.
@@ -262,33 +261,20 @@ fn refused(machine: &'static str, from: impl fmt::Display, to: impl fmt::Display
     }
 }
 
-fn parse<T: FromStr<Err = Error>>(index: usize, text: String) -> rusqlite::Result<T> {
-    text.parse().map_err(|err: Error| {
-        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(err))
-    })
-}
-
-fn agent_id_at(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<AgentId> {
-    let text: String = row.get(index)?;
-    AgentId::parse(&text).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(err))
-    })
-}
-
 const RUNTIME_COLS: &str = "agent_id, state, generation, attempt, until_ms, fault_kind, fault_detail, vendor_session_id, updated_at_ms";
 
-fn runtime_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRuntime> {
+fn runtime_from_row(row: &DbRow<'_>) -> Result<AgentRuntime, Error> {
     let fault_kind: Option<String> = row.get(5)?;
     let fault = match fault_kind {
         Some(kind) => Some(Fault {
-            kind: parse(5, kind)?,
-            detail: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+            kind: kind.parse()?,
+            detail: row.get::<Option<String>>(6)?.unwrap_or_default(),
         }),
         None => None,
     };
     Ok(AgentRuntime {
-        agent_id: agent_id_at(row, 0)?,
-        state: parse(1, row.get(1)?)?,
+        agent_id: row.get(0)?,
+        state: row.parse_str(1)?,
         generation: row.get(2)?,
         attempt: row.get(3)?,
         until_ms: row.get(4)?,
@@ -298,14 +284,15 @@ fn runtime_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRuntime> {
     })
 }
 
-fn runtime_of(conn: &Connection, agent_id: &AgentId) -> Result<Option<AgentRuntime>, Error> {
-    Ok(conn
-        .query_row(
-            &format!("SELECT {RUNTIME_COLS} FROM agent_runtime WHERE agent_id = ?1"),
-            [agent_id.as_str()],
-            runtime_from_row,
-        )
-        .optional()?)
+fn runtime_of(
+    conn: &(impl DbExec + ?Sized),
+    agent_id: &AgentId,
+) -> Result<Option<AgentRuntime>, Error> {
+    conn.db_query_opt(
+        &format!("SELECT {RUNTIME_COLS} FROM agent_runtime WHERE agent_id = ?1"),
+        &db_params![agent_id],
+        runtime_from_row,
+    )
 }
 
 /// The runtime state an existing legacy lifecycle value maps to.
@@ -318,10 +305,10 @@ pub(super) fn runtime_state_for_legacy(state: &str) -> RuntimeState {
 }
 
 /// Give a newly inserted agent its runtime row in the creating transaction.
-pub(super) fn seed_runtime(tx: &Transaction<'_>, agent_id: &AgentId) -> Result<(), Error> {
-    tx.execute(
-        "INSERT OR IGNORE INTO agent_runtime (agent_id, state, updated_at_ms) VALUES (?1, 'released', ?2)",
-        params![agent_id.as_str(), now_ms()],
+pub(super) fn seed_runtime(tx: &(impl DbExec + ?Sized), agent_id: &AgentId) -> Result<(), Error> {
+    tx.db_execute(
+        "INSERT INTO agent_runtime (agent_id, state, updated_at_ms) VALUES (?1, 'released', ?2) ON CONFLICT DO NOTHING",
+        &db_params![agent_id, now_ms()],
     )?;
     Ok(())
 }
@@ -329,40 +316,43 @@ pub(super) fn seed_runtime(tx: &Transaction<'_>, agent_id: &AgentId) -> Result<(
 const TURN_COLS: &str = "agent_id, turn_id, generation, state, first_seq, last_seq, opened_at_ms, \
      closed_at_ms, outcome, recovery_count, recovers";
 
-fn turn_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
-    let outcome: Option<String> = row.get(8)?;
+fn turn_from_row(row: &DbRow<'_>) -> Result<Turn, Error> {
     Ok(Turn {
-        agent_id: agent_id_at(row, 0)?,
+        agent_id: row.get(0)?,
         turn_id: row.get(1)?,
         generation: row.get(2)?,
-        state: parse(3, row.get(3)?)?,
+        state: row.parse_str(3)?,
         first_seq: row.get(4)?,
         last_seq: row.get(5)?,
         opened_at_ms: row.get(6)?,
         closed_at_ms: row.get(7)?,
-        outcome: outcome.map(|text| parse(8, text)).transpose()?,
+        outcome: row.opt_parse_str(8)?,
         recovery_count: row.get(9)?,
         recovers: row.get(10)?,
     })
 }
 
-fn unfinished_turn(conn: &Connection, agent_id: &AgentId) -> Result<Option<Turn>, Error> {
-    Ok(conn
-        .query_row(
-            &format!("SELECT {TURN_COLS} FROM turns WHERE agent_id = ?1 AND state != 'closed'"),
-            [agent_id.as_str()],
-            turn_from_row,
-        )
-        .optional()?)
-}
-
-fn turn_by_id(conn: &Connection, agent_id: &AgentId, turn_id: &str) -> Result<Turn, Error> {
-    conn.query_row(
-        &format!("SELECT {TURN_COLS} FROM turns WHERE agent_id = ?1 AND turn_id = ?2"),
-        params![agent_id.as_str(), turn_id],
+fn unfinished_turn(
+    conn: &(impl DbExec + ?Sized),
+    agent_id: &AgentId,
+) -> Result<Option<Turn>, Error> {
+    conn.db_query_opt(
+        &format!("SELECT {TURN_COLS} FROM turns WHERE agent_id = ?1 AND state != 'closed'"),
+        &db_params![agent_id],
         turn_from_row,
     )
-    .optional()?
+}
+
+fn turn_by_id(
+    conn: &(impl DbExec + ?Sized),
+    agent_id: &AgentId,
+    turn_id: &str,
+) -> Result<Turn, Error> {
+    conn.db_query_opt(
+        &format!("SELECT {TURN_COLS} FROM turns WHERE agent_id = ?1 AND turn_id = ?2"),
+        &db_params![agent_id, turn_id],
+        turn_from_row,
+    )?
     .ok_or_else(|| Error::Message(format!("turn `{turn_id}` not found for {agent_id}")))
 }
 
@@ -371,7 +361,7 @@ fn new_turn_id() -> String {
 }
 
 /// Keep the legacy `turn_recovery` row equal to what the turn table says.
-fn mirror_turn_recovery(tx: &Transaction<'_>, agent_id: &AgentId) -> Result<(), Error> {
+fn mirror_turn_recovery(tx: &(impl DbExec + ?Sized), agent_id: &AgentId) -> Result<(), Error> {
     let (opened, completed, count, opened_at) = match unfinished_turn(tx, agent_id)? {
         Some(turn) => (
             turn.last_seq,
@@ -380,37 +370,38 @@ fn mirror_turn_recovery(tx: &Transaction<'_>, agent_id: &AgentId) -> Result<(), 
             turn.opened_at_ms,
         ),
         None => {
-            let last: Option<(i64, i64)> = tx
-                .query_row(
-                    "SELECT last_seq, opened_at_ms FROM turns WHERE agent_id = ?1
-                     ORDER BY last_seq DESC, opened_at_ms DESC LIMIT 1",
-                    [agent_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
+            let last: Option<(i64, i64)> = tx.db_query_opt(
+                "SELECT last_seq, opened_at_ms FROM turns WHERE agent_id = ?1
+                 ORDER BY last_seq DESC, opened_at_ms DESC LIMIT 1",
+                &db_params![agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
             let (seq, at) = last.unwrap_or((0, 0));
             (seq, seq, 0, at)
         }
     };
-    tx.execute(
+    tx.db_execute(
         "INSERT INTO turn_recovery (agent_id, opened_seq, completed_seq, recovery_count, opened_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(agent_id) DO UPDATE SET opened_seq = ?2, completed_seq = ?3,
              recovery_count = ?4, opened_at_ms = ?5",
-        params![agent_id.as_str(), opened, completed, count, opened_at],
+        &db_params![agent_id, opened, completed, count, opened_at],
     )?;
     Ok(())
 }
 
 /// Precondition for `live -> released`: no unfinished turn, a drained
 /// mailbox, and no child that may hold a process.
-fn release_blocker(tx: &Transaction<'_>, agent_id: &AgentId) -> Result<Option<String>, Error> {
+fn release_blocker(
+    tx: &dyn DbExec,
+    agent_id: &AgentId,
+) -> Result<Option<String>, Error> {
     if let Some(turn) = unfinished_turn(tx, agent_id)? {
         return Ok(Some(format!("turn {} is {}", turn.turn_id, turn.state)));
     }
-    let max_seq: i64 = tx.query_row(
+    let max_seq: i64 = tx.db_query_one(
         "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?1",
-        [agent_id.as_str()],
+        &db_params![agent_id],
         |row| row.get(0),
     )?;
     let delivered = cursor(tx, agent_id)?;
@@ -419,21 +410,19 @@ fn release_blocker(tx: &Transaction<'_>, agent_id: &AgentId) -> Result<Option<St
             "mailbox holds undelivered rows after {delivered} (last {max_seq})"
         )));
     }
-    let busy_child: Option<String> = tx
-        .query_row(
-            "SELECT a.id FROM agents a JOIN agent_runtime r ON r.agent_id = a.id
-             WHERE a.parent_id = ?1 AND r.state IN ('starting', 'live', 'draining', 'backoff', 'quota_blocked')
-             LIMIT 1",
-            [agent_id.as_str()],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let busy_child: Option<String> = tx.db_query_opt(
+        "SELECT a.id FROM agents a JOIN agent_runtime r ON r.agent_id = a.id
+         WHERE a.parent_id = ?1 AND r.state IN ('starting', 'live', 'draining', 'backoff', 'quota_blocked')
+         LIMIT 1",
+        &db_params![agent_id],
+        |row| row.get(0),
+    )?;
     Ok(busy_child.map(|child| format!("child {child} is active")))
 }
 
-fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionLease> {
+fn lease_from_row(row: &DbRow<'_>) -> Result<SessionLease, Error> {
     Ok(SessionLease {
-        agent_id: agent_id_at(row, 0)?,
+        agent_id: row.get(0)?,
         vendor_session_id: row.get(1)?,
         generation: row.get(2)?,
         holder: ProcessIdentity {
@@ -448,10 +437,10 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionLease> {
 const LEASE_COLS: &str =
     "agent_id, vendor_session_id, generation, holder_pid, holder_start_time, pgid, acquired_at_ms";
 
-fn quota_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuotaBlock> {
+fn quota_from_row(row: &DbRow<'_>) -> Result<QuotaBlock, Error> {
     let source: String = row.get(2)?;
     Ok(QuotaBlock {
-        agent_id: agent_id_at(row, 0)?,
+        agent_id: row.get(0)?,
         until_ms: row.get(1)?,
         source: if source == "known" {
             QuotaSource::Known
@@ -463,24 +452,15 @@ fn quota_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuotaBlock> {
     })
 }
 
-fn quota_of(conn: &Connection, agent_id: &AgentId) -> Result<Option<QuotaBlock>, Error> {
-    Ok(conn
-        .query_row(
-            "SELECT agent_id, until_ms, source, attempt, observed_at_ms FROM quota_blocks WHERE agent_id = ?1",
-            [agent_id.as_str()],
-            quota_from_row,
-        )
-        .optional()?)
+fn quota_of(conn: &(impl DbExec + ?Sized), agent_id: &AgentId) -> Result<Option<QuotaBlock>, Error> {
+    conn.db_query_opt(
+        "SELECT agent_id, until_ms, source, attempt, observed_at_ms FROM quota_blocks WHERE agent_id = ?1",
+        &db_params![agent_id],
+        quota_from_row,
+    )
 }
 
 impl Store {
-    fn runtime_write<T>(
-        &self,
-        op: impl FnOnce(&Transaction<'_>) -> Result<T, Error>,
-    ) -> Result<T, Error> {
-        self.write_tx(op)
-    }
-
     /// The agent's runtime row. Every agent has one after the runtime backfill.
     pub fn agent_runtime(&self, agent_id: &AgentId) -> Result<Option<AgentRuntime>, Error> {
         runtime_of(&self.read_conn(), agent_id)
@@ -494,7 +474,7 @@ impl Store {
         to: RuntimeState,
         change: RuntimeChange,
     ) -> Result<AgentRuntime, Error> {
-        self.runtime_write(|tx| transition_runtime_tx(tx, agent_id, from, to, &change))
+        self.write_tx(|tx| transition_runtime_tx(tx, agent_id, from, to, &change))
     }
 
     /// The agent's unfinished turn (`open`, `interrupted` or `recovery_offered`).
@@ -505,15 +485,14 @@ impl Store {
     /// The most recent turns, newest first.
     pub fn recent_turns(&self, agent_id: &AgentId, limit: usize) -> Result<Vec<Turn>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {TURN_COLS} FROM turns WHERE agent_id = ?1
-             ORDER BY opened_at_ms DESC, last_seq DESC LIMIT ?2"
-        ))?;
-        let rows = stmt.query_map(
-            params![agent_id.as_str(), i64::try_from(limit).unwrap_or(i64::MAX)],
+        conn.db_query_vec(
+            &format!(
+                "SELECT {TURN_COLS} FROM turns WHERE agent_id = ?1
+                 ORDER BY opened_at_ms DESC, last_seq DESC LIMIT ?2"
+            ),
+            &db_params![agent_id, i64::try_from(limit).unwrap_or(i64::MAX)],
             turn_from_row,
-        )?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        )
     }
 
     /// Open a turn at `first_seq` for the live generation. Refused while another
@@ -524,16 +503,16 @@ impl Store {
         generation: i64,
         first_seq: i64,
     ) -> Result<Turn, Error> {
-        self.runtime_write(|tx| {
+        self.write_tx(|tx| {
             require_live(tx, agent_id, generation)?;
             if let Some(turn) = unfinished_turn(tx, agent_id)? {
                 return Err(refused("turn", turn.state, TurnState::Open));
             }
             let turn_id = new_turn_id();
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO turns (agent_id, turn_id, generation, state, first_seq, last_seq, opened_at_ms)
                  VALUES (?1, ?2, ?3, 'open', ?4, ?4, ?5)",
-                params![agent_id.as_str(), turn_id, generation, first_seq, now_ms()],
+                &db_params![agent_id, turn_id, generation, first_seq, now_ms()],
             )?;
             mirror_turn_recovery(tx, agent_id)?;
             turn_by_id(tx, agent_id, &turn_id)
@@ -542,7 +521,7 @@ impl Store {
 
     /// Record that the open turn took `seq` (a steer or a followup line).
     pub fn extend_turn(&self, agent_id: &AgentId, turn_id: &str, seq: i64) -> Result<Turn, Error> {
-        self.runtime_write(|tx| {
+        self.write_tx(|tx| {
             let turn = turn_by_id(tx, agent_id, turn_id)?;
             if turn.state != TurnState::Open {
                 return Err(conflict("turn", TurnState::Open, turn.state));
@@ -553,9 +532,9 @@ impl Store {
                     turn.last_seq
                 )));
             }
-            tx.execute(
+            tx.db_execute(
                 "UPDATE turns SET last_seq = ?3 WHERE agent_id = ?1 AND turn_id = ?2",
-                params![agent_id.as_str(), turn_id, seq],
+                &db_params![agent_id, turn_id, seq],
             )?;
             mirror_turn_recovery(tx, agent_id)?;
             turn_by_id(tx, agent_id, turn_id)
@@ -572,7 +551,7 @@ impl Store {
         if outcome == TurnOutcome::Recovered {
             return Err(refused("turn", TurnState::Open, "closed(recovered)"));
         }
-        self.runtime_write(|tx| {
+        self.write_tx(|tx| {
             let turn = turn_by_id(tx, agent_id, turn_id)?;
             if turn.state != TurnState::Open {
                 return Err(conflict("turn", TurnState::Open, turn.state));
@@ -585,7 +564,7 @@ impl Store {
 
     /// Mark the open turn interrupted (process exit or generation change).
     pub fn interrupt_turn(&self, agent_id: &AgentId, turn_id: &str) -> Result<Turn, Error> {
-        self.runtime_write(|tx| {
+        self.write_tx(|tx| {
             let turn = turn_by_id(tx, agent_id, turn_id)?;
             if turn.state != TurnState::Open {
                 return Err(conflict("turn", TurnState::Open, turn.state));
@@ -603,7 +582,7 @@ impl Store {
         turn_id: &str,
         limit: i64,
     ) -> Result<RecoveryOffer, Error> {
-        self.runtime_write(|tx| {
+        self.write_tx(|tx| {
             let turn = turn_by_id(tx, agent_id, turn_id)?;
             if turn.state != TurnState::Interrupted {
                 return Err(conflict("turn", TurnState::Interrupted, turn.state));
@@ -632,10 +611,10 @@ impl Store {
                 }
                 return Ok(RecoveryOffer::Exhausted(turn));
             }
-            tx.execute(
+            tx.db_execute(
                 "UPDATE turns SET state = 'recovery_offered', recovery_count = recovery_count + 1
                  WHERE agent_id = ?1 AND turn_id = ?2",
-                params![agent_id.as_str(), turn_id],
+                &db_params![agent_id, turn_id],
             )?;
             mirror_turn_recovery(tx, agent_id)?;
             Ok(RecoveryOffer::Offered(turn_by_id(tx, agent_id, turn_id)?))
@@ -651,7 +630,7 @@ impl Store {
         generation: i64,
         seq: i64,
     ) -> Result<Turn, Error> {
-        self.runtime_write(|tx| {
+        self.write_tx(|tx| {
             require_live(tx, agent_id, generation)?;
             let turn = turn_by_id(tx, agent_id, turn_id)?;
             if turn.state != TurnState::RecoveryOffered {
@@ -659,12 +638,12 @@ impl Store {
             }
             close_turn(tx, agent_id, turn_id, TurnOutcome::Recovered)?;
             let next = new_turn_id();
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO turns (agent_id, turn_id, generation, state, first_seq, last_seq,
                                     opened_at_ms, recovery_count, recovers)
                  VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    agent_id.as_str(),
+                &db_params![
+                    agent_id,
                     next,
                     generation,
                     turn.first_seq,
@@ -689,7 +668,7 @@ impl Store {
         holder: ProcessIdentity,
         pgid: i64,
     ) -> Result<SessionLease, Error> {
-        self.runtime_write(|tx| {
+        self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
             if let Some(held) = session_lease_of(tx, agent_id)? {
                 return Err(Error::LeaseHeld {
@@ -697,12 +676,12 @@ impl Store {
                     holder_pid: held.holder.pid,
                 });
             }
-            tx.execute(
+            tx.db_execute(
                 &format!(
                     "INSERT INTO session_leases ({LEASE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
                 ),
-                params![
-                    agent_id.as_str(),
+                &db_params![
+                    agent_id,
                     vendor_session_id,
                     generation,
                     holder.pid,
@@ -727,11 +706,11 @@ impl Store {
         generation: i64,
         holder: ProcessIdentity,
     ) -> Result<bool, Error> {
-        self.runtime_write(|tx| {
-            Ok(tx.execute(
+        self.write_tx(|tx| {
+            Ok(tx.db_execute(
                 "DELETE FROM session_leases WHERE agent_id = ?1 AND generation = ?2
                  AND holder_pid = ?3 AND holder_start_time = ?4",
-                params![agent_id.as_str(), generation, holder.pid, holder.start_time],
+                &db_params![agent_id, generation, holder.pid, holder.start_time],
             )? > 0)
         })
     }
@@ -744,20 +723,20 @@ impl Store {
         &self,
         is_alive: impl Fn(&ProcessIdentity) -> bool,
     ) -> Result<Vec<SessionLease>, Error> {
-        self.runtime_write(|tx| {
-            let leases: Vec<SessionLease> = {
-                let mut stmt = tx.prepare(&format!("SELECT {LEASE_COLS} FROM session_leases"))?;
-                let rows = stmt.query_map([], lease_from_row)?;
-                rows.collect::<Result<_, _>>()?
-            };
+        self.write_tx(|tx| {
+            let leases = tx.db_query_vec(
+                &format!("SELECT {LEASE_COLS} FROM session_leases"),
+                &[],
+                lease_from_row,
+            )?;
             let mut dropped = Vec::new();
             for lease in leases {
                 if is_alive(&lease.holder) {
                     continue;
                 }
-                tx.execute(
+                tx.db_execute(
                     "DELETE FROM session_leases WHERE agent_id = ?1 AND holder_pid = ?2 AND holder_start_time = ?3",
-                    params![lease.agent_id.as_str(), lease.holder.pid, lease.holder.start_time],
+                    &db_params![lease.agent_id, lease.holder.pid, lease.holder.start_time],
                 )?;
                 dropped.push(lease);
             }
@@ -773,7 +752,7 @@ impl Store {
         reset: QuotaReset,
         now: i64,
     ) -> Result<QuotaBlock, Error> {
-        self.runtime_write(|tx| {
+        self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
             let previous = quota_of(tx, agent_id)?;
             let (until_ms, source, attempt) = match reset {
@@ -789,11 +768,11 @@ impl Store {
                     (now.saturating_add(QUOTA_ESTIMATE_MS[index]), QuotaSource::Estimated, attempt)
                 }
             };
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO quota_blocks (agent_id, until_ms, source, attempt, observed_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(agent_id) DO UPDATE SET until_ms = ?2, source = ?3, attempt = ?4, observed_at_ms = ?5",
-                params![agent_id.as_str(), until_ms, source.as_str(), attempt, now],
+                &db_params![agent_id, until_ms, source.as_str(), attempt, now],
             )?;
             quota_of(tx, agent_id)?.ok_or_else(|| Error::Message("quota block vanished".into()))
         })
@@ -805,10 +784,10 @@ impl Store {
 
     /// Clear the quota block (deadline passed, or an operator cleared it).
     pub fn clear_quota_block(&self, agent_id: &AgentId) -> Result<bool, Error> {
-        self.runtime_write(|tx| {
-            Ok(tx.execute(
+        self.write_tx(|tx| {
+            Ok(tx.db_execute(
                 "DELETE FROM quota_blocks WHERE agent_id = ?1",
-                [agent_id.as_str()],
+                &db_params![agent_id],
             )? > 0)
         })
     }
@@ -820,7 +799,7 @@ impl Store {
         &self,
         last_error: impl Fn(&AgentId) -> Option<String>,
     ) -> Result<BackfillReport, Error> {
-        self.runtime_write(|tx| backfill_tx(tx, &last_error))
+        self.write_tx(|tx| backfill_tx(tx, &last_error))
     }
 }
 
@@ -834,18 +813,16 @@ pub struct BackfillReport {
 }
 
 pub(super) fn backfill_tx(
-    tx: &Transaction<'_>,
+    tx: &(impl DbExec + ?Sized),
     last_error: &dyn Fn(&AgentId) -> Option<String>,
 ) -> Result<BackfillReport, Error> {
     let mut report = BackfillReport::default();
-    let missing: Vec<(String, String)> = {
-        let mut stmt = tx.prepare(
-            "SELECT a.id, a.state FROM agents a
-             WHERE NOT EXISTS (SELECT 1 FROM agent_runtime r WHERE r.agent_id = a.id)",
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        rows.collect::<Result<_, _>>()?
-    };
+    let missing = tx.db_query_vec(
+        "SELECT a.id, a.state FROM agents a
+         WHERE NOT EXISTS (SELECT 1 FROM agent_runtime r WHERE r.agent_id = a.id)",
+        &[],
+        |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
+    )?;
     let now = now_ms();
     for (id, legacy_state) in missing {
         let agent_id = AgentId::parse(&id)?;
@@ -859,10 +836,10 @@ pub(super) fn backfill_tx(
             state = RuntimeState::Faulted;
             report.faulted += 1;
         }
-        tx.execute(
+        tx.db_execute(
             "INSERT INTO agent_runtime (agent_id, state, fault_kind, fault_detail, updated_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
+            &db_params![
                 id,
                 state.as_str(),
                 fault.as_ref().map(|_| FaultKind::Legacy.as_str()),
@@ -871,38 +848,36 @@ pub(super) fn backfill_tx(
             ],
         )?;
         report.runtimes += 1;
-        let has_turns: bool = tx.query_row(
+        let has_turns: bool = tx.db_query_one(
             "SELECT EXISTS(SELECT 1 FROM turns WHERE agent_id = ?1)",
-            [&id],
+            &db_params![&id],
             |row| row.get(0),
         )?;
         if has_turns {
             continue;
         }
-        let legacy: Option<(i64, i64, i64, i64)> = tx
-            .query_row(
-                "SELECT opened_seq, completed_seq, recovery_count, opened_at_ms FROM turn_recovery WHERE agent_id = ?1",
-                [&id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
+        let legacy: Option<(i64, i64, i64, i64)> = tx.db_query_opt(
+            "SELECT opened_seq, completed_seq, recovery_count, opened_at_ms FROM turn_recovery WHERE agent_id = ?1",
+            &db_params![&id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
         let Some((opened, completed, count, opened_at)) = legacy else {
             continue;
         };
         if opened > completed {
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO turns (agent_id, turn_id, generation, state, first_seq, last_seq,
                                     opened_at_ms, recovery_count)
                  VALUES (?1, ?2, 0, 'interrupted', ?3, ?4, ?5, ?6)",
-                params![id, new_turn_id(), completed + 1, opened, opened_at, count],
+                &db_params![id, new_turn_id(), completed + 1, opened, opened_at, count],
             )?;
             report.interrupted_turns += 1;
         } else if opened > 0 {
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO turns (agent_id, turn_id, generation, state, first_seq, last_seq,
                                     opened_at_ms, closed_at_ms, outcome)
                  VALUES (?1, ?2, 0, 'closed', ?3, ?3, ?4, ?4, 'completed')",
-                params![id, new_turn_id(), opened, opened_at],
+                &db_params![id, new_turn_id(), opened, opened_at],
             )?;
             report.closed_turns += 1;
         }
@@ -910,17 +885,22 @@ pub(super) fn backfill_tx(
     Ok(report)
 }
 
-fn session_lease_of(conn: &Connection, agent_id: &AgentId) -> Result<Option<SessionLease>, Error> {
-    Ok(conn
-        .query_row(
-            &format!("SELECT {LEASE_COLS} FROM session_leases WHERE agent_id = ?1"),
-            [agent_id.as_str()],
-            lease_from_row,
-        )
-        .optional()?)
+fn session_lease_of(
+    conn: &(impl DbExec + ?Sized),
+    agent_id: &AgentId,
+) -> Result<Option<SessionLease>, Error> {
+    conn.db_query_opt(
+        &format!("SELECT {LEASE_COLS} FROM session_leases WHERE agent_id = ?1"),
+        &db_params![agent_id],
+        lease_from_row,
+    )
 }
 
-fn require_live(tx: &Transaction<'_>, agent_id: &AgentId, generation: i64) -> Result<(), Error> {
+fn require_live(
+    tx: &(impl DbExec + ?Sized),
+    agent_id: &AgentId,
+    generation: i64,
+) -> Result<(), Error> {
     let runtime =
         runtime_of(tx, agent_id)?.ok_or_else(|| Error::AgentNotFound(agent_id.to_string()))?;
     if runtime.state != RuntimeState::Live || runtime.generation != generation {
@@ -934,33 +914,33 @@ fn require_live(tx: &Transaction<'_>, agent_id: &AgentId, generation: i64) -> Re
 }
 
 fn set_turn_state(
-    tx: &Transaction<'_>,
+    tx: &(impl DbExec + ?Sized),
     agent_id: &AgentId,
     turn_id: &str,
     state: TurnState,
 ) -> Result<(), Error> {
-    tx.execute(
+    tx.db_execute(
         "UPDATE turns SET state = ?3 WHERE agent_id = ?1 AND turn_id = ?2",
-        params![agent_id.as_str(), turn_id, state.as_str()],
+        &db_params![agent_id, turn_id, state.as_str()],
     )?;
     Ok(())
 }
 
 fn close_turn(
-    tx: &Transaction<'_>,
+    tx: &(impl DbExec + ?Sized),
     agent_id: &AgentId,
     turn_id: &str,
     outcome: TurnOutcome,
 ) -> Result<(), Error> {
-    tx.execute(
+    tx.db_execute(
         "UPDATE turns SET state = 'closed', outcome = ?3, closed_at_ms = ?4 WHERE agent_id = ?1 AND turn_id = ?2",
-        params![agent_id.as_str(), turn_id, outcome.as_str(), now_ms()],
+        &db_params![agent_id, turn_id, outcome.as_str(), now_ms()],
     )?;
     Ok(())
 }
 
 fn transition_runtime_tx(
-    tx: &Transaction<'_>,
+    tx: &dyn DbExec,
     agent_id: &AgentId,
     from: RuntimeState,
     to: RuntimeState,
@@ -1026,12 +1006,12 @@ fn transition_runtime_tx(
         .vendor_session_id
         .clone()
         .or(current.vendor_session_id.clone());
-    tx.execute(
+    tx.db_execute(
         "UPDATE agent_runtime SET state = ?2, generation = ?3, attempt = ?4, until_ms = ?5,
              fault_kind = ?6, fault_detail = ?7, vendor_session_id = ?8, updated_at_ms = ?9
          WHERE agent_id = ?1",
-        params![
-            agent_id.as_str(),
+        &db_params![
+            agent_id,
             to.as_str(),
             generation,
             attempt,
@@ -1042,9 +1022,9 @@ fn transition_runtime_tx(
             now_ms()
         ],
     )?;
-    tx.execute(
+    tx.db_execute(
         "UPDATE agents SET state = ?2 WHERE id = ?1",
-        params![agent_id.as_str(), to.legacy()],
+        &db_params![agent_id, to.legacy()],
     )?;
     if to == RuntimeState::Archived {
         super::cancel_archived_schedules(tx, agent_id)?;
