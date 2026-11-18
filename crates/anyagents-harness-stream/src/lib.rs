@@ -333,6 +333,8 @@ impl Write for Input {
 
 /// Shared by every harness over one child: the owner and any reader.
 struct State {
+    turn_tool_context: bool,
+    task_turn_result: Option<(String, String, HashSet<String>)>,
     child: Option<Child>,
     /// A listening v2 child outlives [`StreamHarness::stop`] unless reaped or
     /// stopped by its owning adapter.
@@ -979,6 +981,18 @@ impl StreamHarness {
     /// What the vendor already proved about the message answers first,
     /// before liveness or a quota: a proof outlives the process that gave
     /// it. A refusal for good is answered again for the same id.
+    pub fn supports_turn_tool_context(&self) -> bool {
+        lock(&self.shared).turn_tool_context
+    }
+
+    pub fn task_turn_result(&self, input_id: &str) -> Option<(String, String)> {
+        let state = lock(&self.shared);
+        let (opener, text, inputs) = state.task_turn_result.as_ref()?;
+        inputs
+            .contains(input_id)
+            .then(|| (opener.clone(), text.clone()))
+    }
+
     pub fn deliver(
         &mut self,
         message: &OutboundMessage,
@@ -1272,6 +1286,11 @@ impl StreamHarness {
                 let mut line = line.clone();
                 line["type"] = json!(if starts_turn { "prompt" } else { "steer" });
                 line["request_id"] = json!(id);
+                if !starts_turn || !state.turn_tool_context {
+                    line.as_object_mut()
+                        .expect("prompt object")
+                        .remove("tool_context");
+                }
                 if starts_turn {
                     state.turns_started += 1;
                     state.turn_user_inputs = 0;
@@ -1975,6 +1994,8 @@ impl State {
 
     fn new(session_id: Option<&str>) -> Self {
         Self {
+            turn_tool_context: false,
+            task_turn_result: None,
             child: None,
             listening_child: false,
             log_path: None,
@@ -2203,6 +2224,14 @@ fn read_stdout(
                     continue;
                 }
                 state.ready = Some(true);
+                state.turn_tool_context = value
+                    .get("features")
+                    .and_then(Value::as_array)
+                    .is_some_and(|features| {
+                        features
+                            .iter()
+                            .any(|feature| feature.as_str() == Some("turn-tool-context-v1"))
+                    });
                 state.peer = Some(announced_peer(&value));
                 if let Some(attach) = &state.v2_attach
                     && value.get("request_id").and_then(Value::as_str) == Some(attach.as_str())
@@ -3000,6 +3029,24 @@ fn finish_consumed(state: &mut State, turn: &str, usage: TurnUsage, value: &Valu
         .filter(|(_, owner)| owner.as_str() == turn)
         .map(|(id, _)| id.clone())
         .collect();
+    if state.turn_tool_context
+        && state.sign_in_fault.is_none()
+        && state.quota_reset_at_ms.is_none()
+        && !state.duplicates.contains(turn)
+        && value.get("duplicate").and_then(Value::as_bool) != Some(true)
+        && let Some(text) = value.get("final_text").and_then(Value::as_str)
+    {
+        let inputs = members
+            .iter()
+            .filter(|id| state.consumed.contains(*id) && !state.duplicates.contains(*id))
+            .cloned()
+            .collect();
+        let text = anyagents_harness::masking::mask_known_secrets(text)
+            .chars()
+            .take(16384)
+            .collect();
+        state.task_turn_result = Some((turn.to_owned(), text, inputs));
+    }
     // The opener first, so it carries the turn's usage.
     members.sort_by_key(|id| id != turn);
     for id in members {

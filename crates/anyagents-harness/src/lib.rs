@@ -962,6 +962,24 @@ pub const STOP_DEADLINE: Duration = Duration::from_secs(5);
 pub trait Harness: Send {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError>;
 
+    fn supports_turn_tool_context(&self) -> bool {
+        false
+    }
+
+    fn deliver_with_turn_context(
+        &mut self,
+        message: &OutboundMessage,
+        _context: Option<&str>,
+    ) -> Result<DeliverOutcome, HarnessError> {
+        self.deliver(message)
+    }
+
+    /// Genuine successful v2 terminal result covering this exact input.
+    /// Returns the physical turn opener ID and final assistant text.
+    fn task_turn_result(&self, _input_id: &str) -> Option<(String, String)> {
+        None
+    }
+
     /// What this harness already proved about `message_id`, without writing
     /// anything and whether or not its process still runs. The host commits
     /// these before it replaces the process or waits out a quota: a proof

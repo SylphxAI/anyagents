@@ -841,6 +841,12 @@ pub(crate) fn capability_of(config: &Path) -> Result<String, Error> {
     Ok(capability)
 }
 
+pub(crate) const TASK_TURN_CONTEXT_HEADER: &str = "x-anyagents-task-turn-context";
+
+pub(crate) fn is_task_turn_context(token: &str) -> bool {
+    token.len() == 32 && token.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
 #[derive(Clone)]
 pub(crate) struct Client {
     pub(crate) socket: PathBuf,
@@ -851,6 +857,8 @@ pub(crate) struct Client {
     /// process: every call it makes carries [`HTTP_MCP_HEADER`], so routes
     /// that would start or read something on the host refuse it.
     via_http: bool,
+    /// A mounted stdio call's opener context, scoped to this dispatch clone.
+    turn_context: Option<String>,
     /// The router of the server process that owns this HTTP MCP tool server:
     /// calls go straight through it instead of dialing the external socket,
     /// which closes at the start of a stop while admitted calls still drain.
@@ -908,6 +916,7 @@ impl Client {
             config,
             capability,
             via_http: false,
+            turn_context: None,
             in_process: None,
             link: Arc::default(),
         }
@@ -967,7 +976,7 @@ impl Client {
     ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
         let payload = body.unwrap_or_default();
         let fresh = || {
-            build_request(
+            let mut request = build_request(
                 method,
                 path,
                 Some(payload.clone()),
@@ -975,7 +984,18 @@ impl Client {
                 None,
                 agent_id,
                 self.via_http,
-            )
+            )?;
+            if path == "/v1/send"
+                && let Some(context) = self.turn_context.as_deref()
+            {
+                let mut value = hyper::header::HeaderValue::from_str(context)
+                    .map_err(|_| "invalid task turn context".to_string())?;
+                value.set_sensitive(true);
+                request
+                    .headers_mut()
+                    .insert(TASK_TURN_CONTEXT_HEADER, value);
+            }
+            Ok::<_, String>(request)
         };
         if let Some(router) = &self.in_process {
             use hyper::service::Service as _;
@@ -5517,8 +5537,16 @@ impl AgentMcp {
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
+                let mut scoped = self.clone();
+                if !self.client.via_http {
+                    scoped.client.turn_context = params
+                        .pointer("/_meta/io.spiron~1turn-context")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|token| is_task_turn_context(token))
+                        .map(str::to_owned);
+                }
                 let call_result =
-                    match self.dispatch_any_tool(tool_name, args).await {
+                    match scoped.dispatch_any_tool(tool_name, args).await {
                         Ok((val, media)) => {
                             let mut res = rmcp::model::CallToolResult::structured(val);
                             res.content.extend(media);

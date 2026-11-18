@@ -50,7 +50,114 @@ fn record_terminal_for(
     Ok(changed != 0)
 }
 
+fn task_return_on(
+    tx: &Connection,
+    child_id: &AgentId,
+    delivered_seq: i64,
+    opener_id: &str,
+    output: &str,
+) -> Result<Option<ReceiveTx>, Error> {
+    // Persist the authority of the exact result even when schedules or an
+    // explicit send suppress the return; legacy idle notices must not run.
+    let sent_to_parent = tx
+        .query_row(
+            "UPDATE task_turn_contexts SET closed_delivery_seq = ?4
+         WHERE child_id = ?1 AND opener_id = ?2 AND opener_seq <= ?3
+           AND closed_delivery_seq IS NULL RETURNING sent_to_parent_id",
+            params![child_id.as_str(), opener_id, delivered_seq, delivered_seq],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    let Some(sent_to_parent) = sent_to_parent else {
+        return Ok(None);
+    };
+    // Only the latest authoritative completion is needed by idle release;
+    // a stale result cannot move the terminal event backwards.
+    tx.execute(
+        "DELETE FROM task_turn_contexts WHERE child_id = ?1 AND opener_id != ?2 AND opener_seq <= ?3",
+        params![child_id.as_str(), opener_id, delivered_seq],
+    )?;
+    let child = agent_by_id(tx, child_id)?;
+    if !child.is_task_subagent() || child.state == "archived" {
+        return Ok(None);
+    }
+    let Some(parent_id) = child.parent_id else {
+        return Ok(None);
+    };
+    let scheduled: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_schedules WHERE agent_id = ?1 AND state = 'active')",
+        [child_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if scheduled || sent_to_parent.as_deref() == Some(parent_id.as_str()) {
+        return Ok(None);
+    }
+    let mut incoming = Incoming::new(format!(
+        "<task_return agent_id=\"{}\" delivered_seq=\"{delivered_seq}\">{}</task_return>",
+        child_id,
+        xml_escape_attr_local(output),
+    ));
+    incoming.sender = Some(format!("agent:{child_id}"));
+    let key = format!("anyagents:task-return:{child_id}:{opener_id}");
+    Store::receive_on(
+        tx,
+        &parent_id,
+        incoming,
+        Some(key),
+        now_ms(),
+        IngressHistory::default(),
+        false,
+        Some("task_return"),
+        &mut Vec::new(),
+    )
+    .map(Some)
+}
+
 impl Store {
+    pub fn mailbox_message_id_at(
+        &self,
+        agent_id: &AgentId,
+        seq: i64,
+    ) -> Result<Option<String>, Error> {
+        Ok(self
+            .read_conn()
+            .query_row(
+                "SELECT id FROM messages WHERE agent_id = ?1 AND seq = ?2",
+                params![agent_id.as_str(), seq],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Allocate transport-only context for a task mailbox opener before the
+    /// first prompt byte can reach the engine. Retries of the same request
+    /// keep the same token; a closed or non-task input cannot acquire one.
+    pub fn prepare_task_turn_context(
+        &self,
+        child_id: &AgentId,
+        opener_id: &str,
+    ) -> Result<Option<String>, Error> {
+        self.write_tx(|tx| {
+            let child = agent_by_id(tx, child_id)?;
+            if !child.is_task_subagent() || child.state != "running" {
+                return Ok(None);
+            }
+            tx.execute(
+                "INSERT INTO task_turn_contexts(child_id, opener_id, opener_seq, token)
+                 SELECT agent_id, id, seq, ?3 FROM messages
+                 WHERE agent_id = ?1 AND id = ?2 AND seq > COALESCE(
+                     (SELECT delivered_seq FROM mailbox_cursors WHERE agent_id = ?1), 0)
+                 ON CONFLICT(child_id, opener_id) DO NOTHING",
+                params![child_id.as_str(), opener_id, uuid::Uuid::new_v4().simple().to_string()],
+            )?;
+            Ok(tx.query_row(
+                "SELECT token FROM task_turn_contexts WHERE child_id = ?1 AND opener_id = ?2 AND closed_delivery_seq IS NULL",
+                params![child_id.as_str(), opener_id],
+                |row| row.get(0),
+            ).optional()?)
+        })
+    }
+
     /// Complete callback-owned delivery custody exactly once. A stale or
     /// duplicate callback returns false without changing recovery or errors.
     pub fn note_turn_completed_for(
@@ -58,10 +165,31 @@ impl Store {
         agent_id: &AgentId,
         delivered_seq: i64,
     ) -> Result<bool, Error> {
-        self.write_tx(|tx| {
+        self.note_turn_completed_with_output_for(agent_id, delivered_seq, None)
+    }
+
+    /// Commit a terminal callback and its implicit task return together. The
+    /// output must come from the harness for this exact delivery, not a recent
+    /// transcript row or a user-supplied assertion of completion.
+    pub fn note_turn_completed_with_output_for(
+        &self,
+        agent_id: &AgentId,
+        delivered_seq: i64,
+        exact_output: Option<(&str, &str)>,
+    ) -> Result<bool, Error> {
+        let exact_output = exact_output.map(|(opener, text)| {
+            (
+                opener,
+                crate::masking::mask_known_secrets(text.trim())
+                    .chars()
+                    .take(16_384)
+                    .collect::<String>(),
+            )
+        });
+        let (accepted, notice) = self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
             if !record_terminal_for(tx, agent_id, delivered_seq, "completed")? {
-                return Ok(false);
+                return Ok((false, None));
             }
             tx.execute(
                 "UPDATE turn_recovery SET completed_seq = opened_seq, recovery_count = 0
@@ -69,8 +197,17 @@ impl Store {
                 params![agent_id.as_str(), delivered_seq],
             )?;
             super::turn_errors::end_run(tx, agent_id)?;
-            Ok(true)
-        })
+            let notice = exact_output
+                .as_ref()
+                .map(|(opener, text)| task_return_on(tx, agent_id, delivered_seq, opener, text))
+                .transpose()?
+                .flatten();
+            Ok((true, notice))
+        })?;
+        if let Some(notice) = notice {
+            self.finish_receive(notice, &[]);
+        }
+        Ok(accepted)
     }
 
     /// Record an error only for this callback's exact delivery custody. False
@@ -122,6 +259,146 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn task_fixture() -> (tempfile::TempDir, Store, Agent, Agent) {
+        let (dir, store, parent) = super::super::runtime_tests::setup();
+        let mut child = NewAgent::new("child", "spiron");
+        child.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(child).unwrap();
+        assert!(child.is_task_subagent());
+        let child = store.set_agent_state(&child.id, "running").unwrap();
+        (dir, store, parent, child)
+    }
+
+    #[test]
+    fn task_return_is_exactly_once_and_only_for_the_genuine_opener() {
+        let (_dir, store, parent, child) = task_fixture();
+        let first = super::super::runtime_tests::receive(&store, &child, "open turn");
+        let token = store
+            .prepare_task_turn_context(&child.id, first.id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .prepare_task_turn_context(&child.id, first.id.as_str())
+                .unwrap()
+                .as_deref(),
+            Some(token.as_str())
+        );
+        store.note_delivered(&child.id, first.seq).unwrap();
+        let steer = super::super::runtime_tests::receive(&store, &child, "follow-up");
+        store.note_delivered(&child.id, steer.seq).unwrap();
+        let result = (first.id.as_str(), "Finished <proof> & tests");
+        assert!(
+            !store
+                .note_turn_completed_with_output_for(&child.id, first.seq, Some(result))
+                .unwrap()
+        );
+        assert!(store.inbox(&parent.id, None).unwrap().is_empty());
+        assert!(
+            store
+                .note_turn_completed_with_output_for(&child.id, steer.seq, Some(result))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .note_turn_completed_with_output_for(&child.id, steer.seq, Some(result))
+                .unwrap()
+        );
+        let inbox = store.inbox(&parent.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].context.event.as_deref(), Some("task_return"));
+        assert!(inbox[0].text.contains("Finished &lt;proof&gt; &amp; tests"));
+    }
+
+    #[test]
+    fn only_a_new_parent_delivery_with_this_turns_token_suppresses_return() {
+        let (_dir, store, parent, child) = task_fixture();
+        let other = store.create_agent(NewAgent::new("other", "test")).unwrap();
+        let mut send = Incoming::new("explicit message");
+        send.source_key = Some("repeatable-key".into());
+        send.sender = Some(format!("agent:{}", child.id));
+        for seq in 1..=3 {
+            let opener = super::super::runtime_tests::receive(&store, &child, "open turn");
+            let token = store
+                .prepare_task_turn_context(&child.id, opener.id.as_str())
+                .unwrap()
+                .unwrap();
+            store.note_delivered(&child.id, opener.seq).unwrap();
+            assert!(
+                store
+                    .receive_turn_send(&parent.id, send.clone(), false, &other.id, &token)
+                    .is_err()
+            );
+            let recipient = if seq < 3 { &parent } else { &other };
+            let result = store
+                .receive_turn_send(&recipient.id, send.clone(), false, &child.id, &token)
+                .unwrap();
+            assert!(matches!(result, ReceiveOutcome::Duplicate(_)) == (seq == 2));
+            assert!(
+                store
+                    .note_turn_completed_with_output_for(
+                        &child.id,
+                        opener.seq,
+                        Some((opener.id.as_str(), "return text"))
+                    )
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .receive_turn_send(
+                        &parent.id,
+                        Incoming::new("late send"),
+                        false,
+                        &child.id,
+                        &token
+                    )
+                    .is_err()
+            );
+        }
+        let inbox = store.inbox(&parent.id, None).unwrap();
+        assert_eq!(inbox.len(), 3);
+        assert_eq!(
+            inbox
+                .iter()
+                .filter(|m| m.context.event.as_deref() == Some("task_return"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn failed_parent_mail_insert_rolls_back_task_completion() {
+        let (_dir, store, parent, child) = task_fixture();
+        let opener = super::super::runtime_tests::receive(&store, &child, "open turn");
+        store
+            .prepare_task_turn_context(&child.id, opener.id.as_str())
+            .unwrap()
+            .unwrap();
+        store.note_delivered(&child.id, opener.seq).unwrap();
+        store.conn().execute_batch("CREATE TRIGGER test_fail_task_return BEFORE INSERT ON messages
+            WHEN NEW.source_key LIKE 'anyagents:task-return:%' BEGIN SELECT RAISE(ABORT, 'injected fault'); END;").unwrap();
+        let result = Some((opener.id.as_str(), "return once"));
+        assert!(
+            store
+                .note_turn_completed_with_output_for(&child.id, opener.seq, result)
+                .is_err()
+        );
+        assert_eq!(store.agent_turn_snapshot(&child.id).unwrap().turn_seq, 0);
+        assert!(store.inbox(&parent.id, None).unwrap().is_empty());
+        store
+            .conn()
+            .execute_batch("DROP TRIGGER test_fail_task_return")
+            .unwrap();
+        assert!(
+            store
+                .note_turn_completed_with_output_for(&child.id, opener.seq, result)
+                .unwrap()
+        );
+        assert_eq!(store.inbox(&parent.id, None).unwrap().len(), 1);
+    }
+
     #[test]
     fn terminal_ledger_is_causal_and_duplicate_safe() {
         let (_tmp, store, agent) = super::super::runtime_tests::setup();

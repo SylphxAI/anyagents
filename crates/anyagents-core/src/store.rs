@@ -2609,6 +2609,38 @@ impl Store {
         wake_archived: bool,
         admit: impl FnOnce(&Connection) -> Result<bool, Error>,
     ) -> Result<Option<ReceiveOutcome>, Error> {
+        self.receive_with_turn_admission(agent_id, incoming, wake_archived, admit, None)
+    }
+
+    /// For a mounted stdio tool call, bind a newly committed delivery to the
+    /// exact task opener. Neither a skipped delivery nor an idempotent replay
+    /// can count as this turn's explicit send.
+    pub fn receive_turn_send(
+        &self,
+        agent_id: &AgentId,
+        incoming: Incoming,
+        wake_archived: bool,
+        sender: &AgentId,
+        token: &str,
+    ) -> Result<ReceiveOutcome, Error> {
+        self.receive_with_turn_admission(
+            agent_id,
+            incoming,
+            wake_archived,
+            |_| Ok(true),
+            Some((sender, token)),
+        )
+        .map(|outcome| outcome.expect("unconditional turn send admission"))
+    }
+
+    fn receive_with_turn_admission(
+        &self,
+        agent_id: &AgentId,
+        incoming: Incoming,
+        wake_archived: bool,
+        admit: impl FnOnce(&Connection) -> Result<bool, Error>,
+        turn: Option<(&AgentId, &str)>,
+    ) -> Result<Option<ReceiveOutcome>, Error> {
         let mut incoming = incoming;
         let source_key = incoming.source_key.take().filter(|key| !key.is_empty());
         let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
@@ -2619,7 +2651,18 @@ impl Store {
             if !admit(tx)? {
                 return Ok(ReceiveTx::Early(None));
             }
-            Self::receive_on(
+            if let Some((sender, token)) = turn {
+                let active: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM task_turn_contexts
+                      WHERE child_id = ?1 AND token = ?2 AND closed_delivery_seq IS NULL)",
+                    params![sender.as_str(), token],
+                    |row| row.get(0),
+                )?;
+                if !active {
+                    return Err(Error::PermissionDenied("invalid or closed task turn context".into()));
+                }
+            }
+            let outcome = Self::receive_on(
                 tx,
                 agent_id,
                 incoming,
@@ -2629,7 +2672,15 @@ impl Store {
                 wake_archived,
                 None,
                 &mut merged,
-            )
+            )?;
+            if let Some((sender, token)) = turn && matches!(outcome, ReceiveTx::Inserted { .. }) {
+                tx.execute(
+                    "UPDATE task_turn_contexts SET sent_to_parent_id = ?3
+                     WHERE child_id = ?1 AND token = ?2 AND ?3 = (SELECT parent_id FROM agents WHERE id = ?1)",
+                    params![sender.as_str(), token, agent_id.as_str()],
+                )?;
+            }
+            Ok(outcome)
         })?;
         Ok(self.finish_receive(tx_outcome, &merged))
     }
@@ -3198,6 +3249,10 @@ impl Store {
                      WHERE a.id = ?1
                        AND a.parent_id IS NOT NULL
                        AND a.state = 'running'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM task_turn_contexts t
+                           WHERE t.child_id = a.id AND t.closed_delivery_seq = tr.completed_seq
+                       )
                        AND EXISTS (
                            SELECT 1 FROM messages m
                            WHERE m.agent_id = ?1

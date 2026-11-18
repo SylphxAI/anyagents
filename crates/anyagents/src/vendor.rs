@@ -2587,6 +2587,27 @@ fn pairs(env: &[(String, String)]) -> Vec<(&str, &str)> {
 }
 
 impl Harness for LocalAdapter {
+    fn supports_turn_tool_context(&self) -> bool {
+        matches!(self, Self::Spiron(harness) if harness.supports_turn_tool_context())
+    }
+
+    fn task_turn_result(&self, input_id: &str) -> Option<(String, String)> {
+        match self {
+            Self::Spiron(harness) => harness.task_turn_result(input_id),
+            _ => None,
+        }
+    }
+
+    fn deliver_with_turn_context(
+        &mut self,
+        message: &OutboundMessage,
+        context: Option<&str>,
+    ) -> Result<DeliverOutcome, HarnessError> {
+        match self {
+            Self::Spiron(harness) => harness.deliver_with_turn_context(message, context),
+            _ => self.deliver(message),
+        }
+    }
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         match self {
             Self::Claude(harness) => harness.deliver(message),
@@ -2876,6 +2897,25 @@ impl Hosted for LocalAdapter {
 }
 
 impl Harness for VendorHarness {
+    fn supports_turn_tool_context(&self) -> bool {
+        self.adapter().supports_turn_tool_context()
+    }
+
+    fn task_turn_result(&self, input_id: &str) -> Option<(String, String)> {
+        self.adapter().task_turn_result(input_id)
+    }
+
+    fn deliver_with_turn_context(
+        &mut self,
+        message: &OutboundMessage,
+        context: Option<&str>,
+    ) -> Result<DeliverOutcome, HarnessError> {
+        let out = self
+            .adapter_mut()
+            .deliver_with_turn_context(message, context);
+        self.sync_session().map_err(HarnessError::Failed)?;
+        out
+    }
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         let out = self.adapter_mut().deliver(message);
         self.sync_session().map_err(HarnessError::Failed)?;
