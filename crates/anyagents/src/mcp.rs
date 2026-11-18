@@ -4989,7 +4989,12 @@ impl AgentMcp {
                     .conversation(Parameters(ConversationArgs {
                         scope: Some("memory".into()),
                         query: Some(q.clone()),
-                        agent: target_arg.clone(),
+                        // Conversation search defaults to all; learned memory defaults to self.
+                        agent: Some(
+                            target_arg
+                                .filter(|target| !target.trim().is_empty())
+                                .unwrap_or_else(|| "self".into()),
+                        ),
                         limit: args.limit,
                         ..ConversationArgs::default()
                     }))
@@ -12582,6 +12587,61 @@ mod tool_server_runtime_tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         })
+    }
+
+    #[tokio::test]
+    async fn memory_search_defaults_to_self_without_changing_conversation_search() {
+        use axum::{extract::Path as RoutePath, http::Uri, routing::get};
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("anyagents.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let app = axum::Router::new().route(
+            "/v1/agents/{target}/conversation",
+            get(
+                |RoutePath(target): RoutePath<String>, uri: Uri| async move {
+                    assert!(matches!(target.as_str(), "worker" | "all"));
+                    assert_eq!(uri.query(), Some("scope=memory&query=needle&limit=20"));
+                    axum::Json(json!({"agent": target, "agent_id": target, "turns": []}))
+                },
+            ),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: AgentId::generate(),
+                name: "worker".into(),
+                workdir: Some(dir.path().to_path_buf()),
+            },
+            client: Client::new(socket, dir.path().join("config"), "test-cap".into()),
+            profile: McpProfile::Full,
+        };
+
+        for (agent, expected) in [
+            (None, "worker"),
+            (Some("agent:"), "worker"),
+            (Some("self"), "worker"),
+            (Some("all"), "all"),
+        ] {
+            let mut args = json!({"action": "search", "query": "needle"});
+            if let Some(agent) = agent {
+                args["agent"] = json!(agent);
+            }
+            let (result, _) = mcp.dispatch_any_tool("memory", args).await.unwrap();
+            assert_eq!(result["agent"], expected, "agent argument: {agent:?}");
+        }
+
+        let result = mcp
+            .conversation(Parameters(ConversationArgs {
+                scope: Some("memory".into()),
+                query: Some("needle".into()),
+                ..ConversationArgs::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.0.agent, "all");
+        server.abort();
     }
 
     #[test]
