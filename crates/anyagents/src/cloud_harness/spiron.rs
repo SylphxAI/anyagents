@@ -490,8 +490,7 @@ impl Session {
     }
 
     fn sync_mcp_servers(&self, config: &Path, force: bool) -> Result<(), CloudErrorDetail> {
-        let Some(servers) =
-            Self::mcp_servers_payload(config).map_err(CloudErrorDetail::generic)?
+        let Some(servers) = Self::mcp_servers_payload(config).map_err(CloudErrorDetail::generic)?
         else {
             return Ok(());
         };
@@ -509,8 +508,8 @@ impl Session {
             return Ok(());
         }
         if self.api.put_mcp_servers(&self.agent_id, &servers)? {
-            let bytes =
-                serde_json::to_vec(&digest).map_err(|e| CloudErrorDetail::generic(e.to_string()))?;
+            let bytes = serde_json::to_vec(&digest)
+                .map_err(|e| CloudErrorDetail::generic(e.to_string()))?;
             save(&sync_path, &bytes).map_err(CloudErrorDetail::generic)?;
         }
         Ok(())

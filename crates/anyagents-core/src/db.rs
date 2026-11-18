@@ -20,7 +20,10 @@ use std::time::Duration;
 
 use rusqlite::{Connection, Row};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow};
-use sqlx::{Arguments as _, Column as _, Executor as _, PgPool, Postgres, Row as _, Transaction, TypeInfo as _, ValueRef as _};
+use sqlx::{
+    Arguments as _, Column as _, Executor as _, PgPool, Postgres, Row as _, Transaction,
+    TypeInfo as _, ValueRef as _,
+};
 
 use crate::error::Error;
 use crate::id::{AgentId, ChannelId, MessageId, UsageId};
@@ -117,9 +120,7 @@ static CLI_DATABASE_URL: LazyLock<RwLock<Option<String>>> = LazyLock::new(|| RwL
 
 /// Install a process-wide `--database-url` override from the CLI parser.
 pub fn set_cli_database_url(url: Option<String>) {
-    let cleaned = url
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let cleaned = url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     if let Ok(mut guard) = CLI_DATABASE_URL.write() {
         *guard = cleaned;
     }
@@ -251,8 +252,12 @@ pub(crate) fn block_on_pg<F: std::future::Future>(fut: F) -> F::Output {
 }
 
 fn pg_connect_options(url: &str) -> Result<PgConnectOptions, Error> {
-    let mut opts = PgConnectOptions::from_str(url)
-        .map_err(|err| Error::Message(format!("invalid postgres url {}: {err}", redact_database_url(url))))?;
+    let mut opts = PgConnectOptions::from_str(url).map_err(|err| {
+        Error::Message(format!(
+            "invalid postgres url {}: {err}",
+            redact_database_url(url)
+        ))
+    })?;
     let stmt_cache = non_empty_trimmed_env(PG_STATEMENT_CACHE_ENV)
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| {
@@ -348,10 +353,12 @@ impl PgHandle {
             if !exists {
                 return Ok::<_, sqlx::Error>(None);
             }
-            sqlx::query_scalar("SELECT COALESCE(MAX(version), 0)::bigint FROM public.pg_schema_migrations")
-                .fetch_one(&self.pool)
-                .await
-                .map(Some)
+            sqlx::query_scalar(
+                "SELECT COALESCE(MAX(version), 0)::bigint FROM public.pg_schema_migrations",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map(Some)
         })?;
         if version.is_some_and(|v| v >= PG_LATEST_VERSION) {
             return Ok(());
@@ -819,8 +826,9 @@ impl<'a> DbRow<'a> {
     {
         let text: Option<String> = self.get(index)?;
         text.map(|text| {
-            text.parse()
-                .map_err(|err| Error::Message(format!("invalid column {index} value `{text}`: {err}")))
+            text.parse().map_err(|err| {
+                Error::Message(format!("invalid column {index} value `{text}`: {err}"))
+            })
         })
         .transpose()
     }
@@ -930,7 +938,8 @@ impl FromDbValue for Option<i64> {
 impl FromDbValue for usize {
     fn from_db_row(row: &DbRow<'_>, index: usize) -> Result<Self, Error> {
         let v: i64 = FromDbValue::from_db_row(row, index)?;
-        usize::try_from(v).map_err(|_| Error::Message(format!("negative integer {v} at col {index}")))
+        usize::try_from(v)
+            .map_err(|_| Error::Message(format!("negative integer {v} at col {index}")))
     }
 }
 impl FromDbValue for u64 {
@@ -1140,7 +1149,8 @@ fn sqlite_for_each_row(
     f: &mut dyn FnMut(&DbRow<'_>) -> Result<bool, Error>,
 ) -> Result<(), Error> {
     let mut stmt = conn.prepare_cached(sql)?;
-    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+    let refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
     let mut rows = stmt.query(rusqlite::params_from_iter(refs))?;
     while let Some(row) = rows.next()? {
         if !f(&DbRow::Sqlite(row))? {
@@ -1152,7 +1162,8 @@ fn sqlite_for_each_row(
 
 fn sqlite_execute(conn: &Connection, sql: &str, params: &[DbParam]) -> Result<usize, Error> {
     let mut stmt = conn.prepare_cached(sql)?;
-    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+    let refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
     Ok(stmt.execute(rusqlite::params_from_iter(refs))?)
 }
 
@@ -1496,23 +1507,24 @@ mod tests {
             "SELECT id FROM agents WHERE id = $1 AND parent_id = $1 AND state != '?'"
         );
         assert_eq!(
-            to_pg_sql("SELECT * FROM host_documents WHERE agent_id=? AND seq>=? -- comment ?\nAND \"col?\"=?"),
+            to_pg_sql(
+                "SELECT * FROM host_documents WHERE agent_id=? AND seq>=? -- comment ?\nAND \"col?\"=?"
+            ),
             "SELECT * FROM host_documents WHERE agent_id=$1 AND seq>=$2 -- comment ?\nAND \"col?\"=$3"
         );
         assert_eq!(
             to_pg_sql("SELECT /* skipped ?1 */ $$?literal$$, ?2, ?"),
             "SELECT /* skipped ?1 */ $$?literal$$, $2, $3"
         );
-        assert_eq!(
-            to_pg_sql("SELECT '中文?1' || ?1"),
-            "SELECT '中文?1' || $1"
-        );
+        assert_eq!(to_pg_sql("SELECT '中文?1' || ?1"), "SELECT '中文?1' || $1");
     }
 
     #[test]
     fn database_url_redacts_password_only() {
         assert_eq!(
-            redact_database_url("postgres://kyle:supersecret@db.sylphx.net:5432/anyagents?sslmode=require"),
+            redact_database_url(
+                "postgres://kyle:supersecret@db.sylphx.net:5432/anyagents?sslmode=require"
+            ),
             "postgres://kyle:***@db.sylphx.net:5432/anyagents?sslmode=require"
         );
         assert_eq!(
@@ -1523,11 +1535,7 @@ mod tests {
 
     #[test]
     fn pg_tsquery_builds_or_and_expression_without_syntax_chars() {
-        let q = build_pg_tsquery(&[
-            "foo:bar (test)".into(),
-            "繁體中文!".into(),
-        ])
-        .unwrap();
+        let q = build_pg_tsquery(&["foo:bar (test)".into(), "繁體中文!".into()]).unwrap();
         assert!(q.contains('|'));
         assert!(!q.contains('\''));
         assert!(!q.contains(':'));

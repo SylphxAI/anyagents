@@ -1539,9 +1539,11 @@ impl Store {
     /// A receipt one named send already produced, or `None`.
     pub fn send_receipt(&self, id: &str) -> Result<Option<String>, Error> {
         let conn = self.read_conn();
-        conn.db_query_opt("SELECT receipt FROM sends WHERE id = ?1", &db_params![id], |row| {
-            row.get(0)
-        })
+        conn.db_query_opt(
+            "SELECT receipt FROM sends WHERE id = ?1",
+            &db_params![id],
+            |row| row.get(0),
+        )
     }
 
     /// A committed mailbox receipt for this source, including when the server
@@ -1588,9 +1590,11 @@ impl Store {
     /// been, the deployment has an identity boundary.
     pub fn ever_authenticated(&self) -> bool {
         self.read_conn()
-            .db_query_one("SELECT EXISTS(SELECT 1 FROM agent_capabilities)", &[], |row| {
-                row.get(0)
-            })
+            .db_query_one(
+                "SELECT EXISTS(SELECT 1 FROM agent_capabilities)",
+                &[],
+                |row| row.get(0),
+            )
             .unwrap_or(false)
     }
 
@@ -2254,7 +2258,11 @@ impl Store {
     /// instructions or decoding launch environments.
     pub fn agent_summaries(&self, include_archived: bool) -> Result<Vec<AgentSummary>, Error> {
         let sql = if include_archived {
-            concat!("SELECT ", agent_summary_cols!(), " FROM agents ORDER BY name")
+            concat!(
+                "SELECT ",
+                agent_summary_cols!(),
+                " FROM agents ORDER BY name"
+            )
         } else {
             concat!(
                 "SELECT ",
@@ -3771,19 +3779,20 @@ impl Store {
         } else {
             format!("[tool:{clean_tool}] {}", summary.trim())
         };
-        self.memory_index().record_standalone(&memory_index::Chunk {
-            id: &id,
-            agent_id: agent_id.as_str(),
-            agent_name: &agent.name,
-            direction: "out",
-            sender: &format!("agent:{}", agent.name),
-            destination: &format!("tool:{clean_tool}"),
-            timestamp_ms: now_ms(),
-            text: &text,
-            kind: Some("tool"),
-            tool: Some(&clean_tool),
-            seq: cur_seq,
-        })?;
+        self.memory_index()
+            .record_standalone(&memory_index::Chunk {
+                id: &id,
+                agent_id: agent_id.as_str(),
+                agent_name: &agent.name,
+                direction: "out",
+                sender: &format!("agent:{}", agent.name),
+                destination: &format!("tool:{clean_tool}"),
+                timestamp_ms: now_ms(),
+                text: &text,
+                kind: Some("tool"),
+                tool: Some(&clean_tool),
+                seq: cur_seq,
+            })?;
         Ok(id)
     }
 
@@ -3874,9 +3883,7 @@ impl Store {
     /// busy index fails the change before it starts.
     fn invalidate_index(&self, chunks: &[&str], agents: &[&str]) -> Result<(), Error> {
         match self.index_state_reader() {
-            Some(state) => self
-                .memory_index()
-                .invalidate(&state, chunks, agents, true),
+            Some(state) => self.memory_index().invalidate(&state, chunks, agents, true),
             None => {
                 let state = self.sqlite_shared().writer();
                 self.memory_index()
@@ -4390,20 +4397,33 @@ impl Store {
         if !all_queries.is_empty() {
             // 1. Lexical FTS5 / PostgreSQL GIN tsvector leg with filter pushdown.
             let fts_limit = i64::try_from((limit * 8).max(120)).unwrap_or(120);
-            let fts_rows: Option<Vec<(String, String, String, String, String, i64, String, String, String, i64, f64)>> =
-                match conn.backend() {
-                    DbBackend::Sqlite => {
-                        let fts_query = build_fts5_query_with_filters(
-                            &all_queries,
-                            agent_name_filter.as_deref(),
-                            kind_sql_filter,
-                            tool_filter.as_deref(),
-                        );
-                        let visibility_sql = visible_agent_ids_sql("agent_id", visible_agent_ids, 5);
-                        if fts_query.is_empty() {
-                            None
-                        } else {
-                            let sql = format!(
+            let fts_rows: Option<
+                Vec<(
+                    String,
+                    String,
+                    String,
+                    String,
+                    String,
+                    i64,
+                    String,
+                    String,
+                    String,
+                    i64,
+                    f64,
+                )>,
+            > = match conn.backend() {
+                DbBackend::Sqlite => {
+                    let fts_query = build_fts5_query_with_filters(
+                        &all_queries,
+                        agent_name_filter.as_deref(),
+                        kind_sql_filter,
+                        tool_filter.as_deref(),
+                    );
+                    let visibility_sql = visible_agent_ids_sql("agent_id", visible_agent_ids, 5);
+                    if fts_query.is_empty() {
+                        None
+                    } else {
+                        let sql = format!(
                                 "SELECT c.chunk_id, c.direction, c.sender, c.destination,
                                         COALESCE(
                                             (SELECT m.body FROM messages m WHERE m.agent_id = c.agent_id AND m.id = c.chunk_id),
@@ -4425,32 +4445,32 @@ impl Store {
                                  WHERE c.timestamp_ms > ?2 AND c.timestamp_ms <= ?3
                                  ORDER BY f.score ASC"
                             );
-                            let p = scoped_params(
-                                db_params![fts_query, since, until, fts_limit],
-                                visible_agent_ids,
-                            );
-                            conn.db_query_vec(&sql, &p, |r| {
-                                Ok((
-                                    r.get(0)?,
-                                    r.get(1)?,
-                                    r.get(2)?,
-                                    r.get(3)?,
-                                    r.get(4)?,
-                                    r.get(5)?,
-                                    r.get(6)?,
-                                    r.get(7)?,
-                                    r.get(8)?,
-                                    r.get(9)?,
-                                    r.get::<Option<f64>>(10)?.unwrap_or(0.0),
-                                ))
-                            })
-                            .ok()
-                        }
+                        let p = scoped_params(
+                            db_params![fts_query, since, until, fts_limit],
+                            visible_agent_ids,
+                        );
+                        conn.db_query_vec(&sql, &p, |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                r.get(3)?,
+                                r.get(4)?,
+                                r.get(5)?,
+                                r.get(6)?,
+                                r.get(7)?,
+                                r.get(8)?,
+                                r.get(9)?,
+                                r.get::<Option<f64>>(10)?.unwrap_or(0.0),
+                            ))
+                        })
+                        .ok()
                     }
-                    DbBackend::Postgres => {
-                        let pg_query = build_pg_tsquery(&all_queries);
-                        let visibility_sql = visible_agent_ids_sql("c.agent_id", visible_agent_ids, 8);
-                        pg_query.and_then(|fts_query| {
+                }
+                DbBackend::Postgres => {
+                    let pg_query = build_pg_tsquery(&all_queries);
+                    let visibility_sql = visible_agent_ids_sql("c.agent_id", visible_agent_ids, 8);
+                    pg_query.and_then(|fts_query| {
                             let sql = format!(
                                 "SELECT c.chunk_id, c.direction, c.sender, c.destination,
                                         COALESCE(
@@ -4499,8 +4519,8 @@ impl Store {
                             })
                             .ok()
                         })
-                    }
-                };
+                }
+            };
             if let Some(rows) = fts_rows {
                 for (
                     rank,
@@ -4618,7 +4638,19 @@ impl Store {
                         ))
                     })?;
                     let mut rank = 0usize;
-                    for (cid, direction, from, to, text, timestamp_ms, aname, kind, tool_name, seq) in lrows {
+                    for (
+                        cid,
+                        direction,
+                        from,
+                        to,
+                        text,
+                        timestamp_ms,
+                        aname,
+                        kind,
+                        tool_name,
+                        seq,
+                    ) in lrows
+                    {
                         let turn = ConversationTurn {
                             seq,
                             id: cid.clone(),
@@ -4689,7 +4721,8 @@ impl Store {
                 ))
             })?;
             let mut rank = 0usize;
-            for (cid, direction, from, to, text, timestamp_ms, aname, kind, tool_name, seq) in brows {
+            for (cid, direction, from, to, text, timestamp_ms, aname, kind, tool_name, seq) in brows
+            {
                 let turn = ConversationTurn {
                     seq,
                     id: cid.clone(),
@@ -7841,9 +7874,7 @@ fn enrich_quote_from_store(
             ) {
                 for body in bodies {
                     let clean = strip_quoted_block(&body).trim().to_string();
-                    if clean.starts_with(&base_quote_text)
-                        && clean.len() > base_quote_text.len()
-                    {
+                    if clean.starts_with(&base_quote_text) && clean.len() > base_quote_text.len() {
                         stored_excerpt = Some(clean);
                         break;
                     }

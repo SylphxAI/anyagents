@@ -72,22 +72,46 @@ struct ColSpec {
 
 impl ColSpec {
     const fn txt(col: &'static str) -> Self {
-        Self { sqlite_expr: col, pg_col: col, kind: ColKind::Text { default: "" } }
+        Self {
+            sqlite_expr: col,
+            pg_col: col,
+            kind: ColKind::Text { default: "" },
+        }
     }
     const fn txt_def(col: &'static str, default: &'static str) -> Self {
-        Self { sqlite_expr: col, pg_col: col, kind: ColKind::Text { default } }
+        Self {
+            sqlite_expr: col,
+            pg_col: col,
+            kind: ColKind::Text { default },
+        }
     }
     const fn opt_txt(col: &'static str) -> Self {
-        Self { sqlite_expr: col, pg_col: col, kind: ColKind::OptText }
+        Self {
+            sqlite_expr: col,
+            pg_col: col,
+            kind: ColKind::OptText,
+        }
     }
     const fn int(col: &'static str) -> Self {
-        Self { sqlite_expr: col, pg_col: col, kind: ColKind::Int { default: 0 } }
+        Self {
+            sqlite_expr: col,
+            pg_col: col,
+            kind: ColKind::Int { default: 0 },
+        }
     }
     const fn opt_int(col: &'static str) -> Self {
-        Self { sqlite_expr: col, pg_col: col, kind: ColKind::OptInt }
+        Self {
+            sqlite_expr: col,
+            pg_col: col,
+            kind: ColKind::OptInt,
+        }
     }
     const fn expr_txt(sqlite_expr: &'static str, pg_col: &'static str) -> Self {
-        Self { sqlite_expr, pg_col, kind: ColKind::Text { default: "" } }
+        Self {
+            sqlite_expr,
+            pg_col,
+            kind: ColKind::Text { default: "" },
+        }
     }
 }
 
@@ -101,7 +125,11 @@ struct TableSpec {
 }
 
 impl TableSpec {
-    const fn simple(sqlite_table: &'static str, pg_table: &'static str, cols: &'static [ColSpec]) -> Self {
+    const fn simple(
+        sqlite_table: &'static str,
+        pg_table: &'static str,
+        cols: &'static [ColSpec],
+    ) -> Self {
         Self {
             sqlite_table,
             sqlite_from: sqlite_table,
@@ -239,7 +267,9 @@ fn sqlite_count(conn: &Connection, table: &str) -> Result<i64, Error> {
     if !sqlite_table_exists(conn, table)? {
         return Ok(0);
     }
-    let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| r.get(0))?;
+    let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| {
+        r.get(0)
+    })?;
     Ok(count)
 }
 
@@ -589,7 +619,9 @@ async fn reset_identity_sequences(pool: &PgPool) -> Result<(), Error> {
              EXISTS (SELECT 1 FROM {table}))"
         );
         sqlx::query(&sql).execute(pool).await.map_err(|e| {
-            Error::Message(format!("failed to reset identity sequence on {table}.{col}: {e}"))
+            Error::Message(format!(
+                "failed to reset identity sequence on {table}.{col}: {e}"
+            ))
         })?;
     }
     Ok(())
@@ -802,7 +834,11 @@ const STATE_WAVE_BEFORE_AGENTS: &[TableSpec] = &[
     TableSpec::simple(
         "sends",
         "public.sends",
-        &[ColSpec::txt("id"), ColSpec::txt("receipt"), ColSpec::int("created_at_ms")],
+        &[
+            ColSpec::txt("id"),
+            ColSpec::txt("receipt"),
+            ColSpec::int("created_at_ms"),
+        ],
     ),
     TableSpec::simple(
         "turn_errors",
@@ -1176,19 +1212,71 @@ const MEMORY_INDEX_TABLES: &[TableSpec] = &[
         sqlite_from: "rag_chunks r LEFT JOIN rag_chunks_fts f ON f.rowid = r.rowid",
         pg_table: "memory_index.rag_chunks",
         cols: &[
-            ColSpec { sqlite_expr: "r.rowid", pg_col: "rowid", kind: ColKind::Int { default: 0 } },
-            ColSpec { sqlite_expr: "r.chunk_id", pg_col: "chunk_id", kind: ColKind::Text { default: "" } },
-            ColSpec { sqlite_expr: "r.agent_id", pg_col: "agent_id", kind: ColKind::Text { default: "" } },
-            ColSpec { sqlite_expr: "r.agent_name", pg_col: "agent_name", kind: ColKind::Text { default: "" } },
-            ColSpec { sqlite_expr: "r.direction", pg_col: "direction", kind: ColKind::Text { default: "" } },
-            ColSpec { sqlite_expr: "r.sender", pg_col: "sender", kind: ColKind::Text { default: "" } },
-            ColSpec { sqlite_expr: "r.destination", pg_col: "destination", kind: ColKind::Text { default: "" } },
-            ColSpec { sqlite_expr: "r.timestamp_ms", pg_col: "timestamp_ms", kind: ColKind::Int { default: 0 } },
-            ColSpec { sqlite_expr: "r.content_hash", pg_col: "content_hash", kind: ColKind::Text { default: "" } },
-            ColSpec { sqlite_expr: "r.text", pg_col: "text", kind: ColKind::Text { default: "" } },
-            ColSpec { sqlite_expr: "r.kind", pg_col: "kind", kind: ColKind::Text { default: "message" } },
-            ColSpec { sqlite_expr: "r.tool_name", pg_col: "tool_name", kind: ColKind::Text { default: "" } },
-            ColSpec { sqlite_expr: "r.seq", pg_col: "seq", kind: ColKind::Int { default: 0 } },
+            ColSpec {
+                sqlite_expr: "r.rowid",
+                pg_col: "rowid",
+                kind: ColKind::Int { default: 0 },
+            },
+            ColSpec {
+                sqlite_expr: "r.chunk_id",
+                pg_col: "chunk_id",
+                kind: ColKind::Text { default: "" },
+            },
+            ColSpec {
+                sqlite_expr: "r.agent_id",
+                pg_col: "agent_id",
+                kind: ColKind::Text { default: "" },
+            },
+            ColSpec {
+                sqlite_expr: "r.agent_name",
+                pg_col: "agent_name",
+                kind: ColKind::Text { default: "" },
+            },
+            ColSpec {
+                sqlite_expr: "r.direction",
+                pg_col: "direction",
+                kind: ColKind::Text { default: "" },
+            },
+            ColSpec {
+                sqlite_expr: "r.sender",
+                pg_col: "sender",
+                kind: ColKind::Text { default: "" },
+            },
+            ColSpec {
+                sqlite_expr: "r.destination",
+                pg_col: "destination",
+                kind: ColKind::Text { default: "" },
+            },
+            ColSpec {
+                sqlite_expr: "r.timestamp_ms",
+                pg_col: "timestamp_ms",
+                kind: ColKind::Int { default: 0 },
+            },
+            ColSpec {
+                sqlite_expr: "r.content_hash",
+                pg_col: "content_hash",
+                kind: ColKind::Text { default: "" },
+            },
+            ColSpec {
+                sqlite_expr: "r.text",
+                pg_col: "text",
+                kind: ColKind::Text { default: "" },
+            },
+            ColSpec {
+                sqlite_expr: "r.kind",
+                pg_col: "kind",
+                kind: ColKind::Text { default: "message" },
+            },
+            ColSpec {
+                sqlite_expr: "r.tool_name",
+                pg_col: "tool_name",
+                kind: ColKind::Text { default: "" },
+            },
+            ColSpec {
+                sqlite_expr: "r.seq",
+                pg_col: "seq",
+                kind: ColKind::Int { default: 0 },
+            },
             ColSpec::expr_txt("COALESCE(f.search_tokens, '')", "search_tokens"),
         ],
         extra_pg_cols: Some("\"search_tsv\""),
@@ -1238,7 +1326,11 @@ const HOST_INDEX_TABLES: &[TableSpec] = &[
             ColSpec::opt_txt("tool_name"),
             ColSpec::opt_txt("role"),
             ColSpec::txt("segment"),
-            ColSpec { sqlite_expr: "\"offset\"", pg_col: "offset", kind: ColKind::Int { default: 0 } },
+            ColSpec {
+                sqlite_expr: "\"offset\"",
+                pg_col: "offset",
+                kind: ColKind::Int { default: 0 },
+            },
             ColSpec::int("length"),
             ColSpec::txt("sha256"),
             ColSpec::int("seq"),
@@ -1265,11 +1357,31 @@ const HOST_INDEX_TABLES: &[TableSpec] = &[
         sqlite_from: "host_windows w LEFT JOIN host_fts f ON f.rowid = w.id",
         pg_table: "host_index.host_windows",
         cols: &[
-            ColSpec { sqlite_expr: "w.id", pg_col: "id", kind: ColKind::Int { default: 0 } },
-            ColSpec { sqlite_expr: "w.document_id", pg_col: "document_id", kind: ColKind::Text { default: "" } },
-            ColSpec { sqlite_expr: "w.\"offset\"", pg_col: "offset", kind: ColKind::Int { default: 0 } },
-            ColSpec { sqlite_expr: "w.length", pg_col: "length", kind: ColKind::Int { default: 0 } },
-            ColSpec { sqlite_expr: "w.sha256", pg_col: "sha256", kind: ColKind::Text { default: "" } },
+            ColSpec {
+                sqlite_expr: "w.id",
+                pg_col: "id",
+                kind: ColKind::Int { default: 0 },
+            },
+            ColSpec {
+                sqlite_expr: "w.document_id",
+                pg_col: "document_id",
+                kind: ColKind::Text { default: "" },
+            },
+            ColSpec {
+                sqlite_expr: "w.\"offset\"",
+                pg_col: "offset",
+                kind: ColKind::Int { default: 0 },
+            },
+            ColSpec {
+                sqlite_expr: "w.length",
+                pg_col: "length",
+                kind: ColKind::Int { default: 0 },
+            },
+            ColSpec {
+                sqlite_expr: "w.sha256",
+                pg_col: "sha256",
+                kind: ColKind::Text { default: "" },
+            },
             ColSpec::expr_txt("COALESCE(NULLIF(CAST(f.tokens AS TEXT), ''), '')", "tokens"),
         ],
         extra_pg_cols: Some("\"tokens_tsv\""),
@@ -1304,7 +1416,10 @@ pub fn migrate_sqlite_dir_to_postgres(
 
     let state_sqlite = open_sqlite_readonly(&state_path)?;
     let schema_ver = crate::migrate::current_version(&state_sqlite)?;
-    let latest_sqlite = crate::migrate::MIGRATIONS.last().map(|(v, _)| *v).unwrap_or(0);
+    let latest_sqlite = crate::migrate::MIGRATIONS
+        .last()
+        .map(|(v, _)| *v)
+        .unwrap_or(0);
     if schema_ver < latest_sqlite {
         return Err(Error::Message(format!(
             "source state.db schema version {schema_ver} is behind expected v{latest_sqlite}; open/upgrade a copy before migrating"

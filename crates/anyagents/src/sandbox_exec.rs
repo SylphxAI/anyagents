@@ -142,8 +142,8 @@ pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
     // `sandbox-sylphx.json` or configured via `sandbox-provider.json` / env).
     if let Some(cfg_dir) = config.as_deref() {
         let mut lease_cfg = SylphxLeaseConfig::from_config_dir(cfg_dir);
-        let sylphx_provider = SylphxProviderConfig::resolve(data_dir.as_deref())
-            .map_err(Error::Message)?;
+        let sylphx_provider =
+            SylphxProviderConfig::resolve(data_dir.as_deref()).map_err(Error::Message)?;
         if lease_cfg.is_some()
             || sylphx_provider
                 .as_ref()
@@ -151,14 +151,9 @@ pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
         {
             let aid = agent_id_str.as_deref().unwrap_or("agent");
             let lease_env = BTreeMap::new();
-            lease_cfg = ensure_leased_for_config_dir(
-                data_dir.as_deref(),
-                cfg_dir,
-                aid,
-                None,
-                &lease_env,
-            )
-            .map_err(Error::Message)?;
+            lease_cfg =
+                ensure_leased_for_config_dir(data_dir.as_deref(), cfg_dir, aid, None, &lease_env)
+                    .map_err(Error::Message)?;
         }
         if let Some(lease) = lease_cfg {
             return run_sylphx_sandbox(
@@ -670,7 +665,10 @@ pub(crate) fn sync_agent_bundle_to_sylphx(
     ));
 
     let toml_cfg = build_sandbox_toml_config(&guest_bin, &mcp_url, &token_path_in_vm);
-    uploads.push((format!("{state_root}/config.toml"), toml_cfg.as_bytes().to_vec()));
+    uploads.push((
+        format!("{state_root}/config.toml"),
+        toml_cfg.as_bytes().to_vec(),
+    ));
     dirs_to_create.insert(format!("{state_root}/.grok"));
     uploads.push((
         format!("{state_root}/.grok/config.toml"),
@@ -911,12 +909,23 @@ fn run_sylphx_sandbox(
     oneshot: bool,
     extra_args: &[String],
 ) -> Result<(), Error> {
-    sync_agent_bundle_to_sylphx(&lease, data_dir, config_dir, agent_id_str, harness, extra_args)
-        .map_err(Error::Message)?;
+    sync_agent_bundle_to_sylphx(
+        &lease,
+        data_dir,
+        config_dir,
+        agent_id_str,
+        harness,
+        extra_args,
+    )
+    .map_err(Error::Message)?;
 
     if oneshot {
         let cmd_argv = if extra_args.is_empty() {
-            vec![program_arg.unwrap_or(default_remote_program(harness)).to_string()]
+            vec![
+                program_arg
+                    .unwrap_or(default_remote_program(harness))
+                    .to_string(),
+            ]
         } else if let Some(p) = program_arg {
             let mut v = vec![p.to_string()];
             v.extend(extra_args.iter().cloned());
@@ -1020,11 +1029,12 @@ fn run_sylphx_envd_bridge(
     ];
     if let Some(prog) = program_arg.map(str::trim).filter(|s| !s.is_empty()) {
         // Avoid passing host absolute paths from non-container orchestrators as-is unless explicit.
-        let normalized_prog = if prog.starts_with('/') && !prog.starts_with("/usr/") && !prog.starts_with("/home/") {
-            default_remote_program(harness)
-        } else {
-            prog
-        };
+        let normalized_prog =
+            if prog.starts_with('/') && !prog.starts_with("/usr/") && !prog.starts_with("/home/") {
+                default_remote_program(harness)
+            } else {
+                prog
+            };
         guest_args.push("--program".to_string());
         guest_args.push(normalized_prog.to_string());
     }
@@ -1044,7 +1054,10 @@ fn run_sylphx_envd_bridge(
 
     let mut guest_env = BTreeMap::new();
     guest_env.insert("HOME".to_string(), lease.mount_path.clone());
-    guest_env.insert("ANYAGENTS_GUEST_STATE_DIR".to_string(), lease.mount_path.clone());
+    guest_env.insert(
+        "ANYAGENTS_GUEST_STATE_DIR".to_string(),
+        lease.mount_path.clone(),
+    );
     guest_env.insert("ANYAGENTS_GUEST_WORKDIR".to_string(), lease.workdir.clone());
 
     let pid_slot: Arc<(Mutex<(Option<u32>, Vec<Vec<u8>>, bool)>, Condvar)> =
@@ -1154,7 +1167,9 @@ fn run_sylphx_envd_bridge(
     if initial_ready.0.is_none() && initial_ready.1 {
         let stream_err = stream_thread.join().ok().and_then(Result::err);
         if let Some(err_msg) = stream_err {
-            eprintln!("sandbox-exec: envd stream unavailable ({err_msg}), using Sylphx `:exec` turn loop");
+            eprintln!(
+                "sandbox-exec: envd stream unavailable ({err_msg}), using Sylphx `:exec` turn loop"
+            );
         }
         return run_sylphx_exec_fallback_loop(
             lease,
@@ -1262,8 +1277,13 @@ fn run_sylphx_exec_fallback_loop(
             extra_args,
         );
         let prompt_text = extract_user_prompt(&event);
-        let cmd_str =
-            build_remote_command_string(harness, program, session_id.as_deref(), &prompt_text, extra_args);
+        let cmd_str = build_remote_command_string(
+            harness,
+            program,
+            session_id.as_deref(),
+            &prompt_text,
+            extra_args,
+        );
         let mut exec_env = BTreeMap::new();
         exec_env.insert("HOME".to_string(), lease.mount_path.clone());
         match client.exec(
@@ -1274,8 +1294,13 @@ fn run_sylphx_exec_fallback_loop(
             None,
         ) {
             Ok(out) => {
-                let outcome =
-                    parse_remote_exec_output(harness, session_id.as_deref(), &out.stdout, &out.stderr, out.exit_code);
+                let outcome = parse_remote_exec_output(
+                    harness,
+                    session_id.as_deref(),
+                    &out.stdout,
+                    &out.stderr,
+                    out.exit_code,
+                );
                 session_id = Some(outcome.session_id.clone());
                 persist_session_id(config_dir, harness, &outcome.session_id);
                 for raw_line in &outcome.forwarded_stream_lines {
@@ -1940,7 +1965,11 @@ mod tests {
         .unwrap();
         std::fs::write(cfg_dir.join("mcp-capability"), "local-cap-never-sent\n").unwrap();
         let remote_tok = format!("aars_{}", "9".repeat(64));
-        std::fs::write(cfg_dir.join(crate::remote::TOKEN_FILE), format!("{remote_tok}\n")).unwrap();
+        std::fs::write(
+            cfg_dir.join(crate::remote::TOKEN_FILE),
+            format!("{remote_tok}\n"),
+        )
+        .unwrap();
         std::fs::write(
             cfg_dir.join(".anyagents-mcp-url"),
             "https://coordinator.example.test/v1/webhooks/mcp\n",
@@ -1989,7 +2018,10 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             let _env = crate::server::tests::env_lock();
             unsafe {
-                std::env::set_var(crate::gateway::ENV_PUBLIC_GATEWAY_URL, "https://gw.example.test");
+                std::env::set_var(
+                    crate::gateway::ENV_PUBLIC_GATEWAY_URL,
+                    "https://gw.example.test",
+                );
             }
             let r1 = sync_agent_bundle_to_sylphx(
                 &lease_clone,

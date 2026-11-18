@@ -172,7 +172,10 @@ fn forward_rpc(
         .map_err(|err| format!("MCP response read error: {err}"))?;
 
     if !(200..300).contains(&status) {
-        return Err(format!("MCP server returned HTTP {status}: {}", raw_body.trim()));
+        return Err(format!(
+            "MCP server returned HTTP {status}: {}",
+            raw_body.trim()
+        ));
     }
     if raw_body.trim().is_empty() || status == 202 || status == 204 {
         return Ok(Vec::new());
@@ -260,7 +263,11 @@ mod tests {
                     let mut auth = None;
                     loop {
                         let mut h = String::new();
-                        if reader.read_line(&mut h).is_err() || h == "\r\n" || h == "\n" || h.is_empty() {
+                        if reader.read_line(&mut h).is_err()
+                            || h == "\r\n"
+                            || h == "\n"
+                            || h.is_empty()
+                        {
                             break;
                         }
                         if let Some((k, v)) = h.split_once(':') {

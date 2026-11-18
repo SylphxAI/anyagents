@@ -266,10 +266,7 @@ impl Store {
         self.write_tx(|tx| Self::record_outcome_on(tx, new))
     }
 
-    fn record_outcome_on(
-        tx: &dyn DbExec,
-        new: NewOutcome,
-    ) -> Result<(Outcome, bool), Error> {
+    fn record_outcome_on(tx: &dyn DbExec, new: NewOutcome) -> Result<(Outcome, bool), Error> {
         bounded("subject", &new.subject)?;
         bounded("dedupe_key", &new.dedupe_key)?;
         bounded("actor", &new.actor)?;
@@ -922,9 +919,9 @@ fn finish(key: GroupKey, accum: Accum) -> OutcomeGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::params;
     use crate::id::UsageId;
     use crate::{Agent, NewAgent};
+    use rusqlite::params;
 
     fn open() -> (tempfile::TempDir, Store) {
         let dir = crate::test_tempdir();

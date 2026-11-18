@@ -87,10 +87,9 @@ impl Error {
                 rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
             ),
             Self::Postgres(sqlx::Error::PoolTimedOut) => true,
-            Self::Postgres(sqlx::Error::Database(err)) => matches!(
-                err.code().as_deref(),
-                Some("40001" | "40P01" | "55P03")
-            ),
+            Self::Postgres(sqlx::Error::Database(err)) => {
+                matches!(err.code().as_deref(), Some("40001" | "40P01" | "55P03"))
+            }
             _ => false,
         }
     }

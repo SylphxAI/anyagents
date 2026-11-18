@@ -3493,11 +3493,7 @@ fn discover_spiron_cloud_auth_token(config: &Path) -> Option<String> {
             }
         }
     }
-    for rel in [
-        "sylphx.key",
-        ".config/opencode/sylphx.key",
-        "spiron.key",
-    ] {
+    for rel in ["sylphx.key", ".config/opencode/sylphx.key", "spiron.key"] {
         if let Ok(raw) = std::fs::read_to_string(config.join(rel)) {
             let t = raw.trim();
             if !t.is_empty() {
@@ -9059,7 +9055,8 @@ fn json_value_has_secret(val: &serde_json::Value) -> bool {
         serde_json::Value::Object(map) => map.iter().any(|(k, v)| {
             let key_is_secret = matches!(
                 k.as_str(),
-                "key" | "apiKey"
+                "key"
+                    | "apiKey"
                     | "api_key"
                     | "access"
                     | "accessToken"
@@ -9126,7 +9123,11 @@ fn probe_opencode_profile_credentials(
     now_ms: i64,
 ) -> Option<String> {
     let mut saw_expired_oauth = false;
-    for rel in [".local/share/opencode/auth.json", "auth.json", ".omp/auth.json"] {
+    for rel in [
+        ".local/share/opencode/auth.json",
+        "auth.json",
+        ".omp/auth.json",
+    ] {
         if let Ok(raw) = std::fs::read_to_string(prof_dir.join(rel))
             && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
         {
@@ -9833,9 +9834,7 @@ fn try_rotate_exhausted_profile_in(
     let current_prof = bound_profile_of_provider(&cfg, &provider)?;
     let current_provider = bound_profile_name(&cfg)
         .and_then(|bound| bound.split_once('/').map(|(p, _)| p.to_string()))
-        .filter(|bp| {
-            bp == &provider || compatible_harnesses_for(&provider).contains(&bp.as_str())
-        })
+        .filter(|bp| bp == &provider || compatible_harnesses_for(&provider).contains(&bp.as_str()))
         .or_else(|| {
             if data
                 .join("profiles")
@@ -9847,7 +9846,12 @@ fn try_rotate_exhausted_profile_in(
             } else {
                 compatible_harnesses_for(&provider)
                     .iter()
-                    .find(|compat| data.join("profiles").join(compat).join(&current_prof).is_dir())
+                    .find(|compat| {
+                        data.join("profiles")
+                            .join(compat)
+                            .join(&current_prof)
+                            .is_dir()
+                    })
                     .map(|compat| (*compat).to_string())
             }
         })
@@ -9936,9 +9940,12 @@ fn try_rotate_exhausted_profile_in(
             if cand_prof == current_prof && cand_provider == current_provider {
                 continue;
             }
-            if let Some(rem_pct) =
-                probe_profile_remaining_pct(data, &cand_provider, &cand_prof, agent.model.as_deref())
-                && rem_pct > 0
+            if let Some(rem_pct) = probe_profile_remaining_pct(
+                data,
+                &cand_provider,
+                &cand_prof,
+                agent.model.as_deref(),
+            ) && rem_pct > 0
             {
                 let cnt = bound_counts.get(&cand_prof).copied().unwrap_or(0);
                 let score = (rem_pct * 100) / (cnt + 1);
@@ -18479,10 +18486,7 @@ Connection: close
             parse_remaining_pct_from_usage("$4.00/$10.00 remaining", None),
             Some(40)
         );
-        assert_eq!(
-            parse_remaining_pct_from_usage("75% left", None),
-            Some(75)
-        );
+        assert_eq!(parse_remaining_pct_from_usage("75% left", None), Some(75));
         assert!(compatible_harnesses_for("opencode").contains(&"omp"));
         assert!(compatible_harnesses_for("spiron-local").contains(&"sylphx"));
 
@@ -18630,12 +18634,9 @@ Connection: close
         .unwrap();
         reconcile_agent_runtime_config(&store, data, &cloud_agent, &cloud_cfg, &cloud_work)
             .unwrap();
-        verify_harness_runtime_config(&cloud_cfg, "spiron", cloud_agent.model.as_deref())
-            .unwrap();
-        let cloud_json: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(cloud_cfg.join("cloud.json")).unwrap(),
-        )
-        .unwrap();
+        verify_harness_runtime_config(&cloud_cfg, "spiron", cloud_agent.model.as_deref()).unwrap();
+        let cloud_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cloud_cfg.join("cloud.json")).unwrap()).unwrap();
         assert_eq!(cloud_json["api_key"], "spiron_sk_test_123");
         assert!(!cloud_cfg.join("spiron-mcp.json").exists());
 

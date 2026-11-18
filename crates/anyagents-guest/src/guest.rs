@@ -938,8 +938,8 @@ pub(crate) fn run_serve_io<R: BufRead + Send + 'static, W: Write>(
                     turn_finished: true
                 }) | Some(Proof::Duplicate)
             );
-            let done_by_turns = adapter.turns_served() > turn.base_turns
-                && health.turn_state == TurnState::Idle;
+            let done_by_turns =
+                adapter.turns_served() > turn.base_turns && health.turn_state == TurnState::Idle;
             let done_by_failure = adapter.failure_for_id(&turn.id).is_some();
             if done_by_proof || done_by_turns || done_by_failure || !health.process_alive {
                 let err_override = adapter.failure_for_id(&turn.id).or_else(|| {
@@ -994,9 +994,7 @@ fn emit_turn_completion<W: Write>(
     let usage = adapter
         .usage_for_id(&turn.id)
         .unwrap_or_else(|| adapter.served_usage().difference(turn.base_usage.clone()));
-    let cost_usd = usage
-        .reported_cost_micros
-        .map(|m| (m as f64) / 1_000_000.0);
+    let cost_usd = usage.reported_cost_micros.map(|m| (m as f64) / 1_000_000.0);
 
     if let Some(err_msg) = err_override {
         return emit_line(
@@ -1085,7 +1083,9 @@ fn launch_guest_harness(
                 full_args.push("--mcp-config".to_string());
                 full_args.push(mcp_cfg.display().to_string());
             }
-            if !full_args.iter().any(|a| a == "--dangerously-skip-permissions")
+            if !full_args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions")
                 && !extra_args.iter().any(|a| a == "--guest-bare")
             {
                 full_args.insert(0, "--dangerously-skip-permissions".to_string());
@@ -1105,8 +1105,13 @@ fn launch_guest_harness(
             Ok(Box::new(CodexAdapter(h)))
         }
         "opencode" => {
-            let h =
-                OpenCodeHarness::start_in_config(program, session, &pairs, Some(work_dir), state_dir)?;
+            let h = OpenCodeHarness::start_in_config(
+                program,
+                session,
+                &pairs,
+                Some(work_dir),
+                state_dir,
+            )?;
             Ok(Box::new(OpenCodeAdapter(h)))
         }
         "agy" => {
@@ -1206,14 +1211,7 @@ fn launch_guest_harness(
             let mcp_url = file_cfg.and_then(|c| c.mcp_url.as_deref());
             let mcp_tok = file_cfg.and_then(|c| c.mcp_token_file.as_deref());
             let h = GrokGuestHarness::start(
-                program,
-                model,
-                session,
-                &pairs,
-                work_dir,
-                guest_exe,
-                mcp_url,
-                mcp_tok,
+                program, model, session, &pairs, work_dir, guest_exe, mcp_url, mcp_tok,
             )?;
             Ok(Box::new(GrokAdapter(h)))
         }
@@ -1313,7 +1311,12 @@ pub(crate) fn ensure_repo_checked_out(
     };
     let mut cmd = spawn_command(&git_bin, &[]).map_err(|e| format!("git spawn: {e}"))?;
     cmd.arg("clone");
-    if let Some(branch) = spec.branch.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(branch) = spec
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         cmd.arg("--branch").arg(branch);
     }
     cmd.arg(repo).arg(work_dir);
@@ -1324,12 +1327,18 @@ pub(crate) fn ensure_repo_checked_out(
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    if let Some(base) = spec.base.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    if let Some(base) = spec
+        .base
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         && spec.branch.as_deref().is_none_or(|b| b.trim().is_empty())
     {
         let mut co = spawn_command(&git_bin, &[]).map_err(|e| format!("git spawn: {e}"))?;
         co.current_dir(work_dir).args(["checkout", base]);
-        let co_out = co.output().map_err(|e| format!("git checkout `{base}` failed: {e}"))?;
+        let co_out = co
+            .output()
+            .map_err(|e| format!("git checkout `{base}` failed: {e}"))?;
         if !co_out.status.success() {
             return Err(format!(
                 "git checkout `{base}` failed: {}",
@@ -1421,7 +1430,9 @@ fn split_marker_or_uuid(val: &Value, raw_text: &str, seq: u64) -> (String, Strin
         && let Some(id) = first_line.strip_prefix(anyagents_harness::MESSAGE_MARKER_PREFIX)
         && !id.trim().is_empty()
     {
-        let body = raw_text[first_line.len()..].strip_prefix('\n').unwrap_or("");
+        let body = raw_text[first_line.len()..]
+            .strip_prefix('\n')
+            .unwrap_or("");
         return (id.trim().to_string(), body.to_string());
     }
     let uuid = val
@@ -1570,13 +1581,15 @@ done
             text.contains("\"type\":\"result\""),
             "missing result: {text}"
         );
-        assert!(text.contains("\"input_tokens\":11"), "missing usage: {text}");
+        assert!(
+            text.contains("\"input_tokens\":11"),
+            "missing usage: {text}"
+        );
         assert!(
             text.contains("\"type\":\"control_response\""),
             "missing cancel ack: {text}"
         );
-        let saved_sid =
-            std::fs::read_to_string(state_dir.join("claude-code-session-id")).unwrap();
+        let saved_sid = std::fs::read_to_string(state_dir.join("claude-code-session-id")).unwrap();
         assert_eq!(saved_sid.trim(), "guest-sess-42");
     }
 

@@ -102,7 +102,9 @@ pub mod sylphx {
         /// if a non-empty value cannot be parsed.
         pub fn from_env() -> Self {
             match std::env::var(ENV_SANDBOX_MODE) {
-                Ok(val) if !val.trim().is_empty() => Self::parse(&val).unwrap_or(Self::RemoteRequired),
+                Ok(val) if !val.trim().is_empty() => {
+                    Self::parse(&val).unwrap_or(Self::RemoteRequired)
+                }
                 _ => Self::Off,
             }
         }
@@ -446,8 +448,12 @@ pub mod sylphx {
                 workdir: self.workdir.clone(),
                 remote_spawn: true,
             };
-            let legacy_json = serde_json::to_string_pretty(&legacy).map_err(|err| err.to_string())?;
-            write_private_file(&config_dir.join("sandbox.json"), format!("{legacy_json}\n").as_bytes())
+            let legacy_json =
+                serde_json::to_string_pretty(&legacy).map_err(|err| err.to_string())?;
+            write_private_file(
+                &config_dir.join("sandbox.json"),
+                format!("{legacy_json}\n").as_bytes(),
+            )
         }
 
         /// Active data-plane resource path (e.g. `orgs/.../leases/{id}`).
@@ -461,11 +467,19 @@ pub mod sylphx {
 
         /// Resolved `envd` proxy base URL for streaming Connect-RPC process control.
         pub fn resolved_envd_url(&self) -> Result<String, String> {
-            if let Some(url) = self.envd_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(url) = self
+                .envd_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 return Ok(url.trim_end_matches('/').to_string());
             }
             let resource = self.active_data_resource()?.trim_matches('/');
-            Ok(format!("{}/v1/{resource}/envd", normalize_api_base(&self.endpoint)))
+            Ok(format!(
+                "{}/v1/{resource}/envd",
+                normalize_api_base(&self.endpoint)
+            ))
         }
 
         /// Build a client configured for this lease's endpoint and bearer token.
@@ -533,7 +547,9 @@ pub mod sylphx {
         pub fn new(endpoint: impl Into<String>, token: Option<String>) -> Self {
             Self {
                 endpoint: normalize_api_base(&endpoint.into()),
-                token: token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+                token: token
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty()),
             }
         }
 
@@ -605,9 +621,7 @@ pub mod sylphx {
                         body.unwrap_or(&serde_json::Value::Object(Default::default())),
                     )
                     .map_err(|e| e.to_string())?;
-                    let mut req = agent
-                        .post(url)
-                        .header("content-type", "application/json");
+                    let mut req = agent.post(url).header("content-type", "application/json");
                     if let Some(tok) = &self.token {
                         req = req.header("authorization", &format!("Bearer {tok}"));
                     }
@@ -644,12 +658,8 @@ pub mod sylphx {
                 body.insert("sizeGib".into(), serde_json::json!(size));
                 body.insert("size_gib".into(), serde_json::json!(size));
             }
-            let (status, val) = self.request_json(
-                "POST",
-                &url,
-                Some(&serde_json::Value::Object(body)),
-                30_000,
-            )?;
+            let (status, val) =
+                self.request_json("POST", &url, Some(&serde_json::Value::Object(body)), 30_000)?;
             if !(200..300).contains(&status) {
                 return Err(format!(
                     "Sylphx POST {url} returned HTTP {status}: {}",
@@ -730,7 +740,9 @@ pub mod sylphx {
             ttl: Option<&str>,
         ) -> Result<SylphxLease, String> {
             let url = self.collection_url(parent, "leases");
-            let ttl_val = ttl.filter(|s| !s.trim().is_empty()).unwrap_or(DEFAULT_LEASE_TTL);
+            let ttl_val = ttl
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(DEFAULT_LEASE_TTL);
             let body = serde_json::json!({
                 "template": template,
                 "shape": shape,
@@ -823,7 +835,9 @@ pub mod sylphx {
         ) -> Result<SylphxLease, String> {
             let resource = self.resolve_resource(parent, "leases", lease_id_or_name);
             let url = format!("{}:renew", self.v1_resource_url(&resource));
-            let ttl_val = ttl.filter(|s| !s.trim().is_empty()).unwrap_or(DEFAULT_LEASE_TTL);
+            let ttl_val = ttl
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(DEFAULT_LEASE_TTL);
             let body = serde_json::json!({ "ttl": ttl_val });
             let (status, val) = self.request_json("POST", &url, Some(&body), 20_000)?;
             if !(200..300).contains(&status) {
@@ -837,11 +851,7 @@ pub mod sylphx {
 
         /// Release an active lease on idle / pause / archive (`POST /v1/{lease_resource}:release`).
         /// Preserves the attached persistent volume.
-        pub fn release_lease(
-            &self,
-            parent: &str,
-            lease_id_or_name: &str,
-        ) -> Result<(), String> {
+        pub fn release_lease(&self, parent: &str, lease_id_or_name: &str) -> Result<(), String> {
             let resource = self.resolve_resource(parent, "leases", lease_id_or_name);
             let url = format!("{}:release", self.v1_resource_url(&resource));
             let (status, val) =
@@ -882,11 +892,8 @@ pub mod sylphx {
                 && let Some(fetched) = self.get_lease(&provider.parent, prev_lease)?
                 && !fetched.is_terminal()
             {
-                reused_lease = Some(self.wait_lease_ready(
-                    &provider.parent,
-                    fetched,
-                    LEASE_READY_TIMEOUT,
-                )?);
+                reused_lease =
+                    Some(self.wait_lease_ready(&provider.parent, fetched, LEASE_READY_TIMEOUT)?);
             }
 
             let lease = match reused_lease {
@@ -927,9 +934,10 @@ pub mod sylphx {
                 volume_resource: vol.resource_name.clone(),
                 lease_id: Some(lease.id.clone()),
                 lease_resource: Some(lease.resource_name.clone()),
-                data_plane_resource: lease.data_plane_resource.clone().or_else(|| {
-                    Some(lease.resource_name.clone())
-                }),
+                data_plane_resource: lease
+                    .data_plane_resource
+                    .clone()
+                    .or_else(|| Some(lease.resource_name.clone())),
                 envd_url: lease.envd_url.clone(),
                 envd_token: lease.envd_token.clone(),
                 expires_at: lease.expires_at.clone(),
@@ -1015,7 +1023,9 @@ pub mod sylphx {
             {
                 return Ok(text.as_bytes().to_vec());
             }
-            Err(format!("Sylphx `:readFile` {path} returned unexpected payload: {val}"))
+            Err(format!(
+                "Sylphx `:readFile` {path} returned unexpected payload: {val}"
+            ))
         }
 
         /// Write a file via `:writeFile` (`POST /v1/{resource}:writeFile`).
@@ -1038,7 +1048,11 @@ pub mod sylphx {
         }
 
         /// List directory entries via `:listFiles` (`POST /v1/{resource}:listFiles`).
-        pub fn list_files(&self, resource: &str, path: &str) -> Result<Vec<SylphxFileEntry>, String> {
+        pub fn list_files(
+            &self,
+            resource: &str,
+            path: &str,
+        ) -> Result<Vec<SylphxFileEntry>, String> {
             let url = format!("{}:listFiles", self.v1_resource_url(resource));
             let body = serde_json::json!({ "path": path });
             let (status, val) = self.request_json("POST", &url, Some(&body), 20_000)?;
@@ -1087,7 +1101,9 @@ pub mod sylphx {
                         item.get("type")
                             .or_else(|| item.get("kind"))
                             .and_then(serde_json::Value::as_str)
-                            .is_some_and(|k| k.eq_ignore_ascii_case("dir") || k.eq_ignore_ascii_case("directory"))
+                            .is_some_and(|k| {
+                                k.eq_ignore_ascii_case("dir") || k.eq_ignore_ascii_case("directory")
+                            })
                     });
                 let size_bytes = item
                     .get("size_bytes")
@@ -1134,7 +1150,10 @@ pub mod sylphx {
                 "pty": null,
                 "stdin": stdin_enabled,
             });
-            let framed = encode_connect_frame(0x00, &serde_json::to_vec(&req_json).map_err(|e| e.to_string())?)?;
+            let framed = encode_connect_frame(
+                0x00,
+                &serde_json::to_vec(&req_json).map_err(|e| e.to_string())?,
+            )?;
             let agent = self.stream_agent();
             let mut req = agent
                 .post(&url)
@@ -1145,9 +1164,9 @@ pub mod sylphx {
                     .header("authorization", &format!("Bearer {tok}"))
                     .header("x-access-token", tok);
             }
-            let resp = req
-                .send(framed.as_slice())
-                .map_err(|err| format!("envd `process.Process/Start` request failed ({url}): {err}"))?;
+            let resp = req.send(framed.as_slice()).map_err(|err| {
+                format!("envd `process.Process/Start` request failed ({url}): {err}")
+            })?;
             let status = resp.status().as_u16();
             let content_type = resp
                 .headers()
@@ -1159,7 +1178,9 @@ pub mod sylphx {
             if !(200..300).contains(&status) {
                 let mut err_buf = String::new();
                 let _ = reader.read_to_string(&mut err_buf);
-                return Err(format!("envd `process.Process/Start` returned HTTP {status}: {err_buf}"));
+                return Err(format!(
+                    "envd `process.Process/Start` returned HTTP {status}: {err_buf}"
+                ));
             }
             if content_type.contains("application/json") && !content_type.contains("connect+json") {
                 let mut body = String::new();
@@ -1198,7 +1219,10 @@ pub mod sylphx {
                     break;
                 }
                 if let Some(ev) = parse_envd_event(&val) {
-                    if let EnvdProcessEvent::End { exit_code, error, .. } = &ev {
+                    if let EnvdProcessEvent::End {
+                        exit_code, error, ..
+                    } = &ev
+                    {
                         exit_code_seen = *exit_code;
                         if let Some(err_msg) = error.as_ref().filter(|s| !s.is_empty()).cloned()
                             && exit_code_seen.is_none_or(|c| c == 0)
@@ -1221,7 +1245,10 @@ pub mod sylphx {
             pid: u32,
             data: &[u8],
         ) -> Result<(), String> {
-            let url = format!("{}/process.Process/SendInput", envd_base.trim_end_matches('/'));
+            let url = format!(
+                "{}/process.Process/SendInput",
+                envd_base.trim_end_matches('/')
+            );
             let body = serde_json::json!({
                 "process": { "pid": pid },
                 "input": { "data": base64_encode(data) },
@@ -1237,7 +1264,10 @@ pub mod sylphx {
             pid: u32,
             signal: EnvdSignal,
         ) -> Result<(), String> {
-            let url = format!("{}/process.Process/SendSignal", envd_base.trim_end_matches('/'));
+            let url = format!(
+                "{}/process.Process/SendSignal",
+                envd_base.trim_end_matches('/')
+            );
             let body = serde_json::json!({
                 "process": { "pid": pid },
                 "signal": signal.as_proto_str(),
@@ -1638,7 +1668,11 @@ pub mod sylphx {
         val.get("error")
             .or_else(|| val.get("message"))
             .or_else(|| val.get("raw"))
-            .and_then(|v| v.as_str().map(str::to_string).or_else(|| Some(v.to_string())))
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| Some(v.to_string()))
+            })
             .unwrap_or_else(|| val.to_string())
     }
 
@@ -1670,9 +1704,13 @@ pub mod sylphx {
                 return Err(format!("Sylphx volume response missing name/id: {val}"));
             }
         };
-        let id = raw_id
-            .map(str::to_string)
-            .unwrap_or_else(|| resource_name.rsplit('/').next().unwrap_or(fallback_name).to_string());
+        let id = raw_id.map(str::to_string).unwrap_or_else(|| {
+            resource_name
+                .rsplit('/')
+                .next()
+                .unwrap_or(fallback_name)
+                .to_string()
+        });
         let display_name = raw_name.unwrap_or(fallback_name).to_string();
         let size_gib = root
             .get("sizeGib")
@@ -1869,7 +1907,11 @@ pub mod sylphx {
                 .get("pty")
                 .map(decode_maybe_bytes_field)
                 .unwrap_or_default();
-            return Some(EnvdProcessEvent::Data { stdout, stderr, pty });
+            return Some(EnvdProcessEvent::Data {
+                stdout,
+                stderr,
+                pty,
+            });
         }
         if let Some(end) = ev.get("end") {
             let exit_code = end
@@ -1908,7 +1950,10 @@ pub mod sylphx {
 
         fn spawn_mock_http<F>(handler: F) -> (String, std::thread::JoinHandle<()>)
         where
-            F: Fn(&str, &str, &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) + Send + Sync + 'static,
+            F: Fn(&str, &str, &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>)
+                + Send
+                + Sync
+                + 'static,
         {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1977,9 +2022,7 @@ pub mod sylphx {
             }
             assert_eq!(SandboxMode::from_env(), SandboxMode::Off);
             assert!(SandboxMode::parse("auto").unwrap() == SandboxMode::Auto);
-            assert!(
-                SandboxMode::parse("remote_required").unwrap() == SandboxMode::RemoteRequired
-            );
+            assert!(SandboxMode::parse("remote_required").unwrap() == SandboxMode::RemoteRequired);
 
             let dir = tempfile::tempdir().unwrap();
             let err = resolve_workspace_backend_for_mode(
@@ -1997,7 +2040,8 @@ pub mod sylphx {
             let calls: Arc<Mutex<Vec<(String, serde_json::Value)>>> =
                 Arc::new(Mutex::new(Vec::new()));
             let calls_ref = Arc::clone(&calls);
-            let files: Arc<Mutex<BTreeMap<String, Vec<u8>>>> = Arc::new(Mutex::new(BTreeMap::new()));
+            let files: Arc<Mutex<BTreeMap<String, Vec<u8>>>> =
+                Arc::new(Mutex::new(BTreeMap::new()));
             let files_ref = Arc::clone(&files);
             let lease_polls = Arc::new(Mutex::new(0u32));
             let lease_polls_ref = Arc::clone(&lease_polls);
@@ -2162,14 +2206,25 @@ pub mod sylphx {
             release_sandbox_for_config_dir(dir.path()).unwrap();
             let after_release = SylphxLeaseConfig::from_config_dir(dir.path()).unwrap();
             assert!(after_release.lease_id.is_none(), "lease cleared on release");
-            assert_eq!(after_release.volume_id, "vol_123", "volume preserved across release");
+            assert_eq!(
+                after_release.volume_id, "vol_123",
+                "volume preserved across release"
+            );
 
             destroy_sandbox_for_config_dir(dir.path()).unwrap();
             let recorded = calls.lock().unwrap();
             assert!(recorded.iter().all(|(route, _)| !route.contains(":pause")));
             assert!(recorded.iter().all(|(route, _)| !route.contains(":resume")));
-            assert!(recorded.iter().any(|(route, _)| route.ends_with(":release")));
-            assert!(recorded.iter().any(|(route, _)| route.starts_with("DELETE ")));
+            assert!(
+                recorded
+                    .iter()
+                    .any(|(route, _)| route.ends_with(":release"))
+            );
+            assert!(
+                recorded
+                    .iter()
+                    .any(|(route, _)| route.starts_with("DELETE "))
+            );
         }
 
         #[test]
@@ -2180,8 +2235,9 @@ pub mod sylphx {
 
             let (base_url, _srv) = spawn_mock_http(move |method, path, body| {
                 if path.ends_with("/process.Process/Start") {
-                    let (flags, frame) =
-                        read_connect_frame(&mut std::io::Cursor::new(body)).unwrap().unwrap();
+                    let (flags, frame) = read_connect_frame(&mut std::io::Cursor::new(body))
+                        .unwrap()
+                        .unwrap();
                     assert_eq!(flags, 0x00);
                     let req: serde_json::Value = serde_json::from_slice(&frame).unwrap();
                     events_ref.lock().unwrap().push((path.to_string(), req));
@@ -2231,7 +2287,10 @@ pub mod sylphx {
                     || path.ends_with("/process.Process/SendSignal")
                 {
                     let req: serde_json::Value = serde_json::from_slice(body).unwrap();
-                    events_ref.lock().unwrap().push((format!("{method} {path}"), req));
+                    events_ref
+                        .lock()
+                        .unwrap()
+                        .push((format!("{method} {path}"), req));
                     (
                         200,
                         vec![("Content-Type".into(), "application/json".into())],
@@ -2274,7 +2333,12 @@ pub mod sylphx {
                 ]
             );
             client
-                .send_envd_input(&format!("{base_url}/envd"), Some("envd-tok"), 42, b"steer\n")
+                .send_envd_input(
+                    &format!("{base_url}/envd"),
+                    Some("envd-tok"),
+                    42,
+                    b"steer\n",
+                )
                 .unwrap();
             client
                 .send_envd_signal(
@@ -2306,8 +2370,7 @@ pub use sylphx::{
     EnvdProcessEvent, EnvdSignal, SandboxDriver, SandboxMode, SylphxFileEntry, SylphxLease,
     SylphxLeaseConfig, SylphxProviderConfig, SylphxSandboxClient, SylphxSandboxWorkspace,
     SylphxVolume, destroy_sandbox_for_config_dir, ensure_leased_for_config_dir,
-    release_sandbox_for_config_dir, renew_lease_for_config_dir,
-    resolve_workspace_backend_for_mode,
+    release_sandbox_for_config_dir, renew_lease_for_config_dir, resolve_workspace_backend_for_mode,
 };
 pub use workspace::{
     DockerWorkspace, ExecEnv, ExecOutput, LocalWorkspace, REMOTE_EXEC_MAX_TIMEOUT_MS,

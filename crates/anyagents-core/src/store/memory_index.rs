@@ -144,12 +144,8 @@ pub(super) struct Chunk<'a> {
 }
 
 enum MemoryIndexBackend {
-    Sqlite {
-        writer: Mutex<Connection>,
-    },
-    Postgres {
-        pool: sqlx::PgPool,
-    },
+    Sqlite { writer: Mutex<Connection> },
+    Postgres { pool: sqlx::PgPool },
 }
 
 /// The process's one writer on a SQLite index file, or pooled connection on PostgreSQL.
@@ -286,11 +282,8 @@ impl MemoryIndex {
                         return Ok(None);
                     }
                 } else {
-                    let _: () = tx.db_query_one(
-                        "SELECT pg_advisory_xact_lock(78697969)",
-                        &[],
-                        |_| Ok(()),
-                    )?;
+                    let _: () =
+                        tx.db_query_one("SELECT pg_advisory_xact_lock(78697969)", &[], |_| Ok(()))?;
                 }
                 let wrapped = DbTx::Postgres(tx);
                 let out = f(&wrapped)?;
@@ -322,9 +315,8 @@ impl MemoryIndex {
                     return Ok(false);
                 };
                 conn.busy_timeout(if wait { BUSY } else { Duration::ZERO })?;
-                let deferred = std::mem::take(
-                    &mut *self.deferred.lock().unwrap_or_else(|p| p.into_inner()),
-                );
+                let deferred =
+                    std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|p| p.into_inner()));
                 let mut outcome = Ok(true);
                 if !deferred.is_empty() {
                     let tx_res = (|| -> Result<(), Error> {
@@ -354,9 +346,8 @@ impl MemoryIndex {
                 }
             }
             MemoryIndexBackend::Postgres { pool } => {
-                let deferred = std::mem::take(
-                    &mut *self.deferred.lock().unwrap_or_else(|p| p.into_inner()),
-                );
+                let deferred =
+                    std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|p| p.into_inner()));
                 let res = sync_on_postgres(pool, state, &deferred, wait, budget);
                 if res.is_err() && !deferred.is_empty() {
                     self.deferred
@@ -1213,8 +1204,8 @@ pub(super) fn read_source_rows(
             params,
         );
     }
-    let retiring = state.backend() == DbBackend::Sqlite
-        && super::retired_search::present_db(state)?;
+    let retiring =
+        state.backend() == DbBackend::Sqlite && super::retired_search::present_db(state)?;
     let select = if retiring {
         OUTBOUND_SELECT_RETIRING
     } else {
@@ -1223,17 +1214,12 @@ pub(super) fn read_source_rows(
     match read_rows(state, &format!("{select} {filter}"), direction, params) {
         // The retired chunks were dropped since they were looked up; every
         // position had been moved onto its row first.
-        Err(_)
-            if retiring
-                && !super::retired_search::present_db(state)? =>
-        {
-            read_rows(
-                state,
-                &format!("{OUTBOUND_SELECT} {filter}"),
-                direction,
-                params,
-            )
-        }
+        Err(_) if retiring && !super::retired_search::present_db(state)? => read_rows(
+            state,
+            &format!("{OUTBOUND_SELECT} {filter}"),
+            direction,
+            params,
+        ),
         other => other,
     }
 }
@@ -1273,15 +1259,13 @@ fn source_row(state: &(impl DbExec + ?Sized), id: &str) -> Result<Option<SourceR
     )
 }
 
-fn sync_on_sqlite(
-    conn: &mut Connection,
-    state: &dyn DbExec,
-    budget: usize,
-) -> Result<bool, Error> {
+fn sync_on_sqlite(conn: &mut Connection, state: &dyn DbExec, budget: usize) -> Result<bool, Error> {
     let (messages, outbound) = marks(conn)?;
     let (max_messages, max_outbound) = max_rowids(state)?;
     let pending: bool =
-        conn.db_query_one("SELECT EXISTS(SELECT 1 FROM index_pending)", &[], |r| r.get(0))?;
+        conn.db_query_one("SELECT EXISTS(SELECT 1 FROM index_pending)", &[], |r| {
+            r.get(0)
+        })?;
     // Caught up: answered by reads, without the index's write lock.
     if !pending && messages == max_messages && outbound == max_outbound {
         return Ok(true);
@@ -1365,7 +1349,9 @@ fn sync_on_postgres(
         let (messages, outbound) = marks(pool)?;
         let (max_messages, max_outbound) = max_rowids(state)?;
         let pending: bool =
-            pool.db_query_one("SELECT EXISTS(SELECT 1 FROM index_pending)", &[], |r| r.get(0))?;
+            pool.db_query_one("SELECT EXISTS(SELECT 1 FROM index_pending)", &[], |r| {
+                r.get(0)
+            })?;
         if !pending && messages == max_messages && outbound == max_outbound {
             return Ok(Some(true));
         }
@@ -1465,7 +1451,10 @@ fn with_pg_sync_lock<T>(
 ) -> Result<Option<T>, Error> {
     let tx = PgTx::begin(pool)?;
     if !wait {
-        let got: bool = tx.db_query_one("SELECT pg_try_advisory_xact_lock(78697969)", &[], |r| r.get(0))?;
+        let got: bool =
+            tx.db_query_one("SELECT pg_try_advisory_xact_lock(78697969)", &[], |r| {
+                r.get(0)
+            })?;
         if !got {
             return Ok(None);
         }
@@ -1844,10 +1833,13 @@ pub(super) fn rewrite_agent_fts_rows(
         if fts_tokens(&name).next().is_some() {
             let phrase = fts_exact_phrase(&name);
             changed += match rename_to {
-                None => conn.db_execute(FTS_DELETE_AGENT_ROWS, &db_params![name, phrase, agent_id])?,
-                Some(new) => {
-                    conn.db_execute(FTS_RENAME_AGENT_ROWS, &db_params![name, phrase, agent_id, new])?
+                None => {
+                    conn.db_execute(FTS_DELETE_AGENT_ROWS, &db_params![name, phrase, agent_id])?
                 }
+                Some(new) => conn.db_execute(
+                    FTS_RENAME_AGENT_ROWS,
+                    &db_params![name, phrase, agent_id, new],
+                )?,
             };
             continue;
         }

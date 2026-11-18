@@ -7223,7 +7223,8 @@ fn execute_remote_grep(
         .map(|s| s.strip_prefix("./").unwrap_or(s));
 
     let base_root = backend.root_display();
-    let files_to_search: Vec<(String, String)> = match backend.list_dir(Some(&target_path), true, 1) {
+    let files_to_search: Vec<(String, String)> = match backend.list_dir(Some(&target_path), true, 1)
+    {
         Err(_) if backend.read_file_bytes(Some(&target_path)).is_ok() => {
             let disp = remote_rel_display(&base_root, &target_path);
             vec![(target_path, disp)]
@@ -7233,7 +7234,9 @@ fn execute_remote_grep(
                 let disp = remote_rel_display(&base_root, &target_path);
                 vec![(target_path, disp)]
             } else {
-                return Err(format!("grep target path `{target_path}` does not exist: {err}"));
+                return Err(format!(
+                    "grep target path `{target_path}` does not exist: {err}"
+                ));
             }
         }
         Ok(_) => {
@@ -8451,12 +8454,13 @@ struct LocalPatchFs<'a> {
 
 impl PatchFs for LocalPatchFs<'_> {
     fn resolve(&self, raw: &str) -> Result<String, String> {
-        Ok(resolve_patch_rel_path(self.base_dir, raw)?.display().to_string())
+        Ok(resolve_patch_rel_path(self.base_dir, raw)?
+            .display()
+            .to_string())
     }
 
     fn read_text(&self, resolved: &str, rel_label: &str) -> Result<String, String> {
-        std::fs::read_to_string(resolved)
-            .map_err(|e| format!("failed reading `{rel_label}`: {e}"))
+        std::fs::read_to_string(resolved).map_err(|e| format!("failed reading `{rel_label}`: {e}"))
     }
 
     fn write_text(&self, resolved: &str, rel_label: &str, content: &str) -> Result<String, String> {
@@ -8476,8 +8480,7 @@ impl PatchFs for LocalPatchFs<'_> {
     fn delete_if_exists(&self, resolved: &str, rel_label: &str) -> Result<(), String> {
         let p = Path::new(resolved);
         if p.exists() {
-            std::fs::remove_file(p)
-                .map_err(|e| format!("failed deleting `{rel_label}`: {e}"))?;
+            std::fs::remove_file(p).map_err(|e| format!("failed deleting `{rel_label}`: {e}"))?;
         }
         Ok(())
     }
@@ -13484,10 +13487,7 @@ mod client_link_tests {
         }
 
         let mut initial = BTreeMap::new();
-        initial.insert(
-            "/ws/.gitignore".into(),
-            b"ignored.rs\n".to_vec(),
-        );
+        initial.insert("/ws/.gitignore".into(), b"ignored.rs\n".to_vec());
         initial.insert(
             "/ws/src/main.rs".into(),
             b"fn main() {\n    println!(\"hello\");\n}\n".to_vec(),
@@ -13496,10 +13496,7 @@ mod client_link_tests {
             "/ws/src/ignored.rs".into(),
             b"// should skip\nfn hidden_match() {}\n".to_vec(),
         );
-        initial.insert(
-            "/ws/README.md".into(),
-            b"# Project\n".to_vec(),
-        );
+        initial.insert("/ws/README.md".into(), b"# Project\n".to_vec());
         let backend = MockRemoteFs {
             root: PathBuf::from("/ws"),
             files: Mutex::new(initial),

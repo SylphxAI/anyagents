@@ -384,7 +384,9 @@ impl Store {
     ) -> Result<Vec<CredentialBinding>, Error> {
         let conn = self.read_conn();
         conn.db_query_vec(
-            &format!("SELECT {BINDING_COLS} FROM credential_bindings WHERE agent_id = ?1 ORDER BY slot"),
+            &format!(
+                "SELECT {BINDING_COLS} FROM credential_bindings WHERE agent_id = ?1 ORDER BY slot"
+            ),
             &db_params![agent_id],
             binding_from_row,
         )

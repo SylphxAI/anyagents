@@ -392,10 +392,7 @@ fn mirror_turn_recovery(tx: &(impl DbExec + ?Sized), agent_id: &AgentId) -> Resu
 
 /// Precondition for `live -> released`: no unfinished turn, a drained
 /// mailbox, and no child that may hold a process.
-fn release_blocker(
-    tx: &dyn DbExec,
-    agent_id: &AgentId,
-) -> Result<Option<String>, Error> {
+fn release_blocker(tx: &dyn DbExec, agent_id: &AgentId) -> Result<Option<String>, Error> {
     if let Some(turn) = unfinished_turn(tx, agent_id)? {
         return Ok(Some(format!("turn {} is {}", turn.turn_id, turn.state)));
     }
@@ -452,7 +449,10 @@ fn quota_from_row(row: &DbRow<'_>) -> Result<QuotaBlock, Error> {
     })
 }
 
-fn quota_of(conn: &(impl DbExec + ?Sized), agent_id: &AgentId) -> Result<Option<QuotaBlock>, Error> {
+fn quota_of(
+    conn: &(impl DbExec + ?Sized),
+    agent_id: &AgentId,
+) -> Result<Option<QuotaBlock>, Error> {
     conn.db_query_opt(
         "SELECT agent_id, until_ms, source, attempt, observed_at_ms FROM quota_blocks WHERE agent_id = ?1",
         &db_params![agent_id],

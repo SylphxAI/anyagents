@@ -261,7 +261,9 @@ impl Store {
     ) -> Result<Vec<OperatorMessage>, Error> {
         let conn = self.read_conn();
         let mut messages = conn.db_query_vec(
-            &format!("SELECT {COLS} FROM operator_messages WHERE seq > ?1 ORDER BY seq DESC LIMIT ?2"),
+            &format!(
+                "SELECT {COLS} FROM operator_messages WHERE seq > ?1 ORDER BY seq DESC LIMIT ?2"
+            ),
             &db_params![
                 since.unwrap_or(i64::MIN),
                 limit

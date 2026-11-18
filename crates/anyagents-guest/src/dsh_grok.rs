@@ -62,7 +62,10 @@ impl GrokGuestHarness {
         mcp_token_file: Option<&Path>,
     ) -> Result<Self, HarnessError> {
         let shared = Arc::new(Mutex::new(GrokState {
-            wanted_session: session_id.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+            wanted_session: session_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             ..GrokState::default()
         }));
         let on_shared = Arc::clone(&shared);
@@ -99,7 +102,11 @@ impl GrokGuestHarness {
         )?;
 
         let mcp_servers = if let Some(url) = mcp_url {
-            let mut proxy_args = vec!["mcp-proxy".to_string(), "--url".to_string(), url.to_string()];
+            let mut proxy_args = vec![
+                "mcp-proxy".to_string(),
+                "--url".to_string(),
+                url.to_string(),
+            ];
             if let Some(tf) = mcp_token_file {
                 proxy_args.push("--token-file".to_string());
                 proxy_args.push(tf.display().to_string());
@@ -247,7 +254,9 @@ fn on_grok_notification(st: &mut GrokState, value: &Value) -> NotificationEffect
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if kind == "agent_message_chunk"
-                && let Some(chunk) = params.pointer("/update/content/text").and_then(Value::as_str)
+                && let Some(chunk) = params
+                    .pointer("/update/content/text")
+                    .and_then(Value::as_str)
             {
                 st.current_text.push_str(chunk);
                 return NotificationEffect {
@@ -257,7 +266,11 @@ fn on_grok_notification(st: &mut GrokState, value: &Value) -> NotificationEffect
             }
             if kind == "user_message_chunk" {
                 let raw = params.to_string();
-                if let Some(id) = st.requests.values().find(|id| raw.contains(id.as_str())).cloned()
+                if let Some(id) = st
+                    .requests
+                    .values()
+                    .find(|id| raw.contains(id.as_str()))
+                    .cloned()
                 {
                     st.admitted.entry(id).or_insert(false);
                 }
@@ -286,7 +299,9 @@ impl Harness for GrokGuestHarness {
                 return Ok(DeliverOutcome::rejected(reason.clone(), false));
             }
             if st.finished.contains_key(id) {
-                return Ok(DeliverOutcome::Accepted { turn_finished: true });
+                return Ok(DeliverOutcome::Accepted {
+                    turn_finished: true,
+                });
             }
             if let Some(&dup) = st.admitted.get(id) {
                 return Ok(if dup {
@@ -705,7 +720,9 @@ impl Harness for DshGuestHarness {
                 return Ok(DeliverOutcome::rejected(reason.clone(), false));
             }
             if st.finished.contains_key(&message.id) {
-                return Ok(DeliverOutcome::Accepted { turn_finished: true });
+                return Ok(DeliverOutcome::Accepted {
+                    turn_finished: true,
+                });
             }
             if let Some(&dup) = st.admitted.get(&message.id) {
                 return Ok(if dup {
@@ -803,7 +820,8 @@ impl Harness for DshGuestHarness {
         let (port, cookie) = {
             let st = lock(&self.shared);
             (
-                st.port.ok_or_else(|| HarnessError::Failed("no dsh port".into()))?,
+                st.port
+                    .ok_or_else(|| HarnessError::Failed("no dsh port".into()))?,
                 st.cookie
                     .clone()
                     .ok_or_else(|| HarnessError::Failed("no dsh cookie".into()))?,
@@ -825,7 +843,8 @@ impl Harness for DshGuestHarness {
         let (port, cookie, session) = {
             let st = lock(&self.shared);
             (
-                st.port.ok_or_else(|| HarnessError::Failed("no dsh port".into()))?,
+                st.port
+                    .ok_or_else(|| HarnessError::Failed("no dsh port".into()))?,
                 st.cookie
                     .clone()
                     .ok_or_else(|| HarnessError::Failed("no dsh cookie".into()))?,
@@ -895,9 +914,13 @@ fn dsh_exchange_token(port: u16, token: &str) -> Result<String, String> {
     let req = format!(
         "GET /?token={token} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
     );
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
     let mut resp = String::new();
-    stream.read_to_string(&mut resp).map_err(|e| e.to_string())?;
+    stream
+        .read_to_string(&mut resp)
+        .map_err(|e| e.to_string())?;
     for line in resp.lines() {
         if line.to_ascii_lowercase().starts_with("set-cookie:")
             && let Some((_, v)) = line.split_once(':')
@@ -936,7 +959,9 @@ fn dsh_rpc_call(
          Connection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(hdr.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(hdr.as_bytes())
+        .map_err(|e| e.to_string())?;
     stream.write_all(&body).map_err(|e| e.to_string())?;
     let mut raw = String::new();
     stream.read_to_string(&mut raw).map_err(|e| e.to_string())?;
@@ -958,7 +983,9 @@ fn ws_connect(port: u16, cookie: &str) -> Result<TcpStream, String> {
          {key_hdr}: AAAAAAAAAAAAAAAAAAAAAA==\r\n\
          Sec-WebSocket-Version: 13\r\n\r\n"
     );
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     loop {
         let mut b = [0u8; 1];

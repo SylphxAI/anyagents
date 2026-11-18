@@ -1596,13 +1596,15 @@ fn authenticate_mcp_request(
             &agent.id,
         ))
         .map_err(ApiError::from_store)?;
-        let sandbox_backed = !crate::vendor::is_effective_cloud_harness(
-            &agent.harness,
-            Some(store.data_dir()),
-            Some(&config_dir),
-        ) && (anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir).is_some()
-            || anyagents_tools::SandboxConfig::from_config_dir(&config_dir)
-                .is_some_and(|sbx| sbx.remote_spawn));
+        let sandbox_backed =
+            !crate::vendor::is_effective_cloud_harness(
+                &agent.harness,
+                Some(store.data_dir()),
+                Some(&config_dir),
+            ) && (anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir)
+                .is_some()
+                || anyagents_tools::SandboxConfig::from_config_dir(&config_dir)
+                    .is_some_and(|sbx| sbx.remote_spawn));
         return Ok(McpCaller {
             agent,
             internal_token,
@@ -6178,15 +6180,17 @@ fn prepare_agent_wake_with_options(
     rotate_profile: bool,
 ) -> Result<(), ApiError> {
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &found.id);
-    if !crate::vendor::is_effective_cloud_harness(&found.harness, Some(store.data_dir()), Some(&cfg))
-        && let Err(err) = anyagents_tools::ensure_leased_for_config_dir(
-            Some(store.data_dir()),
-            &cfg,
-            found.id.as_str(),
-            found.workdir.as_deref(),
-            &std::collections::BTreeMap::new(),
-        )
-    {
+    if !crate::vendor::is_effective_cloud_harness(
+        &found.harness,
+        Some(store.data_dir()),
+        Some(&cfg),
+    ) && let Err(err) = anyagents_tools::ensure_leased_for_config_dir(
+        Some(store.data_dir()),
+        &cfg,
+        found.id.as_str(),
+        found.workdir.as_deref(),
+        &std::collections::BTreeMap::new(),
+    ) {
         if anyagents_tools::SandboxMode::from_env().is_remote_required() {
             return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
         }
@@ -18515,10 +18519,7 @@ exec '{}' "$@"
 
         let cloud_agent = state
             .store
-            .create_agent(anyagents_core::NewAgent::new(
-                "cloud-only",
-                "claude-cloud",
-            ))
+            .create_agent(anyagents_core::NewAgent::new("cloud-only", "claude-cloud"))
             .unwrap();
         let cloud_cfg = anyagents_core::agent_config_dir(dir.path(), &cloud_agent.id);
         std::fs::create_dir_all(&cloud_cfg).unwrap();
@@ -18588,8 +18589,7 @@ exec '{}' "$@"
             let list_body = list.clone();
             let (status, _) = tokio::task::spawn_blocking(move || {
                 let hdrs = [("authorization", format!("Bearer {cloud_remote}"))];
-                let refs: Vec<(&str, &str)> =
-                    hdrs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                let refs: Vec<(&str, &str)> = hdrs.iter().map(|(k, v)| (*k, v.as_str())).collect();
                 raw_http(addr, "POST", "/mcp?profile=full", &refs, &list_body)
             })
             .await
@@ -18627,7 +18627,10 @@ exec '{}' "$@"
         let data = dir.path();
         let store = Store::open(data.join("state.db")).unwrap();
         let agent = store
-            .create_agent(anyagents_core::NewAgent::new("ephem-browser", "claude-code"))
+            .create_agent(anyagents_core::NewAgent::new(
+                "ephem-browser",
+                "claude-code",
+            ))
             .unwrap();
         let bp = data.join("browser-profiles").join(&agent.name);
         std::fs::create_dir_all(&bp).unwrap();
@@ -18635,7 +18638,11 @@ exec '{}' "$@"
         store.set_agent_state(&agent.id, "archived").unwrap();
 
         reap_subagent_ephemeral_dirs_in(&store, data, &agent.id);
-        assert!(!bp.exists(), "browser-profiles/{} must be reaped", agent.name);
+        assert!(
+            !bp.exists(),
+            "browser-profiles/{} must be reaped",
+            agent.name
+        );
     }
 }
 

@@ -317,7 +317,11 @@ async fn on_responses(
             .unwrap();
     }
 
-    if passthrough && (stream || content_type.as_deref().is_some_and(|c| c.contains("text/event-stream")))
+    if passthrough
+        && (stream
+            || content_type
+                .as_deref()
+                .is_some_and(|c| c.contains("text/event-stream")))
     {
         return Response::builder()
             .status(StatusCode::OK)
@@ -342,10 +346,12 @@ async fn on_responses(
         upstream_val
     } else {
         match parse_response(route.protocol, &upstream_val) {
-            Ok(completion) => match encode_response(Protocol::OpenAiResponses, &completion, &route.model) {
-                Ok(v) => v,
-                Err(err) => return err.into_response(),
-            },
+            Ok(completion) => {
+                match encode_response(Protocol::OpenAiResponses, &completion, &route.model) {
+                    Ok(v) => v,
+                    Err(err) => return err.into_response(),
+                }
+            }
             Err(err) => return err.into_response(),
         }
     };
@@ -400,9 +406,10 @@ fn forward_upstream_sync(
     let mut req = agent.post(&url).header("content-type", "application/json");
     match route.protocol {
         Protocol::AnthropicMessages => {
-            req = req
-                .header("x-api-key", &route.api_key)
-                .header("anthropic-version", anthropic_version.unwrap_or("2023-06-01"));
+            req = req.header("x-api-key", &route.api_key).header(
+                "anthropic-version",
+                anthropic_version.unwrap_or("2023-06-01"),
+            );
         }
         Protocol::OpenAiChat | Protocol::OpenAiResponses => {
             req = req.header("authorization", &format!("Bearer {}", route.api_key));
@@ -415,10 +422,7 @@ fn forward_upstream_sync(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let bytes = resp
-        .into_body()
-        .read_to_vec()
-        .map_err(|e| e.to_string())?;
+    let bytes = resp.into_body().read_to_vec().map_err(|e| e.to_string())?;
     Ok((status, ctype, bytes))
 }
 
@@ -448,11 +452,11 @@ pub fn add_route(data: &Path, agent: &Agent) -> Result<Option<String>, Error> {
     // Local agents keep using the loopback listener; remote-sandbox agents must
     // use the external public gateway origin so sandboxes never dial 127.0.0.1.
     let config_dir = anyagents_core::agent_config_dir(data, &agent.id);
-    let runs_in_sandbox =
-        anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir).is_some()
-            || anyagents_tools::SandboxConfig::resolve(Some(&config_dir))
-                .is_some_and(|s| s.remote_spawn)
-            || anyagents_tools::SandboxMode::from_env().is_remote_required();
+    let runs_in_sandbox = anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir)
+        .is_some()
+        || anyagents_tools::SandboxConfig::resolve(Some(&config_dir))
+            .is_some_and(|s| s.remote_spawn)
+        || anyagents_tools::SandboxMode::from_env().is_remote_required();
     let origin = if runs_in_sandbox {
         public_origin(Some(data))
     } else {
@@ -790,7 +794,11 @@ mod tests {
                     let mut auth = String::new();
                     loop {
                         let mut h = String::new();
-                        if reader.read_line(&mut h).is_err() || h == "\r\n" || h == "\n" || h.is_empty() {
+                        if reader.read_line(&mut h).is_err()
+                            || h == "\r\n"
+                            || h == "\n"
+                            || h.is_empty()
+                        {
                             break;
                         }
                         if let Some((k, v)) = h.split_once(':') {
@@ -915,7 +923,10 @@ mod tests {
             })
             .await
             .unwrap();
-            assert_eq!(resp_pass["output"][0]["content"][0]["text"], "passthrough ok");
+            assert_eq!(
+                resp_pass["output"][0]["content"][0]["text"],
+                "passthrough ok"
+            );
 
             let resp_trans: serde_json::Value = tokio::task::spawn_blocking(move || {
                 let r = http

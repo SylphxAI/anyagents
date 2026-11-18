@@ -1661,10 +1661,7 @@ fn plan_adapter(
     let legacy_remote_spawn = anyagents_tools::SandboxConfig::resolve(Some(&request.config_dir))
         .is_some_and(|cfg| cfg.remote_spawn);
 
-    if !scripted
-        && !effective_cloud
-        && (sylphx_backed || legacy_remote_spawn)
-    {
+    if !scripted && !effective_cloud && (sylphx_backed || legacy_remote_spawn) {
         let canonical = if request.agent.harness.eq_ignore_ascii_case("spiron-local") {
             "spiron"
         } else {
@@ -2362,7 +2359,10 @@ fn spiron_execution_mode_local_in_toml(data: &Path) -> bool {
                 .and_then(|v| v.get("execution_mode")),
         )
         || check_eq(val.get("server").and_then(|v| v.get("execution_mode")))
-        || check_eq(val.get("server").and_then(|v| v.get("spiron_execution_mode")))
+        || check_eq(
+            val.get("server")
+                .and_then(|v| v.get("spiron_execution_mode")),
+        )
 }
 
 /// Whether `harness` should execute the local external `spiron` binary
@@ -2428,7 +2428,8 @@ pub(crate) fn is_effective_cloud_harness(
     config_dir: Option<&Path>,
 ) -> bool {
     is_cloud_harness(harness)
-        || (is_spiron_harness(harness) && !spiron_uses_local_execution(harness, data_dir, config_dir))
+        || (is_spiron_harness(harness)
+            && !spiron_uses_local_execution(harness, data_dir, config_dir))
 }
 
 /// A harness that runs off this host starts with a fresh remote session: its

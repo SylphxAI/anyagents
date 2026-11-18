@@ -732,9 +732,7 @@ mod tests {
         // The fallback reads the search index too, attached for the borrow
         // only: the writer never keeps it.
         reader
-            .db_query_one("SELECT count(*) FROM rag_chunks", &[], |r| {
-                r.get::<i64>(0)
-            })
+            .db_query_one("SELECT count(*) FROM rag_chunks", &[], |r| r.get::<i64>(0))
             .unwrap();
         drop(reader);
         let attached: i64 = store

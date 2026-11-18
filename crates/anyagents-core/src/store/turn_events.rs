@@ -323,10 +323,16 @@ impl Store {
                  WHERE a.id = ?1"
             ),
             &db_params![agent_id],
-            |row| Ok(AgentTurnSnapshot {
-                turn_seq: row.get(0)?, terminal_delivered_seq: row.get(1)?, outcome: row.get(2)?,
-                delivered_seq: row.get(3)?, pending_mail: row.get(4)?, open_turn: row.get(5)?,
-            }),
+            |row| {
+                Ok(AgentTurnSnapshot {
+                    turn_seq: row.get(0)?,
+                    terminal_delivered_seq: row.get(1)?,
+                    outcome: row.get(2)?,
+                    delivered_seq: row.get(3)?,
+                    pending_mail: row.get(4)?,
+                    open_turn: row.get(5)?,
+                })
+            },
         )?;
         tx.commit()?;
         Ok(snapshot)

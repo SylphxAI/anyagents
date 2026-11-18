@@ -205,9 +205,7 @@ fn postgres_end_to_end_store_search_host_index_redaction_and_concurrency() {
         )
         .unwrap();
     assert!(claimed);
-    store
-        .cancel_schedule(Some(&root.id), &sched.id)
-        .unwrap();
+    store.cancel_schedule(Some(&root.id), &sched.id).unwrap();
 
     // 5. High-concurrency multi-thread PG `next_seq` test on SAME agent.
     let shared_store = Arc::new(Store::open_postgres(&url, dir.path()).unwrap());
@@ -409,7 +407,9 @@ fn postgres_end_to_end_store_search_host_index_redaction_and_concurrency() {
 #[test]
 fn sqlite_to_postgres_migration_preserves_data_and_sequences() {
     let Some(url) = pg_url() else {
-        eprintln!("skipping sqlite_to_postgres_migration_preserves_data_and_sequences (ANYAGENTS_TEST_POSTGRES_URL unset)");
+        eprintln!(
+            "skipping sqlite_to_postgres_migration_preserves_data_and_sequences (ANYAGENTS_TEST_POSTGRES_URL unset)"
+        );
         return;
     };
     let _guard = test_lock();
@@ -479,7 +479,12 @@ fn sqlite_to_postgres_migration_preserves_data_and_sequences() {
     let seg_path = src_dir.path().join("raw/seg1.raw");
     let seg = RawSegment::open(&seg_path).unwrap();
     let coord = seg.append(br#"{"text":"MigHostNeedle"}"#).unwrap();
-    let mut src_hidx = HostIndex::open(&src_dir.path().join(anyagents_core::host_retrieval::INDEX_FILE)).unwrap();
+    let mut src_hidx = HostIndex::open(
+        &src_dir
+            .path()
+            .join(anyagents_core::host_retrieval::INDEX_FILE),
+    )
+    .unwrap();
     src_hidx
         .index(
             &format!("migdoc_{tag}"),
@@ -502,9 +507,24 @@ fn sqlite_to_postgres_migration_preserves_data_and_sequences() {
 
     let opts = anyagents_core::db::MigrateToPostgresOptions::new(src_dir.path(), &url);
     let report = anyagents_core::db::migrate_sqlite_dir_to_postgres(&opts).unwrap();
-    assert!(report.tables.iter().any(|t| t.pg_table == "public.agents" && t.sqlite_rows == 3));
-    assert!(report.tables.iter().any(|t| t.pg_table == "memory_index.rag_chunks" && t.sqlite_rows >= 1));
-    assert!(report.tables.iter().any(|t| t.pg_table == "host_index.host_documents" && t.sqlite_rows == 1));
+    assert!(
+        report
+            .tables
+            .iter()
+            .any(|t| t.pg_table == "public.agents" && t.sqlite_rows == 3)
+    );
+    assert!(
+        report
+            .tables
+            .iter()
+            .any(|t| t.pg_table == "memory_index.rag_chunks" && t.sqlite_rows >= 1)
+    );
+    assert!(
+        report
+            .tables
+            .iter()
+            .any(|t| t.pg_table == "host_index.host_documents" && t.sqlite_rows == 1)
+    );
     assert!(report.reconciled_archived_runtime >= 1);
 
     let pg_dir = tempfile::tempdir().unwrap();
@@ -538,12 +558,19 @@ fn sqlite_to_postgres_migration_preserves_data_and_sequences() {
             ..Default::default()
         })
         .unwrap();
-    assert!(!hits.is_empty(), "expected CJK search hit after PG migration");
+    assert!(
+        !hits.is_empty(),
+        "expected CJK search hit after PG migration"
+    );
 
     // Verify migrated HostIndex document metadata exists on PG.
     let pg_hidx = HostIndex::open_postgres(&url).unwrap();
     let doc = pg_hidx
-        .document(&[child.id.to_string()], MemoryScope::All, &format!("migdoc_{tag}"))
+        .document(
+            &[child.id.to_string()],
+            MemoryScope::All,
+            &format!("migdoc_{tag}"),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(doc.metadata.agent_id, child.id.as_str());

@@ -251,10 +251,7 @@ impl Store {
 /// A resume clears a parking and the run that caused it; any other start
 /// leaves a run in progress counted. Called inside the transaction that sets
 /// the agent running.
-pub(super) fn clear_parking(
-    tx: &(impl DbExec + ?Sized),
-    agent_id: &AgentId,
-) -> Result<(), Error> {
+pub(super) fn clear_parking(tx: &(impl DbExec + ?Sized), agent_id: &AgentId) -> Result<(), Error> {
     tx.db_execute(
         "UPDATE turn_errors SET streak = 0, faulted_at_ms = NULL
          WHERE agent_id = ?1 AND faulted_at_ms IS NOT NULL",

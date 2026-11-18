@@ -110,11 +110,7 @@ fn forbidden(name: &str, reason: &'static str) -> Error {
     }
 }
 
-fn supervises(
-    conn: &dyn DbExec,
-    caller: &AgentId,
-    target: &AgentId,
-) -> Result<bool, Error> {
+fn supervises(conn: &dyn DbExec, caller: &AgentId, target: &AgentId) -> Result<bool, Error> {
     let mut cursor = Some(target.clone());
     let mut seen = HashSet::new();
     while let Some(id) = cursor {
