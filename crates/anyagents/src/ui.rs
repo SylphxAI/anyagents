@@ -341,6 +341,7 @@ pub struct Table {
     rows: Vec<Vec<String>>,
     indent: &'static str,
     fit_terminal: bool,
+    preserve_cells: bool,
 }
 
 impl Table {
@@ -351,11 +352,18 @@ impl Table {
             rows: Vec::new(),
             indent: "  ",
             fit_terminal: true,
+            preserve_cells: false,
         }
     }
 
     pub fn with_fit_terminal(mut self, fit: bool) -> Self {
         self.fit_terminal = fit;
+        self
+    }
+
+    /// Fall back to labeled rows rather than chopping identities or status.
+    fn preserve_cells(mut self) -> Self {
+        self.preserve_cells = true;
         self
     }
 
@@ -388,7 +396,7 @@ impl Table {
                 .map(|(h, _)| visible_width(h).max(6))
                 .sum::<usize>()
                 + 2 * cols.saturating_sub(1);
-            if minimum > available {
+            if minimum > available || self.preserve_cells {
                 let mut lines = Vec::new();
                 for (n, row) in self.rows.iter().enumerate() {
                     if n > 0 {
@@ -398,7 +406,11 @@ impl Table {
                         let cell = row.get(i).map(String::as_str).unwrap_or("—");
                         let label = format!("{}{}  ", self.indent, dim(title));
                         let space = term_w.saturating_sub(visible_width(&label));
-                        lines.push(format!("{label}{}", truncate_visible(cell, space)));
+                        if self.preserve_cells {
+                            lines.push(format!("{label}{cell}"));
+                        } else {
+                            lines.push(format!("{label}{}", truncate_visible(cell, space)));
+                        }
                     }
                 }
                 return lines;
@@ -506,6 +518,7 @@ fn state_rank(state: &str, process: &str, turn_state: &str) -> u8 {
 /// Options controlling how the agent hierarchy table is rendered.
 #[derive(Clone, Copy, Debug)]
 pub struct AgentsTableOptions {
+    pub title: &'static str,
     pub include_archived: bool,
     pub archived_count: Option<usize>,
     /// Maximum sub-agent tree depth to expand (`Some(0)` = roots only with subtree summary;
@@ -520,6 +533,7 @@ pub struct AgentsTableOptions {
 impl Default for AgentsTableOptions {
     fn default() -> Self {
         Self {
+            title: "Agents",
             include_archived: false,
             archived_count: None,
             max_depth: Some(0),
@@ -556,21 +570,21 @@ fn compute_subtree_stats<'a>(
             let child_stats = compute_subtree_stats(&kid.id, children_by_parent, now, memo);
             stats.total += 1 + child_stats.total;
             stats.max_depth = stats.max_depth.max(1 + child_stats.max_depth);
+            let on_quota = is_quota_held(kid, now);
             match (
                 kid.state.as_str(),
                 kid.process.as_str(),
                 kid.turn_state.as_str(),
             ) {
-                ("running", "alive", "working") => stats.working += 1,
+                ("running", "alive", "working") if is_healthy_active_turn(kid, on_quota) => {
+                    stats.working += 1
+                }
                 ("running", _, _) => stats.ready_or_starting += 1,
                 ("idle", _, _) => stats.scaled_idle += 1,
                 ("paused", _, _) => stats.paused += 1,
                 ("archived", _, _) => stats.archived += 1,
                 _ => stats.scaled_idle += 1,
             }
-            let on_quota = kid
-                .quota_reset_at_ms
-                .is_some_and(|ms| ms > now && ms - now < 86_400_000 * 7);
             let is_blocked = kid
                 .block_reason
                 .as_deref()
@@ -668,30 +682,37 @@ fn is_expected_turn_queue(agent: &AgentView, on_quota: bool) -> bool {
         && (agent.delivery.level == "turn-end" || agent.pending_switch)
 }
 
-fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
-    let on_quota = agent
-        .quota_reset_at_ms
-        .is_some_and(|ms| ms > now && ms - now < 86_400_000 * 7);
-    if agent.state == "running"
-        && on_quota
-        && let Some(reset_ms) = agent.quota_reset_at_ms
-    {
-        return yellow(&format!("○ quota ({})", format_duration_ms(reset_ms - now)));
+pub(crate) fn is_quota_held(agent: &AgentView, now: i64) -> bool {
+    agent.state == "running"
+        && agent
+            .quota_reset_at_ms
+            .is_some_and(|ms| ms > now && ms - now < 86_400_000 * 7)
+}
+
+pub(crate) fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
+    let on_quota = is_quota_held(agent, now);
+    if on_quota && let Some(reset_ms) = agent.quota_reset_at_ms {
+        return yellow(&format!("◐ quota ↻{}", format_duration_ms(reset_ms - now)));
     }
-    let mut base = format_agent_status(
-        &agent.state,
-        &agent.process,
-        &agent.turn_state,
-        agent.quota_reset_at_ms,
-        agent.block_reason.as_deref(),
-    );
+    let mut base = if agent.display_state() == "faulted" {
+        red("✕ faulted")
+    } else if matches!(agent.state.as_str(), "running" | "idle")
+        && agent.block_reason.as_deref() == Some("sign_in_required")
+    {
+        red("✕ sign-in required")
+    } else {
+        format_agent_status(
+            &agent.state,
+            &agent.process,
+            &agent.turn_state,
+            agent.quota_reset_at_ms,
+            agent.block_reason.as_deref(),
+        )
+    };
     if is_healthy_active_turn(agent, on_quota)
         && let Some(turn_ms) = agent.open_turn_age_ms.filter(|&ms| ms >= 5_000)
     {
-        base = format!(
-            "{base} {}",
-            dim(&format!("({})", format_duration_ms(turn_ms)))
-        );
+        base = format!("{base} {}", dim(&format_duration_ms(turn_ms)));
     }
     if agent.state != "archived"
         && agent.state != "paused"
@@ -828,50 +849,22 @@ fn clean_agent_description(
 }
 
 /// Render the agent list using default options (concise root overview with subtree depth/status summary).
-pub fn print_agents_table(
-    agents: &[AgentView],
-    profile_lookup: Option<&dyn Fn(&AgentView) -> String>,
-    include_archived: bool,
-) {
-    print_agents_table_with_options(
-        agents,
-        profile_lookup,
-        AgentsTableOptions {
-            include_archived,
-            ..AgentsTableOptions::default()
-        },
-    );
-}
-
-/// Render the agent list as a clean root overview or multi-level hierarchical tree (`L1 -> L2 -> L3+`).
 pub fn print_agents_table_with_options(
     agents: &[AgentView],
     profile_lookup: Option<&dyn Fn(&AgentView) -> String>,
     options: AgentsTableOptions,
 ) {
     if agents.is_empty() {
-        println!("  {}", dim("No agents found."));
+        println!(
+            "\n  {}\n  {}",
+            bold_cyan(options.title),
+            dim("No agents found.")
+        );
         return;
     }
 
     let include_archived = options.include_archived;
     let now = anyagents_core::now_ms();
-    let running = agents.iter().filter(|a| a.state == "running").count();
-    let working = agents
-        .iter()
-        .filter(|a| a.state == "running" && a.process == "alive" && a.turn_state == "working")
-        .count();
-    let quota_count = agents
-        .iter()
-        .filter(|a| {
-            a.state == "running"
-                && a.quota_reset_at_ms
-                    .is_some_and(|ms| ms > now && ms - now < 86_400_000 * 7)
-        })
-        .count();
-    let idle = running.saturating_sub(working).saturating_sub(quota_count);
-    let scaled_idle = agents.iter().filter(|a| a.state == "idle").count();
-    let paused = agents.iter().filter(|a| a.state == "paused").count();
     let archived = options
         .archived_count
         .unwrap_or_else(|| agents.iter().filter(|a| a.state == "archived").count());
@@ -963,62 +956,63 @@ pub fn print_agents_table_with_options(
         .max()
         .unwrap_or(0);
 
-    let mut summary = Vec::new();
-    if running > 0 {
-        let mut breakdown = Vec::new();
-        if working > 0 {
-            breakdown.push(format!("{working} working"));
-        }
-        if idle > 0 {
-            breakdown.push(format!("{idle} idle"));
-        }
-        if quota_count > 0 {
-            breakdown.push(format!("{quota_count} quota"));
-        }
-        let detail = if breakdown.is_empty() {
-            bold_green(&format!("{running} active"))
-        } else {
-            format!(
-                "{} ({})",
-                bold_green(&format!("{running} active")),
-                breakdown.join(", ")
-            )
-        };
-        summary.push(detail);
-    }
-    if scaled_idle > 0 {
-        summary.push(dim(&format!("{scaled_idle} idle (process released)")));
-    }
-    if paused > 0 {
-        summary.push(yellow(&format!("{paused} paused")));
-    }
-    if archived > 0 {
-        if include_archived {
-            summary.push(dim(&format!("{archived} archived")));
-        } else {
-            summary.push(dim(&format!("{archived} archived hidden (--state all)")));
+    let working = visible_agents
+        .iter()
+        .filter(|a| is_healthy_active_turn(a, is_quota_held(a, now)))
+        .count();
+    let quota = visible_agents
+        .iter()
+        .filter(|a| is_quota_held(a, now))
+        .count();
+    let paused = visible_agents
+        .iter()
+        .filter(|a| a.display_state() == "paused")
+        .count();
+    let faulted = visible_agents
+        .iter()
+        .filter(|a| a.display_state() == "faulted")
+        .count();
+    let mut counts = Vec::new();
+    for (count, label) in [
+        (working, "working"),
+        (quota, "quota-held"),
+        (paused, "paused"),
+        (faulted, "faulted"),
+    ] {
+        if count > 0 {
+            counts.push(format!("{count} {label}"));
         }
     }
-    println!("\n  {}  {}", bold_cyan("Agents"), summary.join(&dim(" · ")));
-    if total_subagents > 0 {
-        let view_hint = match options.max_depth {
-            Some(0) => "use --tree (-t) or --depth <N> (-d) to expand sub-agents".to_string(),
-            Some(d) if d < global_max_depth => {
-                format!(
-                    "showing depth ≤ {d} of {global_max_depth} · use --tree (-t) or -d {global_max_depth} for all"
-                )
+    let detail = if counts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", counts.join(", "))
+    };
+    let archive_note = if archived > 0 && (include_archived || options.wide) {
+        format!(
+            " · {archived} archived{}",
+            if include_archived {
+                ""
+            } else {
+                " hidden (--state all)"
             }
-            _ => format!("showing full tree ({global_max_depth} levels deep)"),
-        };
+        )
+    } else {
+        String::new()
+    };
+    println!(
+        "\n  {}  {} root agents · {total_subagents} sub-agents{detail}{archive_note}",
+        bold_cyan(options.title),
+        roots.len()
+    );
+    if options.title == "Agents"
+        && options
+            .max_depth
+            .is_some_and(|depth| depth < global_max_depth)
+    {
         println!(
-            "          {}",
-            dim(&format!(
-                "{} roots · {} sub-agents (up to {} deep) · {}",
-                roots.len(),
-                total_subagents,
-                global_max_depth,
-                view_hint
-            ))
+            "  {}",
+            dim("Use --tree or --depth <N> to expand sub-agents.")
         );
     }
     println!();
@@ -1120,33 +1114,24 @@ pub fn print_agents_table_with_options(
         );
     }
 
-    let has_descriptions = ordered.iter().any(|n| {
-        n.agent
-            .description
-            .as_deref()
-            .is_some_and(|d| !d.trim().is_empty())
-    });
-
     let mut headers = vec![
         ("AGENT", false),
-        ("ROLE", false),
         ("STATUS", false),
-        ("TREE", false),
-        ("RUNTIME", false),
-        ("DELIVERY", false),
-        ("AUTOMATIONS", false),
+        (if options.wide { "RUNTIME" } else { "MODEL" }, false),
+        ("SUBAGENTS", false),
+        ("ROLE", false),
     ];
-    if profile_lookup.is_some() {
-        headers.push(("PROFILE", false));
-    }
-    if has_descriptions {
-        headers.push(("DESCRIPTION", false));
-    }
     if options.wide {
-        headers.push(("ID", false));
+        headers.push(("AUTOMATIONS", false));
+        if profile_lookup.is_some() {
+            headers.push(("PROFILE", false));
+        }
+        headers.extend([("DESCRIPTION", false), ("ID", false)]);
     }
 
-    let mut table = Table::new(&headers).with_fit_terminal(!options.wide);
+    let mut table = Table::new(&headers)
+        .with_fit_terminal(!options.wide)
+        .preserve_cells();
     for node in ordered {
         let agent = node.agent;
         let is_dim = agent.state == "archived" || agent.state == "idle";
@@ -1156,7 +1141,13 @@ pub fn print_agents_table_with_options(
             .get(agent.id.as_str())
             .copied()
             .unwrap_or_default();
-        let tree_cell = if node.depth == 0 {
+        let tree_cell = if !options.wide {
+            match (stats.total, stats.working) {
+                (0, _) => dim("—"),
+                (total, 0) => total.to_string(),
+                (total, working) => format!("{total} ({working} working)"),
+            }
+        } else if node.depth == 0 {
             if stats.total == 0 {
                 dim("-")
             } else {
@@ -1186,8 +1177,23 @@ pub fn print_agents_table_with_options(
         };
 
         let model_raw = agent.model.as_deref().unwrap_or("-");
-        let mut short_model = short_model_name(model_raw);
-        if agent.harness == "claude-code"
+        let mut short_model = if options.wide {
+            std::borrow::Cow::Borrowed(model_raw)
+        } else {
+            short_model_name(
+                model_raw
+                    .strip_prefix("sylphx/openai/")
+                    .unwrap_or(model_raw),
+            )
+        };
+        if !options.wide
+            && agent.harness == "agy"
+            && let Some(stripped) = short_model.strip_prefix("gemini-4-")
+        {
+            short_model = std::borrow::Cow::Owned(stripped.to_string());
+        }
+        if !options.wide
+            && agent.harness == "claude-code"
             && let Some(stripped) = short_model.strip_prefix("claude-")
         {
             short_model = std::borrow::Cow::Owned(stripped.to_string());
@@ -1217,22 +1223,12 @@ pub fn print_agents_table_with_options(
             None => dim("-"),
         };
 
-        let delivery = agent.delivery.label();
-        let delivery_cell = if is_dim { dim(&delivery) } else { delivery };
-        let mut row = vec![
-            node.display_name,
-            role_cell,
-            status,
-            tree_cell,
-            runtime,
-            delivery_cell,
-            automation_summary(&agent.automations),
-        ];
-        if let Some(lookup) = profile_lookup {
-            let prof = lookup(agent);
-            row.push(if is_dim { dim(&prof) } else { prof });
-        }
-        if has_descriptions {
+        let mut row = vec![node.display_name, status, runtime, tree_cell, role_cell];
+        if options.wide {
+            row.push(automation_summary(&agent.automations));
+            if let Some(lookup) = profile_lookup {
+                row.push(lookup(agent));
+            }
             let cleaned = agent
                 .description
                 .as_deref()
@@ -1246,8 +1242,6 @@ pub fn print_agents_table_with_options(
             } else {
                 desc_text.to_string()
             });
-        }
-        if options.wide {
             row.push(dim(&agent.id));
         }
         table.add_row(row);

@@ -1371,6 +1371,7 @@ fn list_filtered(
             &listed.agents,
             None,
             crate::ui::AgentsTableOptions {
+title: "Agents",
                 include_archived,
                 archived_count: Some(listed.archived_count),
                 max_depth: effective_max_depth,
