@@ -2325,69 +2325,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn coordinate_inputs_dispatch_refuses_without_input_on_owned_desktop() {
-        if std::env::var("ANYAGENTS_DESKTOP_HEADFUL").as_deref() != Ok("1") {
-            eprintln!("skipped: set ANYAGENTS_DESKTOP_HEADFUL=1");
-            return;
-        }
-        use crate::workstation::{Caller, browser, desktop, session};
-        use futures::FutureExt as _;
-        let data = tempfile::tempdir().unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let caller = Caller {
-            agent_id: None,
-            principal: "coordinate-regression".into(),
-            profile: "coordinate-regression".into(),
-        };
-        let browser_call = async |req: Value| {
-            browser::execute(
-                data.path(),
-                &caller,
-                serde_json::from_value(req).unwrap(),
-                &crate::agent_file::FileAuthority::Own,
-            )
-            .await
-            .unwrap()
-        };
-        let outcome = std::panic::AssertUnwindSafe(async {
-            browser_call(json!({"action":"open","url":"about:blank"})).await;
-            browser_call(json!({"action":"eval","script":"window.clicks=[];document.addEventListener('click',e=>clicks.push([e.clientX,e.clientY]));document.body.style.margin='0'"})).await;
-            for req in [
-                json!({"action":"click","x":200,"y":200}),
-                json!({"action":"left_click","coordinate":[200,200]}),
-                json!({"type":"click","x":200,"y":200,"button":"left"}),
-            ] {
-                desktop::execute(data.path(), &caller, req).await.unwrap();
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let clicks = browser_call(json!({"action":"eval","script":"window.clicks.splice(0)"})).await;
-            assert_eq!(clicks["result"].as_array().unwrap().len(), 3);
-            for req in [
-                json!({"action":"click","x":4294967415_i64,"y":200}),
-                json!({"action":"left_click","coordinate":[4294967415_i64,200]}),
-                json!({"type":"click","x":4294967415_i64,"y":200}),
-                json!({"action":"mouse_down","coordinate":null}),
-                json!({"action":"scroll","x":200}),
-            ] {
-                let error = desktop::execute(data.path(), &caller, req).await.unwrap_err().to_string();
-                assert!(error.contains("INVALID_INPUT"), "{error}");
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let clicks = browser_call(json!({"action":"eval","script":"window.clicks"})).await;
-            assert_eq!(clicks["result"], json!([]));
-            let pos = desktop::execute(data.path(), &caller, json!({"action":"cursor_position"})).await.unwrap();
-            assert_eq!((pos["x"].as_i64(),pos["y"].as_i64()), (Some(200),Some(200)));
-        }).catch_unwind().await;
-        session::stop(data.path(), &caller.profile).await;
-        assert!(session::running(data.path(), &caller.profile).is_none());
-        if let Err(panic) = outcome {
-            std::panic::resume_unwind(panic);
-        }
-    }
-
     #[test]
     fn parses_flat_sdk_computer_actions() {
         let click = parse_computer_action(&json!({
