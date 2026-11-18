@@ -1692,7 +1692,7 @@ mod tests {
         assert!(rendered_followup.contains("queued 3m"));
         assert!(!rendered_followup.contains("! lag"));
 
-        let mut attention = steered;
+        let mut attention = steered.clone();
         let now = 10_000_000;
         assert_eq!(agent_attention(&attention, now), None);
         attention.last_error = Some("private error details".into());
