@@ -111,6 +111,7 @@ pub enum Routed {
     /// the agent that posted it.
     EchoToPeers {
         chat_id: i64,
+        telegram_sender_id: Option<i64>,
         outbound_id: i64,
         text: String,
         /// The agent whose bot posted it, when the record says. The peer reads
@@ -139,6 +140,76 @@ pub enum Routed {
     Dropped,
 }
 
+/// Each configured channel list must match; an empty list matches nothing.
+/// The environment fallback matches positive user IDs or negative chat IDs.
+#[derive(Debug, Default, Deserialize)]
+pub struct CallerAllowlist {
+    allowed_user_ids: Option<Vec<i64>>,
+    allowed_chat_ids: Option<Vec<i64>>,
+    #[serde(skip)]
+    fallback_ids: Option<Vec<i64>>,
+    #[serde(skip)]
+    invalid: bool,
+}
+
+impl CallerAllowlist {
+    /// A valid environment list is a fallback for channels without policy.
+    /// Malformed configuration (including non-UTF-8 environment) denies all.
+    pub fn from_config(config: &str, fallback: Option<&std::ffi::OsStr>) -> Self {
+        let deny = || Self {
+            invalid: true,
+            ..Self::default()
+        };
+        let Ok(mut policy) = serde_json::from_str::<Self>(config) else {
+            return deny();
+        };
+        if !config.trim_start().starts_with('{')
+            || policy.allowed_user_ids.iter().flatten().any(|&id| id <= 0)
+            || policy.allowed_chat_ids.iter().flatten().any(|&id| id == 0)
+        {
+            return deny();
+        }
+        if let Some(fallback) = fallback {
+            let Some(raw) = fallback.to_str() else {
+                return deny();
+            };
+            let ids = if raw.trim_start().starts_with('[') {
+                serde_json::from_str::<Vec<i64>>(raw).ok()
+            } else if raw.trim().is_empty() {
+                Some(Vec::new())
+            } else {
+                raw.split(',')
+                    .map(|id| id.trim().parse::<i64>().ok())
+                    .collect()
+            };
+            let Some(ids) = ids.filter(|ids| !ids.contains(&0)) else {
+                return deny();
+            };
+            if policy.allowed_user_ids.is_none() && policy.allowed_chat_ids.is_none() {
+                policy.fallback_ids = Some(ids);
+            }
+        }
+        policy
+    }
+
+    pub fn allows(&self, user: Option<i64>, chat: Option<i64>) -> bool {
+        if self.invalid {
+            return false;
+        }
+        if let Some(ids) = &self.fallback_ids {
+            return user.is_some_and(|id| id > 0 && ids.contains(&id))
+                || chat.is_some_and(|id| id < 0 && ids.contains(&id));
+        }
+        self.allowed_user_ids
+            .as_ref()
+            .is_none_or(|ids| user.is_some_and(|id| ids.contains(&id)))
+            && self
+                .allowed_chat_ids
+                .as_ref()
+                .is_none_or(|ids| chat.is_some_and(|id| ids.contains(&id)))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct Update {
     update_id: i64,
@@ -154,6 +225,23 @@ struct Update {
     /// A bot managed by this bot was created or its token was updated (`managed_bot`, Bot API 9.6+).
     #[serde(default)]
     managed_bot: Option<TgManagedBotUpdated>,
+}
+
+impl Update {
+    // Match dispatch priority; another field cannot authorize this event.
+    fn caller(&self) -> (Option<i64>, Option<i64>) {
+        if let Some(member) = &self.my_chat_member {
+            (member.from.as_ref().map(|u| u.id), Some(member.chat.id))
+        } else if let Some(bot) = &self.managed_bot {
+            (Some(bot.user.id), None)
+        } else if let Some(reaction) = &self.message_reaction {
+            (reaction.user.as_ref().map(|u| u.id), Some(reaction.chat.id))
+        } else if let Some(msg) = self.message.as_ref().or(self.edited_message.as_ref()) {
+            (msg.from.as_ref().map(|u| u.id), Some(msg.chat.id))
+        } else {
+            (None, None)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -189,6 +277,7 @@ struct TgReactionType {
 #[derive(Clone, Debug, Deserialize)]
 struct ChatMemberUpdate {
     chat: TgChat,
+    from: Option<TgUser>,
     new_chat_member: ChatMember,
 }
 
@@ -1044,12 +1133,27 @@ impl Poll {
         agent: &str,
         payload: &str,
     ) -> Result<Vec<Routed>, PollError> {
+        self.route_with_allowlist(bot, agent, payload, &CallerAllowlist::default())
+    }
+
+    /// Reject before dispatch, but acknowledge denied IDs in the cursor.
+    pub fn route_with_allowlist(
+        &mut self,
+        bot: &str,
+        agent: &str,
+        payload: &str,
+        allowlist: &CallerAllowlist,
+    ) -> Result<Vec<Routed>, PollError> {
         let updates: Vec<Update> =
             serde_json::from_str(payload).map_err(|e| PollError::BadPayload(e.to_string()))?;
         let mut out = Vec::new();
         for update in updates {
             if update.update_id >= self.offset {
                 self.offset = update.update_id + 1;
+            }
+            let (user, chat) = update.caller();
+            if !allowlist.allows(user, chat) {
+                continue;
             }
             // A membership change is how a bot learns it is in, or out of, a
             // group. It carries no message and is recorded, not delivered.
@@ -1170,6 +1274,7 @@ impl Poll {
             {
                 out.push(Routed::EchoToPeers {
                     chat_id: record.chat_id,
+                    telegram_sender_id: message.from.as_ref().map(|u| u.id),
                     outbound_id: record.message_id,
                     text: record.text.clone(),
                     sender_agent: Some(record.sender_agent.clone()),
@@ -2646,6 +2751,7 @@ pub fn deliver_to_mailbox(
             sender_agent,
             reply_to,
             quote,
+            ..
         } => {
             for (agent_id, chat) in peers {
                 if chat != chat_id {
@@ -2710,6 +2816,59 @@ pub fn telegram_sender(inbound: &Inbound) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn allowlist_is_typed_and_fails_closed() {
+        use std::ffi::OsStr;
+        let policy =
+            |config, env: Option<&str>| CallerAllowlist::from_config(config, env.map(OsStr::new));
+        assert!(policy("{}", None).allows(None, None));
+        assert!(policy(r#"{"allowed_chat_ids":[-42]}"#, None).allows(None, Some(-42)));
+        let both = policy(r#"{"allowed_user_ids":[7],"allowed_chat_ids":[-42]}"#, None);
+        assert!(both.allows(Some(7), Some(-42)));
+        assert!(!both.allows(Some(8), Some(-42)));
+        assert!(!both.allows(Some(7), None));
+        assert!(!both.allows(None, Some(-42)));
+        for (config, env) in [
+            (r#"{"allowed_user_ids":[]}"#, None),
+            (r#"{"allowed_chat_ids":[]}"#, None),
+            (r#"{"allowed_user_ids":["7"]}"#, None),
+            (r#"{"allowed_chat_ids":false}"#, None),
+            ("{}", Some("")),
+            ("{}", Some("[]")),
+            ("{}", Some("7,typo")),
+            (r#"{"allowed_user_ids":[7]}"#, Some("[7,]")),
+        ] {
+            assert!(
+                !policy(config, env).allows(Some(7), Some(-42)),
+                "{config}: {env:?}"
+            );
+        }
+        for env in ["7, -42", "[7,-42]"] {
+            let fallback = policy("{}", Some(env));
+            assert!(fallback.allows(Some(7), Some(7)));
+            assert!(fallback.allows(Some(8), Some(-42)));
+            assert!(!fallback.allows(Some(8), Some(7)));
+            assert!(!policy(r#"{"allowed_user_ids":[8]}"#, Some(env)).allows(Some(7), Some(-42)));
+        }
+    }
+
+    #[test]
+    fn denied_membership_and_reactions_advance_the_cursor_without_routing() {
+        let restriction = CallerAllowlist::from_config(r#"{"allowed_user_ids":[7]}"#, None);
+        let mut poll = Poll::resume(0);
+        let payload = r#"[
+            {"update_id":1,"my_chat_member":{"chat":{"id":-42,"type":"supergroup"},"from":{"id":8},"new_chat_member":{"status":"member"}}},
+            {"update_id":2,"message_reaction":{"chat":{"id":-42,"type":"supergroup"},"message_id":10,"date":0,"new_reaction":[{"type":"emoji","emoji":"👍"}]}},
+            {"update_id":3,"edited_message":{"message_id":11,"chat":{"id":-42,"type":"supergroup"},"from":{"id":8},"text":"edit","date":0}}
+        ]"#;
+        assert!(
+            poll.route_with_allowlist("bot", "agent", payload, &restriction)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(poll.offset, 4);
+    }
+
     fn payload(update_id: i64, chat: i64, message_id: i64, text: &str) -> String {
         format!(
             r#"[{{"update_id":{update_id},"message":{{"message_id":{message_id},"chat":{{"id":{chat}}},"date":1700000000,"text":"{text}"}}}}]"#
@@ -2758,6 +2917,7 @@ mod tests {
             routed,
             vec![Routed::EchoToPeers {
                 chat_id: 100,
+                telegram_sender_id: None,
                 outbound_id: 9,
                 text: "from ada".to_string(),
                 sender_agent: Some("ada".to_string()),

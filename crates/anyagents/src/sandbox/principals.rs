@@ -188,16 +188,118 @@ pub(crate) fn reconcile_principals(store: &Store) -> Result<(), Error> {
     update(store.data_dir(), &store.list_agents()?, true)
 }
 
-/// New children inherit the parent's bound principal. New roots require an
-/// explicit grant or an exact per-ID OS account; their names confer no grant.
-pub(crate) fn bind_principal(store: &Store, agent: &Agent) -> Result<(), Error> {
-    if std::env::var_os("ANYAGENTS_PRINCIPALS").is_some() {
-        return Ok(());
+/// Optional account selection and UID assertion from an authenticated operator.
+#[derive(Default)]
+pub(crate) struct RootSeatRequest {
+    pub user: Option<String>,
+    pub uid: Option<u32>,
+}
+
+impl RootSeatRequest {
+    pub fn explicit(&self) -> bool {
+        self.user.is_some() || self.uid.is_some()
     }
-    update(store.data_dir(), std::slice::from_ref(agent), false)
+}
+
+/// Returns whether this call installed a new operator seat grant.
+pub(crate) fn bind_principal(
+    store: &Store,
+    agent: &Agent,
+    root: Option<&RootSeatRequest>,
+) -> Result<bool, Error> {
+    let explicit = root.is_some_and(RootSeatRequest::explicit);
+    if root.is_some() && agent.parent_id.is_some() {
+        return Err(seat_denied(
+            "seat admission requires an operator-created root",
+        ));
+    }
+    if std::env::var_os("ANYAGENTS_PRINCIPALS").is_some() {
+        if explicit {
+            return Err(seat_denied(
+                "cannot select a seat with an operator principal map",
+            ));
+        }
+        return Ok(false);
+    }
+    let data = store.data_dir();
+    let Some(root) = root else {
+        update(data, std::slice::from_ref(agent), false)?;
+        return Ok(false);
+    };
+    let prefix = seat_prefix();
+    let mut claimed = false;
+    edit_registry(data, |grants, _| {
+        let socket_gid = registry_socket_gid(grants);
+        claimed = claim_root_seat(grants, agent, root, &prefix, socket_gid, |user| {
+            lookup_root_account(data, user)
+        })?;
+        if claimed || grants.contains_key(agent.id.as_str()) {
+            return Ok(claimed);
+        }
+        // No named seat was requested or found; keep ordinary per-ID behavior.
+        Ok(socket_gid.is_some_and(|gid| {
+            extend(
+                grants,
+                std::slice::from_ref(agent),
+                &prefix,
+                gid,
+                false,
+                lookup_account,
+            )
+        }))
+    })?;
+    Ok(claimed)
+}
+
+pub(crate) fn rollback_root_seat(store: &Store, id: &AgentId) -> Result<(), Error> {
+    edit_registry(store.data_dir(), |grants, _| {
+        let Some(grant) = grants.get(id.as_str()) else {
+            return Ok(false);
+        };
+        // A live child can inherit a grant during creation. Keep the original
+        // reservation if anyone else uses these credentials.
+        let (user, uid) = (grant["user"].as_str(), grant["uid"].as_u64());
+        if grants.iter().any(|(other, value)| {
+            other != id.as_str() && (value["user"].as_str() == user || value["uid"].as_u64() == uid)
+        }) {
+            return Ok(false);
+        }
+        grants.remove(id.as_str());
+        Ok(true)
+    })
+}
+
+fn seat_prefix() -> String {
+    std::env::var("ANYAGENTS_SEAT_USER_PREFIX").unwrap_or_else(|_| "seat-".into())
+}
+
+fn registry_socket_gid(grants: &Map<String, Value>) -> Option<u32> {
+    super::sock_gid_for().or_else(|| {
+        grants
+            .values()
+            .find_map(|entry| u32::try_from(entry.get("socket_gid")?.as_u64()?).ok())
+    })
 }
 
 fn update(data: &Path, agents: &[Agent], import_legacy: bool) -> Result<(), Error> {
+    edit_registry(data, |grants, new| {
+        Ok(registry_socket_gid(grants).is_some_and(|gid| {
+            extend(
+                grants,
+                agents,
+                &seat_prefix(),
+                gid,
+                import_legacy && new,
+                lookup_account,
+            )
+        }))
+    })
+}
+
+fn edit_registry(
+    data: &Path,
+    edit: impl FnOnce(&mut Map<String, Value>, bool) -> Result<bool, Error>,
+) -> Result<(), Error> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -216,28 +318,7 @@ fn update(data: &Path, agents: &[Agent], import_legacy: bool) -> Result<(), Erro
             .map_err(|_| Error::Message("invalid principal registry".into()))?,
         None => Map::new(),
     };
-    let prefix = std::env::var("ANYAGENTS_SEAT_USER_PREFIX").unwrap_or_else(|_| "seat-".into());
-    let Some(socket_gid) = super::sock_gid_for().or_else(|| {
-        grants.values().find_map(|entry| {
-            entry
-                .get("socket_gid")?
-                .as_u64()
-                .and_then(|n| u32::try_from(n).ok())
-        })
-    }) else {
-        // Existing registries remain in force, even when automatic provisioning
-        // is unavailable; this is not permission to choose another principal.
-        return Ok(());
-    };
-    let changed = extend(
-        &mut grants,
-        agents,
-        &prefix,
-        socket_gid,
-        import_legacy && old.is_none(),
-        lookup_account,
-    );
-    if !changed && (old.is_some() || grants.is_empty()) {
+    if !edit(&mut grants, old.is_none())? {
         return Ok(());
     }
     let temp = data.join(format!(
@@ -264,6 +345,91 @@ fn update(data: &Path, agents: &[Agent], import_legacy: bool) -> Result<(), Erro
     result
 }
 
+fn seat_denied(message: &str) -> Error {
+    Error::PermissionDenied(message.into())
+}
+
+fn seat_claimed(grants: &Map<String, Value>, user: &str, uid: u32) -> bool {
+    grants.values().any(|grant| {
+        grant["user"].as_str() == Some(user) || grant["uid"].as_u64() == Some(uid.into())
+    })
+}
+
+fn claim_root_seat(
+    grants: &mut Map<String, Value>,
+    agent: &Agent,
+    request: &RootSeatRequest,
+    prefix: &str,
+    socket_gid: Option<u32>,
+    lookup: impl FnOnce(&str) -> Result<Option<(u32, u32)>, Error>,
+) -> Result<bool, Error> {
+    if let Some(grant) = grants.get(agent.id.as_str()) {
+        if request
+            .user
+            .as_deref()
+            .is_some_and(|user| grant["user"].as_str() != Some(user))
+            || request
+                .uid
+                .is_some_and(|uid| grant["uid"].as_u64() != Some(uid.into()))
+        {
+            return Err(seat_denied("execution principal grant is immutable"));
+        }
+        return Ok(false);
+    }
+    let default_user = format!("{prefix}{}", agent.name);
+    let user = request.user.as_deref().unwrap_or(&default_user);
+    // Named admission cannot consume the reserved per-ID account namespace.
+    if prefix.is_empty()
+        || user
+            .strip_prefix(prefix)
+            .is_none_or(|slug| slug.is_empty() || AgentId::parse(slug).is_ok())
+    {
+        return if request.explicit() {
+            Err(seat_denied("expected a named seat account"))
+        } else {
+            Ok(false)
+        };
+    }
+    let Some((uid, gid)) = lookup(user)? else {
+        return if request.explicit() {
+            Err(seat_denied("named seat account does not exist"))
+        } else {
+            Ok(false)
+        };
+    };
+    if uid == 0
+        || uid == super::current_uid()
+        || request.uid.is_some_and(|expected| uid != expected)
+    {
+        return Err(seat_denied(
+            "named seat UID is not eligible or does not match",
+        ));
+    }
+    if seat_claimed(grants, user, uid) {
+        return Err(seat_denied("named seat account is already claimed"));
+    }
+    let socket_gid = socket_gid.ok_or_else(|| seat_denied("no socket group for named seat"))?;
+    grants.insert(
+        agent.id.to_string(),
+        serde_json::json!({"user":user,"uid":uid,"gid":gid,"socket_gid":socket_gid}),
+    );
+    Ok(true)
+}
+
+fn lookup_root_account(data: &Path, user: &str) -> Result<Option<(u32, u32)>, Error> {
+    #[cfg(test)]
+    match std::fs::read_to_string(data.join("test-passwd")) {
+        Ok(text) => return Ok(account_in(&text, user)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    let _ = data;
+    if super::is_isolated_test_env() {
+        return Ok(None);
+    }
+    Ok(account_in(&std::fs::read_to_string("/etc/passwd")?, user))
+}
+
 fn lookup_account(user: &str) -> Option<(u32, u32)> {
     if super::is_isolated_test_env() {
         return None;
@@ -271,6 +437,10 @@ fn lookup_account(user: &str) -> Option<(u32, u32)> {
     // Parse the operator-owned account database, avoiding getpwnam's shared
     // static buffer while concurrent launches may resolve other accounts.
     let text = std::fs::read_to_string("/etc/passwd").ok()?;
+    account_in(&text, user)
+}
+
+fn account_in(text: &str, user: &str) -> Option<(u32, u32)> {
     text.lines().find_map(|line| {
         let mut fields = line.split(':');
         if fields.next()? != user {
@@ -308,7 +478,7 @@ fn extend(
                     lookup(&user).map(|(uid, gid)| (user, uid, gid))
                 });
             let value = if let Some((user, uid, gid)) = principal {
-                if uid == 0 || uid == super::current_uid() {
+                if uid == 0 || uid == super::current_uid() || seat_claimed(grants, &user, uid) {
                     continue;
                 }
                 serde_json::json!({"user":user,"uid":uid,"gid":gid,"socket_gid":socket_gid})
@@ -335,6 +505,75 @@ fn extend(
 mod tests {
     use super::*;
     use anyagents_core::NewAgent;
+
+    #[test]
+    fn operator_admits_one_immutable_root_per_user_or_uid() {
+        let _env = crate::server::tests::env_lock();
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let root = store
+            .create_agent(NewAgent::new("receiver", "codex"))
+            .unwrap();
+        let next = store
+            .create_agent(NewAgent::new("reviewer", "codex"))
+            .unwrap();
+        let uid = (42001..42010)
+            .find(|&uid| uid != super::super::current_uid())
+            .unwrap();
+        std::fs::write(dir.path().join("test-passwd"), format!(
+            "seat-receiver:x:{uid}:42010::/:/bin/false\nseat-reviewer:x:{uid}:42010::/:/bin/false\n"
+        )).unwrap();
+        // Use an unrelated pre-existing grant to supply the socket GID from disk.
+        let other = store.create_agent(NewAgent::new("other", "codex")).unwrap();
+        edit_registry(dir.path(), |grants, _| {
+            grants.insert(
+                other.id.to_string(),
+                serde_json::json!({
+                    "user":"seat-other", "uid":uid + 100, "gid":42010, "socket_gid":42011
+                }),
+            );
+            Ok(true)
+        })
+        .unwrap();
+        assert!(!bind_principal(&store, &root, None).unwrap());
+        let implicit = RootSeatRequest::default();
+        assert!(bind_principal(&store, &root, Some(&implicit)).unwrap());
+        let (user, bound_uid, _, _) = read_admitted_principal(dir.path(), root.id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!((user.as_str(), bound_uid), ("seat-receiver", uid));
+        let explicit = RootSeatRequest {
+            user: Some(user),
+            uid: Some(uid),
+        };
+        let registry = dir.path().join(REGISTRY);
+        let saved = std::fs::read(&registry).unwrap();
+        assert!(!bind_principal(&store, &root, Some(&explicit)).unwrap());
+        // Same username, or different username with the same OS UID.
+        for request in [&explicit, &implicit] {
+            assert!(matches!(
+                bind_principal(&store, &next, Some(request)),
+                Err(Error::PermissionDenied(_))
+            ));
+        }
+        let mismatch = RootSeatRequest {
+            user: None,
+            uid: Some(uid + 1),
+        };
+        assert!(matches!(
+            bind_principal(&store, &root, Some(&mismatch)),
+            Err(Error::PermissionDenied(_))
+        ));
+        assert_eq!(std::fs::read(&registry).unwrap(), saved);
+        assert_eq!(std::fs::metadata(&registry).unwrap().mode() & 0o777, 0o600);
+        rollback_root_seat(&store, &root.id).unwrap();
+        assert!(
+            read_admitted_principal(dir.path(), root.id.as_str())
+                .unwrap()
+                .is_none()
+        );
+        assert!(bind_principal(&store, &next, Some(&explicit)).unwrap());
+    }
 
     #[test]
     fn empty_initial_census_does_not_select_managed_execution() {
@@ -438,16 +677,16 @@ mod tests {
         let mut new = NewAgent::new("child", "codex");
         new.parent_id = Some(root.id.clone());
         let child = store.create_agent(new).unwrap();
-        bind_principal(&store, &child).unwrap();
+        bind_principal(&store, &child, None).unwrap();
         let retained = read_principal_registry(dir.path()).unwrap().unwrap();
         let grants: Value = serde_json::from_str(&retained).unwrap();
         assert_eq!(grants[child.id.as_str()], grants[root.id.as_str()]);
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         store.rename_agent(&child.id, "renamed").unwrap();
-        bind_principal(&store, &store.agent(&child.id).unwrap()).unwrap();
+        bind_principal(&store, &store.agent(&child.id).unwrap(), None).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), retained);
         std::fs::write(&path, "corrupt").unwrap();
-        assert!(bind_principal(&store, &child).is_err());
+        assert!(bind_principal(&store, &child, None).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "corrupt");
         unsafe {
             match previous {

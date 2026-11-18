@@ -4886,6 +4886,18 @@ async fn create_agent_route(
             anyagents_core::parse_agent_lifecycle(lifecycle).map_err(ApiError::from_store)?;
         }
         let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
+        let seat = crate::sandbox::RootSeatRequest {
+            user: body.seat_user,
+            uid: body.seat_uid,
+        };
+        let operator_root = matches!(&principal, Principal::Operator) && parent_id.is_none();
+        if seat.explicit() && !operator_root {
+            return Err(ApiError::from_store(
+                anyagents_core::Error::PermissionDenied(
+                    "seat admission requires an operator-created root".into(),
+                ),
+            ));
+        }
         let (harness, model, profile) = create::resolve_subagent_defaults(
             state.store.data_dir(),
             parent_agent.as_ref(),
@@ -4895,32 +4907,33 @@ async fn create_agent_route(
         );
         require_remote_callback(state.store.data_dir(), &harness)?;
         refuse_host_placement_over_http(via_http, &harness)?;
-        let agent = create::create(
-            &state.store,
-            state.store.data_dir(),
-            CreateRequest {
-                name: body.name,
-                role: Some(
-                    body.role
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(create::DEFAULT_AGENT_ROLE)
-                        .to_string(),
-                ),
-                harness,
-                model,
-                profile,
-                repo: body.repo,
-                branch: body.branch,
-                base: body.base,
-                workdir: body.workdir.map(PathBuf::from),
-                workdir_default: owner_workdir(),
-                description: body.description,
-                instructions: body.instructions,
-                parent_id,
-            },
-        )
+        let request = CreateRequest {
+            name: body.name,
+            role: Some(
+                body.role
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(create::DEFAULT_AGENT_ROLE)
+                    .to_string(),
+            ),
+            harness,
+            model,
+            profile,
+            repo: body.repo,
+            branch: body.branch,
+            base: body.base,
+            workdir: body.workdir.map(PathBuf::from),
+            workdir_default: owner_workdir(),
+            description: body.description,
+            instructions: body.instructions,
+            parent_id,
+        };
+        let agent = if operator_root {
+            create::create_operator_root(&state.store, state.store.data_dir(), request, seat)
+        } else {
+            create::create(&state.store, state.store.data_dir(), request)
+        }
         .map_err(ApiError::from_store)?;
         let actor = match &principal {
             Principal::Operator => "operator".to_string(),
@@ -16672,6 +16685,119 @@ exec '{}' "$@"
             .unwrap();
         let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, value)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn over_http_only_operator_root_creation_can_request_a_named_seat() {
+        let dir = crate::test_tempdir();
+        let mut state = archetype_validation_state(dir.path());
+        let operator_token = "operator-token-0123456789abcdef0123456789abcdef";
+        state.auth = auth::Mode::Confined {
+            operator_digest: Some(auth::operator_digest(operator_token)),
+        };
+        let owner = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("owner", "spiron"))
+            .unwrap();
+        let capability = state.store.issue_capability(&owner.id).unwrap();
+        let uid = (42001..42010)
+            .find(|&uid| uid != crate::sandbox::server_uid())
+            .unwrap();
+        let data = state.store.data_dir();
+        let registry = data.join("execution-principals.json");
+        std::fs::write(
+            data.join("test-passwd"),
+            format!(
+                "seat-claimed:x:{uid}:42010::/:/bin/false\nseat-fresh:x:{}:42010::/:/bin/false\n",
+                uid + 100
+            ),
+        )
+        .unwrap();
+        let saved = serde_json::json!({owner.id.as_str(): {
+            "user":"seat-claimed", "uid":uid, "gid":42010, "socket_gid":42011
+        }})
+        .to_string();
+        std::fs::write(&registry, &saved).unwrap();
+        let socket = dir.path().join("admission.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let app = build_router(state.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let workdir = dir.path().join("work");
+        std::fs::create_dir(&workdir).unwrap();
+        let explicit = serde_json::json!({
+            "name":"fresh", "harness":"spiron", "scope":"isolated", "workdir":workdir,
+            "seat_user":"seat-fresh", "seat_uid":uid + 100
+        });
+        for (mut body, agent_token, operator, want, problem) in [
+            (
+                explicit.clone(),
+                None,
+                None,
+                StatusCode::UNAUTHORIZED,
+                "authenticated",
+            ),
+            (
+                explicit.clone(),
+                Some(capability.as_str()),
+                None,
+                StatusCode::FORBIDDEN,
+                "operator-created root",
+            ),
+            (
+                explicit.clone(),
+                None,
+                Some(operator_token),
+                StatusCode::FORBIDDEN,
+                "operator-created root",
+            ),
+            (
+                serde_json::json!({"name":"claimed","harness":"spiron","scope":"isolated","workdir":workdir}),
+                None,
+                Some(operator_token),
+                StatusCode::FORBIDDEN,
+                "already claimed",
+            ),
+        ] {
+            if operator.is_some() && body["name"] == "fresh" {
+                body["parent"] = serde_json::json!(owner.name);
+            }
+            let (status, reply) = http(
+                &socket,
+                "POST",
+                "/v1/agents",
+                Some(body),
+                agent_token,
+                operator,
+            )
+            .await;
+            assert_eq!(status, want, "{reply}");
+            assert!(
+                reply["error"].as_str().unwrap().contains(problem),
+                "{reply}"
+            );
+        }
+        let mut mismatch = explicit;
+        mismatch["seat_uid"] = serde_json::json!(uid + 101);
+        let (status, reply) = http(
+            &socket,
+            "POST",
+            "/v1/agents",
+            Some(mismatch),
+            None,
+            Some(operator_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{reply}");
+        assert!(
+            reply["error"].as_str().unwrap().contains("does not match"),
+            "{reply}"
+        );
+        assert_eq!(std::fs::read_to_string(registry).unwrap(), saved);
+        assert!(state.store.agent_by_name("fresh").is_err());
+        assert!(state.store.agent_by_name("claimed").is_err());
+        server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -13,9 +13,9 @@
 use std::time::Duration;
 
 use anyagents_channel_telegram::{
-    BotCall, ManagedBotEvent, MediaAttachment, Memory, Poll, Routed, bot_identity, delete_message,
-    deliver_to_mailbox, edit_message_text, file_path_of, format_checklist_markdown, get_file,
-    get_managed_bot_token, get_me, managed_bot_token_of, pin_chat_message,
+    BotCall, CallerAllowlist, ManagedBotEvent, MediaAttachment, Memory, Poll, Routed, bot_identity,
+    delete_message, deliver_to_mailbox, edit_message_text, file_path_of, format_checklist_markdown,
+    get_file, get_managed_bot_token, get_me, managed_bot_token_of, pin_chat_message,
     replace_managed_bot_token, send_checklist, send_location, send_media_ref, send_message,
     send_poll, sent_message_id, set_message_reaction, stop_poll, unpin_chat_message,
 };
@@ -810,6 +810,12 @@ fn poll_channel(
     )
 }
 
+fn caller_allowlist(channel: &Channel) -> CallerAllowlist {
+    let fallback = std::env::var_os("ANYAGENTS_TELEGRAM_ALLOWED_IDS")
+        .or_else(|| std::env::var_os("ALLOWED_TELEGRAM_IDS"));
+    CallerAllowlist::from_config(&channel.config, fallback.as_deref())
+}
+
 fn ingest_updates(
     store: &Store,
     channel: &Channel,
@@ -819,12 +825,15 @@ fn ingest_updates(
     body: &str,
     method: &str,
 ) -> Result<(), anyagents_core::Error> {
-    if let Some(fresh) = store
+    let Some(channel) = store
         .list_channels()?
         .into_iter()
         .find(|c| c.id == channel.id)
+    else {
+        return Ok(());
+    };
     {
-        let fresh_mem = Memory::try_from_state(&fresh.state)?;
+        let fresh_mem = Memory::try_from_state(&channel.state)?;
         memory.chats = fresh_mem.chats;
         memory.pending_managed_bots = fresh_mem.pending_managed_bots;
         if fresh_mem.bot.is_some() {
@@ -833,17 +842,19 @@ fn ingest_updates(
     }
     let mut poll = Poll::resume(memory.offset);
     let before = poll.offset;
-    let routed = poll.route("bot", agent_id.as_str(), body).map_err(|_| {
-        api_error(
-            method,
-            Some(&channel.id),
-            "invalid_response",
-            None,
-            None,
-            "Telegram update response is invalid",
-            None,
-        )
-    })?;
+    let routed = poll
+        .route_with_allowlist("bot", agent_id.as_str(), body, &caller_allowlist(&channel))
+        .map_err(|_| {
+            api_error(
+                method,
+                Some(&channel.id),
+                "invalid_response",
+                None,
+                None,
+                "Telegram update response is invalid",
+                None,
+            )
+        })?;
     if let Ok(owner_agent) = store.agent(agent_id)
         && (owner_agent.state == "archived"
             || owner_agent.state == "paused"
@@ -855,7 +866,6 @@ fn ingest_updates(
         }
         return Ok(());
     }
-    let attached = attached_agents(store)?;
     let own_bots = known_bot_identities(store, memory.bot.as_deref())?;
     let mut grew = false;
     let mut removed_chats: Vec<i64> = Vec::new();
@@ -883,7 +893,12 @@ fn ingest_updates(
                     removed_chats.push(inbound.chat_id);
                     grew = true;
                 }
-                detach_removed_own_bots_from_chat(store, inbound.chat_id, &removed_ids)?;
+                detach_removed_own_bots_from_chat(
+                    store,
+                    inbound.chat_id,
+                    inbound.sender_id,
+                    &removed_ids,
+                )?;
                 if own_bots
                     .iter()
                     .any(|(id, _)| id.is_some_and(|id| removed_ids.contains(&id)))
@@ -924,6 +939,7 @@ fn ingest_updates(
                     token,
                     &channel.id,
                     inbound.chat_id,
+                    inbound.sender_id,
                     &inbound.chat_type,
                 );
             }
@@ -1036,7 +1052,7 @@ fn ingest_updates(
         if let Routed::ManagedBot { event, .. } = &one {
             handle_managed_bot_event(
                 store,
-                channel,
+                &channel,
                 agent_id,
                 token,
                 memory,
@@ -1046,7 +1062,7 @@ fn ingest_updates(
             grew = true;
             continue;
         }
-        let peers = peer_ids(store, &poll, &one, agent_id.as_str(), &attached)?;
+        let peers = peer_ids(store, &poll, &one, agent_id.as_str())?;
         deliver_to_mailbox(store, &one, &peers)?;
         if let Routed::ToAgent { inbound, .. } = &one
             && (inbound.chat_type == "group" || inbound.chat_type == "supergroup")
@@ -1132,10 +1148,11 @@ fn is_own_bot(
 fn detach_removed_own_bots_from_chat(
     store: &Store,
     chat_id: i64,
+    sender_id: Option<i64>,
     removed_ids: &[i64],
 ) -> Result<(), anyagents_core::Error> {
     for ch in store.list_channels()? {
-        if ch.kind != "telegram" {
+        if ch.kind != "telegram" || !caller_allowlist(&ch).allows(sender_id, Some(chat_id)) {
             continue;
         }
         let mut mem = Memory::try_from_state(&ch.state)?;
@@ -1349,6 +1366,7 @@ fn discover_peer_bots_in_chat(
     token: &str,
     current_channel_id: &anyagents_core::ChannelId,
     chat_id: i64,
+    sender_id: Option<i64>,
     chat_type: &str,
 ) {
     let is_live = std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none();
@@ -1356,7 +1374,10 @@ fn discover_peer_bots_in_chat(
         return;
     };
     for other in channels {
-        if other.id == *current_channel_id || other.kind != "telegram" {
+        if other.id == *current_channel_id
+            || other.kind != "telegram"
+            || !caller_allowlist(&other).allows(sender_id, Some(chat_id))
+        {
             continue;
         }
         let Some(other_agent_id) = other.agents.first() else {
@@ -1421,7 +1442,7 @@ fn relay_inbound_to_group_peers(
     receiver_id: &anyagents_core::AgentId,
     inbound: &anyagents_channel_telegram::Inbound,
 ) -> Result<(), anyagents_core::Error> {
-    for peer in telegram_chat_agents(store, inbound.chat_id)? {
+    for peer in telegram_chat_agents(store, inbound.chat_id, Some(inbound.sender_id))? {
         if &peer.id == receiver_id || peer.state == "archived" || peer.state == "paused" {
             continue;
         }
@@ -1468,12 +1489,17 @@ fn peer_ids(
     poll: &Poll,
     one: &Routed,
     sender: &str,
-    attached: &[(String, i64)],
 ) -> Result<Vec<(anyagents_core::AgentId, i64)>, anyagents_core::Error> {
-    let Routed::EchoToPeers { chat_id, .. } = one else {
+    let Routed::EchoToPeers {
+        chat_id,
+        telegram_sender_id,
+        ..
+    } = one
+    else {
         return Ok(Vec::new());
     };
-    let attached: Vec<(&str, i64)> = attached
+    let links = attached_agents(store, *telegram_sender_id)?;
+    let attached: Vec<(&str, i64)> = links
         .iter()
         .map(|(name, chat)| (name.as_str(), *chat))
         .collect();
@@ -1494,10 +1520,17 @@ fn peer_ids(
 /// Two bots on one chat are peers even though each is a separate channel with
 /// its own bot, so membership is read from every channel's saved links. An
 /// agent on another chat is not a member of this one.
-fn attached_agents(store: &Store) -> Result<Vec<(String, i64)>, anyagents_core::Error> {
+fn attached_agents(
+    store: &Store,
+    sender_id: Option<i64>,
+) -> Result<Vec<(String, i64)>, anyagents_core::Error> {
     let mut links: Vec<(String, i64)> = Vec::new();
     for one in store.list_channels()? {
+        if one.kind != "telegram" {
+            continue;
+        }
         let memory = Memory::try_from_state(&one.state)?;
+        let policy = caller_allowlist(&one);
         let channel_agents: Vec<(String, String)> = one
             .agents
             .iter()
@@ -1514,6 +1547,9 @@ fn attached_agents(store: &Store) -> Result<Vec<(String, i64)>, anyagents_core::
             })
             .collect();
         for link in memory.chats {
+            if !policy.allows(sender_id, Some(link.chat_id)) {
+                continue;
+            }
             let Some((canonical_name, _)) = channel_agents
                 .iter()
                 .find(|(name, id)| name == &link.agent || id == &link.agent)
@@ -3663,7 +3699,7 @@ fn project_local_receipt(
         let mut recipients = Vec::new();
         if chat_is_room(store, receipt.chat_id)? {
             let author = resolve_telegram_agent(store, &receipt.from)?;
-            for member in telegram_chat_agents(store, receipt.chat_id)? {
+            for member in telegram_chat_agents(store, receipt.chat_id, None)? {
                 if member.id != author.id && member.state != "paused" && member.state != "archived"
                 {
                     recipients.push(member.id);
@@ -3713,10 +3749,14 @@ fn project_local_receipt(
 fn telegram_chat_agents(
     store: &Store,
     chat_id: i64,
+    // None is an internal outbound receipt, not a Telegram ingress event.
+    inbound_caller: Option<Option<i64>>,
 ) -> Result<Vec<anyagents_core::Agent>, anyagents_core::Error> {
     let mut agents = Vec::new();
     for ch in store.list_channels()? {
-        if ch.kind != "telegram" {
+        if ch.kind != "telegram"
+            || inbound_caller.is_some_and(|id| !caller_allowlist(&ch).allows(id, Some(chat_id)))
+        {
             continue;
         }
         if Memory::try_from_state(&ch.state)?
@@ -4717,7 +4757,7 @@ pub(crate) mod tests {
         assert_eq!(memory.chats.len(), 1);
         assert_eq!(memory.chats[0].chat_id, -1007);
         assert_eq!(
-            attached_agents(&store).unwrap(),
+            attached_agents(&store, None).unwrap(),
             vec![("ada".to_string(), -1007)]
         );
     }

@@ -616,3 +616,97 @@ fn offline_rich_line_breaks_reach_send_and_edit_transport() {
         std::env::remove_var("ANYAGENTS_TELEGRAM_API");
     }
 }
+
+#[test]
+fn webhook_and_poll_apply_the_same_caller_policy_before_binding_or_delivery() {
+    let _lock = telegram::tests::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let allowed = store
+        .create_agent(NewAgent::new("receiver", "codex"))
+        .unwrap();
+    let peer = store.create_agent(NewAgent::new("peer", "codex")).unwrap();
+    let make_channel = |agent: &anyagents_core::Agent, users: Value| {
+        let reference = format!("channels/{}", agent.name);
+        let channel = store
+            .create_channel(NewChannel {
+                kind: "telegram".into(),
+                identity: None,
+                config: json!({"allowed_user_ids": users, "allowed_chat_ids": [7, -42]})
+                    .to_string(),
+                credential_ref: Some(reference.clone()),
+            })
+            .unwrap();
+        store.attach_channel(&channel.id, &agent.id).unwrap();
+        FileCredentialStore::new(dir.path())
+            .write(&reference, b"777:synthetic-token")
+            .unwrap();
+        channel.id
+    };
+    let id = make_channel(&allowed, json!([7]));
+    let peer_id = make_channel(&peer, json!([]));
+    store
+        .set_channel_state(&id, r#"{"bot":"777:receiver_bot"}"#)
+        .unwrap();
+    store
+        .set_channel_state(
+            &peer_id,
+            &json!({"bot":"778:peer_bot","chats":[{
+                "agent": peer.name, "chat_id": -42, "chat_type": "supergroup"
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+    let saved = || {
+        store
+            .list_channels()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == id)
+            .unwrap()
+    };
+    let memory = || anyagents_channel_telegram::Memory::from_state(&saved().state);
+    let update = |seq, user, chat, kind| {
+        json!({"update_id": seq, "message": {
+            "message_id": seq, "from":{"id":user, "first_name":"Visitor"},
+            "chat":{"id":chat,"type":kind}, "text": format!("message {seq}"), "date": 1
+        }})
+    };
+    let secret = telegram::webhook_secret("777:synthetic-token", id.as_str());
+    let webhook = |payload: &Value| {
+        telegram::receive_webhook(&store, dir.path(), id.as_str(), Some(&secret), payload).unwrap()
+    };
+    webhook(&update(1, 8, 8, "private"));
+    webhook(&update(2, 8, -42, "supergroup"));
+    assert!(memory().chats.is_empty());
+    assert!(store.inbox(&allowed.id, None).unwrap().is_empty());
+    assert_eq!(memory().offset, 3);
+    webhook(&update(3, 7, 7, "private"));
+    assert_eq!(memory().chats.len(), 1);
+    assert_eq!(store.inbox(&allowed.id, None).unwrap().len(), 1);
+
+    let (address, task) = fake(
+        200,
+        json!({"ok":true,"result":[
+            update(4, 7, -42, "supergroup"), update(5, 7, -43, "supergroup"),
+            update(6, 8, -42, "supergroup"), update(7, 9, 9, "private")
+        ]}),
+    );
+    unsafe {
+        std::env::set_var("ANYAGENTS_TELEGRAM_API", address);
+    }
+    let result =
+        telegram::poll_channel_once(&store, &FileCredentialStore::new(dir.path()), &saved(), 0);
+    unsafe {
+        std::env::remove_var("ANYAGENTS_TELEGRAM_API");
+    }
+    result.unwrap();
+    assert_eq!(task.join().unwrap()["offset"], 4);
+    assert_eq!(memory().offset, 8);
+    let mut chats: Vec<_> = memory().chats.into_iter().map(|c| c.chat_id).collect();
+    chats.sort_unstable();
+    assert_eq!(chats, vec![-42, 7]);
+    let inbox = store.inbox(&allowed.id, None).unwrap();
+    assert_eq!(inbox.len(), 2, "{inbox:?}");
+    assert!(store.inbox(&peer.id, None).unwrap().is_empty());
+}

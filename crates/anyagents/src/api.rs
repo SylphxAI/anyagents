@@ -330,6 +330,12 @@ pub struct CreateAgentRequest {
     pub base: Option<String>,
     #[serde(default)]
     pub workdir: Option<String>,
+    /// Optional pre-created seat account; only the operator may set it on a root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_user: Option<String>,
+    /// Expected OS UID (assertion only, never the source of authority).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_uid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(

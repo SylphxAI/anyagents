@@ -211,7 +211,10 @@ fn lookup_group(name: &str) -> Option<u32> {
 mod principals;
 #[cfg(test)]
 use principals::read_principal_registry;
-pub(crate) use principals::{bind_principal, load_principal_registry, reconcile_principals};
+pub(crate) use principals::{
+    RootSeatRequest, bind_principal, load_principal_registry, reconcile_principals,
+    rollback_root_seat,
+};
 
 /// The seat one agent runs in: `(seat user, uid, gid, socket gid)`.
 ///
