@@ -29,7 +29,9 @@ pub const SYSTEM_SENDER: &str = "anyagents";
 /// pause or an archive of their recipient is not announced back to it.
 fn is_lifecycle_notice(message: &Message) -> bool {
     message.source_key.as_deref().is_some_and(|key| {
-        key.starts_with("subagent-error:") || key.starts_with("subagent_completed:")
+        key.starts_with("subagent-error:")
+            || key.starts_with("subagent_completed:")
+            || key.starts_with("anyagents:task-return:")
     })
 }
 

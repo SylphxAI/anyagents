@@ -62,6 +62,8 @@ pub struct Live {
     /// Proxy the session was started with; `Some("")` is an explicit direct
     /// connection.
     pub proxy: Option<String>,
+    /// Caller work (including clipboard I/O) must finish before teardown.
+    admission: tokio::sync::RwLock<()>,
     last_used_ms: AtomicI64,
     started_at_ms: i64,
     /// The takeover page's mount key on the public listener, when mounted.
@@ -73,12 +75,55 @@ pub struct Live {
     hand_backs: tokio::sync::watch::Receiver<u64>,
     /// Hand-backs counted when the latest takeover was requested.
     awaited: AtomicU64,
+    hand_back_pending: std::sync::Mutex<Option<u64>>,
     /// Whether the latest takeover started on a challenged page requiring solve proof.
     watch_challenge: Arc<AtomicBool>,
     runtime_dir: PathBuf,
 }
 
+/// Touch on every completion, error and cancellation, before releasing admission.
+pub struct Operation<'a> {
+    live: &'a Live,
+    _guard: tokio::sync::RwLockReadGuard<'a, ()>,
+}
+
+impl Drop for Operation<'_> {
+    fn drop(&mut self) {
+        self.live.touch();
+    }
+}
+
 impl Live {
+    /// Admit caller work or refuse an Arc retired while the caller was waiting.
+    pub async fn operation(&self) -> Result<Operation<'_>, ToolError> {
+        let guard = self.admission.read().await;
+        if self.session.is_closed() {
+            return Err(agent_workstation::Error::Closed.into());
+        }
+        Ok(Operation {
+            live: self,
+            _guard: guard,
+        })
+    }
+
+    fn pending_hand_back(&self) -> bool {
+        let mut pending = self
+            .hand_back_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let Some(baseline) = *pending else {
+            return false;
+        };
+        if *self.hand_backs.borrow() <= baseline {
+            return true;
+        }
+        // Hand-back is activity too. Give the agent its normal idle window
+        // to resume; don't reap immediately after a long human interaction.
+        *pending = None;
+        self.touch();
+        false
+    }
+
     /// Record a call (idle reaping counts from the last one).
     pub fn touch(&self) {
         self.last_used_ms.store(now_ms(), Ordering::Relaxed);
@@ -116,8 +161,15 @@ impl Live {
     pub fn expect_hand_back(&self, challenge_detected: bool) {
         self.watch_challenge
             .store(challenge_detected, Ordering::Release);
-        self.awaited
-            .store(*self.hand_backs.borrow(), Ordering::Release);
+        let mut pending = self
+            .hand_back_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // The watcher may lag a previous release; never let that old
+        // completion satisfy a newly requested takeover.
+        let baseline = self.session.gate().hand_backs();
+        self.awaited.store(baseline, Ordering::Release);
+        *pending = Some(baseline);
     }
 
     /// Wait up to `wait` for a hand-back after the latest takeover request;
@@ -197,12 +249,9 @@ pub async fn acquire(
         .map_err(|_| session_busy())?;
     let mut replacement_proxy = None;
     if let Some(live) = guard.as_ref() {
-        // Authorize even a closed session before probing or replacing it. The
-        // engine's lease() checks closed first; its gate preserves the owner.
-        live.session
-            .gate()
-            .acquire(principal)
-            .map_err(|e| in_use(profile, e))?;
+        // Authorize before probing or replacing a running session. Closing
+        // ends the engine lease; the profile directory remains protected.
+        authorize(live, principal)?;
         if let Some(requested) = proxy
             && live.proxy.as_deref().unwrap_or("") != requested
         {
@@ -214,26 +263,35 @@ pub async fn acquire(
             live.touch();
             return Ok(live.clone());
         }
-        // Never restart underneath a person who took control during the probe.
-        live.session
-            .gate()
-            .check(principal)
-            .map_err(ToolError::from)?;
         replacement_proxy = Some(live.proxy.clone());
-        // Keep the SAME slot locked through graceful close. Cancelling an
-        // acquire or hitting its deadline must not permit a second writer.
+        // Keep the SAME slot and caller admission locked through revalidation
+        // and close. A stale health probe must not replace a recovered session.
         let principal = principal.to_owned();
+        let health_key = key.clone();
         let closing = tokio::spawn(async move {
             let live = guard.as_ref().expect("live session").clone();
-            live.session
-                .gate()
-                .check(&principal)
-                .map_err(ToolError::from)?;
-            shutdown(live).await;
-            *guard = None;
+            let admission = live.admission.write().await;
+            authorize(&live, &principal)?;
+            if !cached_healthy(&live, &health_key).await? {
+                if !live.session.is_closed() {
+                    live.session
+                        .gate()
+                        .check(&principal)
+                        .map_err(ToolError::from)?;
+                }
+                if !shutdown_if_agent(&live).await {
+                    return Err(session_busy());
+                }
+                *guard = None;
+            }
+            drop(admission);
             Ok::<_, ToolError>(guard)
         });
         guard = wait_for_shutdown(closing, SHUTDOWN_WAIT).await??;
+        if let Some(live) = guard.as_ref() {
+            live.touch();
+            return Ok(live.clone());
+        }
     }
     let proxy = super::proxy::resolve(
         proxy,
@@ -243,6 +301,30 @@ pub async fn acquire(
     let live = Arc::new(start(data, &key, profile, principal, proxy).await?);
     *guard = Some(live.clone());
     Ok(live)
+}
+
+// Engine close ends its lease. The already-validated profile may be reopened,
+// but a running session still requires its exact current principal.
+fn authorize(live: &Live, principal: &str) -> Result<(), ToolError> {
+    if live.session.is_closed() {
+        return Ok(());
+    }
+    live.session
+        .gate()
+        .acquire(principal)
+        .map(|_| ())
+        .map_err(|e| in_use(&live.profile, e))
+}
+
+fn takeover_pending() -> ToolError {
+    ToolError {
+        code: "TAKEOVER_PENDING",
+        message:
+            "a requested browser takeover is awaiting explicit hand-back; the desktop was preserved"
+                .into(),
+        hint: "Use wait_for_user or ask the person to hand control back before closing.",
+        retryable: false,
+    }
 }
 
 fn session_busy() -> ToolError {
@@ -257,6 +339,9 @@ fn session_busy() -> ToolError {
 /// Only read-only checks run here, before dispatch. Mutating calls are never
 /// retried: losing their reply still means their outcome is uncertain.
 async fn cached_healthy(live: &Live, dir: &Path) -> Result<bool, ToolError> {
+    if live.pending_hand_back() {
+        return Ok(true);
+    }
     if matches!(live.session.gate().holder(), Holder::Human { .. }) {
         // Takeover/status/release must remain usable; observations are gated.
         return Ok(true);
@@ -512,6 +597,9 @@ fn session_config(
     browser.clear_env = true;
     browser.extra_env = chromium_environment(&home, &tmp)?;
     let mut cfg = SessionConfig::new(Profile::new(profile, dir), browser, runtime_dir);
+    // A takeover is a custody transfer, not an idle lease. Only explicit
+    // hand-back may resume the agent, including after a browser failure.
+    cfg.human_idle_timeout = None;
     if let Some(languages) = std::env::var("ANYAGENTS_BROWSER_LANGUAGES")
         .ok()
         .map(|v| {
@@ -585,6 +673,7 @@ async fn start(
         session,
         profile: profile.to_string(),
         proxy,
+        admission: tokio::sync::RwLock::new(()),
         last_used_ms: AtomicI64::new(now),
         started_at_ms: now,
         mount,
@@ -592,32 +681,10 @@ async fn start(
         watcher,
         hand_backs,
         awaited: AtomicU64::new(0),
+        hand_back_pending: std::sync::Mutex::new(None),
         watch_challenge,
         runtime_dir,
     })
-}
-
-/// Stop `profile`'s session; `true` when one was running. The profile
-/// directory (logins included) stays on disk.
-pub async fn stop(data: &Path, profile: &str) -> bool {
-    let Ok(Some(key)) = server_profile_dir(data, profile, false) else {
-        return false;
-    };
-    let slot = SESSIONS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(&key)
-        .cloned();
-    let Some(slot) = slot else {
-        return false;
-    };
-    // Detach, do not cancel, on timeout: close may be flushing the profile.
-    // Retain the registry slot until it finishes, excluding every new writer.
-    let closing = tokio::spawn(async move { close_slot(slot.lock_owned().await).await });
-    // Shutdown requested; completion can outlive the caller budget.
-    wait_for_shutdown(closing, SHUTDOWN_WAIT)
-        .await
-        .unwrap_or(true)
 }
 
 /// Check the lease and begin shutdown under one profile-slot lock.
@@ -644,17 +711,38 @@ pub async fn stop_authorized(
     let guard = tokio::time::timeout_at(deadline, slot.lock_owned())
         .await
         .map_err(|_| session_busy())?;
-    if let Some(live) = guard.as_ref() {
-        live.session
-            .lease(principal)
-            .map_err(|e| in_use(profile, e))?;
-    }
-    let closing = tokio::spawn(close_slot(guard));
+    let principal = principal.to_owned();
+    let closing = tokio::spawn(async move {
+        let mut guard = guard;
+        let Some(live) = guard.as_ref().cloned() else {
+            return Ok(false);
+        };
+        let _admission = live.admission.write().await;
+        authorize(&live, &principal)?;
+        if live.pending_hand_back() {
+            return Err(takeover_pending());
+        }
+        if !live.session.is_closed() {
+            live.session
+                .gate()
+                .check(&principal)
+                .map_err(ToolError::from)?;
+        }
+        if !shutdown_if_agent(&live).await {
+            live.session
+                .gate()
+                .check(&principal)
+                .map_err(ToolError::from)?;
+            return Err(session_busy());
+        }
+        *guard = None;
+        Ok(true)
+    });
     wait_for_shutdown(
         closing,
         deadline.saturating_duration_since(tokio::time::Instant::now()),
     )
-    .await
+    .await?
 }
 
 // Dropping a JoinHandle detaches the cleanup; it never releases the writer
@@ -673,19 +761,34 @@ async fn close_slot(mut guard: tokio::sync::OwnedMutexGuard<Option<Arc<Live>>>) 
     let Some(live) = guard.as_ref().cloned() else {
         return false;
     };
-    shutdown(live).await;
+    let _admission = live.admission.write().await;
+    live.session.close().await;
+    cleanup(&live).await;
     *guard = None;
     true
 }
 
-/// Close a session gracefully: calls in flight finish, the browser flushes
-/// its profile, and nothing keeps it reachable afterwards.
-async fn shutdown(live: Arc<Live>) {
+// Caller admission is held exclusively. The engine's conditional close is
+// atomic with human takeover; no mounts, watchers or tunnels change on refusal.
+async fn shutdown_if_agent(live: &Live) -> bool {
+    if live.pending_hand_back() {
+        return false;
+    }
+    if live.session.is_closed() {
+        live.session.close().await;
+    } else if !live.session.close_if_agent().await {
+        return false;
+    }
+    cleanup(live).await;
+    true
+}
+
+/// Only remove caller resources after engine close has succeeded.
+async fn cleanup(live: &Live) {
     live.watcher.abort();
     if let Some(key) = &live.mount {
         takeover::unmount(key);
     }
-    live.session.close().await;
     drop(live.tunnel.lock().await.take());
     let runtime_dir = live.runtime_dir.clone();
     let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(runtime_dir)).await;
@@ -719,7 +822,13 @@ async fn stop_agent(data: &Path, agent: &str) {
     profiles.push(agent.to_string());
     profiles.sort();
     profiles.dedup();
-    futures::future::join_all(profiles.iter().map(|profile| stop(data, profile))).await;
+    // Revalidate the principal under the close lock, not only in the snapshot.
+    futures::future::join_all(
+        profiles
+            .iter()
+            .map(|profile| stop_authorized(data, profile, agent)),
+    )
+    .await;
 }
 
 /// Stop every session (server shutdown), concurrently.
@@ -790,18 +899,196 @@ pub fn reap_idle(data: &Path) {
         return;
     };
     for live in all_running() {
-        if live.holder() == "agent" && now.saturating_sub(live.last_used_ms()) > idle_ms {
-            let (data, profile) = (data.to_path_buf(), live.profile.clone());
+        if live.holder() == "agent"
+            && !live.pending_hand_back()
+            && now.saturating_sub(live.last_used_ms()) > idle_ms
+        {
+            let data = data.to_path_buf();
             handle.spawn(async move {
-                stop(&data, &profile).await;
+                reap_candidate(&data, live, idle_ms).await;
             });
         }
     }
 }
 
+// A snapshot only nominates a candidate. Identity and current activity must
+// still match after waiting for both registry and caller work to drain.
+async fn reap_candidate(data: &Path, expected: Arc<Live>, idle_ms: i64) -> bool {
+    let Ok(Some(key)) = server_profile_dir(data, &expected.profile, false) else {
+        return false;
+    };
+    let slot = slot(&key);
+    let mut guard = slot.lock_owned().await;
+    let Some(live) = guard.as_ref().cloned() else {
+        return false;
+    };
+    if !Arc::ptr_eq(&live, &expected) {
+        return false;
+    }
+    let _admission = live.admission.write().await;
+    if live.pending_hand_back()
+        || now_ms().saturating_sub(live.last_used_ms()) <= idle_ms
+        || !shutdown_if_agent(&live).await
+    {
+        return false;
+    }
+    *guard = None;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn headful_teardown_revalidates_activity_custody_and_identity() {
+        if std::env::var("ANYAGENTS_DESKTOP_HEADFUL").as_deref() != Ok("1") {
+            eprintln!("skipped: set ANYAGENTS_DESKTOP_HEADFUL=1");
+            return;
+        }
+        let data = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let live = acquire(data.path(), "old-owner", "old-owner", None)
+            .await
+            .unwrap();
+        assert!(
+            !live.pending_hand_back(),
+            "fresh sessions must still expire"
+        );
+        assert_eq!(live.session.gate().human_idle_timeout(), None);
+
+        // An old nomination waits for in-flight caller work (clipboard included),
+        // then sees the completion timestamp rather than killing the browser.
+        let operation = live.operation().await.unwrap();
+        live.last_used_ms.store(0, Ordering::Relaxed);
+        let reaper = {
+            let data = data.path().to_path_buf();
+            let live = live.clone();
+            tokio::spawn(async move { reap_candidate(&data, live, 60_000).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert!(!reaper.is_finished());
+        drop(operation);
+        assert!(!reaper.await.unwrap());
+        assert!(!live.session.is_closed());
+
+        // Cancellation also records activity before giving up admission.
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let task = {
+            let live = live.clone();
+            tokio::spawn(async move {
+                let _operation = live.operation().await.unwrap();
+                live.last_used_ms.store(0, Ordering::Relaxed);
+                ready.send(()).unwrap();
+                std::future::pending::<()>().await;
+            })
+        };
+        waiting.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(live.last_used_ms() > 0);
+
+        // A takeover can win after nomination. Reaping must leave the watcher,
+        // runtime and public page reachable, not just avoid browser shutdown.
+        live.last_used_ms.store(0, Ordering::Relaxed);
+        let admission = live.admission.write().await;
+        let reaper = {
+            let data = data.path().to_path_buf();
+            let live = live.clone();
+            tokio::spawn(async move { reap_candidate(&data, live, 60_000).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        live.session.gate().take(Some("fixture".into()));
+        drop(admission);
+        assert!(!reaper.await.unwrap());
+        assert_eq!(live.holder(), "human");
+        assert!(!live.watcher.is_finished());
+        assert!(live.runtime_dir.exists());
+        assert_eq!(
+            stop_authorized(data.path(), "old-owner", "old-owner")
+                .await
+                .unwrap_err()
+                .code,
+            "HUMAN_IN_CONTROL"
+        );
+        assert!(live.session.gate().release(Some("fixture complete".into())));
+
+        // A requested but unopened takeover is protected, including a timed-out
+        // wait and failed transport probe. No implicit replacement/replay.
+        live.expect_hand_back(false);
+        assert!(
+            !live
+                .wait_for_hand_back(std::time::Duration::from_millis(40))
+                .await
+        );
+        live.last_used_ms.store(0, Ordering::Relaxed);
+        assert!(live.pending_hand_back());
+        assert!(!reap_candidate(data.path(), live.clone(), 60_000).await);
+        assert!(
+            cached_healthy(&live, &data.path().join("absent"))
+                .await
+                .unwrap()
+        );
+        assert!(Arc::ptr_eq(
+            &acquire(data.path(), "old-owner", "old-owner", None)
+                .await
+                .unwrap(),
+            &live
+        ));
+        assert_eq!(
+            stop_authorized(data.path(), "old-owner", "old-owner")
+                .await
+                .unwrap_err()
+                .code,
+            "TAKEOVER_PENDING"
+        );
+        live.session.gate().take(Some("fixture".into()));
+        assert!(
+            live.session
+                .gate()
+                .release(Some("explicit hand-back".into()))
+        );
+        assert!(
+            live.wait_for_hand_back(std::time::Duration::from_secs(2))
+                .await
+        );
+        live.last_used_ms.store(0, Ordering::Relaxed);
+        assert!(!live.pending_hand_back());
+        assert!(
+            live.last_used_ms() > 0,
+            "hand-back starts a fresh idle window"
+        );
+
+        // An actual idle, agent-held session still closes. A previously acquired
+        // Arc then refuses work, and its stale nomination cannot close a successor.
+        live.last_used_ms.store(0, Ordering::Relaxed);
+        assert!(reap_candidate(data.path(), live.clone(), 60_000).await);
+        assert_eq!(live.operation().await.err().unwrap().code, "CLOSED");
+        let successor = acquire(data.path(), "old-owner", "new-owner", None)
+            .await
+            .unwrap();
+        successor.last_used_ms.store(0, Ordering::Relaxed);
+        assert!(!reap_candidate(data.path(), live, 60_000).await);
+        stop_agent(data.path(), "old-owner").await;
+        assert!(
+            !successor.session.is_closed(),
+            "archive must revalidate the current lease"
+        );
+        assert_eq!(successor.leaseholder().as_deref(), Some("new-owner"));
+        // Engine close ends the lease, so this protected profile can reopen.
+        successor.session.close().await;
+        let recovered = acquire(data.path(), "old-owner", "recovered-owner", None)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&successor, &recovered));
+        assert!(!recovered.session.is_closed());
+        assert!(
+            stop_authorized(data.path(), "old-owner", "recovered-owner")
+                .await
+                .unwrap()
+        );
+    }
 
     #[test]
     fn direct_access_disables_system_proxies() {
@@ -832,6 +1119,10 @@ mod tests {
             }
         }
         assert_eq!(cfg.profile.user_data_dir(), dir.path().join("user-data"));
+        assert_eq!(
+            cfg.human_idle_timeout, None,
+            "takeover requires explicit hand-back"
+        );
     }
 
     #[test]

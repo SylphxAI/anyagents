@@ -1699,6 +1699,10 @@ fn resolve_work_path(work_dir: &Path, raw: &str) -> Result<PathBuf, String> {
 }
 
 pub fn resolve_sylphx_gateway_base_url() -> String {
+    configured_gateway_base_url().unwrap_or_else(|| "https://api.sylphx.com".to_string())
+}
+
+fn configured_gateway_base_url() -> Option<String> {
     let raw = std::env::var("SYLPHX_AI_BASE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -1706,10 +1710,9 @@ pub fn resolve_sylphx_gateway_base_url() -> String {
             std::env::var("SYLPHX_GATEWAY_URL")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
-        })
-        .unwrap_or_else(|| "https://api.sylphx.com".to_string());
+        })?;
     let trimmed = raw.trim().trim_end_matches('/');
-    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
+    Some(trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string())
 }
 
 pub fn resolve_sylphx_api_key(data_dir: Option<&Path>, config_dir: &Path) -> Option<String> {

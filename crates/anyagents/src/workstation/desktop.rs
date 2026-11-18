@@ -140,6 +140,7 @@ async fn run(data: &Path, caller: &Caller, req: Value) -> Result<Value, ToolErro
     }
 
     let live = super::session::acquire(data, &profile, &caller.principal, None).await?;
+    let _operation = live.operation().await?;
     let s = live
         .session
         .lease(&caller.principal)
@@ -204,7 +205,6 @@ async fn run(data: &Path, caller: &Caller, req: Value) -> Result<Value, ToolErro
             pixel(&s, action).await?
         }
     };
-    live.touch();
     Ok(out)
 }
 

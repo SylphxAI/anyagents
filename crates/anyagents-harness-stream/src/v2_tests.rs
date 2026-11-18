@@ -188,6 +188,237 @@ fn a_replay_rebuilds_the_open_turn_and_its_proofs_and_nothing_is_written_twice()
 }
 
 #[test]
+fn bound_terminal_replay_rebuilds_members_without_accepted_and_context_stays_on_openers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let peer = std::thread::spawn(move || {
+        let (mut out, _) = listener.accept().unwrap();
+        out.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut reader = BufReader::new(out.try_clone().unwrap());
+        let mut read = || {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        let attach = read();
+        assert_eq!(attach["after_seq"], 21);
+        for chunk in [
+            frame(
+                22,
+                "past-duplicate",
+                json!({"type":"result", "status":"completed",
+                "duplicate":true, "tool_context_bound":false, "final_text":"", "consumed_request_ids":[]}),
+            ),
+            frame(
+                23,
+                "past-no-error-field",
+                json!({"type":"result", "status":"completed", "is_error":false,
+                "duplicate":false, "tool_context_bound":true, "final_text":"incomplete envelope",
+                "consumed_request_ids":["past-no-error-field"], "undelivered_steer_ids":[]}),
+            ),
+            frame(
+                24,
+                "past-error",
+                json!({"type":"result", "status":"completed", "is_error":false, "error":"provider failure",
+                "duplicate":false, "tool_context_bound":true, "final_text":"contradictory envelope",
+                "consumed_request_ids":["past-error"], "undelivered_steer_ids":[]}),
+            ),
+            frame(
+                25,
+                "past-no-text",
+                json!({"type":"result", "status":"completed", "is_error":false, "error":null,
+                "duplicate":false, "tool_context_bound":true,
+                "consumed_request_ids":["past-no-text"], "undelivered_steer_ids":[]}),
+            ),
+            frame(
+                26,
+                "past-opener",
+                json!({"type":"result", "status":"completed", "is_error":false, "error":null,
+                "duplicate":false, "tool_context_bound":true, "final_text":"replayed answer",
+                "consumed_request_ids":["past-opener","past-steer"], "undelivered_steer_ids":["untaken"]}),
+            ),
+            frame(
+                27,
+                attach["request_id"].as_str().unwrap(),
+                json!({"type":"ready", "protocol":"spiron.headless/v2",
+                "features":["turn-tool-context-v1"]}),
+            ),
+        ] {
+            out.write_all(chunk.as_bytes()).unwrap();
+        }
+        let prompt = read();
+        assert_eq!(prompt["type"], "prompt");
+        assert_eq!(prompt["tool_context"], "opener-scope");
+        out.write_all(frame(28, "live", json!({"type":"accepted", "mode":"turn"})).as_bytes())
+            .unwrap();
+        let steer = read();
+        assert_eq!(steer["type"], "steer");
+        assert!(steer.get("tool_context").is_none());
+        out.write_all(
+            frame(
+                29,
+                "live",
+                json!({"type":"result", "status":"completed", "is_error":false, "error":null,
+            "duplicate":false, "tool_context_bound":false, "final_text":"unscoped answer",
+            "consumed_request_ids":["live"], "undelivered_steer_ids":["later"]}),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut line = String::new();
+        assert_eq!(reader.read_line(&mut line).unwrap(), 0, "{line}");
+    });
+    let mut harness = StreamHarness::connect(Connect {
+        spec: spec(),
+        program: "spiron".into(),
+        socket: path,
+        pid: Some(4242),
+        after_seq: Some(21),
+        session_id: Some("s-1".into()),
+        environment: Vec::new(),
+        delivery: SPIRON,
+    })
+    .unwrap();
+    harness.wait_ready(Duration::from_secs(10)).unwrap();
+    assert!(harness.supports_turn_tool_context());
+    assert_eq!(
+        harness.proven("past-opener"),
+        Some(Proof::Taken {
+            turn_finished: true
+        })
+    );
+    assert_eq!(
+        harness.proven("past-steer"),
+        Some(Proof::Taken {
+            turn_finished: true
+        })
+    );
+    assert_eq!(
+        harness.task_turn_result("past-steer"),
+        Some(("past-opener".into(), "replayed answer".into()))
+    );
+    for missing in [
+        "untaken",
+        "past-duplicate",
+        "past-no-error-field",
+        "past-error",
+        "past-no-text",
+    ] {
+        assert!(harness.proven(missing).is_none());
+        assert!(harness.task_turn_result(missing).is_none());
+    }
+    assert!(harness.written_ids().is_empty());
+    harness
+        .deliver(
+            &message("live"),
+            &json!({"type":"user", "text":"run", "tool_context":"opener-scope"}),
+        )
+        .unwrap();
+    until(|| harness.proven("live").is_some());
+    harness
+        .deliver(
+            &message("later"),
+            &json!({"type":"user", "text":"steer", "tool_context":"not-the-opener"}),
+        )
+        .unwrap();
+    until(|| {
+        harness.proven("live")
+            == Some(Proof::Taken {
+                turn_finished: true,
+            })
+    });
+    assert!(harness.task_turn_result("live").is_none());
+    assert!(harness.task_turn_result("later").is_none());
+    harness.stop();
+    peer.join().unwrap();
+}
+
+#[test]
+fn replayed_ready_does_not_enable_context_before_or_without_current_negotiation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let (allow_ready, wait_for_assertions) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let attach: Value = serde_json::from_str(&line).unwrap();
+        for chunk in [
+            frame(
+                2,
+                "old-attach",
+                json!({"type":"ready", "protocol":"spiron.headless/v2",
+                "features":["turn-tool-context-v1"]}),
+            ),
+            frame(
+                3,
+                "past",
+                json!({"type":"result", "status":"completed", "is_error":false,
+                "error":null, "duplicate":false, "tool_context_bound":true,
+                "final_text":"historical answer", "consumed_request_ids":["past"]}),
+            ),
+        ] {
+            stream.write_all(chunk.as_bytes()).unwrap();
+        }
+        wait_for_assertions
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        stream
+            .write_all(
+                frame(
+                    4,
+                    attach["request_id"].as_str().unwrap(),
+                    json!({"type":"ready", "protocol":"spiron.headless/v2"}),
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let prompt: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(prompt["type"], "prompt");
+        assert!(prompt.get("tool_context").is_none());
+    });
+    let mut harness = StreamHarness::connect(Connect {
+        spec: spec(),
+        program: "spiron".into(),
+        socket: path,
+        pid: None,
+        after_seq: Some(1),
+        session_id: Some("s-1".into()),
+        environment: Vec::new(),
+        delivery: SPIRON,
+    })
+    .unwrap();
+    until(|| {
+        harness.proven("past")
+            == Some(Proof::Taken {
+                turn_finished: true,
+            })
+    });
+    assert!(!harness.supports_turn_tool_context());
+    assert!(harness.task_turn_result("past").is_none());
+    allow_ready.send(()).unwrap();
+    harness.wait_ready(Duration::from_secs(10)).unwrap();
+    assert!(!harness.supports_turn_tool_context());
+    assert!(harness.task_turn_result("past").is_none());
+    harness
+        .deliver(
+            &message("live"),
+            &json!({"type":"user", "text":"run", "tool_context":"opener-scope"}),
+        )
+        .unwrap();
+    peer.join().unwrap();
+    harness.stop();
+}
+
+#[test]
 fn a_replayed_steer_ack_marks_its_turn_in_flight_before_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.sock");

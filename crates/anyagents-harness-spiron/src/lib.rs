@@ -356,11 +356,30 @@ impl SpironHarness {
 
 impl Harness for SpironHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        let line = json!({
+        self.deliver_with_turn_context(message, None)
+    }
+
+    fn supports_turn_tool_context(&self) -> bool {
+        self.inner.supports_turn_tool_context()
+    }
+
+    fn task_turn_result(&self, input_id: &str) -> Option<(String, String)> {
+        self.inner.task_turn_result(input_id)
+    }
+
+    fn deliver_with_turn_context(
+        &mut self,
+        message: &OutboundMessage,
+        context: Option<&str>,
+    ) -> Result<DeliverOutcome, HarnessError> {
+        let mut line = json!({
             "type": "prompt",
             "request_id": message.id,
             "text": compose_message(&message.id, &message.context, &message.text),
         });
+        if let Some(context) = context {
+            line["tool_context"] = json!(context);
+        }
         self.inner.deliver(message, &line)
     }
 

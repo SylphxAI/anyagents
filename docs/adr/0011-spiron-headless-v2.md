@@ -173,6 +173,12 @@ Capability level, as 0010 D7 asks each adapter to declare: delivery `next-step`,
 
 **Deletes.** The keeper for each Spiron agent with a v2 binary (ADR 0010 D6). Later, with the last v1 binary: the v1 path in the Spiron adapter and `fake_spiron.py`.
 
+#### Task return custody (optional)
+
+A peer that advertises `turn-tool-context-v1` in `ready.features` accepts an opaque `prompt.tool_context` on the request opening a turn. The peer passes it in `params._meta["io.spiron/turn-context"]` to mounted stdio MCP calls, including through Code Mode, and preserves it across internal window rollovers. Steers and duplicate prompts cannot replace it. The value is transport metadata, not prompt text or output.
+
+AnyAgents uses a successful, non-duplicate `result` only when it asserts `tool_context_bound: true`, carries `final_text`, and lists the durably consumed requests in `consumed_request_ids`, with the opener first. Replay preserves that proof even when earlier receipt frames precede the cursor. AnyAgents commits completion and appends a `<task_return>` in one transaction if the task child has no active schedules and did not deliver new mail to its parent during the turn. If the peer is older or the proof is missing, AnyAgents retains existing lifecycle notices; it does not infer an exact return from transcripts or timestamps.
+
 ### D10. Conformance
 
 The conformance suite drives the real Spiron binary, built in Spiron's CI, through this contract over the Unix socket and stdio, and checks every frame against the schema: `ready`, deliver (`prompt` → `accepted`), `steer` → `steer_ack` → `steer_consumed`, a host tool call answered after a reattach, `result` with `usage` and `cost_micros`, the client killed mid-turn, the process still running, `attach {after_seq}` replaying exactly the missed frames, a redelivered `prompt` and `steer` answered as duplicates, no `seq` seen twice and none skipped, and `stop`. A Python fake is not conformance.

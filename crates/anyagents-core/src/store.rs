@@ -85,6 +85,10 @@ fn cancel_archived_schedules(conn: &Connection, id: &AgentId) -> Result<(), Erro
          WHERE agent_id = ?1 AND state = 'active'",
         [id.as_str()],
     )?;
+    conn.execute(
+        "DELETE FROM task_turn_contexts WHERE child_id = ?1 AND closed_delivery_seq IS NULL",
+        [id.as_str()],
+    )?;
     Ok(())
 }
 
@@ -94,6 +98,16 @@ pub struct Origin {
     pub chat_id: Option<i64>,
     pub thread_id: Option<i64>,
     pub message_id: Option<i64>,
+}
+
+enum ReceiveTx {
+    Early(Option<ReceiveOutcome>),
+    Inserted {
+        message: Message,
+        woke_agent: bool,
+        is_passive_reaction: bool,
+        recipient: Box<Agent>,
+    },
 }
 
 /// History an incoming line refers to, read before the ingress transaction
@@ -959,23 +973,23 @@ fn is_transient_sqlite_error(error: &rusqlite::Error) -> bool {
 /// discards SQLite's page cache and re-reads the schema every time; on a
 /// multi-GB store that turned every read into a burst of `pread` syscalls and
 /// pinned the daemon in the kernel. Readers beyond this many simply close.
-const MAX_IDLE_READERS: usize = 32;
-/// Upper bound for memory-mapped I/O (SQLite clamps it to its compile-time
-/// maximum). Mapped pages come straight from the shared OS page cache, so
-/// reads cost no syscalls and no per-connection copy.
-const MMAP_SIZE_BYTES: i64 = 64 * 1024 * 1024 * 1024;
-/// Per-connection page cache, in KiB (negative `cache_size` units).
-const CACHE_SIZE_KIB: i64 = 32 * 1024;
+const MAX_IDLE_READERS: usize = 8;
+/// Use the bounded page cache instead of retaining resident file mappings
+/// across pooled connections. The OS still caches ordinary file reads.
+const MMAP_SIZE_BYTES: i64 = 0;
+/// Per-schema page cache, in KiB (negative `cache_size` units).
+const CACHE_SIZE_KIB: i64 = 2 * 1024;
 /// Prepared statements kept per connection; read paths reuse a few dozen.
 const STATEMENT_CACHE: usize = 128;
 
-/// Apply the shared performance settings to any store connection. Failures
-/// are ignored: each setting is an optimisation, never a correctness need.
-fn tune_connection(conn: &Connection) {
-    let _ = conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES);
-    let _ = conn.pragma_update(None, "cache_size", -CACHE_SIZE_KIB);
-    let _ = conn.pragma_update(None, "temp_store", "MEMORY");
+/// Apply resource bounds to every store/index connection. Do not admit a
+/// connection whose pager settings could not be established.
+pub(crate) fn tune_connection(conn: &Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "mmap_size", MMAP_SIZE_BYTES)?;
+    conn.pragma_update(None, "cache_size", -CACHE_SIZE_KIB)?;
+    conn.pragma_update(None, "temp_store", "FILE")?;
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+    Ok(())
 }
 
 /// Open one read-only connection for the reader pool.
@@ -987,7 +1001,7 @@ fn open_reader(path: &Path) -> Option<Connection> {
     .ok()?;
     let _ = conn.busy_timeout(BUSY_TIMEOUT);
     let _ = conn.pragma_update(None, "query_only", "ON");
-    tune_connection(&conn);
+    tune_connection(&conn).ok()?;
     // The mailbox search index, read-only like the rest of this connection:
     // `rag_chunks` resolves to it, as state has no table of that name. A
     // reader without it is not a reader of this store; none is pooled.
@@ -1007,6 +1021,10 @@ fn attach_memory_index(conn: &Connection, path: &Path) -> Result<(), Error> {
         &format!("ATTACH DATABASE ?1 AS {}", memory_index::ATTACHED),
         [index.as_os_str().to_string_lossy()],
     )?;
+    // Pager settings are per schema: tuning main does not tune an attachment.
+    let schema = Some(memory_index::ATTACHED);
+    conn.pragma_update(schema, "mmap_size", MMAP_SIZE_BYTES)?;
+    conn.pragma_update(schema, "cache_size", -CACHE_SIZE_KIB)?;
     Ok(())
 }
 
@@ -2595,22 +2613,97 @@ impl Store {
         wake_archived: bool,
         admit: impl FnOnce(&Connection) -> Result<bool, Error>,
     ) -> Result<Option<ReceiveOutcome>, Error> {
+        self.receive_with_turn_admission(agent_id, incoming, wake_archived, admit, None)
+    }
+
+    /// For a mounted stdio tool call, bind a newly committed delivery to the
+    /// exact task opener. Neither a skipped delivery nor an idempotent replay
+    /// can count as this turn's explicit send.
+    pub fn receive_turn_send(
+        &self,
+        agent_id: &AgentId,
+        incoming: Incoming,
+        wake_archived: bool,
+        sender: &AgentId,
+        token: &str,
+    ) -> Result<ReceiveOutcome, Error> {
+        self.receive_with_turn_admission(
+            agent_id,
+            incoming,
+            wake_archived,
+            |_| Ok(true),
+            Some((sender, token)),
+        )
+        .map(|outcome| outcome.expect("unconditional turn send admission"))
+    }
+
+    fn receive_with_turn_admission(
+        &self,
+        agent_id: &AgentId,
+        incoming: Incoming,
+        wake_archived: bool,
+        admit: impl FnOnce(&Connection) -> Result<bool, Error>,
+        turn: Option<(&AgentId, &str)>,
+    ) -> Result<Option<ReceiveOutcome>, Error> {
         let mut incoming = incoming;
         let source_key = incoming.source_key.take().filter(|key| !key.is_empty());
         let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
         let history = self.ingress_history(&mut incoming, source_key.as_deref(), agent_id);
-        enum ReceiveTx {
-            Early(Option<ReceiveOutcome>),
-            Inserted {
-                message: Message,
-                woke_agent: bool,
-                is_passive_reaction: bool,
-                recipient: Box<Agent>,
-            },
-        }
         // Stored bodies a channel retry merged a fuller copy into.
-        let mut merged: Vec<String> = Vec::new();
-        let tx_outcome = self.write_tx(|tx| -> Result<ReceiveTx, Error> {
+        let mut merged = Vec::new();
+        let tx_outcome = self.write_tx(|tx| {
+            if !admit(tx)? {
+                return Ok(ReceiveTx::Early(None));
+            }
+            if let Some((sender, token)) = turn {
+                let sender_agent = agent_by_id(tx, sender)?;
+                let active = sender_agent.is_task_subagent() && sender_agent.state != "archived"
+                    && tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM task_turn_contexts
+                         WHERE child_id = ?1 AND token = ?2 AND closed_delivery_seq IS NULL)",
+                        params![sender.as_str(), token],
+                        |row| row.get::<_, bool>(0),
+                    )?;
+                if !active {
+                    return Err(Error::PermissionDenied("invalid or closed task turn context".into()));
+                }
+            }
+            let outcome = Self::receive_on(
+                tx,
+                agent_id,
+                incoming,
+                source_key,
+                received_at_ms,
+                history,
+                wake_archived,
+                None,
+                &mut merged,
+            )?;
+            if let Some((sender, token)) = turn && matches!(outcome, ReceiveTx::Inserted { .. }) {
+                tx.execute(
+                    "UPDATE task_turn_contexts SET sent_to_parent_id = ?3
+                     WHERE child_id = ?1 AND token = ?2 AND ?3 = (SELECT parent_id FROM agents WHERE id = ?1)",
+                    params![sender.as_str(), token, agent_id.as_str()],
+                )?;
+            }
+            Ok(outcome)
+        })?;
+        Ok(self.finish_receive(tx_outcome, &merged))
+    }
+
+    /// Append under an existing writer. Call finish_receive only after commit.
+    #[allow(clippy::too_many_arguments)]
+    fn receive_on(
+        tx: &Connection,
+        agent_id: &AgentId,
+        incoming: Incoming,
+        source_key: Option<String>,
+        received_at_ms: i64,
+        history: IngressHistory,
+        wake_archived: bool,
+        trusted_event: Option<&str>,
+        merged: &mut Vec<String>,
+    ) -> Result<ReceiveTx, Error> {
         // Author validity shares the write transaction with delivery. A sender
         // deleted while waiting for publication cannot borrow a same-spelled
         // display name or produce a stale-principal mailbox/context receipt.
@@ -2622,9 +2715,6 @@ impl Store {
             .and_then(|reference| AgentId::parse(reference).ok())
         {
             agent_exists(tx, &author)?;
-        }
-        if !admit(tx)? {
-            return Ok(ReceiveTx::Early(None));
         }
         agent_exists(tx, agent_id)?;
         // Erasure is authoritative over provider retries/edits, including basic
@@ -2694,7 +2784,7 @@ impl Store {
                 source_key.as_deref(),
                 reply_to_author.as_deref(),
                 &mut redelivery_identity,
-                &mut merged,
+                merged,
             )?
         {
             return Ok(ReceiveTx::Early(Some(ReceiveOutcome::Duplicate(existing))));
@@ -2782,7 +2872,9 @@ impl Store {
             Some(cid) => resolve_chat_metadata(tx, cid),
             None => (None, None),
         };
-        let event = if incoming.text.starts_with("[Pinned message #")
+        let event = if let Some(event) = trusted_event {
+            Some(event.to_string())
+        } else if incoming.text.starts_with("[Pinned message #")
             || incoming.text.starts_with("[pinned message")
         {
             Some("pinned".to_string())
@@ -2801,7 +2893,9 @@ impl Store {
                             || rta.eq_ignore_ascii_case(&a.name)
                     })
                 })
-                || history.reaction_chat_agents.is_some_and(|agents| agents <= 1);
+                || history
+                    .reaction_chat_agents
+                    .is_some_and(|agents| agents <= 1);
             if is_targeted_reaction {
                 Some("reaction".to_string())
             } else {
@@ -2938,40 +3032,37 @@ impl Store {
             )? > 0
         };
         let agent = agent_by_id(tx, agent_id)?;
-            Ok(ReceiveTx::Inserted {
-                message,
-                woke_agent,
-                is_passive_reaction,
-                recipient: Box::new(agent),
-            })
-        })?;
+        Ok(ReceiveTx::Inserted {
+            message,
+            woke_agent,
+            is_passive_reaction,
+            recipient: Box::new(agent),
+        })
+    }
+
+    fn finish_receive(&self, tx_outcome: ReceiveTx, merged: &[String]) -> Option<ReceiveOutcome> {
+        self.reproject_merged(merged);
         match tx_outcome {
-            ReceiveTx::Early(outcome) => {
-                self.reproject_merged(&merged);
-                Ok(outcome)
-            }
+            ReceiveTx::Early(outcome) => outcome,
             ReceiveTx::Inserted {
                 message,
                 woke_agent,
                 is_passive_reaction,
                 recipient,
             } => {
-                self.reproject_merged(&merged);
                 self.project_mailbox();
                 if woke_agent {
                     self.notify(Wake::Agent {
-                        agent_id: agent_id.clone(),
+                        agent_id: message.agent_id.clone(),
                     });
                 }
                 if !is_passive_reaction {
                     self.notify(Wake::Mail {
-                        agent_id: agent_id.clone(),
+                        agent_id: message.agent_id.clone(),
                     });
-                    // Mail that waits behind a pause, or that an archived
-                    // agent will not read, is announced (mail_notices.rs).
                     self.announce_held_mail(&message, &recipient);
                 }
-                Ok(Some(ReceiveOutcome::New(message)))
+                Some(ReceiveOutcome::New(message))
             }
         }
     }
@@ -3164,6 +3255,10 @@ impl Store {
                      WHERE a.id = ?1
                        AND a.parent_id IS NOT NULL
                        AND a.state = 'running'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM task_turn_contexts t
+                           WHERE t.child_id = a.id AND t.closed_delivery_seq = tr.completed_seq
+                       )
                        AND EXISTS (
                            SELECT 1 FROM messages m
                            WHERE m.agent_id = ?1
@@ -8497,6 +8592,32 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_resident_cache_limits_cover_writer_reader_and_attachment() {
+        let (_dir, store) = setup();
+        let check = |conn: &Connection, schema| {
+            let cache: i64 = conn
+                .pragma_query_value(schema, "cache_size", |r| r.get(0))
+                .unwrap();
+            let mmap: i64 = conn
+                .pragma_query_value(schema, "mmap_size", |r| r.get(0))
+                .unwrap();
+            assert_eq!(cache, -CACHE_SIZE_KIB);
+            assert_eq!(mmap, 0);
+        };
+        {
+            let writer = store.conn();
+            check(&writer, None);
+            let temporary: i64 = writer
+                .pragma_query_value(None, "temp_store", |r| r.get(0))
+                .unwrap();
+            assert_eq!(temporary, 1, "large sorts must be able to spill to disk");
+        }
+        let reader = store.read_conn();
+        check(&reader, None);
+        check(&reader, Some(memory_index::ATTACHED));
+    }
+
+    #[test]
     fn an_open_turn_never_quotes_a_message_parked_inside_it() {
         let (_dir, store) = setup();
         let bob = store.create_agent(NewAgent::new("bob", "codex")).unwrap();
@@ -8669,6 +8790,46 @@ mod tests {
             store.set_agent_harness(&created.id, "codex").unwrap();
             let switched = store.set_agent_harness(&created.id, legacy).unwrap();
             assert_eq!(switched, created);
+        }
+    }
+
+    #[test]
+    fn model_selector_matrix_survives_create_update_harness_switch_and_reopen() {
+        let (dir, store) = setup();
+        let mut expected = Vec::new();
+        for base in [
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "gpt-6.1-sol",
+            "unknown-model",
+        ] {
+            for prefix in ["openai/", "sylphx/openai/"] {
+                for effort in ["low", "medium", "high", "xhigh", "max"] {
+                    let selector = format!("{prefix}{base}#{effort}");
+                    let mut new =
+                        NewAgent::new(format!("selector-{}", expected.len()), "sylphx/default");
+                    new.model = Some(selector.clone());
+                    let created = store.create_agent(new).unwrap();
+                    assert_eq!(created.model.as_deref(), Some(selector.as_str()));
+                    let switched = store.set_agent_harness(&created.id, "codex").unwrap();
+                    assert_eq!(switched.model, created.model);
+                    store
+                        .set_agent_model(&created.id, "vendor/unknown#future")
+                        .unwrap();
+                    store.set_agent_model(&created.id, &selector).unwrap();
+                    let updated = store.agent(&created.id).unwrap();
+                    assert_eq!(updated.model.as_deref(), Some(selector.as_str()));
+                    expected.push((created.id, selector));
+                }
+            }
+        }
+        drop(store);
+        let reopened = Store::open(dir.path().join("state.db")).unwrap();
+        for (id, selector) in expected {
+            assert_eq!(
+                reopened.agent(&id).unwrap().model.as_deref(),
+                Some(selector.as_str())
+            );
         }
     }
 
@@ -11760,6 +11921,75 @@ mod tests {
         let sleep = crate::learned_memory::read_sleep_state(&root);
         assert_eq!(sleep.last_inbound_seq, 1);
         assert_eq!(sleep.consolidated_topics, 1);
+    }
+
+    #[test]
+    fn sleep_model_selector_matrix_reaches_chat_completions_without_route_or_fragment() {
+        use crate::learned_memory::{SleepModelEndpoint, request_sleep_consolidation_plan};
+        let root = crate::test_tempdir();
+        let mut cases = Vec::new();
+        for base in [
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "gpt-6.1-sol",
+            "unknown-model",
+        ] {
+            for prefix in ["openai/", "sylphx/openai/"] {
+                for effort in ["low", "medium", "high", "xhigh", "max"] {
+                    cases.push((
+                        format!("{prefix}{base}#{effort}"),
+                        format!("openai/{base}"),
+                        Some(effort),
+                    ));
+                }
+            }
+        }
+        for opaque in [
+            "vendor/custom#future",
+            "sylphx/vendor/custom#high",
+            "openai/custom#future",
+            "openai/gpt-6.1-sol",
+        ] {
+            cases.push((opaque.into(), opaque.into(), None));
+        }
+        for (selector, model, effort) in cases {
+            let (url, requests, handle) =
+                spawn_mock_sleep_model_server(r#"{"operations":[]}"#.into());
+            let endpoint = SleepModelEndpoint {
+                url,
+                bearer_key: None,
+                model: selector.clone(),
+            };
+            request_sleep_consolidation_plan(&endpoint, root.path(), "worker", None, &[], &[])
+                .unwrap();
+            handle.join().unwrap();
+            let captured = requests.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert!(captured[0].starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+            let (_, payload) = captured[0].split_once("\r\n\r\n").unwrap();
+            let body: serde_json::Value = serde_json::from_str(payload).unwrap();
+            assert_eq!(body["model"].as_str(), Some(model.as_str()), "{selector}");
+            assert_eq!(
+                body.get("reasoning_effort").and_then(|v| v.as_str()),
+                effort
+            );
+            assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                endpoint.model, selector,
+                "wire conversion must not rewrite the stored selector"
+            );
+        }
+        let (url, _, handle) = spawn_mock_sleep_model_server("not a consolidation plan".into());
+        let endpoint = SleepModelEndpoint {
+            url,
+            bearer_key: None,
+            model: "sylphx/openai/gpt-6.2-sol#max".into(),
+        };
+        assert!(
+            request_sleep_consolidation_plan(&endpoint, root.path(), "worker", None, &[], &[])
+                .is_err()
+        );
+        handle.join().unwrap();
     }
 
     #[test]

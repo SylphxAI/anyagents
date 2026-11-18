@@ -139,7 +139,8 @@ def inputs():
                 for frame in frames:
                     if frame['seq'] > after:
                         send_frame(frame)
-            emit('ready', attach['request_id'], protocol='spiron.headless/v2', replay=dict(after_seq=after, complete=True))
+            features = ['turn-tool-context-v1'] if (root / 'task-context').exists() else []
+            emit('ready', attach['request_id'], protocol='spiron.headless/v2', features=features, replay=dict(after_seq=after, complete=True))
         for line in reader:
             msg = json.loads(line)
             assert msg['type'] in ('prompt', 'steer', 'cancel', 'stop'), msg
@@ -1168,6 +1169,13 @@ def drive():
                     "usage": {"input_tokens": 3, "output_tokens": 1},
                         }
                 frame["undelivered_steer_ids"] = [request_id for request_id, _ in pending]
+                if (root / "task-context").exists():
+                    written = [json.loads(line)["msg"] for line in (root / "wire.jsonl").read_text().splitlines()]
+                    openers = [msg for msg in written if msg["request_id"] == turn and msg["type"] == "prompt"]
+                    assert len(openers) == 1 and openers[0].get("tool_context")
+                    taken = [json.loads(line) for line in journal.read_text().splitlines()]
+                    frame.update(duplicate=False, tool_context_bound=True, final_text="Final <answer> & evidence",
+                                 consumed_request_ids=[row["key"].removeprefix("input:") for row in taken if row["turn"] == turn])
                 close_turn()
                 receipt(frame, turn)
                 take("finish")
@@ -1207,6 +1215,10 @@ struct FakeSpiron {
 
 impl FakeSpiron {
     fn new(temp: &Path) -> (Self, Store) {
+        Self::with_task_context(temp, false)
+    }
+
+    fn with_task_context(temp: &Path, task_context: bool) -> (Self, Store) {
         let environment = crate::server::tests::env_lock();
         let config = temp.join("config");
         let work = temp.join("work");
@@ -1216,9 +1228,16 @@ impl FakeSpiron {
         std::fs::write(&program, native_script(FAKE_SPIRON)).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let store = Store::open(temp.join("state.db")).unwrap();
-        let agent = store
-            .create_agent(NewAgent::new("steered", "spiron"))
-            .unwrap();
+        let mut input = NewAgent::new("steered", "spiron");
+        if task_context {
+            let parent = store.create_agent(NewAgent::new("lead", "spiron")).unwrap();
+            input.parent_id = Some(parent.id);
+            std::fs::write(config.join("task-context"), "").unwrap();
+        }
+        let agent = store.create_agent(input).unwrap();
+        if task_context {
+            store.set_agent_state(&agent.id, "running").unwrap();
+        }
         // The fake names its session, which binds to the agent's host session.
         anyagents_core::host_session::ensure_active(temp, "spiron").unwrap();
         let fake = Self {
@@ -1309,6 +1328,39 @@ fn deliver_through(delivery: &mut anyagents_agent::DeliveryLoop<VendorHarness>, 
     });
     assert_eq!(delivery.delivered_cursor().unwrap(), seq);
     delivered
+}
+
+#[test]
+fn spiron_task_return_uses_bound_result_after_consumed_steer() {
+    let temp = crate::test_tempdir();
+    let (fake, store) = FakeSpiron::with_task_context(temp.path(), true);
+    let opener = fake.receive(&store, "start the work");
+    let mut delivery = fake.delivery(store);
+    assert_eq!(deliver_through(&mut delivery, opener.seq), 1);
+    let parent_id = fake.agent.parent_id.as_ref().unwrap();
+    assert!(delivery.store().inbox(parent_id, None).unwrap().is_empty());
+    let steer = fake.receive(delivery.store(), "finish the work");
+    delivery.run_once().unwrap();
+    eventually(|| fake.wire().len() == 2);
+    let lines = fake.lines("wire.jsonl");
+    assert!(lines[0]["msg"]["tool_context"].as_str().is_some());
+    assert!(lines[1]["msg"].get("tool_context").is_none());
+    fake.act("step");
+    assert_eq!(deliver_through(&mut delivery, steer.seq), 1);
+    fake.act("finish");
+    eventually(|| delivery.harness().health().turn_state == anyagents_harness::TurnState::Idle);
+    assert!(delivery.complete_turn().unwrap());
+    assert!(!delivery.complete_turn().unwrap());
+    let items = delivery.store().inbox(parent_id, None).unwrap();
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(
+        items[0].text,
+        format!(
+            "<task_return agent_id=\"{}\" delivered_seq=\"{}\">Final &lt;answer&gt; &amp; evidence</task_return>",
+            fake.agent.id, steer.seq
+        )
+    );
+    delivery.harness_mut().stop();
 }
 
 #[test]

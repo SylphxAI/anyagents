@@ -11,7 +11,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
-use super::{Store, agent_by_id, agent_exists};
+use super::{
+    Agent, Incoming, IngressHistory, Store, Wake, agent_by_id, agent_exists,
+    cancel_archived_schedules, turn_errors,
+};
 use crate::error::Error;
 use crate::id::AgentId;
 use crate::migrate::now_ms;
@@ -261,6 +264,10 @@ impl Store {
     /// Record one fact. Returns the stored row and whether this call added
     /// it: a repeated `(agent, dedupe_key)` returns the first row unchanged.
     pub fn record_outcome(&self, new: NewOutcome) -> Result<(Outcome, bool), Error> {
+        self.write_tx(|tx| Self::record_outcome_on(tx, new))
+    }
+
+    fn record_outcome_on(tx: &Connection, new: NewOutcome) -> Result<(Outcome, bool), Error> {
         bounded("subject", &new.subject)?;
         bounded("dedupe_key", &new.dedupe_key)?;
         bounded("actor", &new.actor)?;
@@ -281,44 +288,122 @@ impl Store {
             .map(str::trim)
             .filter(|profile| !profile.is_empty());
         let id = format!("out_{}", uuid::Uuid::now_v7().simple());
-        self.write_tx(|tx| {
-            let agent = agent_by_id(tx, &new.agent_id)?;
-            let inserted = tx.execute(
-                "INSERT INTO outcomes (id, agent_id, kind, source, subject, dedupe_key, actor,
+        let agent = agent_by_id(tx, &new.agent_id)?;
+        let inserted = tx.execute(
+            "INSERT INTO outcomes (id, agent_id, kind, source, subject, dedupe_key, actor,
                                        harness, model, role, profile, note, claimed_at_ms,
                                        observed_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT (agent_id, dedupe_key) DO NOTHING",
-                params![
-                    id,
-                    agent.id.as_str(),
-                    new.kind.as_str(),
-                    new.kind.source(),
-                    new.subject,
-                    new.dedupe_key,
-                    new.actor,
-                    agent.harness,
-                    agent.model,
-                    agent.role,
-                    profile,
-                    note,
-                    new.claimed_at_ms,
-                    new.observed_at_ms,
-                ],
-            )? == 1;
-            let stored = {
-                let mut statement = tx.prepare(&format!(
-                    "SELECT {OUTCOME_COLS} FROM outcomes WHERE agent_id = ?1 AND dedupe_key = ?2"
-                ))?;
-                let mut rows = statement.query(params![agent.id.as_str(), new.dedupe_key])?;
-                match rows.next()? {
-                    Some(row) => outcome_from_row(row)?,
-                    None => None,
-                }
+            params![
+                id,
+                agent.id.as_str(),
+                new.kind.as_str(),
+                new.kind.source(),
+                new.subject,
+                new.dedupe_key,
+                new.actor,
+                agent.harness,
+                agent.model,
+                agent.role,
+                profile,
+                note,
+                new.claimed_at_ms,
+                new.observed_at_ms,
+            ],
+        )? == 1;
+        let stored = {
+            let mut statement = tx.prepare(&format!(
+                "SELECT {OUTCOME_COLS} FROM outcomes WHERE agent_id = ?1 AND dedupe_key = ?2"
+            ))?;
+            let mut rows = statement.query(params![agent.id.as_str(), new.dedupe_key])?;
+            match rows.next()? {
+                Some(row) => outcome_from_row(row)?,
+                None => None,
             }
-            .ok_or_else(|| Error::Message("a newer binary recorded this outcome".to_string()))?;
-            Ok((stored, inserted))
-        })
+        }
+        .ok_or_else(|| Error::Message("a newer binary recorded this outcome".to_string()))?;
+        Ok((stored, inserted))
+    }
+
+    /// Record an operator/ancestor verdict and apply its task lifecycle action
+    /// in the same commit. Caller holds the target's lifecycle lock while
+    /// reconciling any process, archive-marker and worktree side effects.
+    pub fn apply_verdict(
+        &self,
+        actor_id: Option<&AgentId>,
+        target_id: &AgentId,
+        kind: OutcomeKind,
+        reason: Option<String>,
+        profile: Option<String>,
+    ) -> Result<(Outcome, Option<Agent>), Error> {
+        if !kind.is_verdict() {
+            return Err(Error::Message("expected a verdict".into()));
+        }
+        let (outcome, changed, mail) = self.write_tx(|tx| {
+            let target = agent_by_id(tx, target_id)?;
+            let (actor, sender) = if let Some(id) = actor_id {
+                if id == target_id {
+                    return Err(Error::PermissionDenied("an agent cannot record a verdict on its own work".into()));
+                }
+                let caller = agent_by_id(tx, id)?;
+                let mut ancestor = target.parent_id.clone();
+                let mut permitted = false;
+                for _ in 0..17 {
+                    let Some(parent_id) = ancestor else { break; };
+                    if parent_id == *id {
+                        permitted = true;
+                        break;
+                    }
+                    ancestor = agent_by_id(tx, &parent_id)?.parent_id;
+                }
+                let actor = format!("agent:{}", caller.name);
+                if !permitted {
+                    if caller.parent_id.is_some() || !caller.is_admin {
+                        return Err(Error::PermissionDenied("administrative authority required".into()));
+                    }
+                    tx.execute(
+                        "INSERT INTO admin_audit (created_at, actor, action, target) VALUES (?1, ?2, 'agents.verdict', ?3)",
+                        params![now_ms(), actor, target.name],
+                    )?;
+                }
+                (actor, format!("agent:{id}"))
+            } else {
+                ("operator".to_string(), "operator".to_string())
+            };
+            let (outcome, _) = Self::record_outcome_on(tx, NewOutcome::verdict(
+                target_id.clone(), kind, actor, reason, now_ms(), profile,
+            ))?;
+            if !target.is_task_subagent() {
+                return Ok((outcome, None, None));
+            }
+            let (state, mail) = if kind == OutcomeKind::Rework {
+                let mut incoming = Incoming::new(outcome.note.as_deref().unwrap_or("Please rework the task."));
+                incoming.sender = Some(sender);
+                tx.execute("UPDATE agents SET state = 'running' WHERE id = ?1", [target_id.as_str()])?;
+                turn_errors::clear_parking(tx, target_id)?;
+                let mail = Self::receive_on(tx, target_id, incoming,
+                    Some(format!("anyagents:verdict:{}", outcome.id)), now_ms(),
+                    IngressHistory::default(), false, Some("task_rework"), &mut Vec::new())?;
+                ("running", Some(mail))
+            } else {
+                tx.execute("UPDATE agents SET state = 'archived' WHERE id = ?1", [target_id.as_str()])?;
+                cancel_archived_schedules(tx, target_id)?;
+                ("archived", None)
+            };
+            let mut changed = target;
+            changed.state = state.to_string();
+            Ok((outcome, Some(changed), mail))
+        })?;
+        if let Some(mail) = mail {
+            self.finish_receive(mail, &[]);
+        }
+        if changed.is_some() {
+            self.notify(Wake::Agent {
+                agent_id: target_id.clone(),
+            });
+        }
+        Ok((outcome, changed))
     }
 
     /// Record that `agent_id` read `file` of skill `skill`, whose bytes had

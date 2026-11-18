@@ -121,6 +121,14 @@ async fn write_legacy_profile(user_data: &Path, url: &str, seen: &Arc<Mutex<Seen
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| super::session::tool("chromium", "browser").unwrap());
     std::fs::create_dir_all(user_data).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        // The legacy data is private; don't depend on the runner's umask.
+        for path in user_data.ancestors().take(3) {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
     let mut child = tokio::process::Command::new(bin)
         .args([
             "--headless=new",
@@ -217,6 +225,11 @@ async fn existing_profile_opens_with_logins_and_every_operation_works() {
     let data = data.path();
     let seen = Arc::new(Mutex::new(Seen::default()));
     let url = serve(seen.clone()).await;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let dir = super::profile_dir(data, "agent-a");
     write_legacy_profile(&dir.join("user-data"), &url, &seen).await;
     // The previous implementation's bookkeeping, as an upgraded host has it.
@@ -233,7 +246,20 @@ async fn existing_profile_opens_with_logins_and_every_operation_works() {
     let text = read["text"].as_str().unwrap();
     assert!(text.contains("cookie=legacy=yes"), "{text}");
     assert!(text.contains("local=legacy-ok"), "{text}");
-    assert!(opened["takeover_url"].as_str().is_some());
+    assert_eq!(opened["captcha_detected"], false);
+    assert!(opened.get("takeover_url").is_none());
+
+    let live = super::session::running(data, "agent-a").unwrap();
+    assert!(live.takeover_url().is_some());
+    drop(live);
+    let status = call(data, json!({"action": "status"})).await;
+    assert_eq!(status["status"], "running");
+    assert!(
+        status["tabs"]
+            .as_array()
+            .is_some_and(|tabs| !tabs.is_empty())
+    );
+    assert!(status.get("takeover_url").is_none());
 
     // One agent drives a profile's desktop at a time.
     let err = refused(
@@ -390,8 +416,12 @@ async fn existing_profile_opens_with_logins_and_every_operation_works() {
     };
     assert!(live.session.gate().release(Some("done".into())));
     assert_eq!(waiter.await.unwrap()["completed"], true);
+    // A deployment can advertise the mounted public URL. Exercise its token
+    // against the same page on the fixture's loopback listener, never over the
+    // network to the deployment's configured host.
+    let addr = live.session.takeover_addr().unwrap();
+    assert!(addr.ip().is_loopback());
     drop(live);
-    let addr = page.socket_addrs(|| None).unwrap()[0];
     let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
     let q = page.query().unwrap();
     tcp.write_all(format!("GET /?{q} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes())
@@ -434,7 +464,9 @@ async fn existing_profile_opens_with_logins_and_every_operation_works() {
         .unwrap();
     assert_eq!(other.leaseholder().as_deref(), Some("agent-b"));
     drop(other);
-    super::session::stop(data, "agent-a").await;
+    super::session::stop_authorized(data, "agent-a", "agent-b")
+        .await
+        .unwrap();
     call(data, json!({"action": "open", "url": url})).await;
     let read = call(data, json!({"action": "read"})).await;
     assert!(

@@ -254,3 +254,30 @@ fn exposed_tools_are_linked_and_stale_links_removed() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "cargo 1.91.0");
 }
+
+#[cfg(unix)]
+#[test]
+fn an_undeclared_tool_resolves_from_the_declared_tail_before_the_inherited_path() {
+    let dir = tempfile::tempdir().unwrap();
+    // `git` is also on the inherited `PATH`; the declared tail must win.
+    let tail_git = fake_tool(dir.path(), "git", "tail");
+    let tc = toolchain(&format!(
+        "schema = 1\nchild_path_tail = [\"{}\"]\n",
+        dir.path().display()
+    ));
+    let resolved = tc.tool("git", "checkout").unwrap();
+    assert_eq!(resolved.provenance, Provenance::Legacy);
+    assert_eq!(resolved.path, tail_git);
+    let report = tc.report();
+    assert_eq!(
+        report.legacy[0].resolved.as_deref(),
+        Some(tail_git.as_path())
+    );
+}
+
+#[test]
+fn with_a_manifest_the_exec_path_is_constructed_and_not_a_legacy_use() {
+    let tc = toolchain(&manifest(&[], ""));
+    assert_eq!(tc.exec_path("repo"), "/usr/bin:/bin");
+    assert!(tc.report().legacy.is_empty());
+}

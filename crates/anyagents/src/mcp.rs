@@ -841,6 +841,12 @@ pub(crate) fn capability_of(config: &Path) -> Result<String, Error> {
     Ok(capability)
 }
 
+pub(crate) const TASK_TURN_CONTEXT_HEADER: &str = "x-anyagents-task-turn-context";
+
+pub(crate) fn is_task_turn_context(token: &str) -> bool {
+    token.len() == 32 && token.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
 #[derive(Clone)]
 pub(crate) struct Client {
     pub(crate) socket: PathBuf,
@@ -851,6 +857,8 @@ pub(crate) struct Client {
     /// process: every call it makes carries [`HTTP_MCP_HEADER`], so routes
     /// that would start or read something on the host refuse it.
     via_http: bool,
+    /// A mounted stdio call's opener context, scoped to this dispatch clone.
+    turn_context: Option<String>,
     /// The router of the server process that owns this HTTP MCP tool server:
     /// calls go straight through it instead of dialing the external socket,
     /// which closes at the start of a stop while admitted calls still drain.
@@ -908,6 +916,7 @@ impl Client {
             config,
             capability,
             via_http: false,
+            turn_context: None,
             in_process: None,
             link: Arc::default(),
         }
@@ -967,7 +976,7 @@ impl Client {
     ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
         let payload = body.unwrap_or_default();
         let fresh = || {
-            build_request(
+            let mut request = build_request(
                 method,
                 path,
                 Some(payload.clone()),
@@ -975,7 +984,18 @@ impl Client {
                 None,
                 agent_id,
                 self.via_http,
-            )
+            )?;
+            if path == "/v1/send"
+                && let Some(context) = self.turn_context.as_deref()
+            {
+                let mut value = hyper::header::HeaderValue::from_str(context)
+                    .map_err(|_| "invalid task turn context".to_string())?;
+                value.set_sensitive(true);
+                request
+                    .headers_mut()
+                    .insert(TASK_TURN_CONTEXT_HEADER, value);
+            }
+            Ok::<_, String>(request)
         };
         if let Some(router) = &self.in_process {
             use hyper::service::Service as _;
@@ -2687,6 +2707,8 @@ impl AgentMcp {
                     branch: args.branch,
                     base: args.base,
                     workdir: args.workdir,
+                    seat_user: None,
+                    seat_uid: None,
                     description: args.description,
                     instructions: args.instructions,
                     parent: parent_val,
@@ -3036,6 +3058,8 @@ impl AgentMcp {
             branch: args.branch,
             base: args.base,
             workdir: args.workdir,
+            seat_user: None,
+            seat_uid: None,
             description: args.description,
             instructions: args.instructions,
             parent: Some(self.agent.id.to_string()),
@@ -3830,7 +3854,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Multimodal Media tool (`action`: `\"image_generate\"` | `\"speech\"` | `\"transcribe\"`) backed by the Sylphx AI Gateway (`/v1/images/generations`, `/v1/audio/speech`, `/v1/audio/transcriptions`)."
+        description = "Multimodal media through the configured AI gateway (action: image_generate | video_generate | speech | transcribe). video_generate takes prompt and optional model, size and seconds, waits up to five minutes, and saves an MP4 under workspace/media. It returns {path, id, model, mime_type, bytes} and attaches smaller videos."
     )]
     async fn media(
         &self,
@@ -3838,14 +3862,18 @@ impl AgentMcp {
     ) -> Result<MultimediaJson, String> {
         let data_dir = self.client.socket.parent().map(Path::to_path_buf);
         let work_dir = self.resolve_workdir();
-        let mut val = crate::computer::execute_media_request(
+        let (mut val, video) = crate::computer::execute_media_request(
             data_dir.as_deref(),
             &self.client.config,
             &work_dir,
             args.into_value(),
         )
         .await?;
-        let media = extract_media_blocks_from_tool_value("media", &mut val);
+        let media = if let Some(bytes) = video {
+            video_attachment(&val, &bytes).into_iter().collect()
+        } else {
+            extract_media_blocks_from_tool_value("media", &mut val)
+        };
         Ok(MultimediaJson(val, media))
     }
 
@@ -3892,7 +3920,7 @@ const SCHEDULES_TOOL_DESCRIPTION: &str = "List authorized fleet automations with
 /// `tool_definitions_with_roles` rewrites the limits to the configured ones.
 const CODE_TOOL_DESCRIPTION: &str = "Run a TypeScript snippet (plain JS works; NOT Python). `code` is the body of an async function: `await` calls, `return` a JSON value; you get `{result, logs, duration_ms}`. No `import`, `require`, `process`, `Buffer`, `fs` or `fetch`; use the globals below. `timeout_ms`: default 30000, max 600000. An inner `workspace.exec` gets the remaining time, or its own `timeout_ms` (the call stretches to fit, up to the max).\n\
 workspace: read(path|{path, start_line?, end_line?}), write(path, content), edit({path, target, replacement}), multi_edit({path, edits: [{target, replacement}]}), patch(text), glob(pattern|{pattern, path?}), grep(query|{query, path?, glob?}), list(path?), exec(cmd|{cmd, cwd?, timeout_ms?}) -> {exit_code, stdout, stderr}.\n\
-anyagents: send, inbox, agents, schedule, conversation, groups, browser, skills, interact; each takes its MCP tool's object, e.g. `anyagents.schedule({action: \"create\", watch: \"github:pr:o/r#1\", prompt: \"...\"})`. memory: read(topic), write({topic, description, content}), search(query), list(). web: search(query), fetch(url). computer, device, media: `<ns>.<action>(opts)`. All also under `tools.`.\n\
+anyagents: send, inbox, agents, schedule, conversation, groups, browser, skills, interact; each takes its MCP tool's object, e.g. `anyagents.schedule({action: \"create\", watch: \"github:pr:o/r#1\", prompt: \"...\"})`. memory: read(topic), write({topic, description, content}), search(query), list(). web: search(query), fetch(url). computer, device, media: `<ns>.<action>(opts)`. All also under `tools.`. For `media.video_generate({prompt, model?})`, set the outer `code` `timeout_ms` above 300000 when the configured ceiling allows it.\n\
 `console.log` goes to `logs`. Use `Promise.all` for independent calls. Run other languages from a file you `workspace.write`, not a quoted one-liner. Reading images, PDF, audio or video, and screenshots, attach the media.";
 
 const CODE_TOOL_LIMITS_TEXT: &str = "default 30000, max 600000";
@@ -4056,7 +4084,18 @@ impl rmcp::ServerHandler for AgentMcp {
             ));
         }
         let ct = context.ct.clone();
-        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        // rmcp moves params._meta into RequestContext. Scope the opaque
+        // opener credential to this dispatch, including nested code calls.
+        let mut scoped = self.clone();
+        if !scoped.client.via_http {
+            scoped.client.turn_context = context
+                .meta
+                .get("io.spiron/turn-context")
+                .and_then(serde_json::Value::as_str)
+                .filter(|token| is_task_turn_context(token))
+                .map(str::to_owned);
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(&scoped, request, context);
         as_call(
             Call::new(Arc::new(move || ct.is_cancelled())),
             Self::tool_router().call(tcc),
@@ -4324,6 +4363,7 @@ rl.on("line", async (line) => {
 
         const mediaFn = (req = {}) => callTool("media", req);
         mediaFn.image_generate = (promptOrObj = {}) => callTool("media", typeof promptOrObj === "string" ? { action: "image_generate", prompt: promptOrObj } : { ...promptOrObj, action: "image_generate" });
+        mediaFn.video_generate = (promptOrObj = {}) => callTool("media", typeof promptOrObj === "string" ? { action: "video_generate", prompt: promptOrObj } : { ...promptOrObj, action: "video_generate" });
         mediaFn.speech = (inputOrObj = {}) => callTool("media", typeof inputOrObj === "string" ? { action: "speech", input: inputOrObj } : { ...inputOrObj, action: "speech" });
         mediaFn.transcribe = (pathOrObj = {}) => callTool("media", typeof pathOrObj === "string" ? { action: "transcribe", file_path: pathOrObj } : { ...pathOrObj, action: "transcribe" });
         Object.freeze(mediaFn);
@@ -6367,6 +6407,26 @@ fn extract_media_blocks_from_tool_value(
     }
 
     blocks
+}
+
+fn video_attachment(
+    receipt: &serde_json::Value,
+    bytes: &[u8],
+) -> Option<rmcp::model::ContentBlock> {
+    if bytes.len() > MAX_MULTIMEDIA_READ_BYTES {
+        return None;
+    }
+    let path = receipt.get("path")?.as_str()?;
+    let uri = url::Url::from_file_path(path).ok()?.to_string();
+    let mime_type = receipt.get("mime_type")?.as_str()?.to_owned();
+    Some(rmcp::model::ContentBlock::resource(
+        rmcp::model::ResourceContents::BlobResourceContents {
+            uri,
+            mime_type: Some(mime_type),
+            blob: crate::computer::base64_encode(bytes),
+            meta: None,
+        },
+    ))
 }
 
 fn read_multimedia_file(

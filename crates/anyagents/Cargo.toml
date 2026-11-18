@@ -48,6 +48,7 @@ serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
 subtle = "2.6"
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-stream = "0.1"
 toml = "0.9"
@@ -62,7 +63,7 @@ roxmltree = "0.21"
 # Pinned by git revision (agent-workstation 0.2.0, merged to main as #9)
 # until 0.2.0 is published; then this becomes `agent-workstation = "0.2"`.
 [target.'cfg(target_os = "linux")'.dependencies]
-agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "ec73f6cf0d36d42cf02b3a19e0d0765a3d9082a6" }
+agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "9737417b6b0328a1d7893b80ec0d928fc6e5151b" }
 async-trait = "0.1"
 tower = { version = "0.5", features = ["util"] }
 
@@ -76,7 +77,6 @@ anyagents-invariants = { path = "../../tests/invariants" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rmcp = { version = "3.5", features = ["client", "transport-child-process"] }
 serde_json = "1"
-tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 
 # A scripted `opencode` for the server test: it speaks the CLI's own `serve`

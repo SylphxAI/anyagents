@@ -168,7 +168,7 @@ fn capability_key() -> Result<String, Error> {
 }
 
 /// Index host history in the background: what searches left for later,
-/// sources due for full verification, and a pre-warm pass over every agent
+/// sources due for full verification, and a bounded pre-warm pass over live agents
 /// after the daemon starts. It runs on its own thread at the lowest CPU and
 /// I/O priority, so it reads only when nothing else wants the machine.
 fn start_host_history_indexer(store: Arc<Store>) {
@@ -1877,38 +1877,32 @@ async fn verdict_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
-        let actor = match &principal {
-            Principal::Operator => "operator".to_string(),
-            Principal::Agent { agent_id, .. } if *agent_id == target.id => {
-                return Err(ApiError::forbidden(
-                    "an agent cannot record a verdict on its own work",
-                ));
-            }
-            Principal::Agent { agent_id, name } => {
-                if is_self_or_ancestor(&state.store, agent_id, &target) {
-                    format!("agent:{name}")
-                } else {
-                    require_admin_or_operator(
-                        &state.store,
-                        &principal,
-                        "agents.verdict",
-                        &target.name,
-                    )?
-                }
-            }
-        };
-        let config = anyagents_core::agent_config_dir(state.store.data_dir(), &target.id);
-        let (outcome, _) = state
+        let _lifecycle = state
             .store
-            .record_outcome(anyagents_core::NewOutcome::verdict(
-                target.id.clone(),
-                kind,
-                actor,
-                body.reason,
-                now_ms(),
-                create::bound_profile_name(&config),
-            ))
+            .lock_agent_lifecycle(&target.id)
             .map_err(ApiError::from_store)?;
+        let config = anyagents_core::agent_config_dir(state.store.data_dir(), &target.id);
+        let actor_id = match &principal {
+            Principal::Operator => None,
+            Principal::Agent { agent_id, .. } => Some(agent_id),
+        };
+        let (outcome, changed) = state
+            .store
+            .apply_verdict(
+                actor_id,
+                &target.id,
+                kind,
+                body.reason,
+                create::bound_profile_name(&config),
+            )
+            .map_err(ApiError::from_store)?;
+        if let Some(agent) = changed {
+            if agent.state == "archived" {
+                finish_agent_archive_locked(&state, &agent, false)?;
+            } else {
+                clear_explicitly_archived(state.store.data_dir(), &agent.id);
+            }
+        }
         Ok(Json(outcome))
     })
     .await
@@ -4886,6 +4880,18 @@ async fn create_agent_route(
             anyagents_core::parse_agent_lifecycle(lifecycle).map_err(ApiError::from_store)?;
         }
         let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
+        let seat = crate::sandbox::RootSeatRequest {
+            user: body.seat_user,
+            uid: body.seat_uid,
+        };
+        let operator_root = matches!(&principal, Principal::Operator) && parent_id.is_none();
+        if seat.explicit() && !operator_root {
+            return Err(ApiError::from_store(
+                anyagents_core::Error::PermissionDenied(
+                    "seat admission requires an operator-created root".into(),
+                ),
+            ));
+        }
         let (harness, model, profile) = create::resolve_subagent_defaults(
             state.store.data_dir(),
             parent_agent.as_ref(),
@@ -4895,32 +4901,33 @@ async fn create_agent_route(
         );
         require_remote_callback(state.store.data_dir(), &harness)?;
         refuse_host_placement_over_http(via_http, &harness)?;
-        let agent = create::create(
-            &state.store,
-            state.store.data_dir(),
-            CreateRequest {
-                name: body.name,
-                role: Some(
-                    body.role
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(create::DEFAULT_AGENT_ROLE)
-                        .to_string(),
-                ),
-                harness,
-                model,
-                profile,
-                repo: body.repo,
-                branch: body.branch,
-                base: body.base,
-                workdir: body.workdir.map(PathBuf::from),
-                workdir_default: owner_workdir(),
-                description: body.description,
-                instructions: body.instructions,
-                parent_id,
-            },
-        )
+        let request = CreateRequest {
+            name: body.name,
+            role: Some(
+                body.role
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(create::DEFAULT_AGENT_ROLE)
+                    .to_string(),
+            ),
+            harness,
+            model,
+            profile,
+            repo: body.repo,
+            branch: body.branch,
+            base: body.base,
+            workdir: body.workdir.map(PathBuf::from),
+            workdir_default: owner_workdir(),
+            description: body.description,
+            instructions: body.instructions,
+            parent_id,
+        };
+        let agent = if operator_root {
+            create::create_operator_root(&state.store, state.store.data_dir(), request, seat)
+        } else {
+            create::create(&state.store, state.store.data_dir(), request)
+        }
         .map_err(ApiError::from_store)?;
         let actor = match &principal {
             Principal::Operator => "operator".to_string(),
@@ -5196,49 +5203,58 @@ async fn archive_agent_route(
             .store
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
-        mark_explicitly_archived_locked(&state.store, state.store.data_dir(), &agent)
-            .map_err(ApiError::from_store)?;
-        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(
-            &anyagents_core::agent_config_dir(state.store.data_dir(), &found.id),
-        ) {
-            let _ = anyagents_tools::SandboxProvider::pause(&sbx);
-        }
-        let mut process_guard = None;
-        if !is_self {
-            let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
-            while std::time::Instant::now() < deadline {
-                if state
-                    .health
-                    .get(&found.id)
-                    .is_none_or(|live| !live.process_alive)
-                    && let Ok(guard) = state.store.try_lock_agent(&found.id)
-                {
-                    process_guard = Some(guard);
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            if process_guard.is_none()
-                && state
-                    .health
-                    .get(&found.id)
-                    .is_none_or(|live| !live.process_alive)
-            {
-                process_guard = state.store.try_lock_agent(&found.id).ok();
-            }
-        }
-        if let Some(process) = process_guard.as_ref() {
-            reap_archived_agent_with_process_locked(
-                &state.store,
-                state.store.data_dir(),
-                &found.id,
-                process,
-            );
-        }
-        drop(process_guard);
+        finish_agent_archive_locked(&state, &agent, is_self)?;
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
     .await
+}
+
+fn finish_agent_archive_locked(
+    state: &AppState,
+    agent: &Agent,
+    is_self: bool,
+) -> Result<(), ApiError> {
+    mark_explicitly_archived_locked(&state.store, state.store.data_dir(), agent)
+        .map_err(ApiError::from_store)?;
+    if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(
+        &anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id),
+    ) {
+        let _ = anyagents_tools::SandboxProvider::pause(&sbx);
+    }
+    let mut process_guard = None;
+    if !is_self {
+        let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
+        while std::time::Instant::now() < deadline {
+            if state
+                .health
+                .get(&agent.id)
+                .is_none_or(|live| !live.process_alive)
+                && let Ok(guard) = state.store.try_lock_agent(&agent.id)
+            {
+                process_guard = Some(guard);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if process_guard.is_none()
+            && state
+                .health
+                .get(&agent.id)
+                .is_none_or(|live| !live.process_alive)
+        {
+            process_guard = state.store.try_lock_agent(&agent.id).ok();
+        }
+    }
+    if let Some(process) = process_guard.as_ref() {
+        reap_archived_agent_with_process_locked(
+            &state.store,
+            state.store.data_dir(),
+            &agent.id,
+            process,
+        );
+    }
+    drop(process_guard);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -7122,6 +7138,20 @@ async fn send(
     Json(body): Json<SendRequest>,
 ) -> Result<Json<SendResponse>, ApiError> {
     let via_http = via_http_mcp(&headers);
+    let turn_context = if let Some(header) = headers.get(crate::mcp::TASK_TURN_CONTEXT_HEADER) {
+        let token = header
+            .to_str()
+            .ok()
+            .filter(|token| crate::mcp::is_task_turn_context(token));
+        match (&principal, token, via_http) {
+            (Principal::Agent { agent_id, .. }, Some(token), false) => {
+                Some((agent_id.clone(), token.to_owned()))
+            }
+            _ => return Err(ApiError::forbidden("invalid task turn context")),
+        }
+    } else {
+        None
+    };
     if via_http {
         refuse_host_media_over_http(&body)?;
     }
@@ -7184,6 +7214,14 @@ async fn send(
         // refused for it with the reason, as any send that cannot wake an
         // archived recipient is.
         plan.revive_host_agents = !via_http;
+        if let Some((caller, token)) = turn_context {
+            if plan.sender_id.as_ref() != Some(&caller) {
+                return Err(ApiError::forbidden(
+                    "task turn context belongs to the authenticated author",
+                ));
+            }
+            plan.turn_context = Some(token);
+        }
         let key_body = SendRequest {
             sender: plan
                 .sender_id
@@ -7767,6 +7805,7 @@ struct SendPlan {
     /// Whether an authored send may revive an archived agent that runs on
     /// this host. False for a call made over HTTP MCP.
     revive_host_agents: bool,
+    turn_context: Option<String>,
 }
 
 #[derive(Debug)]
@@ -7981,6 +8020,7 @@ impl SendPlan {
             sender_id: sender.as_ref().map(|agent| agent.id.clone()),
             principal_id: None,
             revive_host_agents: true,
+            turn_context: None,
         })
     }
 }
@@ -8350,6 +8390,7 @@ fn send_sync(
                                 key.as_deref(),
                                 wake_archived,
                                 upload.as_ref(),
+                                plan.turn_context.as_deref().map(|token| (sid, token)),
                             )?])
                         },
                     )?
@@ -8361,6 +8402,7 @@ fn send_sync(
                         key.as_deref(),
                         wake_archived,
                         upload.as_ref(),
+                        None,
                     )?]
                 };
                 deliveries.extend(sent);
@@ -8768,6 +8810,7 @@ fn deliver_agent_with_media(
     key: Option<&str>,
     wake_archived: bool,
     upload: Option<&crate::telegram::MediaUpload>,
+    turn_context: Option<(&anyagents_core::AgentId, &str)>,
 ) -> Result<Delivery, ApiError> {
     let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
     let _lifecycle = store
@@ -8813,7 +8856,9 @@ fn deliver_agent_with_media(
         origin: None,
         received_at_ms: None,
     };
-    let outcome = if wake_archived {
+    let outcome = if let Some((sender, token)) = turn_context {
+        store.receive_turn_send(&agent.id, incoming, wake_archived, sender, token)
+    } else if wake_archived {
         store.receive_direct_send(&agent.id, incoming)
     } else {
         store.receive(&agent.id, incoming)
@@ -16672,6 +16717,119 @@ exec '{}' "$@"
             .unwrap();
         let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, value)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn over_http_only_operator_root_creation_can_request_a_named_seat() {
+        let dir = crate::test_tempdir();
+        let mut state = archetype_validation_state(dir.path());
+        let operator_token = "operator-token-0123456789abcdef0123456789abcdef";
+        state.auth = auth::Mode::Confined {
+            operator_digest: Some(auth::operator_digest(operator_token)),
+        };
+        let owner = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("owner", "spiron"))
+            .unwrap();
+        let capability = state.store.issue_capability(&owner.id).unwrap();
+        let uid = (42001..42010)
+            .find(|&uid| uid != crate::sandbox::server_uid())
+            .unwrap();
+        let data = state.store.data_dir();
+        let registry = data.join("execution-principals.json");
+        std::fs::write(
+            data.join("test-passwd"),
+            format!(
+                "seat-claimed:x:{uid}:42010::/:/bin/false\nseat-fresh:x:{}:42010::/:/bin/false\n",
+                uid + 100
+            ),
+        )
+        .unwrap();
+        let saved = serde_json::json!({owner.id.as_str(): {
+            "user":"seat-claimed", "uid":uid, "gid":42010, "socket_gid":42011
+        }})
+        .to_string();
+        std::fs::write(&registry, &saved).unwrap();
+        let socket = dir.path().join("admission.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let app = build_router(state.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let workdir = dir.path().join("work");
+        std::fs::create_dir(&workdir).unwrap();
+        let explicit = serde_json::json!({
+            "name":"fresh", "harness":"spiron", "scope":"isolated", "workdir":workdir,
+            "seat_user":"seat-fresh", "seat_uid":uid + 100
+        });
+        for (mut body, agent_token, operator, want, problem) in [
+            (
+                explicit.clone(),
+                None,
+                None,
+                StatusCode::UNAUTHORIZED,
+                "authenticated",
+            ),
+            (
+                explicit.clone(),
+                Some(capability.as_str()),
+                None,
+                StatusCode::FORBIDDEN,
+                "operator-created root",
+            ),
+            (
+                explicit.clone(),
+                None,
+                Some(operator_token),
+                StatusCode::FORBIDDEN,
+                "operator-created root",
+            ),
+            (
+                serde_json::json!({"name":"claimed","harness":"spiron","scope":"isolated","workdir":workdir}),
+                None,
+                Some(operator_token),
+                StatusCode::FORBIDDEN,
+                "already claimed",
+            ),
+        ] {
+            if operator.is_some() && body["name"] == "fresh" {
+                body["parent"] = serde_json::json!(owner.name);
+            }
+            let (status, reply) = http(
+                &socket,
+                "POST",
+                "/v1/agents",
+                Some(body),
+                agent_token,
+                operator,
+            )
+            .await;
+            assert_eq!(status, want, "{reply}");
+            assert!(
+                reply["error"].as_str().unwrap().contains(problem),
+                "{reply}"
+            );
+        }
+        let mut mismatch = explicit;
+        mismatch["seat_uid"] = serde_json::json!(uid + 101);
+        let (status, reply) = http(
+            &socket,
+            "POST",
+            "/v1/agents",
+            Some(mismatch),
+            None,
+            Some(operator_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{reply}");
+        assert!(
+            reply["error"].as_str().unwrap().contains("does not match"),
+            "{reply}"
+        );
+        assert_eq!(std::fs::read_to_string(registry).unwrap(), saved);
+        assert!(state.store.agent_by_name("fresh").is_err());
+        assert!(state.store.agent_by_name("claimed").is_err());
+        server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1074,6 +1074,12 @@ fn apply_result(state: &mut State, value: &Value) {
     {
         state.session_id = Some(id.to_string());
     }
+    // Declaring peers can finish independent remote inputs out of order. A
+    // root receipt is not authority for every line currently held in open.
+    if state.peer_declares && value.get("completed_message_uuids").is_some() {
+        apply_scoped_result(state, value);
+        return;
+    }
     if state.open.is_empty() {
         return;
     }
@@ -1106,6 +1112,56 @@ fn apply_result(state: &mut State, value: &Value) {
         state.cost_seen = Some(total);
     }
     finish_open(state, usage);
+}
+
+/// Explicit completion membership is distinct from consumption proof. Failed
+/// inputs may finish without ever having a durable user row.
+fn apply_scoped_result(state: &mut State, value: &Value) {
+    let Some(uuids) = value
+        .get("completed_message_uuids")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    let mut ids = Vec::new();
+    for uuid in uuids {
+        if let Some(id) = uuid.as_str().and_then(|uuid| state.uuid_ids.get(uuid))
+            && !state.finished.contains(id)
+            && (state.open.contains(id) || state.followups.contains(id))
+            && !ids.contains(id)
+        {
+            ids.push(id.clone());
+        }
+    }
+    if ids.is_empty() {
+        return;
+    }
+    let error = result_error(value);
+    if error.as_deref().is_some_and(is_oauth_auth_error_text) {
+        fail_oauth_turn(state, error.unwrap());
+        return;
+    }
+    let usage = usage_from_claude(value);
+    for (index, id) in ids.iter().enumerate() {
+        state.finished.insert(id.clone());
+        if let Some(reason) = &error {
+            state.failures.push((id.clone(), reason.clone()));
+        } else {
+            state.usages.push((
+                id.clone(),
+                if index == 0 {
+                    usage.clone()
+                } else {
+                    TurnUsage::default()
+                },
+            ));
+        }
+    }
+    state.open.retain(|id| !ids.contains(id));
+    state.followups.retain(|id| !ids.contains(id));
+    if state.open.is_empty() {
+        promote_followups(state);
+    }
 }
 
 /// The vendor's error text from a `result` event, or `None` when it succeeded.
@@ -2053,6 +2109,49 @@ mod tests {
             &serde_json::json!({"type": "command_lifecycle", "command_uuid": uuid_for("m1"), "state": "refused"}),
         );
         assert!(state.rejected.contains_key("m1"));
+    }
+
+    #[test]
+    fn scoped_root_result_cannot_finish_same_turn_or_successor_steers() {
+        for consumed in [true, false] {
+            let mut state = State {
+                peer_declares: true,
+                ..State::default()
+            };
+            for id in ["root", "steer"] {
+                state.uuid_ids.insert(uuid_for(id), id.into());
+                state.in_flight.insert(id.into());
+                accept_message(&mut state, id);
+                if consumed {
+                    take(&mut state, id);
+                }
+            }
+            apply_result(
+                &mut state,
+                &serde_json::json!({"type":"result", "subtype":"success",
+                "completed_message_uuids":[uuid_for("root")]}),
+            );
+            assert!(state.finished.contains("root"));
+            assert!(!state.finished.contains("steer"));
+            assert_eq!(state.open, ["steer"]);
+            apply_result(
+                &mut state,
+                &serde_json::json!({"type":"result", "subtype":"success",
+                "completed_message_uuids":[uuid_for("root")]}),
+            );
+            assert!(
+                !state.finished.contains("steer"),
+                "duplicate root terminal is harmless"
+            );
+            apply_result(
+                &mut state,
+                &serde_json::json!({"type":"result", "subtype":"error", "is_error":true,
+                "result":"failed", "completed_message_uuids":[uuid_for("steer")]}),
+            );
+            assert!(state.finished.contains("steer"));
+            assert_eq!(state.failures, [("steer".into(), "error: failed".into())]);
+            assert!(state.open.is_empty());
+        }
     }
 
     #[test]

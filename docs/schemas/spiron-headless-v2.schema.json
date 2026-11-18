@@ -54,7 +54,13 @@
       "properties": {
         "type": { "const": "prompt" },
         "request_id": { "$ref": "#/$defs/request_id" },
-        "text": { "$ref": "#/$defs/text" }
+        "text": { "$ref": "#/$defs/text" },
+        "tool_context": {
+          "description": "Opaque opener-only context for peers advertising turn-tool-context-v1; 1–4096 UTF-8 bytes.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
       }
     },
     "steer": {
@@ -166,6 +172,11 @@
         "commit": { "type": ["string", "null"], "pattern": "^[0-9a-f]{7,40}$" },
         "model": { "type": "string", "minLength": 1 },
         "context": { "$ref": "#/$defs/context_policy" },
+        "features": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
         "host_tools": {
           "type": "array",
           "items": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
@@ -358,6 +369,14 @@
         "is_error": { "type": "boolean" },
         "error": { "type": ["string", "null"] },
         "duplicate": { "type": "boolean" },
+        "tool_context_bound": { "type": "boolean" },
+        "final_text": { "type": "string" },
+        "consumed_request_ids": {
+          "description": "Durably consumed request IDs, opener first; empty on a duplicate result.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/request_id" },
+          "uniqueItems": true
+        },
         "usage": { "$ref": "#/$defs/usage" },
         "cost_micros": {
           "description": "Millionths of a US dollar the turn's requests cost, as the gateway reported; null when none reported a cost.",

@@ -316,6 +316,7 @@ impl HostIndex {
 
     fn open_inner(path: &Path) -> Result<Self, IndexError> {
         let conn = Connection::open(path)?;
+        crate::store::tune_connection(&conn)?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;",

@@ -291,7 +291,7 @@ fn open_writer(path: &Path) -> Result<Connection, Error> {
             "sqlite journal mode is {mode}, not wal"
         )));
     }
-    tune_connection(&conn);
+    tune_connection(&conn)?;
     Ok(conn)
 }
 
