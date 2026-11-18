@@ -1,7 +1,8 @@
-//! `tools.media`: image generation, speech and transcription through the
-//! Sylphx AI Gateway.
+//! Media generation and transcription through the configured AI gateway.
 
 use super::*;
+
+mod video;
 
 pub const DEFAULT_IMAGE_MODEL: &str = "openai/gpt-image-2";
 pub const DEFAULT_SPEECH_MODEL: &str = "elevenlabs/eleven-flash-v2";
@@ -18,15 +19,14 @@ fn default_speech_voice(model: &str) -> &'static str {
     }
 }
 
-/// Execute a `tools.media` (Multimodal Image Generation, Speech TTS, and Audio Transcription)
-/// request via the Sylphx AI Gateway (`/v1/images/generations`, `/v1/audio/speech`,
-/// `/v1/audio/transcriptions`).
+/// Return a media receipt and, for generated videos, the downloaded MP4 bytes
+/// separately so callers can attach them without putting binary in the receipt.
 pub async fn execute_media_request(
     data_dir: Option<&Path>,
     config_dir: &Path,
     work_dir: &Path,
     req: Value,
-) -> Result<Value, String> {
+) -> Result<(Value, Option<Vec<u8>>), String> {
     let action = req
         .get("action")
         .and_then(Value::as_str)
@@ -34,13 +34,24 @@ pub async fn execute_media_request(
         .trim()
         .to_ascii_lowercase();
 
+    if action == "video_generate" {
+        let (receipt, mp4) = video::generate(
+            configured_gateway_base_url(),
+            resolve_sylphx_api_key(data_dir, config_dir),
+            work_dir,
+            &req,
+        )
+        .await?;
+        return Ok((receipt, Some(mp4)));
+    }
+
     let base_url = resolve_sylphx_gateway_base_url();
     let api_key = resolve_sylphx_api_key(data_dir, config_dir).ok_or_else(|| {
         "missing Sylphx AI Gateway key (set SYLPHX_API_KEY or configure .config/sylphx/key)"
             .to_string()
     })?;
 
-    match action.as_str() {
+    let receipt = match action.as_str() {
         "image_generate" | "image" | "generate_image" => {
             let prompt = req
                 .get("prompt")
@@ -277,9 +288,10 @@ pub async fn execute_media_request(
             }
         }
         other => Err(format!(
-            "unsupported media action `{other}` (expected image_generate|speech|transcribe)"
+            "unsupported media action `{other}` (expected image_generate|video_generate|speech|transcribe)"
         )),
-    }
+    }?;
+    Ok((receipt, None))
 }
 
 #[cfg(test)]
@@ -364,7 +376,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let img = runtime
+        let (img, attachment) = runtime
             .block_on(execute_media_request(
                 None,
                 dir.path(),
@@ -376,10 +388,11 @@ mod tests {
                 }),
             ))
             .unwrap();
+        assert!(attachment.is_none());
         assert_eq!(img["data"][0]["b64_json"], "aGVsbG8=");
         assert_eq!(std::fs::read(dir.path().join("out.png")).unwrap(), b"hello");
 
-        let tts = runtime
+        let (tts, attachment) = runtime
             .block_on(execute_media_request(
                 None,
                 dir.path(),
@@ -391,6 +404,7 @@ mod tests {
                 }),
             ))
             .unwrap();
+        assert!(attachment.is_none());
         assert_eq!(tts["model"], DEFAULT_SPEECH_MODEL);
         assert_eq!(tts["voice"], DEFAULT_ELEVENLABS_VOICE_ID);
         assert_eq!(
@@ -398,7 +412,7 @@ mod tests {
             b"ID3-audio"
         );
 
-        let stt = runtime
+        let (stt, attachment) = runtime
             .block_on(execute_media_request(
                 None,
                 dir.path(),
@@ -409,6 +423,7 @@ mod tests {
                 }),
             ))
             .unwrap();
+        assert!(attachment.is_none());
         assert_eq!(stt["text"], "hello world");
 
         unsafe {
