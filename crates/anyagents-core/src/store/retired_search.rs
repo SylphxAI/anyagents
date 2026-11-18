@@ -56,6 +56,7 @@ const DELETE_BATCH: i64 = 256;
 const MIN_PAUSE: Duration = Duration::from_millis(20);
 
 /// Whether state still has its retired chunk table.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn present(conn: &Connection) -> Result<bool, Error> {
     present_db(conn)
 }

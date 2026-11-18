@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
+#[cfg(test)]
+use anyagents_harness::Delivery;
 use anyagents_harness::{
-    Context, DeliverOutcome, Delivery, Harness, HarnessError, OutboundMessage, Proof, TurnState,
-    TurnUsage, normalize_harness_name, spawn_command,
+    Context, DeliverOutcome, Harness, HarnessError, OutboundMessage, Proof, TurnState, TurnUsage,
+    normalize_harness_name, spawn_command,
 };
 use anyagents_harness_agy::AgyHarness;
 use anyagents_harness_claude::ClaudeHarness;
@@ -753,6 +755,26 @@ pub(crate) fn run_serve_io<R: BufRead + Send + 'static, W: Write>(
                 } => queued.push_back((msg, uuid, raw_message)),
                 StdinEvent::Interrupt { request_id } => {
                     let _ = adapter.cancel();
+                    // Underlying stream harnesses (e.g. Claude/Stream) clear open turn tracking on
+                    // cancel, so settle any still-inflight turns now instead of waiting forever.
+                    while let Some(turn) = inflight.pop_front() {
+                        let proven = adapter.proven(&turn.id);
+                        let done = matches!(
+                            proven,
+                            Some(Proof::Taken {
+                                turn_finished: true
+                            }) | Some(Proof::Duplicate)
+                        );
+                        let err_override = (!done).then(|| "interrupted".to_string());
+                        emit_turn_completion(
+                            adapter.as_ref(),
+                            &state_dir,
+                            &harness_name,
+                            &turn,
+                            err_override,
+                            writer,
+                        )?;
+                    }
                     if let Some(rid) = request_id {
                         emit_line(
                             writer,
@@ -1430,7 +1452,6 @@ fn wait_wake(wakeup: &(Mutex<bool>, Condvar), timeout: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     fn write_fake_claude_script(dir: &Path) -> PathBuf {
         let script = dir.join("fake-claude");
@@ -1478,14 +1499,71 @@ done
             git_program: None,
             extra_args: vec!["--guest-bare".into()],
         };
-        let input = concat!(
-            "{\"type\":\"user\",\"uuid\":\"u-1\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello guest\"}]}}\n",
-            "{\"type\":\"control_request\",\"request_id\":\"req-1\",\"request\":{\"subtype\":\"interrupt\"}}\n"
-        );
-        let mut out = Vec::new();
-        run_serve_io(args, Cursor::new(input.as_bytes()), &mut out).unwrap();
+        let (line_tx, line_rx) = mpsc::channel::<String>();
+        struct ChannelReader {
+            rx: mpsc::Receiver<String>,
+            buf: Vec<u8>,
+            pos: usize,
+        }
+        impl std::io::Read for ChannelReader {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                while self.pos >= self.buf.len() {
+                    match self.rx.recv() {
+                        Ok(next) => {
+                            self.buf = next.into_bytes();
+                            self.pos = 0;
+                        }
+                        Err(_) => return Ok(0),
+                    }
+                }
+                let n = (self.buf.len() - self.pos).min(out.len());
+                out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+        struct NotifyingWriter {
+            buf: Vec<u8>,
+            on_result: Option<mpsc::Sender<()>>,
+        }
+        impl Write for NotifyingWriter {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.buf.extend_from_slice(data);
+                if let Some(tx) = &self.on_result
+                    && String::from_utf8_lossy(&self.buf).contains("\"type\":\"result\"")
+                {
+                    let _ = tx.send(());
+                    self.on_result = None;
+                }
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let feeder = std::thread::spawn(move || {
+            line_tx
+                .send("{\"type\":\"user\",\"uuid\":\"u-1\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello guest\"}]}}\n".into())
+                .unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(10));
+            let _ = line_tx.send(
+                "{\"type\":\"control_request\",\"request_id\":\"req-1\",\"request\":{\"subtype\":\"interrupt\"}}\n".into(),
+            );
+        });
+        let reader = BufReader::new(ChannelReader {
+            rx: line_rx,
+            buf: Vec::new(),
+            pos: 0,
+        });
+        let mut out = NotifyingWriter {
+            buf: Vec::new(),
+            on_result: Some(done_tx),
+        };
+        run_serve_io(args, reader, &mut out).unwrap();
+        feeder.join().unwrap();
 
-        let text = String::from_utf8(out).unwrap();
+        let text = String::from_utf8(out.buf).unwrap();
         assert!(text.contains("\"type\":\"system\""), "missing init: {text}");
         assert!(text.contains("\"isReplay\":true"), "missing replay: {text}");
         assert!(

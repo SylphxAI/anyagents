@@ -1249,14 +1249,14 @@ impl Store {
         matches!(self.backend, registry::Backend::Postgres(_))
     }
 
-    pub(super) fn sqlite_shared(&self) -> &Arc<registry::Shared> {
+    fn sqlite_shared(&self) -> &Arc<registry::Shared> {
         match &self.backend {
             registry::Backend::Sqlite(s) => s,
             registry::Backend::Postgres(_) => panic!("expected SQLite Store backend"),
         }
     }
 
-    pub(super) fn memory_index(&self) -> &Arc<memory_index::MemoryIndex> {
+    fn memory_index(&self) -> &Arc<memory_index::MemoryIndex> {
         match &self.backend {
             registry::Backend::Sqlite(s) => &s.memory_index,
             registry::Backend::Postgres(p) => &p.memory_index,
@@ -5854,6 +5854,7 @@ impl Store {
 
     /// The process's one read-write connection to this database. Use it only
     /// to write: reads go through [`Store::read_conn`] and never wait here.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn conn(&self) -> registry::WriterGuard<'_> {
         self.sqlite_shared().writer()
     }

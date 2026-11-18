@@ -280,11 +280,11 @@ mod tests {
                     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
                     let mut stream = reader.into_inner();
                     if method == "notifications/initialized" {
-                        let _ = stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nMcp-Session-Id: sess-1\r\n\r\n");
+                        let _ = stream.write_all(b"HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\nMcp-Session-Id: sess-1\r\n\r\n");
                     } else if method == "tools/call" {
                         let sse = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n\n";
                         let hdr = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
                             sse.len()
                         );
                         let _ = stream.write_all(hdr.as_bytes());
@@ -297,7 +297,7 @@ mod tests {
                         }))
                         .unwrap();
                         let hdr = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sess-1\r\nContent-Length: {}\r\n\r\n",
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nMcp-Session-Id: sess-1\r\nContent-Length: {}\r\n\r\n",
                             resp.len()
                         );
                         let _ = stream.write_all(hdr.as_bytes());

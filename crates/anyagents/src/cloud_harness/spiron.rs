@@ -264,7 +264,7 @@ impl Api {
         Self::decode_detailed(response).map(PostMessageResponse::Json)
     }
 
-    fn put_mcp_servers(&self, agent_id: &str, servers: &Value) -> Result<(), CloudErrorDetail> {
+    fn put_mcp_servers(&self, agent_id: &str, servers: &Value) -> Result<bool, CloudErrorDetail> {
         let path = format!("/v1/agents/{agent_id}/mcp-servers");
         let mut req = self
             .client
@@ -278,10 +278,13 @@ impl Api {
             .send_json(&json!({ "mcp_servers": servers }))
             .map_err(|_| CloudErrorDetail::generic("Spiron MCP server registration failed"))?;
         let status = response.status().as_u16();
-        if (200..300).contains(&status) || matches!(status, 404 | 405 | 501) {
-            return Ok(());
+        if (200..300).contains(&status) {
+            return Ok(true);
         }
-        Self::decode_detailed(response).map(|_| ())
+        if matches!(status, 404 | 405 | 501) {
+            return Ok(false);
+        }
+        Self::decode_detailed(response).map(|_| true)
     }
 
     fn decode_detailed(
@@ -466,8 +469,8 @@ impl Session {
             || read_cloud_json(config)
                 .and_then(|v| v.get("sync_mcp_servers").and_then(Value::as_bool))
                 == Some(true);
-        if (created_fresh || explicit_sync) && config.join(crate::remote::TOKEN_FILE).exists() {
-            session.sync_mcp_servers(config)?;
+        if explicit_sync && config.join(crate::remote::TOKEN_FILE).exists() {
+            session.sync_mcp_servers(config, created_fresh || explicit_sync)?;
         }
         Ok(session)
     }
@@ -486,11 +489,29 @@ impl Session {
         }])))
     }
 
-    fn sync_mcp_servers(&self, config: &Path) -> Result<(), CloudErrorDetail> {
-        if let Some(servers) =
+    fn sync_mcp_servers(&self, config: &Path, force: bool) -> Result<(), CloudErrorDetail> {
+        let Some(servers) =
             Self::mcp_servers_payload(config).map_err(CloudErrorDetail::generic)?
+        else {
+            return Ok(());
+        };
+        let encoded = serde_json::to_vec(&json!({
+            "scope": &self.scope,
+            "servers": &servers
+        }))
+        .map_err(|e| CloudErrorDetail::generic(e.to_string()))?;
+        let digest = format!("{:x}", Sha256::digest(&encoded));
+        let sync_path = config.join("spiron-cloud-mcp-sync.json");
+        if !force
+            && let Ok(bytes) = std::fs::read(&sync_path)
+            && serde_json::from_slice::<String>(&bytes).is_ok_and(|prev| prev == digest)
         {
-            self.api.put_mcp_servers(&self.agent_id, &servers)?;
+            return Ok(());
+        }
+        if self.api.put_mcp_servers(&self.agent_id, &servers)? {
+            let bytes =
+                serde_json::to_vec(&digest).map_err(|e| CloudErrorDetail::generic(e.to_string()))?;
+            save(&sync_path, &bytes).map_err(CloudErrorDetail::generic)?;
         }
         Ok(())
     }
@@ -504,11 +525,11 @@ impl Session {
             prompt.to_string()
         };
         let mut body = json!({"content": content});
-        // Never export the local mailbox capability. Re-read the expiring remote token each turn.
+        // Per-turn Streamable HTTP MCP attachment (live Spiron Agents API contract).
+        // Never export the local mailbox capability; re-read the expiring remote token each turn.
         if let Some(servers) = Self::mcp_servers_payload(config)? {
             body["mcp_servers"] = servers;
         }
-
         Ok(body)
     }
 }

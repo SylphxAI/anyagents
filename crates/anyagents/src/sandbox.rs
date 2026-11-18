@@ -1245,7 +1245,7 @@ mod tests {
     fn prepare_and_share_config_restore_agent_root_traversal_preserving_setgid() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let dir = tempfile::tempdir().unwrap();
-        let (uid, gid) = (server_uid(), server_gid());
+        let (uid, gid) = (server_uid(), std::fs::metadata(dir.path()).unwrap().gid());
 
         for initial_root_mode in [0o700u32, 0o2700u32] {
             let root = dir.path().join(format!("agent-{initial_root_mode:o}"));

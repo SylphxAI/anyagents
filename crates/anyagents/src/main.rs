@@ -1155,6 +1155,13 @@ fn main() -> ExitCode {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv
+        .first()
+        .and_then(|arg| Path::new(arg).file_stem())
+        .is_some_and(|stem| stem == "anyagents-guest")
+    {
+        return anyagents_guest::run_cli_exit_code();
+    }
     if argv.get(1).is_some_and(|arg| arg == "internal") {
         return internal(&argv[2..]);
     }

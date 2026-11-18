@@ -18,6 +18,7 @@ fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 fn pg_url() -> Option<String> {
     std::env::var("ANYAGENTS_TEST_POSTGRES_URL")
+        .or_else(|_| std::env::var("TEST_DATABASE_URL"))
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())

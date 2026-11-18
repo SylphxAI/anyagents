@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::{DbExecExt as _, db_params};
+use crate::db::db_params;
 use crate::{Agent, Incoming, NewAgent, ReceiveOutcome};
 use rusqlite::params;
 use serde_json::json;

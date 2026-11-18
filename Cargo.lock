@@ -130,6 +130,7 @@ dependencies = [
  "anyagents-channel-telegram",
  "anyagents-core",
  "anyagents-gateway",
+ "anyagents-guest",
  "anyagents-harness",
  "anyagents-harness-agy",
  "anyagents-harness-claude",

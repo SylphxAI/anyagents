@@ -1685,22 +1685,6 @@ pub(crate) struct PreparedDocument {
     pub windows: Vec<PreparedWindow>,
 }
 
-fn raw_json(raw: &RawCoordinate) -> String {
-    serde_json::json!([raw.segment, raw.offset, raw.length, raw.sha256, raw.seq]).to_string()
-}
-fn meta_json(metadata: &IndexMetadata, source: &str) -> String {
-    serde_json::json!([
-        metadata.agent_id,
-        source,
-        metadata.timestamp_ms,
-        metadata.direction,
-        metadata.sender,
-        metadata.destination,
-        metadata.tool_name,
-        metadata.role
-    ])
-    .to_string()
-}
 fn tool_set(metadata: &IndexMetadata) -> Vec<String> {
     let mut names = metadata.tool_names.clone();
     names.extend(metadata.tool_name.iter().cloned());

@@ -185,14 +185,15 @@ fn attaches_exact_mcp_schema_and_refreshes_remote_capability() {
         let token = format!("aars_{}", ch.repeat(64));
         std::fs::write(config.path().join(crate::remote::TOKEN_FILE), &token).unwrap();
         turn(config.path(), "work").unwrap();
-        let req = mock
-            .requests()
-            .into_iter()
+        let reqs = mock.requests();
+        assert!(reqs.iter().all(|r| r.method != Method::PUT));
+        let post = reqs
+            .iter()
             .rev()
             .find(|r| r.method == Method::POST)
             .unwrap();
         assert_eq!(
-            req.body["mcp_servers"],
+            post.body["mcp_servers"],
             json!([{"name":"anyagents","url":"https://callback.example/v1/webhooks/mcp?profile=remote","bearer_token":token}])
         );
     }
@@ -338,6 +339,11 @@ fn paginates_conversation_pages_and_deduplicates_outputs() {
     let result = turn(config.path(), "work").unwrap();
     assert_eq!(result.reply_text, "first\nsecond");
     let requests = mock.requests();
+    assert_eq!(requests[0].method, Method::POST);
+    assert_eq!(
+        requests[0].body["mcp_servers"][0]["url"],
+        json!("http://127.0.0.1:8787/v1/webhooks/mcp?profile=remote")
+    );
     assert_eq!(
         requests[1].uri,
         format!("/v1/agents/{AGENT}/conversation?limit=100")
@@ -473,7 +479,8 @@ fn spiron_cloud_syncs_mcp_servers_streams_sse_and_reattaches_active_run_on_crash
     let cfg = tempfile::tempdir().unwrap();
     std::fs::write(
         cfg.path().join("cloud.json"),
-        json!({"base_url": base, "token": "spiron_sk_test_key_123"}).to_string(),
+        json!({"base_url": base, "token": "spiron_sk_test_key_123", "sync_mcp_servers": true})
+            .to_string(),
     )
     .unwrap();
     std::fs::write(

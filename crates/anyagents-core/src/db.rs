@@ -294,6 +294,7 @@ pub(crate) fn build_pg_pool(url: &str, max_connections: Option<u32>) -> Result<P
 
 #[derive(Clone)]
 pub(crate) struct PgHandle {
+    #[allow(dead_code)]
     pub(crate) redacted_url: String,
     pub(crate) pool: PgPool,
     pub(crate) direct_url: String,
