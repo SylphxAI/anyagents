@@ -154,8 +154,10 @@ fn nothing_is_written_before_the_peer_says_what_it_can_do() {
     let error = harness.wait_ready(Duration::from_millis(50)).unwrap_err();
     assert!(error.to_string().contains("no ready frame"), "{error}");
     drop(harness);
-    // A legacy peer is refused before it receives input.
-    let old = fake_spiron(dir.path(), false);
+    // A legacy peer is refused before it receives input. Its startup must not
+    // race the capable peer on the fixture's non-atomic launch counter.
+    let legacy_dir = tempfile::tempdir().unwrap();
+    let old = fake_spiron(legacy_dir.path(), false);
     assert!(!old.proves_consumption());
     let capable = fake_spiron(dir.path(), true);
     assert!(capable.proves_consumption());
