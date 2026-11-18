@@ -776,12 +776,12 @@ fn harness_gone() -> (
                 if thread_stop.load(Ordering::Relaxed) {
                     break;
                 }
-                // POLLHUP, POLLERR and POLLNVAL are reported in revents even
-                // when no events are requested, so this detects the harness
-                // closing stdin without reading (and consuming) its frames.
+                // Request POLLIN so BSD poll reports POLLHUP too; poll never
+                // consumes bytes, so an initialize frame buffered by the
+                // harness stays for the stdio transport to read after startup.
                 let mut stdin = libc::pollfd {
                     fd: libc::STDIN_FILENO,
-                    events: 0,
+                    events: libc::POLLIN,
                     revents: 0,
                 };
                 // SAFETY: poll receives one live pollfd for the call's duration.
