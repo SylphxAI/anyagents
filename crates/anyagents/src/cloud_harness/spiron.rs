@@ -14,11 +14,57 @@ struct Pending {
     body: Value,
     receipt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     mailbox_uuid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     input_delivery: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     completed: Option<Value>,
+}
+
+const ACTIVE_RUN_FILE: &str = "spiron-cloud-active-run.json";
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(super) struct ActiveRunState {
+    pub(super) agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) receipt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) content: Option<String>,
+    pub(super) started_at_ms: i64,
+}
+
+pub(super) fn persist_active_run(config: &Path, state: &ActiveRunState) -> Result<(), String> {
+    let bytes = serde_json::to_vec(state).map_err(|e| e.to_string())?;
+    save(&config.join(ACTIVE_RUN_FILE), &bytes)
+}
+
+pub(super) fn read_active_run(config: &Path) -> Result<Option<ActiveRunState>, String> {
+    match std::fs::read(config.join(ACTIVE_RUN_FILE)) {
+        Ok(bytes) => {
+            let parsed: ActiveRunState = serde_json::from_slice(&bytes)
+                .map_err(|_| "invalid Spiron active run state".to_string())?;
+            validate_id(&parsed.agent_id, "agent_id")?;
+            if let Some(ref receipt_id) = parsed.receipt_id {
+                validate_id(receipt_id, "receipt_id")?;
+            }
+            if let Some(ref run_id) = parsed.run_id {
+                validate_id(run_id, "run_id")?;
+            }
+            Ok(Some(parsed))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("cannot read Spiron active run state: {e}")),
+    }
+}
+
+pub(super) fn clear_active_run(config: &Path) {
+    let _ = std::fs::remove_file(config.join(ACTIVE_RUN_FILE));
 }
 
 fn save(path: &Path, value: &[u8]) -> Result<(), String> {
@@ -66,6 +112,7 @@ fn pending(path: &Path, scope: &str, body: Value, key: Option<&str>) -> Result<P
                 }),
                 body,
                 receipt: None,
+                run_id: None,
                 mailbox_uuid: key.map(str::to_string),
                 input_delivery: None,
                 completed: None,
@@ -100,35 +147,65 @@ fn identifier(value: &Value, field: &str) -> Result<String, String> {
     )
 }
 
+enum PostMessageResponse {
+    Json(Value),
+    Stream(CloudTurnOutcome),
+}
+
 struct Api {
     client: ureq::Agent,
+    stream_client: ureq::Agent,
     base: String,
     token: Option<String>,
 }
 
 impl Api {
-    fn new(config: &Path) -> Self {
-        Self {
+    fn new(config: &Path) -> Result<Self, CloudErrorDetail> {
+        let token =
+            resolve_cloud_auth_token_checked(config, HARNESS).map_err(|msg| CloudErrorDetail {
+                status: Some(401),
+                code: "authentication_failed",
+                message: msg,
+                quota_reset_at_ms: None,
+            })?;
+        let idle = cloud_idle_timeout();
+        Ok(Self {
             client: ureq::Agent::config_builder()
                 .timeout_global(Some(crate::remote::REQUEST_MARGIN))
                 .http_status_as_error(false)
                 .build()
                 .into(),
+            stream_client: ureq::Agent::config_builder()
+                .timeout_connect(Some(Duration::from_secs(15)))
+                .timeout_send_request(Some(Duration::from_secs(30)))
+                .timeout_send_body(Some(Duration::from_secs(30)))
+                .timeout_recv_response(Some(idle))
+                .timeout_recv_body(None)
+                .timeout_global(None)
+                .http_status_as_error(false)
+                .build()
+                .into(),
             base: resolve_cloud_base_url(config, HARNESS),
-            token: resolve_cloud_auth_token(config, HARNESS),
-        }
+            token,
+        })
     }
+
     fn get(&self, path: &str) -> Result<Value, String> {
+        self.get_detailed(path).map_err(|d| d.message)
+    }
+
+    fn get_detailed(&self, path: &str) -> Result<Value, CloudErrorDetail> {
         let mut req = self.client.get(format!("{}{path}", self.base));
         if let Some(token) = &self.token {
             req = req.header("authorization", &format!("Bearer {token}"));
         }
-        let response = req
-            .call()
-            .map_err(|_| "Spiron read failed; pending receipt retained".to_string())?;
-        Self::decode(response)
+        let response = req.call().map_err(|_| {
+            CloudErrorDetail::generic("Spiron read failed; pending receipt retained")
+        })?;
+        Self::decode_detailed(response)
     }
-    fn post(&self, path: &str, p: &Pending) -> Result<Value, String> {
+
+    fn post_detailed(&self, path: &str, p: &Pending) -> Result<Value, CloudErrorDetail> {
         let mut req = self
             .client
             .post(format!("{}{path}", self.base))
@@ -138,20 +215,120 @@ impl Api {
             req = req.header("authorization", &format!("Bearer {token}"));
         }
         let response = req.send_json(&p.body).map_err(|_| {
-            "Spiron write acknowledgement uncertain; durable idempotency key retained".to_string()
+            CloudErrorDetail::generic(
+                "Spiron write acknowledgement uncertain; durable idempotency key retained",
+            )
         })?;
-        Self::decode(response)
+        Self::decode_detailed(response)
     }
-    fn decode(mut response: ureq::http::Response<ureq::Body>) -> Result<Value, String> {
+
+    fn post_message_stream_or_json(
+        &self,
+        path: &str,
+        p: &Pending,
+        agent_id: &str,
+        cancel_flag: &TurnCancel,
+    ) -> Result<PostMessageResponse, CloudErrorDetail> {
+        let mut req = self
+            .stream_client
+            .post(format!("{}{path}", self.base))
+            .header("Idempotency-Key", &p.key)
+            .header("Prefer", "respond-async")
+            .header("Accept", "text/event-stream, application/json");
+        if let Some(token) = &self.token {
+            req = req.header("authorization", &format!("Bearer {token}"));
+        }
+        let response = req.send_json(&p.body).map_err(|_| {
+            CloudErrorDetail::generic(
+                "Spiron write acknowledgement uncertain; durable idempotency key retained",
+            )
+        })?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if (200..300).contains(&status) && content_type.contains("text/event-stream") {
+            let reader = BufReader::new(response.into_body().into_reader());
+            let outcome = read_sse_cloud_stream(
+                reader,
+                HARNESS,
+                Some(agent_id),
+                cloud_idle_timeout(),
+                cancel_flag,
+            )?;
+            return Ok(PostMessageResponse::Stream(outcome));
+        }
+        Self::decode_detailed(response).map(PostMessageResponse::Json)
+    }
+
+    fn put_mcp_servers(&self, agent_id: &str, servers: &Value) -> Result<(), CloudErrorDetail> {
+        let path = format!("/v1/agents/{agent_id}/mcp-servers");
+        let mut req = self
+            .client
+            .put(format!("{}{path}", self.base))
+            .header("content-type", "application/json")
+            .header("accept", "application/json");
+        if let Some(token) = &self.token {
+            req = req.header("authorization", &format!("Bearer {token}"));
+        }
+        let response = req
+            .send_json(&json!({ "mcp_servers": servers }))
+            .map_err(|_| CloudErrorDetail::generic("Spiron MCP server registration failed"))?;
+        let status = response.status().as_u16();
+        if (200..300).contains(&status) || matches!(status, 404 | 405 | 501) {
+            return Ok(());
+        }
+        Self::decode_detailed(response).map(|_| ())
+    }
+
+    fn decode_detailed(
+        response: ureq::http::Response<ureq::Body>,
+    ) -> Result<Value, CloudErrorDetail> {
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let mut raw = String::new();
+            let _ = response
+                .into_body()
+                .into_reader()
+                .take(16 * 1024)
+                .read_to_string(&mut raw);
+            if status == 429 || status == 401 {
+                return Err(classify_http_error(
+                    status,
+                    retry_after.as_deref(),
+                    &raw,
+                    HARNESS,
+                    "spiron",
+                ));
+            }
+            if status == 503 {
+                // Provider error bodies must not echo prompts/capabilities, while preserving HTTP 503 code.
+                return Err(CloudErrorDetail {
+                    status: Some(503),
+                    code: "service_unavailable",
+                    message: format!("Spiron API returned HTTP {status}"),
+                    quota_reset_at_ms: None,
+                });
+            }
             // Provider error bodies can echo prompts, headers or MCP capabilities.
-            return Err(format!("Spiron API returned HTTP {status}"));
+            return Err(CloudErrorDetail {
+                status: Some(status),
+                code: "cloud_error",
+                message: format!("Spiron API returned HTTP {status}"),
+                quota_reset_at_ms: None,
+            });
         }
-        response
-            .body_mut()
-            .read_json()
-            .map_err(|_| "Spiron returned invalid JSON; pending state retained".to_string())
+        response.into_body().read_json().map_err(|_| {
+            CloudErrorDetail::generic("Spiron returned invalid JSON; pending state retained")
+        })
     }
 }
 
@@ -169,32 +346,46 @@ struct Session {
 
 impl Session {
     fn open(config: &Path, model: Option<&str>, resume: Option<&str>) -> Result<Self, String> {
+        Self::open_detailed(config, model, resume).map_err(|d| d.message)
+    }
+
+    fn open_detailed(
+        config: &Path,
+        model: Option<&str>,
+        resume: Option<&str>,
+    ) -> Result<Self, CloudErrorDetail> {
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(config.join("spiron-cloud.lock"))
-            .map_err(|_| "cannot open Spiron turn lock")?;
+            .map_err(|_| CloudErrorDetail::generic("cannot open Spiron turn lock"))?;
         lock.try_lock()
-            .map_err(|_| "another Spiron controller owns this config")?;
-        let api = Api::new(config);
+            .map_err(|_| CloudErrorDetail::generic("another Spiron controller owns this config"))?;
+        let api = Api::new(config)?;
         // Bind persisted identities and capabilities to the endpoint that created them.
         let origin = config.join("spiron-cloud-origin.json");
         match std::fs::read(&origin) {
             Ok(bytes) => {
-                let bound: String =
-                    serde_json::from_slice(&bytes).map_err(|_| "invalid Spiron origin state")?;
+                let bound: String = serde_json::from_slice(&bytes)
+                    .map_err(|_| CloudErrorDetail::generic("invalid Spiron origin state"))?;
                 if bound != api.base {
-                    return Err("Spiron identity belongs to another API origin".into());
+                    return Err(CloudErrorDetail::generic(
+                        "Spiron identity belongs to another API origin",
+                    ));
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 save(
                     &origin,
-                    &serde_json::to_vec(&api.base).map_err(|e| e.to_string())?,
-                )?;
+                    &serde_json::to_vec(&api.base)
+                        .map_err(|e| CloudErrorDetail::generic(e.to_string()))?,
+                )
+                .map_err(CloudErrorDetail::generic)?;
             }
-            Err(_) => return Err("cannot read Spiron origin state".into()),
+            Err(_) => {
+                return Err(CloudErrorDetail::generic("cannot read Spiron origin state"));
+            }
         }
         // Changing API key changes the remote connection and conversation. Refuse
         // silently rebinding an existing identity, including across restarts.
@@ -206,25 +397,32 @@ impl Session {
         match std::fs::read(&binding) {
             Ok(bytes) => {
                 let previous: String = serde_json::from_slice(&bytes)
-                    .map_err(|_| "invalid Spiron credential binding")?;
+                    .map_err(|_| CloudErrorDetail::generic("invalid Spiron credential binding"))?;
                 if previous != credential {
-                    return Err(
-                        "Spiron API key changed; explicit conversation migration required".into(),
-                    );
+                    return Err(CloudErrorDetail::generic(
+                        "Spiron API key changed; explicit conversation migration required",
+                    ));
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => save(
                 &binding,
-                &serde_json::to_vec(&credential).map_err(|e| e.to_string())?,
-            )?,
-            Err(_) => return Err("cannot read Spiron credential binding".into()),
+                &serde_json::to_vec(&credential)
+                    .map_err(|e| CloudErrorDetail::generic(e.to_string()))?,
+            )
+            .map_err(CloudErrorDetail::generic)?,
+            Err(_) => {
+                return Err(CloudErrorDetail::generic(
+                    "cannot read Spiron credential binding",
+                ));
+            }
         }
         let identity_path = config.join(session_filename_for(HARNESS));
+        let mut created_fresh = false;
         let agent_id = if let Some(id) = resume
             .map(str::to_string)
             .or_else(|| read_persisted_session_id(config, HARNESS))
         {
-            identifier(&json!({"id": id}), "id")?
+            identifier(&json!({"id": id}), "id").map_err(CloudErrorDetail::generic)?
         } else {
             let path = config.join("spiron-cloud-create.json");
             let mut body = json!({"name": "Remote worker", "tools": {"disabled": resolve_cloud_disabled_tools(config)}});
@@ -234,7 +432,7 @@ impl Session {
             if let Some(instructions) = build_cloud_system_prompt(config) {
                 body["instructions"] = json!(instructions);
             }
-            if let Some(context) = workspace_context(config)?
+            if let Some(context) = workspace_context(config).map_err(CloudErrorDetail::generic)?
                 && let Some(repo) = context
                     .get("repo")
                     .and_then(Value::as_str)
@@ -242,64 +440,73 @@ impl Session {
             {
                 body["github"] = json!({"repositories": [repo]});
             }
-            let request = pending(&path, &api.base, body, None)?;
-            let created = api.post("/v1/agents", &request)?;
-            let id = identifier(&created, "id")?;
-            save(&identity_path, format!("{id}\n").as_bytes())?;
-            std::fs::remove_file(path).map_err(|e| e.to_string())?;
+            let request =
+                pending(&path, &api.base, body, None).map_err(CloudErrorDetail::generic)?;
+            let created = api.post_detailed("/v1/agents", &request)?;
+            let id = identifier(&created, "id").map_err(CloudErrorDetail::generic)?;
+            save(&identity_path, format!("{id}\n").as_bytes())
+                .map_err(CloudErrorDetail::generic)?;
+            std::fs::remove_file(path).map_err(|e| CloudErrorDetail::generic(e.to_string()))?;
+            created_fresh = true;
             id
         };
-        save(
-            &identity_path,
-            format!(
-                "{agent_id}
-"
-            )
-            .as_bytes(),
-        )?;
+        save(&identity_path, format!("{agent_id}\n").as_bytes())
+            .map_err(CloudErrorDetail::generic)?;
 
         let scope = format!("{}/{}/{}", api.base, agent_id, credential);
-        Ok(Self {
+        let session = Self {
             _lock: lock,
             api,
             agent_id,
             scope,
-        })
+        };
+        let explicit_sync = std::env::var("ANYAGENTS_SPIRON_SYNC_MCP_SERVERS")
+            .ok()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true"))
+            || read_cloud_json(config)
+                .and_then(|v| v.get("sync_mcp_servers").and_then(Value::as_bool))
+                == Some(true);
+        if (created_fresh || explicit_sync) && config.join(crate::remote::TOKEN_FILE).exists() {
+            session.sync_mcp_servers(config)?;
+        }
+        Ok(session)
+    }
+
+    fn mcp_servers_payload(config: &Path) -> Result<Option<Value>, String> {
+        if !config.join(crate::remote::TOKEN_FILE).exists() {
+            return Ok(None);
+        }
+        let url = resolve_public_mcp_url(config)?;
+        let validated = validate_remote_mcp_url(config, &url)?;
+        let capability = crate::remote::session_token(config)?;
+        Ok(Some(json!([{
+            "name": "anyagents",
+            "url": mcp_url_with_profile(&validated, remote_mcp_profile(config)),
+            "bearer_token": capability
+        }])))
+    }
+
+    fn sync_mcp_servers(&self, config: &Path) -> Result<(), CloudErrorDetail> {
+        if let Some(servers) =
+            Self::mcp_servers_payload(config).map_err(CloudErrorDetail::generic)?
+        {
+            self.api.put_mcp_servers(&self.agent_id, &servers)?;
+        }
+        Ok(())
     }
 
     fn body(config: &Path, prompt: &str) -> Result<Value, String> {
         let content = if let Some(context) = workspace_context(config)? {
-            format!("Remote workspace context (repository, branch, base): {context}
-Prepare this checkout in your cloud workspace before repository work; never use the controller filesystem.
-
-{prompt}")
+            format!(
+                "Remote workspace context (repository, branch, base): {context}\nPrepare this checkout in your cloud workspace before repository work; never use the controller filesystem.\n\n{prompt}"
+            )
         } else {
             prompt.to_string()
         };
         let mut body = json!({"content": content});
         // Never export the local mailbox capability. Re-read the expiring remote token each turn.
-        if config.join(crate::remote::TOKEN_FILE).exists() {
-            let url = resolve_public_mcp_url(config)?;
-            let parsed = url::Url::parse(&url).map_err(|_| "invalid Spiron MCP callback URL")?;
-            let loopback_test = cfg!(test)
-                && read_cloud_json(config)
-                    .and_then(|v| v.get("allow_loopback_mcp").and_then(Value::as_bool))
-                    == Some(true)
-                && parsed
-                    .host_str()
-                    .is_some_and(|h| matches!(h, "127.0.0.1" | "[::1]"));
-            if (parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback_test))
-                || parsed.host_str().is_none()
-                || !parsed.username().is_empty()
-                || parsed.password().is_some()
-                || parsed.fragment().is_some()
-            {
-                return Err(
-                    "Spiron MCP callback requires HTTPS without credentials or fragment".into(),
-                );
-            }
-            let capability = crate::remote::session_token(config)?;
-            body["mcp_servers"] = json!([{"name": "anyagents", "url": mcp_url_with_profile(&url, remote_mcp_profile(config)), "bearer_token": capability}]);
+        if let Some(servers) = Self::mcp_servers_payload(config)? {
+            body["mcp_servers"] = servers;
         }
 
         Ok(body)
@@ -308,6 +515,7 @@ Prepare this checkout in your cloud workspace before repository work; never use 
 
 /// Synchronous callers use the same session/request engine. The stream
 /// controller supplies mailbox UUIDs; this older API retains its durable key.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn dispatch(
     config: &Path,
     model: Option<&str>,
@@ -316,38 +524,206 @@ pub(super) fn dispatch(
     cancel: &TurnCancel,
     active: &Mutex<Option<String>>,
 ) -> Result<CloudTurnOutcome, String> {
-    let session = Session::open(config, model, resume)?;
+    dispatch_detailed(config, model, resume, prompt, cancel, active).map_err(|d| d.message)
+}
+
+pub(super) fn dispatch_detailed(
+    config: &Path,
+    model: Option<&str>,
+    resume: Option<&str>,
+    prompt: &str,
+    cancel: &TurnCancel,
+    active: &Mutex<Option<String>>,
+) -> Result<CloudTurnOutcome, CloudErrorDetail> {
+    let session = Session::open_detailed(config, model, resume)?;
     if cancel.is_cancelled() {
-        return Err("cancelled before Spiron message submission".into());
+        return Err(CloudErrorDetail::generic(
+            "cancelled before Spiron message submission",
+        ));
     }
     let path = config.join("spiron-cloud-message.json");
-    let mut input = controller::Input::prepare(&session, config, path, None, prompt)?;
+    if !path.exists()
+        && let Some(active_run) = read_active_run(config).map_err(CloudErrorDetail::generic)?
+        && active_run.agent_id == session.agent_id
+        && active_run.content.as_deref() == Some(prompt)
+        && let Some(receipt_id) = active_run.receipt_id.clone().or(active_run.run_id.clone())
+    {
+        return reattach_active_run(&session, config, &active_run, &receipt_id, cancel, active);
+    }
+    let mut input = controller::Input::prepare(&session, config, path, None, prompt)
+        .map_err(CloudErrorDetail::generic)?;
     let deadline = Instant::now() + TURN_BUDGET;
+    let mut poll_interval = Duration::from_millis(250);
     let result = (|| loop {
-        if let Some(outcome) = input.advance(&session, false)? {
+        if let Some(outcome) = input.advance_detailed(&session, false, cancel)? {
+            clear_active_run(config);
             return Ok(outcome);
         }
         if let Some(reason) = input.failure.take() {
-            return Err(reason);
+            clear_active_run(config);
+            return Err(CloudErrorDetail::generic(reason));
         }
-        *active.lock().unwrap() = input.request.receipt.clone();
+        let active_id = input
+            .request
+            .run_id
+            .clone()
+            .or_else(|| input.request.receipt.clone());
+        *active.lock().unwrap() = active_id;
         if cancel.is_cancelled() || Instant::now() >= deadline {
             if let Some(task) = &input.request.receipt {
-                cancel_cloud_turn(
-                    &session.api.base,
-                    HARNESS,
-                    session.api.token.as_deref(),
-                    task,
-                )?;
+                if let Some(run_id) = input
+                    .request
+                    .run_id
+                    .as_deref()
+                    .filter(|r| *r != task.as_str())
+                {
+                    cancel_spiron_run(
+                        &session.api.base,
+                        session.api.token.as_deref(),
+                        &session.agent_id,
+                        run_id,
+                        Some(task),
+                    )
+                    .map_err(CloudErrorDetail::generic)?;
+                } else {
+                    cancel_cloud_turn(
+                        &session.api.base,
+                        HARNESS,
+                        session.api.token.as_deref(),
+                        task,
+                    )
+                    .map_err(CloudErrorDetail::generic)?;
+                }
             }
-            return Err(
-                "Spiron cancellation requested; receipt retained for reconciliation".into(),
-            );
+            clear_active_run(config);
+            return Err(CloudErrorDetail::generic(
+                "Spiron cancellation requested; receipt retained for reconciliation",
+            ));
         }
-        cancel.wait(Duration::from_millis(250));
+        cancel.wait(apply_poll_jitter(poll_interval));
+        poll_interval = (poll_interval * 2).min(Duration::from_secs(5));
     })();
     *active.lock().unwrap() = None;
     result
+}
+
+fn reattach_active_run(
+    session: &Session,
+    config: &Path,
+    active_run: &ActiveRunState,
+    receipt_id: &str,
+    cancel: &TurnCancel,
+    active: &Mutex<Option<String>>,
+) -> Result<CloudTurnOutcome, CloudErrorDetail> {
+    let mut poll_interval = Duration::from_millis(250);
+    let deadline = Instant::now() + TURN_BUDGET;
+    let mut transient_errors = 0u32;
+    let mut use_run_endpoint = false;
+    loop {
+        *active.lock().unwrap() = active_run
+            .run_id
+            .clone()
+            .or_else(|| Some(receipt_id.to_string()));
+        if cancel.is_cancelled() || Instant::now() >= deadline {
+            if let Some(run_id) = &active_run.run_id {
+                let _ = cancel_spiron_run(
+                    &session.api.base,
+                    session.api.token.as_deref(),
+                    &session.agent_id,
+                    run_id,
+                    Some(receipt_id),
+                );
+            } else {
+                let _ = cancel_cloud_turn(
+                    &session.api.base,
+                    HARNESS,
+                    session.api.token.as_deref(),
+                    receipt_id,
+                );
+            }
+            *active.lock().unwrap() = None;
+            return Err(CloudErrorDetail::generic(
+                "Spiron cancellation requested during crash re-attach",
+            ));
+        }
+        let path = if use_run_endpoint && let Some(run_id) = active_run.run_id.as_deref() {
+            format!("/v1/agents/{}/runs/{run_id}", session.agent_id)
+        } else {
+            format!("/v1/message-receipts/{receipt_id}")
+        };
+        let val = match session.api.get_detailed(&path) {
+            Ok(v) => {
+                transient_errors = 0;
+                v
+            }
+            Err(d) if d.status == Some(404) && !use_run_endpoint && active_run.run_id.is_some() => {
+                use_run_endpoint = true;
+                continue;
+            }
+            Err(d) if d.status.is_some_and(|s| (500..=599).contains(&s)) => {
+                transient_errors += 1;
+                if transient_errors > 5 {
+                    *active.lock().unwrap() = None;
+                    return Err(d);
+                }
+                cancel.wait(apply_poll_jitter(poll_interval));
+                poll_interval = (poll_interval * 2).min(Duration::from_secs(5));
+                continue;
+            }
+            Err(d) => {
+                *active.lock().unwrap() = None;
+                return Err(d);
+            }
+        };
+        match val.get("status").and_then(Value::as_str) {
+            Some("completed") => {
+                let reply = val
+                    .get("reply")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let reply = match reply {
+                    Some(r) => r,
+                    None => conversation_reply(
+                        &session.api,
+                        &session.agent_id,
+                        receipt_id,
+                        cancel,
+                        deadline,
+                    )
+                    .map_err(CloudErrorDetail::generic)?
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        CloudErrorDetail::generic("completed Spiron run has no reply")
+                    })?,
+                };
+                clear_active_run(config);
+                *active.lock().unwrap() = None;
+                return Ok(CloudTurnOutcome {
+                    session_id: session.agent_id.clone(),
+                    reply_text: reply,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                });
+            }
+            Some("failed" | "canceled" | "cancelled") => {
+                let st = val["status"].as_str().unwrap_or("failed");
+                clear_active_run(config);
+                *active.lock().unwrap() = None;
+                return Err(CloudErrorDetail::generic(format!("Spiron turn {st}")));
+            }
+            Some("submitted" | "working" | "input_required" | "queued" | "running" | "pending") => {
+                cancel.wait(apply_poll_jitter(poll_interval));
+                poll_interval = (poll_interval * 2).min(Duration::from_secs(5));
+            }
+            _ => {
+                *active.lock().unwrap() = None;
+                return Err(CloudErrorDetail::generic(
+                    "Spiron re-attached receipt has missing or unknown status",
+                ));
+            }
+        }
+    }
 }
 
 fn workspace_context(config: &Path) -> Result<Option<Value>, String> {

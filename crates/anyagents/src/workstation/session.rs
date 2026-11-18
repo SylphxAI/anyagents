@@ -24,10 +24,11 @@
 //!
 //! Where people reach the takeover page is decided in [`super::takeover`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Once};
 
 use agent_workstation::{
     BrowserConfig, DesktopSession, Holder, Profile, Proxy, SessionConfig, TakeoverConfig,
@@ -39,8 +40,10 @@ use super::{ToolError, server_profile_dir};
 
 const DEFAULT_IDLE_SECS: i64 = 15 * 60;
 // One total caller budget, including a slot held by startup or an in-flight call.
-const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(9);
+const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const HEALTH_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const ORPHAN_RUNTIME_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+const RUNTIME_LOCK_FILE: &str = ".desktop.lock";
 /// Browser arguments when `ANYAGENTS_BROWSER_ARGS` is unset. No sandbox, as
 /// before: containers without user namespaces cannot start Chromium's. No
 /// crash-restore prompt: profiles the previous implementation stopped with a
@@ -79,6 +82,49 @@ pub struct Live {
     /// Whether the latest takeover started on a challenged page requiring solve proof.
     watch_challenge: Arc<AtomicBool>,
     runtime_dir: PathBuf,
+    runtime_guard: Option<RuntimeDirGuard>,
+}
+
+#[derive(Debug)]
+struct RuntimeDirGuard {
+    dir: PathBuf,
+    lock: std::sync::Mutex<Option<std::fs::File>>,
+}
+
+impl RuntimeDirGuard {
+    fn new(dir: PathBuf, lock: Option<std::fs::File>) -> Self {
+        register_starting_runtime_dir(&dir);
+        Self {
+            dir,
+            lock: std::sync::Mutex::new(lock),
+        }
+    }
+
+    fn release_lock(&self) {
+        if let Ok(mut lock) = self.lock.lock() {
+            drop(lock.take());
+        }
+        unregister_starting_runtime_dir(&self.dir);
+    }
+}
+
+impl Drop for RuntimeDirGuard {
+    fn drop(&mut self) {
+        self.release_lock();
+        if self.dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.watcher.abort();
+        if let Some(key) = &self.mount {
+            takeover::unmount(key);
+        }
+        drop(self.runtime_guard.take());
+    }
 }
 
 /// Touch on every completion, error and cancellation, before releasing admission.
@@ -234,12 +280,116 @@ pub fn running(data: &Path, profile: &str) -> Option<Arc<Live>> {
 /// `ANYAGENTS_BROWSER_PROXY` for a new one). A different proxy than the
 /// running session's is refused: changing routing would discard open tabs or
 /// interrupt a person.
+static STARTING_RUNTIME_DIRS: LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+fn register_starting_runtime_dir(dir: &Path) {
+    STARTING_RUNTIME_DIRS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(dir.to_path_buf());
+}
+
+fn unregister_starting_runtime_dir(dir: &Path) {
+    STARTING_RUNTIME_DIRS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(dir);
+}
+
+fn active_runtime_dirs() -> HashSet<PathBuf> {
+    let mut dirs = STARTING_RUNTIME_DIRS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    for live in all_running() {
+        dirs.insert(live.runtime_dir.clone());
+    }
+    dirs
+}
+
+fn lock_runtime_dir(dir: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join(RUNTIME_LOCK_FILE))?;
+    // SAFETY: valid open file descriptor; LOCK_EX | LOCK_NB never blocks.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+fn current_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+/// Remove orphaned `/tmp/anyagents-desktop-*` runtime directories left behind by
+/// crashed processes once their kernel `flock` is released (or stale legacy dirs).
+pub fn reap_stale_runtime_dirs() {
+    reap_stale_runtime_dirs_in(Path::new("/tmp"), ORPHAN_RUNTIME_AGE);
+}
+
+fn reap_stale_runtime_dirs_once() {
+    static INIT_REAP: Once = Once::new();
+    INIT_REAP.call_once(reap_stale_runtime_dirs);
+}
+
+fn reap_stale_runtime_dirs_in(base: &Path, legacy_max_age: std::time::Duration) {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    let me = current_uid();
+    let active = active_runtime_dirs();
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with("anyagents-desktop-") {
+            continue;
+        }
+        let path = entry.path();
+        if active.contains(&path) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != me {
+            continue;
+        }
+        let lock_path = path.join(RUNTIME_LOCK_FILE);
+        if lock_path.exists() {
+            match lock_runtime_dir(&path) {
+                Ok(lock_file) => {
+                    drop(lock_file);
+                    let _ = std::fs::remove_dir_all(&path);
+                }
+                Err(_) => continue,
+            }
+        } else if let Ok(modified) = meta.modified()
+            && now
+                .duration_since(modified)
+                .is_ok_and(|age| age >= legacy_max_age)
+        {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
 pub async fn acquire(
     data: &Path,
     profile: &str,
     principal: &str,
     proxy: Option<&str>,
 ) -> Result<Arc<Live>, ToolError> {
+    reap_stale_runtime_dirs_once();
     let key = server_profile_dir(data, profile, true)
         .map_err(|e| ToolError::invalid(e.to_string()))?
         .ok_or_else(|| ToolError::invalid("browser profile is missing"))?;
@@ -643,25 +793,16 @@ async fn start(
     principal: &str,
     proxy: Option<String>,
 ) -> Result<Live, ToolError> {
+    reap_stale_runtime_dirs_once();
     let (parsed, proxy_argument) = super::proxy::configure(proxy.as_deref())?;
     super::legacy::retire(dir)
         .await
         .map_err(|e| ToolError::invalid(format!("cannot retire legacy browser: {e}")))?;
     let runtime_dir = new_runtime_dir().map_err(|e| ToolError::invalid(e.to_string()))?;
-    let cfg = match session_config(profile, dir, &runtime_dir, parsed, proxy_argument) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&runtime_dir);
-            return Err(e);
-        }
-    };
-    let session = match DesktopSession::start(cfg).await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&runtime_dir);
-            return Err(e.into());
-        }
-    };
+    let runtime_lock = lock_runtime_dir(&runtime_dir).ok();
+    let runtime_guard = RuntimeDirGuard::new(runtime_dir.clone(), runtime_lock);
+    let cfg = session_config(profile, dir, &runtime_dir, parsed, proxy_argument)?;
+    let session = Arc::new(DesktopSession::start(cfg).await?);
     // A fresh session: the lease cannot be held by anyone else yet.
     session.lease(principal).map_err(|e| in_use(profile, e))?;
     let mount = takeover::mount(data, &session);
@@ -684,6 +825,7 @@ async fn start(
         hand_back_pending: std::sync::Mutex::new(None),
         watch_challenge,
         runtime_dir,
+        runtime_guard: Some(runtime_guard),
     })
 }
 
@@ -790,6 +932,10 @@ async fn cleanup(live: &Live) {
         takeover::unmount(key);
     }
     drop(live.tunnel.lock().await.take());
+    if let Some(guard) = &live.runtime_guard {
+        guard.release_lock();
+    }
+    unregister_starting_runtime_dir(&live.runtime_dir);
     let runtime_dir = live.runtime_dir.clone();
     let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(runtime_dir)).await;
 }
@@ -831,7 +977,7 @@ async fn stop_agent(data: &Path, agent: &str) {
     .await;
 }
 
-/// Stop every session (server shutdown), concurrently.
+/// Stop every session (server shutdown), concurrently across per-slot tasks.
 pub async fn stop_all() {
     let slots: Vec<Slot> = SESSIONS
         .lock()
@@ -840,10 +986,11 @@ pub async fn stop_all() {
         .cloned()
         .collect();
     let closing = tokio::spawn(async move {
-        futures::future::join_all(slots.into_iter().map(|slot| async move {
-            close_slot(slot.lock_owned().await).await;
-        }))
-        .await;
+        let tasks: Vec<_> = slots
+            .into_iter()
+            .map(|slot| tokio::spawn(async move { close_slot(slot.lock_owned().await).await }))
+            .collect();
+        futures::future::join_all(tasks).await;
     });
     // A single total deadline covers all slots, startup contention, web calls,
     // tunnel publication and filesystem cleanup, not a per-session timeout.
@@ -1229,5 +1376,81 @@ mod tests {
         for unreadable in ["", "-1", "abc", "2.5"] {
             assert_eq!(counts(Some(unreadable)), vec!["2"], "{unreadable:?}");
         }
+    }
+
+    #[test]
+    fn orphan_runtime_dir_reaper_removes_unlocked_and_stale_dirs_but_preserves_locked_or_fresh() {
+        let base = tempfile::tempdir().unwrap();
+        let unlocked_dead = base.path().join("anyagents-desktop-dead01");
+        std::fs::create_dir(&unlocked_dead).unwrap();
+        std::fs::write(unlocked_dead.join(RUNTIME_LOCK_FILE), b"").unwrap();
+        std::fs::write(unlocked_dead.join("stale.sock"), b"junk").unwrap();
+
+        let locked_live = base.path().join("anyagents-desktop-live02");
+        std::fs::create_dir(&locked_live).unwrap();
+        let held_lock = lock_runtime_dir(&locked_live).unwrap();
+
+        let fresh_legacy = base.path().join("anyagents-desktop-fresh3");
+        std::fs::create_dir(&fresh_legacy).unwrap();
+
+        let unrelated = base.path().join("unrelated-dir");
+        std::fs::create_dir(&unrelated).unwrap();
+
+        // With 5m threshold: unlocked_dead (unlocked .desktop.lock) is reaped immediately;
+        // locked_live (flock held), fresh_legacy (younger than 5m), and unrelated survive.
+        reap_stale_runtime_dirs_in(base.path(), ORPHAN_RUNTIME_AGE);
+        assert!(!unlocked_dead.exists());
+        assert!(locked_live.exists());
+        assert!(fresh_legacy.exists());
+        assert!(unrelated.exists());
+
+        // Dropping held lock + zero legacy threshold reaps both unlocked dirs, leaving unrelated.
+        drop(held_lock);
+        reap_stale_runtime_dirs_in(base.path(), std::time::Duration::ZERO);
+        assert!(!locked_live.exists());
+        assert!(!fresh_legacy.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn runtime_dir_guard_drop_removes_runtime_dir_and_unregisters_starting_set() {
+        let base = tempfile::tempdir().unwrap();
+        let runtime_dir = base.path().join("anyagents-desktop-drop01");
+        std::fs::create_dir(&runtime_dir).unwrap();
+        std::fs::write(runtime_dir.join("sway.sock"), b"sock").unwrap();
+        let lock = lock_runtime_dir(&runtime_dir).unwrap();
+        let guard = RuntimeDirGuard::new(runtime_dir.clone(), Some(lock));
+        assert!(active_runtime_dirs().contains(&runtime_dir));
+        assert!(runtime_dir.exists());
+
+        // While guard is alive, orphan reaper must preserve the locked directory.
+        reap_stale_runtime_dirs_in(base.path(), std::time::Duration::ZERO);
+        assert!(runtime_dir.exists());
+
+        drop(guard);
+        assert!(!runtime_dir.exists());
+        assert!(!active_runtime_dirs().contains(&runtime_dir));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_all_runs_concurrent_slot_teardowns_within_budget() {
+        assert!(SHUTDOWN_WAIT <= std::time::Duration::from_secs(10));
+        // Verify two locked profile slots run their close futures concurrently under stop_all.
+        let s1: Slot = Arc::new(tokio::sync::Mutex::new(None));
+        let s2: Slot = Arc::new(tokio::sync::Mutex::new(None));
+        let g1 = s1.clone().lock_owned().await;
+        let g2 = s2.clone().lock_owned().await;
+        let t1 = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            close_slot(g1).await
+        });
+        let t2 = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            close_slot(g2).await
+        });
+        let started = std::time::Instant::now();
+        let (r1, r2) = tokio::join!(t1, t2);
+        assert!(!r1.unwrap() && !r2.unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

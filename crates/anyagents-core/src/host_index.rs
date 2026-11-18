@@ -82,6 +82,18 @@ pub struct IndexHit {
     pub lexical_score: f64,
 }
 
+/// Read-only document catalog projection shared with external indexers
+/// across both SQLite and PostgreSQL backends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostCatalogEntry {
+    pub rowid: i64,
+    pub id: String,
+    pub agent_id: String,
+    pub source: String,
+    pub timestamp_ms: Option<i64>,
+    pub raw: RawCoordinate,
+}
+
 fn decode_tool_names(value: String) -> Result<Vec<String>, crate::error::Error> {
     serde_json::from_str(&value)
         .map_err(|error| crate::error::Error::Message(format!("invalid tool_names json: {error}")))
@@ -612,7 +624,13 @@ impl HostIndex {
         let rows = self.exec().db_query_vec(
             "SELECT agent_id,segment,cursor FROM host_sources",
             &[],
-            |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?, r.get::<String>(2)?)),
+            |r| {
+                Ok((
+                    r.get::<String>(0)?,
+                    r.get::<String>(1)?,
+                    r.get::<String>(2)?,
+                ))
+            },
         )?;
         let mut due = Vec::with_capacity(rows.len());
         for (owner, path, raw) in rows {
@@ -1112,7 +1130,8 @@ impl HostIndex {
         seqs: &[u64],
     ) -> Result<(), IndexError> {
         let source_str = source.to_string_lossy().into_owned();
-        let sql = format!("DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE} AND seq=?3");
+        let sql =
+            format!("DELETE FROM host_documents WHERE agent_id=?1 AND {OF_SOURCE} AND seq=?3");
         let exec = self.exec();
         for seq in seqs {
             exec.db_execute(&sql, &db_params![owner, source_str, *seq as i64])?;
@@ -1219,6 +1238,79 @@ impl HostIndex {
         filters.sort = HistorySort::Oldest;
         filters.limit = ids.len().min(200);
         self.search_in_segment(visible_agents, scope, &filters, None, Some(ids))
+    }
+
+    /// Read-only catalog scan across both SQLite and PostgreSQL backends.
+    ///
+    /// When `random` is `true`, returns up to `limit` uniformly sampled entries.
+    /// Otherwise returns entries strictly `after_rowid` (ascending) or strictly
+    /// `before_rowid` (descending), optionally partitioned by `stripe` `(index, of)`
+    /// where `rowid % of == index`.
+    pub fn list_catalog_entries(
+        &self,
+        after_rowid: Option<i64>,
+        before_rowid: Option<i64>,
+        stripe: Option<(usize, usize)>,
+        random: bool,
+        limit: usize,
+    ) -> Result<Vec<HostCatalogEntry>, IndexError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut clauses = Vec::new();
+        let mut params: Vec<DbParam> = Vec::new();
+        if !random {
+            if let Some(after) = after_rowid {
+                params.push(DbParam::I64(Some(after)));
+                clauses.push(format!("rowid>?{}", params.len()));
+            } else if let Some(before) = before_rowid {
+                params.push(DbParam::I64(Some(before)));
+                clauses.push(format!("rowid<?{}", params.len()));
+            }
+            if let Some((index, of)) = stripe
+                && of > 1
+            {
+                params.push(DbParam::I64(Some(i64::try_from(of).unwrap_or(i64::MAX))));
+                let of_idx = params.len();
+                params.push(DbParam::I64(Some(i64::try_from(index).unwrap_or(0))));
+                let idx_pos = params.len();
+                clauses.push(format!("rowid % ?{of_idx} = ?{idx_pos}"));
+            }
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        let order_sql = if random {
+            "ORDER BY random()"
+        } else if after_rowid.is_none() && before_rowid.is_some() {
+            "ORDER BY rowid DESC"
+        } else {
+            "ORDER BY rowid ASC"
+        };
+        params.push(DbParam::I64(Some(i64::try_from(limit).unwrap_or(i64::MAX))));
+        let limit_idx = params.len();
+        let sql = format!(
+            "SELECT rowid, id, agent_id, source, timestamp_ms, segment, \"offset\", length, sha256, seq \
+             FROM host_documents{where_sql} {order_sql} LIMIT ?{limit_idx}"
+        );
+        Ok(self.exec().db_query_vec(&sql, &params, |r| {
+            Ok(HostCatalogEntry {
+                rowid: r.get(0)?,
+                id: r.get(1)?,
+                agent_id: r.get(2)?,
+                source: r.get(3)?,
+                timestamp_ms: r.get(4)?,
+                raw: RawCoordinate {
+                    segment: PathBuf::from(r.get::<String>(5)?),
+                    offset: r.get(6)?,
+                    length: r.get(7)?,
+                    sha256: r.get(8)?,
+                    seq: r.get(9)?,
+                },
+            })
+        })?)
     }
 
     fn search_in_segment(
@@ -2327,6 +2419,64 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "checkpoint waited too long despite Duration::ZERO: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn list_catalog_entries_supports_forward_backward_stripes_and_sampling() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("index.db");
+        let segment = RawSegment::open(&dir.path().join("events.raw")).unwrap();
+        let mut index = HostIndex::open(&path).unwrap();
+        for i in 0..7 {
+            let raw = segment.append(format!("line {i}").as_bytes()).unwrap();
+            index
+                .index(
+                    &format!("doc-{i}"),
+                    &metadata("agent-a", MemoryScope::Transcripts, i as i64),
+                    &raw,
+                )
+                .unwrap();
+        }
+
+        let all = index
+            .list_catalog_entries(Some(0), None, None, false, 100)
+            .unwrap();
+        assert_eq!(all.len(), 7);
+        assert_eq!(all[0].id, "doc-0");
+        assert_eq!(all[6].id, "doc-6");
+
+        let back = index
+            .list_catalog_entries(None, Some(i64::MAX), None, false, 2)
+            .unwrap();
+        assert_eq!(
+            back.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["doc-6", "doc-5"]
+        );
+
+        let mut partitioned = Vec::new();
+        for stripe_idx in 0..3 {
+            let rows = index
+                .list_catalog_entries(Some(0), None, Some((stripe_idx, 3)), false, 100)
+                .unwrap();
+            assert!(rows.iter().all(|r| r.rowid as usize % 3 == stripe_idx));
+            partitioned.extend(rows.into_iter().map(|r| r.rowid));
+        }
+        partitioned.sort();
+        assert_eq!(partitioned, all.iter().map(|r| r.rowid).collect::<Vec<_>>());
+
+        assert_eq!(
+            index
+                .list_catalog_entries(None, None, None, true, 3)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(
+            index
+                .list_catalog_entries(Some(0), None, None, false, 0)
+                .unwrap()
+                .is_empty()
         );
     }
 }

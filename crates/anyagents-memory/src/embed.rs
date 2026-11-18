@@ -7,10 +7,18 @@ use crate::{
     runtime::Error,
     text::Span,
 };
-use anyagents_core::raw_segment::{RawCoordinate, read_raw};
+use anyagents_core::{
+    db::configured_database_url_for_data_dir,
+    host_index::{HostCatalogEntry, HostIndex},
+    raw_segment::{RawCoordinate, read_raw},
+};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 /// A document is embedded up to this many pieces; the rest of a very large
 /// event (a long log or file dump) stays reachable through lexical search.
@@ -41,24 +49,70 @@ impl Stripe {
     pub const ALL: Stripe = Stripe { index: 0, of: 1 };
 }
 
+enum HostCatalogBackend {
+    Sqlite(Connection),
+    Index {
+        index: HostIndex,
+        contains_cache: Mutex<Option<(i64, HashMap<String, String>)>>,
+    },
+}
+
+/// Returns whether a host index is reachable via an on-disk SQLite file or a
+/// configured PostgreSQL database for `host_path`'s data directory.
+pub(crate) fn host_index_available(host_path: &Path) -> bool {
+    host_path.exists()
+        || configured_database_url_for_data_dir(host_path.parent().unwrap_or_else(|| Path::new("")))
+            .is_some()
+}
+
 /// A read-only view of the kernel's host index: the catalog of documents and
 /// their raw coordinates. The service never writes it.
 pub struct HostCatalog {
-    conn: Connection,
+    backend: HostCatalogBackend,
 }
 
 impl HostCatalog {
-    pub fn open(path: &Path) -> rusqlite::Result<Self> {
+    pub fn open(path: &Path) -> Result<Self, Error> {
+        let data_dir = path.parent().unwrap_or_else(|| Path::new(""));
+        if let Some(url) = configured_database_url_for_data_dir(data_dir) {
+            let index = HostIndex::open_postgres(&url)?;
+            return Ok(Self::from_host_index(index));
+        }
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        Ok(Self { conn })
+        Ok(Self {
+            backend: HostCatalogBackend::Sqlite(conn),
+        })
+    }
+
+    pub fn from_host_index(index: HostIndex) -> Self {
+        Self {
+            backend: HostCatalogBackend::Index {
+                index,
+                contains_cache: Mutex::new(None),
+            },
+        }
     }
 
     const COLUMNS: &str =
         "rowid, id, agent_id, source, timestamp_ms, segment, offset, length, sha256, seq";
+
+    fn entry_to_document(entry: HostCatalogEntry) -> HostDocument {
+        HostDocument {
+            rowid: entry.rowid,
+            document: Document {
+                id: entry.id,
+                agent_id: entry.agent_id,
+                source: entry.source,
+                timestamp_ms: entry.timestamp_ms,
+                raw_sha256: entry.raw.sha256.clone(),
+            },
+            raw: entry.raw,
+        }
+    }
 
     fn rows(
         &self,
@@ -66,8 +120,11 @@ impl HostCatalog {
         bound: i64,
         limit: usize,
         stripe: Stripe,
-    ) -> rusqlite::Result<Vec<HostDocument>> {
-        self.conn
+    ) -> Result<Vec<HostDocument>, Error> {
+        let HostCatalogBackend::Sqlite(conn) = &self.backend else {
+            unreachable!("SQLite row query called on non-SQLite backend");
+        };
+        let rows = conn
             .prepare_cached(&format!(
                 "SELECT {} FROM host_documents WHERE rowid % ?3 = ?4 AND {sql} LIMIT ?2",
                 Self::COLUMNS
@@ -94,7 +151,8 @@ impl HostCatalog {
                     })
                 },
             )?
-            .collect()
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Documents of `stripe` published after `rowid`, oldest first.
@@ -103,8 +161,23 @@ impl HostCatalog {
         rowid: i64,
         limit: usize,
         stripe: Stripe,
-    ) -> rusqlite::Result<Vec<HostDocument>> {
-        self.rows("rowid>?1 ORDER BY rowid", rowid, limit, stripe)
+    ) -> Result<Vec<HostDocument>, Error> {
+        match &self.backend {
+            HostCatalogBackend::Sqlite(_) => {
+                self.rows("rowid>?1 ORDER BY rowid", rowid, limit, stripe)
+            }
+            HostCatalogBackend::Index { index, .. } => Ok(index
+                .list_catalog_entries(
+                    Some(rowid),
+                    None,
+                    Some((stripe.index, stripe.of)),
+                    false,
+                    limit,
+                )?
+                .into_iter()
+                .map(Self::entry_to_document)
+                .collect()),
+        }
     }
 
     /// Documents of `stripe` published before `rowid`, newest first.
@@ -113,63 +186,142 @@ impl HostCatalog {
         rowid: i64,
         limit: usize,
         stripe: Stripe,
-    ) -> rusqlite::Result<Vec<HostDocument>> {
-        self.rows("rowid<?1 ORDER BY rowid DESC", rowid, limit, stripe)
+    ) -> Result<Vec<HostDocument>, Error> {
+        match &self.backend {
+            HostCatalogBackend::Sqlite(_) => {
+                self.rows("rowid<?1 ORDER BY rowid DESC", rowid, limit, stripe)
+            }
+            HostCatalogBackend::Index { index, .. } => Ok(index
+                .list_catalog_entries(
+                    None,
+                    Some(rowid),
+                    Some((stripe.index, stripe.of)),
+                    false,
+                    limit,
+                )?
+                .into_iter()
+                .map(Self::entry_to_document)
+                .collect()),
+        }
     }
 
     /// Up to `n` documents chosen uniformly at random, to estimate from.
-    pub fn sample(&self, n: usize) -> rusqlite::Result<Vec<HostDocument>> {
-        self.rows(
-            "rowid IN (SELECT rowid FROM host_documents ORDER BY random() LIMIT ?1)",
-            n as i64,
-            n,
-            Stripe::ALL,
-        )
+    pub fn sample(&self, n: usize) -> Result<Vec<HostDocument>, Error> {
+        match &self.backend {
+            HostCatalogBackend::Sqlite(_) => self.rows(
+                "rowid IN (SELECT rowid FROM host_documents ORDER BY random() LIMIT ?1)",
+                n as i64,
+                n,
+                Stripe::ALL,
+            ),
+            HostCatalogBackend::Index { index, .. } => Ok(index
+                .list_catalog_entries(None, None, None, true, n)?
+                .into_iter()
+                .map(Self::entry_to_document)
+                .collect()),
+        }
     }
 
     /// The host index's generation (`host_generation`), which changes when
     /// its documents table is created again and rowids start over; `legacy`
     /// for an index made before generations.
-    pub fn generation(&self) -> rusqlite::Result<String> {
-        match self.conn.query_row(
-            "SELECT generation FROM host_generation WHERE id=1",
-            [],
-            |r| r.get::<_, String>(0),
-        ) {
-            Ok(generation) => Ok(generation),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok("legacy".into()),
-            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
-                if message.contains("no such table") =>
-            {
-                Ok("legacy".into())
+    pub fn generation(&self) -> Result<String, Error> {
+        match &self.backend {
+            HostCatalogBackend::Sqlite(conn) => {
+                match conn.query_row(
+                    "SELECT generation FROM host_generation WHERE id=1",
+                    [],
+                    |r| r.get::<_, String>(0),
+                ) {
+                    Ok(generation) => Ok(generation),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok("legacy".into()),
+                    Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                        if message.contains("no such table") =>
+                    {
+                        Ok("legacy".into())
+                    }
+                    Err(error) => Err(error.into()),
+                }
             }
-            Err(error) => Err(error),
+            HostCatalogBackend::Index { index, .. } => {
+                Ok(index.generation()?.unwrap_or_else(|| "legacy".into()))
+            }
         }
     }
 
-    pub fn max_rowid(&self) -> rusqlite::Result<i64> {
-        self.conn.query_row(
-            "SELECT COALESCE(MAX(rowid),0) FROM host_documents",
-            [],
-            |r| r.get(0),
-        )
+    pub fn max_rowid(&self) -> Result<i64, Error> {
+        match &self.backend {
+            HostCatalogBackend::Sqlite(conn) => Ok(conn.query_row(
+                "SELECT COALESCE(MAX(rowid),0) FROM host_documents",
+                [],
+                |r| r.get(0),
+            )?),
+            HostCatalogBackend::Index { index, .. } => Ok(index
+                .list_catalog_entries(None, Some(i64::MAX), None, false, 1)?
+                .first()
+                .map_or(0, |e| e.rowid)),
+        }
     }
 
-    pub fn count(&self) -> rusqlite::Result<u64> {
-        self.conn
-            .query_row("SELECT count(*) FROM host_documents", [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .map(|n| n as u64)
+    pub fn count(&self) -> Result<u64, Error> {
+        match &self.backend {
+            HostCatalogBackend::Sqlite(conn) => Ok(conn
+                .query_row("SELECT count(*) FROM host_documents", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .map(|n| n as u64)?),
+            HostCatalogBackend::Index { index, .. } => {
+                let mut total = 0u64;
+                let mut cursor = 0i64;
+                loop {
+                    let batch =
+                        index.list_catalog_entries(Some(cursor), None, None, false, 4096)?;
+                    let Some(last) = batch.last() else { break };
+                    total = total.saturating_add(batch.len() as u64);
+                    cursor = last.rowid;
+                    if batch.len() < 4096 {
+                        break;
+                    }
+                }
+                Ok(total)
+            }
+        }
     }
 
-    pub fn contains(&self, document_id: &str, raw_sha256: &str) -> rusqlite::Result<bool> {
-        Ok(self
-            .conn
-            .prepare_cached("SELECT 1 FROM host_documents WHERE id=?1 AND sha256=?2")?
-            .query_row([document_id, raw_sha256], |_| Ok(()))
-            .optional()?
-            .is_some())
+    pub fn contains(&self, document_id: &str, raw_sha256: &str) -> Result<bool, Error> {
+        match &self.backend {
+            HostCatalogBackend::Sqlite(conn) => Ok(conn
+                .prepare_cached("SELECT 1 FROM host_documents WHERE id=?1 AND sha256=?2")?
+                .query_row([document_id, raw_sha256], |_| Ok(()))
+                .optional()?
+                .is_some()),
+            HostCatalogBackend::Index {
+                index,
+                contains_cache,
+            } => {
+                let mut guard = contains_cache
+                    .lock()
+                    .map_err(|_| "catalog cache poisoned")?;
+                let (cursor, map) = guard.get_or_insert_with(|| (0i64, HashMap::new()));
+                if map.get(document_id).map(String::as_str) == Some(raw_sha256) {
+                    return Ok(true);
+                }
+                loop {
+                    let batch =
+                        index.list_catalog_entries(Some(*cursor), None, None, false, 4096)?;
+                    let Some(last) = batch.last() else { break };
+                    *cursor = last.rowid;
+                    let batch_len = batch.len();
+                    for entry in batch {
+                        map.insert(entry.id, entry.raw.sha256);
+                    }
+                    if batch_len < 4096 {
+                        break;
+                    }
+                }
+                Ok(map.get(document_id).map(String::as_str) == Some(raw_sha256))
+            }
+        }
     }
 }
 
@@ -498,5 +650,67 @@ mod tests {
             "a cut cites its whole value"
         );
         assert_eq!(chunk(&spans, &mut count, 4, 2).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn host_catalog_via_host_index_matches_sqlite_queries_and_handles_pg_fallback() {
+        use anyagents_core::{
+            host_index::{HostIndex, IndexMetadata, MemoryScope},
+            raw_segment::retained_jsonl_records,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("history.jsonl");
+        let lines: String = (0..5)
+            .map(|i| format!("{{\"content\":\"doc line {i}\"}}\n"))
+            .collect();
+        std::fs::write(&file, lines).unwrap();
+        let path = dir.path().join("host-history-index-v1.db");
+        let mut index = HostIndex::open(&path).unwrap();
+        let records = retained_jsonl_records(&file).unwrap();
+        for (i, raw) in records.iter().enumerate() {
+            let metadata = IndexMetadata {
+                agent_id: "agt".into(),
+                source: MemoryScope::Transcripts,
+                timestamp_ms: Some(i as i64),
+                direction: "in".into(),
+                sender: "s".into(),
+                destination: "d".into(),
+                tool_name: None,
+                tool_names: Vec::new(),
+                role: None,
+            };
+            index.index(&format!("doc{i}"), &metadata, raw).unwrap();
+        }
+
+        let catalog = HostCatalog::from_host_index(index);
+        assert_eq!(catalog.count().unwrap(), 5);
+        assert_eq!(catalog.max_rowid().unwrap(), 5);
+        assert!(!catalog.generation().unwrap().is_empty());
+        assert_eq!(catalog.sample(3).unwrap().len(), 3);
+        assert!(catalog.contains("doc2", &records[2].sha256).unwrap());
+        assert!(!catalog.contains("doc2", "wrong-sha").unwrap());
+        let forward = catalog.after(0, 10, Stripe { index: 1, of: 2 }).unwrap();
+        let backward = catalog
+            .before(i64::MAX, 10, Stripe { index: 1, of: 2 })
+            .unwrap();
+        assert_eq!(
+            forward.iter().map(|d| d.rowid).collect::<Vec<_>>(),
+            backward.iter().rev().map(|d| d.rowid).collect::<Vec<_>>()
+        );
+
+        // When `database-url` configures PostgreSQL and no SQLite file exists on disk,
+        // `host_index_available` reports true and `HostCatalog::open` routes to PG
+        // rather than failing with SQLite CANTOPEN or creating an empty file.
+        let pg_dir = tempfile::tempdir().unwrap();
+        let missing_host = pg_dir.path().join("host-history-index-v1.db");
+        assert!(!host_index_available(&missing_host));
+        std::fs::write(
+            pg_dir.path().join("database-url"),
+            "postgres://user:pass@127.0.0.1:1/nonexistent_db\n",
+        )
+        .unwrap();
+        assert!(host_index_available(&missing_host));
+        assert!(HostCatalog::open(&missing_host).is_err());
+        assert!(!missing_host.exists());
     }
 }

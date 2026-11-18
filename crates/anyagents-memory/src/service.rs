@@ -4,7 +4,7 @@
 //! writes only its own dense index.
 use crate::{
     dense::DenseIndex,
-    embed::{HostCatalog, Stripe, embed_documents},
+    embed::{HostCatalog, Stripe, embed_documents, host_index_available},
     model::{self, ModelPin},
     protocol::{self, Rebuild, Reply, Request, Status},
     providers::{
@@ -258,7 +258,7 @@ pub fn plan_rebuild(
     max_usd: f64,
     workers: usize,
 ) -> Result<Option<Rebuild>, Error> {
-    if !host_path.exists() {
+    if !host_index_available(host_path) {
         return Ok(None);
     }
     let host = HostCatalog::open(host_path)?;
@@ -462,7 +462,7 @@ fn recorded_built(path: &Path, stamp: &Stamp) -> Result<bool, Error> {
 /// model, reading a profile's key or writing anything.
 pub fn estimate_configured(config: &Config) -> Result<Estimate, Error> {
     let host_path = config.data_dir.join(HOST_INDEX);
-    if !host_path.exists() {
+    if !host_index_available(&host_path) {
         return Err(format!("no host index at {}", host_path.display()).into());
     }
     let (embedder, name, width_known) = configured_embedder(config)?;
@@ -553,7 +553,7 @@ impl Shared {
         let dense = self.dense()?;
         let (embedded, vectors) = dense.counts()?;
         let host = self.config.data_dir.join(HOST_INDEX);
-        let (total, generation) = if host.exists() {
+        let (total, generation) = if host_index_available(&host) {
             let host = HostCatalog::open(&host)?;
             (host.count()?, host.generation()?)
         } else {
@@ -856,7 +856,7 @@ fn index_once(
 ) -> Result<Duration, Error> {
     let config = &shared.config;
     let host_path = config.data_dir.join(HOST_INDEX);
-    if !host_path.exists() {
+    if !host_index_available(&host_path) {
         return Ok(config.poll);
     }
     if worker.is_none() {
@@ -1950,5 +1950,51 @@ mod tests {
         // A socket whose service is gone is replaced.
         drop(live);
         drop(bind(&path).unwrap());
+    }
+
+    #[test]
+    fn estimate_configured_supports_postgres_pointer_without_sqlite_file() {
+        let dir = crate::test_tempdir();
+        let host_path = dir.path().join(HOST_INDEX);
+        assert!(!host_index_path_missing_ok(&host_path));
+
+        let (url, _) = stub_models(0.0, &[]);
+        let mut config = Config::new(dir.path());
+        config.providers = desk_pair(&url, Some(0.01), 10.0);
+
+        // Without SQLite file or PG URL, estimate_configured reports missing host index.
+        let missing_err = estimate_configured(&config).unwrap_err().to_string();
+        assert!(missing_err.contains("no host index"), "{missing_err}");
+
+        // With `database-url` pointing to PostgreSQL (and NO SQLite file on disk),
+        // `estimate_configured` skips the file-existence check and routes to PostgreSQL.
+        let pg_url = std::env::var("ANYAGENTS_TEST_POSTGRES_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(live_pg) = pg_url {
+            std::fs::write(dir.path().join("database-url"), format!("{live_pg}\n")).unwrap();
+            assert!(!host_path.exists());
+            let est = estimate_configured(&config).unwrap();
+            assert_eq!(est.embedder, "desk");
+            assert!(!host_path.exists());
+        } else {
+            std::fs::write(
+                dir.path().join("database-url"),
+                "postgres://user:pass@127.0.0.1:1/nonexistent_db\n",
+            )
+            .unwrap();
+            assert!(host_index_path_missing_ok(&host_path));
+            let pg_err = estimate_configured(&config).unwrap_err().to_string();
+            assert!(
+                !pg_err.contains("no host index"),
+                "PG-configured estimate_configured must not bail out on missing SQLite file: {pg_err}"
+            );
+            assert!(!host_path.exists());
+        }
+    }
+
+    fn host_index_path_missing_ok(host_path: &Path) -> bool {
+        host_index_available(host_path)
     }
 }
