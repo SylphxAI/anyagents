@@ -96,6 +96,16 @@ pub struct Origin {
     pub message_id: Option<i64>,
 }
 
+enum ReceiveTx {
+    Early(Option<ReceiveOutcome>),
+    Inserted {
+        message: Message,
+        woke_agent: bool,
+        is_passive_reaction: bool,
+        recipient: Box<Agent>,
+    },
+}
+
 /// History an incoming line refers to, read before the ingress transaction
 /// (see [`Store::ingress_history`]).
 #[derive(Default)]
@@ -2603,18 +2613,40 @@ impl Store {
         let source_key = incoming.source_key.take().filter(|key| !key.is_empty());
         let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
         let history = self.ingress_history(&mut incoming, source_key.as_deref(), agent_id);
-        enum ReceiveTx {
-            Early(Option<ReceiveOutcome>),
-            Inserted {
-                message: Message,
-                woke_agent: bool,
-                is_passive_reaction: bool,
-                recipient: Box<Agent>,
-            },
-        }
         // Stored bodies a channel retry merged a fuller copy into.
-        let mut merged: Vec<String> = Vec::new();
-        let tx_outcome = self.write_tx(|tx| -> Result<ReceiveTx, Error> {
+        let mut merged = Vec::new();
+        let tx_outcome = self.write_tx(|tx| {
+            if !admit(tx)? {
+                return Ok(ReceiveTx::Early(None));
+            }
+            Self::receive_on(
+                tx,
+                agent_id,
+                incoming,
+                source_key,
+                received_at_ms,
+                history,
+                wake_archived,
+                None,
+                &mut merged,
+            )
+        })?;
+        Ok(self.finish_receive(tx_outcome, &merged))
+    }
+
+    /// Append under an existing writer. Call finish_receive only after commit.
+    #[allow(clippy::too_many_arguments)]
+    fn receive_on(
+        tx: &Connection,
+        agent_id: &AgentId,
+        incoming: Incoming,
+        source_key: Option<String>,
+        received_at_ms: i64,
+        history: IngressHistory,
+        wake_archived: bool,
+        trusted_event: Option<&str>,
+        merged: &mut Vec<String>,
+    ) -> Result<ReceiveTx, Error> {
         // Author validity shares the write transaction with delivery. A sender
         // deleted while waiting for publication cannot borrow a same-spelled
         // display name or produce a stale-principal mailbox/context receipt.
@@ -2626,9 +2658,6 @@ impl Store {
             .and_then(|reference| AgentId::parse(reference).ok())
         {
             agent_exists(tx, &author)?;
-        }
-        if !admit(tx)? {
-            return Ok(ReceiveTx::Early(None));
         }
         agent_exists(tx, agent_id)?;
         // Erasure is authoritative over provider retries/edits, including basic
@@ -2698,7 +2727,7 @@ impl Store {
                 source_key.as_deref(),
                 reply_to_author.as_deref(),
                 &mut redelivery_identity,
-                &mut merged,
+                merged,
             )?
         {
             return Ok(ReceiveTx::Early(Some(ReceiveOutcome::Duplicate(existing))));
@@ -2786,7 +2815,9 @@ impl Store {
             Some(cid) => resolve_chat_metadata(tx, cid),
             None => (None, None),
         };
-        let event = if incoming.text.starts_with("[Pinned message #")
+        let event = if let Some(event) = trusted_event {
+            Some(event.to_string())
+        } else if incoming.text.starts_with("[Pinned message #")
             || incoming.text.starts_with("[pinned message")
         {
             Some("pinned".to_string())
@@ -2805,7 +2836,9 @@ impl Store {
                             || rta.eq_ignore_ascii_case(&a.name)
                     })
                 })
-                || history.reaction_chat_agents.is_some_and(|agents| agents <= 1);
+                || history
+                    .reaction_chat_agents
+                    .is_some_and(|agents| agents <= 1);
             if is_targeted_reaction {
                 Some("reaction".to_string())
             } else {
@@ -2942,40 +2975,37 @@ impl Store {
             )? > 0
         };
         let agent = agent_by_id(tx, agent_id)?;
-            Ok(ReceiveTx::Inserted {
-                message,
-                woke_agent,
-                is_passive_reaction,
-                recipient: Box::new(agent),
-            })
-        })?;
+        Ok(ReceiveTx::Inserted {
+            message,
+            woke_agent,
+            is_passive_reaction,
+            recipient: Box::new(agent),
+        })
+    }
+
+    fn finish_receive(&self, tx_outcome: ReceiveTx, merged: &[String]) -> Option<ReceiveOutcome> {
+        self.reproject_merged(merged);
         match tx_outcome {
-            ReceiveTx::Early(outcome) => {
-                self.reproject_merged(&merged);
-                Ok(outcome)
-            }
+            ReceiveTx::Early(outcome) => outcome,
             ReceiveTx::Inserted {
                 message,
                 woke_agent,
                 is_passive_reaction,
                 recipient,
             } => {
-                self.reproject_merged(&merged);
                 self.project_mailbox();
                 if woke_agent {
                     self.notify(Wake::Agent {
-                        agent_id: agent_id.clone(),
+                        agent_id: message.agent_id.clone(),
                     });
                 }
                 if !is_passive_reaction {
                     self.notify(Wake::Mail {
-                        agent_id: agent_id.clone(),
+                        agent_id: message.agent_id.clone(),
                     });
-                    // Mail that waits behind a pause, or that an archived
-                    // agent will not read, is announced (mail_notices.rs).
                     self.announce_held_mail(&message, &recipient);
                 }
-                Ok(Some(ReceiveOutcome::New(message)))
+                Some(ReceiveOutcome::New(message))
             }
         }
     }
