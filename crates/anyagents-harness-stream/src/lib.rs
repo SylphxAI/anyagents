@@ -3107,7 +3107,13 @@ fn finish_consumed(state: &mut State, turn: &str, usage: TurnUsage, value: &Valu
                 && state.consumed.contains(*id)
                 && !state.duplicates.contains(*id)
         })
-        && let Some(text) = value.get("final_text").and_then(Value::as_str)
+        // An empty final text is the peer's "no final text": the turn ended
+        // on a context rollover handoff, a tool step or a superseded reply.
+        // It answers nothing, so it is no task result to return.
+        && let Some(text) = value
+            .get("final_text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
     {
         let inputs = inputs.into_iter().map(str::to_owned).collect();
         let text = anyagents_harness::masking::mask_known_secrets(text)

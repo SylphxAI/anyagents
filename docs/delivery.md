@@ -107,10 +107,24 @@ here either.
   the agent's. One the supervisor treats as a transient mid-turn fault (a
   5xx, `server_error`, a reset connection) is first retried in a new
   process, as before, up to three times. After that, and at once for the
-  rest, each follow-up waits 15 s, doubling to at most 10 minutes; the turn
+  rest, each follow-up waits 15 s, doubling to at most 10 minutes, each wait
+  lengthened by up to a fifth from a per-agent salt so that agents one outage
+  interrupted together do not all ask again at the same instant; the turn
   stays open while it waits, and mail waits behind it. The next completed
   turn resets the backoff. So a gateway that misroutes every request slows
   every busy agent down; it pauses none of them.
+- **A transient capacity fault is work in progress, not an error.** A fault
+  that clears by itself (no capacity: `included_capacity_unavailable`,
+  `model_unavailable`, `seat_429`; a 429 with no stated reset; a 5xx or 529;
+  an overload or a broken stream), and that no 400, 401, 403, full context
+  or missing sign-in accompanies, follows the systemic backoff above. It is
+  recorded with no terminal outcome, so an `agent:idle` watch keeps waiting
+  for the retried work. Until a turn ends without an error, the supervisor
+  publishes the agent as in a turn with `retry_at_ms`, and with no error.
+  `agents list` shows it `working` with that retry time. It is never
+  `errored`, even though the adapter persisted the fault, and its parent is
+  sent no `[Sub-Agent Error]`. A fault somebody must act on (`model_not_found`,
+  rejected credentials) stays visible as the error it is.
 - **Park at three strikes.** At `MAX_ERRORED_TURNS` (3) strikes in a row the
   agent is parked: `state = paused`, its process stopped, its mail held,
   `turn_errors.faulted_at_ms` set, and the turn left open so that a resume

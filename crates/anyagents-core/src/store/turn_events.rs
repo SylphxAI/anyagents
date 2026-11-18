@@ -277,6 +277,34 @@ impl Store {
         })
     }
 
+    /// Record a turn that a transient provider capacity fault ended, for this
+    /// callback's exact delivery custody, without a terminal outcome: its work
+    /// is retried, so a watcher of the agent still sees the turn in progress.
+    /// The error is kept for diagnosis and is never a strike. False means
+    /// nothing was changed (stale, duplicate or unowned custody).
+    pub fn note_turn_retrying_for(
+        &self,
+        agent_id: &AgentId,
+        delivered_seq: i64,
+        error: &str,
+    ) -> Result<bool, Error> {
+        self.write_tx(|tx| {
+            agent_exists(tx, agent_id)?;
+            let owned: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mailbox_cursors
+                 WHERE agent_id = ?1 AND delivered_seq = ?2 AND delivered_seq > 0)",
+                params![agent_id.as_str(), delivered_seq],
+                |row| row.get(0),
+            )?;
+            if !owned {
+                return Ok(false);
+            }
+            revoke_task_contexts_through(tx, agent_id, delivered_seq)?;
+            super::turn_errors::record_error(tx, agent_id, error, false)?;
+            Ok(true)
+        })
+    }
+
     pub fn agent_turn_snapshot(&self, agent_id: &AgentId) -> Result<AgentTurnSnapshot, Error> {
         let conn = self.read_conn();
         let tx = conn.unchecked_transaction()?;
@@ -543,6 +571,41 @@ mod tests {
         let rows = store.inbox(&parent.id, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].text.contains(">recovered answer</task_return>"));
+    }
+
+    #[test]
+    fn a_capacity_retry_keeps_the_turn_open_without_a_terminal_outcome() {
+        let (_tmp, store, agent) = super::super::runtime_tests::setup();
+        let msg = super::super::runtime_tests::receive(&store, &agent, "work");
+        // Custody the cursor has not reached is not owned.
+        assert!(
+            !store
+                .note_turn_retrying_for(&agent.id, msg.seq, "capacity")
+                .unwrap()
+        );
+        assert!(store.turn_errors(&agent.id).unwrap().is_none());
+        store.note_delivered(&agent.id, msg.seq).unwrap();
+        let error = r#"Sylphx AI failure Some("included_capacity_unavailable"): Retry later."#;
+        assert!(
+            store
+                .note_turn_retrying_for(&agent.id, msg.seq, error)
+                .unwrap()
+        );
+        let snap = store.agent_turn_snapshot(&agent.id).unwrap();
+        assert_eq!(snap.turn_seq, 0, "no terminal outcome for a retried turn");
+        assert_eq!(snap.outcome, None);
+        assert!(snap.open_turn, "the work stays open for its retry");
+        let errors = store.turn_errors(&agent.id).unwrap().unwrap();
+        assert_eq!(errors.streak, 0, "a capacity fault is never a strike");
+        assert_eq!(errors.last_error.as_deref(), Some(error));
+        // The retried work completes as any turn does.
+        assert!(store.note_turn_completed_for(&agent.id, msg.seq).unwrap());
+        let done = store.agent_turn_snapshot(&agent.id).unwrap();
+        assert_eq!(
+            (done.turn_seq, done.outcome.as_deref()),
+            (1, Some("completed"))
+        );
+        assert!(!done.open_turn);
     }
 
     #[test]

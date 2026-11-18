@@ -12629,6 +12629,7 @@ stderr: {}",
                 live_model: child.model.clone(),
                 process_started_at_ms: Some(anyagents_core::now_ms()),
                 last_error: None,
+                retry_at_ms: None,
             },
         );
         let mut views;
