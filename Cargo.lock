@@ -230,6 +230,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyagents-guest"
+version = "0.1.9"
+dependencies = [
+ "anyagents-harness",
+ "anyagents-harness-agy",
+ "anyagents-harness-claude",
+ "anyagents-harness-codex",
+ "anyagents-harness-muse",
+ "anyagents-harness-omp",
+ "anyagents-harness-opencode",
+ "anyagents-harness-spiron",
+ "anyagents-harness-stream",
+ "anyagents-toolchain",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ureq",
+]
+
+[[package]]
 name = "anyagents-harness"
 version = "0.1.9"
 dependencies = [

@@ -284,7 +284,10 @@ async fn serve(
     // harness it starts is in its own OS seat. Otherwise the boundary contract
     // says so, and no run claims it.
     let seats = active_seat_ids(&store)?;
-    if operator::operator_token(data).is_some() && !crate::sandbox::launch_boundary(&seats) {
+    if !anyagents_tools::SandboxMode::from_env().is_remote_required()
+        && operator::operator_token(data).is_some()
+        && !crate::sandbox::launch_boundary(&seats)
+    {
         return Err(Error::Message(
             "this server has an operator token, so it is the identity boundary, but no OS seat is \
              in place for its agents: configure ANYAGENTS_AGENT_UID, ANYAGENTS_AGENT_GID and \
@@ -310,6 +313,9 @@ async fn serve(
     // started: a client that sees the socket must find a live origin, not the
     // port of the server that just stopped.
     let gateway = crate::gateway::start(data)?;
+    if let Err(err) = crate::gateway::ensure_routes_loaded(data) {
+        eprintln!("anyagents-gateway: deferred route hydration: {err}");
+    }
     // The API is bound before any vendor starts: an agent that is slow, silent
     // or wedged must never stop the server from answering.
     prepare_socket(&path)?;
@@ -329,21 +335,20 @@ async fn serve(
     };
     let custody = crate::keeper::custody(data, &host, refused);
     let kept = matches!(host, HarnessHost::Keeper(_));
-    let supervisor = Retaining(
-        Some(
-            Supervisor::<VendorHarness>::start_with_custody(
-                Arc::clone(&store),
-                Arc::new(SystemClock::new()),
-                Arc::new(move |request| {
-                    vendor::vendor_launch_hosted(request, &launch_store, &host)
-                }),
-                vendor::child_env(),
-                custody,
-            )
-            .map_err(Error::Message)?,
-        ),
-        kept,
-    );
+    let sup = Supervisor::<VendorHarness>::start_with_custody(
+        Arc::clone(&store),
+        Arc::new(SystemClock::new()),
+        Arc::new(move |request| vendor::vendor_launch_hosted(request, &launch_store, &host)),
+        vendor::child_env(),
+        custody,
+    )
+    .map_err(Error::Message)?;
+    sup.set_on_idle_released(Arc::new(|_agent_id, cfg| {
+        if let Err(err) = anyagents_tools::release_sandbox_for_config_dir(cfg) {
+            eprintln!("anyagents-sandbox: idle release failed: {err}");
+        }
+    }));
+    let supervisor = Retaining(Some(sup), kept);
     if auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&data.join("wake.sock"));
     }
@@ -425,60 +430,15 @@ async fn serve(
                     crate::create::sync_fresher_bound_agent_credentials_in(&store, &root);
                     #[cfg(unix)]
                     crate::create::sync_canonical_skills(&root);
-                })
-                .await;
-            }
-        });
-        let updater_root = data.to_path_buf();
-        let updater_store = Arc::clone(&store);
-        let mut updater_stop = stopping.subscribe();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
-                std::time::Duration::from_secs(6 * 3600),
-            );
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = updater_stop.wait_for(|stop| *stop) => break,
-                    _ = interval.tick() => {}
-                }
-                let root = updater_root.clone();
-                let store_for_update = Arc::clone(&updater_store);
-                let _ = tokio::task::spawn_blocking(move || {
-                    let catalog = match anyagents_installer::Catalog::load(&root) {
-                        Ok(catalog) => catalog,
-                        Err(err) => {
-                            eprintln!("anyagents-updater: failed to load catalog overrides: {err}");
-                            return;
-                        }
-                    };
-                    for entry in catalog.harnesses().iter().chain(catalog.runtimes()) {
-                        if !entry.source.is_managed()
-                            || matches!(
-                                entry.source,
-                                anyagents_installer::source::Source::Unconfigured
-                            )
-                        {
-                            continue;
-                        }
-                        match crate::install::update_harness_with_store(
-                            &root,
-                            &entry.id,
-                            Arc::clone(&store_for_update)
-                                as Arc<dyn anyagents_installer::LeaseView>,
-                        ) {
-                            Ok((before, after, true)) => {
+                    if run_verify
+                        && let Ok(live) = store.list_live_agents()
+                    {
+                        for a in live {
+                            let cfg = anyagents_core::agent_config_dir(&root, &a.id);
+                            if let Err(err) = anyagents_tools::renew_lease_for_config_dir(&cfg) {
                                 eprintln!(
-                                    "anyagents-updater: upgraded harness `{}` {} -> {}",
-                                    entry.id, before, after
-                                );
-                            }
-                            Ok((_, _, false)) => {}
-                            Err(err) => {
-                                eprintln!(
-                                    "anyagents-updater: failed to update `{}`: {err}",
-                                    entry.id
+                                    "anyagents-sandbox: lease renew failed for `{}`: {err}",
+                                    a.name
                                 );
                             }
                         }
@@ -487,6 +447,68 @@ async fn serve(
                 .await;
             }
         });
+        if !anyagents_tools::SandboxMode::from_env().is_remote_required() {
+            let updater_root = data.to_path_buf();
+            let updater_store = Arc::clone(&store);
+            let mut updater_stop = stopping.subscribe();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval_at(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(6 * 3600),
+                );
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = updater_stop.wait_for(|stop| *stop) => break,
+                        _ = interval.tick() => {}
+                    }
+                    let root = updater_root.clone();
+                    let store_for_update = Arc::clone(&updater_store);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let catalog = match anyagents_installer::Catalog::load(&root) {
+                            Ok(catalog) => catalog,
+                            Err(err) => {
+                                eprintln!(
+                                    "anyagents-updater: failed to load catalog overrides: {err}"
+                                );
+                                return;
+                            }
+                        };
+                        for entry in catalog.harnesses().iter().chain(catalog.runtimes()) {
+                            if !entry.source.is_managed()
+                                || matches!(
+                                    entry.source,
+                                    anyagents_installer::source::Source::Unconfigured
+                                )
+                            {
+                                continue;
+                            }
+                            match crate::install::update_harness_with_store(
+                                &root,
+                                &entry.id,
+                                Arc::clone(&store_for_update)
+                                    as Arc<dyn anyagents_installer::LeaseView>,
+                            ) {
+                                Ok((before, after, true)) => {
+                                    eprintln!(
+                                        "anyagents-updater: upgraded harness `{}` {} -> {}",
+                                        entry.id, before, after
+                                    );
+                                }
+                                Ok((_, _, false)) => {}
+                                Err(err) => {
+                                    eprintln!(
+                                        "anyagents-updater: failed to update `{}`: {err}",
+                                        entry.id
+                                    );
+                                }
+                            }
+                        }
+                    })
+                    .await;
+                }
+            });
+        }
         crate::schedule::start_loops(
             Arc::clone(&store),
             state.health.clone(),
@@ -624,19 +646,22 @@ async fn serve(
                 exit_after(STOP_WITHIN);
             }
 
-            // A long poll ends at Telegram, not here: signal the poller to
-            // stop so released long polls exit instead of re-entering a 30s
-            // wait, and release every bot while the calls drain, so each
-            // bot's last offset is written before shutdown.
-            poller.signal_stop();
-            let release_store = Arc::clone(&store);
-            releasing = Some(tokio::task::spawn_blocking(move || {
-                crate::telegram::poller::release_every_bot(
-                    &release_store,
-                    release_store.data_dir(),
-                    TELEGRAM_RELEASE_WITHIN,
-                )
-            }));
+            let preserve_webhook = preserve_webhooks_on_shutdown(data);
+            if !preserve_webhook {
+                // A long poll ends at Telegram, not here: signal the poller to
+                // stop so released long polls exit instead of re-entering a 30s
+                // wait, and release every bot while the calls drain, so each
+                // bot's last offset is written before shutdown.
+                poller.signal_stop();
+                let release_store = Arc::clone(&store);
+                releasing = Some(tokio::task::spawn_blocking(move || {
+                    crate::telegram::poller::release_every_bot(
+                        &release_store,
+                        release_store.data_dir(),
+                        TELEGRAM_RELEASE_WITHIN,
+                    )
+                }));
+            }
             let _ = stopping.send(true);
             // `serving` is polled first so the Unix listener closes at once,
             // while `settling` keeps waiting even after `serving` has no open
@@ -688,24 +713,44 @@ async fn serve(
     };
     #[cfg(target_os = "linux")]
     crate::workstation::session::stop_all().await;
-    let released = match releasing {
-        Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
-        None => {
-            poller.signal_stop();
-            crate::telegram::poller::release_every_bot(
-                &store,
-                store.data_dir(),
-                TELEGRAM_RELEASE_WITHIN,
-            )
+    let preserve_webhook = preserve_webhooks_on_shutdown(data);
+    let released = if preserve_webhook {
+        Ok(())
+    } else {
+        match releasing {
+            Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
+            None => {
+                poller.signal_stop();
+                crate::telegram::poller::release_every_bot(
+                    &store,
+                    store.data_dir(),
+                    TELEGRAM_RELEASE_WITHIN,
+                )
+            }
         }
     };
     if let Err(reason) = released {
         eprintln!("anyagents-telegram: shutdown did not release every bot: {reason}");
     }
-    poller.stop();
+    if preserve_webhook {
+        // Stateless K8s webhook pods keep Telegram webhooks active on pod
+        // SIGTERM so rolling replacements never drop incoming updates.
+        std::mem::forget(poller);
+    } else {
+        poller.stop();
+    }
     drop(supervisor);
     let _ = std::fs::remove_file(&path);
     result.map_err(Error::from)
+}
+
+fn preserve_webhooks_on_shutdown(data: &Path) -> bool {
+    anyagents_tools::SandboxMode::from_env().is_remote_required()
+        || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
+        || std::env::var("ANYAGENTS_PUBLIC_URL")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+        || crate::remote::require_public_url(data).is_ok()
 }
 
 /// How long a stopping server waits for the mutating calls it is running
@@ -1287,6 +1332,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
         )
         .fallback(public_not_found)
         .with_state(state)
+        .merge(crate::gateway::http_router())
         .layer(axum::middleware::from_fn(in_flight::track))
 }
 
@@ -1354,6 +1400,7 @@ fn build_webhook_router(state: AppState) -> Router {
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
         .with_state(state)
+        .merge(crate::gateway::http_router())
         .layer(axum::middleware::from_fn(in_flight::track))
 }
 
@@ -1439,6 +1486,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
         .with_state(state)
+        .merge(crate::gateway::http_router())
         .layer(axum::middleware::from_fn(in_flight::track))
 }
 
@@ -1466,15 +1514,19 @@ struct McpCaller {
     internal_token: String,
     /// The remote session the presented token belongs to.
     remote: Option<anyagents_core::RemoteSessionGrant>,
+    /// True when the agent runs inside an isolated remote sandbox (`SandboxConfig`
+    /// with `remote_spawn` or Sylphx sandbox lease), admitting `?profile=full`.
+    sandbox_backed: bool,
 }
 
 impl McpCaller {
     /// The tool profile this call gets: `remote`, or `coordination` when it
-    /// asks, for every credential kind. Over HTTP the tools run inside the
-    /// server process as the server's own user, so `full` is never served
-    /// here (403); it exists only over stdio, where the tool server runs as
-    /// the agent.
+    /// asks, or `full` strictly when authenticated as an isolated remote-sandbox
+    /// agent (never cloud harnesses or unisolated local processes).
     fn profile(&self, requested: Option<&str>) -> Result<crate::mcp::McpProfile, ApiError> {
+        if self.sandbox_backed && self.remote.is_some() && requested == Some("full") {
+            return Ok(crate::mcp::McpProfile::Full);
+        }
         crate::mcp::McpProfile::resolve_http(requested).map_err(|msg| {
             let known = requested.and_then(crate::mcp::McpProfile::from_str_opt);
             let status = if known.is_some() {
@@ -1544,10 +1596,18 @@ fn authenticate_mcp_request(
             &agent.id,
         ))
         .map_err(ApiError::from_store)?;
+        let sandbox_backed = !crate::vendor::is_effective_cloud_harness(
+            &agent.harness,
+            Some(store.data_dir()),
+            Some(&config_dir),
+        ) && (anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir).is_some()
+            || anyagents_tools::SandboxConfig::from_config_dir(&config_dir)
+                .is_some_and(|sbx| sbx.remote_spawn));
         return Ok(McpCaller {
             agent,
             internal_token,
             remote: Some(grant),
+            sandbox_backed,
         });
     }
     // The public listener never tells a network peer whether a token is a
@@ -2213,7 +2273,7 @@ async fn harness_route(
             }
         };
         require_remote_callback(state.store.data_dir(), &body.harness)?;
-        refuse_host_placement_over_http(via_http, &body.harness)?;
+        refuse_host_placement_over_http(via_http, state.store.data_dir(), &body.harness)?;
         let out = create::set_agent_harness(
             &state.store,
             state.store.data_dir(),
@@ -2248,8 +2308,14 @@ fn runs_off_host(data_dir: &Path, agent: &Agent) -> bool {
 
 /// Over HTTP MCP an agent is created on, or moved to, a cloud harness only:
 /// any other harness would run on this host on the call's behalf.
-fn refuse_host_placement_over_http(via_http: bool, harness: &str) -> Result<(), ApiError> {
-    if via_http && !vendor::is_cloud_harness(harness) {
+fn refuse_host_placement_over_http(
+    via_http: bool,
+    data_dir: &Path,
+    harness: &str,
+) -> Result<(), ApiError> {
+    let remote_capable = vendor::is_effective_cloud_harness(harness, Some(data_dir), None)
+        || anyagents_tools::SandboxMode::from_env().is_remote_required();
+    if via_http && !remote_capable {
         return Err(ApiError::forbidden(format!(
             "a call over HTTP MCP places agents only on a cloud harness (`claude-cloud`, \
              `openai-cloud`, `cursor-cloud`, `spiron-cloud`); `{harness}` would run on this host"
@@ -3696,7 +3762,7 @@ pub fn serve_gateway(
     routes: MemoryRoutes,
     usage: anyagents_gateway::MemoryUsage,
 ) -> Result<(), Error> {
-    let app = anyagents_gateway::router(routes, usage);
+    let app = crate::gateway::http_router_with(routes, usage);
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -4914,7 +4980,7 @@ async fn create_agent_route(
             body.profile,
         );
         require_remote_callback(state.store.data_dir(), &harness)?;
-        refuse_host_placement_over_http(via_http, &harness)?;
+        refuse_host_placement_over_http(via_http, state.store.data_dir(), &harness)?;
         let request = CreateRequest {
             name: body.name,
             role: Some(
@@ -5230,9 +5296,11 @@ fn finish_agent_archive_locked(
 ) -> Result<(), ApiError> {
     mark_explicitly_archived_locked(&state.store, state.store.data_dir(), agent)
         .map_err(ApiError::from_store)?;
-    if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(
-        &anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id),
-    ) {
+    let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+    if let Err(err) = anyagents_tools::release_sandbox_for_config_dir(&cfg) {
+        eprintln!("anyagents-sandbox: archive release failed: {err}");
+    }
+    if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&cfg) {
         let _ = anyagents_tools::SandboxProvider::pause(&sbx);
     }
     let mut process_guard = None;
@@ -5344,9 +5412,14 @@ fn reap_subagent_ephemeral_dirs_in(
         );
     }
     let mut shared_workdirs = std::collections::HashSet::new();
-    #[cfg(target_os = "linux")]
     if let Some(agent) = agent {
+        #[cfg(target_os = "linux")]
         crate::workstation::session::stop_agent_in_background(data_dir, &agent.name);
+        complete &= remove_path_with_seat_under(
+            data_dir,
+            &data_dir.join("browser-profiles").join(&agent.name),
+            seat_ids,
+        );
     }
     // Every other agent that is not archived, and the parent even when it is,
     // keeps its workdir.
@@ -5756,9 +5829,11 @@ async fn pause_agent_route(
             .store
             .set_agent_state(&found.id, "paused")
             .map_err(ApiError::from_store)?;
-        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(
-            &anyagents_core::agent_config_dir(state.store.data_dir(), &found.id),
-        ) {
+        let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &found.id);
+        if let Err(err) = anyagents_tools::release_sandbox_for_config_dir(&cfg) {
+            eprintln!("anyagents-sandbox: pause release failed: {err}");
+        }
+        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&cfg) {
             let _ = anyagents_tools::SandboxProvider::pause(&sbx);
         }
         drop(lifecycle);
@@ -5849,8 +5924,8 @@ async fn delete_agent_route(
         let data_dir = state.store.data_dir();
         let config = agent_dir.join("config");
         let seat_ids = detect_seat_ids(&config);
-        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&config) {
-            let _ = anyagents_tools::SandboxProvider::destroy(&sbx);
+        if let Err(err) = anyagents_tools::destroy_sandbox_for_config_dir(&config) {
+            eprintln!("anyagents-sandbox: delete destroy failed: {err}");
         }
 
         reap_subagent_ephemeral_dirs_in(&state.store, data_dir, &found.id);
@@ -6103,6 +6178,20 @@ fn prepare_agent_wake_with_options(
     rotate_profile: bool,
 ) -> Result<(), ApiError> {
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &found.id);
+    if !crate::vendor::is_effective_cloud_harness(&found.harness, Some(store.data_dir()), Some(&cfg))
+        && let Err(err) = anyagents_tools::ensure_leased_for_config_dir(
+            Some(store.data_dir()),
+            &cfg,
+            found.id.as_str(),
+            found.workdir.as_deref(),
+            &std::collections::BTreeMap::new(),
+        )
+    {
+        if anyagents_tools::SandboxMode::from_env().is_remote_required() {
+            return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
+        }
+        eprintln!("anyagents-sandbox: wake lease ensure failed: {err}");
+    }
     if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&cfg) {
         let _ = anyagents_tools::SandboxProvider::resume(&sbx);
     }
@@ -8858,6 +8947,21 @@ fn deliver_agent_with_media(
         && !is_explicitly_archived(store.data_dir(), &agent)
         && !(agent.parent_id.is_none() && is_auto_subagent_lifecycle)
     {
+        let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+        if !crate::vendor::is_effective_cloud_harness(
+            &agent.harness,
+            Some(store.data_dir()),
+            Some(&cfg),
+        ) && let Err(err) = anyagents_tools::ensure_leased_for_config_dir(
+            Some(store.data_dir()),
+            &cfg,
+            agent.id.as_str(),
+            agent.workdir.as_deref(),
+            &std::collections::BTreeMap::new(),
+        ) && anyagents_tools::SandboxMode::from_env().is_remote_required()
+        {
+            return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
+        }
         let _ = store.set_agent_state(&agent.id, "running");
     }
     let incoming = Incoming {
@@ -18367,6 +18471,171 @@ exec '{}' "$@"
                 .as_str()
             )
         );
+    }
+
+    #[test]
+    fn webhook_router_serves_mcp_profile_full_for_sandboxed_only_and_gateway_prefix() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.test\"\n",
+        )
+        .unwrap();
+
+        let sbx_agent = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("sbx-codex", "codex"))
+            .unwrap();
+        let sbx_cfg = anyagents_core::agent_config_dir(dir.path(), &sbx_agent.id);
+        std::fs::create_dir_all(&sbx_cfg).unwrap();
+        anyagents_tools::sylphx::SylphxLeaseConfig {
+            endpoint: "https://sandbox.example.test".into(),
+            token: None,
+            parent: "orgs/o1/projects/p1/envs/e1".into(),
+            template: "agent".into(),
+            shape: "linux-m".into(),
+            volume_size_gib: Some(10),
+            mount_path: "/home/user/agent-state".into(),
+            workdir: "/home/user/workspace".into(),
+            volume_id: "vol_1".into(),
+            volume_resource: "orgs/o1/projects/p1/envs/e1/volumes/vol_1".into(),
+            lease_id: Some("lease_1".into()),
+            lease_resource: Some("orgs/o1/projects/p1/envs/e1/leases/lease_1".into()),
+            data_plane_resource: Some("orgs/o1/projects/p1/envs/e1/leases/lease_1".into()),
+            envd_url: None,
+            envd_token: None,
+            expires_at: None,
+        }
+        .save_to_config_dir(&sbx_cfg)
+        .unwrap();
+        crate::remote::begin_session(&state.store, &sbx_agent).unwrap();
+        let sbx_remote = crate::remote::session_token(&sbx_cfg).unwrap();
+
+        let cloud_agent = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new(
+                "cloud-only",
+                "claude-cloud",
+            ))
+            .unwrap();
+        let cloud_cfg = anyagents_core::agent_config_dir(dir.path(), &cloud_agent.id);
+        std::fs::create_dir_all(&cloud_cfg).unwrap();
+        crate::remote::begin_session(&state.store, &cloud_agent).unwrap();
+        let cloud_remote = crate::remote::session_token(&cloud_cfg).unwrap();
+
+        // Start a minimal mock upstream responses server and add gateway route.
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in upstream.incoming().take(2) {
+                let mut s = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = std::io::Read::read(&mut s, &mut buf).unwrap();
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(req_str.contains("upstream-secret-token"), "{req_str}");
+                let body = r#"{"id":"resp_1","object":"response","status":"completed"}"#;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = std::io::Write::write_all(&mut s, reply.as_bytes());
+            }
+        });
+        crate::gateway::ProviderImage::store(
+            dir.path(),
+            &sbx_agent,
+            &format!("http://{upstream_addr}/v1"),
+            "gpt-test",
+            "upstream-secret-token",
+        )
+        .unwrap();
+        let gw_token = crate::gateway::add_route(dir.path(), &sbx_agent)
+            .unwrap()
+            .unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = build_webhook_router(state.clone());
+            let served = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let list = tools_list().to_string();
+
+            // 1) Remote-sandboxed agent admits `?profile=full` on `/mcp` and `/v1/webhooks/mcp`.
+            for path in ["/mcp?profile=full", "/v1/webhooks/mcp?profile=full"] {
+                let list_body = list.clone();
+                let tok = sbx_remote.clone();
+                let (status, body) = tokio::task::spawn_blocking(move || {
+                    let hdrs = [("authorization", format!("Bearer {tok}"))];
+                    let refs: Vec<(&str, &str)> =
+                        hdrs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    raw_http(addr, "POST", path, &refs, &list_body)
+                })
+                .await
+                .unwrap();
+                assert_eq!(status, 200, "{path}: {body}");
+                let tools_str = body.to_string();
+                assert!(tools_str.contains("\"code\""), "{path}: {tools_str}");
+                assert!(tools_str.contains("\"web_search\""), "{path}: {tools_str}");
+                assert!(tools_str.contains("\"browser\""), "{path}: {tools_str}");
+            }
+
+            // 2) Cloud-only harness MUST NOT receive `?profile=full`.
+            let list_body = list.clone();
+            let (status, _) = tokio::task::spawn_blocking(move || {
+                let hdrs = [("authorization", format!("Bearer {cloud_remote}"))];
+                let refs: Vec<(&str, &str)> =
+                    hdrs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                raw_http(addr, "POST", "/mcp?profile=full", &refs, &list_body)
+            })
+            .await
+            .unwrap();
+            assert_eq!(status, 403);
+
+            // 3) Both `/v1/responses` and `/gateway/v1/responses` work on the webhook router.
+            for path in ["/gateway/v1/responses", "/v1/responses"] {
+                let tok = gw_token.clone();
+                let (status, body) = tokio::task::spawn_blocking(move || {
+                    let hdrs = [("authorization", format!("Bearer {tok}"))];
+                    let refs: Vec<(&str, &str)> =
+                        hdrs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    raw_http(
+                        addr,
+                        "POST",
+                        path,
+                        &refs,
+                        r#"{"model":"gpt-test","input":"hi"}"#,
+                    )
+                })
+                .await
+                .unwrap();
+                assert_eq!(status, 200, "{path}: {body}");
+                assert_eq!(body["id"], "resp_1", "{path}: {body}");
+            }
+
+            served.abort();
+        });
+    }
+
+    #[test]
+    fn reap_subagent_ephemeral_dirs_removes_browser_profiles_for_reaped_agent() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("ephem-browser", "claude-code"))
+            .unwrap();
+        let bp = data.join("browser-profiles").join(&agent.name);
+        std::fs::create_dir_all(&bp).unwrap();
+        std::fs::write(bp.join("cookies.sqlite"), b"db").unwrap();
+        store.set_agent_state(&agent.id, "archived").unwrap();
+
+        reap_subagent_ephemeral_dirs_in(&store, data, &agent.id);
+        assert!(!bp.exists(), "browser-profiles/{} must be reaped", agent.name);
     }
 }
 

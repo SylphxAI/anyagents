@@ -5,14 +5,21 @@
 //! inside the remote workspace with the agent's Streamable HTTP `/mcp` URL and
 //! bearer capability token.
 
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read as _, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use anyagents_core::Error;
+use anyagents_core::{AgentId, Error, Store};
 use anyagents_harness::normalize_harness_name;
-use anyagents_tools::{RemoteSandboxWorkspace, SandboxConfig, WorkspaceBackend};
+use anyagents_tools::sylphx::{
+    EnvdProcessEvent, EnvdSignal, SandboxDriver, SandboxMode, SylphxLeaseConfig,
+    SylphxProviderConfig, ensure_leased_for_config_dir, renew_lease_for_config_dir,
+};
+use anyagents_tools::{RemoteSandboxWorkspace, SandboxConfig, WorkspaceBackend, sha256_hex};
 use clap::Args;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[derive(Args, Clone, Debug, Default)]
@@ -107,18 +114,79 @@ pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
     let config = args
         .config
         .or_else(|| std::env::var_os("ANYAGENTS_AGENT_CONFIG").map(PathBuf::from));
-    let sbx = SandboxConfig::resolve(config.as_deref()).ok_or_else(|| {
-        Error::Message(
-            "sandbox-exec requires a configured remote sandbox (`sandbox.json` or `ANYAGENTS_SANDBOX_API_URL`)"
-                .into(),
-        )
-    })?;
-
     let raw_harness = args
         .harness
         .or_else(|| std::env::var("ANYAGENTS_AGENT_HARNESS").ok())
         .unwrap_or_else(|| "claude-code".to_string());
-    let harness = normalize_harness_name(&raw_harness).to_string();
+    let harness = match raw_harness.trim() {
+        "spiron-local" => "spiron".to_string(),
+        other => normalize_harness_name(other).to_string(),
+    };
+
+    let data_dir = config
+        .as_deref()
+        .and_then(|c| c.parent())
+        .and_then(|agent_dir| agent_dir.parent())
+        .and_then(|agents_dir| agents_dir.parent())
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("ANYAGENTS_DATA").map(PathBuf::from));
+
+    let agent_id_str = config
+        .as_deref()
+        .and_then(|c| c.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(str::to_string);
+
+    // Check native Sylphx Sandboxes v1 driver first (either already persisted
+    // `sandbox-sylphx.json` or configured via `sandbox-provider.json` / env).
+    if let Some(cfg_dir) = config.as_deref() {
+        let mut lease_cfg = SylphxLeaseConfig::from_config_dir(cfg_dir);
+        let sylphx_provider = SylphxProviderConfig::resolve(data_dir.as_deref())
+            .map_err(Error::Message)?;
+        if lease_cfg.is_some()
+            || sylphx_provider
+                .as_ref()
+                .is_some_and(|p| p.driver == SandboxDriver::Sylphx)
+        {
+            let aid = agent_id_str.as_deref().unwrap_or("agent");
+            let lease_env = BTreeMap::new();
+            lease_cfg = ensure_leased_for_config_dir(
+                data_dir.as_deref(),
+                cfg_dir,
+                aid,
+                None,
+                &lease_env,
+            )
+            .map_err(Error::Message)?;
+        }
+        if let Some(lease) = lease_cfg {
+            return run_sylphx_sandbox(
+                lease,
+                data_dir.as_deref(),
+                cfg_dir,
+                aid_or_default(agent_id_str.as_deref()),
+                &harness,
+                args.program.as_deref(),
+                args.resume.as_deref(),
+                args.oneshot,
+                &args.args,
+            );
+        }
+    }
+
+    let mode = SandboxMode::from_env();
+    let sbx = SandboxConfig::resolve(config.as_deref()).ok_or_else(|| {
+        let suffix = if mode.is_remote_required() {
+            " (ANYAGENTS_SANDBOX_MODE=remote_required forbids host fallback)"
+        } else {
+            ""
+        };
+        Error::Message(format!(
+            "sandbox-exec requires a configured remote sandbox (`sandbox-sylphx.json`, `sandbox.json`, or `ANYAGENTS_SANDBOX_API_URL`){suffix}"
+        ))
+    })?;
+
     let program = args
         .program
         .filter(|p| !p.trim().is_empty())
@@ -481,6 +549,867 @@ pub fn dispatch_remote_sandbox_turn(
         forwarded_stream_lines: Vec::new(),
         forwarded_has_result: false,
     })
+}
+
+fn aid_or_default(s: Option<&str>) -> &str {
+    s.filter(|v| !v.trim().is_empty()).unwrap_or("agent")
+}
+
+/// Guest binary inside the sandbox VM (`anyagents-guest`).
+fn guest_binary_path() -> String {
+    std::env::var("ANYAGENTS_SANDBOX_GUEST_PATH")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/usr/local/bin/anyagents-guest".to_string())
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct BundleManifest {
+    #[serde(default)]
+    volume_id: String,
+    #[serde(default)]
+    files: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SyncedRepoSpec {
+    repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
+}
+
+/// Sync skills (dereferencing symlinks), instructions, harness MCP configs targeting
+/// `/home/user/agent-state` + `anyagents-guest mcp-proxy`, repo checkout spec, Gateway
+/// origin/token, and refreshed OAuth/provider credentials into the agent's Sylphx Volume.
+pub(crate) fn sync_agent_bundle_to_sylphx(
+    lease: &SylphxLeaseConfig,
+    data_dir: Option<&Path>,
+    config_dir: &Path,
+    agent_id_str: &str,
+    harness: &str,
+    extra_args: &[String],
+) -> Result<(), String> {
+    let client = lease.client();
+    let resource = lease.active_data_resource()?;
+    let state_root = lease.mount_path.trim_end_matches('/');
+
+    let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut dirs_to_create: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    dirs_to_create.insert(state_root.to_string());
+    dirs_to_create.insert(lease.workdir.clone());
+
+    // 1. Agent instructions (`SYSTEM_PROMPT.md`, `AGENTS.md`, `CLAUDE.md`).
+    for fname in ["SYSTEM_PROMPT.md", "AGENTS.md", "CLAUDE.md"] {
+        let src = config_dir.join(fname);
+        if let Ok(bytes) = std::fs::read(&src) {
+            uploads.push((format!("{state_root}/{fname}"), bytes));
+        }
+    }
+
+    // 2. Dereferenced skills from `<config_dir>/.agents/skills`, `<config_dir>/skills`,
+    //    and canonical `<data_dir>/skills`.
+    let mut skill_roots: Vec<PathBuf> = Vec::new();
+    if let Some(d) = data_dir {
+        skill_roots.push(d.join("skills"));
+    }
+    skill_roots.push(config_dir.join("skills"));
+    skill_roots.push(config_dir.join(".agents/skills"));
+    for root in skill_roots {
+        collect_dereferenced_tree(
+            &root,
+            &format!("{state_root}/.agents/skills"),
+            &mut uploads,
+            &mut dirs_to_create,
+        );
+    }
+
+    // 3. Remote MCP token + harness configs targeting `/home/user/agent-state` & `mcp-proxy`.
+    let mcp_base = crate::cloud_harness::resolve_public_mcp_url(config_dir)?;
+    let mcp_url = crate::cloud_harness::mcp_url_with_profile(&mcp_base, "full");
+    let mcp_token = crate::remote::session_token(config_dir)?;
+    let token_path_in_vm = format!("{state_root}/.mcp-token");
+    uploads.push((
+        token_path_in_vm.clone(),
+        format!("{mcp_token}\n").into_bytes(),
+    ));
+
+    let guest_bin = guest_binary_path();
+    let proxy_args = vec![
+        "mcp-proxy".to_string(),
+        "--url".to_string(),
+        mcp_url.clone(),
+        "--token-file".to_string(),
+        token_path_in_vm.clone(),
+    ];
+    let stdio_mcp_json = serde_json::to_vec_pretty(&json!({
+        "mcpServers": {
+            "anyagents": {
+                "command": guest_bin,
+                "args": proxy_args,
+            }
+        }
+    }))
+    .map_err(|e| e.to_string())?;
+    let mut stdio_mcp_bytes = stdio_mcp_json;
+    stdio_mcp_bytes.push(b'\n');
+    for target in [".mcp.json", ".claude.json", "mcp.json", "spiron-mcp.json"] {
+        uploads.push((format!("{state_root}/{target}"), stdio_mcp_bytes.clone()));
+    }
+    dirs_to_create.insert(format!("{state_root}/.gemini/config"));
+    uploads.push((
+        format!("{state_root}/.gemini/config/mcp_config.json"),
+        stdio_mcp_bytes.clone(),
+    ));
+    dirs_to_create.insert(format!("{state_root}/.omp/agent"));
+    uploads.push((
+        format!("{state_root}/.omp/agent/mcp.json"),
+        stdio_mcp_bytes.clone(),
+    ));
+
+    let toml_cfg = build_sandbox_toml_config(&guest_bin, &mcp_url, &token_path_in_vm);
+    uploads.push((format!("{state_root}/config.toml"), toml_cfg.as_bytes().to_vec()));
+    dirs_to_create.insert(format!("{state_root}/.grok"));
+    uploads.push((
+        format!("{state_root}/.grok/config.toml"),
+        toml_cfg.as_bytes().to_vec(),
+    ));
+
+    let opencode_json = serde_json::to_vec_pretty(&json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {
+            "anyagents": {
+                "type": "local",
+                "command": [guest_bin, "mcp-proxy", "--url", mcp_url, "--token-file", token_path_in_vm],
+                "enabled": true,
+            }
+        }
+    }))
+    .map_err(|e| e.to_string())?;
+    uploads.push((format!("{state_root}/opencode.json"), opencode_json));
+
+    let dsh_patch = format!(
+        "mcpServers:\n  anyagents:\n    command: {guest_bin}\n    args:\n      - mcp-proxy\n      - --url\n      - {mcp_url}\n      - --token-file\n      - {token_path_in_vm}\n"
+    );
+    uploads.push((
+        format!("{state_root}/dsh-mcp-patch.yml"),
+        dsh_patch.into_bytes(),
+    ));
+
+    // 4. Sync refreshed upstream OAuth/subscription credential files (NEVER provider.json or local mcp-capability).
+    for cred_rel in [
+        ".credentials.json",
+        ".claude/.credentials.json",
+        "auth.json",
+        ".codex/auth.json",
+        ".config/sylphx/auth.json",
+        ".spiron/auth.json",
+        "muse/auth.json",
+        ".config/muse/auth.json",
+        ".config/opencode/auth.json",
+        ".grok/auth.json",
+        ".gemini/antigravity-cli/antigravity-oauth-token",
+    ] {
+        let local_cred = config_dir.join(cred_rel);
+        if local_cred.is_file()
+            && let Ok(bytes) = std::fs::read(&local_cred)
+        {
+            let remote_path = format!("{state_root}/{cred_rel}");
+            if let Some(parent) = Path::new(&remote_path).parent().and_then(|p| p.to_str()) {
+                dirs_to_create.insert(parent.to_string());
+            }
+            uploads.push((remote_path, bytes));
+        }
+    }
+
+    // 5. Repo clone/checkout spec (so guest checks out git repo on first boot).
+    let repo_spec = read_synced_repo_spec(config_dir);
+    if let Some(ref spec) = repo_spec {
+        let spec_bytes = serde_json::to_vec_pretty(spec).map_err(|e| e.to_string())?;
+        uploads.push((format!("{state_root}/repo-spec.json"), spec_bytes));
+    }
+
+    // 6. Agent metadata, Gateway URL + per-agent gateway token (without raw upstream API keys).
+    let (agent_name, agent_model, gateway_env) = if let Some(d) = data_dir {
+        if let Ok(aid) = agent_id_str.parse::<AgentId>() {
+            let (name, model) = Store::open(d.join("state.db"))
+                .ok()
+                .and_then(|s| s.agent(&aid).ok())
+                .map(|a| (Some(a.name), a.model))
+                .unwrap_or((None, None));
+            let gw_env = crate::gateway::sandbox_env(d, &aid)?;
+            (name, model, gw_env)
+        } else {
+            (None, None, Vec::new())
+        }
+    } else {
+        (None, None, Vec::new())
+    };
+    let mut env = gateway_env;
+    env.push(("HOME".into(), state_root.to_string()));
+    env.push(("ANYAGENTS_GUEST_STATE_DIR".into(), state_root.to_string()));
+    env.push(("ANYAGENTS_GUEST_WORKDIR".into(), lease.workdir.clone()));
+    env.push(("ANYAGENTS_MCP_URL".into(), mcp_url.clone()));
+    env.push(("ANYAGENTS_MCP_TOKEN_FILE".into(), token_path_in_vm.clone()));
+
+    let session_id = read_persisted_session_id(config_dir, harness);
+    let guest_cfg = json!({
+        "agent_id": agent_id_str,
+        "agent_name": agent_name,
+        "harness": harness,
+        "model": agent_model,
+        "session_id": session_id,
+        "workdir": lease.workdir,
+        "extra_args": extra_args,
+        "env": env,
+        "mcp_url": mcp_url,
+        "mcp_token_file": token_path_in_vm,
+        "repo_spec": repo_spec,
+    });
+    uploads.push((
+        format!("{state_root}/guest-config.json"),
+        serde_json::to_vec_pretty(&guest_cfg).map_err(|e| e.to_string())?,
+    ));
+
+    // Incremental SHA-256 diff so unchanged skills/configs are not re-uploaded every turn.
+    let manifest_path = config_dir.join(".sylphx-bundle-hashes.json");
+    let mut manifest: BundleManifest = std::fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .filter(|m: &BundleManifest| m.volume_id == lease.volume_id)
+        .unwrap_or_else(|| BundleManifest {
+            volume_id: lease.volume_id.clone(),
+            files: HashMap::new(),
+        });
+
+    let mut changed: Vec<(String, Vec<u8>, String)> = Vec::new();
+    for (remote_path, bytes) in uploads {
+        let hash = sha256_hex(&bytes);
+        if manifest.files.get(&remote_path).map(String::as_str) != Some(hash.as_str()) {
+            changed.push((remote_path, bytes, hash));
+        }
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+
+    let mut mkdir_argv = vec!["mkdir".to_string(), "-p".to_string()];
+    mkdir_argv.extend(dirs_to_create);
+    let mk_out = client.exec(
+        resource,
+        &mkdir_argv,
+        Some("/"),
+        &BTreeMap::new(),
+        Some(20_000),
+    )?;
+    if mk_out.exit_code != 0 {
+        return Err(format!(
+            "cannot prepare remote directories under {state_root}: {}",
+            mk_out.stderr.trim()
+        ));
+    }
+
+    for (remote_path, bytes, hash) in changed {
+        client.write_file(resource, &remote_path, &bytes)?;
+        manifest.files.insert(remote_path, hash);
+    }
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
+    let _ = anyagents_harness::atomic_write_nonempty_file(&manifest_path, &manifest_bytes, 0o600);
+    Ok(())
+}
+
+fn build_sandbox_toml_config(guest_bin: &str, mcp_url: &str, token_path: &str) -> String {
+    format!(
+        "always_approve = true\n\n[mcp_servers.anyagents]\ncommand = {cmd}\nargs = [\"mcp-proxy\", \"--url\", {url}, \"--token-file\", {tok}]\n",
+        cmd = serde_json::to_string(guest_bin).unwrap_or_else(|_| "\"anyagents-guest\"".into()),
+        url = serde_json::to_string(mcp_url).unwrap_or_default(),
+        tok = serde_json::to_string(token_path).unwrap_or_default(),
+    )
+}
+
+fn read_synced_repo_spec(config_dir: &Path) -> Option<SyncedRepoSpec> {
+    for rel in ["repo-spec.json", ".anyagents-managed-worktree.json"] {
+        let path = config_dir.join(rel);
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(val) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let repo = val
+            .get("repo")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(repo) = repo {
+            return Some(SyncedRepoSpec {
+                repo: repo.to_string(),
+                branch: val
+                    .get("branch")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                base: val
+                    .get("base")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            });
+        }
+    }
+    None
+}
+
+fn collect_dereferenced_tree(
+    src_root: &Path,
+    dst_prefix: &str,
+    uploads: &mut Vec<(String, Vec<u8>)>,
+    dirs: &mut std::collections::BTreeSet<String>,
+) {
+    let mut stack = vec![(src_root.to_path_buf(), dst_prefix.to_string(), 0usize)];
+    while let Some((src, dst, depth)) = stack.pop() {
+        if depth > 16 || !src.exists() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&src) else {
+            continue;
+        };
+        dirs.insert(dst.clone());
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let entry_path = entry.path();
+            // Follow symlinks (`std::fs::metadata` / `canonicalize`) so skill symlinks resolve to real files.
+            let Ok(meta) = std::fs::metadata(&entry_path) else {
+                continue;
+            };
+            let target_path = format!("{dst}/{name}");
+            if meta.is_dir() {
+                stack.push((entry_path, target_path, depth + 1));
+            } else if meta.is_file()
+                && let Ok(bytes) = std::fs::read(&entry_path)
+            {
+                uploads.push((target_path, bytes));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sylphx_sandbox(
+    lease: SylphxLeaseConfig,
+    data_dir: Option<&Path>,
+    config_dir: &Path,
+    agent_id_str: &str,
+    harness: &str,
+    program_arg: Option<&str>,
+    resume: Option<&str>,
+    oneshot: bool,
+    extra_args: &[String],
+) -> Result<(), Error> {
+    sync_agent_bundle_to_sylphx(&lease, data_dir, config_dir, agent_id_str, harness, extra_args)
+        .map_err(Error::Message)?;
+
+    if oneshot {
+        let cmd_argv = if extra_args.is_empty() {
+            vec![program_arg.unwrap_or(default_remote_program(harness)).to_string()]
+        } else if let Some(p) = program_arg {
+            let mut v = vec![p.to_string()];
+            v.extend(extra_args.iter().cloned());
+            v
+        } else {
+            extra_args.to_vec()
+        };
+        let out = lease
+            .client()
+            .exec(
+                lease.active_data_resource().map_err(Error::Message)?,
+                &cmd_argv,
+                Some(&lease.workdir),
+                &BTreeMap::new(),
+                None,
+            )
+            .map_err(Error::Message)?;
+        if !out.stdout.is_empty() {
+            print!("{}", out.stdout);
+        }
+        if !out.stderr.is_empty() {
+            eprint!("{}", out.stderr);
+        }
+        if out.exit_code != 0 {
+            return Err(Error::Message(format!(
+                "Sylphx `:exec` exited with code {}",
+                out.exit_code
+            )));
+        }
+        return Ok(());
+    }
+
+    // Background lease TTL renewal thread (`:renew` while sandbox-exec is running).
+    let renew_stop = Arc::new((Mutex::new(false), Condvar::new()));
+    let renew_cfg = config_dir.to_path_buf();
+    let renew_flag = Arc::clone(&renew_stop);
+    let renew_thread = std::thread::Builder::new()
+        .name("anyagents-sylphx-renew".into())
+        .spawn(move || {
+            let renew_interval = Duration::from_secs(6 * 3600);
+            let (lock, cv) = &*renew_flag;
+            loop {
+                let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let (stop, _) = cv
+                    .wait_timeout_while(guard, renew_interval, |stopped| !*stopped)
+                    .unwrap_or_else(|e| e.into_inner());
+                if *stop {
+                    break;
+                }
+                drop(stop);
+                let _ = renew_lease_for_config_dir(&renew_cfg);
+            }
+        })
+        .ok();
+
+    let res = run_sylphx_envd_bridge(
+        &lease,
+        data_dir,
+        config_dir,
+        agent_id_str,
+        harness,
+        program_arg,
+        resume,
+        extra_args,
+    );
+
+    if let Ok(mut stopped) = renew_stop.0.lock() {
+        *stopped = true;
+        renew_stop.1.notify_all();
+    }
+    if let Some(h) = renew_thread {
+        let _ = h.join();
+    }
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sylphx_envd_bridge(
+    lease: &SylphxLeaseConfig,
+    data_dir: Option<&Path>,
+    config_dir: &Path,
+    agent_id_str: &str,
+    harness: &str,
+    program_arg: Option<&str>,
+    resume: Option<&str>,
+    extra_args: &[String],
+) -> Result<(), Error> {
+    let client = lease.client();
+    let envd_url = lease.resolved_envd_url().map_err(Error::Message)?;
+    let envd_token = lease.envd_token.clone();
+    let guest_bin = guest_binary_path();
+
+    let mut guest_args = vec![
+        "serve".to_string(),
+        "--harness".to_string(),
+        harness.to_string(),
+        "--state-dir".to_string(),
+        lease.mount_path.clone(),
+        "--workdir".to_string(),
+        lease.workdir.clone(),
+    ];
+    if let Some(prog) = program_arg.map(str::trim).filter(|s| !s.is_empty()) {
+        // Avoid passing host absolute paths from non-container orchestrators as-is unless explicit.
+        let normalized_prog = if prog.starts_with('/') && !prog.starts_with("/usr/") && !prog.starts_with("/home/") {
+            default_remote_program(harness)
+        } else {
+            prog
+        };
+        guest_args.push("--program".to_string());
+        guest_args.push(normalized_prog.to_string());
+    }
+    let session_id = resume
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| read_persisted_session_id(config_dir, harness));
+    if let Some(sid) = session_id {
+        guest_args.push("--session".to_string());
+        guest_args.push(sid);
+    }
+    if !extra_args.is_empty() {
+        guest_args.push("--".to_string());
+        guest_args.extend(extra_args.iter().cloned());
+    }
+
+    let mut guest_env = BTreeMap::new();
+    guest_env.insert("HOME".to_string(), lease.mount_path.clone());
+    guest_env.insert("ANYAGENTS_GUEST_STATE_DIR".to_string(), lease.mount_path.clone());
+    guest_env.insert("ANYAGENTS_GUEST_WORKDIR".to_string(), lease.workdir.clone());
+
+    let pid_slot: Arc<(Mutex<(Option<u32>, Vec<Vec<u8>>, bool)>, Condvar)> =
+        Arc::new((Mutex::new((None, Vec::new(), false)), Condvar::new()));
+    let pid_for_stream = Arc::clone(&pid_slot);
+
+    let cfg_clone = config_dir.to_path_buf();
+    let harness_clone = harness.to_string();
+    let client_for_stream = client.clone();
+    let envd_url_for_stream = envd_url.clone();
+    let envd_tok_for_stream = envd_token.clone();
+    let workdir_for_stream = lease.workdir.clone();
+    let stream_thread = std::thread::Builder::new()
+        .name("anyagents-sylphx-envd-stdout".into())
+        .spawn(move || -> Result<(), String> {
+            let mut stdout_buf = Vec::new();
+            let client_send = client_for_stream.clone();
+            let url_send = envd_url_for_stream.clone();
+            let tok_send = envd_tok_for_stream.clone();
+            let res = client_for_stream.start_envd_stream(
+                &envd_url_for_stream,
+                envd_tok_for_stream.as_deref(),
+                &guest_bin,
+                &guest_args,
+                Some(&workdir_for_stream),
+                &guest_env,
+                true,
+                |ev| match ev {
+                    EnvdProcessEvent::Start { pid } => {
+                        let queued_inputs = {
+                            let mut st = pid_for_stream.0.lock().unwrap_or_else(|e| e.into_inner());
+                            st.0 = Some(pid);
+                            pid_for_stream.1.notify_all();
+                            std::mem::take(&mut st.1)
+                        };
+                        for chunk in queued_inputs {
+                            let _ = client_send.send_envd_input(
+                                &url_send,
+                                tok_send.as_deref(),
+                                pid,
+                                &chunk,
+                            );
+                        }
+                    }
+                    EnvdProcessEvent::Data { stdout, stderr, .. } => {
+                        if !stderr.is_empty() {
+                            let s = String::from_utf8_lossy(&stderr);
+                            eprint!("{s}");
+                        }
+                        if !stdout.is_empty() {
+                            stdout_buf.extend_from_slice(&stdout);
+                            while let Some(pos) = stdout_buf.iter().position(|&b| b == b'\n') {
+                                let line_bytes: Vec<u8> = stdout_buf.drain(..=pos).collect();
+                                if let Ok(line_str) = std::str::from_utf8(&line_bytes) {
+                                    let trimmed = line_str.trim();
+                                    if !trimmed.is_empty() {
+                                        if let Ok(val) = serde_json::from_str::<Value>(trimmed)
+                                            && let Some(sid) = val
+                                                .get("session_id")
+                                                .and_then(Value::as_str)
+                                                .map(str::trim)
+                                                .filter(|s| !s.is_empty())
+                                        {
+                                            persist_session_id(&cfg_clone, &harness_clone, sid);
+                                        }
+                                        let mut out = std::io::stdout().lock();
+                                        let _ = writeln!(out, "{trimmed}");
+                                        let _ = out.flush();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    EnvdProcessEvent::End { .. } => {
+                        let mut st = pid_for_stream.0.lock().unwrap_or_else(|e| e.into_inner());
+                        st.2 = true;
+                        pid_for_stream.1.notify_all();
+                    }
+                    EnvdProcessEvent::Keepalive => {}
+                },
+            );
+            let mut st = pid_for_stream.0.lock().unwrap_or_else(|e| e.into_inner());
+            st.2 = true;
+            pid_for_stream.1.notify_all();
+            res.map(|_| ())
+        })
+        .map_err(|e| Error::Message(e.to_string()))?;
+
+    // Wait briefly for `Start { pid }` or immediate stream error so fallback works cleanly.
+    let initial_ready = {
+        let mut guard = pid_slot.0.lock().unwrap_or_else(|e| e.into_inner());
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while guard.0.is_none() && !guard.2 {
+            let now = std::time::Instant::now();
+            if now >= wait_deadline {
+                break;
+            }
+            guard = pid_slot
+                .1
+                .wait_timeout(guard, wait_deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        (guard.0, guard.2)
+    };
+
+    if initial_ready.0.is_none() && initial_ready.1 {
+        let stream_err = stream_thread.join().ok().and_then(Result::err);
+        if let Some(err_msg) = stream_err {
+            eprintln!("sandbox-exec: envd stream unavailable ({err_msg}), using Sylphx `:exec` turn loop");
+        }
+        return run_sylphx_exec_fallback_loop(
+            lease,
+            data_dir,
+            config_dir,
+            agent_id_str,
+            harness,
+            program_arg.unwrap_or(default_remote_program(harness)),
+            resume,
+            extra_args,
+        );
+    }
+
+    let stdin = std::io::stdin();
+    for line in BufReader::new(stdin.lock()).lines() {
+        let Ok(line) = line else { break };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<Value>(trimmed)
+            && event.get("type").and_then(Value::as_str) == Some("user")
+        {
+            let _ = sync_agent_bundle_to_sylphx(
+                lease,
+                data_dir,
+                config_dir,
+                agent_id_str,
+                harness,
+                extra_args,
+            );
+        }
+        let mut payload = trimmed.as_bytes().to_vec();
+        payload.push(b'\n');
+
+        let pid_now = {
+            let mut st = pid_slot.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pid) = st.0 {
+                Some(pid)
+            } else if !st.2 {
+                st.1.push(payload.clone());
+                None
+            } else {
+                None
+            }
+        };
+        if let Some(pid) = pid_now {
+            client
+                .send_envd_input(&envd_url, envd_token.as_deref(), pid, &payload)
+                .map_err(Error::Message)?;
+        }
+    }
+
+    // Clean shutdown: signal guest process when coordinator closes stdin.
+    let pid_opt = pid_slot.0.lock().unwrap_or_else(|e| e.into_inner()).0;
+    if let Some(pid) = pid_opt {
+        let _ = client.send_envd_signal(&envd_url, envd_token.as_deref(), pid, EnvdSignal::SigTerm);
+    }
+    let _ = stream_thread.join();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sylphx_exec_fallback_loop(
+    lease: &SylphxLeaseConfig,
+    data_dir: Option<&Path>,
+    config_dir: &Path,
+    agent_id_str: &str,
+    harness: &str,
+    program: &str,
+    resume: Option<&str>,
+    extra_args: &[String],
+) -> Result<(), Error> {
+    let mut session_id = resume
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| read_persisted_session_id(config_dir, harness));
+    let client = lease.client();
+    let resource = lease.active_data_resource().map_err(Error::Message)?;
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+
+    for line in BufReader::new(stdin.lock()).lines() {
+        let Ok(line) = line else { break };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        writeln!(stdout, "{trimmed}")?;
+        stdout.flush()?;
+
+        let _ = sync_agent_bundle_to_sylphx(
+            lease,
+            data_dir,
+            config_dir,
+            agent_id_str,
+            harness,
+            extra_args,
+        );
+        let prompt_text = extract_user_prompt(&event);
+        let cmd_str =
+            build_remote_command_string(harness, program, session_id.as_deref(), &prompt_text, extra_args);
+        let mut exec_env = BTreeMap::new();
+        exec_env.insert("HOME".to_string(), lease.mount_path.clone());
+        match client.exec(
+            resource,
+            &["/bin/sh".into(), "-lc".into(), cmd_str],
+            Some(&lease.workdir),
+            &exec_env,
+            None,
+        ) {
+            Ok(out) => {
+                let outcome =
+                    parse_remote_exec_output(harness, session_id.as_deref(), &out.stdout, &out.stderr, out.exit_code);
+                session_id = Some(outcome.session_id.clone());
+                persist_session_id(config_dir, harness, &outcome.session_id);
+                for raw_line in &outcome.forwarded_stream_lines {
+                    writeln!(stdout, "{raw_line}")?;
+                }
+                if outcome.forwarded_stream_lines.is_empty() {
+                    let assistant_event = json!({
+                        "type": "assistant",
+                        "session_id": outcome.session_id,
+                        "message": {
+                            "role": "assistant",
+                            "content": [{ "type": "text", "text": outcome.reply_text }]
+                        }
+                    });
+                    writeln!(stdout, "{assistant_event}")?;
+                }
+                if !outcome.forwarded_has_result {
+                    let result_event = json!({
+                        "type": "result",
+                        "subtype": if outcome.is_error { "error" } else { "success" },
+                        "is_error": outcome.is_error,
+                        "session_id": outcome.session_id,
+                        "result": outcome.reply_text,
+                        "usage": {
+                            "input_tokens": outcome.input_tokens,
+                            "output_tokens": outcome.output_tokens,
+                        }
+                    });
+                    writeln!(stdout, "{result_event}")?;
+                }
+                stdout.flush()?;
+            }
+            Err(err_msg) => {
+                let fallback_sid = session_id
+                    .clone()
+                    .unwrap_or_else(|| format!("{harness}-remote-session"));
+                let result_event = json!({
+                    "type": "result",
+                    "subtype": "error",
+                    "is_error": true,
+                    "session_id": fallback_sid,
+                    "result": err_msg,
+                });
+                writeln!(stdout, "{result_event}")?;
+                stdout.flush()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_remote_exec_output(
+    canonical: &str,
+    session_id: Option<&str>,
+    stdout_str: &str,
+    stderr_str: &str,
+    exit_code: i32,
+) -> RemoteTurnOutcome {
+    let mut resolved_sid = session_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{canonical}-remote-1"));
+    let mut forwarded_stream_lines = Vec::new();
+    let mut forwarded_has_result = false;
+    let mut extracted_reply = String::new();
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+
+    for raw_line in stdout_str.lines() {
+        let l = raw_line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<Value>(l)
+            && let Some(t) = val.get("type").and_then(Value::as_str)
+            && matches!(t, "assistant" | "result" | "system")
+        {
+            if let Some(sid) = val
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                resolved_sid = sid.to_string();
+            }
+            if t == "result" {
+                forwarded_has_result = true;
+                if let Some(r) = val.get("result").and_then(Value::as_str) {
+                    extracted_reply = r.to_string();
+                }
+                input_tokens = val
+                    .pointer("/usage/input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(input_tokens);
+                output_tokens = val
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(output_tokens);
+            }
+            forwarded_stream_lines.push(l.to_string());
+        }
+    }
+
+    if !forwarded_stream_lines.is_empty() {
+        if extracted_reply.is_empty() {
+            extracted_reply = "completed".to_string();
+        }
+        return RemoteTurnOutcome {
+            session_id: resolved_sid,
+            reply_text: extracted_reply,
+            is_error: exit_code != 0,
+            input_tokens,
+            output_tokens,
+            forwarded_stream_lines,
+            forwarded_has_result,
+        };
+    }
+
+    let is_error = exit_code != 0 && stdout_str.trim().is_empty();
+    let reply_text = if !stdout_str.trim().is_empty() {
+        stdout_str.trim().to_string()
+    } else if !stderr_str.trim().is_empty() {
+        stderr_str.trim().to_string()
+    } else {
+        "completed".to_string()
+    };
+    RemoteTurnOutcome {
+        session_id: resolved_sid,
+        reply_text,
+        is_error,
+        input_tokens: 0,
+        output_tokens: 0,
+        forwarded_stream_lines: Vec::new(),
+        forwarded_has_result: false,
+    }
 }
 
 fn build_remote_command_string(
@@ -933,5 +1862,188 @@ mod tests {
         assert_eq!(reqs[0]["agent_id"], created.id.as_str());
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn sylphx_bundle_sync_dereferences_skills_redacts_secrets_and_targets_agent_state() {
+        let written: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let written_ref = Arc::clone(&written);
+        let exec_cmds: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let exec_ref = Arc::clone(&exec_cmds);
+
+        let app = Router::new()
+            .route(
+                "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_sync:exec",
+                post({
+                    let exec_ref = Arc::clone(&exec_ref);
+                    move |axum::Json(payload): axum::Json<Value>| {
+                        let exec_ref = Arc::clone(&exec_ref);
+                        async move {
+                            let cmd: Vec<String> = payload["command"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect();
+                            exec_ref.lock().unwrap().push(cmd);
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({ "exit_code": 0, "stdout": "", "stderr": "" })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_sync:writeFile",
+                post({
+                    let written_ref = Arc::clone(&written_ref);
+                    move |axum::Json(payload): axum::Json<Value>| {
+                        let written_ref = Arc::clone(&written_ref);
+                        async move {
+                            let path = payload["path"].as_str().unwrap().to_string();
+                            let bytes = anyagents_tools::base64_decode(
+                                payload["content_base64"].as_str().unwrap(),
+                            )
+                            .unwrap();
+                            written_ref.lock().unwrap().insert(path, bytes);
+                            (StatusCode::OK, axum::Json(json!({})))
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sbx-sync", "codex"))
+            .unwrap();
+        let cfg_dir = anyagents_core::agent_config_dir(data, &agent.id);
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+
+        // Store raw provider secret -> gateway must emit proxy URL/token, NEVER raw key.
+        crate::gateway::ProviderImage::store(
+            data,
+            &agent,
+            "https://provider.example.test/v1",
+            "gpt-5",
+            "raw-upstream-secret-never-sent",
+        )
+        .unwrap();
+        std::fs::write(cfg_dir.join("mcp-capability"), "local-cap-never-sent\n").unwrap();
+        let remote_tok = format!("aars_{}", "9".repeat(64));
+        std::fs::write(cfg_dir.join(crate::remote::TOKEN_FILE), format!("{remote_tok}\n")).unwrap();
+        std::fs::write(
+            cfg_dir.join(".anyagents-mcp-url"),
+            "https://coordinator.example.test/v1/webhooks/mcp\n",
+        )
+        .unwrap();
+        std::fs::write(cfg_dir.join("SYSTEM_PROMPT.md"), "You are sandboxed.").unwrap();
+        std::fs::write(
+            cfg_dir.join("repo-spec.json"),
+            r#"{"repo":"https://github.com/example/repo.git","branch":"main"}"#,
+        )
+        .unwrap();
+
+        // Real symlinked skill file must be dereferenced and uploaded by bytes.
+        let real_skill = data.join("canonical-skill");
+        std::fs::create_dir_all(&real_skill).unwrap();
+        std::fs::write(real_skill.join("SKILL.md"), "# Real Skill\nDetails\n").unwrap();
+        let skill_mount = cfg_dir.join(".agents/skills");
+        std::fs::create_dir_all(&skill_mount).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_skill, skill_mount.join("my-skill")).unwrap();
+
+        let lease = SylphxLeaseConfig {
+            endpoint: format!("http://{addr}"),
+            token: Some("sbx-tok".into()),
+            parent: "orgs/o1/projects/p1/envs/e1".into(),
+            template: "agent".into(),
+            shape: "linux-m".into(),
+            volume_size_gib: Some(20),
+            workdir: "/home/user/workspace".into(),
+            mount_path: "/home/user/agent-state".into(),
+            volume_id: "vol_sync".into(),
+            volume_resource: "orgs/o1/projects/p1/envs/e1/volumes/vol_sync".into(),
+            lease_id: Some("lease_sync".into()),
+            lease_resource: Some("orgs/o1/projects/p1/envs/e1/leases/lease_sync".into()),
+            data_plane_resource: Some("orgs/o1/projects/p1/envs/e1/leases/lease_sync".into()),
+            envd_url: None,
+            envd_token: None,
+            expires_at: None,
+        };
+        lease.save_to_config_dir(&cfg_dir).unwrap();
+
+        let aid_str = agent.id.as_str().to_string();
+        let data_clone = data.to_path_buf();
+        let cfg_clone = cfg_dir.clone();
+        let lease_clone = lease.clone();
+        tokio::task::spawn_blocking(move || {
+            let _env = crate::server::tests::env_lock();
+            unsafe {
+                std::env::set_var(crate::gateway::ENV_PUBLIC_GATEWAY_URL, "https://gw.example.test");
+            }
+            let r1 = sync_agent_bundle_to_sylphx(
+                &lease_clone,
+                Some(&data_clone),
+                &cfg_clone,
+                &aid_str,
+                "codex",
+                &[],
+            );
+            // Second immediate sync must be an incremental no-op!
+            let r2 = r1.and_then(|_| {
+                sync_agent_bundle_to_sylphx(
+                    &lease_clone,
+                    Some(&data_clone),
+                    &cfg_clone,
+                    &aid_str,
+                    "codex",
+                    &[],
+                )
+            });
+            unsafe {
+                std::env::remove_var(crate::gateway::ENV_PUBLIC_GATEWAY_URL);
+            }
+            r2.unwrap();
+        })
+        .await
+        .unwrap();
+
+        let files = written.lock().unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            files
+                .get("/home/user/agent-state/.agents/skills/my-skill/SKILL.md")
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .as_deref(),
+            Some("# Real Skill\nDetails\n")
+        );
+        let guest_cfg_raw =
+            String::from_utf8(files["/home/user/agent-state/guest-config.json"].clone()).unwrap();
+        assert!(guest_cfg_raw.contains("https://gw.example.test"));
+        assert!(!guest_cfg_raw.contains("raw-upstream-secret-never-sent"));
+        assert!(!guest_cfg_raw.contains("local-cap-never-sent"));
+
+        let mcp_json_raw =
+            String::from_utf8(files["/home/user/agent-state/.mcp.json"].clone()).unwrap();
+        assert!(mcp_json_raw.contains("mcp-proxy"));
+        assert!(mcp_json_raw.contains("profile=full"));
+
+        assert!(files.contains_key("/home/user/agent-state/repo-spec.json"));
+        // Exactly one mkdir exec batch due to SHA-256 manifest caching on 2nd sync.
+        assert_eq!(exec_cmds.lock().unwrap().len(), 1);
+        assert!(lease.workdir == "/home/user/workspace");
+        assert!(!anyagents_tools::sylphx::SYLPHX_STATE_FILE.is_empty());
+
+        srv.abort();
     }
 }

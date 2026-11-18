@@ -210,6 +210,24 @@ fn create_with_seat(
     consumer: &crate::repo::Checkouts,
     root_seat: Option<crate::sandbox::RootSeatRequest>,
 ) -> Result<Agent, Error> {
+    create_with_seat_and_sandbox_mode(
+        store,
+        data,
+        request,
+        consumer,
+        root_seat,
+        anyagents_tools::SandboxMode::from_env(),
+    )
+}
+
+fn create_with_seat_and_sandbox_mode(
+    store: &Store,
+    data: &Path,
+    request: CreateRequest,
+    consumer: &crate::repo::Checkouts,
+    root_seat: Option<crate::sandbox::RootSeatRequest>,
+    sandbox_mode: anyagents_tools::SandboxMode,
+) -> Result<Agent, Error> {
     let normalized_harness = normalize_harness_name(&request.harness).to_string();
     // A harness is installed only if an adapter can start it.
     install::adapter(&normalized_harness)?;
@@ -228,7 +246,7 @@ fn create_with_seat(
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
         .or_else(|| {
-            (normalized_harness == "spiron")
+            (normalized_harness == "spiron" || normalized_harness == "spiron-local")
                 .then(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
         });
     new.description = request
@@ -277,14 +295,21 @@ fn create_with_seat(
     let made: std::cell::RefCell<MadeDirs> = std::cell::RefCell::new(MadeDirs::default());
     let mut claimed_root_seat = false;
     let finish = (|| -> Result<Agent, Error> {
-        if root_seat.is_none() {
+        if root_seat.is_none() && !sandbox_mode.is_remote_required() {
             crate::sandbox::bind_principal(store, &agent, None)?;
         }
         // Nothing is installed until an agent needs it: this is that moment. A
         // failure is the reason the agent's first turn cannot start, reported here
         // and never retried in a loop.
-        if !cfg!(test) {
-            install::record(&data, &agent.harness).map_err(Error::Message)?;
+        let install_target = if crate::vendor::is_spiron_harness(&agent.harness)
+            && !crate::vendor::spiron_uses_local_execution(&agent.harness, Some(&data), None)
+        {
+            "spiron-cloud"
+        } else {
+            agent.harness.as_str()
+        };
+        if !cfg!(test) && !sandbox_mode.is_remote_required() {
+            install::record(&data, install_target).map_err(Error::Message)?;
         }
         // The gateway origin and this agent's own token, kept so a restart starts
         // the same agent the same way.
@@ -411,12 +436,27 @@ fn create_with_seat(
                 .unwrap_or_else(|| "default".to_string());
             pairs.push(("SYLPHX_AGENT_ENV".to_string(), env_slug));
         }
+        let effective_cloud =
+            crate::vendor::is_effective_cloud_harness(&agent.harness, Some(&data), None);
+        if sandbox_mode.is_remote_required()
+            && !effective_cloud
+            && anyagents_tools::SylphxProviderConfig::resolve(Some(&data))
+                .map_err(Error::Message)?
+                .is_none()
+            && anyagents_tools::SandboxProviderConfig::resolve(Some(&data)).is_none()
+        {
+            return Err(Error::Message(
+                "ANYAGENTS_SANDBOX_MODE=remote_required requires a remote sandbox provider (`ANYAGENTS_SYLPHX_PARENT`)"
+                    .into(),
+            ));
+        }
         let workdir_created =
             explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
         let managed_abs = std::path::absolute(&managed)?;
         // Cloud harnesses run only a small HTTP launcher here, never a local checkout.
         // Explicit filesystem paths and explicit inheritance keep their local semantics.
-        let remote_placement = crate::vendor::is_cloud_harness(&agent.harness)
+        let remote_placement = (crate::vendor::is_cloud_harness(&agent.harness)
+            || sandbox_mode.is_remote_required())
             && explicit_workdir.is_none()
             && !wd_is_inherit_keyword;
         // Record the allocation before any checkout or cloud provisioning can
@@ -448,9 +488,10 @@ fn create_with_seat(
             create_dir_all_recorded(&launcher, &made)?;
             launcher
         } else if let Some(repo_raw) = effective_repo {
-            if crate::vendor::is_spiron_harness(&agent.harness)
-                && is_cloud_agent_mode
-                && explicit_workdir.is_none()
+            if (sandbox_mode.is_remote_required())
+                || (crate::vendor::is_spiron_harness(&agent.harness)
+                    && is_cloud_agent_mode
+                    && explicit_workdir.is_none())
             {
                 provision_cloud_sandbox_worktree_marker(
                     store,
@@ -482,7 +523,9 @@ fn create_with_seat(
                 target_wt
             }
         } else if wd_is_private_keyword || wd_is_worktree_keyword {
-            if crate::vendor::is_spiron_harness(&agent.harness) && is_cloud_agent_mode {
+            if sandbox_mode.is_remote_required()
+                || (crate::vendor::is_spiron_harness(&agent.harness) && is_cloud_agent_mode)
+            {
                 provision_cloud_sandbox_worktree_marker(
                     store,
                     &agent,
@@ -531,7 +574,10 @@ fn create_with_seat(
                 }
                 None => {
                     if agent.parent_id.is_some() {
-                        if crate::vendor::is_spiron_harness(&agent.harness) && is_cloud_agent_mode {
+                        if sandbox_mode.is_remote_required()
+                            || (crate::vendor::is_spiron_harness(&agent.harness)
+                                && is_cloud_agent_mode)
+                        {
                             provision_cloud_sandbox_worktree_marker(
                                 store,
                                 &agent,
@@ -559,32 +605,46 @@ fn create_with_seat(
             create_dir_all_recorded(&managed_abs, &made)?;
         }
         // Reserve a named seat after workdir validation and before opening the tree to it.
-        if root_seat.is_some() {
+        if !sandbox_mode.is_remote_required() && root_seat.is_some() {
             claimed_root_seat = crate::sandbox::bind_principal(store, &agent, root_seat.as_ref())?;
         }
         // The config is private; the seat may now traverse to its own tree.
         open_agent_root(&root)?;
-        let (uid, gid, launch) = match resolved_agent_seat_info(store, &agent) {
-            Some((_, uid, gid, launch)) => (uid, gid, launch),
-            None if claimed_root_seat => {
-                return Err(Error::PermissionDenied(
-                    "newly admitted seat could not be resolved for execution".into(),
-                ));
-            }
-            None => (
+        let (uid, gid, launch) = if sandbox_mode.is_remote_required() {
+            (
                 crate::sandbox::server_uid(),
                 crate::sandbox::server_gid(),
                 None,
-            ),
+            )
+        } else {
+            match resolved_agent_seat_info(store, &agent) {
+                Some((_, uid, gid, launch)) => (uid, gid, launch),
+                None if claimed_root_seat => {
+                    return Err(Error::PermissionDenied(
+                        "newly admitted seat could not be resolved for execution".into(),
+                    ));
+                }
+                None => (
+                    crate::sandbox::server_uid(),
+                    crate::sandbox::server_gid(),
+                    None,
+                ),
+            }
         };
-        if remote_placement || workdir_created || cwd == managed_abs {
-            crate::sandbox::share_worktree_with_seat(&cwd, gid)?;
+        if !sandbox_mode.is_remote_required() {
+            if remote_placement || workdir_created || cwd == managed_abs {
+                crate::sandbox::share_worktree_with_seat(&cwd, gid)?;
+            }
+            crate::repo::verify(&cwd, uid, gid, launch.as_deref())?;
         }
-        crate::repo::verify(&cwd, uid, gid, launch.as_deref())?;
         crate::operator::mint(store, &agent.id)?;
         store.set_agent_launch_env(&agent.id, &pairs)?;
         if !remote_placement
+            && !effective_cloud
             && anyagents_tools::SandboxConfig::from_config_dir(&config).is_none()
+            && anyagents_tools::SylphxProviderConfig::resolve(Some(&data))
+                .map_err(Error::Message)?
+                .is_none()
             && let Some(provider) = anyagents_tools::SandboxProviderConfig::resolve(Some(&data))
             && let Ok(sbx) = anyagents_tools::SandboxProvider::provision(
                 &provider,
@@ -3184,7 +3244,11 @@ fn reconcile_agent_runtime_config_inner(
     }
     let capability = std::fs::read_to_string(config.join("mcp-capability"))?;
     crate::operator::verify_capability(store, &agent.id, capability.trim())?;
-    if crate::sandbox::seats_configured() && resolved_agent_seat_info(store, agent).is_none() {
+    let sandbox_mode = anyagents_tools::SandboxMode::from_env();
+    if !sandbox_mode.is_remote_required()
+        && crate::sandbox::seats_configured()
+        && resolved_agent_seat_info(store, agent).is_none()
+    {
         return Err(Error::Message(format!(
             "no admitted execution principal for {}",
             agent.id
@@ -3210,6 +3274,13 @@ fn reconcile_agent_runtime_config_inner(
             before_prompt.as_deref(),
             min_started_ms,
         )?;
+    }
+
+    let spiron_cloud_active = (crate::vendor::is_spiron_harness(&agent.harness)
+        || normalize_harness_name(&agent.harness) == "spiron-cloud")
+        && crate::vendor::is_effective_cloud_harness(&agent.harness, Some(data), Some(config));
+    if spiron_cloud_active {
+        ensure_spiron_cloud_config(data, config, agent.model.as_deref())?;
     }
 
     if !config_writes_suppressed(data)
@@ -3269,13 +3340,15 @@ fn reconcile_agent_runtime_config_inner(
             "grok" => {
                 crate::grok::write_grok_config(config, agent.model.as_deref(), &command, &args)?;
             }
-            "spiron" | "spiron-cloud" => {
-                crate::spiron::write_spiron_config(
-                    config,
-                    agent.model.as_deref(),
-                    &command,
-                    &args,
-                )?;
+            "spiron" | "spiron-local" | "spiron-cloud" => {
+                if !spiron_cloud_active || config.join("config.toml").exists() {
+                    crate::spiron::write_spiron_config(
+                        config,
+                        agent.model.as_deref(),
+                        &command,
+                        &args,
+                    )?;
+                }
             }
             _ => {
                 mcp_config::sanitize_claude_settings(config)?;
@@ -3285,7 +3358,9 @@ fn reconcile_agent_runtime_config_inner(
         }
     }
 
-    if let Some((_, uid, gid, spec_opt)) = resolved_agent_seat_info(store, agent) {
+    if !sandbox_mode.is_remote_required()
+        && let Some((_, uid, gid, spec_opt)) = resolved_agent_seat_info(store, agent)
+    {
         if let Some(ref spec) = spec_opt {
             ensure_seat_op_config(config, spec);
         }
@@ -3321,6 +3396,116 @@ fn reconcile_agent_runtime_config_inner(
     }
     verify_harness_runtime_config(config, &agent.harness, agent.model.as_deref())?;
     Ok(continuity)
+}
+
+/// Seed `<agent>/config/cloud.json` when Spiron runs via Cloud (`spiron` default
+/// or explicit `spiron-cloud`), preserving any caller-provided keys while
+/// discovering `spiron_sk_...`, JWTs, or Sylphx/Spiron API keys cleanly.
+fn ensure_spiron_cloud_config(
+    data: &Path,
+    config: &Path,
+    _model: Option<&str>,
+) -> Result<(), Error> {
+    if config_writes_suppressed(data) {
+        return Ok(());
+    }
+    let cloud_path = config.join("cloud.json");
+    let mut map = if let Ok(raw) = std::fs::read_to_string(&cloud_path)
+        && let Ok(serde_json::Value::Object(existing)) = serde_json::from_str(&raw)
+    {
+        existing
+    } else {
+        serde_json::Map::new()
+    };
+
+    if !map.contains_key("base_url")
+        && !map.contains_key("endpoint")
+        && let Ok(url) = std::env::var("ANYAGENTS_SPIRON_CLOUD_URL")
+            .or_else(|_| std::env::var("SPIRON_CLOUD_URL"))
+        && !url.trim().is_empty()
+    {
+        map.insert(
+            "base_url".to_string(),
+            serde_json::Value::String(url.trim().trim_end_matches('/').to_string()),
+        );
+    }
+
+    let has_token = ["api_key", "apiKey", "token", "bearer_token", "access_token"]
+        .iter()
+        .any(|k| {
+            map.get(*k)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+        });
+    if !has_token && let Some(tok) = discover_spiron_cloud_auth_token(config) {
+        let field = if tok.starts_with("spiron_sk_") {
+            "api_key"
+        } else {
+            "token"
+        };
+        map.insert(field.to_string(), serde_json::Value::String(tok));
+    }
+
+    let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(map))
+        .map_err(|err| Error::Message(err.to_string()))?;
+    write_required_file(&cloud_path, &bytes, 0o600)?;
+    Ok(())
+}
+
+fn discover_spiron_cloud_auth_token(config: &Path) -> Option<String> {
+    for env_key in [
+        "ANYAGENTS_SPIRON_API_KEY",
+        "SPIRON_API_KEY",
+        "SYLPHX_API_KEY",
+    ] {
+        if let Ok(v) = std::env::var(env_key) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    for rel in [
+        ".spiron/auth.json",
+        ".spiron/credentials.json",
+        ".config/sylphx/auth.json",
+        ".config/sylphx/credentials.json",
+        "auth.json",
+        "credentials.json",
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(config.join(rel))
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+        {
+            for ptr in [
+                "/api_key",
+                "/apiKey",
+                "/token",
+                "/bearer_token",
+                "/access_token",
+                "/accessToken",
+            ] {
+                if let Some(s) = val.pointer(ptr).and_then(serde_json::Value::as_str) {
+                    let t = s.trim();
+                    if !t.is_empty() {
+                        return Some(t.to_string());
+                    }
+                }
+            }
+        }
+    }
+    for rel in [
+        "sylphx.key",
+        ".config/opencode/sylphx.key",
+        "spiron.key",
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(config.join(rel)) {
+            let t = raw.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Verifies that the active harness's runtime configuration file exists on disk
@@ -3484,6 +3669,36 @@ pub(crate) fn verify_harness_runtime_config(
             if crate::vendor::is_spiron_harness(selector)
                 || normalize_harness_name(selector) == "spiron-cloud" =>
         {
+            let data_dir = config
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent);
+            let local_exec =
+                crate::vendor::spiron_uses_local_execution(selector, data_dir, Some(config));
+            let cloud_path = config.join("cloud.json");
+            if !local_exec {
+                if cloud_path.is_file() {
+                    let bytes = std::fs::read(&cloud_path).map_err(|err| {
+                        Error::Message(format!(
+                            "spiron cloud.json unreadable {}: {err}",
+                            cloud_path.display()
+                        ))
+                    })?;
+                    serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| {
+                        Error::Message(format!(
+                            "spiron cloud.json invalid JSON: {}",
+                            cloud_path.display()
+                        ))
+                    })?;
+                    return Ok(());
+                }
+                if !config.join("spiron-mcp.json").is_file() {
+                    return Err(Error::Message(format!(
+                        "spiron cloud runtime config missing: {}",
+                        cloud_path.display()
+                    )));
+                }
+            }
             let path = config.join("spiron-mcp.json");
             let text = std::fs::read_to_string(&path).map_err(|_| {
                 Error::Message(format!("spiron runtime config missing: {}", path.display()))
@@ -5639,7 +5854,7 @@ pub(crate) fn upstream_provider_of(harness: &str, model: Option<&str>) -> String
         "dsh" => "deepseek".to_string(),
         "grok" => "xai".to_string(),
         "cursor-cloud" => "cursor".to_string(),
-        "spiron" | "spiron-cloud" => "spiron".to_string(),
+        "spiron" | "spiron-local" | "spiron-cloud" => "spiron".to_string(),
         "opencode" => "opencode".to_string(),
         "omp" => "omp".to_string(),
         other => other.to_string(),
@@ -5656,13 +5871,17 @@ pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<S
         "deepseek" => ("subscription", harnesses(&["dsh"])),
         "xai" => ("subscription", harnesses(&["grok"])),
         "cursor" => ("subscription", harnesses(&["cursor-cloud"])),
-        "spiron" => ("api-key", harnesses(&["spiron", "spiron-cloud"])),
-        "opencode" => ("api-key", harnesses(&["opencode"])),
-        "omp" => ("api-key", harnesses(&["omp"])),
+        "spiron" => (
+            "api-key",
+            harnesses(&["spiron", "spiron-local", "spiron-cloud"]),
+        ),
+        "opencode" => ("api-key", harnesses(&["opencode", "omp"])),
+        "omp" => ("api-key", harnesses(&["omp", "opencode"])),
         "sylphx" => (
             "api-key",
             harnesses(&[
                 "spiron",
+                "spiron-local",
                 "spiron-cloud",
                 "opencode",
                 "omp",
@@ -5802,7 +6021,7 @@ pub(crate) fn ensure_profile_compatible_and_mapped(
             compatible_harnesses.join(", ")
         )));
     }
-    if target_harness == "opencode" && provider != "opencode" {
+    if target_harness == "opencode" && !matches!(provider, "opencode" | "omp") {
         let explicit_sylphx_model = provider == "sylphx"
             && resolved_model
                 .map(str::trim)
@@ -8742,16 +8961,43 @@ pub(crate) fn probe_one_profile_usage(
                 let count = val.get("data")?.as_array()?.len();
                 Some(format!("active ({count} models)"))
             }
-            "sylphx" => {
-                let resp = http.get("https://api.sylphx.com/health").call().ok()?;
-                let body = resp.into_body().read_to_string().ok()?;
-                let val: serde_json::Value = serde_json::from_str(&body).ok()?;
-                if val.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
+            "sylphx" | "spiron" => {
+                let has_creds = profile_has_sylphx_credentials(&prof_dir);
+                let health_url = std::env::var("ANYAGENTS_SYLPHX_HEALTH_URL")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                if let Some(url) = health_url {
+                    let resp = http.get(&url).call().ok()?;
+                    let body = resp.into_body().read_to_string().ok()?;
+                    let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    if let Some(pct) = val
+                        .get("remaining_pct")
+                        .or_else(|| val.get("remainingPct"))
+                        .and_then(serde_json::Value::as_i64)
+                    {
+                        return Some(format!("{}% left", pct.clamp(0, 100)));
+                    }
+                    if val.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
+                        return Some("online (gateway-edge)".to_string());
+                    }
+                    None
+                } else if has_creds {
                     Some("online (gateway-edge)".to_string())
+                } else if !crate::sandbox::is_isolated_test_env() {
+                    let resp = http.get("https://api.sylphx.com/health").call().ok()?;
+                    let body = resp.into_body().read_to_string().ok()?;
+                    let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+                    if val.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
+                        Some("online (gateway-edge)".to_string())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
             }
+            "opencode" | "omp" => probe_opencode_profile_credentials(&prof_dir, provider, now_ms),
             "google-gemini" => {
                 let key = read_first_non_empty_file(
                     &prof_dir,
@@ -8775,6 +9021,29 @@ pub(crate) fn probe_one_profile_usage(
             _ => None,
         }
     })();
+    let result = if provider != "anthropic" {
+        let reset_active = std::fs::read_to_string(prof_dir.join(".anyagents-quota-reset-ms"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .is_some_and(|ms| ms > now_ms);
+        match result {
+            Some(s) => Some(overlay_active_quota_reset_on_cached_usage(
+                &prof_dir,
+                &last_usage_path,
+                &s,
+                now_ms,
+            )),
+            None if reset_active => Some(overlay_active_quota_reset_on_cached_usage(
+                &prof_dir,
+                &last_usage_path,
+                "",
+                now_ms,
+            )),
+            None => None,
+        }
+    } else {
+        result
+    };
     if provider != "anthropic" {
         if let Some(ref s) = result {
             write_seat_shared_file(&last_usage_path, format!("{s}\n").as_bytes(), 0o600);
@@ -8785,8 +9054,148 @@ pub(crate) fn probe_one_profile_usage(
     result
 }
 
+fn json_value_has_secret(val: &serde_json::Value) -> bool {
+    match val {
+        serde_json::Value::Object(map) => map.iter().any(|(k, v)| {
+            let key_is_secret = matches!(
+                k.as_str(),
+                "key" | "apiKey"
+                    | "api_key"
+                    | "access"
+                    | "accessToken"
+                    | "access_token"
+                    | "refresh"
+                    | "refreshToken"
+                    | "refresh_token"
+                    | "token"
+                    | "bearer"
+                    | "bearer_token"
+                    | "bearerToken"
+            );
+            if key_is_secret
+                && v.as_str().is_some_and(|s| {
+                    let t = s.trim();
+                    !t.is_empty() && !t.starts_with("${") && !t.eq_ignore_ascii_case("null")
+                })
+            {
+                return true;
+            }
+            json_value_has_secret(v)
+        }),
+        serde_json::Value::Array(arr) => arr.iter().any(json_value_has_secret),
+        _ => false,
+    }
+}
+
+fn profile_has_sylphx_credentials(prof_dir: &Path) -> bool {
+    if read_first_non_empty_file(
+        prof_dir,
+        &[
+            "sylphx.key",
+            ".config/opencode/sylphx.key",
+            "spiron.key",
+            "api-key",
+            ".env",
+            "env",
+        ],
+    )
+    .is_some()
+    {
+        return true;
+    }
+    for rel in [
+        ".credentials.json",
+        "auth.json",
+        ".local/share/opencode/auth.json",
+        ".config/opencode/opencode.json",
+        "opencode.json",
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(prof_dir.join(rel))
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+            && json_value_has_secret(&val)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn probe_opencode_profile_credentials(
+    prof_dir: &Path,
+    provider: &str,
+    now_ms: i64,
+) -> Option<String> {
+    let mut saw_expired_oauth = false;
+    for rel in [".local/share/opencode/auth.json", "auth.json", ".omp/auth.json"] {
+        if let Ok(raw) = std::fs::read_to_string(prof_dir.join(rel))
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+        {
+            if let Some(map) = val.as_object() {
+                for entry in map.values() {
+                    if let Some(obj) = entry.as_object() {
+                        let has_refresh = obj
+                            .get("refresh")
+                            .or_else(|| obj.get("refreshToken"))
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|s| !s.trim().is_empty());
+                        let expired = obj
+                            .get("expires")
+                            .and_then(serde_json::Value::as_i64)
+                            .is_some_and(|exp| exp > 0 && exp <= now_ms);
+                        if expired && !has_refresh {
+                            saw_expired_oauth = true;
+                            continue;
+                        }
+                    }
+                    if json_value_has_secret(entry) {
+                        return Some(format!("active ({provider}-auth)"));
+                    }
+                }
+            } else if json_value_has_secret(&val) {
+                return Some(format!("active ({provider}-auth)"));
+            }
+        }
+    }
+    if read_first_non_empty_file(
+        prof_dir,
+        &[
+            ".config/opencode/sylphx.key",
+            "sylphx.key",
+            "api-key",
+            ".env",
+            "env",
+        ],
+    )
+    .is_some()
+    {
+        return Some(format!("active ({provider}-auth)"));
+    }
+    for rel in [
+        ".config/opencode/opencode.json",
+        "opencode.json",
+        ".omp/agent.json",
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(prof_dir.join(rel))
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+            && json_value_has_secret(&val)
+        {
+            return Some(format!("active ({provider}-auth)"));
+        }
+    }
+    if saw_expired_oauth {
+        Some("oauth expired".to_string())
+    } else {
+        None
+    }
+}
+
 pub(crate) fn parse_remaining_pct_from_usage(usage: &str, model: Option<&str>) -> Option<i64> {
-    if usage.starts_with("oauth expired") || usage.starts_with(USAGE_LIMITED_PREFIX) {
+    let lower = usage.trim().to_ascii_lowercase();
+    if lower.starts_with("oauth expired")
+        || lower.starts_with(USAGE_LIMITED_PREFIX)
+        || lower.contains("quota exhausted")
+        || lower.contains("rate limited")
+    {
         return Some(0);
     }
     let extract_after = |label: &str| -> Option<i64> {
@@ -8796,8 +9205,8 @@ pub(crate) fn parse_remaining_pct_from_usage(usage: &str, model: Option<&str>) -
         rest[..pct_idx].trim().parse::<i64>().ok()
     };
     let wants_opus = model.is_some_and(|m| {
-        let lower = m.to_ascii_lowercase();
-        lower.contains("opus") || lower.contains("claude")
+        let lower_m = m.to_ascii_lowercase();
+        lower_m.contains("opus") || lower_m.contains("claude")
     });
     if wants_opus && usage.contains("opus:") {
         return extract_after("opus:");
@@ -8811,7 +9220,68 @@ pub(crate) fn parse_remaining_pct_from_usage(usage: &str, model: Option<&str>) -
             min_pct = Some(min_pct.map_or(p, |cur| cur.min(p)));
         }
     }
-    min_pct
+    if min_pct.is_some() {
+        return min_pct;
+    }
+    // Generic `<N>% left` without a window prefix.
+    let mut scan = usage;
+    let mut generic_min: Option<i64> = None;
+    while let Some(pos) = scan.find("% left") {
+        let before = &scan[..pos];
+        let digits: String = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_whitespace() || c.is_ascii_digit())
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if let Ok(p) = digits.trim().parse::<i64>() {
+            let clamped = p.clamp(0, 100);
+            generic_min = Some(generic_min.map_or(clamped, |cur| cur.min(clamped)));
+        }
+        scan = &scan[pos + "% left".len()..];
+    }
+    if generic_min.is_some() {
+        return generic_min;
+    }
+    if let Some(pct) = parse_currency_balance_pct(usage) {
+        return Some(pct);
+    }
+    if lower.starts_with("online") || lower.starts_with("active") {
+        return Some(100);
+    }
+    None
+}
+
+fn parse_currency_balance_pct(usage: &str) -> Option<i64> {
+    for sym in ['$', '¥'] {
+        if let Some(idx) = usage.find(sym) {
+            let after = &usage[idx + sym.len_utf8()..];
+            let rem_str: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            let Ok(rem) = rem_str.parse::<f64>() else {
+                continue;
+            };
+            let rest = after[rem_str.len()..].trim_start();
+            if let Some(after_slash) = rest.strip_prefix('/') {
+                let after_sym = after_slash.trim_start().trim_start_matches(sym);
+                let tot_str: String = after_sym
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if let Ok(tot) = tot_str.parse::<f64>()
+                    && tot > 0.0
+                {
+                    return Some(((rem / tot) * 100.0).round().clamp(0.0, 100.0) as i64);
+                }
+            }
+            return Some(if rem <= 0.0 { 0 } else { 100 });
+        }
+    }
+    None
 }
 
 pub(crate) fn probe_profile_remaining_pct(
@@ -9344,14 +9814,48 @@ pub(crate) fn try_rotate_exhausted_profile(
     agent: &Agent,
     has_active_quota_hold: bool,
 ) -> Option<String> {
-    if crate::sandbox::is_isolated_test_env() {
+    try_rotate_exhausted_profile_in(store, data, agent, has_active_quota_hold, false)
+}
+
+fn try_rotate_exhausted_profile_in(
+    store: &Store,
+    data: &Path,
+    agent: &Agent,
+    has_active_quota_hold: bool,
+    allow_in_test_env: bool,
+) -> Option<String> {
+    if !allow_in_test_env && crate::sandbox::is_isolated_test_env() {
         return None;
     }
     let cfg = agent_config_dir(data, &agent.id);
     let now_ms = anyagents_core::now_ms();
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
     let current_prof = bound_profile_of_provider(&cfg, &provider)?;
-    let prof_dir = data.join("profiles").join(&provider).join(&current_prof);
+    let current_provider = bound_profile_name(&cfg)
+        .and_then(|bound| bound.split_once('/').map(|(p, _)| p.to_string()))
+        .filter(|bp| {
+            bp == &provider || compatible_harnesses_for(&provider).contains(&bp.as_str())
+        })
+        .or_else(|| {
+            if data
+                .join("profiles")
+                .join(&provider)
+                .join(&current_prof)
+                .is_dir()
+            {
+                Some(provider.clone())
+            } else {
+                compatible_harnesses_for(&provider)
+                    .iter()
+                    .find(|compat| data.join("profiles").join(compat).join(&current_prof).is_dir())
+                    .map(|compat| (*compat).to_string())
+            }
+        })
+        .unwrap_or_else(|| provider.clone());
+    let prof_dir = data
+        .join("profiles")
+        .join(&current_provider)
+        .join(&current_prof);
     let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
@@ -9368,7 +9872,7 @@ pub(crate) fn try_rotate_exhausted_profile(
             .unwrap_or(0);
         if now_ms.saturating_sub(last_check) < 120_000 {
             if cleared_ms >= last_check && now_ms.saturating_sub(cleared_ms) < 120_000 {
-                return Some(format!("{provider}/{current_prof}"));
+                return Some(format!("{current_provider}/{current_prof}"));
             }
             return None;
         }
@@ -9394,7 +9898,12 @@ pub(crate) fn try_rotate_exhausted_profile(
     let cur_pct = if post_clear_error {
         Some(0)
     } else {
-        probe_profile_remaining_pct(data, &provider, &current_prof, agent.model.as_deref())
+        probe_profile_remaining_pct(
+            data,
+            &current_provider,
+            &current_prof,
+            agent.model.as_deref(),
+        )
     };
     if has_active_quota_hold && cur_pct.is_some_and(|p| p > 0) {
         write_profile_marker(&cfg, ".anyagents-quota-cleared-ms", &format!("{now_ms}\n"))
@@ -9406,7 +9915,7 @@ pub(crate) fn try_rotate_exhausted_profile(
             clear_stale_agy_quota_error_steps(&cfg);
         }
         poke_agent_wake_socket(data, &agent.id);
-        return Some(format!("{provider}/{current_prof}"));
+        return Some(format!("{current_provider}/{current_prof}"));
     }
     if has_active_quota_hold && cur_pct.is_some_and(|pct| pct <= 0) {
         let bound_counts = count_bound_profile_agents(
@@ -9415,26 +9924,33 @@ pub(crate) fn try_rotate_exhausted_profile(
             &provider,
             &agent.id,
         );
-        let mut best: Option<(String, i64, i64)> = None;
-        for (cand_prof, _) in list_harness_profiles(data, &provider) {
-            if cand_prof == current_prof {
+        let mut best: Option<(String, String, i64, i64)> = None;
+        for (cand_prof, cand_path) in list_harness_profiles(data, &provider) {
+            let cand_provider = cand_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&provider)
+                .to_string();
+            if cand_prof == current_prof && cand_provider == current_provider {
                 continue;
             }
             if let Some(rem_pct) =
-                probe_profile_remaining_pct(data, &provider, &cand_prof, agent.model.as_deref())
+                probe_profile_remaining_pct(data, &cand_provider, &cand_prof, agent.model.as_deref())
                 && rem_pct > 0
             {
                 let cnt = bound_counts.get(&cand_prof).copied().unwrap_or(0);
                 let score = (rem_pct * 100) / (cnt + 1);
-                if best.as_ref().is_none_or(|(_, best_score, best_rem)| {
+                if best.as_ref().is_none_or(|(_, _, best_score, best_rem)| {
                     (score, rem_pct) > (*best_score, *best_rem)
                 }) {
-                    best = Some((cand_prof, score, rem_pct));
+                    best = Some((cand_provider, cand_prof, score, rem_pct));
                 }
             }
         }
-        if let Some((best_prof, _, _)) = best {
-            let target_prof = format!("{provider}/{best_prof}");
+        if let Some((best_provider, best_prof, _, _)) = best {
+            let target_prof = format!("{best_provider}/{best_prof}");
             if configure_agent_runtime(
                 store,
                 data,
@@ -9473,7 +9989,9 @@ fn count_bound_profile_agents(
                             bound.clone(),
                         )
                     });
-                if bound_provider == provider {
+                if bound_provider == provider
+                    || compatible_harnesses_for(provider).contains(&bound_provider.as_str())
+                {
                     *counts.entry(profile).or_insert(0) += 1;
                 }
             }
@@ -9488,6 +10006,9 @@ pub(crate) fn compatible_harnesses_for(provider_or_harness: &str) -> &'static [&
         "spiron" | "spiron-cloud" | "sylphx" | "sylphx-agent" | "sylphx_agent" => {
             &["spiron", "spiron-cloud", "sylphx"]
         }
+        "spiron-local" => &["spiron-local", "spiron", "spiron-cloud", "sylphx"],
+        "opencode" => &["opencode", "omp"],
+        "omp" => &["omp", "opencode"],
         "claude-code" | "claude-cloud" | "anthropic" => {
             &["anthropic", "claude-code", "claude-cloud"]
         }
@@ -9506,9 +10027,8 @@ pub(crate) fn list_harness_profiles(
 ) -> Vec<(String, PathBuf)> {
     let provider = match provider_or_harness {
         "claude-code" | "claude-cloud" | "codex" | "openai-cloud" | "cursor-cloud" | "agy"
-        | "muse" | "dsh" | "grok" | "opencode" | "omp" | "spiron" | "spiron-cloud" => {
-            upstream_provider_of(provider_or_harness, None)
-        }
+        | "muse" | "dsh" | "grok" | "opencode" | "omp" | "spiron" | "spiron-local"
+        | "spiron-cloud" => upstream_provider_of(provider_or_harness, None),
         other => other.to_string(),
     };
     let mut base_dirs = vec![
@@ -10992,7 +11512,8 @@ pub(crate) fn resolve_subagent_defaults(
             .filter(|m| !m.eq_ignore_ascii_case("inherit"))
             .map(str::to_string)
             .or_else(|| {
-                (harness == "spiron").then(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
+                (harness == "spiron" || harness == "spiron-local")
+                    .then(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
             });
         let profile = p_trim
             .filter(|p| !p.eq_ignore_ascii_case("inherit"))
@@ -11060,7 +11581,7 @@ pub(crate) fn resolve_subagent_defaults(
         None
     }
     .or_else(|| {
-        (resolved_harness == "spiron").then(|| {
+        (resolved_harness == "spiron" || resolved_harness == "spiron-local").then(|| {
             spec.model
                 .as_deref()
                 .map(str::trim)
@@ -17930,5 +18451,206 @@ Connection: close
             bound_profile_name(&cfg).as_deref(),
             Some("google-antigravity/team-alpha")
         );
+    }
+
+    #[test]
+    fn sylphx_and_opencode_quota_probe_parse_and_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+
+        // 1) Parse edge-gateway/online, active, currency ratios, and quota-limited strings.
+        assert_eq!(
+            parse_remaining_pct_from_usage("online (gateway-edge)", None),
+            Some(100)
+        );
+        assert_eq!(
+            parse_remaining_pct_from_usage("active (opencode-auth)", None),
+            Some(100)
+        );
+        assert_eq!(
+            parse_remaining_pct_from_usage("limited ↻10m · online (gateway-edge)", None),
+            Some(0)
+        );
+        assert_eq!(
+            parse_remaining_pct_from_usage("$4.00/$10.00 remaining", None),
+            Some(40)
+        );
+        assert_eq!(
+            parse_remaining_pct_from_usage("75% left", None),
+            Some(75)
+        );
+        assert!(compatible_harnesses_for("opencode").contains(&"omp"));
+        assert!(compatible_harnesses_for("spiron-local").contains(&"sylphx"));
+
+        // 2) Sylphx profiles rotate cleanly on active `.anyagents-quota-reset-ms`.
+        let future_reset = anyagents_core::now_ms() + 300_000;
+        let exhausted = data.join("profiles/sylphx/exhausted/.config/opencode");
+        let healthy = data.join("profiles/sylphx/healthy/.config/opencode");
+        std::fs::create_dir_all(&exhausted).unwrap();
+        std::fs::create_dir_all(&healthy).unwrap();
+        std::fs::write(exhausted.join("sylphx.key"), "sk-ex\n").unwrap();
+        std::fs::write(healthy.join("sylphx.key"), "sk-ok\n").unwrap();
+        std::fs::write(
+            data.join("profiles/sylphx/exhausted/.anyagents-quota-reset-ms"),
+            format!("{future_reset}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_remaining_pct_from_usage(
+                &probe_one_profile_usage(data, "sylphx", "exhausted").unwrap(),
+                None
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            parse_remaining_pct_from_usage(
+                &probe_one_profile_usage(data, "sylphx", "healthy").unwrap(),
+                None
+            ),
+            Some(100)
+        );
+
+        let spiron_agent = store
+            .create_agent(NewAgent::new("sylphx-rot", "spiron"))
+            .unwrap();
+        let spiron_cfg = agent_config_dir(data, &spiron_agent.id);
+        std::fs::create_dir_all(&spiron_cfg).unwrap();
+        std::fs::write(spiron_cfg.join(".anyagents-profile"), "sylphx/exhausted\n").unwrap();
+        let rotated = try_rotate_exhausted_profile_in(&store, data, &spiron_agent, true, true);
+        assert_eq!(rotated.as_deref(), Some("sylphx/healthy"));
+        assert_eq!(
+            bound_profile_name(&spiron_cfg).as_deref(),
+            Some("sylphx/healthy")
+        );
+
+        // 3) OpenCode profiles probe auth.json expiry and rotate to healthy omp/opencode profile.
+        let oc_expired = data.join("profiles/opencode/expired/.local/share/opencode");
+        let oc_healthy = data.join("profiles/omp/fresh/.local/share/opencode");
+        std::fs::create_dir_all(&oc_expired).unwrap();
+        std::fs::create_dir_all(&oc_healthy).unwrap();
+        let past_ms = anyagents_core::now_ms() - 60_000;
+        let future_ms = anyagents_core::now_ms() + 3_600_000;
+        std::fs::write(
+            oc_expired.join("auth.json"),
+            serde_json::json!({
+                "openai": { "access": "tok-old", "expires": past_ms }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            oc_healthy.join("auth.json"),
+            serde_json::json!({
+                "openai": { "access": "tok-fresh", "refresh": "ref-fresh", "expires": future_ms }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            probe_one_profile_usage(data, "opencode", "expired").as_deref(),
+            Some("oauth expired")
+        );
+        assert_eq!(
+            probe_one_profile_usage(data, "omp", "fresh").as_deref(),
+            Some("active (omp-auth)")
+        );
+
+        let oc_agent = store
+            .create_agent(NewAgent::new("oc-rot", "opencode"))
+            .unwrap();
+        let oc_cfg = agent_config_dir(data, &oc_agent.id);
+        std::fs::create_dir_all(&oc_cfg).unwrap();
+        std::fs::write(oc_cfg.join(".anyagents-profile"), "opencode/expired\n").unwrap();
+        let oc_rotated = try_rotate_exhausted_profile_in(&store, data, &oc_agent, true, true);
+        assert_eq!(oc_rotated.as_deref(), Some("omp/fresh"));
+    }
+
+    #[test]
+    fn create_remote_required_fails_closed_without_sandbox_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = std::path::absolute(dir.path()).unwrap();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let checkouts = crate::repo::Checkouts::configured(&data);
+        let req = CreateRequest {
+            name: "thin-test".into(),
+            role: None,
+            harness: "claude-code".into(),
+            model: None,
+            profile: None,
+            repo: None,
+            branch: None,
+            base: None,
+            workdir: Some(PathBuf::from("isolated")),
+            workdir_default: None,
+            description: None,
+            instructions: None,
+            parent_id: None,
+        };
+        let err = create_with_seat_and_sandbox_mode(
+            &store,
+            &data,
+            req,
+            &checkouts,
+            None,
+            anyagents_tools::SandboxMode::RemoteRequired,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("remote_required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn spiron_routes_to_cloud_json_while_spiron_local_requires_mcp_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+
+        let cloud_agent = store
+            .create_agent(NewAgent::new("spiron-default-cloud", "spiron"))
+            .unwrap();
+        let cloud_cfg = agent_config_dir(data, &cloud_agent.id);
+        let cloud_work = data.join("work-cloud");
+        std::fs::create_dir_all(cloud_cfg.join(".spiron")).unwrap();
+        std::fs::create_dir_all(&cloud_work).unwrap();
+        std::fs::write(
+            cloud_cfg.join(".spiron/auth.json"),
+            r#"{"api_key":"spiron_sk_test_123"}"#,
+        )
+        .unwrap();
+        reconcile_agent_runtime_config(&store, data, &cloud_agent, &cloud_cfg, &cloud_work)
+            .unwrap();
+        verify_harness_runtime_config(&cloud_cfg, "spiron", cloud_agent.model.as_deref())
+            .unwrap();
+        let cloud_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(cloud_cfg.join("cloud.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cloud_json["api_key"], "spiron_sk_test_123");
+        assert!(!cloud_cfg.join("spiron-mcp.json").exists());
+
+        let local_agent = store
+            .create_agent(NewAgent::new("spiron-explicit-local", "spiron-local"))
+            .unwrap();
+        let local_cfg = agent_config_dir(data, &local_agent.id);
+        let local_work = data.join("work-local");
+        std::fs::create_dir_all(&local_cfg).unwrap();
+        std::fs::create_dir_all(&local_work).unwrap();
+        reconcile_agent_runtime_config(&store, data, &local_agent, &local_cfg, &local_work)
+            .unwrap();
+        verify_harness_runtime_config(&local_cfg, "spiron-local", local_agent.model.as_deref())
+            .unwrap();
+        assert!(local_cfg.join("spiron-mcp.json").is_file());
+        assert!(local_cfg.join("config.toml").is_file());
     }
 }
