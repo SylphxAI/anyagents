@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use anyagents_harness::Delivery;
@@ -29,11 +29,32 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::activity::{
+    DEFAULT_HEARTBEAT_INTERVAL_MS, GuestActivitySnapshot, clear_activity_snapshot,
+    write_activity_snapshot,
+};
 use crate::dsh_grok::{DshGuestHarness, GrokGuestHarness};
+
+/// Default unified persistent volume mount root inside sandboxes.
+pub const DEFAULT_DATA_MOUNT_DIR: &str = "/home/user/agent-data";
+/// Default persistent agent state directory (`/home/user/agent-data/state`).
+pub const DEFAULT_STATE_DIR: &str = "/home/user/agent-data/state";
+/// Default persistent workspace directory (`/home/user/agent-data/workspace`).
+pub const DEFAULT_WORKDIR: &str = "/home/user/agent-data/workspace";
 
 const GUEST_CONFIG_FILE: &str = "guest-config.json";
 const REPO_SPEC_FILE: &str = "repo-spec.json";
 const IDLE_TICK: Duration = Duration::from_millis(80);
+
+#[derive(Args, Clone, Debug, Default)]
+pub struct HealthArgs {
+    /// Persistent agent state directory (defaults to `/home/user/agent-data/state`).
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+    /// Persistent workspace directory (defaults to `/home/user/agent-data/workspace`).
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+}
 
 #[derive(Args, Clone, Debug)]
 pub struct ServeArgs {
@@ -43,10 +64,10 @@ pub struct ServeArgs {
     /// Explicit path to the underlying vendor CLI binary inside the sandbox.
     #[arg(long)]
     pub program: Option<PathBuf>,
-    /// Persistent agent state directory (typically mounted at `/home/user/agent-state`).
+    /// Persistent agent state directory (defaults to `/home/user/agent-data/state`).
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
-    /// Workspace directory (typically `/home/user/workspace`).
+    /// Persistent workspace directory (defaults to `/home/user/agent-data/workspace`).
     #[arg(long)]
     pub workdir: Option<PathBuf>,
     /// Model identifier override.
@@ -58,9 +79,52 @@ pub struct ServeArgs {
     /// Explicit git binary path when repo checkout is needed.
     #[arg(long)]
     pub git_program: Option<PathBuf>,
+    /// Interval in milliseconds for emitting remote `system/heartbeat` frames (`0` disables stream ticks).
+    #[arg(long)]
+    pub heartbeat_interval_ms: Option<u64>,
     /// Trailing CLI flags forwarded to compatible adapters.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub extra_args: Vec<String>,
+}
+
+/// Resolve the guest state directory from explicit CLI override, env vars, or `/home/user/agent-data/state`.
+pub fn resolve_default_state_dir(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = explicit {
+        return p;
+    }
+    for key in ["ANYAGENTS_GUEST_STATE_DIR", "ANYAGENTS_SANDBOX_STATE_DIR"] {
+        if let Some(val) = env_non_empty_path(key) {
+            return val;
+        }
+    }
+    if let Some(data_dir) = env_non_empty_path("ANYAGENTS_SANDBOX_DATA_DIR") {
+        return data_dir.join("state");
+    }
+    PathBuf::from(DEFAULT_STATE_DIR)
+}
+
+/// Resolve the guest working directory from explicit CLI override, env vars, or `/home/user/agent-data/workspace`.
+pub fn resolve_default_workdir(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = explicit {
+        return p;
+    }
+    for key in ["ANYAGENTS_GUEST_WORKDIR", "ANYAGENTS_SANDBOX_WORKDIR"] {
+        if let Some(val) = env_non_empty_path(key) {
+            return val;
+        }
+    }
+    if let Some(data_dir) = env_non_empty_path("ANYAGENTS_SANDBOX_DATA_DIR") {
+        return data_dir.join("workspace");
+    }
+    PathBuf::from(DEFAULT_WORKDIR)
+}
+
+fn env_non_empty_path(key: &str) -> Option<PathBuf> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Optional configuration synced by the coordinator into `<state-dir>/guest-config.json`.
@@ -531,15 +595,12 @@ pub fn run_serve(mut args: ServeArgs) -> Result<(), String> {
     if args.harness.is_none() {
         args.harness = std::env::var("ANYAGENTS_GUEST_HARNESS").ok();
     }
-    if args.state_dir.is_none() {
-        args.state_dir = std::env::var_os("ANYAGENTS_GUEST_STATE_DIR")
-            .map(PathBuf::from)
-            .or_else(|| Some(PathBuf::from("/home/user/agent-state")));
-    }
-    if args.workdir.is_none() {
-        args.workdir = std::env::var_os("ANYAGENTS_GUEST_WORKDIR")
-            .map(PathBuf::from)
-            .or_else(|| Some(PathBuf::from("/home/user/workspace")));
+    args.state_dir = Some(resolve_default_state_dir(args.state_dir.take()));
+    args.workdir = Some(resolve_default_workdir(args.workdir.take()));
+    if args.heartbeat_interval_ms.is_none() {
+        args.heartbeat_interval_ms = std::env::var("ANYAGENTS_GUEST_HEARTBEAT_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
     }
     let reader = BufReader::new(std::io::stdin());
     let stdout = std::io::stdout();
@@ -577,11 +638,16 @@ pub(crate) fn run_serve_io<R: BufRead + Send + 'static, W: Write>(
     let state_dir = args
         .state_dir
         .clone()
-        .unwrap_or_else(|| PathBuf::from("/home/user/agent-state"));
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
     let default_workdir = args
         .workdir
         .clone()
-        .unwrap_or_else(|| PathBuf::from("/home/user/workspace"));
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKDIR));
+    let heartbeat_interval_ms = args
+        .heartbeat_interval_ms
+        .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL_MS);
+    let heartbeat_interval =
+        (heartbeat_interval_ms > 0).then(|| Duration::from_millis(heartbeat_interval_ms));
     std::fs::create_dir_all(&state_dir)
         .map_err(|e| format!("cannot create state dir {}: {e}", state_dir.display()))?;
     let file_cfg = load_guest_config(&state_dir);
@@ -744,6 +810,17 @@ pub(crate) fn run_serve_io<R: BufRead + Send + 'static, W: Write>(
     let mut queued: VecDeque<(OutboundMessage, String, Value)> = VecDeque::new();
     let mut inflight: VecDeque<PendingTurn> = VecDeque::new();
     let mut eof = false;
+    let mut last_heartbeat = Instant::now();
+    let mut last_activity_sync = Instant::now() - Duration::from_secs(10);
+
+    let initial_snap = GuestActivitySnapshot::capture_current(
+        &harness_name,
+        Some(initial_sid.clone()),
+        turn_state_label(initial_health.turn_state),
+        0,
+        0,
+    );
+    let _ = write_activity_snapshot(&state_dir, &initial_snap);
 
     loop {
         while let Ok(ev) = rx.try_recv() {
@@ -969,14 +1046,43 @@ pub(crate) fn run_serve_io<R: BufRead + Send + 'static, W: Write>(
             break;
         }
 
-        wait_wake(&wakeup, IDLE_TICK);
+        let heartbeat_due = heartbeat_interval.is_some_and(|iv| last_heartbeat.elapsed() >= iv);
+        if heartbeat_due || last_activity_sync.elapsed() >= Duration::from_secs(1) {
+            let snap = GuestActivitySnapshot::capture_current(
+                &harness_name,
+                adapter.session_id().or_else(|| Some(initial_sid.clone())),
+                turn_state_label(health.turn_state),
+                inflight.len(),
+                queued.len(),
+            );
+            let _ = write_activity_snapshot(&state_dir, &snap);
+            last_activity_sync = Instant::now();
+            if heartbeat_due {
+                emit_line(writer, &snap.to_heartbeat_event())?;
+                last_heartbeat = Instant::now();
+            }
+        }
+
+        let wait_dur = match heartbeat_interval {
+            Some(iv) => IDLE_TICK.min(iv.max(Duration::from_millis(10))),
+            None => IDLE_TICK,
+        };
+        wait_wake(&wakeup, wait_dur);
     }
 
+    clear_activity_snapshot(&state_dir);
     adapter.stop();
     if let Some(sid) = adapter.session_id() {
         let _ = persist_session(&state_dir, &harness_name, &sid);
     }
     Ok(())
+}
+
+fn turn_state_label(state: TurnState) -> &'static str {
+    match state {
+        TurnState::Idle => "idle",
+        TurnState::InTurn => "in_turn",
+    }
 }
 
 fn emit_turn_completion<W: Write>(
@@ -1274,6 +1380,7 @@ fn build_guest_env(
         ("SPIRON_STATE_DIR", state_str.as_str()),
         ("SPIRON_WORKSPACE", &work_dir.display().to_string()),
         ("ANYAGENTS_GUEST_STATE_DIR", state_str.as_str()),
+        ("ANYAGENTS_GUEST_WORKDIR", &work_dir.display().to_string()),
         ("MUSE_NO_AUTO_UPDATE", "1"),
     ] {
         env.retain(|(ek, _)| ek != k);
@@ -1508,6 +1615,7 @@ done
             model: None,
             session: None,
             git_program: None,
+            heartbeat_interval_ms: None,
             extra_args: vec!["--guest-bare".into()],
         };
         let (line_tx, line_rx) = mpsc::channel::<String>();
@@ -1605,5 +1713,218 @@ done
         let decoded: Delivery = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.level, anyagents_harness::DeliveryLevel::MidTurn);
         assert_eq!(decoded.peer.as_deref(), Some("opencode 1.0"));
+    }
+
+    #[test]
+    fn guest_default_paths_align_to_agent_data_and_respect_env_overrides() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = [
+            "ANYAGENTS_GUEST_STATE_DIR",
+            "ANYAGENTS_SANDBOX_STATE_DIR",
+            "ANYAGENTS_GUEST_WORKDIR",
+            "ANYAGENTS_SANDBOX_WORKDIR",
+            "ANYAGENTS_SANDBOX_DATA_DIR",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in keys {
+            unsafe { std::env::remove_var(k) };
+        }
+
+        assert_eq!(
+            resolve_default_state_dir(None),
+            PathBuf::from("/home/user/agent-data/state")
+        );
+        assert_eq!(
+            resolve_default_workdir(None),
+            PathBuf::from("/home/user/agent-data/workspace")
+        );
+
+        unsafe { std::env::set_var("ANYAGENTS_SANDBOX_DATA_DIR", "/mnt/persistent") };
+        assert_eq!(
+            resolve_default_state_dir(None),
+            PathBuf::from("/mnt/persistent/state")
+        );
+        assert_eq!(
+            resolve_default_workdir(None),
+            PathBuf::from("/mnt/persistent/workspace")
+        );
+
+        unsafe {
+            std::env::set_var("ANYAGENTS_GUEST_STATE_DIR", "/custom/state");
+            std::env::set_var("ANYAGENTS_GUEST_WORKDIR", "/custom/work");
+        }
+        assert_eq!(
+            resolve_default_state_dir(None),
+            PathBuf::from("/custom/state")
+        );
+        assert_eq!(resolve_default_workdir(None), PathBuf::from("/custom/work"));
+
+        for (k, val) in saved {
+            match val {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+
+    #[test]
+    fn guest_serve_emits_heartbeat_and_reports_live_inflight_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        let work_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        let script = tmp.path().join("fake-claude-with-bg-job");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+echo '{"type":"system","subtype":"init","session_id":"hb-sess-1","claude_code_version":"1.0","peer":"claude-code 1.0"}'
+sleep 30 &
+bg_pid=$!
+trap 'kill "$bg_pid" 2>/dev/null || true; exit 0' INT TERM EXIT
+while IFS= read -r line; do
+  :
+done
+kill "$bg_pid" 2>/dev/null || true
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let (line_tx, line_rx) = mpsc::channel::<String>();
+        struct ChannelReader {
+            rx: mpsc::Receiver<String>,
+            buf: Vec<u8>,
+            pos: usize,
+        }
+        impl std::io::Read for ChannelReader {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                while self.pos >= self.buf.len() {
+                    match self.rx.recv() {
+                        Ok(next) => {
+                            self.buf = next.into_bytes();
+                            self.pos = 0;
+                        }
+                        Err(_) => return Ok(0),
+                    }
+                }
+                let n = (self.buf.len() - self.pos).min(out.len());
+                out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let (hb_tx, hb_rx) = mpsc::channel::<Value>();
+        struct HeartbeatCapturingWriter {
+            buf: Vec<u8>,
+            pending_line: Vec<u8>,
+            hb_tx: mpsc::Sender<Value>,
+        }
+        impl Write for HeartbeatCapturingWriter {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.buf.extend_from_slice(data);
+                self.pending_line.extend_from_slice(data);
+                while let Some(pos) = self.pending_line.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = self.pending_line.drain(..=pos).collect();
+                    if let Ok(val) = serde_json::from_slice::<Value>(&line)
+                        && val.get("subtype").and_then(Value::as_str) == Some("heartbeat")
+                    {
+                        let _ = self.hb_tx.send(val);
+                    }
+                }
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let state_probe = state_dir.clone();
+        let work_probe = work_dir.clone();
+        let stopper = std::thread::spawn(move || {
+            let mut saw_busy_hb = None;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                match hb_rx.recv_timeout(rem) {
+                    Ok(ev) => {
+                        #[cfg(target_os = "linux")]
+                        let ready = ev["inflight_children"].as_u64().unwrap_or(0) >= 1;
+                        #[cfg(not(target_os = "linux"))]
+                        let ready = true;
+                        if ready {
+                            let health =
+                                crate::activity::build_health_payload(&state_probe, &work_probe);
+                            saw_busy_hb = Some((ev, health));
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            drop(line_tx);
+            saw_busy_hb
+        });
+
+        let args = ServeArgs {
+            harness: Some("claude-code".into()),
+            program: Some(script),
+            state_dir: Some(state_dir.clone()),
+            workdir: Some(work_dir),
+            model: None,
+            session: None,
+            git_program: None,
+            heartbeat_interval_ms: Some(40),
+            extra_args: vec!["--guest-bare".into()],
+        };
+        let reader = BufReader::new(ChannelReader {
+            rx: line_rx,
+            buf: Vec::new(),
+            pos: 0,
+        });
+        let mut out = HeartbeatCapturingWriter {
+            buf: Vec::new(),
+            pending_line: Vec::new(),
+            hb_tx,
+        };
+        run_serve_io(args, reader, &mut out).unwrap();
+        let (hb_ev, health_ev) = stopper
+            .join()
+            .unwrap()
+            .expect("should observe heartbeat with live background child");
+
+        assert_eq!(hb_ev["type"], "system");
+        assert_eq!(hb_ev["subtype"], "heartbeat");
+        assert_eq!(hb_ev["harness"], "claude-code");
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                hb_ev["inflight_children"].as_u64().unwrap_or(0) >= 1,
+                "expected inflight_children >= 1 in heartbeat: {hb_ev}"
+            );
+            assert_eq!(
+                hb_ev["busy"], true,
+                "expected busy=true in heartbeat: {hb_ev}"
+            );
+            assert!(
+                health_ev["inflight_children"].as_u64().unwrap_or(0) >= 1,
+                "expected inflight_children >= 1 in health payload: {health_ev}"
+            );
+            assert_eq!(
+                health_ev["busy"], true,
+                "expected busy=true in health: {health_ev}"
+            );
+        }
+        assert_eq!(health_ev["status"], "ok");
+        assert_eq!(health_ev["binary"], "anyagents-guest");
+        assert_eq!(health_ev["harnesses"], 9);
     }
 }
