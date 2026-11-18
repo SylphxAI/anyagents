@@ -4928,13 +4928,13 @@ pub(crate) mod tests {
         .unwrap();
         assert!(memory.is_room(-1007));
         assert_eq!(store.inbox(&agent.id, None).unwrap().len(), 1);
-        detach_removed_own_bots_from_chat(&store, -1007, &[77]).unwrap();
+        detach_removed_own_bots_from_chat(&store, -1007, Some(42), &[77]).unwrap();
         assert!(
             Memory::try_from_state(&store.list_channels().unwrap()[0].state)
                 .unwrap()
                 .is_room(-1007)
         );
-        detach_removed_own_bots_from_chat(&store, -1007, &[777]).unwrap();
+        detach_removed_own_bots_from_chat(&store, -1007, Some(42), &[777]).unwrap();
         assert!(
             !Memory::try_from_state(&store.list_channels().unwrap()[0].state)
                 .unwrap()
