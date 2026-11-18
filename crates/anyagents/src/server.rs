@@ -4360,6 +4360,7 @@ fn archived_agent_view_fast(agent: &Agent) -> AgentView {
         schedules: Vec::new(),
         turn_errors: None,
         unsettled_outbound: Vec::new(),
+        retry_at_ms: None,
     }
 }
 
@@ -4448,8 +4449,18 @@ fn agent_view_preloaded(
         process_started_at_ms,
         pending_switch,
         last_error,
+        retry_at_ms,
     ) = match health.get(&agent.id) {
         Some(live) if !crate::vendor::is_spiron_harness(&agent.harness) || live.process_alive => {
+            // The supervisor retries a transient capacity fault by itself and
+            // publishes the work as in progress: neither the fault nor the
+            // record its adapter persisted for it is an error of the agent's.
+            let retry_at_ms = live.retry_at_ms.filter(|_| live.process_alive);
+            let (session_quota, session_error) = if retry_at_ms.is_some() {
+                (None, None)
+            } else {
+                (session_quota, session_error)
+            };
             let effective_quota = live.quota_reset_at_ms.or(session_quota);
             let effective_err = live.last_error.clone().or(session_error);
             let working = live.process_alive
@@ -4485,6 +4496,7 @@ fn agent_view_preloaded(
                 live.process_started_at_ms,
                 switch_pending,
                 effective_err,
+                retry_at_ms,
             )
         }
         _ => {
@@ -4513,6 +4525,7 @@ fn agent_view_preloaded(
                 None,
                 false,
                 session_error,
+                None,
             )
         }
     };
@@ -4658,6 +4671,7 @@ fn agent_view_preloaded(
             .filter(|held| held.agent_id == agent.id)
             .map(unsettled_view)
             .collect(),
+        retry_at_ms,
     })
 }
 
@@ -9962,6 +9976,7 @@ pub(crate) mod tests {
             live_model: None,
             process_started_at_ms: Some(1),
             last_error: error.map(str::to_string),
+            retry_at_ms: None,
         };
         health.publish(&agent.id, live(Some(reset_ms), None));
         let view = agent_view(&store, &health, &agent).unwrap();
@@ -9980,6 +9995,79 @@ pub(crate) mod tests {
         let view = agent_view(&store, &health, &agent).unwrap();
         assert_eq!(view.turn_state, "errored");
         assert_eq!(view.block_reason.as_deref(), Some("sign_in_required"));
+    }
+
+    /// A capacity fault the supervisor retries is work in progress: the view
+    /// shows the agent working with its retry time, never `errored`, even
+    /// though the adapter persisted the fault, and its parent is told nothing.
+    /// Without the retry the same fault is an error, and the parent is told.
+    #[test]
+    fn agent_view_shows_a_capacity_retry_as_work_in_progress_without_a_parent_notice() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let lead = store
+            .create_agent(anyagents_core::NewAgent::new("lead", "spiron"))
+            .unwrap();
+        let worker = store
+            .create_agent(anyagents_core::NewAgent {
+                parent_id: Some(lead.id.clone()),
+                ..anyagents_core::NewAgent::new("worker", "spiron")
+            })
+            .unwrap();
+        store.set_agent_state(&worker.id, "running").unwrap();
+        let worker = store.agent(&worker.id).unwrap();
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &worker.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        let fault = r#"Sylphx AI failure Some("included_capacity_unavailable"): Included capacity is not available right now. Retry later. (request req_7)"#;
+        // What the stream adapter persists when the turn fails.
+        std::fs::write(
+            cfg.join(".anyagents-last-error.json"),
+            serde_json::json!({"error": fault, "quota_reset_at_ms": null, "timestamp_ms": now_ms()})
+                .to_string(),
+        )
+        .unwrap();
+        let retry_at = now_ms() + 15_000;
+        let live = |retry_at_ms: Option<i64>| anyagents_supervisor::LiveState {
+            process_alive: true,
+            turn_state: if retry_at_ms.is_some() {
+                anyagents_harness::TurnState::InTurn
+            } else {
+                anyagents_harness::TurnState::Idle
+            },
+            delivery: Some(crate::vendor::declared_delivery("spiron")),
+            quota_reset_at_ms: None,
+            restart_at_ms: None,
+            pid: Some(42),
+            live_harness: Some("spiron".into()),
+            live_model: None,
+            process_started_at_ms: Some(1),
+            last_error: retry_at_ms.is_none().then(|| fault.to_string()),
+            retry_at_ms,
+        };
+        let parent_notices = || {
+            store
+                .inbox(&lead.id, None)
+                .unwrap()
+                .into_iter()
+                .filter(|m| m.text.starts_with("[Sub-Agent Error]"))
+                .count()
+        };
+
+        health.publish(&worker.id, live(Some(retry_at)));
+        let view = agent_view(&store, &health, &worker).unwrap();
+        assert_eq!(view.turn_state, "working");
+        assert_eq!(view.retry_at_ms, Some(retry_at));
+        assert_eq!(view.last_error, None);
+        assert_eq!(view.block_reason, None);
+        assert_eq!(parent_notices(), 0);
+
+        health.publish(&worker.id, live(None));
+        let view = agent_view(&store, &health, &worker).unwrap();
+        assert_eq!(view.turn_state, "errored");
+        assert_eq!(view.retry_at_ms, None);
+        assert_eq!(view.last_error.as_deref(), Some(fault));
+        assert_eq!(parent_notices(), 1);
     }
 
     #[test]
@@ -10017,6 +10105,7 @@ pub(crate) mod tests {
                     live_model: None,
                     process_started_at_ms: None,
                     last_error: None,
+                    retry_at_ms: None,
                 },
             );
             assert_eq!(
@@ -10092,6 +10181,7 @@ pub(crate) mod tests {
             live_model: None,
             process_started_at_ms: None,
             last_error: None,
+            retry_at_ms: None,
         };
         state.health.publish(&agent.id, live.clone());
         tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -12532,6 +12622,7 @@ pub(crate) mod tests {
             live_model: None,
             process_started_at_ms: None,
             last_error: None,
+            retry_at_ms: None,
         };
         health.publish(&child.id, live.clone());
         reap_archived_agents(&store, dir.path(), &health);
@@ -17877,6 +17968,7 @@ exec '{}' "$@"
                         live_model: None,
                         process_started_at_ms: Some(now_ms()),
                         last_error: Some(msg.to_string()),
+                        retry_at_ms: None,
                     },
                 );
 
@@ -18217,6 +18309,7 @@ exec '{}' "$@"
                 live_model: running.model.clone(),
                 process_started_at_ms: Some(started_ms),
                 last_error: None,
+                retry_at_ms: None,
             },
         );
 

@@ -356,7 +356,7 @@ fn terminal_systemic_fault_keeps_backoff_and_queued_mail(error: &'static str) {
         }));
         assert!(wait_until(|| {
             recorded.waits().iter().any(|(_, deadline)| {
-                deadline.is_some_and(|at| (START + 15_000..=START + 16_000).contains(&at))
+                deadline.is_some_and(|at| (START + 15_000..=START + 19_000).contains(&at))
             }) || fx.vendor.lock().unwrap().attempts.len() > 1
         }));
         let (original_id, attempts) = {
@@ -368,7 +368,7 @@ fn terminal_systemic_fault_keeps_backoff_and_queued_mail(error: &'static str) {
             .waits()
             .iter()
             .find_map(|(_, deadline)| {
-                deadline.filter(|at| (START + 15_000..=START + 16_000).contains(at))
+                deadline.filter(|at| (START + 15_000..=START + 19_000).contains(at))
             })
             .unwrap();
         // A mailbox wake must neither erase the terminal follow-up nor bypass its
@@ -502,8 +502,9 @@ fn an_errored_turn_proven_while_deferred_stays_open_for_its_follow_up() {
         task.seq,
         "the proof is committed, not handed over again"
     );
-    // The systemic backoff ends: the note goes out and closes the turn.
-    clock.set_ms(START + 15_000);
+    // The systemic backoff (15 s, lengthened by up to a fifth) ends: the
+    // note goes out and closes the turn.
+    clock.set_ms(START + 18_000);
     assert!(wait_until(|| fx.vendor.lock().unwrap().given.len() == 2));
     assert!(wait_until(|| !fx
         .store
@@ -586,8 +587,9 @@ fn systemic_errors_back_off_and_never_park() {
         fx.store.has_open_turn(&fx.worker.id).unwrap(),
         "the turn stays open while it waits"
     );
-    // Past it, the note goes out and the turn closes with it.
-    advance(5_000);
+    // Past it (15 s, lengthened by up to a fifth), the note goes out and the
+    // turn closes with it.
+    advance(9_000);
     assert!(wait_until(|| given() == 2));
     let (_, note) = fx.vendor.lock().unwrap().given[1].clone();
     assert!(note.contains("never pauses the agent"), "{note}");
@@ -725,4 +727,137 @@ fn stale_custody_error_callback_suppresses_strikes_and_followup_side_effects() {
     );
     assert_eq!(store.inbox(&worker.id, None).unwrap().len(), 2);
     support::stop(supervisor);
+}
+
+/// What a provider out of capacity answers; each attempt names its own
+/// request, so the text differs from one retry to the next.
+const CAPACITY: &str = "Sylphx AI failure Some(\"included_capacity_unavailable\"): Included capacity is not available right now. Retry later. (request req_0001)";
+
+/// A turn that a transient capacity fault ends is no error of the agent's:
+/// its work stays pending and is retried after a jittered backoff. It is
+/// published as in progress the whole time, with no terminal `errored`
+/// outcome for a watcher, no error shown and nobody told, until the retried
+/// work completes.
+#[test]
+fn a_capacity_fault_is_retried_as_work_in_progress_never_as_an_error() {
+    const START: i64 = 1_700_000_000_000;
+    let clock = ManualClock::new(START);
+    let recorded = RecordingClock::new(clock.clone());
+    let fx = start_with(1, Some(CAPACITY), recorded.clone());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let task = received(&fx.store, &fx.worker, "summarise the incident");
+        assert!(wait_until(|| fx.vendor.lock().unwrap().given.len() == 1));
+        let live = || fx.supervisor.board().get(&fx.worker.id);
+        // The pass that records the fault runs on the worker's short timer.
+        assert!(wait_until(|| {
+            live().is_some_and(|state| state.retry_at_ms.is_some()) || {
+                recorded.fire_next_timer(START + 1_000);
+                false
+            }
+        }));
+        let state = live().unwrap();
+        assert!(state.process_alive, "{state:?}");
+        assert_eq!(state.turn_state, TurnState::InTurn, "{state:?}");
+        assert_eq!(state.last_error, None, "{state:?}");
+        let retry_at = state.retry_at_ms.unwrap();
+        assert!(
+            (START + 15_000..=START + 19_000).contains(&retry_at),
+            "15 s lengthened by up to a fifth: {}",
+            retry_at - START
+        );
+        let snap = fx.store.agent_turn_snapshot(&fx.worker.id).unwrap();
+        assert_eq!(
+            (snap.turn_seq, snap.outcome.as_deref()),
+            (0, None),
+            "a watcher sees no terminal outcome"
+        );
+        assert!(snap.open_turn, "the work stays open while it waits");
+        let errors = fx.store.turn_errors(&fx.worker.id).unwrap().unwrap();
+        assert_eq!(errors.streak, 0, "a capacity fault is never a strike");
+        assert_eq!(errors.last_error.as_deref(), Some(CAPACITY));
+
+        // Nothing is retried before the deadline.
+        clock.set_ms(retry_at - 1);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(fx.vendor.lock().unwrap().given.len(), 1);
+        assert!(live().unwrap().retry_at_ms.is_some());
+
+        // At it, the work goes out again, with what the failed turn held.
+        clock.set_ms(retry_at);
+        assert!(wait_until(|| fx.vendor.lock().unwrap().given.len() == 2));
+        let (_, note) = fx.vendor.lock().unwrap().given[1].clone();
+        assert!(note.contains("[Recovery]"), "{note}");
+        assert!(note.contains(task.id.as_str()), "{note}");
+        assert!(note.contains("summarise the incident"), "{note}");
+
+        // Its completion ends the retry: idle, no error, no notice.
+        assert!(wait_until(|| !fx
+            .store
+            .has_open_turn(&fx.worker.id)
+            .unwrap()));
+        assert!(wait_until(|| {
+            live().is_some_and(|state| state.retry_at_ms.is_none()) || {
+                recorded.fire_next_timer(clock.now_ms() + 60_000);
+                false
+            }
+        }));
+        let state = live().unwrap();
+        assert_eq!(state.last_error, None, "{state:?}");
+        assert_eq!(state.turn_state, TurnState::Idle, "{state:?}");
+        let done = fx.store.agent_turn_snapshot(&fx.worker.id).unwrap();
+        assert_eq!(done.outcome.as_deref(), Some("completed"));
+        assert!(notices(&fx.store, &fx.lead).is_empty());
+    }));
+    support::stop(fx.supervisor);
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+/// Only a fault that clears by itself is retried silently: one somebody has
+/// to act on (a model that does not exist) still backs off without parking,
+/// and stays visible as the error it is.
+#[test]
+fn an_actionable_systemic_error_stays_visible_while_it_backs_off() {
+    const NOT_FOUND: &str =
+        "Sylphx AI failure Some(\"model_not_found\"): The model does not exist.";
+    const START: i64 = 1_700_000_000_000;
+    let clock = ManualClock::new(START);
+    let recorded = RecordingClock::new(clock.clone());
+    let fx = start_with(1, Some(NOT_FOUND), recorded.clone());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fx.store
+            .receive(&fx.worker.id, Incoming::new("summarise the incident"))
+            .unwrap();
+        assert!(wait_until(|| fx.vendor.lock().unwrap().given.len() == 1));
+        let live = || fx.supervisor.board().get(&fx.worker.id);
+        // The pass that records the error runs on the worker's short timer.
+        let recorded_errored = || {
+            fx.store
+                .agent_turn_snapshot(&fx.worker.id)
+                .unwrap()
+                .outcome
+                .as_deref()
+                == Some("errored")
+        };
+        assert!(wait_until(|| recorded_errored() || {
+            recorded.fire_next_timer(START + 1_000);
+            false
+        }));
+        // Its backoff wait publishes it as the error it is, with no retry.
+        assert!(wait_until(|| {
+            live().is_some_and(|state| state.last_error.as_deref() == Some(NOT_FOUND))
+                && recorded
+                    .waits()
+                    .iter()
+                    .any(|(_, deadline)| deadline.is_some_and(|at| at >= START + 15_000))
+        }));
+        let state = live().unwrap();
+        assert_eq!(state.retry_at_ms, None, "{state:?}");
+        assert_ne!(fx.store.agent(&fx.worker.id).unwrap().state, "paused");
+    }));
+    support::stop(fx.supervisor);
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }

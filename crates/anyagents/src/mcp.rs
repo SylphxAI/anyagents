@@ -10720,6 +10720,7 @@ mod spawn_args_tests {
             schedules: Vec::new(),
             turn_errors: None,
             unsettled_outbound: Vec::new(),
+            retry_at_ms: None,
         }
     }
 

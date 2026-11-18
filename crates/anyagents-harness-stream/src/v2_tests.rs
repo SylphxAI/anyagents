@@ -334,6 +334,74 @@ fn bound_terminal_replay_rebuilds_members_without_accepted_and_context_stays_on_
     peer.join().unwrap();
 }
 
+/// A turn that ends on a context rollover handoff (or a tool step) reports
+/// `final_text: ""`: it is completed and its inputs consumed, but it answers
+/// nothing, so it must never become a task result that a parent is told.
+#[test]
+fn a_completed_turn_with_no_final_text_proves_consumption_but_returns_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let peer = std::thread::spawn(move || {
+        let (mut out, _) = listener.accept().unwrap();
+        out.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut reader = BufReader::new(out.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let attach: Value = serde_json::from_str(&line).unwrap();
+        let bound = |text: &str, id: &str| {
+            json!({"type":"result", "status":"completed", "is_error":false, "error":null,
+            "duplicate":false, "tool_context_bound":true, "final_text":text,
+            "consumed_request_ids":[id], "undelivered_steer_ids":[]})
+        };
+        for chunk in [
+            frame(1, "answered", bound("the answer", "answered")),
+            frame(2, "rolled", bound("", "rolled")),
+            frame(3, "rolled-ws", bound(" \n\t", "rolled-ws")),
+            frame(
+                4,
+                attach["request_id"].as_str().unwrap(),
+                json!({"type":"ready", "protocol":"spiron.headless/v2",
+                "features":["turn-tool-context-v1"]}),
+            ),
+        ] {
+            out.write_all(chunk.as_bytes()).unwrap();
+        }
+        line.clear();
+        assert_eq!(reader.read_line(&mut line).unwrap(), 0, "{line}");
+    });
+    let mut harness = StreamHarness::connect(Connect {
+        spec: spec(),
+        program: "spiron".into(),
+        socket: path,
+        pid: Some(4242),
+        after_seq: Some(0),
+        session_id: Some("s-1".into()),
+        environment: Vec::new(),
+        delivery: SPIRON,
+    })
+    .unwrap();
+    harness.wait_ready(Duration::from_secs(10)).unwrap();
+    assert!(harness.supports_turn_tool_context());
+    for id in ["answered", "rolled", "rolled-ws"] {
+        assert_eq!(
+            harness.proven(id),
+            Some(Proof::Taken {
+                turn_finished: true
+            }),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        harness.task_turn_result("answered"),
+        Some(("answered".into(), "the answer".into()))
+    );
+    assert!(harness.task_turn_result("rolled").is_none());
+    assert!(harness.task_turn_result("rolled-ws").is_none());
+    harness.stop();
+    peer.join().unwrap();
+}
+
 #[test]
 fn replayed_ready_does_not_enable_context_before_or_without_current_negotiation() {
     let dir = tempfile::tempdir().unwrap();
