@@ -39,7 +39,7 @@ pub struct BrowserRequest {
     /// `"tabs"` (list tabs, or open/switch/close via `tab_action` and `target_id`),
     /// `"takeover"` (return the URL where a person takes over the whole desktop, e.g. to solve a CAPTCHA or 2FA challenge),
     /// `"takeover_status"` / `"wait_for_user"` (inspect, or wait for, a person's hand-back),
-    /// `"release_takeover"` (reclaim control from a person),
+    /// `"release_takeover"` (reclaim control or cancel an unclaimed invitation),
     /// `"status"` (profile status and fingerprint),
     /// `"profiles"` / `"list"` (all persistent profiles),
     /// or `"close"` / `"stop"` (stop the desktop; logins stay on disk).
@@ -672,7 +672,7 @@ impl BrowserClient for LiveBrowserClient<'_> {
         self.live.wait_for_hand_back(wait).await
     }
     fn release_takeover(&self, note: String) -> bool {
-        self.live.session.gate().release(Some(note))
+        self.live.release_takeover(note)
     }
 }
 
@@ -1218,12 +1218,12 @@ async fn dispatch_action<C: BrowserClient>(
             // turn an otherwise available takeover into an error.
             let captcha = s.eval(&detect_captcha_expression()).await.ok();
             s.publish_takeover().await;
-            s.expect_hand_back(captcha_detected_flag(captcha.as_ref()));
             if s.takeover_url().is_none() {
                 return Err(ToolError::unsupported(
                     "this desktop session has no takeover page",
                 ));
             }
+            s.expect_hand_back(captcha_detected_flag(captcha.as_ref()));
             let reason = req.reason.as_deref().or(req.text.as_deref());
             let mut m = json_map(json!({
                 "status": "takeover_ready",
