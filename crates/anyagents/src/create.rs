@@ -216,7 +216,7 @@ fn create_with_seat(
         request,
         consumer,
         root_seat,
-        anyagents_tools::SandboxMode::from_env(),
+        crate::sandbox_providers::SandboxMode::from_env(),
     )
 }
 
@@ -226,7 +226,7 @@ fn create_with_seat_and_sandbox_mode(
     request: CreateRequest,
     consumer: &crate::repo::Checkouts,
     root_seat: Option<crate::sandbox::RootSeatRequest>,
-    sandbox_mode: anyagents_tools::SandboxMode,
+    sandbox_mode: crate::sandbox_providers::SandboxMode,
 ) -> Result<Agent, Error> {
     let normalized_harness = normalize_harness_name(&request.harness).to_string();
     // A harness is installed only if an adapter can start it.
@@ -441,10 +441,10 @@ fn create_with_seat_and_sandbox_mode(
         if sandbox_mode.is_remote_required()
             && !effective_cloud
             && !crate::sandbox_exec::has_remote_sandbox_provider(Some(&data))
-            && anyagents_tools::SylphxProviderConfig::resolve(Some(&data))
+            && crate::sandbox_providers::SylphxProviderConfig::resolve(Some(&data))
                 .map_err(Error::Message)?
                 .is_none()
-            && anyagents_tools::SandboxProviderConfig::resolve(Some(&data)).is_none()
+            && crate::sandbox_providers::resolve_sandbox_provider_config(Some(&data)).is_none()
         {
             return Err(Error::Message(
                 "ANYAGENTS_SANDBOX_MODE=remote_required requires a remote sandbox provider (`ANYAGENTS_SANDBOX_PROVIDER` or `ANYAGENTS_SYLPHX_PARENT`)"
@@ -642,13 +642,14 @@ fn create_with_seat_and_sandbox_mode(
         store.set_agent_launch_env(&agent.id, &pairs)?;
         if !remote_placement
             && !effective_cloud
-            && anyagents_tools::SandboxConfig::from_config_dir(&config).is_none()
+            && crate::sandbox_providers::sandbox_config_from_config_dir(&config).is_none()
             && !crate::sandbox_exec::has_remote_sandbox_provider(Some(&data))
-            && anyagents_tools::SylphxProviderConfig::resolve(Some(&data))
+            && crate::sandbox_providers::SylphxProviderConfig::resolve(Some(&data))
                 .map_err(Error::Message)?
                 .is_none()
-            && let Some(provider) = anyagents_tools::SandboxProviderConfig::resolve(Some(&data))
-            && let Ok(sbx) = anyagents_tools::SandboxProvider::provision(
+            && let Some(provider) =
+                crate::sandbox_providers::resolve_sandbox_provider_config(Some(&data))
+            && let Ok(sbx) = agent_tools::SandboxProvider::provision(
                 &provider,
                 agent.id.as_str(),
                 &agent.name,
@@ -3246,7 +3247,7 @@ fn reconcile_agent_runtime_config_inner(
     }
     let capability = std::fs::read_to_string(config.join("mcp-capability"))?;
     crate::operator::verify_capability(store, &agent.id, capability.trim())?;
-    let sandbox_mode = anyagents_tools::SandboxMode::from_env();
+    let sandbox_mode = crate::sandbox_providers::SandboxMode::from_env();
     if !sandbox_mode.is_remote_required()
         && crate::sandbox::seats_configured()
         && resolved_agent_seat_info(store, agent).is_none()
@@ -18604,7 +18605,7 @@ Connection: close
             req,
             &checkouts,
             None,
-            anyagents_tools::SandboxMode::RemoteRequired,
+            crate::sandbox_providers::SandboxMode::RemoteRequired,
         )
         .unwrap_err();
         assert!(

@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
-use anyagents_tools::providers::{
+use super::providers::{
     CloudflareConfig, CloudflareProvider, DEFAULT_IDLE_TTL_MS, DEFAULT_MAX_LEASE_TTL_MS,
     DEFAULT_MOUNT_PATH, DEFAULT_STATE_DIR, DEFAULT_WORKDIR, DaytonaConfig, DaytonaProvider,
     DockerConfig, DockerProvider, E2bConfig, E2bProvider, EnsureSandboxRequest, ExecRequest,
@@ -16,12 +16,12 @@ use anyagents_tools::providers::{
     SandboxRegistryConfig, SylphxConfig, SylphxProvider, VolumeSpec, build_bundle_tar_gz,
     extract_bundle_tar_gz, persistent_layout_init_script,
 };
-use anyagents_tools::sylphx::{
+use super::sylphx::{
     DEFAULT_LEASE_TTL, DEFAULT_MOUNT_PATH as SYLPHX_DEFAULT_MOUNT,
     DEFAULT_SANDBOX_WORKDIR as SYLPHX_DEFAULT_WORKDIR, DEFAULT_STATE_DIR as SYLPHX_DEFAULT_STATE,
     encode_connect_frame,
 };
-use anyagents_tools::{base64_decode, base64_encode};
+use agent_tools::{base64_decode, base64_encode};
 
 #[derive(Clone, Debug)]
 struct CapturedReq {

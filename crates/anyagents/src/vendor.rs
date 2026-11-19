@@ -1464,7 +1464,7 @@ fn vendor_launch_inner(
                 seat_hint.as_deref(),
             )
         });
-    let sandbox_mode = anyagents_tools::SandboxMode::from_env();
+    let sandbox_mode = crate::sandbox_providers::SandboxMode::from_env();
     let effective_cloud = is_effective_cloud_harness(
         &request.agent.harness,
         Some(&request.data_dir),
@@ -1475,14 +1475,16 @@ fn vendor_launch_inner(
         .is_some();
     let sylphx_backed = pg_sandbox_backed
         || crate::sandbox_exec::has_remote_sandbox_provider(Some(&request.data_dir))
-        || anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&request.config_dir)
-            .is_some()
-        || anyagents_tools::SylphxProviderConfig::resolve(Some(&request.data_dir))
+        || crate::sandbox_providers::sylphx::SylphxLeaseConfig::from_config_dir(
+            &request.config_dir,
+        )
+        .is_some()
+        || crate::sandbox_providers::SylphxProviderConfig::resolve(Some(&request.data_dir))
             .ok()
             .flatten()
             .is_some();
     let remote_sandbox_backed = sylphx_backed
-        || anyagents_tools::SandboxConfig::resolve(Some(&request.config_dir))
+        || crate::sandbox_providers::resolve_sandbox_config(Some(&request.config_dir))
             .is_some_and(|cfg| cfg.remote_spawn);
 
     if crate::sandbox::seats_configured()
@@ -1743,7 +1745,7 @@ fn plan_adapter(
             &request.agent.harness,
         ));
     }
-    let sandbox_mode = anyagents_tools::SandboxMode::from_env();
+    let sandbox_mode = crate::sandbox_providers::SandboxMode::from_env();
     let effective_cloud = is_effective_cloud_harness(
         &request.agent.harness,
         Some(&request.data_dir),
@@ -1751,14 +1753,17 @@ fn plan_adapter(
     );
     let sylphx_backed = pg_sandbox_backed
         || crate::sandbox_exec::has_remote_sandbox_provider(Some(&request.data_dir))
-        || anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&request.config_dir)
-            .is_some()
-        || anyagents_tools::SylphxProviderConfig::resolve(Some(&request.data_dir))
+        || crate::sandbox_providers::sylphx::SylphxLeaseConfig::from_config_dir(
+            &request.config_dir,
+        )
+        .is_some()
+        || crate::sandbox_providers::SylphxProviderConfig::resolve(Some(&request.data_dir))
             .ok()
             .flatten()
             .is_some();
-    let legacy_remote_spawn = anyagents_tools::SandboxConfig::resolve(Some(&request.config_dir))
-        .is_some_and(|cfg| cfg.remote_spawn);
+    let legacy_remote_spawn =
+        crate::sandbox_providers::resolve_sandbox_config(Some(&request.config_dir))
+            .is_some_and(|cfg| cfg.remote_spawn);
 
     if !scripted && !effective_cloud && (sylphx_backed || legacy_remote_spawn) {
         let canonical = if request.agent.harness.eq_ignore_ascii_case("spiron-local") {
@@ -2511,7 +2516,7 @@ pub(crate) fn spiron_uses_local_execution(
     if !is_spiron_harness(trimmed) {
         return false;
     }
-    if anyagents_tools::SandboxMode::from_env().is_remote_required() {
+    if crate::sandbox_providers::SandboxMode::from_env().is_remote_required() {
         return false;
     }
     if let Ok(mode) = std::env::var("ANYAGENTS_SPIRON_EXECUTION_MODE")

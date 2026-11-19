@@ -623,7 +623,7 @@ fn validate_fetch_url_inner(url_str: &str, resolve_dns: bool) -> Result<(), Stri
 }
 
 fn is_non_global_ip(ip: IpAddr) -> bool {
-    !anyagents_tools::web::is_global_unicast_ip(ip)
+    !agent_tools::web::is_global_unicast_ip(ip)
 }
 
 fn execute_sylphx_baas_search(
@@ -1998,7 +1998,7 @@ fn execute_direct_http_fetch(
 }
 
 pub fn html_to_clean_markdown(raw: &str) -> (Option<String>, String) {
-    anyagents_tools::web::html_to_markdown(raw)
+    agent_tools::web::html_to_markdown(raw)
 }
 
 fn send_http_json(

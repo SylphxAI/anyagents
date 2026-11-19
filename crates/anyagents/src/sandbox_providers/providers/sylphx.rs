@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use crate::encoding::base64_encode;
-use crate::sylphx::{DEFAULT_SHAPE, DEFAULT_TEMPLATE, SylphxSandboxClient};
+use super::super::sylphx::{DEFAULT_SHAPE, DEFAULT_TEMPLATE, SylphxSandboxClient};
+use agent_tools::base64_encode;
 
 use super::{
     DEFAULT_MOUNT_PATH, EnsureSandboxRequest, ExecOutput, ExecRequest, LeasePolicy,

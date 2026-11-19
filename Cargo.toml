@@ -18,8 +18,6 @@ members = [
     "crates/anyagents-toolchain",
     "crates/anyagents-channel-telegram",
     "crates/anyagents-gateway",
-    "crates/anyagents-tools",
-    "crates/anyagents-memory",
     "crates/anyagents-guest",
     "crates/anyagents",
     "tests/invariants",

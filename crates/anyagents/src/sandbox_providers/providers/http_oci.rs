@@ -15,7 +15,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
-use crate::encoding::{base64_encode, url_encode_query_component};
+use super::super::url_encode_query_component;
+use agent_tools::base64_encode;
 
 use super::{
     EnsureSandboxRequest, ExecOutput, ExecRequest, NetworkPolicySpec, ProviderHealth, ProviderKind,

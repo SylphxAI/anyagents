@@ -157,7 +157,7 @@ fn stored_route_to_provider_route(r: StoredGatewayRoute) -> ProviderRoute {
 /// exclusively on the public/HTTP router via [`http_router_for_store`].
 pub fn start(data: &Path) -> Result<Started, Error> {
     let guard = START.lock().unwrap_or_else(PoisonError::into_inner);
-    if anyagents_tools::SandboxMode::from_env().is_remote_required() {
+    if crate::sandbox_providers::SandboxMode::from_env().is_remote_required() {
         let store = Store::open(data.join("state.db"))?;
         let agents = if store.is_postgres() {
             store
@@ -608,12 +608,12 @@ pub fn add_route(data: &Path, agent: &Agent) -> Result<Option<String>, Error> {
     // Local agents keep using the loopback listener; remote-sandbox agents must
     // use the external public gateway origin so sandboxes never dial 127.0.0.1.
     let config_dir = anyagents_core::agent_config_dir(data, &agent.id);
-    let remote_required = anyagents_tools::SandboxMode::from_env().is_remote_required();
-    let runs_in_sandbox = anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir)
-        .is_some()
-        || anyagents_tools::SandboxConfig::resolve(Some(&config_dir))
-            .is_some_and(|s| s.remote_spawn)
-        || remote_required;
+    let remote_required = crate::sandbox_providers::SandboxMode::from_env().is_remote_required();
+    let runs_in_sandbox =
+        crate::sandbox_providers::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir).is_some()
+            || crate::sandbox_providers::resolve_sandbox_config(Some(&config_dir))
+                .is_some_and(|s| s.remote_spawn)
+            || remote_required;
     let origin = if runs_in_sandbox {
         public_origin(Some(data))
     } else {
@@ -672,7 +672,7 @@ pub fn store_key_in(
             token: tok.clone(),
         })?;
         shared_routes().insert(tok.clone(), stored_route_to_provider_route(stored));
-        if !anyagents_tools::SandboxMode::from_env().is_remote_required()
+        if !crate::sandbox_providers::SandboxMode::from_env().is_remote_required()
             && let Some(origin) = public_origin(Some(store.data_dir())).or_else(origin)
         {
             let env = env_for_parts(&agent.harness, model, &tok, &origin);

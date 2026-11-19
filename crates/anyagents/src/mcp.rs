@@ -567,7 +567,7 @@ mod stdio_frame_cap_tests {
     async fn native_and_nested_media_pass_above_text_budget() {
         let mut image = image::RgbaImage::new(768, 768);
         let mut state = 1u32;
-        for byte in image.as_mut() {
+        for byte in image.as_flat_samples_mut().samples {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
@@ -3982,8 +3982,8 @@ impl AgentMcp {
         let scope = current_call().scope();
         let (val, media) = tokio::task::spawn_blocking(move || {
             let _scope = code_children::enter(scope);
-            let mode = anyagents_tools::SandboxMode::from_env();
-            let backend = anyagents_tools::resolve_workspace_backend_for_mode(
+            let mode = crate::sandbox_providers::SandboxMode::from_env();
+            let backend = crate::sandbox_providers::resolve_workspace_backend_for_mode(
                 Some(&config_dir),
                 base_dir.clone(),
                 mode,
@@ -4029,7 +4029,7 @@ fn code_tool_description(limits: CodeLimits, backend: &str) -> String {
         ),
         _ => limits_text.push_str(&format!(
             "; `workspace.exec` runs in your remote sandbox, which stops a command at {}",
-            anyagents_tools::REMOTE_EXEC_MAX_TIMEOUT_MS
+            agent_tools::REMOTE_EXEC_MAX_TIMEOUT_MS
         )),
     }
     CODE_TOOL_DESCRIPTION.replace(CODE_TOOL_LIMITS_TEXT, &limits_text)
@@ -4704,8 +4704,8 @@ impl AgentMcp {
         let mut tools =
             tool_definitions_with_roles(self.profile, Some(&wd), self.client.socket.parent());
         if tools.iter().any(|t| t.name == "code") {
-            let mode = anyagents_tools::SandboxMode::from_env();
-            let kind = match anyagents_tools::resolve_workspace_backend_for_mode(
+            let mode = crate::sandbox_providers::SandboxMode::from_env();
+            let kind = match crate::sandbox_providers::resolve_workspace_backend_for_mode(
                 Some(&self.client.config),
                 wd,
                 mode,
@@ -6854,7 +6854,7 @@ fn resolve_workspace_path(
 }
 
 fn execute_files_tool_with_media_backend(
-    backend: &dyn anyagents_tools::WorkspaceBackend,
+    backend: &dyn agent_tools::WorkspaceBackend,
     base_dir: &Path,
     args: FilesArgs,
     limits: CodeLimits,
@@ -6866,7 +6866,7 @@ fn execute_files_tool_with_media_backend(
 }
 
 fn execute_remote_files_tool_with_media(
-    backend: &dyn anyagents_tools::WorkspaceBackend,
+    backend: &dyn agent_tools::WorkspaceBackend,
     args: FilesArgs,
     limits: CodeLimits,
 ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
@@ -7106,10 +7106,10 @@ fn execute_remote_files_tool_with_media(
                 "docker" => None,
                 _ => code_contract::exec_clamp_note(
                     asked,
-                    timeout_ms.min(anyagents_tools::REMOTE_EXEC_MAX_TIMEOUT_MS),
+                    timeout_ms.min(agent_tools::REMOTE_EXEC_MAX_TIMEOUT_MS),
                     &format!(
                         "your remote sandbox stops a command at {}ms",
-                        anyagents_tools::REMOTE_EXEC_MAX_TIMEOUT_MS
+                        agent_tools::REMOTE_EXEC_MAX_TIMEOUT_MS
                     ),
                 ),
             }
@@ -7146,7 +7146,7 @@ fn execute_remote_files_tool_with_media(
 }
 
 fn execute_remote_glob(
-    backend: &dyn anyagents_tools::WorkspaceBackend,
+    backend: &dyn agent_tools::WorkspaceBackend,
     args: FilesArgs,
 ) -> Result<serde_json::Value, String> {
     let mut raw_pattern = args
@@ -7211,7 +7211,7 @@ fn execute_remote_glob(
 }
 
 fn execute_remote_grep(
-    backend: &dyn anyagents_tools::WorkspaceBackend,
+    backend: &dyn agent_tools::WorkspaceBackend,
     args: FilesArgs,
 ) -> Result<serde_json::Value, String> {
     let query = args
@@ -7353,7 +7353,7 @@ fn collect_grep_hits_from_bytes(
 }
 
 fn remote_collect_workspace_files(
-    backend: &dyn anyagents_tools::WorkspaceBackend,
+    backend: &dyn agent_tools::WorkspaceBackend,
     search_root: &str,
     include_hidden: bool,
     include_ignored: bool,
@@ -7429,7 +7429,7 @@ fn remote_collect_workspace_files(
 
 #[allow(clippy::too_many_arguments)]
 fn remote_walk_dir_recursive(
-    backend: &dyn anyagents_tools::WorkspaceBackend,
+    backend: &dyn agent_tools::WorkspaceBackend,
     abs_dir: &str,
     rel_prefix: &str,
     include_hidden: bool,
@@ -8502,7 +8502,7 @@ impl PatchFs for LocalPatchFs<'_> {
 }
 
 struct RemotePatchFs<'a> {
-    backend: &'a dyn anyagents_tools::WorkspaceBackend,
+    backend: &'a dyn agent_tools::WorkspaceBackend,
 }
 
 impl PatchFs for RemotePatchFs<'_> {
@@ -13380,7 +13380,7 @@ mod client_link_tests {
 
     #[test]
     fn remote_sandbox_files_supports_glob_grep_and_patch() {
-        use anyagents_tools::{ExecOutput, WorkspaceBackend, resolve_workspace_path};
+        use agent_tools::{ExecOutput, WorkspaceBackend, resolve_workspace_path};
         use std::collections::BTreeMap;
         use std::sync::Mutex;
 

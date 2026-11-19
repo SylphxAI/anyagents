@@ -12,20 +12,20 @@ use std::str::FromStr as _;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
-use anyagents_core::stateless::SandboxBinding;
-use anyagents_core::{Agent, AgentId, Error, RuntimeHeartbeat, RuntimeState, Store};
-use anyagents_harness::normalize_harness_name;
-use anyagents_tools::providers::{
+use crate::sandbox_providers::providers::{
     DEFAULT_MAX_LEASE_TTL_MS, DEFAULT_MOUNT_PATH, DEFAULT_WORKDIR, EnsureSandboxRequest,
     ExecRequest, ImageSpec, LeasePolicy, ProviderKind, ProviderRegistry, SandboxHandle,
     SandboxProvider as AsyncSandboxProvider, SandboxRegistryConfig, VolumeSpec,
     build_bundle_tar_gz,
 };
-use anyagents_tools::sylphx::{
+use crate::sandbox_providers::sylphx::{
     EnvdProcessEvent, EnvdSignal, SandboxDriver, SandboxMode, SylphxLeaseConfig,
     SylphxProviderConfig, ensure_leased_for_config_dir, renew_lease_for_config_dir,
 };
-use anyagents_tools::{RemoteSandboxWorkspace, SandboxConfig, WorkspaceBackend, sha256_hex};
+use agent_tools::{RemoteSandboxWorkspace, SandboxConfig, WorkspaceBackend, sha256_hex};
+use anyagents_core::stateless::SandboxBinding;
+use anyagents_core::{Agent, AgentId, Error, RuntimeHeartbeat, RuntimeState, Store};
+use anyagents_harness::normalize_harness_name;
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -308,7 +308,7 @@ pub fn run_with_io_in_store<R: BufRead + Send + 'static, W: Write + Send + 'stat
     }
 
     let mode = SandboxMode::from_env();
-    let sbx = SandboxConfig::resolve(config.as_deref()).ok_or_else(|| {
+    let sbx = crate::sandbox_providers::resolve_sandbox_config(config.as_deref()).ok_or_else(|| {
         let suffix = if mode.is_remote_required() {
             " (ANYAGENTS_SANDBOX_MODE=remote_required forbids host fallback)"
         } else {
@@ -1189,7 +1189,7 @@ fn sylphx_lease_from_handle(
         .or_else(|| registry.default_image_spec().template.clone())
         .or_else(|| sylphx_cfg.as_ref().map(|c| c.template.clone()))
         .or_else(|| existing.as_ref().map(|c| c.template.clone()))
-        .unwrap_or_else(|| anyagents_tools::sylphx::DEFAULT_TEMPLATE.to_string());
+        .unwrap_or_else(|| crate::sandbox_providers::sylphx::DEFAULT_TEMPLATE.to_string());
     let shape = spec
         .get("shape")
         .and_then(Value::as_str)
@@ -1197,7 +1197,7 @@ fn sylphx_lease_from_handle(
         .map(str::to_string)
         .or_else(|| sylphx_cfg.as_ref().map(|c| c.shape.clone()))
         .or_else(|| existing.as_ref().map(|c| c.shape.clone()))
-        .unwrap_or_else(|| anyagents_tools::sylphx::DEFAULT_SHAPE.to_string());
+        .unwrap_or_else(|| crate::sandbox_providers::sylphx::DEFAULT_SHAPE.to_string());
     let volume_id = handle
         .volume_id
         .clone()
@@ -1303,7 +1303,7 @@ pub(crate) fn ensure_sandbox_with_provider(
         image: req_image,
         volume: Some(vol),
         shape,
-        network: anyagents_tools::providers::NetworkPolicySpec::Allow,
+        network: crate::sandbox_providers::providers::NetworkPolicySpec::Allow,
         lease: lease_policy.clone(),
         existing: existing_handle,
         workdir: remote_workdir
@@ -1564,7 +1564,7 @@ pub(crate) fn release_sandbox_for_agent(
             );
         }
     }
-    anyagents_tools::release_sandbox_for_config_dir(config_dir)?;
+    crate::sandbox_providers::release_sandbox_for_config_dir(config_dir)?;
     let _ = store.sandbox_binding_store().clear_lease(agent_id);
     Ok(true)
 }
@@ -1618,7 +1618,7 @@ pub(crate) fn handle_agent_idle_release(store: &Store, agent_id: &AgentId, confi
         return;
     }
 
-    if let Err(err) = anyagents_tools::release_sandbox_for_config_dir(config_dir) {
+    if let Err(err) = crate::sandbox_providers::release_sandbox_for_config_dir(config_dir) {
         eprintln!("anyagents-sandbox: idle release failed: {err}");
     }
 }
@@ -1842,7 +1842,7 @@ where
             }
             Ok(None) => {
                 // Legacy file-backed provider (e.g. `legacy_http`).
-                match anyagents_tools::release_sandbox_for_config_dir(&cfg_dir) {
+                match crate::sandbox_providers::release_sandbox_for_config_dir(&cfg_dir) {
                     Ok(()) => {
                         let _ = store.sandbox_binding_store().clear_lease(&binding.agent_id);
                         report.released.push(binding.agent_id);
@@ -3496,7 +3496,7 @@ mod tests {
         .unwrap();
 
         let cfg_dir = anyagents_core::agent_config_dir(&data_dir, &created.id);
-        let sbx = SandboxConfig::from_config_dir(&cfg_dir)
+        let sbx = crate::sandbox_providers::sandbox_config_from_config_dir(&cfg_dir)
             .expect("create_agent should write sandbox.json to agent config_dir");
         assert_eq!(sbx.sandbox_id, "sbx-auto-created-99");
         assert!(sbx.remote_spawn);
@@ -3549,7 +3549,7 @@ mod tests {
                         let written_ref = Arc::clone(&written_ref);
                         async move {
                             let path = payload["path"].as_str().unwrap().to_string();
-                            let bytes = anyagents_tools::base64_decode(
+                            let bytes = agent_tools::base64_decode(
                                 payload["content_base64"].as_str().unwrap(),
                             )
                             .unwrap();
@@ -3695,7 +3695,7 @@ mod tests {
         // Exactly one mkdir exec batch due to SHA-256 manifest caching on 2nd sync.
         assert_eq!(exec_cmds.lock().unwrap().len(), 1);
         assert!(lease.workdir == "/home/user/workspace");
-        assert!(!anyagents_tools::sylphx::SYLPHX_STATE_FILE.is_empty());
+        assert!(!crate::sandbox_providers::sylphx::SYLPHX_STATE_FILE.is_empty());
 
         srv.abort();
     }
@@ -3987,8 +3987,8 @@ mod tests {
                     .update_lease_state(&agent.id, "ready", Some(t0))
                     .unwrap();
                 let provider: Arc<dyn AsyncSandboxProvider> = Arc::new(
-                    anyagents_tools::providers::GenericHttpOciProvider::new(
-                        anyagents_tools::providers::GenericHttpOciConfig::new(endpoint),
+                    crate::sandbox_providers::providers::GenericHttpOciProvider::new(
+                        crate::sandbox_providers::providers::GenericHttpOciConfig::new(endpoint),
                     )
                     .unwrap(),
                 );
@@ -4099,8 +4099,8 @@ mod tests {
             store.sandbox_binding_store().upsert(&binding).unwrap();
 
             let provider: Arc<dyn AsyncSandboxProvider> = Arc::new(
-                anyagents_tools::providers::GenericHttpOciProvider::new(
-                    anyagents_tools::providers::GenericHttpOciConfig::new(endpoint),
+                crate::sandbox_providers::providers::GenericHttpOciProvider::new(
+                    crate::sandbox_providers::providers::GenericHttpOciConfig::new(endpoint),
                 )
                 .unwrap(),
             );

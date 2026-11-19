@@ -420,7 +420,7 @@ async fn serve(
     };
     anyagents_toolchain::init_server(data, crate::sandbox::host_home_dir());
     let store = Arc::new(Store::open(data.join("state.db"))?);
-    let remote_required = anyagents_tools::SandboxMode::from_env().is_remote_required();
+    let remote_required = crate::sandbox_providers::SandboxMode::from_env().is_remote_required();
     let stateless_pg = store.is_postgres() && remote_required;
     if store.is_postgres()
         && (serverless || remote_required)
@@ -482,7 +482,7 @@ async fn serve(
     // harness it starts is in its own OS seat. Otherwise the boundary contract
     // says so, and no run claims it.
     let seats = active_seat_ids(&store)?;
-    if !anyagents_tools::SandboxMode::from_env().is_remote_required()
+    if !crate::sandbox_providers::SandboxMode::from_env().is_remote_required()
         && operator::operator_token(data).is_some()
         && !crate::sandbox::launch_boundary(&seats)
     {
@@ -682,7 +682,7 @@ async fn serve(
                     {
                         for a in live {
                             let cfg = anyagents_core::agent_config_dir(&root, &a.id);
-                            if let Err(err) = anyagents_tools::renew_lease_for_config_dir(&cfg) {
+                            if let Err(err) = crate::sandbox_providers::renew_lease_for_config_dir(&cfg) {
                                 eprintln!(
                                     "anyagents-sandbox: lease renew failed for `{}`: {err}",
                                     a.name
@@ -694,7 +694,7 @@ async fn serve(
                 .await;
             }
         });
-        if !anyagents_tools::SandboxMode::from_env().is_remote_required() {
+        if !crate::sandbox_providers::SandboxMode::from_env().is_remote_required() {
             let updater_root = data.to_path_buf();
             let updater_store = Arc::clone(&store);
             let mut updater_stop = stopping.subscribe();
@@ -999,7 +999,7 @@ async fn serve(
 
 fn preserve_webhooks_on_shutdown(data: &Path) -> bool {
     serverless::is_serverless_mode()
-        || anyagents_tools::SandboxMode::from_env().is_remote_required()
+        || crate::sandbox_providers::SandboxMode::from_env().is_remote_required()
         || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
         || std::env::var("ANYAGENTS_PUBLIC_URL")
             .ok()
@@ -1992,8 +1992,9 @@ fn authenticate_mcp_request(
             Some(store.data_dir()),
             Some(&config_dir),
         ) && (has_pg_binding
-            || anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir).is_some()
-            || anyagents_tools::SandboxConfig::from_config_dir(&config_dir)
+            || crate::sandbox_providers::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir)
+                .is_some()
+            || crate::sandbox_providers::sandbox_config_from_config_dir(&config_dir)
                 .is_some_and(|sbx| sbx.remote_spawn));
         return Ok(McpCaller {
             agent,
@@ -2706,7 +2707,7 @@ fn refuse_host_placement_over_http(
     harness: &str,
 ) -> Result<(), ApiError> {
     let remote_capable = vendor::is_effective_cloud_harness(harness, Some(data_dir), None)
-        || anyagents_tools::SandboxMode::from_env().is_remote_required();
+        || crate::sandbox_providers::SandboxMode::from_env().is_remote_required();
     if via_http && !remote_capable {
         return Err(ApiError::forbidden(format!(
             "a call over HTTP MCP places agents only on a cloud harness (`claude-cloud`, \
@@ -6313,7 +6314,7 @@ async fn delete_agent_route(
         let data_dir = state.store.data_dir();
         let config = agent_dir.join("config");
         let seat_ids = detect_seat_ids(&config);
-        if let Err(err) = anyagents_tools::destroy_sandbox_for_config_dir(&config) {
+        if let Err(err) = crate::sandbox_providers::destroy_sandbox_for_config_dir(&config) {
             eprintln!("anyagents-sandbox: delete destroy failed: {err}");
         }
 
@@ -6583,12 +6584,12 @@ fn prepare_agent_wake_with_options(
             Ok(Some(_)) => {}
             Ok(None) => {
                 // Only dispatch legacy HTTP resume when no leased/registry provider handled wake.
-                if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&cfg) {
-                    let _ = anyagents_tools::SandboxProvider::resume(&sbx);
+                if let Some(sbx) = crate::sandbox_providers::sandbox_config_from_config_dir(&cfg) {
+                    let _ = agent_tools::SandboxProvider::resume(&sbx);
                 }
             }
             Err(err) => {
-                if anyagents_tools::SandboxMode::from_env().is_remote_required() {
+                if crate::sandbox_providers::SandboxMode::from_env().is_remote_required() {
                     return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
                 }
                 eprintln!("anyagents-sandbox: wake lease ensure failed: {err}");
@@ -9388,7 +9389,9 @@ fn deliver_agent_with_media(
                 &std::collections::BTreeMap::new(),
             ) {
                 Ok(Some(_)) | Ok(None) => {}
-                Err(err) if anyagents_tools::SandboxMode::from_env().is_remote_required() => {
+                Err(err)
+                    if crate::sandbox_providers::SandboxMode::from_env().is_remote_required() =>
+                {
                     return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
                 }
                 Err(err) => {
@@ -11321,7 +11324,7 @@ pub(crate) mod tests {
 
     #[test]
     fn hybrid_search_fuses_cited_dense_ranges_reranks_and_never_widens_access() {
-        use anyagents_memory::protocol::{self, DenseHit, Reply, Request, Status};
+        use agent_memory::protocol::{self, DenseHit, Reply, Request, Status};
         use std::io::{BufRead, Write as _};
         let dir = crate::test_tempdir();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
@@ -16664,7 +16667,7 @@ exec '{}' "$@"
             .create_agent(anyagents_core::NewAgent::new("sandboxed", "claude-code"))
             .unwrap();
         let sandbox_cfg = anyagents_core::agent_config_dir(dir.path(), &sandboxed.id);
-        anyagents_tools::SandboxConfig {
+        agent_tools::SandboxConfig {
             endpoint: "https://sandbox.example.com".into(),
             sandbox_id: "sbx-1".into(),
             token: None,
@@ -16722,7 +16725,7 @@ exec '{}' "$@"
         let cfg = anyagents_core::agent_config_dir(dir.path(), &local.id);
         std::fs::create_dir_all(&cfg).unwrap();
         std::fs::write(cfg.join("cloud.json"), r#"{"disable_builtin_tools":true}"#).unwrap();
-        anyagents_tools::SandboxConfig {
+        agent_tools::SandboxConfig {
             endpoint: "https://sandbox.example.com".into(),
             sandbox_id: "sbx-1".into(),
             token: None,
@@ -18977,7 +18980,7 @@ exec '{}' "$@"
             .unwrap();
         let sbx_cfg = anyagents_core::agent_config_dir(dir.path(), &sbx_agent.id);
         std::fs::create_dir_all(&sbx_cfg).unwrap();
-        anyagents_tools::sylphx::SylphxLeaseConfig {
+        crate::sandbox_providers::sylphx::SylphxLeaseConfig {
             endpoint: "https://sandbox.example.test".into(),
             token: None,
             parent: "orgs/o1/projects/p1/envs/e1".into(),

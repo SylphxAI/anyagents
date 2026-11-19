@@ -42,6 +42,7 @@ mod reply;
 mod repo;
 mod sandbox;
 mod sandbox_exec;
+mod sandbox_providers;
 mod schedule;
 mod seat_tree;
 mod server;

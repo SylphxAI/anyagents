@@ -1,6 +1,6 @@
 # Universal Multi-Provider Sandbox Runtime
 
-AnyAgents separates **agent orchestration** from **code execution** through a vendor-neutral async [`SandboxProvider`](../crates/anyagents-tools/src/providers/mod.rs) trait, a unified persistent volume layout, and a repo-owned multi-stage [`Dockerfile.sandbox`](../Dockerfile.sandbox).
+AnyAgents separates **agent orchestration** from **code execution** through a vendor-neutral async [`SandboxProvider`](../crates/anyagents/src/sandbox_providers/providers/mod.rs) trait, a unified persistent volume layout, and a repo-owned multi-stage [`Dockerfile.sandbox`](../Dockerfile.sandbox).
 
 ## 1. Persistent Volume Layout (`/home/user/agent-data`)
 

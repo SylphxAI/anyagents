@@ -34,15 +34,23 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 
-pub use crate::workspace::ExecOutput;
+pub use agent_tools::ExecOutput;
+#[cfg(test)]
 pub use cloudflare::{CloudflareConfig, CloudflareProvider};
+#[cfg(test)]
 pub use daytona::{DaytonaConfig, DaytonaProvider};
+#[cfg(test)]
 pub use docker::{DockerConfig, DockerProvider};
+#[cfg(test)]
 pub use e2b::{E2bConfig, E2bProvider};
+#[cfg(test)]
 pub use http_oci::{GenericHttpOciConfig, GenericHttpOciProvider};
-pub use local::{LocalHostConfig, LocalHostProvider};
+#[cfg(test)]
+pub use local::LocalHostProvider;
+#[cfg(test)]
 pub use modal::{ModalConfig, ModalProvider};
 pub use registry::{ProviderRegistry, SandboxRegistryConfig};
+#[cfg(test)]
 pub use sylphx::{SylphxConfig, SylphxProvider};
 
 /// Default single persistent volume mount root inside all sandboxes.
