@@ -26,6 +26,7 @@ anyagents-harness-spiron = { path = "../anyagents-harness-spiron" }
 anyagents-supervisor = { path = "../anyagents-supervisor" }
 agent-memory = { git = "https://github.com/SylphxAI/agent-kit", tag = "v0.1.0", features = ["service"] }
 agent-tools = { git = "https://github.com/SylphxAI/agent-kit", tag = "v0.1.0" }
+agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "c4470c9a095f46f6bdb6af2f1fc39359104f2fe4" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
@@ -64,12 +65,9 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 roxmltree = "0.21"
 
 # Desktop sessions (headless Wayland) exist on Linux only; other hosts answer
-# session calls with a typed `UNSUPPORTED` error.
-#
-# Pinned by git revision (agent-workstation 0.2.0, merged to main as #9)
-# until 0.2.0 is published; then this becomes `agent-workstation = "0.2"`.
+# session calls with a typed `UNSUPPORTED` error. Host desktop accessibility
+# (`agent_workstation::PlatformAdapter`) compiles across Linux, macOS, and Windows.
 [target.'cfg(target_os = "linux")'.dependencies]
-agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "9587cbc7d0850afa315111b764cc9cde9d62e646" }
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]

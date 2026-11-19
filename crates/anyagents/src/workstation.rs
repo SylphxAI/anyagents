@@ -26,8 +26,6 @@ pub mod browser;
 pub mod desktop;
 pub(crate) mod jail;
 #[cfg(target_os = "linux")]
-mod legacy;
-#[cfg(target_os = "linux")]
 mod proxy;
 pub mod secrets;
 #[cfg(target_os = "linux")]
