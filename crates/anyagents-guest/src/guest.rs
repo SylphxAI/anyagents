@@ -1242,15 +1242,23 @@ pub(crate) fn launch_guest_harness(
     match harness_name {
         "claude-code" => {
             let mut full_args = extra_args.to_vec();
+            let bare = extra_args.iter().any(|a| a == "--guest-bare");
             let mcp_cfg = state_dir.join(".mcp.json");
             if mcp_cfg.is_file() && !full_args.iter().any(|a| a == "--mcp-config") {
                 full_args.push("--mcp-config".to_string());
                 full_args.push(mcp_cfg.display().to_string());
             }
-            if !full_args
-                .iter()
-                .any(|a| a == "--dangerously-skip-permissions")
-                && !extra_args.iter().any(|a| a == "--guest-bare")
+            if !bare
+                && let Some(m) = model.filter(|s| !s.trim().is_empty())
+                && !full_args.iter().any(|a| a == "--model")
+            {
+                full_args.push("--model".to_string());
+                full_args.push(m.to_string());
+            }
+            if !bare
+                && !full_args
+                    .iter()
+                    .any(|a| a == "--dangerously-skip-permissions")
             {
                 full_args.insert(0, "--dangerously-skip-permissions".to_string());
             }
@@ -1279,10 +1287,7 @@ pub(crate) fn launch_guest_harness(
             Ok(Box::new(OpenCodeAdapter(h)))
         }
         "agy" => {
-            let mut spec = StreamSpec::for_program("agy");
-            if !extra_args.is_empty() {
-                spec.args.extend(extra_args.iter().cloned());
-            }
+            let spec = build_agy_stream_spec(model, extra_args);
             let h = AgyHarness::start_with_spec(spec, program, session, &pairs, Some(work_dir))?;
             Ok(Box::new(AgyAdapter(h)))
         }
@@ -1415,6 +1420,33 @@ pub(crate) fn resolve_guest_program(harness: &str) -> PathBuf {
         }
     }
     PathBuf::from(format!("/usr/local/bin/{bin_name}"))
+}
+
+fn build_agy_stream_spec(model: Option<&str>, extra_args: &[String]) -> StreamSpec {
+    let mut spec = StreamSpec::for_program("agy");
+    let bare = extra_args.iter().any(|a| a == "--guest-bare");
+    if !bare {
+        spec.args = vec![
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ];
+        if let Some(m) = model.filter(|s| !s.trim().is_empty())
+            && !extra_args.iter().any(|a| a == "--model")
+        {
+            spec.args.push("--model".to_string());
+            spec.args.push(m.to_string());
+        }
+        spec.resume_flag = "--conversation";
+    }
+    for arg in extra_args {
+        if arg != "--guest-bare" {
+            spec.args.push(arg.clone());
+        }
+    }
+    spec
 }
 
 pub(crate) fn build_guest_env(
@@ -1995,5 +2027,30 @@ kill "$bg_pid" 2>/dev/null || true
         assert_eq!(health_ev["status"], "ok");
         assert_eq!(health_ev["binary"], "anyagents-guest");
         assert_eq!(health_ev["harnesses"], 9);
+    }
+
+    #[test]
+    fn agy_launch_spec_uses_stream_json_and_conversation_resume_flag() {
+        let spec = build_agy_stream_spec(Some("gemini-4-carbon-high"), &[]);
+        assert_eq!(spec.resume_flag, "--conversation");
+        assert_eq!(
+            spec.resume_args(Some("conv-123")),
+            vec![
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--dangerously-skip-permissions",
+                "--model",
+                "gemini-4-carbon-high",
+                "--conversation",
+                "conv-123",
+            ]
+        );
+
+        let bare =
+            build_agy_stream_spec(Some("gemini-4-carbon-high"), &["--guest-bare".to_string()]);
+        assert_eq!(bare.resume_flag, "--resume");
+        assert_eq!(bare.args, vec!["--output-format", "stream-json"]);
     }
 }
