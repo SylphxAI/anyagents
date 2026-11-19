@@ -928,7 +928,7 @@ mod tests {
     #[tokio::test]
     async fn mock_platform_adapter_drives_snapshot_click_type_key_scroll_and_stale_ref() {
         let mock = sample_mock_adapter();
-        let adapter: Arc<dyn PlatformAdapter> = Arc::clone(&mock);
+        let adapter: Arc<dyn PlatformAdapter> = mock.clone();
         let backend = ComputerBackend::with_parts(DisplayAvailability::MacOs, adapter);
 
         let tree = backend.snapshot(TreeOptions::default()).await.unwrap();

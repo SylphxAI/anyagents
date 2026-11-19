@@ -12364,6 +12364,48 @@ pub(crate) mod tests {
         });
     }
 
+    struct SingleUidEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl SingleUidEnvironment {
+        /// Call only while env_lock is held, before starting the fixture server.
+        fn new() -> Self {
+            let keys = [
+                "ANYAGENTS_PRINCIPALS",
+                "ANYAGENTS_PRINCIPAL_REGISTRY",
+                "ANYAGENTS_AGENTS",
+                "ANYAGENTS_AGENT_UID",
+                "ANYAGENTS_AGENT_GID",
+                "ANYAGENTS_SOCKET_GID",
+            ];
+            let saved = keys
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            for key in keys {
+                // SAFETY: these server fixtures hold env_lock through shutdown.
+                unsafe { std::env::remove_var(key) };
+            }
+            assert!(!crate::sandbox::seats_configured());
+            assert!(crate::sandbox::launch_boundary(&[]));
+            Self(saved)
+        }
+    }
+
+    impl Drop for SingleUidEnvironment {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                // SAFETY: the fixture server has stopped and env_lock is held.
+                unsafe {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn readiness_answers_while_the_once_only_image_hash_is_blocked() {
         if single_test_worker("readiness_answers_while_the_once_only_image_hash_is_blocked") {

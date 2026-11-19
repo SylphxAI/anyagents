@@ -48,8 +48,6 @@ pub(crate) use client::{
     request_waiting,
 };
 pub(crate) use frame_cap::FrameArtifactStdout;
-#[cfg(test)]
-pub(crate) use frame_cap::MCP_TEXT_SPILL_BYTES;
 use frame_cap::agent_spill_dir;
 pub use profile::UNIVERSAL_MCP_TOOLS;
 

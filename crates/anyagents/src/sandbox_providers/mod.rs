@@ -13,8 +13,7 @@ mod tests;
 
 pub use sylphx::{
     SandboxMode, SylphxProviderConfig, destroy_sandbox_for_config_dir,
-    release_sandbox_for_config_dir, renew_lease_for_config_dir, resolve_workspace_backend_for_mode,
-    serverless_enabled_from_env,
+    release_sandbox_for_config_dir, renew_lease_for_config_dir, serverless_enabled_from_env,
 };
 
 pub(crate) const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30_000;
