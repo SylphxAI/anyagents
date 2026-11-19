@@ -128,6 +128,16 @@ impl Mode {
         matches!(self, Self::Confined { .. })
     }
 
+    /// Whether an operator token digest is configured for confined API auth.
+    pub fn has_operator(&self) -> bool {
+        matches!(
+            self,
+            Self::Confined {
+                operator_digest: Some(_)
+            }
+        )
+    }
+
     /// Whether this deployment trusts its own machine's agent route.
     pub fn is_trusted(&self) -> bool {
         matches!(self, Self::Trusted { .. })

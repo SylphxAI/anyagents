@@ -3180,4 +3180,100 @@ done
         }
         clear_jwks_cache();
     }
+
+    #[tokio::test]
+    async fn serverless_webhook_router_mounts_confined_api_only_with_operator_token() {
+        let _env = crate::server::tests::env_lock();
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "ANYAGENTS_SERVERLESS",
+            "ANYAGENTS_OPERATOR_TOKEN",
+            "ANYAGENTS_OPERATOR_TOKEN_FILE",
+        ]
+        .into_iter()
+        .map(|k| (k, std::env::var_os(k)))
+        .collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let make_state = |auth: crate::auth::Mode| AppState {
+            store: Arc::clone(&store),
+            health: crate::server::HealthBoard::default(),
+            sign_in: Arc::new(std::sync::Mutex::new(super::super::ProcessRunner)),
+            auth,
+            identity: Arc::new(crate::identity::ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+
+        unsafe {
+            std::env::set_var("ANYAGENTS_SERVERLESS", "true");
+            std::env::remove_var("ANYAGENTS_OPERATOR_TOKEN");
+            std::env::remove_var("ANYAGENTS_OPERATOR_TOKEN_FILE");
+        }
+        let no_op_app = crate::server::build_webhook_router(make_state(
+            crate::auth::Mode::from_env(dir.path()),
+        ));
+        let res_no_op = no_op_app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_no_op.status(), StatusCode::NOT_FOUND);
+
+        unsafe {
+            std::env::set_var(
+                "ANYAGENTS_OPERATOR_TOKEN",
+                "serverless-op-secret-0123456789",
+            );
+        }
+        let auth = crate::auth::Mode::from_env(dir.path());
+        assert!(auth.has_operator());
+        let app = crate::server::build_webhook_router(make_state(auth));
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let unauth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let authed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/agents")
+                    .header(crate::operator::HEADER, "serverless-op-secret-0123456789")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), StatusCode::OK);
+
+        for (k, val) in saved {
+            match val {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
 }

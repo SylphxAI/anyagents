@@ -1670,11 +1670,17 @@ fn walk_regular_files_bounded(
     base: &Path,
     dir: &Path,
     skip_dirs: &[&str],
+    skip_unreadable: bool,
+    skipped_unreadable_dirs: &mut u64,
     out: &mut Vec<(String, PathBuf, i64)>,
 ) -> Result<(), Error> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if skip_unreadable && e.kind() == std::io::ErrorKind::PermissionDenied => {
+            *skipped_unreadable_dirs += 1;
+            return Ok(());
+        }
         Err(e) => return Err(e.into()),
     };
     for entry in entries {
@@ -1693,7 +1699,14 @@ fn walk_regular_files_bounded(
             if skip_dirs.iter().any(|skip| *skip == name_str.as_ref()) {
                 continue;
             }
-            walk_regular_files_bounded(base, &path, skip_dirs, out)?;
+            walk_regular_files_bounded(
+                base,
+                &path,
+                skip_dirs,
+                skip_unreadable,
+                skipped_unreadable_dirs,
+                out,
+            )?;
         } else if meta.is_file() {
             if meta.len() > MAX_MIGRATED_BLOB_BYTES {
                 continue;
@@ -1900,7 +1913,9 @@ fn backfill_on_disk_blobs(
     let mut sorted_agents: Vec<&String> = valid_agents.iter().collect();
     sorted_agents.sort();
 
-    for aid_str in sorted_agents {
+    let mut skipped_unreadable_dirs = 0_u64;
+    let total_agents = sorted_agents.len();
+    for (agent_idx, aid_str) in sorted_agents.into_iter().enumerate() {
         let agent_dir = agents_root.join(aid_str);
         if !agent_dir.is_dir() {
             continue;
@@ -1909,7 +1924,7 @@ fn backfill_on_disk_blobs(
             continue;
         };
 
-        // Direct 1:1 namespace subtrees
+        // Direct 1:1 namespace subtrees (fail-closed on unreadable dirs)
         for (subdir, namespace) in [
             (agent_dir.join("memory"), "memory"),
             (
@@ -1920,7 +1935,14 @@ fn backfill_on_disk_blobs(
             (agent_dir.join("sessions"), "sessions"),
         ] {
             let mut files = Vec::new();
-            walk_regular_files_bounded(&subdir, &subdir, &[], &mut files)?;
+            walk_regular_files_bounded(
+                &subdir,
+                &subdir,
+                &[],
+                false,
+                &mut skipped_unreadable_dirs,
+                &mut files,
+            )?;
             for (rel, full_path, mtime_ms) in files {
                 if namespace == "sessions" && rel.ends_with(".lock") {
                     continue;
@@ -1967,8 +1989,30 @@ fn backfill_on_disk_blobs(
                 ".cache",
                 "tmp",
                 "projects",
+                "shell-snapshots",
+                "plugins",
+                "session-env",
+                "backups",
+                "node_modules",
+                ".git",
+                "brain",
+                "recordings",
+                "logs",
+                ".npm",
+                ".bun",
+                ".cargo",
+                "sessions",
+                ".local",
+                "chromium",
             ];
-            walk_regular_files_bounded(&config_dir, &config_dir, SKIP_CONFIG_DIRS, &mut files)?;
+            walk_regular_files_bounded(
+                &config_dir,
+                &config_dir,
+                SKIP_CONFIG_DIRS,
+                true,
+                &mut skipped_unreadable_dirs,
+                &mut files,
+            )?;
             for (rel, full_path, mtime_ms) in files {
                 if is_agent_config_transient(&rel) {
                     continue;
@@ -2053,6 +2097,16 @@ fn backfill_on_disk_blobs(
                 counts.skipped_secret_files += 1;
             }
         }
+        if (agent_idx + 1) % 500 == 0 || agent_idx + 1 == total_agents {
+            eprintln!(
+                "  [migrate] agent blobs: {}/{} agents ({} files, {} gateway_routes, {} skipped_unreadable_config_dirs)",
+                agent_idx + 1,
+                total_agents,
+                counts.agent_files_migrated,
+                counts.gateway_routes_migrated,
+                skipped_unreadable_dirs
+            );
+        }
     }
     counts.agent_files_migrated += af_batch.flush(pool)?;
 
@@ -2117,7 +2171,14 @@ fn backfill_on_disk_blobs(
     ] {
         let root = source_dir.join(dir_name);
         let mut files = Vec::new();
-        walk_regular_files_bounded(&root, &root, &[], &mut files)?;
+        walk_regular_files_bounded(
+            &root,
+            &root,
+            &[],
+            false,
+            &mut skipped_unreadable_dirs,
+            &mut files,
+        )?;
         for (rel, full_path, mtime_ms) in files {
             if rel.ends_with(".lock") {
                 continue;

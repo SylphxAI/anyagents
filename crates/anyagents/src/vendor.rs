@@ -1320,8 +1320,13 @@ fn vendor_launch_inner(
                     | anyagents_core::GIT_POOL_DIR_ENV
                     | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
+                    | "ANYAGENTS_OPERATOR_TOKEN"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
                     | "ANYAGENTS_CAPABILITY_KEY"
+                    | "ANYAGENTS_MASTER_KEY"
+                    | "ANYAGENTS_TICK_TOKEN"
+                    | "ANYAGENTS_DATABASE_URL"
+                    | "ANYAGENTS_DIRECT_DATABASE_URL"
                     | "LD_PRELOAD"
                     | "LD_LIBRARY_PATH"
             )
@@ -1411,8 +1416,13 @@ fn vendor_launch_inner(
                     | anyagents_core::GIT_POOL_DIR_ENV
                     | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
+                    | "ANYAGENTS_OPERATOR_TOKEN"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
                     | "ANYAGENTS_CAPABILITY_KEY"
+                    | "ANYAGENTS_MASTER_KEY"
+                    | "ANYAGENTS_TICK_TOKEN"
+                    | "ANYAGENTS_DATABASE_URL"
+                    | "ANYAGENTS_DIRECT_DATABASE_URL"
                     | "LD_PRELOAD"
                     | "LD_LIBRARY_PATH"
             )

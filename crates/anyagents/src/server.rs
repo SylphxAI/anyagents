@@ -173,6 +173,69 @@ pub(crate) struct AppState {
     pub(crate) profiles: Arc<profiles::ProfileSnapshots>,
 }
 
+/// Materialize deployment-level config, secret, and profile blobs from
+/// PostgreSQL (`public.deployment_blobs`) into a stateless/serverless replica's
+/// local ephemeral data directory so `FileCredentialStore`, `Settings::load`,
+/// and profile lookups work identically across cold starts.
+fn hydrate_deployment_blobs_on_start(store: &Store, data: &Path) -> Result<usize, Error> {
+    let master_key = anyagents_core::MasterKey::from_env()?;
+    let blobs = store.blob_store_with_key(master_key);
+    let mut hydrated = 0usize;
+    let secrets_dir = data.join("secrets");
+    std::fs::create_dir_all(&secrets_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    for ns in ["config", "secrets", "profiles"] {
+        let metas = blobs.list_deployment_blobs(ns)?;
+        for meta in metas {
+            if anyagents_core::stateless::validate_blob_path(&meta.path).is_err() {
+                continue;
+            }
+            let dest = match ns {
+                "config" => data.join(&meta.path),
+                "secrets" => data.join("secrets").join(&meta.path),
+                "profiles" => data.join("profiles").join(&meta.path),
+                _ => continue,
+            };
+            let Some(entry) = blobs.get_deployment_blob(ns, &meta.path)? else {
+                continue;
+            };
+            let mode = if entry.encrypted || ns == "secrets" {
+                0o600
+            } else {
+                0o644
+            };
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+                #[cfg(unix)]
+                if ns == "secrets" {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ =
+                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+            if entry.content.is_empty() {
+                std::fs::write(&dest, &[])?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode));
+                }
+            } else {
+                anyagents_harness::atomic_write_nonempty_file(&dest, &entry.content, mode)?;
+            }
+            hydrated += 1;
+        }
+    }
+    if hydrated > 0 {
+        eprintln!("anyagents-blobs: hydrated {hydrated} deployment blob(s) from postgres");
+    }
+    Ok(hydrated)
+}
+
 /// This process's capability key. Tests name one so a server and the fixture
 /// it reads share the same key.
 fn capability_key() -> Result<String, Error> {
@@ -362,6 +425,11 @@ async fn serve(
     let store = Arc::new(Store::open(data.join("state.db"))?);
     let remote_required = anyagents_tools::SandboxMode::from_env().is_remote_required();
     let stateless_pg = store.is_postgres() && remote_required;
+    if store.is_postgres() && (serverless || remote_required) {
+        if let Err(err) = hydrate_deployment_blobs_on_start(&store, data) {
+            eprintln!("anyagents-blobs: startup hydration warning: {err}");
+        }
+    }
     for (id, name) in release_stale_unadmitted_names_on_start(&store, UNADMITTED_STALE_AGE_MS)? {
         eprintln!("released name `{name}` held by failed creation {id}");
     }
@@ -1680,7 +1748,7 @@ pub(crate) async fn takeover_page_route(req: axum::extract::Request) -> Response
 }
 
 fn build_webhook_router(state: AppState) -> Router {
-    Router::new()
+    let base = Router::new()
         .route("/v1/webhooks/takeover/{key}", any(takeover_page_route))
         .route("/v1/webhooks/takeover/{key}/", any(takeover_page_route))
         .route(
@@ -1703,7 +1771,16 @@ fn build_webhook_router(state: AppState) -> Router {
         .route("/v1/internal/tick", post(serverless::tick_route))
         .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
-        .route("/mcp", get(mcp_get_route).post(mcp_post_route))
+        .route("/mcp", get(mcp_get_route).post(mcp_post_route));
+    // In Pure Serverless mode there is no reachable host Unix socket, so expose
+    // the full authenticated control/agent API on the HTTP listener strictly
+    // when fail-closed operator auth (`ANYAGENTS_OPERATOR_TOKEN`) is active.
+    let router = if serverless::is_serverless_mode() && state.auth.has_operator() {
+        mount_authenticated_api_routes(base)
+    } else {
+        base
+    };
+    router
         .with_state(state.clone())
         .merge(crate::gateway::http_router_for_store(Arc::clone(
             &state.store,
@@ -1711,8 +1788,8 @@ fn build_webhook_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(in_flight::track))
 }
 
-pub(crate) fn build_router(state: AppState) -> Router {
-    Router::new()
+fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> {
+    router
         .route("/v1/agents", get(list_agents).post(create_agent_route))
         .route("/v1/agents/{name}", get(get_agent))
         .route("/v1/agents/{name}/admin", post(set_admin_route))
@@ -1786,6 +1863,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/outbound", get(outbound_list_route))
         .route("/v1/outbound/{key}/retry", post(outbound_retry_route))
         .route("/v1/outbound/{key}/discard", post(outbound_discard_route))
+}
+
+pub(crate) fn build_router(state: AppState) -> Router {
+    mount_authenticated_api_routes(Router::new())
         .route("/v1/webhooks/healthz", get(webhook_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .route("/v1/webhooks/github", post(github_webhook))
