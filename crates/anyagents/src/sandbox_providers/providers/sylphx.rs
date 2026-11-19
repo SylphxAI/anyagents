@@ -21,8 +21,8 @@ static TAR_UPLOAD_SEQ: AtomicU64 = AtomicU64::new(1);
 use super::{
     DEFAULT_MOUNT_PATH, EnsureSandboxRequest, ExecOutput, ExecRequest, LeasePolicy,
     NetworkPolicySpec, ProviderHealth, ProviderKind, SandboxCapabilities, SandboxHandle,
-    SandboxProvider, http_call_json, normalize_unix_dir, persistent_layout_init_script,
-    resolve_layout, run_blocking, sanitize_name, shell_single_quote,
+    SandboxProvider, http_call_json, normalize_unix_dir, resolve_layout, run_blocking,
+    sanitize_name, shell_single_quote,
 };
 
 const DEFAULT_SYLPHX_ENDPOINT: &str = "https://api.sylphx.com";
@@ -215,14 +215,12 @@ impl SandboxProvider for SylphxProvider {
                 .unwrap_or_else(|| lease.resource_name.clone());
 
             if freshly_created {
-                let script = persistent_layout_init_script(&mount_path, &state_dir, &workdir);
-                let _ = client.exec(
+                client.init_persistent_layout(
                     &data_plane_resource,
-                    &["/bin/sh".to_string(), "-lc".to_string(), script],
-                    Some("/"),
-                    &BTreeMap::new(),
-                    Some(20_000),
-                );
+                    &mount_path,
+                    &state_dir,
+                    &workdir,
+                )?;
             }
 
             let transport_url = lease.envd_url.clone().or_else(|| {

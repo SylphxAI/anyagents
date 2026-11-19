@@ -927,7 +927,37 @@ impl SylphxSandboxClient {
             spec.insert("network".into(), sylphx_network_json(policy));
         }
         let body = serde_json::json!({ "spec": spec });
-        let (status, val) = self.request_json("POST", &url, Some(&body), 45_000)?;
+        const MAX_CAPACITY_RETRIES: usize = 3;
+        let mut attempt = 0usize;
+        let (status, val) = loop {
+            let (status, val) = self.request_json("POST", &url, Some(&body), 45_000)?;
+            if (200..300).contains(&status) {
+                break (status, val);
+            }
+            let retryable_capacity = matches!(status, 429 | 503)
+                && (val
+                    .get("retryable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    || val
+                        .get("code")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|c| c.eq_ignore_ascii_case("NO_CAPACITY")));
+            if retryable_capacity && attempt < MAX_CAPACITY_RETRIES {
+                attempt += 1;
+                let retry_ms = val
+                    .get("retry_after_ms")
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    })
+                    .unwrap_or(2_000)
+                    .clamp(1_000, 5_000);
+                std::thread::sleep(Duration::from_millis(retry_ms));
+                continue;
+            }
+            break (status, val);
+        };
         if !(200..300).contains(&status) {
             return Err(format!(
                 "Sylphx POST {url} returned HTTP {status}: {}",
@@ -959,8 +989,9 @@ impl SylphxSandboxClient {
         Ok(())
     }
 
-    /// Initialize `/home/user/agent-data/{state,workspace}` and backwards-compatible
-    /// symlinks (`/home/user/agent-state`, `/home/user/workspace`) on a ready lease.
+    /// Initialize `/home/user/agent-data/{state,workspace}`, backwards-compatible
+    /// symlinks (`/home/user/agent-state`, `/home/user/workspace`), and `user:user`
+    /// ownership on freshly formatted root-owned persistent volumes.
     pub fn init_persistent_layout(
         &self,
         resource: &str,
@@ -968,14 +999,25 @@ impl SylphxSandboxClient {
         state_dir: &str,
         workdir: &str,
     ) -> Result<(), String> {
-        let script =
+        let base_script =
             super::providers::persistent_layout_init_script(mount_path, state_dir, workdir);
-        let out = self.exec(
+        let mp = super::providers::shell_single_quote(mount_path);
+        let sd = super::providers::shell_single_quote(state_dir);
+        let wd = super::providers::shell_single_quote(workdir);
+        let script = format!(
+            "{base_script}; \
+             if id user >/dev/null 2>&1; then \
+               chown -R user:user {mp} {sd} {wd} 2>/dev/null || true; \
+               chown -h user:user /home/user/agent-state /home/user/workspace 2>/dev/null || true; \
+             fi"
+        );
+        let out = self.exec_as_user(
             resource,
             &["/bin/sh".to_string(), "-lc".to_string(), script],
             Some("/"),
             &BTreeMap::new(),
             Some(20_000),
+            Some("root"),
         )?;
         if out.exit_code != 0 {
             return Err(format!(
@@ -1184,7 +1226,7 @@ impl SylphxSandboxClient {
         Ok(state)
     }
 
-    /// Execute a command via `:exec` (`POST /v1/{resource}:exec`).
+    /// Execute a command via `:exec` (`POST /v1/{resource}:exec`) as the default guest user.
     pub fn exec(
         &self,
         resource: &str,
@@ -1192,6 +1234,21 @@ impl SylphxSandboxClient {
         working_directory: Option<&str>,
         env: &BTreeMap<String, String>,
         timeout_ms: Option<u64>,
+    ) -> Result<ExecOutput, String> {
+        self.exec_as_user(resource, command, working_directory, env, timeout_ms, None)
+    }
+
+    /// Execute a command via `:exec` (`POST /v1/{resource}:exec`), optionally targeting a specific
+    /// guest user (e.g. `Some("root")` for volume mount initialization).
+    #[allow(clippy::too_many_arguments)]
+    pub fn exec_as_user(
+        &self,
+        resource: &str,
+        command: &[String],
+        working_directory: Option<&str>,
+        env: &BTreeMap<String, String>,
+        timeout_ms: Option<u64>,
+        user: Option<&str>,
     ) -> Result<ExecOutput, String> {
         if command.is_empty() {
             return Err("Sylphx `:exec` requires a non-empty command vector".to_string());
@@ -1209,6 +1266,9 @@ impl SylphxSandboxClient {
         }
         if !env.is_empty() {
             body.insert("env".into(), serde_json::json!(env));
+        }
+        if let Some(u) = user.map(str::trim).filter(|s| !s.is_empty()) {
+            body.insert("user".into(), serde_json::json!(u));
         }
         body.insert(
             "timeout".into(),
@@ -2698,5 +2758,99 @@ mod tests {
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[1].1["process"]["pid"], 42);
         assert_eq!(calls[2].1["signal"], "SIGNAL_SIGTERM");
+    }
+
+    #[test]
+    fn init_persistent_layout_runs_as_root_and_chowns_mount_for_user() {
+        let seen_bodies: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_ref = Arc::clone(&seen_bodies);
+        let (base_url, _server) = spawn_mock_http(move |method, path, body| {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(body).unwrap_or_else(|_| serde_json::json!({}));
+            if method == "POST" && path == "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_1:exec" {
+                seen_ref.lock().unwrap().push(parsed);
+                return (
+                    200,
+                    vec![("Content-Type".into(), "application/json".into())],
+                    serde_json::to_vec(&serde_json::json!({
+                        "stdout": base64_encode(b""),
+                        "stderr": base64_encode(b""),
+                        "exit_code": 0
+                    }))
+                    .unwrap(),
+                );
+            }
+            (404, vec![], br#"{"error":"not found"}"#.to_vec())
+        });
+
+        let client = SylphxSandboxClient::new(base_url, Some("tok".into()));
+        client
+            .init_persistent_layout(
+                "orgs/o1/projects/p1/envs/e1/leases/lease_1",
+                "/home/user/agent-data",
+                "/home/user/agent-data/state",
+                "/home/user/agent-data/workspace",
+            )
+            .unwrap();
+
+        let calls = seen_bodies.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["user"], "root");
+        let cmd = calls[0]["command"].as_array().unwrap();
+        assert_eq!(cmd[0], "/bin/sh");
+        assert_eq!(cmd[1], "-lc");
+        let script = cmd[2].as_str().unwrap();
+        assert!(script.contains("chown -R user:user"));
+        assert!(script.contains("/home/user/agent-data"));
+    }
+
+    #[test]
+    fn create_lease_retries_transient_no_capacity_503() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_ref = Arc::clone(&attempts);
+        let (base_url, _server) = spawn_mock_http(move |method, path, _body| {
+            if method == "POST" && path == "/v1/orgs/o1/projects/p1/envs/e1/leases" {
+                let n = attempts_ref.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    return (
+                        503,
+                        vec![("Content-Type".into(), "application/json".into())],
+                        serde_json::to_vec(&serde_json::json!({
+                            "code": "NO_CAPACITY",
+                            "retryable": true,
+                            "retry_after_ms": "1000"
+                        }))
+                        .unwrap(),
+                    );
+                }
+                return (
+                    200,
+                    vec![("Content-Type".into(), "application/json".into())],
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "orgs/o1/projects/p1/envs/e1/leases/lease_ok",
+                        "status": { "state": "ready" }
+                    }))
+                    .unwrap(),
+                );
+            }
+            (404, vec![], br#"{"error":"not found"}"#.to_vec())
+        });
+
+        let client = SylphxSandboxClient::new(base_url, Some("tok".into()));
+        let lease = client
+            .create_lease_with_options(
+                "orgs/o1/projects/p1/envs/e1",
+                "orgs/o1/projects/p1/envs/e1/volumes/vol_1",
+                "/home/user/agent-data",
+                Some("registry.example.com/agent@sha256:abc"),
+                None,
+                "linux-m",
+                &BTreeMap::new(),
+                Some("900s"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(lease.id, "lease_ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 }
