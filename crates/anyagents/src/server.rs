@@ -380,10 +380,7 @@ pub(crate) fn resolve_remote_sandbox_workdir(store: &Store, agent: &Agent) -> St
             return true;
         }
         let temp_dir = std::env::temp_dir();
-        if !temp_dir.as_os_str().is_empty() && path.starts_with(&temp_dir) {
-            return true;
-        }
-        false
+        !temp_dir.as_os_str().is_empty() && path.starts_with(&temp_dir)
     };
 
     if let Ok(Some(binding)) = store.sandbox_binding(&agent.id)
