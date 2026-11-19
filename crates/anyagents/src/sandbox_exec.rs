@@ -3549,10 +3549,9 @@ mod tests {
                         let written_ref = Arc::clone(&written_ref);
                         async move {
                             let path = payload["path"].as_str().unwrap().to_string();
-                            let bytes = agent_tools::base64_decode(
-                                payload["content_base64"].as_str().unwrap(),
-                            )
-                            .unwrap();
+                            let bytes =
+                                agent_tools::base64_decode(payload["content"].as_str().unwrap())
+                                    .unwrap();
                             written_ref.lock().unwrap().insert(path, bytes);
                             (StatusCode::OK, axum::Json(json!({})))
                         }

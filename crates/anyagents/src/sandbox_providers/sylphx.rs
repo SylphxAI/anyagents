@@ -4,11 +4,12 @@
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::DEFAULT_EXEC_TIMEOUT_MS;
+use super::{DEFAULT_EXEC_TIMEOUT_MS, url_encode_query_component};
 use agent_tools::{
     DockerWorkspace, ExecOutput, LocalWorkspace, REMOTE_EXEC_MAX_TIMEOUT_MS,
     RemoteSandboxWorkspace, SandboxConfig, SandboxProviderConfig, WorkspaceBackend, base64_decode,
@@ -44,13 +45,18 @@ pub const DEFAULT_TEMPLATE: &str = "agent";
 pub const DEFAULT_SHAPE: &str = "linux-m";
 /// Default safety lease TTL passed to `POST /v1/{parent}/leases` and `:renew` (15 minutes).
 pub const DEFAULT_LEASE_TTL: &str = "900s";
+/// Default persistent volume size in GiB when `ANYAGENTS_SANDBOX_VOLUME_SIZE_GIB` is unset.
+pub const DEFAULT_VOLUME_SIZE_GIB: u64 = 10;
 /// Per-agent Sylphx lease and persistent volume state file inside `<config_dir>`.
 pub const SYLPHX_STATE_FILE: &str = "sandbox-sylphx.json";
+
+static EXEC_IDEMPOTENCY_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_SYLPHX_ENDPOINT: &str = "https://api.sylphx.com";
 const LEASE_READY_POLL_INITIAL: Duration = Duration::from_millis(25);
 const LEASE_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const LEASE_READY_TIMEOUT: Duration = Duration::from_secs(120);
+const EXEC_IN_PROGRESS_POLL_DELAY: Duration = Duration::from_millis(1_000);
 
 /// Return `true` when `ANYAGENTS_SERVERLESS` is explicitly enabled (`1` | `true` | `yes` | `on`).
 pub fn serverless_enabled_from_env() -> bool {
@@ -376,7 +382,19 @@ impl SylphxLease {
         let s = self.state.trim().to_ascii_uppercase();
         matches!(
             s.as_str(),
-            "RELEASED"
+            "ENDED"
+                | "STATE_ENDED"
+                | "LEASE_STATE_ENDED"
+                | "ENDING"
+                | "STATE_ENDING"
+                | "LEASE_STATE_ENDING"
+                | "REFUSED"
+                | "STATE_REFUSED"
+                | "LEASE_STATE_REFUSED"
+                | "PAUSED"
+                | "STATE_PAUSED"
+                | "LEASE_STATE_PAUSED"
+                | "RELEASED"
                 | "STATE_RELEASED"
                 | "LEASE_STATE_RELEASED"
                 | "EXPIRED"
@@ -674,29 +692,33 @@ impl SylphxSandboxClient {
         Ok((status, val))
     }
 
-    /// Create a persistent volume (`POST /v1/{parent}/volumes`).
+    /// Create a persistent volume (`POST /v1/{parent}/volumes?volume_id={id}`).
     pub fn create_volume(
         &self,
         parent: &str,
         name: &str,
         size_gib: Option<u64>,
     ) -> Result<SylphxVolume, String> {
-        let url = self.collection_url(parent, "volumes");
-        let mut body = serde_json::Map::new();
-        body.insert("name".into(), serde_json::Value::String(name.to_string()));
-        if let Some(size) = size_gib {
-            body.insert("sizeGib".into(), serde_json::json!(size));
-            body.insert("size_gib".into(), serde_json::json!(size));
-        }
-        let (status, val) =
-            self.request_json("POST", &url, Some(&serde_json::Value::Object(body)), 30_000)?;
+        let volume_id = normalize_resource_id(name);
+        let url = format!(
+            "{}?volume_id={}",
+            self.collection_url(parent, "volumes"),
+            url_encode_query_component(&volume_id)
+        );
+        let effective_size = size_gib.unwrap_or(DEFAULT_VOLUME_SIZE_GIB).clamp(1, 1024);
+        let body = serde_json::json!({
+            "spec": {
+                "size_gib": effective_size,
+            }
+        });
+        let (status, val) = self.request_json("POST", &url, Some(&body), 30_000)?;
         if !(200..300).contains(&status) {
             return Err(format!(
                 "Sylphx POST {url} returned HTTP {status}: {}",
                 compact_error_body(&val)
             ));
         }
-        parse_volume_response(&val, parent, name, size_gib)
+        parse_volume_response(&val, parent, &volume_id, Some(effective_size))
     }
 
     /// Fetch volume state (`GET /v1/{parent}/volumes/{id}`). Returns `Ok(None)` on HTTP 404.
@@ -752,10 +774,21 @@ impl SylphxSandboxClient {
         {
             return Ok(found);
         }
-        if let Some(by_name) = self.get_volume(parent, preferred_name)? {
+        let volume_id = normalize_resource_id(preferred_name);
+        if let Some(by_name) = self.get_volume(parent, &volume_id)? {
             return Ok(by_name);
         }
-        self.create_volume(parent, preferred_name, size_gib)
+        match self.create_volume(parent, &volume_id, size_gib) {
+            Ok(vol) => Ok(vol),
+            Err(err) if err.contains("HTTP 409") || err.contains("RESOURCE_ALREADY_EXISTS") => {
+                if let Some(by_name) = self.get_volume(parent, &volume_id)? {
+                    Ok(by_name)
+                } else {
+                    Err(err)
+                }
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Create a sandbox lease attaching `volume_resource` (`POST /v1/{parent}/leases`).
@@ -802,39 +835,42 @@ impl SylphxSandboxClient {
         let ttl_val = ttl
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(DEFAULT_LEASE_TTL);
-        let mut body = serde_json::Map::new();
-        if let Some(img) = image.map(str::trim).filter(|s| !s.is_empty()) {
-            body.insert("image".into(), serde_json::json!(img));
+        let mut spec = serde_json::Map::new();
+        let image_ref = if let Some(img) = image.map(str::trim).filter(|s| !s.is_empty()) {
+            img.to_string()
         } else {
             let tpl = template
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or(DEFAULT_TEMPLATE);
-            body.insert("template".into(), serde_json::json!(tpl));
-            let image_ref = if tpl.starts_with("template:") {
+            if tpl.starts_with("template:") {
                 tpl.to_string()
             } else {
                 format!("template:{tpl}")
-            };
-            body.insert("image".into(), serde_json::json!(image_ref));
+            }
+        };
+        spec.insert("image".into(), serde_json::json!(image_ref));
+        if !shape.trim().is_empty() {
+            spec.insert("shape".into(), serde_json::json!(shape.trim()));
         }
-        body.insert("shape".into(), serde_json::json!(shape));
-        body.insert("ttl".into(), serde_json::json!(ttl_val));
-        body.insert("env".into(), serde_json::json!(env));
-        body.insert(
-            "mounts".into(),
+        spec.insert("ttl".into(), serde_json::json!(ttl_val));
+        if !env.is_empty() {
+            spec.insert("env".into(), serde_json::json!(env));
+        }
+        spec.insert(
+            "volumes".into(),
             serde_json::json!([
                 {
                     "volume": volume_resource,
-                    "mountPath": mount_path,
+                    "mount_path": mount_path,
                 }
             ]),
         );
         if let Some(policy) = network {
-            body.insert("network".into(), sylphx_network_json(policy));
+            spec.insert("network".into(), sylphx_network_json(policy));
         }
-        let (status, val) =
-            self.request_json("POST", &url, Some(&serde_json::Value::Object(body)), 45_000)?;
+        let body = serde_json::json!({ "spec": spec });
+        let (status, val) = self.request_json("POST", &url, Some(&body), 45_000)?;
         if !(200..300).contains(&status) {
             return Err(format!(
                 "Sylphx POST {url} returned HTTP {status}: {}",
@@ -853,7 +889,9 @@ impl SylphxSandboxClient {
     ) -> Result<(), String> {
         let resource = self.resolve_resource(parent, "leases", lease_id_or_name);
         let url = format!("{}:setNetwork", self.v1_resource_url(&resource));
-        let body = sylphx_network_json(policy);
+        let body = serde_json::json!({
+            "network": sylphx_network_json(policy),
+        });
         let (status, val) = self.request_json("POST", &url, Some(&body), 20_000)?;
         if !(200..300).contains(&status) {
             return Err(format!(
@@ -1105,6 +1143,8 @@ impl SylphxSandboxClient {
         let effective_timeout = timeout_ms
             .unwrap_or(DEFAULT_EXEC_TIMEOUT_MS)
             .clamp(100, REMOTE_EXEC_MAX_TIMEOUT_MS);
+        let timeout_secs = effective_timeout.div_ceil(1_000).clamp(1, 1_800);
+        let idempotency_key = next_exec_idempotency_key();
         let mut body = serde_json::Map::new();
         body.insert("command".into(), serde_json::json!(command));
         if let Some(wd) = working_directory.filter(|s| !s.trim().is_empty()) {
@@ -1113,20 +1153,31 @@ impl SylphxSandboxClient {
         if !env.is_empty() {
             body.insert("env".into(), serde_json::json!(env));
         }
-        body.insert("timeout_ms".into(), serde_json::json!(effective_timeout));
+        body.insert(
+            "timeout".into(),
+            serde_json::json!(format!("{timeout_secs}s")),
+        );
+        body.insert("idempotency_key".into(), serde_json::json!(idempotency_key));
+        let payload = serde_json::Value::Object(body);
 
-        let (status, val) = self.request_json(
-            "POST",
-            &url,
-            Some(&serde_json::Value::Object(body)),
-            effective_timeout.saturating_add(10_000),
-        )?;
-        if !(200..300).contains(&status) {
+        let deadline = Instant::now() + Duration::from_millis(effective_timeout + 15_000);
+        let val = loop {
+            let per_call_timeout = effective_timeout.min(35_000).saturating_add(10_000);
+            let (status, val) =
+                self.request_json("POST", &url, Some(&payload), per_call_timeout)?;
+            if (200..300).contains(&status) {
+                break val;
+            }
+            let code = val.get("code").and_then(serde_json::Value::as_str);
+            if code == Some("IDEMPOTENCY_IN_PROGRESS") && Instant::now() < deadline {
+                std::thread::sleep(EXEC_IN_PROGRESS_POLL_DELAY);
+                continue;
+            }
             return Err(format!(
                 "Sylphx POST {url} returned HTTP {status}: {}",
                 compact_error_body(&val)
             ));
-        }
+        };
         let stdout = decode_output_stream(&val, &["stdout_base64", "stdoutBase64"], "stdout")?;
         let stderr = decode_output_stream(&val, &["stderr_base64", "stderrBase64"], "stderr")?;
         let exit_code = val
@@ -1155,16 +1206,16 @@ impl SylphxSandboxClient {
         if let Some(b64) = val
             .get("content_base64")
             .or_else(|| val.get("contentBase64"))
+            .or_else(|| val.get("content"))
             .and_then(serde_json::Value::as_str)
         {
             return base64_decode(b64);
         }
-        if let Some(text) = val
-            .get("content")
-            .or_else(|| val.get("data"))
-            .and_then(serde_json::Value::as_str)
-        {
+        if let Some(text) = val.get("data").and_then(serde_json::Value::as_str) {
             return Ok(text.as_bytes().to_vec());
+        }
+        if val.is_object() {
+            return Ok(Vec::new());
         }
         Err(format!(
             "Sylphx `:readFile` {path} returned unexpected payload: {val}"
@@ -1177,8 +1228,7 @@ impl SylphxSandboxClient {
         let b64 = base64_encode(content);
         let body = serde_json::json!({
             "path": path,
-            "content_base64": b64,
-            "contentBase64": b64,
+            "content": b64,
         });
         let (status, val) = self.request_json("POST", &url, Some(&body), 45_000)?;
         if !(200..300).contains(&status) {
@@ -1233,7 +1283,8 @@ impl SylphxSandboxClient {
                     }
                 });
             let is_dir = item
-                .get("is_dir")
+                .get("directory")
+                .or_else(|| item.get("is_dir"))
                 .or_else(|| item.get("isDir"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or_else(|| {
@@ -1796,6 +1847,32 @@ fn sanitize_resource_segment(raw: &str) -> String {
     }
 }
 
+/// Normalize a caller-supplied volume/lease ID to match `^[a-z]([a-z0-9_-]{0,61}[a-z0-9])?$`.
+fn normalize_resource_id(raw: &str) -> String {
+    let seg = sanitize_resource_segment(raw);
+    let prefixed = if seg.as_bytes().first().is_some_and(u8::is_ascii_lowercase) {
+        seg
+    } else {
+        format!("v-{seg}")
+    };
+    let clipped: String = prefixed.chars().take(63).collect();
+    let trimmed = clipped.trim_end_matches(['-', '_']);
+    if trimmed.is_empty() {
+        "vol-agent".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn next_exec_idempotency_key() -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = EXEC_IDEMPOTENCY_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("aa-exec-{}-{now_ms}-{seq}", std::process::id())
+}
+
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::write(&tmp, bytes).map_err(|err| format!("write {}: {err}", tmp.display()))?;
@@ -1810,20 +1887,22 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 fn sylphx_network_json(policy: &super::providers::NetworkPolicySpec) -> serde_json::Value {
     match policy {
         super::providers::NetworkPolicySpec::Allow => serde_json::json!({
-            "egress": "ALLOW",
+            "egress": "allow",
         }),
         super::providers::NetworkPolicySpec::Deny => serde_json::json!({
-            "egress": "DENY",
+            "egress": "deny",
         }),
         super::providers::NetworkPolicySpec::Allowlist(entries) => {
             let (domains, cidrs) = super::providers::split_allowlist_domains_and_cidrs(entries);
-            serde_json::json!({
-                "egress": "ALLOWLIST",
-                "allowedDomains": domains,
-                "allowed_domains": domains,
-                "allowedCidrs": cidrs,
-                "allowed_cidrs": cidrs,
-            })
+            let mut obj = serde_json::Map::new();
+            obj.insert("egress".into(), serde_json::json!("allowlist"));
+            if !domains.is_empty() {
+                obj.insert("allowed_domains".into(), serde_json::json!(domains));
+            }
+            if !cidrs.is_empty() {
+                obj.insert("allowed_cidrs".into(), serde_json::json!(cidrs));
+            }
+            serde_json::Value::Object(obj)
         }
     }
 }
@@ -1877,12 +1956,15 @@ fn parse_volume_response(
     });
     let display_name = raw_name.unwrap_or(fallback_name).to_string();
     let size_gib = root
-        .get("sizeGib")
+        .pointer("/spec/size_gib")
+        .or_else(|| root.pointer("/spec/sizeGib"))
+        .or_else(|| root.get("sizeGib"))
         .or_else(|| root.get("size_gib"))
         .and_then(serde_json::Value::as_u64)
         .or(fallback_size_gib);
     let state = root
-        .get("state")
+        .pointer("/status/state")
+        .or_else(|| root.get("state"))
         .or_else(|| root.get("status"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
@@ -1920,13 +2002,16 @@ fn parse_lease_response(val: &serde_json::Value, parent: &str) -> Result<SylphxL
         .map(str::to_string)
         .unwrap_or_else(|| resource_name.rsplit('/').next().unwrap_or("").to_string());
     let state = root
-        .get("state")
+        .pointer("/status/state")
+        .or_else(|| root.get("state"))
         .or_else(|| root.get("status"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("READY")
         .to_string();
     let sandbox_id = root
-        .get("sandbox_id")
+        .pointer("/status/endpoints/e2b_sandbox_id")
+        .or_else(|| root.pointer("/status/endpoints/e2bSandboxId"))
+        .or_else(|| root.get("sandbox_id"))
         .or_else(|| root.get("sandboxId"))
         .or_else(|| root.get("sandbox"))
         .and_then(serde_json::Value::as_str)
@@ -1945,7 +2030,9 @@ fn parse_lease_response(val: &serde_json::Value, parent: &str) -> Result<SylphxL
                 .map(|s| s.trim_matches('/').to_string())
         });
     let envd_url = root
-        .get("envd_url")
+        .pointer("/status/endpoints/guest_uri")
+        .or_else(|| root.pointer("/status/endpoints/guestUri"))
+        .or_else(|| root.get("envd_url"))
         .or_else(|| root.get("envdUrl"))
         .or_else(|| root.get("envd_proxy_url"))
         .or_else(|| root.get("envdProxyUrl"))
@@ -1961,7 +2048,9 @@ fn parse_lease_response(val: &serde_json::Value, parent: &str) -> Result<SylphxL
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     let expires_at = root
-        .get("expires_at")
+        .pointer("/status/expire_time")
+        .or_else(|| root.pointer("/status/expireTime"))
+        .or_else(|| root.get("expires_at"))
         .or_else(|| root.get("expiresAt"))
         .or_else(|| root.get("expireTime"))
         .and_then(serde_json::Value::as_str)
@@ -1989,11 +2078,14 @@ fn decode_output_stream(
             return Ok(String::from_utf8_lossy(&bytes).into_owned());
         }
     }
-    Ok(val
-        .get(plain_key)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string())
+    let Some(raw) = val.get(plain_key).and_then(serde_json::Value::as_str) else {
+        return Ok(String::new());
+    };
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
+    let bytes = base64_decode(raw)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Encode a single Connect-RPC streaming envelope `[flags: u8][be_len: u32][payload]`.
@@ -2218,39 +2310,52 @@ mod tests {
                 ("GET", "/v1/orgs/o1/projects/p1/envs/e1/volumes/anyagents-agt-1") => {
                     (404, json_hdr, br#"{"error":"not found"}"#.to_vec())
                 }
-                ("POST", "/v1/orgs/o1/projects/p1/envs/e1/volumes") => (
-                    201,
-                    json_hdr,
-                    serde_json::to_vec(&serde_json::json!({
-                        "name": "orgs/o1/projects/p1/envs/e1/volumes/vol_123",
-                        "volumeId": "vol_123",
-                        "sizeGib": 20,
-                        "state": "READY"
-                    }))
-                    .unwrap(),
-                ),
-                ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases") => (
-                    201,
-                    json_hdr,
-                    serde_json::to_vec(&serde_json::json!({
-                        "name": "orgs/o1/projects/p1/envs/e1/leases/lease_1",
-                        "leaseId": "lease_1",
-                        "state": "PROVISIONING"
-                    }))
-                    .unwrap(),
-                ),
+                (
+                    "POST",
+                    "/v1/orgs/o1/projects/p1/envs/e1/volumes?volume_id=anyagents-agt-1",
+                ) => {
+                    assert_eq!(parsed["spec"]["size_gib"], 20);
+                    (
+                        201,
+                        json_hdr,
+                        serde_json::to_vec(&serde_json::json!({
+                            "name": "orgs/o1/projects/p1/envs/e1/volumes/vol_123",
+                            "spec": { "size_gib": 20 },
+                            "status": { "state": "available" }
+                        }))
+                        .unwrap(),
+                    )
+                }
+                ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases") => {
+                    assert_eq!(parsed["spec"]["shape"], "linux-m");
+                    assert_eq!(parsed["spec"]["ttl"], "900s");
+                    assert_eq!(
+                        parsed["spec"]["volumes"][0]["volume"],
+                        "orgs/o1/projects/p1/envs/e1/volumes/vol_123"
+                    );
+                    (
+                        201,
+                        json_hdr,
+                        serde_json::to_vec(&serde_json::json!({
+                            "name": "orgs/o1/projects/p1/envs/e1/leases/lease_1",
+                            "status": { "state": "granted" }
+                        }))
+                        .unwrap(),
+                    )
+                }
                 ("GET", "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_1") => {
                     let mut count = lease_polls_ref.lock().unwrap();
                     *count += 1;
-                    let st = if *count >= 1 { "READY" } else { "PROVISIONING" };
+                    let st = if *count >= 1 { "ready" } else { "granted" };
                     (
                         200,
                         json_hdr,
                         serde_json::to_vec(&serde_json::json!({
                             "name": "orgs/o1/projects/p1/envs/e1/leases/lease_1",
-                            "leaseId": "lease_1",
-                            "state": st,
-                            "expiresAt": "2026-11-19T20:00:00Z"
+                            "status": {
+                                "state": st,
+                                "expire_time": "2026-11-19T20:00:00Z"
+                            }
                         }))
                         .unwrap(),
                     )
@@ -2260,25 +2365,34 @@ mod tests {
                     json_hdr,
                     serde_json::to_vec(&serde_json::json!({
                         "name": "orgs/o1/projects/p1/envs/e1/leases/lease_1",
-                        "leaseId": "lease_1",
-                        "state": "READY",
-                        "expiresAt": "2026-11-20T20:00:00Z"
+                        "status": {
+                            "state": "ready",
+                            "expire_time": "2026-11-20T20:00:00Z"
+                        }
                     }))
                     .unwrap(),
                 ),
-                ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_1:exec") => (
-                    200,
-                    json_hdr,
-                    serde_json::to_vec(&serde_json::json!({
-                        "stdout_base64": base64_encode(b"hello sylphx\n"),
-                        "stderr_base64": base64_encode(b""),
-                        "exit_code": 0
-                    }))
-                    .unwrap(),
-                ),
+                ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_1:exec") => {
+                    assert!(
+                        parsed["idempotency_key"]
+                            .as_str()
+                            .is_some_and(|s| !s.is_empty())
+                    );
+                    assert!(parsed["timeout"].as_str().is_some_and(|s| s.ends_with('s')));
+                    (
+                        200,
+                        json_hdr,
+                        serde_json::to_vec(&serde_json::json!({
+                            "stdout": base64_encode(b"hello sylphx\n"),
+                            "stderr": base64_encode(b""),
+                            "exit_code": 0
+                        }))
+                        .unwrap(),
+                    )
+                }
                 ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_1:writeFile") => {
                     let p = parsed["path"].as_str().unwrap().to_string();
-                    let b64 = parsed["content_base64"].as_str().unwrap();
+                    let b64 = parsed["content"].as_str().unwrap();
                     let bytes = base64_decode(b64).unwrap();
                     files_ref.lock().unwrap().insert(p, bytes);
                     (200, json_hdr, br#"{}"#.to_vec())
@@ -2290,7 +2404,7 @@ mod tests {
                             200,
                             json_hdr,
                             serde_json::to_vec(&serde_json::json!({
-                                "content_base64": base64_encode(&bytes),
+                                "content": base64_encode(&bytes),
                             }))
                             .unwrap(),
                         )
@@ -2303,15 +2417,21 @@ mod tests {
                     json_hdr,
                     serde_json::to_vec(&serde_json::json!({
                         "entries": [
-                            { "name": "src", "path": "/home/user/workspace/src", "isDir": true },
-                            { "name": "note.txt", "path": "/home/user/workspace/note.txt", "isDir": false, "sizeBytes": 5 }
+                            { "path": "/home/user/workspace/src", "directory": true },
+                            { "path": "/home/user/workspace/note.txt", "directory": false, "size_bytes": 5 }
                         ]
                     }))
                     .unwrap(),
                 ),
-                ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_1:release") => {
-                    (200, json_hdr, br#"{"released":true}"#.to_vec())
-                }
+                ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_1:release") => (
+                    200,
+                    json_hdr,
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "orgs/o1/projects/p1/envs/e1/leases/lease_1",
+                        "status": { "state": "ended" }
+                    }))
+                    .unwrap(),
+                ),
                 ("DELETE", "/v1/orgs/o1/projects/p1/envs/e1/volumes/vol_123") => {
                     (200, json_hdr, br#"{"deleted":true}"#.to_vec())
                 }
