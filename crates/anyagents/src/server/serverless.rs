@@ -1211,7 +1211,8 @@ pub(crate) fn settle_remote_turn_and_deliver(
     // 6. Trigger outbound reply delivery if configured and turn completed with text.
     // Skip automatic fallback delivery when the agent already sent an explicit
     // outbound message via MCP during this turn (avoids double-posting internal
-    // turn summaries into Telegram chats or peer mailboxes).
+    // turn summaries into Telegram chats or peer mailboxes), or when `result_text`
+    // is empty, a silent `NO_REPLY` sentinel, or a legacy guest `"completed"` placeholder.
     let already_replied_via_mcp = store
         .turn_ownership_snapshot(&turn.agent_id)
         .ok()
@@ -1221,7 +1222,7 @@ pub(crate) fn settle_remote_turn_and_deliver(
     if !already_replied_via_mcp
         && turn.status == "completed"
         && let Some(ref reply_text) = turn.result_text
-        && !reply_text.trim().is_empty()
+        && !is_suppressed_fallback_reply(reply_text)
         && let Some(rt_val) = turn
             .metadata_json
             .as_ref()
@@ -1306,6 +1307,13 @@ pub(crate) fn settle_remote_turn_and_deliver(
         settled_now: true,
         delivered_reply,
     }))
+}
+
+fn is_suppressed_fallback_reply(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("completed")
+        || trimmed.eq_ignore_ascii_case("NO_REPLY")
 }
 
 // ============================================================================
@@ -4919,5 +4927,66 @@ done
         assert!(ok.settled_now);
         assert_eq!(store.delivered_cursor(&agent.id).unwrap(), m2.seq);
         assert!(store.list_undelivered(&agent.id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn settle_suppresses_stray_completed_and_no_reply_sentinels() {
+        assert!(is_suppressed_fallback_reply(""));
+        assert!(is_suppressed_fallback_reply("   \n "));
+        assert!(is_suppressed_fallback_reply("completed"));
+        assert!(is_suppressed_fallback_reply(" Completed \n"));
+        assert!(is_suppressed_fallback_reply("NO_REPLY"));
+        assert!(is_suppressed_fallback_reply(" no_reply "));
+        assert!(!is_suppressed_fallback_reply(
+            "Task completed successfully."
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let sender = store
+            .create_agent(NewAgent::new("silent-sender", "agy"))
+            .unwrap();
+        let peer = store
+            .create_agent(NewAgent::new("silent-peer", "agy"))
+            .unwrap();
+        let now = now_ms();
+        for (idx, text) in ["completed", "NO_REPLY", "   "].iter().enumerate() {
+            let tid = format!("turn_suppress_{idx}");
+            store
+                .remote_turn_store()
+                .create_turn(&NewRemoteTurn {
+                    turn_id: tid.clone(),
+                    agent_id: sender.id.clone(),
+                    harness_kind: "sandbox".to_string(),
+                    provider_kind: Some("sylphx".to_string()),
+                    remote_run_id: None,
+                    callback_token_hash: format!("hash_{idx}"),
+                    cursor: None,
+                    status: "dispatched".to_string(),
+                    metadata_json: Some(json!({
+                        "reply_target": { "kind": "agent", "agent_id": peer.id.as_str() }
+                    })),
+                    next_poll_at_ms: None,
+                })
+                .unwrap();
+            let settled = settle_remote_turn_and_deliver(
+                &store,
+                &tid,
+                SettleRemoteTurn {
+                    status: "completed".to_string(),
+                    result_text: Some((*text).to_string()),
+                    error_text: None,
+                    usage_json: None,
+                    cursor: None,
+                    settled_at_ms: now + (idx as i64) + 10,
+                },
+                None,
+                0,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!settled.delivered_reply, "must suppress `{text}`");
+        }
+        assert!(store.list_undelivered(&peer.id, 10).unwrap().is_empty());
     }
 }
