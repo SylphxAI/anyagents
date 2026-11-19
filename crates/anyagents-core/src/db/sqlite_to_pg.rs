@@ -1445,8 +1445,9 @@ const HOST_INDEX_TABLES: &[TableSpec] = &[
 ];
 
 const MAX_MIGRATED_BLOB_BYTES: u64 = 16 * 1024 * 1024;
-const BLOB_BATCH_MAX_ROWS: usize = 250;
-const BLOB_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MIGRATED_CONFIG_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const BLOB_BATCH_MAX_ROWS: usize = 100;
+const BLOB_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Default)]
 struct BlobBackfillCounts {
@@ -1484,6 +1485,12 @@ impl AgentFileBatch {
 
     fn is_empty(&self) -> bool {
         self.agent_ids.is_empty()
+    }
+
+    fn would_overflow(&self, next_bytes: usize) -> bool {
+        !self.is_empty()
+            && (self.agent_ids.len() >= BLOB_BATCH_MAX_ROWS
+                || self.total_bytes.saturating_add(next_bytes) > BLOB_BATCH_MAX_BYTES)
     }
 
     fn should_flush(&self) -> bool {
@@ -1525,36 +1532,54 @@ impl AgentFileBatch {
         self.total_bytes = 0;
 
         block_on_pg(async move {
-            sqlx::query(
-                "INSERT INTO public.agent_files
-                    (agent_id, namespace, path, content, sha256, encrypted, version, updated_at_ms)
-                 SELECT t.agent_id, t.namespace, t.path, t.content, t.sha256, t.encrypted, 1, t.updated_at_ms
-                 FROM UNNEST(
-                     $1::text[], $2::text[], $3::text[], $4::bytea[],
-                     $5::text[], $6::boolean[], $7::bigint[]
-                 ) AS t(agent_id, namespace, path, content, sha256, encrypted, updated_at_ms)
-                 ON CONFLICT (agent_id, namespace, path) DO UPDATE
-                 SET content       = EXCLUDED.content,
-                     sha256        = EXCLUDED.sha256,
-                     encrypted     = EXCLUDED.encrypted,
-                     version       = CASE
-                                       WHEN public.agent_files.sha256 IS DISTINCT FROM EXCLUDED.sha256
-                                         OR public.agent_files.encrypted IS DISTINCT FROM EXCLUDED.encrypted
-                                       THEN public.agent_files.version + 1
-                                       ELSE public.agent_files.version
-                                     END,
-                     updated_at_ms = EXCLUDED.updated_at_ms",
-            )
-            .bind(&agent_ids)
-            .bind(&namespaces)
-            .bind(&paths)
-            .bind(&contents)
-            .bind(&sha256s)
-            .bind(&encrypted)
-            .bind(&updated_at_ms)
-            .execute(pool)
-            .await
-            .map_err(|e| Error::Message(format!("postgres agent_files backfill failed: {e}")))
+            let mut last_err = None;
+            for attempt in 0..2 {
+                let res = sqlx::query(
+                    "INSERT INTO public.agent_files
+                        (agent_id, namespace, path, content, sha256, encrypted, version, updated_at_ms)
+                     SELECT t.agent_id, t.namespace, t.path, t.content, t.sha256, t.encrypted, 1, t.updated_at_ms
+                     FROM UNNEST(
+                         $1::text[], $2::text[], $3::text[], $4::bytea[],
+                         $5::text[], $6::boolean[], $7::bigint[]
+                     ) AS t(agent_id, namespace, path, content, sha256, encrypted, updated_at_ms)
+                     ON CONFLICT (agent_id, namespace, path) DO UPDATE
+                     SET content       = EXCLUDED.content,
+                         sha256        = EXCLUDED.sha256,
+                         encrypted     = EXCLUDED.encrypted,
+                         version       = CASE
+                                           WHEN public.agent_files.sha256 IS DISTINCT FROM EXCLUDED.sha256
+                                             OR public.agent_files.encrypted IS DISTINCT FROM EXCLUDED.encrypted
+                                           THEN public.agent_files.version + 1
+                                           ELSE public.agent_files.version
+                                         END,
+                         updated_at_ms = EXCLUDED.updated_at_ms",
+                )
+                .bind(&agent_ids)
+                .bind(&namespaces)
+                .bind(&paths)
+                .bind(&contents)
+                .bind(&sha256s)
+                .bind(&encrypted)
+                .bind(&updated_at_ms)
+                .execute(pool)
+                .await;
+                match res {
+                    Ok(_) => return Ok(()),
+                    Err(e) if attempt == 0 => {
+                        last_err = Some(e);
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    Err(e) => {
+                        return Err(Error::Message(format!(
+                            "postgres agent_files backfill failed: {e}"
+                        )));
+                    }
+                }
+            }
+            Err(Error::Message(format!(
+                "postgres agent_files backfill failed: {}",
+                last_err.map(|e| e.to_string()).unwrap_or_default()
+            )))
         })?;
         Ok(count)
     }
@@ -1585,6 +1610,12 @@ impl DeploymentBlobBatch {
 
     fn is_empty(&self) -> bool {
         self.namespaces.is_empty()
+    }
+
+    fn would_overflow(&self, next_bytes: usize) -> bool {
+        !self.is_empty()
+            && (self.namespaces.len() >= BLOB_BATCH_MAX_ROWS
+                || self.total_bytes.saturating_add(next_bytes) > BLOB_BATCH_MAX_BYTES)
     }
 
     fn should_flush(&self) -> bool {
@@ -1670,6 +1701,7 @@ fn walk_regular_files_bounded(
     base: &Path,
     dir: &Path,
     skip_dirs: &[&str],
+    max_file_bytes: u64,
     skip_unreadable: bool,
     skipped_unreadable_dirs: &mut u64,
     out: &mut Vec<(String, PathBuf, i64)>,
@@ -1703,12 +1735,13 @@ fn walk_regular_files_bounded(
                 base,
                 &path,
                 skip_dirs,
+                max_file_bytes,
                 skip_unreadable,
                 skipped_unreadable_dirs,
                 out,
             )?;
         } else if meta.is_file() {
-            if meta.len() > MAX_MIGRATED_BLOB_BYTES {
+            if meta.len() > max_file_bytes {
                 continue;
             }
             let Ok(rel) = path.strip_prefix(base) else {
@@ -1727,6 +1760,13 @@ fn walk_regular_files_bounded(
 fn is_agent_config_transient(rel: &str) -> bool {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     name.ends_with(".lock")
+        || name.ends_with(".log")
+        || name.ends_with(".jsonl")
+        || name.ends_with(".db")
+        || name.ends_with(".db-wal")
+        || name.ends_with(".db-shm")
+        || name.ends_with(".bak")
+        || name.contains(".tmp.")
         || matches!(
             name,
             "opencode-service-pid"
@@ -1939,6 +1979,7 @@ fn backfill_on_disk_blobs(
                 &subdir,
                 &subdir,
                 &[],
+                MAX_MIGRATED_BLOB_BYTES,
                 false,
                 &mut skipped_unreadable_dirs,
                 &mut files,
@@ -1950,6 +1991,9 @@ fn backfill_on_disk_blobs(
                 let Ok(bytes) = std::fs::read(&full_path) else {
                     continue;
                 };
+                if af_batch.would_overflow(bytes.len()) {
+                    counts.agent_files_migrated += af_batch.flush(pool)?;
+                }
                 let digest = crate::learned_memory::sha256(&bytes);
                 af_batch.push(
                     aid_str.clone(),
@@ -1983,6 +2027,7 @@ fn backfill_on_disk_blobs(
 
             let mut files = Vec::new();
             const SKIP_CONFIG_DIRS: &[&str] = &[
+                "cache",
                 "cache-home",
                 "data-home",
                 "state-home",
@@ -1997,6 +2042,8 @@ fn backfill_on_disk_blobs(
                 ".git",
                 "brain",
                 "recordings",
+                "browser_recordings",
+                "conversations",
                 "logs",
                 ".npm",
                 ".bun",
@@ -2004,11 +2051,15 @@ fn backfill_on_disk_blobs(
                 "sessions",
                 ".local",
                 "chromium",
+                "tools",
+                "bin",
+                "history",
             ];
             walk_regular_files_bounded(
                 &config_dir,
                 &config_dir,
                 SKIP_CONFIG_DIRS,
+                MAX_MIGRATED_CONFIG_FILE_BYTES,
                 true,
                 &mut skipped_unreadable_dirs,
                 &mut files,
@@ -2032,6 +2083,9 @@ fn backfill_on_disk_blobs(
                 } else {
                     (bytes, false)
                 };
+                if af_batch.would_overflow(stored.len()) {
+                    counts.agent_files_migrated += af_batch.flush(pool)?;
+                }
                 af_batch.push(
                     aid_str.clone(),
                     ns,
@@ -2175,6 +2229,7 @@ fn backfill_on_disk_blobs(
             &root,
             &root,
             &[],
+            MAX_MIGRATED_BLOB_BYTES,
             false,
             &mut skipped_unreadable_dirs,
             &mut files,
@@ -2199,6 +2254,9 @@ fn backfill_on_disk_blobs(
             } else {
                 (bytes, false)
             };
+            if db_batch.would_overflow(stored.len()) {
+                counts.deployment_blobs_migrated += db_batch.flush(pool)?;
+            }
             db_batch.push(namespace, rel, stored, digest, encrypted, mtime_ms);
             if db_batch.should_flush() {
                 counts.deployment_blobs_migrated += db_batch.flush(pool)?;
