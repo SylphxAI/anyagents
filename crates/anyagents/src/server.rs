@@ -1610,15 +1610,6 @@ async fn telegram_webhook(
 /// and MCP for every credential kind. Until a deployment configures
 /// `public_listen` it is also the public one and keeps the `0.0.0.0:8788`
 /// default; once the public listener exists it defaults to loopback.
-#[cfg(target_os = "linux")]
-pub(crate) fn public_entry_listening(data: &Path) -> bool {
-    match crate::remote::Settings::load(data) {
-        Ok(settings) if settings.public_listen.is_some() => true,
-        Ok(_) => webhook_listen_addr(false, None).is_some(),
-        Err(_) => false,
-    }
-}
-
 fn parse_port_env(name: &str) -> Option<u16> {
     std::env::var(name)
         .ok()
