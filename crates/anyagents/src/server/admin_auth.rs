@@ -144,7 +144,8 @@ fn decode_hex_bytes(hex_str: &str) -> Option<Vec<u8>> {
     }
     let bytes = hex_str.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
+    let (chunks, _) = bytes.as_chunks::<2>();
+    for chunk in chunks {
         let hi = hex_nibble(chunk[0])?;
         let lo = hex_nibble(chunk[1])?;
         out.push((hi << 4) | lo);
