@@ -4,12 +4,12 @@
 //! every authorization, verification and raw read; the service only proposes
 //! cited ranges and scores passages. When it does not answer, the route ranks
 //! lexically and says which stage did not run.
+use agent_memory::{fusion, protocol::Client};
 use anyagents_core::{
     HistorySearchQuery, Store,
     host_index::{IndexHit, MemoryScope},
     host_retrieval::CitedRange,
 };
-use anyagents_memory::{fusion, protocol::Client};
 use std::{path::Path, time::Duration};
 
 use crate::api::{ConversationTurnView, RetrievalView};
@@ -236,7 +236,7 @@ mod tests {
         assert_eq!(retrieval.mode, "lexical");
         // A service that is configured but does not answer is a degradation.
         std::fs::write(
-            anyagents_memory::protocol::socket_path(dir.path()),
+            agent_memory::protocol::socket_path(dir.path()),
             b"not a socket",
         )
         .unwrap();

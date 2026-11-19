@@ -70,7 +70,8 @@ pub fn try_run(argv: &[String]) -> Option<i32> {
 /// which speaks this kernel's protocol version. Where keepers are not used,
 /// in the server's own process.
 pub fn host() -> Result<HarnessHost, String> {
-    if !HOSTED_IN_KEEPERS || anyagents_tools::SandboxMode::from_env().is_remote_required() {
+    if !HOSTED_IN_KEEPERS || crate::sandbox_providers::SandboxMode::from_env().is_remote_required()
+    {
         return Ok(HarnessHost::InProcess);
     }
     let path = crate::data::current_exe_clean()

@@ -22,6 +22,9 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::sandbox_providers::providers::{
+    ExecRequest, ImageSpec, LeasePolicy, ProviderKind, SandboxProvider as AsyncSandboxProvider,
+};
 use anyagents_core::stateless::{
     NewRemoteTurn, PendingRemoteTurn, RemoteTurnEventUpdate, SettleRemoteTurn, constant_time_eq,
     generate_callback_token, generate_turn_id, hash_callback_token, verify_callback_token_hash,
@@ -29,9 +32,6 @@ use anyagents_core::stateless::{
 };
 use anyagents_core::{
     Agent, AgentId, BillingMode, Incoming, NewUsage, RuntimeHeartbeat, Store, now_ms, utc_day,
-};
-use anyagents_tools::providers::{
-    ExecRequest, ImageSpec, LeasePolicy, ProviderKind, SandboxProvider as AsyncSandboxProvider,
 };
 use axum::Json;
 use axum::body::Bytes;
@@ -68,7 +68,7 @@ const TICK_STALE_SANDBOX_LIMIT: usize = 32;
 
 /// Return `true` when `ANYAGENTS_SERVERLESS=true` is enabled.
 pub(crate) fn is_serverless_mode() -> bool {
-    anyagents_tools::serverless_enabled_from_env()
+    crate::sandbox_providers::serverless_enabled_from_env()
 }
 
 fn env_non_empty(name: &str) -> Option<String> {
@@ -2100,11 +2100,12 @@ pub(crate) async fn run_tick_pass(
 
 fn renew_binding_lease(store: &Store, binding: &anyagents_core::stateless::SandboxBinding) -> bool {
     let cfg_dir = anyagents_core::agent_config_dir(store.data_dir(), &binding.agent_id);
-    if anyagents_tools::renew_lease_for_config_dir(&cfg_dir).is_ok_and(|renewed| renewed) {
+    if crate::sandbox_providers::renew_lease_for_config_dir(&cfg_dir).is_ok_and(|renewed| renewed) {
         let mut updated = binding.clone();
-        updated.lease_expires_at_ms = Some(
-            now_ms().saturating_add(anyagents_tools::providers::DEFAULT_MAX_LEASE_TTL_MS as i64),
-        );
+        updated.lease_expires_at_ms =
+            Some(now_ms().saturating_add(
+                crate::sandbox_providers::providers::DEFAULT_MAX_LEASE_TTL_MS as i64,
+            ));
         let _ = store.sandbox_binding_store().upsert(&updated);
         return true;
     }
@@ -2125,7 +2126,7 @@ fn renew_binding_lease(store: &Store, binding: &anyagents_core::stateless::Sandb
                 .map(|dt| dt.timestamp_millis())
                 .or_else(|| {
                     Some(now_ms().saturating_add(
-                        anyagents_tools::providers::DEFAULT_MAX_LEASE_TTL_MS as i64,
+                        crate::sandbox_providers::providers::DEFAULT_MAX_LEASE_TTL_MS as i64,
                     ))
                 });
             let _ = store.sandbox_binding_store().upsert(&updated);
@@ -2138,11 +2139,11 @@ fn renew_binding_lease(store: &Store, binding: &anyagents_core::stateless::Sandb
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyagents_core::{NewAgent, NewSchedule, hmac_sha256_hex};
-    use anyagents_supervisor::HealthBoard;
-    use anyagents_tools::providers::{
+    use crate::sandbox_providers::providers::{
         EnsureSandboxRequest, ExecOutput, ProviderHealth, SandboxCapabilities, SandboxHandle,
     };
+    use anyagents_core::{NewAgent, NewSchedule, hmac_sha256_hex};
+    use anyagents_supervisor::HealthBoard;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt as _;

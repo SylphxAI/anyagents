@@ -9,6 +9,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-memory"
+version = "0.1.0"
+source = "git+https://github.com/SylphxAI/agent-kit?tag=v0.1.0#6a2c2ea9050f4ee6a55faf656cee9fa517de20b0"
+dependencies = [
+ "async-trait",
+ "flate2",
+ "libc",
+ "ort",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "thiserror",
+ "tokenizers",
+ "ureq",
+ "uuid",
+]
+
+[[package]]
+name = "agent-tools"
+version = "0.1.0"
+source = "git+https://github.com/SylphxAI/agent-kit?tag=v0.1.0#6a2c2ea9050f4ee6a55faf656cee9fa517de20b0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "futures",
+ "globset",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "ureq",
+ "uuid",
+]
+
+[[package]]
 name = "agent-workstation"
 version = "0.2.0"
 source = "git+https://github.com/SylphxAI/agent-workstation?rev=9587cbc7d0850afa315111b764cc9cde9d62e646#9587cbc7d0850afa315111b764cc9cde9d62e646"
@@ -125,6 +166,8 @@ dependencies = [
 name = "anyagents"
 version = "0.1.9"
 dependencies = [
+ "agent-memory",
+ "agent-tools",
  "agent-workstation",
  "anyagents-agent",
  "anyagents-channel-telegram",
@@ -143,16 +186,15 @@ dependencies = [
  "anyagents-installer",
  "anyagents-invariants",
  "anyagents-keeper",
- "anyagents-memory",
  "anyagents-supervisor",
  "anyagents-toolchain",
- "anyagents-tools",
  "async-trait",
  "axum",
  "base64 0.22.1",
  "bytes",
  "chrono",
  "clap",
+ "flate2",
  "futures",
  "http-body-util",
  "hyper",
@@ -169,6 +211,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "subtle",
+ "tar",
  "tempfile",
  "tikv-jemallocator",
  "tokio",
@@ -395,25 +438,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyagents-memory"
-version = "0.1.9"
-dependencies = [
- "anyagents-core",
- "anyagents-installer",
- "flate2",
- "libc",
- "ort",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "tokenizers",
- "ureq",
-]
-
-[[package]]
 name = "anyagents-supervisor"
 version = "0.1.9"
 dependencies = [
@@ -438,23 +462,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
-]
-
-[[package]]
-name = "anyagents-tools"
-version = "0.1.9"
-dependencies = [
- "anyagents-toolchain",
- "async-trait",
- "base64 0.23.1",
- "flate2",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "tokio",
- "ureq",
 ]
 
 [[package]]
@@ -575,6 +582,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "bstr"
+version = "1.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a680398c10c7bc0488067c4612226ea905a85f607134b69f3068d505d58c4214"
+dependencies = [
+ "memchr",
+ "serde_core",
 ]
 
 [[package]]
@@ -1323,6 +1340,19 @@ checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
 dependencies = [
  "color_quant",
  "weezl",
+]
+
+[[package]]
+name = "globset"
+version = "0.4.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f98b0d85522dc0a824cfebbc9594ff4a9b289c568bea0370319dfbdf20ccdd2d"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]

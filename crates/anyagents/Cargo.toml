@@ -24,14 +24,15 @@ anyagents-harness-codex = { path = "../anyagents-harness-codex" }
 anyagents-harness-opencode = { path = "../anyagents-harness-opencode" }
 anyagents-harness-spiron = { path = "../anyagents-harness-spiron" }
 anyagents-supervisor = { path = "../anyagents-supervisor" }
-anyagents-memory = { path = "../anyagents-memory", features = ["service"] }
-anyagents-tools = { path = "../anyagents-tools" }
+agent-memory = { git = "https://github.com/SylphxAI/agent-kit", tag = "v0.1.0", features = ["service"] }
+agent-tools = { git = "https://github.com/SylphxAI/agent-kit", tag = "v0.1.0" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
+flate2 = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 futures = "0.3"
@@ -52,6 +53,7 @@ serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
 subtle = "2.6"
+tar = { version = "0.4", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-stream = "0.1"

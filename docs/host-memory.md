@@ -385,7 +385,7 @@ embedder over the host index as it stands, without calling a model, reading a
 profile's key or writing anything, prints it with the state `serve` would
 start in, and exits non-zero when `serve` would wait.
 
-Models and runtime are pinned in `crates/anyagents-memory/src/pins.rs` by
+Models and runtime are pinned in `agent-memory` (`SylphxAI/agent-kit`, `crates/agent-memory/src/pins.rs`) by
 Hugging Face commit and per-file SHA-256, and ONNX Runtime 1.31.0 by the
 official release archive's SHA-256. `anyagents memory-service fetch`
 downloads and verifies them into `<data>/memory-service/models`; `serve`
@@ -512,7 +512,7 @@ production dense pipeline, searches only history before each query, and
 scores five rankings of the same candidates: BM25 alone, dense alone, their
 reciprocal-rank fusion, the fusion reranked (first 20), and BM25 reranked.
 Nothing in the live system is written. The same code runs as
-`cargo run -p anyagents-memory --features service --release --example
+`cargo run -p agent-memory --features service --release --example
 memory-eval` for development.
 
 Results on 2026-11-13, from two lead agents whose operator talks to them in

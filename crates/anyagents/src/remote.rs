@@ -307,8 +307,9 @@ pub fn runs_off_host(agent: &Agent, config_dir: &Path) -> bool {
         .and_then(Path::parent);
     crate::vendor::is_cloud_harness(&agent.harness)
         || crate::sandbox_exec::has_remote_sandbox_provider(data_dir)
-        || anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(config_dir).is_some()
-        || anyagents_tools::SandboxConfig::resolve(Some(config_dir))
+        || crate::sandbox_providers::sylphx::SylphxLeaseConfig::from_config_dir(config_dir)
+            .is_some()
+        || crate::sandbox_providers::resolve_sandbox_config(Some(config_dir))
             .is_some_and(|sandbox| sandbox.remote_spawn)
 }
 
@@ -319,7 +320,7 @@ pub fn runs_off_host(agent: &Agent, config_dir: &Path) -> bool {
 pub fn runs_off_host_in(store: &Store, agent: &Agent, config_dir: &Path) -> bool {
     runs_off_host(agent, config_dir)
         || crate::sandbox_exec::has_remote_sandbox_provider(Some(store.data_dir()))
-        || anyagents_tools::SandboxMode::from_env().is_remote_required()
+        || crate::sandbox_providers::SandboxMode::from_env().is_remote_required()
         || store.sandbox_binding(&agent.id).ok().flatten().is_some()
 }
 
