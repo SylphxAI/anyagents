@@ -1975,50 +1975,54 @@ fn collect_agent_bundle_entries(
         toml_cfg.as_bytes().to_vec(),
     ));
 
-    let opencode_json = serde_json::to_vec_pretty(&json!({
-        "$schema": "https://opencode.ai/config.json",
-        "mcp": {
-            "anyagents": {
-                "type": "local",
-                "command": [guest_bin, "mcp-proxy", "--url", mcp_url, "--token-file", token_path_in_vm],
-                "enabled": true,
-            }
+    let opencode_mcp_entry = json!({
+        "type": "local",
+        "command": [guest_bin, "mcp-proxy", "--url", mcp_url, "--token-file", token_path_in_vm],
+        "enabled": true,
+    });
+    let mut opencode_obj = [
+        ".config/opencode/opencode.json",
+        "opencode/opencode.json",
+        "opencode.json",
+    ]
+    .iter()
+    .find_map(|rel| {
+        std::fs::read_to_string(config_dir.join(rel))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .filter(Value::is_object)
+    })
+    .unwrap_or_else(|| json!({ "$schema": "https://opencode.ai/config.json" }));
+    if let Some(root) = opencode_obj.as_object_mut() {
+        root.entry("$schema")
+            .or_insert_with(|| json!("https://opencode.ai/config.json"));
+        let mcp_map = root
+            .entry("mcp")
+            .or_insert_with(|| json!({}))
+            .as_object_mut();
+        if let Some(mcp_map) = mcp_map {
+            mcp_map.insert("anyagents".to_string(), opencode_mcp_entry);
         }
-    }))
-    .map_err(|e| e.to_string())?;
-    uploads.push(("opencode.json".to_string(), opencode_json));
+    }
+    let opencode_json = serde_json::to_vec_pretty(&opencode_obj).map_err(|e| e.to_string())?;
+    uploads.push(("opencode.json".to_string(), opencode_json.clone()));
+    dirs_to_create.insert(format!("{state_root}/.config/opencode"));
+    uploads.push((
+        ".config/opencode/opencode.json".to_string(),
+        opencode_json.clone(),
+    ));
+    dirs_to_create.insert(format!("{state_root}/opencode"));
+    uploads.push(("opencode/opencode.json".to_string(), opencode_json));
 
     let dsh_patch = format!(
         "mcpServers:\n  anyagents:\n    command: {guest_bin}\n    args:\n      - mcp-proxy\n      - --url\n      - {mcp_url}\n      - --token-file\n      - {token_path_in_vm}\n"
     );
     uploads.push(("dsh-mcp-patch.yml".to_string(), dsh_patch.into_bytes()));
 
-    // 4. Sync refreshed upstream OAuth/subscription credential files (NEVER provider.json or local mcp-capability).
-    for cred_rel in [
-        ".credentials.json",
-        ".claude/.credentials.json",
-        "auth.json",
-        ".codex/auth.json",
-        ".config/sylphx/auth.json",
-        ".spiron/auth.json",
-        "muse/auth.json",
-        ".config/muse/auth.json",
-        ".config/opencode/auth.json",
-        ".grok/auth.json",
-        ".gemini/antigravity-cli/antigravity-oauth-token",
-    ] {
-        let local_cred = config_dir.join(cred_rel);
-        if local_cred.is_file()
-            && let Ok(bytes) = std::fs::read(&local_cred)
-        {
-            if let Some(parent) = Path::new(cred_rel).parent().and_then(|p| p.to_str())
-                && !parent.is_empty()
-            {
-                dirs_to_create.insert(format!("{state_root}/{parent}"));
-            }
-            uploads.push((cred_rel.to_string(), bytes));
-        }
-    }
+    // 4. Sync agent config & upstream OAuth/subscription credential files from `config_dir`
+    //    while causally excluding host-only secrets (`provider.json`, `gateway-token.txt`,
+    //    `mcp-capability`, `remote-session-token`, `.anyagents-mcp-url`) and local DB/socket state.
+    collect_agent_config_tree(config_dir, state_root, &mut uploads, &mut dirs_to_create);
 
     // 5. Repo clone/checkout spec (so guest checks out git repo on first boot).
     let repo_spec = read_synced_repo_spec(config_dir);
@@ -2167,7 +2171,7 @@ pub(crate) fn sync_agent_bundle_to_sylphx(
 
 /// Sync agent bundle into any [`AsyncSandboxProvider`] in a single `.tar.gz` batch.
 #[allow(clippy::too_many_arguments)]
-fn sync_agent_bundle_tar_to_provider(
+pub(crate) fn sync_agent_bundle_tar_to_provider(
     provider: &dyn AsyncSandboxProvider,
     handle: &SandboxHandle,
     store: Option<&Store>,
@@ -2448,6 +2452,158 @@ fn read_synced_repo_spec(config_dir: &Path) -> Option<SyncedRepoSpec> {
         }
     }
     None
+}
+
+const MAX_AGENT_BUNDLE_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+fn is_excluded_agent_sync_rel(rel: &str) -> bool {
+    let trimmed = rel.trim_start_matches('/');
+    if trimmed.is_empty() || trimmed.contains("..") {
+        return true;
+    }
+    let first = trimmed.split('/').next().unwrap_or("");
+    if matches!(
+        first,
+        "provider.json"
+            | "gateway-token.txt"
+            | "mcp-capability"
+            | "remote-session-token"
+            | ".anyagents-mcp-url"
+            | "sandbox.json"
+            | "sandbox-sylphx.json"
+            | ".sandbox-bundle-hashes.json"
+            | ".sylphx-bundle-hashes.json"
+            | ".last-cleanup"
+            | "guest-config.json"
+            | "repo-spec.json"
+            | ".mcp-token"
+            | "skills"
+            | ".agents"
+            | "memory"
+            | "history"
+            | "turns"
+            | "work"
+            | "tmp"
+            | "cache"
+            | "node_modules"
+            | "target"
+            | "data-home"
+            | "state-home"
+            | "memory-imports"
+    ) {
+        return true;
+    }
+    if first.starts_with(".seat-before-") {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.ends_with(".db")
+        || lower.ends_with(".db-wal")
+        || lower.ends_with(".db-shm")
+        || lower.ends_with(".sqlite")
+        || lower.ends_with(".sqlite3")
+        || lower.ends_with(".sqlite3-wal")
+        || lower.ends_with(".sqlite3-shm")
+        || lower.ends_with(".sock")
+        || lower.ends_with(".lock")
+        || lower.ends_with(".tmp")
+}
+
+/// Materialize an agent's persisted PostgreSQL `agent_files` (`config` and decrypted `secrets`)
+/// into the ephemeral `config_dir` so stateless replicas can build and sync the full remote
+/// sandbox bundle without local disk state.
+pub(crate) fn hydrate_agent_files_from_store(
+    store: &Store,
+    agent_id: &AgentId,
+    config_dir: &Path,
+) -> Result<usize, String> {
+    if !store.is_postgres() {
+        return Ok(0);
+    }
+    let blobs = store.blob_store();
+    let mut hydrated = 0usize;
+    for (ns, mode) in [("config", 0o644u32), ("secrets", 0o600u32)] {
+        let entries = blobs
+            .list_agent_files(agent_id, ns)
+            .map_err(|e| format!("list agent_files({ns}) failed: {e}"))?;
+        for meta in entries {
+            if meta.size_bytes as u64 > MAX_AGENT_BUNDLE_FILE_BYTES
+                || is_excluded_agent_sync_rel(&meta.path)
+            {
+                continue;
+            }
+            let Some(blob) = blobs
+                .get_agent_file(agent_id, ns, &meta.path)
+                .map_err(|e| format!("read agent_files({ns}, {}) failed: {e}", meta.path))?
+            else {
+                continue;
+            };
+            let dest = config_dir.join(&meta.path);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create dir {}: {e}", parent.display()))?;
+            }
+            std::fs::write(&dest, &blob.content)
+                .map_err(|e| format!("write hydrated {}: {e}", dest.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode));
+            }
+            hydrated += 1;
+        }
+    }
+    Ok(hydrated)
+}
+
+fn collect_agent_config_tree(
+    config_dir: &Path,
+    state_root: &str,
+    uploads: &mut Vec<(String, Vec<u8>)>,
+    dirs: &mut std::collections::BTreeSet<String>,
+) {
+    let existing: std::collections::HashSet<String> =
+        uploads.iter().map(|(p, _)| p.clone()).collect();
+    let mut stack = vec![(config_dir.to_path_buf(), String::new(), 0usize)];
+    while let Some((src, rel_prefix, depth)) = stack.pop() {
+        if depth > 8 || !src.exists() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&src) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if rel_prefix.is_empty() {
+                name
+            } else {
+                format!("{rel_prefix}/{name}")
+            };
+            if is_excluded_agent_sync_rel(&rel) || existing.contains(&rel) {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push((path, rel, depth + 1));
+            } else if meta.is_file()
+                && meta.len() <= MAX_AGENT_BUNDLE_FILE_BYTES
+                && let Ok(bytes) = std::fs::read(&path)
+            {
+                if let Some(parent) = Path::new(&rel).parent().and_then(|p| p.to_str())
+                    && !parent.is_empty()
+                {
+                    dirs.insert(format!("{state_root}/{parent}"));
+                }
+                uploads.push((rel, bytes));
+            }
+        }
+    }
 }
 
 fn collect_dereferenced_tree(
@@ -3596,6 +3752,17 @@ mod tests {
         )
         .unwrap();
         std::fs::write(cfg_dir.join("SYSTEM_PROMPT.md"), "You are sandboxed.").unwrap();
+        std::fs::create_dir_all(cfg_dir.join(".config/opencode")).unwrap();
+        std::fs::write(
+            cfg_dir.join(".config/opencode/opencode.json"),
+            r#"{"provider":{"custom":{"options":{"baseURL":"https://llm.example.test/v1"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cfg_dir.join(".config/opencode/custom.key"),
+            "key-file-val\n",
+        )
+        .unwrap();
         std::fs::write(
             cfg_dir.join("repo-spec.json"),
             r#"{"repo":"https://github.com/example/repo.git","branch":"main"}"#,
@@ -3691,6 +3858,32 @@ mod tests {
         assert!(mcp_json_raw.contains("profile=full"));
 
         assert!(files.contains_key("/home/user/agent-state/repo-spec.json"));
+        // Custom provider config + key files sync and merge `mcp.anyagents` across all opencode paths.
+        assert_eq!(
+            files
+                .get("/home/user/agent-state/.config/opencode/custom.key")
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .as_deref(),
+            Some("key-file-val\n")
+        );
+        for oc_path in [
+            "/home/user/agent-state/opencode.json",
+            "/home/user/agent-state/.config/opencode/opencode.json",
+            "/home/user/agent-state/opencode/opencode.json",
+        ] {
+            let oc_val: Value = serde_json::from_slice(&files[oc_path]).unwrap();
+            assert_eq!(
+                oc_val["provider"]["custom"]["options"]["baseURL"],
+                "https://llm.example.test/v1"
+            );
+            assert_eq!(oc_val["mcp"]["anyagents"]["enabled"], true);
+        }
+        // Host-only secrets must never be uploaded verbatim.
+        assert!(!files.contains_key("/home/user/agent-state/provider.json"));
+        assert!(!files.contains_key("/home/user/agent-state/gateway-token.txt"));
+        assert!(!files.contains_key("/home/user/agent-state/mcp-capability"));
+        assert!(!files.contains_key("/home/user/agent-state/remote-session-token"));
+        assert!(!files.contains_key("/home/user/agent-state/.anyagents-mcp-url"));
         // Exactly one mkdir exec batch due to SHA-256 manifest caching on 2nd sync.
         assert_eq!(exec_cmds.lock().unwrap().len(), 1);
         assert!(lease.workdir == "/home/user/workspace");

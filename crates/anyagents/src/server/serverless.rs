@@ -52,8 +52,8 @@ use crate::cloud_harness::serverless::{
 };
 use crate::sandbox_exec::{
     GuestHeartbeatFrame, apply_guest_heartbeat, ensure_sandbox_with_provider,
-    resolve_registry_for_binding, resolve_remote_provider_registry, sandbox_handle_from_binding,
-    sweep_idle_sandboxes,
+    hydrate_agent_files_from_store, resolve_registry_for_binding, resolve_remote_provider_registry,
+    sandbox_handle_from_binding, sweep_idle_sandboxes, sync_agent_bundle_tar_to_provider,
 };
 
 const DEFAULT_CLOUD_POLL_DELAY_MS: i64 = 5_000;
@@ -531,12 +531,13 @@ async fn dispatch_sandbox_turn(
     let store_ensure = Arc::clone(&store);
     let provider_ensure = Arc::clone(&provider);
     let agent_ensure = input.agent.clone();
-    let ensured = tokio::task::spawn_blocking(move || {
+    let extra_args_ensure = input.guest_extra_args.clone();
+    let ensured: Result<_, String> = tokio::task::spawn_blocking(move || {
         let cfg_dir = anyagents_core::agent_config_dir(store_ensure.data_dir(), &agent_ensure.id);
         let remote_workdir = resolve_remote_sandbox_workdir(&store_ensure, &agent_ensure);
-        ensure_sandbox_with_provider(
+        let ensured = ensure_sandbox_with_provider(
             &store_ensure,
-            provider_ensure,
+            Arc::clone(&provider_ensure),
             &ImageSpec::default(),
             &LeasePolicy::default(),
             None,
@@ -546,7 +547,32 @@ async fn dispatch_sandbox_turn(
             &cfg_dir,
             Some(&remote_workdir),
             &BTreeMap::new(),
-        )
+        )?;
+
+        // Hydrate persisted PostgreSQL `agent_files` (`config` + decrypted `secrets`)
+        // into the ephemeral config dir, ensure a live remote MCP session exists when
+        // public_url is configured, and sync the full bundle tar into `/home/user/agent-data/state`.
+        let _ = hydrate_agent_files_from_store(&store_ensure, &agent_ensure.id, &cfg_dir)?;
+        if crate::remote::session_token(&cfg_dir).is_err()
+            && crate::remote::require_public_url(store_ensure.data_dir()).is_ok()
+        {
+            crate::remote::begin_session(&store_ensure, &agent_ensure)?;
+        }
+        if crate::remote::session_token(&cfg_dir).is_ok()
+            && crate::cloud_harness::resolve_public_mcp_url(&cfg_dir).is_ok()
+        {
+            sync_agent_bundle_tar_to_provider(
+                provider_ensure.as_ref(),
+                &ensured.handle,
+                Some(&store_ensure),
+                Some(store_ensure.data_dir()),
+                &cfg_dir,
+                agent_ensure.id.as_str(),
+                &agent_ensure.harness,
+                &extra_args_ensure,
+            )?;
+        }
+        Ok(ensured)
     })
     .await
     .map_err(|e| format!("sandbox ensure join error: {e}"))?;
