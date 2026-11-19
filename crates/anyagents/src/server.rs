@@ -7446,7 +7446,7 @@ async fn conversation_route(
                 && query.scope != anyagents_core::host_index::MemoryScope::Transcripts
                 && let Some(owner_str) = id.strip_prefix("memory:").and_then(|s| s.split(':').next())
                 && authorized.iter().any(|a| a == owner_str)
-                && let Ok(aid) = AgentId::parse(owner_str)
+                && let Ok(aid) = anyagents_core::AgentId::parse(owner_str)
             {
                 let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(&state.store, &aid);
             }
@@ -7604,7 +7604,7 @@ async fn conversation_route(
                 }
             } else if authorized.len() <= 64 {
                 for aid_str in &authorized {
-                    if let Ok(aid) = AgentId::parse(aid_str) {
+                    if let Ok(aid) = anyagents_core::AgentId::parse(aid_str) {
                         let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(
                             &state.store,
                             &aid,
@@ -15625,12 +15625,15 @@ exec '{}' "$@"
                 State(state.clone()),
                 axum::http::HeaderMap::new(),
                 Query(McpRouteQuery::default()),
-                Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {}
-                })),
+                axum::body::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {}
+                    }))
+                    .unwrap(),
+                ),
             )
             .await
             .expect_err("missing auth must fail with 401");
@@ -15645,12 +15648,15 @@ exec '{}' "$@"
                 State(state.clone()),
                 bad_headers,
                 Query(McpRouteQuery::default()),
-                Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {}
-                })),
+                axum::body::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {}
+                    }))
+                    .unwrap(),
+                ),
             )
             .await
             .expect_err("invalid token must fail with 401");
@@ -15676,12 +15682,15 @@ exec '{}' "$@"
                     State(state.clone()),
                     local_headers,
                     Query(McpRouteQuery::default()),
-                    Json(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "tools/list",
-                        "params": {}
-                    })),
+                    axum::body::Bytes::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/list",
+                            "params": {}
+                        }))
+                        .unwrap(),
+                    ),
                 )
                 .await
                 .expect_err("a local capability must be refused over HTTP");
@@ -15704,8 +15713,9 @@ exec '{}' "$@"
                 let query = McpRouteQuery {
                     profile: profile.map(str::to_string),
                 };
+                let raw = axum::body::Bytes::from(serde_json::to_vec(&body).unwrap());
                 async move {
-                    let resp = mcp_post_route(State(state), headers, Query(query), Json(body))
+                    let resp = mcp_post_route(State(state), headers, Query(query), raw)
                         .await
                         .unwrap();
                     let status = resp.status();
@@ -16052,7 +16062,8 @@ exec '{}' "$@"
         let query = McpRouteQuery {
             profile: profile.map(str::to_string),
         };
-        let resp = mcp_post_route(State(state.clone()), headers, Query(query), Json(body)).await?;
+        let raw = axum::body::Bytes::from(serde_json::to_vec(&body).unwrap());
+        let resp = mcp_post_route(State(state.clone()), headers, Query(query), raw).await?;
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json = if bytes.is_empty() {
@@ -19726,12 +19737,15 @@ exec '{}' "$@"
                 Query(McpRouteQuery {
                     profile: Some("full".to_string()),
                 }),
-                Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/list",
-                    "params": {}
-                })),
+                axum::body::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/list",
+                        "params": {}
+                    }))
+                    .unwrap(),
+                ),
             )
             .await
             .unwrap_or_else(|e| {
@@ -19756,15 +19770,18 @@ exec '{}' "$@"
                 Query(McpRouteQuery {
                     profile: Some("full".to_string()),
                 }),
-                Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "inbox",
-                        "arguments": {}
-                    }
-                })),
+                axum::body::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "inbox",
+                            "arguments": {}
+                        }
+                    }))
+                    .unwrap(),
+                ),
             )
             .await
             .unwrap_or_else(|e| {
