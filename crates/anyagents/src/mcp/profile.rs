@@ -32,6 +32,14 @@ pub enum McpProfile {
     /// closed unless a remote sandbox backend is bound to the agent (zero coordinator-host
     /// filesystem exposure).
     Remote,
+    /// Pure multi-agent coordination + unified `agent-memory` (`send`, `inbox`, `agents`,
+    /// `groups`, `schedules`, `conversation`, `memory`). Default over `stdio` for harnesses
+    /// that embed the native tool, workstation, and skills kernel (such as `spiron`),
+    /// avoiding duplicate `code`, `web_search`, `web_fetch`, `skills`, `browser`, or
+    /// `computer` schemas while sharing the unified orchestrator memory and coordination plane.
+    #[value(name = "coordination-memory", alias = "coord-memory")]
+    #[serde(rename = "coordination-memory")]
+    CoordinationMemory,
     /// Optional explicit coordination-only profile (`--profile coordination` or `?profile=coordination`).
     /// Exposes only pure multi-agent coordination tools (`send`, `inbox`, `agents`, `groups`,
     /// `schedules`, `conversation`).
@@ -70,6 +78,18 @@ pub const REMOTE_MCP_TOOLS: &[&str] = &[
     "skills",
 ];
 
+/// Coordination + unified `agent-memory` profile for harnesses that natively embed
+/// `agent-tools`, `agent-workstation`, and skill loading (zero duplicate tool schemas).
+pub const COORDINATION_MEMORY_MCP_TOOLS: &[&str] = &[
+    "send",
+    "inbox",
+    "agents",
+    "groups",
+    "schedules",
+    "conversation",
+    "memory",
+];
+
 pub const COORDINATION_MCP_TOOLS: &[&str] = &[
     "send",
     "inbox",
@@ -84,6 +104,7 @@ impl McpProfile {
         match self {
             Self::Full => "full",
             Self::Remote => "remote",
+            Self::CoordinationMemory => "coordination-memory",
             Self::Coordination => "coordination",
         }
     }
@@ -92,6 +113,9 @@ impl McpProfile {
         match raw.trim().to_ascii_lowercase().as_str() {
             "full" | "stdio" | "local" => Some(Self::Full),
             "remote" | "http" | "cloud" => Some(Self::Remote),
+            "coordination-memory" | "coordination_memory" | "coord-memory" | "coord_memory" => {
+                Some(Self::CoordinationMemory)
+            }
             "coordination" | "coord" => Some(Self::Coordination),
             _ => None,
         }
@@ -101,6 +125,7 @@ impl McpProfile {
         match self {
             Self::Full => FULL_MCP_TOOLS,
             Self::Remote => REMOTE_MCP_TOOLS,
+            Self::CoordinationMemory => COORDINATION_MEMORY_MCP_TOOLS,
             Self::Coordination => COORDINATION_MCP_TOOLS,
         }
     }
@@ -114,8 +139,10 @@ impl McpProfile {
             // Direct host-bound tools require `Full`.
             "files" | "web" | "web_search" | "web_fetch" | "browser" | "computer" | "device"
             | "media" => matches!(self, Self::Full),
-            // Host-free sandbox-side `code` + control-plane `memory`/`skills` run on `Full` and `Remote`.
-            "code" | "memory" | "skills" => matches!(self, Self::Full | Self::Remote),
+            // Host-free sandbox-side `code` + control-plane `skills` run on `Full` and `Remote`.
+            "code" | "skills" => matches!(self, Self::Full | Self::Remote),
+            // Unified `agent-memory` runs on `Full`, `Remote`, and `CoordinationMemory`.
+            "memory" => matches!(self, Self::Full | Self::Remote | Self::CoordinationMemory),
             "send" | "inbox" | "agents" | "groups" | "schedules" | "schedule" | "conversation"
             | "search" | "spawn" | "subagents" | "describe" | "archive" | "wake" | "interact" => {
                 true
@@ -124,14 +151,20 @@ impl McpProfile {
         }
     }
 
-    pub fn resolve_stdio(explicit: Option<Self>, _harness: Option<&str>, _config: &Path) -> Self {
-        explicit.unwrap_or(Self::Full)
+    pub fn resolve_stdio(explicit: Option<Self>, harness: Option<&str>, _config: &Path) -> Self {
+        if let Some(profile) = explicit {
+            return profile;
+        }
+        if harness.is_some_and(crate::vendor::is_spiron_harness) {
+            return Self::CoordinationMemory;
+        }
+        Self::Full
     }
 
     /// The profile an MCP call over HTTP gets, whatever credential it
-    /// presents: `remote`, or the narrower `coordination` when asked for.
-    /// Over HTTP the tools run inside the server process, as the server's own
-    /// user, so `full` (files, exec, code, browser, computer, ...) would hand
+    /// presents: `remote`, `coordination-memory`, or `coordination` when asked
+    /// for. Over HTTP the tools run inside the server process, as the server's
+    /// own user, so `full` (files, exec, browser, computer, ...) would hand
     /// the caller the server's identity. It is never served here; `full`
     /// exists only on stdio, where the tool server runs as the agent itself.
     pub fn resolve_http(explicit: Option<&str>) -> Result<Self, String> {
@@ -139,14 +172,15 @@ impl McpProfile {
             None => Ok(Self::Remote),
             Some(raw) => match Self::from_str_opt(raw) {
                 Some(Self::Remote) => Ok(Self::Remote),
+                Some(Self::CoordinationMemory) => Ok(Self::CoordinationMemory),
                 Some(Self::Coordination) => Ok(Self::Coordination),
                 Some(Self::Full) => Err(format!(
                     "MCP profile `{raw}` is not served over HTTP, where tools would run as the server; \
-                     HTTP serves `remote` or `coordination`, and `full` is available only over stdio \
+                     HTTP serves `remote`, `coordination-memory`, or `coordination`, and `full` is available only over stdio \
                      (`anyagents mcp`)"
                 )),
                 None => Err(format!(
-                    "invalid MCP profile `{raw}`; HTTP serves `remote` or `coordination`"
+                    "invalid MCP profile `{raw}`; HTTP serves `remote`, `coordination-memory`, or `coordination`"
                 )),
             },
         }

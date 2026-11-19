@@ -1220,9 +1220,13 @@ pub(crate) fn write_agent_instructions_with_continuity_and_store(
             crate::vendor::memory_source(agent),
         ) {
             Ok(Some(session)) => {
-                doc.push('\n');
-                doc.push_str(&session.memory.section);
-                doc.push('\n');
+                // Never inject a duplicate pinned memory block if caller instructions
+                // already carry `<learned_memory>` or `<memory>`.
+                if !doc.contains("<learned_memory>") && !doc.contains("<memory>") {
+                    doc.push('\n');
+                    doc.push_str(&session.memory.section);
+                    doc.push('\n');
+                }
             }
             Ok(None) => (), // First dispatch pins and rerenders before launch.
             Err(error) => {

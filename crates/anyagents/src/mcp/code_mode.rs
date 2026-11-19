@@ -110,8 +110,8 @@ impl CodeExecContext {
             &self.deadline_ms,
             self.max_ms,
         );
-        if self.mcp.profile == McpProfile::Remote {
-            // Remote profile strictly forbids coordinator-host filesystem access.
+        if self.mcp.profile != McpProfile::Full {
+            // Non-`full` profiles strictly forbid coordinator-host filesystem access.
             let local_root = self
                 .mcp
                 .agent
@@ -160,9 +160,10 @@ impl CodeExecContext {
     }
 
     async fn call_web(&self, method: &str, params: Value) -> Result<Value, ToolError> {
-        if self.mcp.profile == McpProfile::Remote {
+        if self.mcp.profile != McpProfile::Full {
             return Err(ToolError::Execution(format!(
-                "web.{method} is disabled by active MCP profile `remote` (host network egress blocked)"
+                "web.{method} is disabled by active MCP profile `{}` (host network egress blocked)",
+                self.mcp.profile.as_str()
             )));
         }
         let args = normalize_web_args(method, params);
@@ -179,10 +180,11 @@ impl CodeExecContext {
         if let Some(desktop_action) = method.strip_prefix("desktop_") {
             return self.call_computer(desktop_action, params).await;
         }
-        if self.mcp.profile == McpProfile::Remote {
+        if self.mcp.profile != McpProfile::Full {
             return Err(ToolError::Execution(format!(
                 "workstation.{method} requires a remote/session workstation or `full` MCP profile; \
-                 coordinator-host browser access is blocked under `remote`"
+                 coordinator-host browser access is blocked under `{}`",
+                self.mcp.profile.as_str()
             )));
         }
         let args = merge_action_field(method, params);
@@ -197,11 +199,12 @@ impl CodeExecContext {
 
     async fn call_computer(&self, method: &str, params: Value) -> Result<Value, ToolError> {
         let args = normalize_computer_args(method, params);
-        if self.mcp.profile == McpProfile::Remote
+        if self.mcp.profile != McpProfile::Full
             && crate::computer::target(&args) != crate::computer::Target::Cloud
         {
             return Err(ToolError::Execution(format!(
-                "computer.{method} is disabled under MCP profile `remote` unless targeting a cloud sandbox"
+                "computer.{method} is disabled under MCP profile `{}` unless targeting a cloud sandbox",
+                self.mcp.profile.as_str()
             )));
         }
         let (val, blocks) = self
@@ -219,9 +222,10 @@ impl CodeExecContext {
         method: &str,
         params: Value,
     ) -> Result<Value, ToolError> {
-        if self.mcp.profile == McpProfile::Remote {
+        if self.mcp.profile != McpProfile::Full {
             return Err(ToolError::Execution(format!(
-                "{tool}.{method} is disabled by active MCP profile `remote`"
+                "{tool}.{method} is disabled by active MCP profile `{}`",
+                self.mcp.profile.as_str()
             )));
         }
         let args = if method == "call" || method == "action" {

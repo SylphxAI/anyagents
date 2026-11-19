@@ -3,14 +3,17 @@
 # Open-source, vendor-neutral multi-stage sandbox image for AnyAgents.
 #
 # Targets:
-#   - guest-builder : compiles the release `anyagents-guest` binary
+#   - guest-builder : compiles the release `anyagents-guest`, `agent-code-mode`
+#                     (`agent-tools`), and `agent-workstation` binaries from `Cargo.lock`
 #   - sandbox-base  : minimal Debian Bookworm developer sandbox with `anyagents-guest`,
-#                     persistent `/home/user/agent-data/{state,workspace}` layout, and
-#                     standard CLI utilities (git, rg, fd, jq, python3, node/npm, gh, tini)
+#                     `agent-code-mode`, `agent-workstation`, persistent
+#                     `/home/user/agent-data/{state,workspace}` layout, and standard CLI
+#                     utilities (git, rg, fd, jq, python3, node/npm, gh, tini)
 #   - sandbox-dev   : extends `sandbox-base` with open-source `rustc`/`cargo` (via rustup)
 #                     and `bun` for building and testing Rust + JS/TS repositories
-#   - sandbox-full  : extends `sandbox-dev` with optional public CLI harnesses selected
-#                     via `--build-arg INSTALL_HARNESSES="..."`
+#   - sandbox-full  : extends `sandbox-dev` with optional CLI harnesses selected via
+#                     `--build-arg INSTALL_HARNESSES="..."` (including opt-in `spiron` via
+#                     `SPIRON_INSTALL_URL` or `SPIRON_NPM_PKG`)
 #
 # Example builds:
 #   docker build -f Dockerfile.sandbox --target sandbox-base -t ghcr.io/<org>/anyagents-sandbox:base .
@@ -33,7 +36,8 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 
 # ------------------------------------------------------------------------------
-# Stage 1: Build standalone release `anyagents-guest` binary
+# Stage 1: Build standalone release `anyagents-guest`, `agent-code-mode`, and
+#          `agent-workstation` binaries from locked workspace dependencies
 # ------------------------------------------------------------------------------
 FROM ${RUST_IMAGE} AS guest-builder
 
@@ -47,8 +51,14 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY tests ./tests
 
-RUN cargo build --release --locked -p anyagents-guest --bin anyagents-guest \
-    && (strip /src/target/release/anyagents-guest || true)
+RUN cargo build --release --locked \
+        -p anyagents-guest --bin anyagents-guest \
+        -p agent-tools --bin agent-code-mode \
+        -p agent-workstation --bin agent-workstation \
+    && (strip \
+        /src/target/release/anyagents-guest \
+        /src/target/release/agent-code-mode \
+        /src/target/release/agent-workstation || true)
 
 # ------------------------------------------------------------------------------
 # Stage 2: Minimal vendor-neutral developer sandbox (`sandbox-base`)
@@ -100,9 +110,15 @@ RUN apt-get update \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
-# Install `anyagents-guest` runtime supervisor + MCP proxy.
+# Install `anyagents-guest` runtime supervisor + MCP proxy alongside unified
+# `agent-code-mode` (`agent-tools`) and `agent-workstation` binaries.
 COPY --from=guest-builder /src/target/release/anyagents-guest /usr/local/bin/anyagents-guest
-RUN chmod 0755 /usr/local/bin/anyagents-guest
+COPY --from=guest-builder /src/target/release/agent-code-mode /usr/local/bin/agent-code-mode
+COPY --from=guest-builder /src/target/release/agent-workstation /usr/local/bin/agent-workstation
+RUN chmod 0755 \
+    /usr/local/bin/anyagents-guest \
+    /usr/local/bin/agent-code-mode \
+    /usr/local/bin/agent-workstation
 
 # Create non-root `user` and unified persistent volume layout under `/home/user/agent-data`.
 # Mounting a single persistent volume at `/home/user/agent-data` preserves BOTH agent runtime
@@ -120,7 +136,9 @@ ENV HOME=/home/user \
     ANYAGENTS_SANDBOX_DATA_DIR=/home/user/agent-data \
     ANYAGENTS_GUEST_STATE_DIR=/home/user/agent-data/state \
     ANYAGENTS_GUEST_WORKDIR=/home/user/agent-data/workspace \
-    ANYAGENTS_SANDBOX_GUEST_PATH=/usr/local/bin/anyagents-guest
+    ANYAGENTS_SANDBOX_GUEST_PATH=/usr/local/bin/anyagents-guest \
+    ANYAGENTS_CODE_MODE_BIN=/usr/local/bin/agent-code-mode \
+    ANYAGENTS_WORKSTATION_BIN=/usr/local/bin/agent-workstation
 
 WORKDIR /home/user/agent-data/workspace
 USER ${USER_UID}:${USER_GID}
@@ -185,12 +203,16 @@ FROM sandbox-dev AS sandbox-full
 
 ARG USER_UID=1000
 ARG USER_GID=1000
-# Space- or comma-separated list of public CLI harnesses to pre-install.
-# Supported values: claude-code, codex, opencode, gemini, omp, none
+# Space- or comma-separated list of CLI harnesses to pre-install.
+# Supported values: claude-code, codex, opencode, gemini, omp, spiron, none
 ARG INSTALL_HARNESSES="claude-code codex opencode gemini omp"
+# Optional binary/tarball download URL or npm package spec when `spiron` is included
+# in `INSTALL_HARNESSES` (kept empty by default for public OSS builds).
+ARG SPIRON_INSTALL_URL=""
+ARG SPIRON_NPM_PKG=""
 
 LABEL org.opencontainers.image.title="anyagents-sandbox-full" \
-      org.opencontainers.image.description="Open-source AnyAgents sandbox image with configurable public CLI harnesses" \
+      org.opencontainers.image.description="Open-source AnyAgents sandbox image with configurable CLI harnesses" \
       org.opencontainers.image.licenses="MIT"
 
 USER root
@@ -198,6 +220,7 @@ USER root
 RUN set -eu; \
     raw="$(printf '%s' "${INSTALL_HARNESSES}" | tr ',' ' ')"; \
     npm_pkgs=""; \
+    install_spiron=0; \
     for item in $raw; do \
         case "$item" in \
             ""|"none") ;; \
@@ -206,9 +229,31 @@ RUN set -eu; \
             "opencode") npm_pkgs="$npm_pkgs opencode-ai" ;; \
             "gemini") npm_pkgs="$npm_pkgs @google/gemini-cli" ;; \
             "omp") npm_pkgs="$npm_pkgs @oh-my-pi/pi-coding-agent" ;; \
+            "spiron") install_spiron=1 ;; \
             *) echo "Unsupported INSTALL_HARNESSES token: $item" >&2; exit 1 ;; \
         esac; \
     done; \
+    if [ "$install_spiron" = "1" ]; then \
+        if [ -n "${SPIRON_INSTALL_URL}" ]; then \
+            tmpd="$(mktemp -d)"; \
+            case "${SPIRON_INSTALL_URL}" in \
+                *.tar.gz|*.tgz) \
+                    curl -fsSL "${SPIRON_INSTALL_URL}" | tar -xz -C "$tmpd"; \
+                    bin="$(find "$tmpd" -type f -name spiron | head -n 1)"; \
+                    test -n "$bin"; \
+                    install -m 0755 "$bin" /usr/local/bin/spiron ;; \
+                *) \
+                    curl -fsSL "${SPIRON_INSTALL_URL}" -o /usr/local/bin/spiron; \
+                    chmod 0755 /usr/local/bin/spiron ;; \
+            esac; \
+            rm -rf "$tmpd"; \
+        elif [ -n "${SPIRON_NPM_PKG}" ]; then \
+            npm_pkgs="$npm_pkgs ${SPIRON_NPM_PKG}"; \
+        else \
+            echo "INSTALL_HARNESSES includes 'spiron' but neither SPIRON_INSTALL_URL nor SPIRON_NPM_PKG was provided" >&2; \
+            exit 1; \
+        fi; \
+    fi; \
     if [ -n "$npm_pkgs" ]; then \
         npm install -g --no-audit --no-fund $npm_pkgs; \
         npm cache clean --force; \
