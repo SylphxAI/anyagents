@@ -683,10 +683,15 @@ async fn dispatch_sandbox_turn(
         argv.extend(input.guest_extra_args.iter().cloned());
     }
 
-    let exec_req = ExecRequest::argv(argv)
+    let mut exec_req = ExecRequest::argv(argv)
         .with_cwd(ensured.handle.workdir.clone())
         .with_stdin(effective_prompt.into_bytes())
         .with_timeout_ms(DETACHED_EXEC_TIMEOUT_MS);
+    exec_req
+        .env
+        .extend(crate::sandbox_exec::filter_sandbox_launch_env(
+            &input.agent.launch_env,
+        ));
 
     let out = match provider.exec(&ensured.handle, &exec_req).await {
         Ok(o) => o,
