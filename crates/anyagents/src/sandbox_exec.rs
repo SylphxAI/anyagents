@@ -4555,7 +4555,10 @@ mod tests {
         let raw = vec![
             ("ANYAGENTS_SCOPE".into(), "repo".into()),
             ("ANYAGENTS_LIFECYCLE".into(), "service".into()),
-            ("CUSTOM_TOOL_ENDPOINT".into(), "https://example.invalid".into()),
+            (
+                "CUSTOM_TOOL_ENDPOINT".into(),
+                "https://example.invalid".into(),
+            ),
             ("ANYAGENTS_OPERATOR_TOKEN".into(), "op-secret".into()),
             ("ANYAGENTS_DATABASE_URL".into(), "postgres://secret".into()),
             ("ANYAGENTS_MASTER_KEY".into(), "master-secret".into()),

@@ -958,20 +958,15 @@ fn ingest_updates(
                 continue;
             }
             if !inbound.media.is_empty() {
-                let downloaded =
-                    download_inbound_media(store, token, &channel.id, &inbound.media);
+                let downloaded = download_inbound_media(store, token, &channel.id, &inbound.media);
                 if !downloaded.is_empty() {
                     inbound.text.push('\n');
                     inbound.text.push_str(&downloaded.join("\n"));
                 }
             }
             if !inbound.quoted_media.is_empty() {
-                let downloaded = download_inbound_media(
-                    store,
-                    token,
-                    &channel.id,
-                    &inbound.quoted_media,
-                );
+                let downloaded =
+                    download_inbound_media(store, token, &channel.id, &inbound.quoted_media);
                 if !downloaded.is_empty()
                     && let Some(ref mut quote) = inbound.quote
                 {

@@ -3046,7 +3046,9 @@ mod tests {
     #[test]
     fn provider_ensure_recovers_from_409_resource_in_use_by_reusing_active_lease() {
         use super::super::providers::sylphx::{SylphxConfig, SylphxProvider};
-        use super::super::providers::{EnsureSandboxRequest, ImageSpec, LeasePolicy, SandboxProvider, VolumeSpec};
+        use super::super::providers::{
+            EnsureSandboxRequest, ImageSpec, LeasePolicy, SandboxProvider, VolumeSpec,
+        };
 
         let list_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let post_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));

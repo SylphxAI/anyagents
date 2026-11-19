@@ -5333,10 +5333,7 @@ async fn media_file_route(
     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "media file not found"))?;
     Ok((
         StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/octet-stream",
-        )],
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
         bytes,
     ))
 }

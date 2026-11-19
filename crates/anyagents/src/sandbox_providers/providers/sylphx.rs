@@ -255,9 +255,10 @@ impl SandboxProvider for SylphxProvider {
                             Err(err) if is_lease_collision_or_timeout(&err) => {
                                 // Recover when a concurrent replica or a timed-out POST
                                 // already attached `volume.resource_name` to a live lease.
-                                if let Ok(Some(discovered)) = client
-                                    .find_active_lease_for_volume(&cfg.parent, &volume.resource_name)
-                                {
+                                if let Ok(Some(discovered)) = client.find_active_lease_for_volume(
+                                    &cfg.parent,
+                                    &volume.resource_name,
+                                ) {
                                     let ready = client.wait_lease_ready(
                                         &cfg.parent,
                                         discovered,

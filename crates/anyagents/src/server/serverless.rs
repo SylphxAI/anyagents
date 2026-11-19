@@ -777,7 +777,10 @@ fn hydrate_prompt_media_for_sandbox(
 ) -> String {
     let media_dir = store.data_dir().join(anyagents_harness::media::MEDIA_DIR);
     let mut prefixes = Vec::new();
-    let dir_str = media_dir.to_string_lossy().trim_end_matches('/').to_string();
+    let dir_str = media_dir
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string();
     if !dir_str.is_empty() {
         prefixes.push(format!("{dir_str}/"));
     }
@@ -888,7 +891,9 @@ pub(crate) async fn dispatch_next_mailbox_message_if_serverless(
         if store_r.has_open_turn(&aid).unwrap_or(false) {
             let _ = store_r.reconcile_stale_open_turn(&aid);
         }
-        let msgs = store_r.list_undelivered(&aid, 20).map_err(|e| e.to_string())?;
+        let msgs = store_r
+            .list_undelivered(&aid, 20)
+            .map_err(|e| e.to_string())?;
         if msgs.is_empty() {
             return Ok(None);
         }
@@ -910,7 +915,10 @@ pub(crate) async fn dispatch_next_mailbox_message_if_serverless(
                 combined.push_str("\n\n---\n\n");
             }
             let sender = m.sender.as_deref().unwrap_or("unknown");
-            combined.push_str(&format!("[Message seq={} from {}]\n{}", m.seq, sender, m.text));
+            combined.push_str(&format!(
+                "[Message seq={} from {}]\n{}",
+                m.seq, sender, m.text
+            ));
         }
         combined
     };
