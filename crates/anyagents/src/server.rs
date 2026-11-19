@@ -191,19 +191,16 @@ fn hydrate_deployment_blobs_on_start(store: &Store, data: &Path) -> Result<usize
         let _ = std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o700));
     }
     for ns in ["config", "secrets", "profiles"] {
-        let metas = blobs.list_deployment_blobs(ns)?;
-        for meta in metas {
-            if anyagents_core::stateless::validate_blob_path(&meta.path).is_err() {
+        let entries = blobs.get_deployment_blobs_all(ns)?;
+        for entry in entries {
+            if anyagents_core::stateless::validate_blob_path(&entry.path).is_err() {
                 continue;
             }
             let dest = match ns {
-                "config" => data.join(&meta.path),
-                "secrets" => data.join("secrets").join(&meta.path),
-                "profiles" => data.join("profiles").join(&meta.path),
+                "config" => data.join(&entry.path),
+                "secrets" => data.join("secrets").join(&entry.path),
+                "profiles" => data.join("profiles").join(&entry.path),
                 _ => continue,
-            };
-            let Some(entry) = blobs.get_deployment_blob(ns, &meta.path)? else {
-                continue;
             };
             let mode = if entry.encrypted || ns == "secrets" {
                 0o600
@@ -2110,12 +2107,38 @@ async fn mcp_get(
         }))
 }
 
+const MCP_PAYLOAD_ENCODING_HEADER: &str = "x-anyagents-payload-encoding";
+
+fn decode_mcp_request_payload(
+    headers: &axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<serde_json::Value, ApiError> {
+    let raw_bytes = if headers
+        .get(MCP_PAYLOAD_ENCODING_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("base64"))
+    {
+        use base64::Engine as _;
+        let encoded = std::str::from_utf8(&body)
+            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid UTF-8 base64 payload"))?
+            .trim();
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid base64 MCP payload"))?
+    } else {
+        body.to_vec()
+    };
+    serde_json::from_slice::<serde_json::Value>(&raw_bytes)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid MCP JSON: {e}")))
+}
+
 async fn mcp_post_route(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Query(query): Query<McpRouteQuery>,
-    Json(payload): Json<serde_json::Value>,
+    body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
+    let payload = decode_mcp_request_payload(&headers, body)?;
     mcp_post(McpListener::Local, state, headers, query, payload).await
 }
 
@@ -2123,8 +2146,9 @@ async fn public_mcp_post_route(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Query(query): Query<McpRouteQuery>,
-    Json(payload): Json<serde_json::Value>,
+    body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
+    let payload = decode_mcp_request_payload(&headers, body)?;
     mcp_post(McpListener::Public, state, headers, query, payload).await
 }
 
@@ -2148,11 +2172,23 @@ async fn mcp_post(
             name: agent.name.clone(),
         };
         let _ = std::fs::create_dir_all(&config_dir);
+        // Hydrate remote sandbox lease metadata + learned memory from PostgreSQL on
+        // stateless replicas so `workspace.*` and `memory.*` tools work identically
+        // across scale-to-zero and replica switches.
+        let hydrated_workdir = crate::sandbox_exec::hydrate_sandbox_lease_file_from_store(
+            &state.store,
+            &agent.id,
+            &config_dir,
+        );
+        let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(&state.store, &agent.id);
+        let effective_workdir = hydrated_workdir
+            .map(PathBuf::from)
+            .or_else(|| agent.workdir.as_deref().map(PathBuf::from));
         Ok(crate::mcp::AgentMcp::new_for_http(
             crate::mcp::AgentRef {
                 id: agent.id.clone(),
                 name: agent.name.clone(),
-                workdir: agent.workdir.as_deref().map(PathBuf::from),
+                workdir: effective_workdir,
             },
             sock,
             config_dir,
@@ -2173,15 +2209,17 @@ async fn mcp_post(
     })
     .await
     .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    match answered {
-        Some(response_json) => Ok(axum::response::IntoResponse::into_response((
-            StatusCode::OK,
-            Json(response_json),
-        ))),
-        None => Ok(axum::response::IntoResponse::into_response(
-            StatusCode::ACCEPTED,
-        )),
-    }
+    let mut resp = match answered {
+        Some(response_json) => {
+            axum::response::IntoResponse::into_response((StatusCode::OK, Json(response_json)))
+        }
+        None => axum::response::IntoResponse::into_response(StatusCode::ACCEPTED),
+    };
+    resp.headers_mut().insert(
+        axum::http::header::HeaderName::from_static(MCP_PAYLOAD_ENCODING_HEADER),
+        axum::http::HeaderValue::from_static("base64"),
+    );
+    Ok(resp)
 }
 
 /// Query parameters for `GET /v1/usage`. `agent` names a target by name or id
@@ -2988,26 +3026,41 @@ fn list_fleet_schedules(
     store: &Store,
     principal: &Principal,
 ) -> Result<serde_json::Value, ApiError> {
-    let mut schedules = Vec::new();
-    for owner in store.list_agents().map_err(ApiError::from_store)? {
-        match authorize_schedule_target(store, principal, Some(owner.id.as_str())) {
-            Ok(_) => {}
-            Err(error) if error.status == StatusCode::FORBIDDEN => continue,
-            Err(error) => return Err(error),
-        }
-        for schedule in store
-            .list_schedules(Some(&owner.id), true)
-            .map_err(ApiError::from_store)?
-        {
-            let schedule = crate::api::ScheduleView::from(schedule);
-            let mut row = serde_json::to_value(&schedule).map_err(|error| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-            })?;
-            row["agent_name"] = serde_json::json!(owner.name);
-            row["next_fire_at_ms"] = serde_json::json!(schedule.next_fire_at_ms);
-            row["last_observed"] = serde_json::json!(schedule.last_observed);
-            schedules.push(row);
-        }
+    // Reject unknown/absent agent principals fail-closed even when no schedules exist.
+    if let Principal::Agent { agent_id, .. } = principal {
+        store.agent(agent_id).map_err(ApiError::from_store)?;
+    }
+    // Load all schedules in a single query instead of iterating every archived/active
+    // agent (which caused O(N) queries across thousands of archived agents).
+    let all_schedules = store
+        .list_schedules(None, true)
+        .map_err(ApiError::from_store)?;
+    let mut authorized_names: HashMap<String, Option<String>> = HashMap::new();
+    let mut schedules = Vec::with_capacity(all_schedules.len());
+    for sched in all_schedules {
+        let owner_id = sched.agent_id.as_str().to_string();
+        let owner_name = if let Some(cached) = authorized_names.get(&owner_id) {
+            cached.clone()
+        } else {
+            let resolved = match authorize_schedule_target(store, principal, Some(&owner_id)) {
+                Ok(agent) => Some(agent.name),
+                Err(error) if error.status == StatusCode::FORBIDDEN => None,
+                Err(error) if error.status == StatusCode::NOT_FOUND => None,
+                Err(error) => return Err(error),
+            };
+            authorized_names.insert(owner_id.clone(), resolved.clone());
+            resolved
+        };
+        let Some(owner_name) = owner_name else {
+            continue;
+        };
+        let schedule = crate::api::ScheduleView::from(sched);
+        let mut row = serde_json::to_value(&schedule)
+            .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        row["agent_name"] = serde_json::json!(owner_name);
+        row["next_fire_at_ms"] = serde_json::json!(schedule.next_fire_at_ms);
+        row["last_observed"] = serde_json::json!(schedule.last_observed);
+        schedules.push(row);
     }
     Ok(serde_json::json!({"agent": "all", "schedules": schedules}))
 }
@@ -4663,12 +4716,27 @@ pub(crate) fn roster_views(
     let files = file_cache::cache();
     files.catch_up();
     let seats = view_seats(files);
+    let mut unsettled_by_agent: HashMap<String, Vec<crate::api::UnsettledOutboundView>> =
+        HashMap::new();
+    for held in outbound_history::unsettled(store) {
+        unsettled_by_agent
+            .entry(held.agent_id.as_str().to_string())
+            .or_default()
+            .push(unsettled_view(&held));
+    }
     let mut agents = Vec::with_capacity(selected.len());
     for agent in all_agents {
         if !selected.contains(agent.id.as_str()) {
             continue;
         }
-        let view = agent_view_preloaded(store, health, agent, Some(&mut metadata), &seats)?;
+        let view = agent_view_preloaded(
+            store,
+            health,
+            agent,
+            Some(&mut metadata),
+            &seats,
+            Some(&unsettled_by_agent),
+        )?;
         agents.push(view);
     }
     Ok(AgentsResponse {
@@ -4863,7 +4931,7 @@ pub(crate) fn agent_view(
 ) -> Result<AgentView, ApiError> {
     let files = file_cache::cache();
     files.catch_up();
-    agent_view_preloaded(store, health, agent, None, &view_seats(files))
+    agent_view_preloaded(store, health, agent, None, &view_seats(files), None)
 }
 
 type RosterSeats = HashMap<String, (String, u32, u32, u32)>;
@@ -4889,6 +4957,7 @@ fn agent_view_preloaded(
     agent: &Agent,
     mut metadata: Option<&mut anyagents_core::AgentQueryMetadata>,
     seats: &RosterSeats,
+    unsettled_by_agent: Option<&HashMap<String, Vec<crate::api::UnsettledOutboundView>>>,
 ) -> Result<AgentView, ApiError> {
     if agent.state == "archived" {
         let mut view = archived_agent_view_fast(agent);
@@ -4897,11 +4966,13 @@ fn agent_view_preloaded(
                 .aliases
                 .remove(agent.id.as_str())
                 .unwrap_or_default();
+            // Avoid O(N) parent-chain DB queries across thousands of archived agents.
+            view.instructions = agent.instructions.clone();
         } else {
             view.aliases = store.agent_aliases(&agent.id).unwrap_or_default();
+            view.instructions =
+                create::effective_agent_instructions(Some(store), store.data_dir(), agent);
         }
-        view.instructions =
-            create::effective_agent_instructions(Some(store), store.data_dir(), agent);
         return Ok(view);
     }
     let now = now_ms();
@@ -5151,18 +5222,25 @@ fn agent_view_preloaded(
         oldest_undelivered_age_ms,
         install: install_state(store, files, agent),
         description: agent.public_description(),
-        instructions: create::effective_agent_instructions(Some(store), store.data_dir(), agent),
+        instructions: create::effective_agent_instructions(
+            (!serverless::is_serverless_mode()).then_some(store),
+            store.data_dir(),
+            agent,
+        ),
         seat_user: seat_info.as_ref().map(|(u, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid)| *gid),
         automations: crate::api::AutomationCountsView::from_schedules(&schedules),
         schedules,
         turn_errors: turn_errors.map(Into::into),
-        unsettled_outbound: outbound_history::unsettled(store)
-            .iter()
-            .filter(|held| held.agent_id == agent.id)
-            .map(unsettled_view)
-            .collect(),
+        unsettled_outbound: match unsettled_by_agent {
+            Some(map) => map.get(agent.id.as_str()).cloned().unwrap_or_default(),
+            None => outbound_history::unsettled(store)
+                .iter()
+                .filter(|held| held.agent_id == agent.id)
+                .map(unsettled_view)
+                .collect(),
+        },
         retry_at_ms,
     })
 }
@@ -7088,6 +7166,10 @@ async fn conversation_route(
                     .data_dir()
                     .join("agents")
                     .join(target.id.as_str());
+                let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(
+                    &state.store,
+                    &target.id,
+                );
                 let is_index_read = topic.eq_ignore_ascii_case("memory")
                     || topic.eq_ignore_ascii_case("memory.md")
                     || topic.eq_ignore_ascii_case("index");
@@ -7100,6 +7182,27 @@ async fn conversation_route(
                     (s, f)
                 };
                 let path = agent_root.join("memory").join(&filename);
+                let needs_index_rebuild = is_index_read
+                    && (!path.is_file()
+                        || std::fs::read_to_string(&path)
+                            .ok()
+                            .is_some_and(|s| s.contains("No topic files recorded yet.")));
+                if needs_index_rebuild
+                    && anyagents_core::learned_memory::list_memory_topics(&agent_root)
+                        .is_ok_and(|topics| !topics.is_empty())
+                    && let Ok(index) = anyagents_core::learned_memory::rebuild_memory_index(
+                        &agent_root,
+                        &target.name,
+                        target.role.as_deref(),
+                    )
+                {
+                    crate::sandbox_exec::persist_agent_memory_file_to_store(
+                        &state.store,
+                        &target.id,
+                        "MEMORY.md",
+                        index.as_bytes(),
+                    );
+                }
                 if state
                     .store
                     .is_host_path_redacted(target.id.as_str(), &path)
@@ -7229,8 +7332,11 @@ async fn conversation_route(
                 .data_dir()
                 .join("agents")
                 .join(target.id.as_str());
+            let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(&state.store, &target.id);
             let now_ms = anyagents_core::now_ms();
             let turn = if query.delete == Some(true) {
+                let slug = anyagents_core::learned_memory::sanitize_topic_slug(topic)
+                    .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
                 let (removed, index) = anyagents_core::learned_memory::delete_memory_topic(
                     &agent_root,
                     &target.name,
@@ -7238,6 +7344,17 @@ async fn conversation_route(
                     topic,
                 )
                 .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+                crate::sandbox_exec::delete_agent_memory_file_from_store(
+                    &state.store,
+                    &target.id,
+                    &format!("{slug}.md"),
+                );
+                crate::sandbox_exec::persist_agent_memory_file_to_store(
+                    &state.store,
+                    &target.id,
+                    "MEMORY.md",
+                    index.as_bytes(),
+                );
                 let _ = state.store.sync_agent_memory_index(&target);
                 ConversationTurnView {
                     seq: 0,
@@ -7258,7 +7375,7 @@ async fn conversation_route(
                 }
             } else {
                 let body_text = query.content.as_deref().unwrap_or_default();
-                let (path, entry, _) = anyagents_core::learned_memory::upsert_memory_topic(
+                let (path, entry, index) = anyagents_core::learned_memory::upsert_memory_topic(
                     &agent_root,
                     &target.name,
                     target.role.as_deref(),
@@ -7268,8 +7385,20 @@ async fn conversation_route(
                     now_ms,
                 )
                 .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
-                let _ = state.store.sync_agent_memory_index(&target);
                 let bytes = std::fs::read(&path).unwrap_or_default();
+                crate::sandbox_exec::persist_agent_memory_file_to_store(
+                    &state.store,
+                    &target.id,
+                    &entry.filename,
+                    &bytes,
+                );
+                crate::sandbox_exec::persist_agent_memory_file_to_store(
+                    &state.store,
+                    &target.id,
+                    "MEMORY.md",
+                    index.as_bytes(),
+                );
+                let _ = state.store.sync_agent_memory_index(&target);
                 let digest = anyagents_core::learned_memory::sha256(&bytes);
                 let doc_id = format!(
                     "memory:{}:{}",
@@ -7346,6 +7475,14 @@ async fn conversation_route(
                 Some(ids) => ids.clone(),
                 None => every_agent_id(&state.store)?,
             };
+            if state.store.is_postgres()
+                && query.scope != anyagents_core::host_index::MemoryScope::Transcripts
+                && let Some(owner_str) = id.strip_prefix("memory:").and_then(|s| s.split(':').next())
+                && authorized.iter().any(|a| a == owner_str)
+                && let Ok(aid) = anyagents_core::AgentId::parse(owner_str)
+            {
+                let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(&state.store, &aid);
+            }
             let (hit, bytes) = state
                 .store
                 .read_host_file_range(
@@ -7485,6 +7622,30 @@ async fn conversation_route(
         let should_search_host_files = has_structured_search
             || query.scope != anyagents_core::host_index::MemoryScope::All
             || std::env::var_os("ANYAGENTS_TESTS").is_some();
+        if should_search_host_files
+            && state.store.is_postgres()
+            && query.scope != anyagents_core::host_index::MemoryScope::Transcripts
+        {
+            if !is_all {
+                if let Ok(target) = state.store.agent_by_name(&name)
+                    && authorized.iter().any(|id| id == target.id.as_str())
+                {
+                    let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(
+                        &state.store,
+                        &target.id,
+                    );
+                }
+            } else if authorized.len() <= 64 {
+                for aid_str in &authorized {
+                    if let Ok(aid) = anyagents_core::AgentId::parse(aid_str) {
+                        let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(
+                            &state.store,
+                            &aid,
+                        );
+                    }
+                }
+            }
+        }
         // A search indexes only a bounded amount of new history before it
         // answers; the background indexer takes the rest, and the response
         // says the history it searched was partial.
@@ -15497,12 +15658,15 @@ exec '{}' "$@"
                 State(state.clone()),
                 axum::http::HeaderMap::new(),
                 Query(McpRouteQuery::default()),
-                Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {}
-                })),
+                axum::body::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {}
+                    }))
+                    .unwrap(),
+                ),
             )
             .await
             .expect_err("missing auth must fail with 401");
@@ -15517,12 +15681,15 @@ exec '{}' "$@"
                 State(state.clone()),
                 bad_headers,
                 Query(McpRouteQuery::default()),
-                Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {}
-                })),
+                axum::body::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {}
+                    }))
+                    .unwrap(),
+                ),
             )
             .await
             .expect_err("invalid token must fail with 401");
@@ -15548,12 +15715,15 @@ exec '{}' "$@"
                     State(state.clone()),
                     local_headers,
                     Query(McpRouteQuery::default()),
-                    Json(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "tools/list",
-                        "params": {}
-                    })),
+                    axum::body::Bytes::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/list",
+                            "params": {}
+                        }))
+                        .unwrap(),
+                    ),
                 )
                 .await
                 .expect_err("a local capability must be refused over HTTP");
@@ -15576,8 +15746,9 @@ exec '{}' "$@"
                 let query = McpRouteQuery {
                     profile: profile.map(str::to_string),
                 };
+                let raw = axum::body::Bytes::from(serde_json::to_vec(&body).unwrap());
                 async move {
-                    let resp = mcp_post_route(State(state), headers, Query(query), Json(body))
+                    let resp = mcp_post_route(State(state), headers, Query(query), raw)
                         .await
                         .unwrap();
                     let status = resp.status();
@@ -15924,7 +16095,8 @@ exec '{}' "$@"
         let query = McpRouteQuery {
             profile: profile.map(str::to_string),
         };
-        let resp = mcp_post_route(State(state.clone()), headers, Query(query), Json(body)).await?;
+        let raw = axum::body::Bytes::from(serde_json::to_vec(&body).unwrap());
+        let resp = mcp_post_route(State(state.clone()), headers, Query(query), raw).await?;
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json = if bytes.is_empty() {
@@ -19598,12 +19770,15 @@ exec '{}' "$@"
                 Query(McpRouteQuery {
                     profile: Some("full".to_string()),
                 }),
-                Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/list",
-                    "params": {}
-                })),
+                axum::body::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/list",
+                        "params": {}
+                    }))
+                    .unwrap(),
+                ),
             )
             .await
             .unwrap_or_else(|e| {
@@ -19628,15 +19803,18 @@ exec '{}' "$@"
                 Query(McpRouteQuery {
                     profile: Some("full".to_string()),
                 }),
-                Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "inbox",
-                        "arguments": {}
-                    }
-                })),
+                axum::body::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "inbox",
+                            "arguments": {}
+                        }
+                    }))
+                    .unwrap(),
+                ),
             )
             .await
             .unwrap_or_else(|e| {
@@ -19697,6 +19875,40 @@ exec '{}' "$@"
 
         // Clean up test agent in PG.
         store_a.delete_agent(&agent.id).unwrap();
+    }
+
+    #[test]
+    fn decode_mcp_request_payload_supports_plain_json_and_base64_waf_framing() {
+        use base64::Engine as _;
+
+        let raw = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "send",
+                "arguments": { "message": "ls -la | grep foo && cat /etc/hosts; SELECT * FROM t" }
+            }
+        });
+        let raw_bytes = serde_json::to_vec(&raw).unwrap();
+
+        // Plain JSON works without any encoding header.
+        let plain_headers = axum::http::HeaderMap::new();
+        let decoded_plain =
+            decode_mcp_request_payload(&plain_headers, axum::body::Bytes::from(raw_bytes.clone()))
+                .unwrap();
+        assert_eq!(decoded_plain, raw);
+
+        // Opaque base64 framing decodes to the identical JSON-RPC value.
+        let mut b64_headers = axum::http::HeaderMap::new();
+        b64_headers.insert(
+            axum::http::header::HeaderName::from_static(MCP_PAYLOAD_ENCODING_HEADER),
+            axum::http::HeaderValue::from_static("base64"),
+        );
+        let b64_body = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
+        let decoded_b64 =
+            decode_mcp_request_payload(&b64_headers, axum::body::Bytes::from(b64_body)).unwrap();
+        assert_eq!(decoded_b64, raw);
     }
 }
 

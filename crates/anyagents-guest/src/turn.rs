@@ -362,6 +362,9 @@ fn execute_turn_foreground(
         (heartbeat_interval_ms > 0).then(|| Duration::from_millis(heartbeat_interval_ms));
 
     let env = build_guest_env(state_dir, &work_dir, file_cfg.as_ref());
+    if harness_name == "agy" {
+        prune_legacy_agy_tool_guard(state_dir);
+    }
     let guest_exe =
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/anyagents-guest"));
     let pre_turn_auth = snapshot_syncable_auth_files(state_dir);
@@ -800,7 +803,65 @@ fn collect_changed_syncable_auth_files(
     changed
 }
 
-fn encode_base64_standard(input: &[u8]) -> String {
+fn prune_legacy_agy_tool_guard(state_dir: &Path) {
+    let hooks_path = state_dir.join(".gemini").join("config").join("hooks.json");
+    if let Ok(raw) = std::fs::read_to_string(&hooks_path)
+        && let Ok(mut root) = serde_json::from_str::<Value>(&raw)
+        && let Some(map) = root.as_object_mut()
+    {
+        let mut changed = map.remove("anyagents-native-tool-guard").is_some();
+        if map.remove("anyagents-steer").is_some() {
+            changed = true;
+        }
+        if changed {
+            if map.is_empty() {
+                let _ = std::fs::remove_file(&hooks_path);
+            } else if let Ok(mut body) = serde_json::to_vec_pretty(&root) {
+                body.push(b'\n');
+                let _ = std::fs::write(&hooks_path, body);
+            }
+        }
+    }
+
+    let settings_path = state_dir
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("settings.json");
+    if let Ok(raw) = std::fs::read_to_string(&settings_path)
+        && let Ok(mut root) = serde_json::from_str::<Value>(&raw)
+        && let Some(deny_arr) = root
+            .get_mut("permissions")
+            .and_then(|p| p.get_mut("deny"))
+            .and_then(Value::as_array_mut)
+    {
+        const LEGACY_FILE_SHELL_DENIES: &[&str] = &[
+            "read_file",
+            "view_file",
+            "read_file(*)",
+            "run_command",
+            "manage_task",
+            "write_file",
+            "edit_file",
+            "grep_search",
+            "find_by_name",
+            "list_dir",
+            "command(*)",
+            "write_file(*)",
+        ];
+        let before = deny_arr.len();
+        deny_arr.retain(|v| {
+            !v.as_str()
+                .is_some_and(|s| LEGACY_FILE_SHELL_DENIES.contains(&s))
+        });
+        if deny_arr.len() != before
+            && let Ok(body) = serde_json::to_vec_pretty(&root)
+        {
+            let _ = std::fs::write(&settings_path, body);
+        }
+    }
+}
+
+pub(crate) fn encode_base64_standard(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
@@ -1121,6 +1182,54 @@ mod tests {
         assert_eq!(
             changed.get(agy_rel).map(String::as_str),
             Some(encode_base64_standard(new_tok).as_str())
+        );
+    }
+
+    #[test]
+    fn prune_legacy_agy_tool_guard_cleans_persistent_volume_hooks_and_file_shell_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_path = dir.path().join(".gemini/config/hooks.json");
+        let settings_path = dir.path().join(".gemini/antigravity-cli/settings.json");
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+
+        std::fs::write(
+            &hooks_path,
+            serde_json::json!({
+                "anyagents-native-tool-guard": { "enabled": true },
+                "anyagents-steer": { "enabled": true }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &settings_path,
+            serde_json::json!({
+                "permissions": {
+                    "deny": [
+                        "invoke_subagent",
+                        "search_web",
+                        "run_command",
+                        "write_file",
+                        "edit_file",
+                        "read_file(*)",
+                        "command(*)",
+                        "write_file(*)"
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        prune_legacy_agy_tool_guard(dir.path());
+
+        assert!(!hooks_path.exists(), "empty hooks.json should be removed");
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            updated["permissions"]["deny"],
+            serde_json::json!(["invoke_subagent", "search_web"])
         );
     }
 }

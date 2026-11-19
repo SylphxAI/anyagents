@@ -570,6 +570,19 @@ async fn dispatch_sandbox_turn(
             // `<state_dir>/media/<file>`), ensure a live remote MCP session exists when
             // public_url is configured, and sync the full bundle tar into `<state_dir>`.
             let _ = hydrate_agent_files_from_store(&store_ensure, &agent_ensure.id, &cfg_dir)?;
+            let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(
+                &store_ensure,
+                &agent_ensure.id,
+            );
+            if anyagents_harness::normalize_harness_name(&agent_ensure.harness) == "agy" {
+                let _ = crate::vendor::ensure_agy_steering_settings(
+                    &cfg_dir,
+                    std::path::Path::new(&ensured.handle.workdir),
+                    &store_ensure
+                        .data_dir()
+                        .join(anyagents_harness::media::MEDIA_DIR),
+                );
+            }
             let rewritten_prompt = hydrate_prompt_media_for_sandbox(
                 &store_ensure,
                 &cfg_dir,

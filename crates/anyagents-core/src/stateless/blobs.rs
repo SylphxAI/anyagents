@@ -149,6 +149,36 @@ pub trait StateBlobStore: Send + Sync {
     fn delete_deployment_blob(&self, namespace: &str, path: &str) -> Result<bool, Error>;
 
     fn list_deployment_blobs(&self, namespace: &str) -> Result<Vec<BlobMeta>, Error>;
+
+    /// Batch-load all files in an agent's namespace in a single round-trip when
+    /// backed by PostgreSQL (falls back to `list_agent_files` + `get_agent_file`).
+    fn get_agent_files_all(
+        &self,
+        agent_id: &AgentId,
+        namespace: &str,
+    ) -> Result<Vec<BlobEntry>, Error> {
+        let metas = self.list_agent_files(agent_id, namespace)?;
+        let mut out = Vec::with_capacity(metas.len());
+        for meta in metas {
+            if let Some(entry) = self.get_agent_file(agent_id, namespace, &meta.path)? {
+                out.push(entry);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batch-load all deployment blobs in a namespace in a single round-trip when
+    /// backed by PostgreSQL (falls back to `list_deployment_blobs` + `get_deployment_blob`).
+    fn get_deployment_blobs_all(&self, namespace: &str) -> Result<Vec<BlobEntry>, Error> {
+        let metas = self.list_deployment_blobs(namespace)?;
+        let mut out = Vec::with_capacity(metas.len());
+        for meta in metas {
+            if let Some(entry) = self.get_deployment_blob(namespace, &meta.path)? {
+                out.push(entry);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// PostgreSQL implementation backed by `public.agent_files` and `public.deployment_blobs`.
@@ -485,6 +515,90 @@ impl StateBlobStore for PgStateBlobStore {
                 },
             )
             .collect())
+    }
+
+    fn get_agent_files_all(
+        &self,
+        agent_id: &AgentId,
+        namespace: &str,
+    ) -> Result<Vec<BlobEntry>, Error> {
+        let ns = validate_agent_namespace(namespace)?;
+        let pool = self.pool.clone();
+        let aid = agent_id.as_str().to_string();
+        let rows: Vec<(String, Vec<u8>, String, bool, i64, i64)> = block_on_pg(async move {
+            sqlx::query_as(
+                "SELECT path, content, sha256, encrypted, version, updated_at_ms
+                 FROM public.agent_files
+                 WHERE agent_id = $1 AND namespace = $2
+                 ORDER BY path ASC",
+            )
+            .bind(&aid)
+            .bind(ns)
+            .fetch_all(&pool)
+            .await
+            .map_err(Error::from)
+        })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (path, raw_content, digest, encrypted, version, updated_at_ms) in rows {
+            let Ok(clean) = validate_blob_path(&path) else {
+                continue;
+            };
+            let content = if encrypted {
+                let key = self.require_key()?;
+                key.decrypt(&agent_aad(agent_id, ns, &clean), &raw_content)?
+            } else {
+                raw_content
+            };
+            out.push(BlobEntry {
+                namespace: ns.to_string(),
+                path: clean,
+                content,
+                sha256: digest,
+                encrypted,
+                version,
+                updated_at_ms,
+            });
+        }
+        Ok(out)
+    }
+
+    fn get_deployment_blobs_all(&self, namespace: &str) -> Result<Vec<BlobEntry>, Error> {
+        let ns = validate_deployment_namespace(namespace)?;
+        let pool = self.pool.clone();
+        let rows: Vec<(String, Vec<u8>, String, bool, i64, i64)> = block_on_pg(async move {
+            sqlx::query_as(
+                "SELECT path, content, sha256, encrypted, version, updated_at_ms
+                 FROM public.deployment_blobs
+                 WHERE namespace = $1
+                 ORDER BY path ASC",
+            )
+            .bind(ns)
+            .fetch_all(&pool)
+            .await
+            .map_err(Error::from)
+        })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (path, raw_content, digest, encrypted, version, updated_at_ms) in rows {
+            let Ok(clean) = validate_blob_path(&path) else {
+                continue;
+            };
+            let content = if encrypted {
+                let key = self.require_key()?;
+                key.decrypt(&deployment_aad(ns, &clean), &raw_content)?
+            } else {
+                raw_content
+            };
+            out.push(BlobEntry {
+                namespace: ns.to_string(),
+                path: clean,
+                content,
+                sha256: digest,
+                encrypted,
+                version,
+                updated_at_ms,
+            });
+        }
+        Ok(out)
     }
 }
 
