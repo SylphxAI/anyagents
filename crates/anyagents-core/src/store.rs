@@ -76,8 +76,8 @@ pub use remote_sessions::{
 };
 pub use runtime::{
     AgentRuntime, BackfillReport, Fault, FaultKind, ProcessIdentity, QUOTA_ESTIMATE_MS, QuotaBlock,
-    QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState, SessionLease, Turn,
-    TurnOutcome, TurnState,
+    QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeHeartbeat, RuntimeState,
+    SessionLease, Turn, TurnOutcome, TurnState,
 };
 pub use turn_errors::{ErroredTurn, MAX_ERRORED_TURNS, TurnErrors, is_session_turn_error};
 pub use turn_events::AgentTurnSnapshot;
@@ -856,8 +856,19 @@ pub struct OpenTurn {
 /// (or adopted it from a keeper) unlocks on drop, and not once
 /// [`AgentLock::retain`] said the keeper keeps holding it after this process.
 #[derive(Debug)]
+enum AgentLockInner {
+    Flock(File),
+    PgLease {
+        guard: Arc<crate::stateless::CoordinatorLeaseGuard>,
+        /// Read-only descriptor supporting `AsFd` / `share()` compatibility for
+        /// callers that expect an OS fd handle.
+        fd: File,
+    },
+}
+
+#[derive(Debug)]
 pub struct AgentLock {
-    file: File,
+    inner: AgentLockInner,
     /// This descriptor took the lock (or adopted it), so its drop releases it.
     owner: bool,
     /// Cleared by [`AgentLock::retain`] on any copy: no copy in this process
@@ -868,17 +879,36 @@ pub struct AgentLock {
 impl AgentLock {
     fn taken(file: File) -> Self {
         Self {
-            file,
+            inner: AgentLockInner::Flock(file),
             owner: true,
             release: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
+    fn from_pg_lease(guard: crate::stateless::CoordinatorLeaseGuard) -> std::io::Result<Self> {
+        let fd = OpenOptions::new().read(true).open("/dev/null")?;
+        Ok(Self {
+            inner: AgentLockInner::PgLease {
+                guard: Arc::new(guard),
+                fd,
+            },
+            owner: true,
+            release: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        })
+    }
+
     /// Another descriptor of this lock, for a keeper process to inherit or
     /// for a later launch to hand on. The copy never unlocks on drop.
     pub fn share(&self) -> std::io::Result<AgentLock> {
+        let inner = match &self.inner {
+            AgentLockInner::Flock(file) => AgentLockInner::Flock(file.try_clone()?),
+            AgentLockInner::PgLease { guard, fd } => AgentLockInner::PgLease {
+                guard: Arc::clone(guard),
+                fd: fd.try_clone()?,
+            },
+        };
         Ok(Self {
-            file: self.file.try_clone()?,
+            inner,
             owner: false,
             release: Arc::clone(&self.release),
         })
@@ -896,23 +926,57 @@ impl AgentLock {
     pub fn retain(&self) {
         self.release.store(false, Ordering::SeqCst);
     }
+
+    /// Fencing token when backed by a distributed PostgreSQL coordinator lease.
+    pub fn fencing_token(&self) -> Option<i64> {
+        match &self.inner {
+            AgentLockInner::Flock(_) => None,
+            AgentLockInner::PgLease { guard, .. } => Some(guard.lease().fencing_token),
+        }
+    }
+
+    #[cfg(test)]
+    fn flock_file(&self) -> &File {
+        match &self.inner {
+            AgentLockInner::Flock(file) => file,
+            AgentLockInner::PgLease { fd, .. } => fd,
+        }
+    }
 }
 
 impl std::os::fd::AsFd for AgentLock {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        self.file.as_fd()
+        match &self.inner {
+            AgentLockInner::Flock(file) => file.as_fd(),
+            AgentLockInner::PgLease { fd, .. } => fd.as_fd(),
+        }
     }
 }
 
 impl Drop for AgentLock {
     fn drop(&mut self) {
-        if !self.owner || !self.release.load(Ordering::SeqCst) {
+        if !self.owner {
             return;
         }
-        // Closing only our descriptor leaves flock held by a concurrent fork's
-        // inherited copy until exec. Release the open-file-description lock
-        // explicitly so the next turn and busy probe see the intended lifetime.
-        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        let should_release = self.release.load(Ordering::SeqCst);
+        match &self.inner {
+            AgentLockInner::Flock(file) => {
+                if !should_release {
+                    return;
+                }
+                // Closing only our descriptor leaves flock held by a concurrent fork's
+                // inherited copy until exec. Release the open-file-description lock
+                // explicitly so the next turn and busy probe see the intended lifetime.
+                let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            }
+            AgentLockInner::PgLease { guard, .. } => {
+                if should_release {
+                    guard.release_now();
+                } else {
+                    guard.detach_without_release();
+                }
+            }
+        }
     }
 }
 
@@ -937,6 +1001,26 @@ pub struct Store {
     db_path: PathBuf,
     data_dir: PathBuf,
     capabilities: Mutex<Option<String>>,
+    replica_id: String,
+}
+
+fn default_replica_id() -> String {
+    static REPLICA_ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        if let Ok(explicit) = std::env::var("ANYAGENTS_REPLICA_ID") {
+            let trimmed = explicit.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        let host = std::env::var("HOSTNAME")
+            .ok()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "replica".to_string());
+        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        format!("{host}-{}-{suffix}", std::process::id())
+    });
+    REPLICA_ID.clone()
 }
 
 /// Default per-statement wait for the writer lock.
@@ -1051,6 +1135,7 @@ pub(crate) enum ReadConn<'a> {
 
 impl ReadConn<'_> {
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn as_sqlite(&self) -> &Connection {
         match self {
             Self::Pooled { conn, .. } => conn.as_ref().expect("pooled reader present until drop"),
@@ -1218,6 +1303,7 @@ impl Store {
             db_path: path.to_path_buf(),
             data_dir,
             capabilities: Mutex::new(None),
+            replica_id: default_replica_id(),
         })
     }
 
@@ -1228,14 +1314,166 @@ impl Store {
         Self::open_postgres_with_paths(url, &data_dir.join("state.db"), data_dir)
     }
 
+    /// Open a PostgreSQL-backed store with its own isolated in-process wake
+    /// bus, `LISTEN` connection, and explicit `replica_id`.
+    ///
+    /// Useful for multi-replica coordinator integration tests simulating
+    /// independent pods sharing one PostgreSQL database.
+    pub fn open_postgres_isolated(
+        url: &str,
+        data_dir: impl AsRef<Path>,
+        replica_id: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let data_dir = data_dir.as_ref();
+        let replica_id = replica_id.into();
+        let pg = registry::isolated_postgres(url, data_dir, &replica_id)?;
+        Ok(Self {
+            backend: registry::Backend::Postgres(pg),
+            db_path: data_dir.join("state.db"),
+            data_dir: data_dir.to_path_buf(),
+            capabilities: Mutex::new(None),
+            replica_id,
+        })
+    }
+
     fn open_postgres_with_paths(url: &str, db_path: &Path, data_dir: &Path) -> Result<Self, Error> {
-        let pg = registry::shared_postgres(url, data_dir)?;
+        let replica_id = default_replica_id();
+        let pg = registry::shared_postgres(url, data_dir, &replica_id)?;
         Ok(Self {
             backend: registry::Backend::Postgres(pg),
             db_path: db_path.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
             capabilities: Mutex::new(None),
+            replica_id,
         })
+    }
+
+    pub fn replica_id(&self) -> &str {
+        &self.replica_id
+    }
+
+    pub fn pg_pool(&self) -> Option<sqlx::PgPool> {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => Some(pg.handle.pool.clone()),
+            registry::Backend::Sqlite(_) => None,
+        }
+    }
+
+    /// Wait up to `timeout` for the background PostgreSQL `LISTEN anyagents_wakes`
+    /// subscriber to become active. Returns `true` immediately on SQLite.
+    pub fn wait_pg_wake_listener_ready(&self, timeout: Duration) -> bool {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => pg.wait_wake_listener_ready(timeout),
+            registry::Backend::Sqlite(_) => true,
+        }
+    }
+
+    /// State blob store (`agent_files` + `deployment_blobs` on PostgreSQL;
+    /// local `<data_dir>` filesystem on SQLite).
+    pub fn blob_store(&self) -> Box<dyn crate::stateless::StateBlobStore> {
+        self.blob_store_with_key(None)
+    }
+
+    pub fn blob_store_with_key(
+        &self,
+        master_key: Option<crate::stateless::MasterKey>,
+    ) -> Box<dyn crate::stateless::StateBlobStore> {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => Box::new(crate::stateless::PgStateBlobStore::new(
+                pg.handle.pool.clone(),
+                master_key,
+            )),
+            registry::Backend::Sqlite(_) => {
+                Box::new(crate::stateless::FsStateBlobStore::new(&self.data_dir))
+            }
+        }
+    }
+
+    /// Distributed coordinator lock backend (`public.coordinator_leases` on
+    /// PostgreSQL; local `flock` files on SQLite).
+    pub fn lock_backend(&self) -> Box<dyn crate::stateless::CoordinatorLockBackend> {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => {
+                Box::new(crate::stateless::PgCoordinatorLockBackend::new(
+                    pg.handle.pool.clone(),
+                    self.replica_id.clone(),
+                ))
+            }
+            registry::Backend::Sqlite(_) => Box::new(crate::stateless::LocalFlockLockBackend::new(
+                &self.data_dir,
+                self.replica_id.clone(),
+            )),
+        }
+    }
+
+    /// Try to acquire a distributed PostgreSQL coordinator lease with automatic
+    /// background heartbeat renewal. Returns `Ok(None)` when another replica
+    /// currently holds an unexpired lease (or when backed by SQLite).
+    pub fn try_acquire_coordinator_lease(
+        &self,
+        lease_key: &str,
+        ttl: Duration,
+    ) -> Result<Option<crate::stateless::CoordinatorLeaseGuard>, Error> {
+        let Some(pool) = self.pg_pool() else {
+            return Ok(None);
+        };
+        let backend =
+            crate::stateless::PgCoordinatorLockBackend::new(pool, self.replica_id.clone());
+        backend.try_acquire_guard(lease_key, ttl)
+    }
+
+    /// PostgreSQL protocol gateway route store (`None` on SQLite).
+    pub fn gateway_route_store(&self) -> Option<crate::stateless::PgGatewayRouteStore> {
+        self.gateway_route_store_with_key(None)
+    }
+
+    pub fn gateway_route_store_with_key(
+        &self,
+        master_key: Option<crate::stateless::MasterKey>,
+    ) -> Option<crate::stateless::PgGatewayRouteStore> {
+        self.pg_pool()
+            .map(|pool| crate::stateless::PgGatewayRouteStore::new(pool, master_key))
+    }
+
+    /// Durable sandbox binding store (`public.agent_sandbox_bindings` on
+    /// PostgreSQL; local config JSON on SQLite).
+    pub fn sandbox_binding_store(&self) -> Box<dyn crate::stateless::SandboxBindingStore> {
+        self.sandbox_binding_store_with_key(None)
+    }
+
+    pub fn sandbox_binding_store_with_key(
+        &self,
+        master_key: Option<crate::stateless::MasterKey>,
+    ) -> Box<dyn crate::stateless::SandboxBindingStore> {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => Box::new(
+                crate::stateless::PgSandboxBindingStore::new(pg.handle.pool.clone(), master_key),
+            ),
+            registry::Backend::Sqlite(_) => {
+                Box::new(crate::stateless::FsSandboxBindingStore::new(&self.data_dir))
+            }
+        }
+    }
+
+    /// Convenience lookup for one agent's persisted sandbox binding.
+    pub fn sandbox_binding(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<crate::stateless::SandboxBinding>, Error> {
+        self.sandbox_binding_store().get(agent_id)
+    }
+
+    /// Durable obligation store (`public.durable_obligations` on PostgreSQL;
+    /// local `<data_dir>/obligations/` on SQLite).
+    pub fn durable_obligation_store(&self) -> Box<dyn crate::stateless::DurableObligationStore> {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => Box::new(
+                crate::stateless::PgDurableObligationStore::new(pg.handle.pool.clone()),
+            ),
+            registry::Backend::Sqlite(_) => Box::new(
+                crate::stateless::FsDurableObligationStore::new(&self.data_dir),
+            ),
+        }
     }
 
     pub fn backend_kind(&self) -> DbBackend {
@@ -1598,6 +1836,17 @@ impl Store {
             .unwrap_or(false)
     }
 
+    /// Whether this agent already has an unrevoked capability row in the store.
+    pub fn has_active_capability(&self, agent_id: &AgentId) -> Result<bool, Error> {
+        let count: i64 = self.read_conn().db_query_one(
+            "SELECT COUNT(*) FROM agent_capabilities
+             WHERE agent_id = ?1 AND revoked_at_ms IS NULL",
+            &db_params![agent_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Replace an agent's instance: its generation moves, so every capability
     /// minted for the last instance stops authenticating at once.
     pub fn retire_capabilities(&self, agent_id: &AgentId) -> Result<(), Error> {
@@ -1617,6 +1866,9 @@ impl Store {
     /// Subscribe before scanning durable state. Generations are coalesced hints,
     /// never proof that any particular predicate became true.
     pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        if let registry::Backend::Postgres(pg) = &self.backend {
+            pg.ensure_wake_listener();
+        }
         self.changes_sender().subscribe()
     }
 
@@ -1627,6 +1879,11 @@ impl Store {
     }
 
     fn notify_changes(&self) {
+        if let registry::Backend::Postgres(pg) = &self.backend {
+            let _ =
+                crate::stateless::publish_pg_wake(&pg.handle.pool, Some(&self.replica_id), None);
+            return;
+        }
         let path = self.data_dir().join("wake.sock");
         if path.as_os_str().len() > 107 {
             return;
@@ -1639,6 +1896,9 @@ impl Store {
 
     /// Subscribe to mailbox/agent hints; committed events are not replayed.
     pub fn subscribe(&self) -> Receiver<Wake> {
+        if let registry::Backend::Postgres(pg) = &self.backend {
+            pg.ensure_wake_listener();
+        }
         let (sender, receiver) = mpsc::channel();
         self.wakes()
             .lock()
@@ -1661,7 +1921,15 @@ impl Store {
     }
 
     fn notify(&self, wake: Wake) {
-        self.send_datagram(&wake);
+        if let registry::Backend::Postgres(pg) = &self.backend {
+            let _ = crate::stateless::publish_pg_wake(
+                &pg.handle.pool,
+                Some(&self.replica_id),
+                Some(&wake),
+            );
+        } else {
+            self.send_datagram(&wake);
+        }
         self.fanout(&wake);
     }
 
@@ -1689,6 +1957,19 @@ impl Store {
 
     /// Exclusive lock for this agent's vendor process. A second caller gets [`Error::AgentBusy`].
     pub fn try_lock_agent(&self, agent_id: &AgentId) -> Result<AgentLock, Error> {
+        if let registry::Backend::Postgres(pg) = &self.backend {
+            let backend = crate::stateless::PgCoordinatorLockBackend::new(
+                pg.handle.pool.clone(),
+                self.replica_id.clone(),
+            );
+            let key = format!("agent:proc:{}", agent_id.as_str());
+            let Some(guard) =
+                backend.try_acquire_guard(&key, crate::stateless::DEFAULT_LEASE_TTL)?
+            else {
+                return Err(Error::AgentBusy);
+            };
+            return AgentLock::from_pg_lease(guard).map_err(Error::Io);
+        }
         let path = agent_lock_path(&self.data_dir, agent_id);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -1730,6 +2011,30 @@ impl Store {
         agent_id: &AgentId,
         nonblocking: bool,
     ) -> Result<AgentLock, Error> {
+        if let registry::Backend::Postgres(pg) = &self.backend {
+            debug_assert!(
+                nonblocking || !registry::holds_store_writer(),
+                "a lifecycle lock is waited for while this thread holds the Store writer"
+            );
+            let backend = crate::stateless::PgCoordinatorLockBackend::new(
+                pg.handle.pool.clone(),
+                self.replica_id.clone(),
+            );
+            let key = format!("agent:life:{}", agent_id.as_str());
+            let guard = if nonblocking {
+                match backend.try_acquire_guard(&key, crate::stateless::DEFAULT_LEASE_TTL)? {
+                    Some(g) => g,
+                    None => return Err(Error::AgentBusy),
+                }
+            } else {
+                backend.acquire_guard_blocking(
+                    &key,
+                    crate::stateless::DEFAULT_LEASE_TTL,
+                    WRITE_RETRY_BUDGET,
+                )?
+            };
+            return AgentLock::from_pg_lease(guard).map_err(Error::Io);
+        }
         let dir = self.data_dir.join("locks");
         std::fs::create_dir_all(&dir)?;
         let file = OpenOptions::new()
@@ -3525,13 +3830,50 @@ impl Store {
     /// every row that never reached admission is a failed or interrupted
     /// creation. Release each one's name. Returns the released `(id, name)`s.
     pub fn release_unadmitted_names(&self) -> Result<Vec<(AgentId, String)>, Error> {
-        let rows: Vec<(String, String)> = self.read_conn().db_query_vec(
-            "SELECT id, name FROM agents
-             WHERE (workdir IS NULL OR state = 'created') AND is_admin = 0 AND name != id
-               AND state IN ('created', 'archived')",
-            &[],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        self.release_unadmitted_names_older_than(0)
+    }
+
+    /// Release unadmitted agent name reservations created at least `min_age_ms`
+    /// ago (and, on PostgreSQL, without a fresh runtime heartbeat), so peer
+    /// coordinator replicas booting in multi-replica mode never clobber an
+    /// in-flight `create_agent` on another pod.
+    pub fn release_unadmitted_names_older_than(
+        &self,
+        min_age_ms: i64,
+    ) -> Result<Vec<(AgentId, String)>, Error> {
+        let cutoff = now_ms().saturating_sub(min_age_ms.max(0));
+        let rows: Vec<(String, String)> = if min_age_ms > 0 && self.is_postgres() {
+            self.read_conn().db_query_vec(
+                "SELECT a.id, a.name
+                 FROM agents a
+                 LEFT JOIN agent_runtime r ON r.agent_id = a.id
+                 WHERE (a.workdir IS NULL OR a.state = 'created')
+                   AND a.is_admin = 0
+                   AND a.name != a.id
+                   AND a.state IN ('created', 'archived')
+                   AND a.created_at_ms <= ?1
+                   AND COALESCE(r.heartbeat_at_ms, 0) <= ?1",
+                &db_params![cutoff],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        } else if min_age_ms > 0 {
+            self.read_conn().db_query_vec(
+                "SELECT id, name FROM agents
+                 WHERE (workdir IS NULL OR state = 'created') AND is_admin = 0 AND name != id
+                   AND state IN ('created', 'archived')
+                   AND created_at_ms <= ?1",
+                &db_params![cutoff],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        } else {
+            self.read_conn().db_query_vec(
+                "SELECT id, name FROM agents
+                 WHERE (workdir IS NULL OR state = 'created') AND is_admin = 0 AND name != id
+                   AND state IN ('created', 'archived')",
+                &[],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        };
         let mut released = Vec::new();
         for (id, name) in rows {
             let id = AgentId::parse(&id)?;
@@ -9971,7 +10313,7 @@ mod tests {
         let lock = store.try_lock_agent(&owner.id).unwrap();
         // A concurrent fork can inherit this open file description until exec.
         // A clone deterministically models that lifetime without timing a fork.
-        let inherited = lock.file.try_clone().unwrap();
+        let inherited = lock.flock_file().try_clone().unwrap();
         drop(lock);
         let _next_turn = store.try_lock_agent(&owner.id).unwrap();
         drop(inherited);
@@ -10012,8 +10354,9 @@ mod tests {
             Err(Error::AgentBusy)
         ));
         // The next kernel adopts the keeper's descriptor and owns release.
-        let adopted =
-            AgentLock::adopt(std::os::fd::OwnedFd::from(keeper.file.try_clone().unwrap()));
+        let adopted = AgentLock::adopt(std::os::fd::OwnedFd::from(
+            keeper.flock_file().try_clone().unwrap(),
+        ));
         drop(keeper);
         assert!(matches!(
             store.try_lock_agent(&owner.id),
@@ -10035,7 +10378,7 @@ mod tests {
             };
             // A duplicate shares the open file description inherited by fork,
             // even when the descriptor is close-on-exec. No fork timing needed.
-            let inherited = lock.file.try_clone().unwrap();
+            let inherited = lock.flock_file().try_clone().unwrap();
             assert!(matches!(
                 store.try_lock_agent_lifecycle(&owner.id),
                 Err(Error::AgentBusy)

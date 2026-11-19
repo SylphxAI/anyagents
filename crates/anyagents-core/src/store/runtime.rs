@@ -138,6 +138,18 @@ pub struct AgentRuntime {
     pub updated_at_ms: i64,
 }
 
+/// Cross-replica heartbeat & remote-execution telemetry persisted on
+/// `public.agent_runtime` in PostgreSQL mode.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeHeartbeat {
+    pub owner_replica_id: Option<String>,
+    pub turn_state: String,
+    pub retry_at_ms: Option<i64>,
+    pub heartbeat_at_ms: Option<i64>,
+    pub idle_since_ms: Option<i64>,
+    pub inflight_children: i32,
+}
+
 /// One requested runtime transition.
 ///
 /// Entering `starting` always opens the next generation. Entering `backoff`
@@ -1030,4 +1042,103 @@ fn transition_runtime_tx(
         super::cancel_archived_schedules(tx, agent_id)?;
     }
     runtime_of(tx, agent_id)?.ok_or_else(|| Error::AgentNotFound(agent_id.to_string()))
+}
+
+impl Store {
+    /// Publish cross-replica runtime ownership & heartbeat telemetry onto
+    /// `public.agent_runtime` (PostgreSQL mode; no-op returning `Ok(false)` on SQLite).
+    pub fn update_runtime_heartbeat(
+        &self,
+        agent_id: &AgentId,
+        hb: &RuntimeHeartbeat,
+    ) -> Result<bool, Error> {
+        let Some(pool) = self.pg_pool() else {
+            return Ok(false);
+        };
+        let aid = agent_id.as_str().to_string();
+        let owner = hb
+            .owner_replica_id
+            .clone()
+            .or_else(|| Some(self.replica_id().to_string()));
+        let turn_state = if hb.turn_state.trim().is_empty() {
+            "idle".to_string()
+        } else {
+            hb.turn_state.clone()
+        };
+        let retry_at = hb.retry_at_ms;
+        let heartbeat_at = hb.heartbeat_at_ms.unwrap_or_else(now_ms);
+        let idle_since = hb.idle_since_ms;
+        let inflight_children = hb.inflight_children.max(0);
+        let updated_at = now_ms();
+        let affected = crate::db::block_on_pg(async move {
+            sqlx::query(
+                "UPDATE public.agent_runtime
+                 SET owner_replica_id  = $2,
+                     turn_state        = $3,
+                     retry_at_ms       = $4,
+                     heartbeat_at_ms   = $5,
+                     idle_since_ms     = $6,
+                     inflight_children = $7,
+                     updated_at_ms     = GREATEST(updated_at_ms, $8)
+                 WHERE agent_id = $1",
+            )
+            .bind(&aid)
+            .bind(&owner)
+            .bind(&turn_state)
+            .bind(retry_at)
+            .bind(heartbeat_at)
+            .bind(idle_since)
+            .bind(inflight_children)
+            .bind(updated_at)
+            .execute(&pool)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(Error::from)
+        })?;
+        Ok(affected > 0)
+    }
+
+    /// Read cross-replica heartbeat metadata from `public.agent_runtime`
+    /// (`Ok(None)` on SQLite or when agent has no runtime row).
+    pub fn runtime_heartbeat(&self, agent_id: &AgentId) -> Result<Option<RuntimeHeartbeat>, Error> {
+        let Some(pool) = self.pg_pool() else {
+            return Ok(None);
+        };
+        let aid = agent_id.as_str().to_string();
+        let row: Option<(
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            i32,
+        )> = crate::db::block_on_pg(async move {
+            sqlx::query_as(
+                    "SELECT owner_replica_id, turn_state, retry_at_ms, heartbeat_at_ms, idle_since_ms, inflight_children
+                     FROM public.agent_runtime
+                     WHERE agent_id = $1",
+                )
+                .bind(&aid)
+                .fetch_optional(&pool)
+                .await
+                .map_err(Error::from)
+        })?;
+        Ok(row.map(
+            |(
+                owner_replica_id,
+                turn_state,
+                retry_at_ms,
+                heartbeat_at_ms,
+                idle_since_ms,
+                inflight_children,
+            )| RuntimeHeartbeat {
+                owner_replica_id,
+                turn_state,
+                retry_at_ms,
+                heartbeat_at_ms,
+                idle_since_ms,
+                inflight_children,
+            },
+        ))
+    }
 }

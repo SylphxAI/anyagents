@@ -236,6 +236,146 @@ fn active_seat_ids(store: &Store) -> Result<Vec<String>, Error> {
         .collect())
 }
 
+/// Minimum age (5 minutes) before a PostgreSQL replica's startup repair
+/// releases an unadmitted agent name reservation, preventing a booting peer
+/// pod from clobbering another replica's in-flight `create_agent`.
+const UNADMITTED_STALE_AGE_MS: i64 = 5 * 60 * 1000;
+
+/// Startup repair of failed agent creation reservations.
+///
+/// On single-host SQLite, `server.lock` excludes concurrent creation so every
+/// unadmitted row is a failed creation. On multi-replica PostgreSQL, gate
+/// behind a distributed `coordinator_leases` lock and only release rows older
+/// than `stale_age_ms` without a fresh runtime heartbeat.
+pub(crate) fn release_stale_unadmitted_names_on_start(
+    store: &Store,
+    stale_age_ms: i64,
+) -> Result<Vec<(anyagents_core::AgentId, String)>, Error> {
+    if store.is_postgres() {
+        let Some(_lease) = store.try_acquire_coordinator_lease(
+            "maint:unadmitted_names",
+            std::time::Duration::from_secs(60),
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        return store.release_unadmitted_names_older_than(stale_age_ms);
+    }
+    store.release_unadmitted_names()
+}
+
+/// Resolve the logical workspace directory inside a remote sandbox VM.
+///
+/// NEVER returns a coordinator-host path (such as `<data>/agents/<id>/launcher`
+/// or `<data>/agents/<id>/work`). Prefers:
+/// 1. Persisted `agent_sandbox_bindings.remote_workdir`
+/// 2. Explicit `ANYAGENTS_SANDBOX_WORKDIR` / `ANYAGENTS_REMOTE_WORKDIR` in `agent.launch_env`
+/// 3. Process env `ANYAGENTS_SANDBOX_WORKDIR` (when host storage env is active)
+/// 4. Default `/home/user/agent-data/workspace`.
+pub(crate) fn resolve_remote_sandbox_workdir(store: &Store, agent: &Agent) -> String {
+    let is_host_local = |raw: &str| -> bool {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || !trimmed.starts_with('/') {
+            return true;
+        }
+        let path = Path::new(trimmed);
+        if trimmed.ends_with("/launcher")
+            || trimmed.contains("/agents/")
+            || trimmed.starts_with("/var/lib/anyagents")
+            || trimmed.starts_with("/tmp/")
+            || trimmed == "/tmp"
+        {
+            return true;
+        }
+        let data_dir = store.data_dir();
+        if !data_dir.as_os_str().is_empty() && path.starts_with(data_dir) {
+            return true;
+        }
+        if let Some(ws) = anyagents_core::configured_workspaces_dir()
+            && path.starts_with(ws)
+        {
+            return true;
+        }
+        let temp_dir = std::env::temp_dir();
+        if !temp_dir.as_os_str().is_empty() && path.starts_with(&temp_dir) {
+            return true;
+        }
+        false
+    };
+
+    if let Ok(Some(binding)) = store.sandbox_binding(&agent.id)
+        && !is_host_local(&binding.remote_workdir)
+    {
+        return binding.remote_workdir;
+    }
+    for key in ["ANYAGENTS_SANDBOX_WORKDIR", "ANYAGENTS_REMOTE_WORKDIR"] {
+        if let Some((_, val)) = agent.launch_env.iter().rev().find(|(k, _)| k == key)
+            && !is_host_local(val)
+        {
+            return val.trim().to_string();
+        }
+    }
+    if anyagents_core::storage_env_enabled()
+        && let Ok(val) = std::env::var("ANYAGENTS_SANDBOX_WORKDIR")
+        && !is_host_local(&val)
+    {
+        return val.trim().to_string();
+    }
+    anyagents_core::DEFAULT_REMOTE_SANDBOX_WORKDIR.to_string()
+}
+
+fn sync_sylphx_lease_to_binding_store(
+    store: &Store,
+    agent_id: &anyagents_core::AgentId,
+    leased: &anyagents_tools::sylphx::SylphxLeaseConfig,
+) {
+    if !store.is_postgres() {
+        return;
+    }
+    let mut binding = store
+        .sandbox_binding(agent_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| anyagents_core::SandboxBinding::new(agent_id.clone(), "sylphx"));
+    binding.provider = "sylphx".to_string();
+    binding.template = Some(leased.template.clone());
+    if !leased.workdir.trim().is_empty() && !leased.workdir.ends_with("/launcher") {
+        binding.remote_workdir = leased.workdir.clone();
+    }
+    binding.volume_id = leased.volume_id.clone();
+    binding.volume_resource = leased.volume_resource.clone();
+    binding.volume_size_gib = leased.volume_size_gib.map(|v| v as i64);
+    binding.lease_id = leased.lease_id.clone();
+    binding.lease_resource = leased.lease_resource.clone();
+    binding.data_plane_resource = leased.data_plane_resource.clone();
+    binding.transport_url = leased.envd_url.clone();
+    binding.guest_endpoint = leased.envd_url.clone();
+    if anyagents_core::MasterKey::from_env()
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        binding.transport_token = leased.envd_token.clone();
+    }
+    binding.lease_state = if leased.lease_id.is_some() {
+        "ready".to_string()
+    } else {
+        "detached".to_string()
+    };
+    binding.idle_since_ms = None;
+    binding.last_heartbeat_ms = Some(now_ms());
+    binding.spec_json = serde_json::json!({
+        "endpoint": leased.endpoint,
+        "parent": leased.parent,
+        "shape": leased.shape,
+        "mount_path": leased.mount_path,
+    })
+    .to_string();
+    if let Err(err) = store.sandbox_binding_store().upsert(&binding) {
+        eprintln!("anyagents-sandbox: failed to persist sandbox binding to postgres: {err}");
+    }
+}
+
 async fn serve(
     data: &Path,
     sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
@@ -245,33 +385,50 @@ async fn serve(
     let _server_lock = acquire_server_lock(data)?;
     anyagents_toolchain::init_server(data, crate::sandbox::host_home_dir());
     let store = Arc::new(Store::open(data.join("state.db"))?);
-    // The server lock excludes concurrent creation: no unadmitted row is in
-    // flight, so each is a failed creation still holding its name.
-    for (id, name) in store.release_unadmitted_names()? {
+    let remote_required = anyagents_tools::SandboxMode::from_env().is_remote_required();
+    let stateless_pg = store.is_postgres() && remote_required;
+    for (id, name) in release_stale_unadmitted_names_on_start(&store, UNADMITTED_STALE_AGE_MS)? {
         eprintln!("released name `{name}` held by failed creation {id}");
     }
-    crate::sandbox::reconcile_principals(&store)?;
-    crate::host_memory::on_start(&store);
+    if !stateless_pg {
+        crate::sandbox::reconcile_principals(&store)?;
+        crate::host_memory::on_start(&store);
+    }
     let key = capability_key()?;
     store.hold_capability_key(&key)?;
-    let agents = store.list_agents()?;
-    // Keep small legacy deployments compatible without walking every archived
-    // seat tree in a large registry. Wake/admission mints a capability on demand.
-    let skip_archived_mint = agents.len() > 32;
-    let mut mint_failures = Vec::new();
-    for agent in &agents {
-        if skip_archived_mint && agent.state == "archived" {
-            continue;
+    // In stateless multi-replica PG mode, HTTP MCP injects `Principal::Agent`
+    // directly after authenticating `remote_session_tokens`, so booting pods
+    // must NEVER blindly call `operator::ensure()` when pod-local
+    // `mcp-capability` is absent (which would revoke peer pods' live
+    // `agent_capabilities` rows in PostgreSQL).
+    if !stateless_pg {
+        let agents = store.list_agents()?;
+        // Keep small legacy deployments compatible without walking every archived
+        // seat tree in a large registry. Wake/admission mints a capability on demand.
+        let skip_archived_mint = agents.len() > 32;
+        let mut mint_failures = Vec::new();
+        for agent in &agents {
+            if skip_archived_mint && agent.state == "archived" {
+                continue;
+            }
+            if store.is_postgres()
+                && store.has_active_capability(&agent.id).unwrap_or(false)
+                && !anyagents_core::agent_config_dir(store.data_dir(), &agent.id)
+                    .join(crate::operator::CAPABILITY_FILE)
+                    .is_file()
+            {
+                continue;
+            }
+            if let Err(err) = crate::operator::ensure(&store, &agent.id) {
+                mint_failures.push(format!("{}: {err}", agent.name));
+            }
         }
-        if let Err(err) = crate::operator::ensure(&store, &agent.id) {
-            mint_failures.push(format!("{}: {err}", agent.name));
+        if !mint_failures.is_empty() {
+            eprintln!(
+                "warning: a capability was not minted for {}",
+                mint_failures.join(", ")
+            );
         }
-    }
-    if !mint_failures.is_empty() {
-        eprintln!(
-            "warning: a capability was not minted for {}",
-            mint_failures.join(", ")
-        );
     }
     if crate::sandbox::seat_named() && crate::sandbox::configured_seat().is_none() {
         return Err(Error::Message(
@@ -343,10 +500,14 @@ async fn serve(
         custody,
     )
     .map_err(Error::Message)?;
-    sup.set_on_idle_released(Arc::new(|_agent_id, cfg| {
+    let idle_release_store = Arc::clone(&store);
+    sup.set_on_idle_released(Arc::new(move |agent_id, cfg| {
         if let Err(err) = anyagents_tools::release_sandbox_for_config_dir(cfg) {
             eprintln!("anyagents-sandbox: idle release failed: {err}");
         }
+        let _ = idle_release_store
+            .sandbox_binding_store()
+            .clear_lease(agent_id);
     }));
     let supervisor = Retaining(Some(sup), kept);
     if auth.is_confined() {
@@ -394,18 +555,42 @@ async fn serve(
                 let health = reaper_health.clone();
                 let memory_backlog = Arc::clone(&memory_backlog);
                 let _ = tokio::task::spawn_blocking(move || {
+                    // In multi-replica PostgreSQL mode, elect one singleton
+                    // maintenance leader per tick via `public.coordinator_leases`
+                    // so N replicas never race on reaping, rotation, or renewals.
+                    let _singleton_lease = if store.is_postgres() {
+                        match store.try_acquire_coordinator_lease(
+                            "maint:singleton",
+                            std::time::Duration::from_secs(90),
+                        ) {
+                            Ok(Some(guard)) => Some(guard),
+                            Ok(None) => return,
+                            Err(err) => {
+                                eprintln!(
+                                    "anyagents-maint: deferred singleton lease acquisition: {err}"
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     // The daemon is the long-lived writer: keep the WAL bounded
                     // from here so it never grows while readers overlap.
-                    match store.checkpoint_wal() {
-                        Ok(c)
-                            if c.passive_busy
-                                || c.checkpointed_frames < c.log_frames
-                                || c.log_frames > WAL_REPORT_FRAMES => eprintln!(
-                            "anyagents-store: wal checkpoint log={} checkpointed={} busy={} truncated={}",
-                            c.log_frames, c.checkpointed_frames, c.passive_busy, c.truncated
-                        ),
-                        Ok(_) => {}
-                        Err(error) => eprintln!("anyagents-store: wal checkpoint failed: {error}"),
+                    if !store.is_postgres() {
+                        match store.checkpoint_wal() {
+                            Ok(c)
+                                if c.passive_busy
+                                    || c.checkpointed_frames < c.log_frames
+                                    || c.log_frames > WAL_REPORT_FRAMES => eprintln!(
+                                "anyagents-store: wal checkpoint log={} checkpointed={} busy={} truncated={}",
+                                c.log_frames, c.checkpointed_frames, c.passive_busy, c.truncated
+                            ),
+                            Ok(_) => {}
+                            Err(error) => {
+                                eprintln!("anyagents-store: wal checkpoint failed: {error}")
+                            }
+                        }
                     }
                     if let Err(error) = outbound_history::reconcile(&store) {
                         eprintln!("outbound history settlement remains pending: {error}");
@@ -1331,8 +1516,10 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
             get(public_mcp_get_route).post(public_mcp_post_route),
         )
         .fallback(public_not_found)
-        .with_state(state)
-        .merge(crate::gateway::http_router())
+        .with_state(state.clone())
+        .merge(crate::gateway::http_router_for_store(Arc::clone(
+            &state.store,
+        )))
         .layer(axum::middleware::from_fn(in_flight::track))
 }
 
@@ -1399,8 +1586,10 @@ fn build_webhook_router(state: AppState) -> Router {
         .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
-        .with_state(state)
-        .merge(crate::gateway::http_router())
+        .with_state(state.clone())
+        .merge(crate::gateway::http_router_for_store(Arc::clone(
+            &state.store,
+        )))
         .layer(axum::middleware::from_fn(in_flight::track))
 }
 
@@ -1485,8 +1674,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
-        .with_state(state)
-        .merge(crate::gateway::http_router())
+        .with_state(state.clone())
+        .merge(crate::gateway::http_router_for_store(Arc::clone(
+            &state.store,
+        )))
         .layer(axum::middleware::from_fn(in_flight::track))
 }
 
@@ -1508,14 +1699,11 @@ enum McpListener {
 /// Who made one MCP call, and with which kind of credential.
 struct McpCaller {
     agent: Agent,
-    /// What the call's tools present on the internal socket: the agent's own
-    /// local capability, which the server reads and which never leaves this
-    /// host.
-    internal_token: String,
     /// The remote session the presented token belongs to.
     remote: Option<anyagents_core::RemoteSessionGrant>,
-    /// True when the agent runs inside an isolated remote sandbox (`SandboxConfig`
-    /// with `remote_spawn` or Sylphx sandbox lease), admitting `?profile=full`.
+    /// True when the agent runs inside an isolated remote sandbox (`agent_sandbox_bindings`
+    /// in PostgreSQL, `SandboxConfig` with `remote_spawn`, or Sylphx sandbox lease),
+    /// admitting `?profile=full`.
     sandbox_backed: bool,
 }
 
@@ -1584,30 +1772,25 @@ fn authenticate_mcp_request(
         let agent = store
             .agent(&grant.agent_id)
             .map_err(|_| unauthenticated())?;
-        // A remote token is for an agent that runs off this host. One whose
-        // harness was moved back onto the host no longer has a remote session.
+        // A remote token is for an agent that runs off this host. Consult
+        // PostgreSQL `agent_sandbox_bindings` (plus local config fallback) so
+        // peer replicas without pod-local `sandbox*.json` admit requests cleanly
+        // and never call `operator::ensure()` (which revokes peer capabilities!).
         let config_dir = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-        if !crate::remote::runs_off_host(&agent, &config_dir) {
+        if !crate::remote::runs_off_host_in(store, &agent, &config_dir) {
             return Err(unauthenticated());
         }
-        operator::ensure(store, &agent.id).map_err(ApiError::from_store)?;
-        let internal_token = crate::mcp::capability_of(&anyagents_core::agent_config_dir(
-            store.data_dir(),
-            &agent.id,
-        ))
-        .map_err(ApiError::from_store)?;
-        let sandbox_backed =
-            !crate::vendor::is_effective_cloud_harness(
-                &agent.harness,
-                Some(store.data_dir()),
-                Some(&config_dir),
-            ) && (anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir)
-                .is_some()
-                || anyagents_tools::SandboxConfig::from_config_dir(&config_dir)
-                    .is_some_and(|sbx| sbx.remote_spawn));
+        let has_pg_binding = store.sandbox_binding(&agent.id).ok().flatten().is_some();
+        let sandbox_backed = !crate::vendor::is_effective_cloud_harness(
+            &agent.harness,
+            Some(store.data_dir()),
+            Some(&config_dir),
+        ) && (has_pg_binding
+            || anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir).is_some()
+            || anyagents_tools::SandboxConfig::from_config_dir(&config_dir)
+                .is_some_and(|sbx| sbx.remote_spawn));
         return Ok(McpCaller {
             agent,
-            internal_token,
             remote: Some(grant),
             sandbox_backed,
         });
@@ -1739,15 +1922,15 @@ async fn mcp_post(
     let mcp = spawn_store(move || {
         let caller = authenticate_mcp_request(&state.store, &headers, listener)?;
         let profile = caller.profile(query.profile.as_deref())?;
-        let McpCaller {
-            agent,
-            internal_token: token,
-            ..
-        } = caller;
+        let McpCaller { agent, .. } = caller;
         let data_dir = state.store.data_dir();
         let config_dir = anyagents_core::agent_config_dir(data_dir, &agent.id);
         let sock = socket_path(data_dir);
         let router = build_router(state.clone());
+        let principal = Principal::Agent {
+            agent_id: agent.id.clone(),
+            name: agent.name.clone(),
+        };
         let _ = std::fs::create_dir_all(&config_dir);
         Ok(crate::mcp::AgentMcp::new_for_http(
             crate::mcp::AgentRef {
@@ -1757,7 +1940,7 @@ async fn mcp_post(
             },
             sock,
             config_dir,
-            token,
+            principal,
             profile,
             router,
         ))
@@ -2300,11 +2483,12 @@ fn via_http_mcp(headers: &axum::http::HeaderMap) -> bool {
     headers.contains_key(crate::mcp::HTTP_MCP_HEADER)
 }
 
-/// Whether an agent's harness runs off this host.
-fn runs_off_host(data_dir: &Path, agent: &Agent) -> bool {
-    crate::remote::runs_off_host(
+/// Whether an agent's harness runs off this host (including PostgreSQL sandbox bindings).
+fn runs_off_host(store: &Store, agent: &Agent) -> bool {
+    crate::remote::runs_off_host_in(
+        store,
         agent,
-        &anyagents_core::agent_config_dir(data_dir, &agent.id),
+        &anyagents_core::agent_config_dir(store.data_dir(), &agent.id),
     )
 }
 
@@ -5302,9 +5486,7 @@ fn finish_agent_archive_locked(
     if let Err(err) = anyagents_tools::release_sandbox_for_config_dir(&cfg) {
         eprintln!("anyagents-sandbox: archive release failed: {err}");
     }
-    if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&cfg) {
-        let _ = anyagents_tools::SandboxProvider::pause(&sbx);
-    }
+    let _ = state.store.sandbox_binding_store().clear_lease(&agent.id);
     let mut process_guard = None;
     if !is_self {
         let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
@@ -5835,9 +6017,7 @@ async fn pause_agent_route(
         if let Err(err) = anyagents_tools::release_sandbox_for_config_dir(&cfg) {
             eprintln!("anyagents-sandbox: pause release failed: {err}");
         }
-        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&cfg) {
-            let _ = anyagents_tools::SandboxProvider::pause(&sbx);
-        }
+        let _ = state.store.sandbox_binding_store().clear_lease(&found.id);
         drop(lifecycle);
         let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
         while std::time::Instant::now() < deadline {
@@ -6004,7 +6184,7 @@ async fn wake_agent_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
-        if via_http && !runs_off_host(state.store.data_dir(), &found) {
+        if via_http && !runs_off_host(&state.store, &found) {
             return Err(ApiError::forbidden(format!(
                 "`{}` runs on this host; a call over HTTP MCP cannot wake it",
                 found.name
@@ -6184,20 +6364,31 @@ fn prepare_agent_wake_with_options(
         &found.harness,
         Some(store.data_dir()),
         Some(&cfg),
-    ) && let Err(err) = anyagents_tools::ensure_leased_for_config_dir(
-        Some(store.data_dir()),
-        &cfg,
-        found.id.as_str(),
-        found.workdir.as_deref(),
-        &std::collections::BTreeMap::new(),
     ) {
-        if anyagents_tools::SandboxMode::from_env().is_remote_required() {
-            return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
+        let remote_workdir = resolve_remote_sandbox_workdir(store, found);
+        match anyagents_tools::ensure_leased_for_config_dir(
+            Some(store.data_dir()),
+            &cfg,
+            found.id.as_str(),
+            Some(remote_workdir.as_str()),
+            &std::collections::BTreeMap::new(),
+        ) {
+            Ok(Some(leased)) => {
+                sync_sylphx_lease_to_binding_store(store, &found.id, &leased);
+            }
+            Ok(None) => {
+                // Only dispatch legacy HTTP resume when no leased driver handled wake.
+                if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&cfg) {
+                    let _ = anyagents_tools::SandboxProvider::resume(&sbx);
+                }
+            }
+            Err(err) => {
+                if anyagents_tools::SandboxMode::from_env().is_remote_required() {
+                    return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
+                }
+                eprintln!("anyagents-sandbox: wake lease ensure failed: {err}");
+            }
         }
-        eprintln!("anyagents-sandbox: wake lease ensure failed: {err}");
-    }
-    if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&cfg) {
-        let _ = anyagents_tools::SandboxProvider::resume(&sbx);
     }
     let work_dir = found
         .workdir
@@ -8471,7 +8662,7 @@ fn send_sync(
                     && (plan.revive_host_agents
                         || store
                             .agent_by_name(name)
-                            .is_ok_and(|agent| runs_off_host(store.data_dir(), &agent)));
+                            .is_ok_and(|agent| runs_off_host(store, &agent)));
                 // An archived recipient this send cannot wake would never read
                 // it: refused with the reason, never stored unread.
                 if !wake_archived && let Some(refusal) = archived_refusal(store, name) {
@@ -8956,15 +9147,26 @@ fn deliver_agent_with_media(
             &agent.harness,
             Some(store.data_dir()),
             Some(&cfg),
-        ) && let Err(err) = anyagents_tools::ensure_leased_for_config_dir(
-            Some(store.data_dir()),
-            &cfg,
-            agent.id.as_str(),
-            agent.workdir.as_deref(),
-            &std::collections::BTreeMap::new(),
-        ) && anyagents_tools::SandboxMode::from_env().is_remote_required()
-        {
-            return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
+        ) {
+            let remote_workdir = resolve_remote_sandbox_workdir(store, &agent);
+            match anyagents_tools::ensure_leased_for_config_dir(
+                Some(store.data_dir()),
+                &cfg,
+                agent.id.as_str(),
+                Some(remote_workdir.as_str()),
+                &std::collections::BTreeMap::new(),
+            ) {
+                Ok(Some(leased)) => {
+                    sync_sylphx_lease_to_binding_store(store, &agent.id, &leased);
+                }
+                Ok(None) => {}
+                Err(err) if anyagents_tools::SandboxMode::from_env().is_remote_required() => {
+                    return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
+                }
+                Err(err) => {
+                    eprintln!("anyagents-sandbox: delivery lease ensure failed: {err}");
+                }
+            }
         }
         let _ = store.set_agent_state(&agent.id, "running");
     }
@@ -18643,6 +18845,380 @@ exec '{}' "$@"
             "browser-profiles/{} must be reaped",
             agent.name
         );
+    }
+
+    #[test]
+    fn stateless_remote_sandbox_workdir_rejects_host_launcher_paths() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sbx-wd", "claude-code"))
+            .unwrap();
+
+        // Default logical workspace when nothing is configured (never a coordinator host path).
+        let default_wd = resolve_remote_sandbox_workdir(&store, &agent);
+        assert_eq!(
+            default_wd,
+            anyagents_core::stateless::DEFAULT_REMOTE_SANDBOX_WORKDIR
+        );
+
+        // Host `<data>/agents/<id>/launcher` path in `agent.workdir` or launch_env MUST be rejected!
+        let host_launcher = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("launcher")
+            .display()
+            .to_string();
+        store
+            .set_agent_launch_env(
+                &agent.id,
+                &[("ANYAGENTS_SANDBOX_WORKDIR".into(), host_launcher)],
+            )
+            .unwrap();
+        let agent_host = store.agent(&agent.id).unwrap();
+        assert_eq!(
+            resolve_remote_sandbox_workdir(&store, &agent_host),
+            anyagents_core::stateless::DEFAULT_REMOTE_SANDBOX_WORKDIR
+        );
+
+        // Explicit logical remote workspace in `agent_sandbox_bindings` is honored.
+        let mut binding =
+            anyagents_core::stateless::SandboxBinding::new(agent.id.clone(), "sylphx");
+        binding.remote_workdir = "/home/user/agent-data/workspace/repo".to_string();
+        store.sandbox_binding_store().upsert(&binding).unwrap();
+        assert_eq!(
+            resolve_remote_sandbox_workdir(&store, &agent_host),
+            "/home/user/agent-data/workspace/repo"
+        );
+    }
+
+    #[test]
+    fn stateless_in_process_remote_harness_delivers_turn_without_os_child_and_keeper_host_is_in_process()
+     {
+        use anyagents_harness::{Context, DeliverOutcome, Harness, OutboundMessage, Proof};
+        use anyagents_keeper::Hosted as _;
+        use std::io::{BufRead as _, Write as _};
+
+        let _env = env_lock();
+        let prev_mode = std::env::var_os("ANYAGENTS_SANDBOX_MODE");
+        unsafe {
+            std::env::set_var("ANYAGENTS_SANDBOX_MODE", "remote_required");
+        }
+        assert!(matches!(
+            crate::keeper::host(),
+            Ok(crate::vendor::HarnessHost::InProcess)
+        ));
+        match prev_mode {
+            Some(v) => unsafe { std::env::set_var("ANYAGENTS_SANDBOX_MODE", v) },
+            None => unsafe { std::env::remove_var("ANYAGENTS_SANDBOX_MODE") },
+        }
+
+        // Exercise `InProcessRemoteHarness` end-to-end with an in-memory stream-json worker.
+        let mut harness = crate::vendor::InProcessRemoteHarness::start_with_worker(
+            true,
+            "test",
+            |reader, mut writer| {
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let Ok(ev) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                        continue;
+                    };
+                    if ev.get("type").and_then(|v| v.as_str()) == Some("user") {
+                        writeln!(writer, "{trimmed}")?;
+                        let res = serde_json::json!({
+                            "type": "result",
+                            "subtype": "success",
+                            "is_error": false,
+                            "session_id": "inproc-sess-42",
+                            "result": "ok",
+                            "usage": { "input_tokens": 11, "output_tokens": 7 }
+                        });
+                        writeln!(writer, "{res}")?;
+                        writer.flush()?;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .expect("start InProcessRemoteHarness");
+
+        assert!(
+            harness.process_id().is_none(),
+            "InProcessRemoteHarness must spawn ZERO OS child processes"
+        );
+        let msg = OutboundMessage {
+            id: "msg-inproc-1".to_string(),
+            seq: 1,
+            text: "ping".to_string(),
+            sender: Some("operator".to_string()),
+            reply_to: None,
+            source_time_ms: None,
+            context: Context::default(),
+        };
+        let outcome = harness.deliver(&msg).expect("deliver to in-process worker");
+        assert!(
+            matches!(outcome, DeliverOutcome::Accepted { .. }),
+            "unexpected deliver outcome: {outcome:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while harness.proven("msg-inproc-1")
+            != Some(Proof::Taken {
+                turn_finished: true,
+            })
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            harness.proven("msg-inproc-1"),
+            Some(Proof::Taken {
+                turn_finished: true
+            })
+        );
+        assert_eq!(harness.session_id().as_deref(), Some("inproc-sess-42"));
+        assert_eq!(harness.turns_served(), 1);
+        assert_eq!(harness.served_usage().input_tokens, 11);
+        assert_eq!(harness.served_usage().output_tokens, 7);
+        harness.stop();
+    }
+
+    #[test]
+    fn stateless_dockerfile_sets_anyagents_data_not_data_dir() {
+        let dockerfile = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Dockerfile");
+        let body = std::fs::read_to_string(&dockerfile)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dockerfile.display()));
+        assert!(
+            body.contains("ANYAGENTS_DATA=/var/lib/anyagents"),
+            "Dockerfile must export ANYAGENTS_DATA=/var/lib/anyagents"
+        );
+        assert!(
+            !body.contains("ANYAGENTS_DATA_DIR"),
+            "Dockerfile must not reference dead ANYAGENTS_DATA_DIR env var"
+        );
+    }
+
+    #[test]
+    fn stateless_two_replicas_mcp_and_gateway_never_revoke_capabilities_or_overwrite_launch_env() {
+        use anyagents_gateway::RouteResolver as _;
+        use http_body_util::BodyExt as _;
+
+        let url = match std::env::var("ANYAGENTS_TEST_POSTGRES_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            Some(u) => u,
+            None => {
+                eprintln!(
+                    "skipping stateless_two_replicas_mcp_and_gateway test: ANYAGENTS_TEST_POSTGRES_URL not set"
+                );
+                return;
+            }
+        };
+        let _env = env_lock();
+        let tag = format!("{}_{}", std::process::id(), anyagents_core::now_ms());
+        let dir_a = crate::test_tempdir();
+        let dir_b = crate::test_tempdir();
+        let store_a = Arc::new(
+            Store::open_postgres_isolated(&url, dir_a.path(), format!("srv-a-{tag}"))
+                .expect("open replica A store"),
+        );
+        let store_b = Arc::new(
+            Store::open_postgres_isolated(&url, dir_b.path(), format!("srv-b-{tag}"))
+                .expect("open replica B store"),
+        );
+        let shared_cap_key = "a".repeat(64);
+        store_a.hold_capability_key(&shared_cap_key).unwrap();
+        store_b.hold_capability_key(&shared_cap_key).unwrap();
+
+        let state_a = AppState {
+            store: Arc::clone(&store_a),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir_a.path().into(),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        let state_b = AppState {
+            store: Arc::clone(&store_b),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir_b.path().into(),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+
+        // 1. Replica A creates a remote-sandbox-backed agent with a live local capability,
+        //    a PG `agent_sandbox_bindings` row, a remote session token, a PG gateway route,
+        //    and a public cloud `launch_env`.
+        let agent = store_a
+            .create_agent(anyagents_core::NewAgent::new(
+                &format!("rep_sbx_{tag}"),
+                "claude-code",
+            ))
+            .unwrap();
+        let cap_a = store_a.issue_capability(&agent.id).unwrap();
+        let mut binding =
+            anyagents_core::stateless::SandboxBinding::new(agent.id.clone(), "sylphx");
+        binding.volume_id = format!("vol-srv-{tag}");
+        binding.lease_id = Some(format!("lease-srv-{tag}"));
+        binding.lease_state = "ready".to_string();
+        store_a.sandbox_binding_store().upsert(&binding).unwrap();
+
+        let remote_tok = store_a
+            .begin_remote_session(&agent.id, 3_600_000)
+            .unwrap()
+            .token;
+
+        let key = anyagents_core::stateless::MasterKey::from_bytes(&[0x55u8; 32]).unwrap();
+        let gw_tok = crate::gateway::store_key_in(
+            &store_a,
+            &agent,
+            "https://api.example.test/v1",
+            "gpt-5",
+            "sk-srv-synthetic",
+            Some(key.clone()),
+        )
+        .expect("store gateway route in PG");
+        let cloud_env = vec![
+            (
+                "OPENAI_BASE_URL".to_string(),
+                "https://public-gateway.example.test/v1".to_string(),
+            ),
+            ("OPENAI_API_KEY".to_string(), gw_tok.clone()),
+        ];
+        store_a.set_agent_launch_env(&agent.id, &cloud_env).unwrap();
+        let expected_launch_env = store_a.agent(&agent.id).unwrap().launch_env;
+
+        // 2. Verify replica B has ZERO local sandbox/capability/provider files on disk!
+        let cfg_b = anyagents_core::agent_config_dir(dir_b.path(), &agent.id);
+        assert!(!cfg_b.exists());
+
+        // 3. Replica B serves HTTP MCP (`?profile=full`) using PG `agent_sandbox_bindings`
+        //    and direct `Principal::Agent` injection WITHOUT calling `operator::ensure()`.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {remote_tok}").parse().unwrap(),
+            );
+            let resp = mcp_post_route(
+                State(state_b.clone()),
+                headers.clone(),
+                Query(McpRouteQuery {
+                    profile: Some("full".to_string()),
+                }),
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                })),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "replica B MCP tools/list failed: {}: {}",
+                    e.status, e.message
+                )
+            });
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                text.contains("\"code\""),
+                "replica B must grant ?profile=full from PG agent_sandbox_bindings: {text}"
+            );
+
+            // Also call an MCP tool (`whoami` / `inbox`) to verify the in-process router accepts
+            // `InjectedPrincipal` cleanly with zero local capability file on replica B!
+            let call_resp = mcp_post_route(
+                State(state_b.clone()),
+                headers,
+                Query(McpRouteQuery {
+                    profile: Some("full".to_string()),
+                }),
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "inbox",
+                        "arguments": {}
+                    }
+                })),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "replica B MCP inbox call failed: {}: {}",
+                    e.status, e.message
+                )
+            });
+            assert_eq!(call_resp.status(), StatusCode::OK);
+        });
+
+        // 4. Replica A's original capability token MUST STILL BE VALID in PG (never revoked by replica B!).
+        let authed = store_a
+            .authenticate_agent(&cap_a)
+            .expect("replica A capability MUST NOT be revoked when replica B serves MCP");
+        assert_eq!(authed.id, agent.id);
+        let _ = state_a;
+
+        // 5. Replica B resolves replica A's gateway route directly from PG `gateway_routes`!
+        let resolver_b =
+            crate::gateway::PgGatewayRoutes::with_master_key(Arc::clone(&store_b), Some(key));
+        let route_b = resolver_b
+            .resolve(&gw_tok)
+            .expect("replica B resolves gateway token from PG");
+        assert_eq!(route_b.agent, agent.name);
+        assert_eq!(route_b.api_key, "sk-srv-synthetic");
+
+        // 6. Under `ANYAGENTS_SANDBOX_MODE=remote_required`, `gateway::start` on replica B
+        //    MUST NOT bind a random loopback port and MUST NOT overwrite `agents.launch_env` in PG!
+        std::fs::write(dir_b.path().join("database-url"), format!("{url}\n")).unwrap();
+        let prev_mode = std::env::var_os("ANYAGENTS_SANDBOX_MODE");
+        unsafe {
+            std::env::set_var("ANYAGENTS_SANDBOX_MODE", "remote_required");
+        }
+        let started_b =
+            crate::gateway::start(dir_b.path()).expect("gateway::start in remote_required");
+        match prev_mode {
+            Some(v) => unsafe { std::env::set_var("ANYAGENTS_SANDBOX_MODE", v) },
+            None => unsafe { std::env::remove_var("ANYAGENTS_SANDBOX_MODE") },
+        }
+        assert!(!started_b.moved);
+        assert!(
+            !dir_b.path().join("gateway.port").exists(),
+            "stateless remote_required replica MUST NOT bind pod-local gateway.port"
+        );
+        let reloaded = store_a.agent(&agent.id).unwrap();
+        assert_eq!(
+            reloaded.launch_env, expected_launch_env,
+            "stateless replica gateway::start MUST NOT overwrite agents.launch_env in PG"
+        );
+        assert!(
+            reloaded.launch_env.iter().any(|(k, v)| {
+                k == "OPENAI_BASE_URL" && v == "https://public-gateway.example.test/v1"
+            }),
+            "public gateway URL must remain intact: {:?}",
+            reloaded.launch_env
+        );
+
+        // Clean up test agent in PG.
+        store_a.delete_agent(&agent.id).unwrap();
     }
 }
 

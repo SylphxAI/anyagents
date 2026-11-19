@@ -50,13 +50,15 @@ pub(super) struct Shared {
 pub(super) struct PgShared {
     pub(super) handle: PgHandle,
     pub(super) memory_index: Arc<MemoryIndex>,
+    pub(super) replica_id: String,
     wakes: Mutex<Vec<Sender<Wake>>>,
     pub(super) changes: tokio::sync::watch::Sender<u64>,
     pub(super) write_retry_budget_ms: AtomicU64,
+    wake_listener: Mutex<Option<crate::stateless::PgWakeListener>>,
 }
 
 impl PgShared {
-    fn open(url: &str, data_dir: &Path) -> Result<Self, Error> {
+    fn open(url: &str, data_dir: &Path, replica_id: String) -> Result<Self, Error> {
         let handle = shared_pg_handle(url)?;
         let memory_index = Arc::new(MemoryIndex::open_postgres(
             &data_dir.join(memory_index::FILE_NAME),
@@ -72,14 +74,70 @@ impl PgShared {
         Ok(Self {
             handle,
             memory_index,
+            replica_id,
             wakes: Mutex::new(Vec::new()),
             changes: tokio::sync::watch::channel(0).0,
             write_retry_budget_ms: AtomicU64::new(WRITE_RETRY_BUDGET.as_millis() as u64),
+            wake_listener: Mutex::new(None),
         })
     }
 
     pub(super) fn wakes(&self) -> &Mutex<Vec<Sender<Wake>>> {
         &self.wakes
+    }
+
+    /// Lazily start the background `LISTEN anyagents_wakes` subscriber for this
+    /// PostgreSQL replica handle. Uses a `Weak<PgShared>` so the listener exits
+    /// automatically when all `Store` handles drop.
+    pub(super) fn ensure_wake_listener(self: &Arc<Self>) {
+        let mut slot = lock(&self.wake_listener);
+        if slot.is_some() {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let direct_url = self.handle.direct_url.clone();
+        let listener = crate::stateless::PgWakeListener::start(direct_url, move |event| {
+            let Some(shared) = weak.upgrade() else {
+                return;
+            };
+            match event {
+                crate::stateless::PgWakeEvent::Wake {
+                    origin_replica_id,
+                    wake,
+                } => {
+                    if origin_replica_id.as_deref() == Some(shared.replica_id.as_str()) {
+                        return;
+                    }
+                    let mut wakes = lock(&shared.wakes);
+                    wakes.retain(|sender| sender.send(wake.clone()).is_ok());
+                    shared.changes.send_modify(|seq| *seq = seq.wrapping_add(1));
+                }
+                crate::stateless::PgWakeEvent::Changes { origin_replica_id } => {
+                    if origin_replica_id.as_deref() == Some(shared.replica_id.as_str()) {
+                        return;
+                    }
+                    shared.changes.send_modify(|seq| *seq = seq.wrapping_add(1));
+                }
+            }
+        });
+        *slot = Some(listener);
+    }
+
+    pub(super) fn wait_wake_listener_ready(self: &Arc<Self>, timeout: std::time::Duration) -> bool {
+        self.ensure_wake_listener();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let connected = lock(&self.wake_listener)
+                .as_ref()
+                .is_some_and(crate::stateless::PgWakeListener::is_connected);
+            if connected {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 
@@ -93,7 +151,11 @@ pub(super) enum Backend {
 static OPEN_PG: LazyLock<Mutex<HashMap<String, Arc<Mutex<Weak<PgShared>>>>>> =
     LazyLock::new(Mutex::default);
 
-pub(super) fn shared_postgres(url: &str, data_dir: &Path) -> Result<Arc<PgShared>, Error> {
+pub(super) fn shared_postgres(
+    url: &str,
+    data_dir: &Path,
+    replica_id: &str,
+) -> Result<Arc<PgShared>, Error> {
     let trimmed = url.trim();
     let slot = {
         let mut open = lock(&OPEN_PG);
@@ -104,8 +166,24 @@ pub(super) fn shared_postgres(url: &str, data_dir: &Path) -> Result<Arc<PgShared
     if let Some(shared) = current.upgrade() {
         return Ok(shared);
     }
-    let shared = Arc::new(PgShared::open(trimmed, data_dir)?);
+    let shared = Arc::new(PgShared::open(trimmed, data_dir, replica_id.to_string())?);
     *current = Arc::downgrade(&shared);
+    Ok(shared)
+}
+
+/// Create a standalone PostgreSQL backend handle with its own in-process wake
+/// subscribers, `PgListener`, and `replica_id` (used to simulate distinct
+/// coordinator pods sharing one PostgreSQL database in integration tests).
+pub(super) fn isolated_postgres(
+    url: &str,
+    data_dir: &Path,
+    replica_id: &str,
+) -> Result<Arc<PgShared>, Error> {
+    let shared = Arc::new(PgShared::open(
+        url.trim(),
+        data_dir,
+        replica_id.to_string(),
+    )?);
     Ok(shared)
 }
 

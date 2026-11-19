@@ -14,13 +14,15 @@
 //! origin it was started with, and a restarted server listens there again.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
-use anyagents_core::{Agent, AgentId, Error, Store};
+use anyagents_core::{
+    Agent, AgentId, Error, MasterKey, Store, StoredGatewayRoute, UpsertGatewayRoute,
+};
 use anyagents_gateway::{
-    MemoryRoutes, MemoryUsage, Protocol, ProviderRoute, RouteResolver as _, UsageEvent,
-    UsageSink as _, encode_request, encode_response, parse_request, parse_response,
+    MemoryRoutes, MemoryUsage, Protocol, ProviderRoute, RouteResolver, UsageEvent, UsageSink as _,
+    encode_request, encode_response, parse_request, parse_response,
 };
 use axum::Router;
 use axum::body::Bytes;
@@ -70,10 +72,108 @@ pub struct Started {
     pub agents: Vec<AgentId>,
 }
 
+/// Cross-replica [`RouteResolver`] backed by PostgreSQL `public.gateway_routes`.
+///
+/// Resolves bearer tokens directly by indexed `token_hash` on PostgreSQL so any
+/// coordinator replica answers LLM gateway traffic for agents configured on any
+/// other replica without pod-local `provider.json` or `gateway-token.txt` files.
+/// On SQLite, delegates directly to the in-process [`MemoryRoutes`] table.
+#[derive(Clone)]
+pub struct PgGatewayRoutes {
+    store: Arc<Store>,
+    memory: MemoryRoutes,
+    master_key: Option<MasterKey>,
+}
+
+impl PgGatewayRoutes {
+    pub fn new(store: Arc<Store>) -> Self {
+        Self {
+            store,
+            memory: shared_routes().clone(),
+            master_key: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_master_key(store: Arc<Store>, master_key: Option<MasterKey>) -> Self {
+        Self {
+            store,
+            memory: shared_routes().clone(),
+            master_key,
+        }
+    }
+}
+
+impl RouteResolver for PgGatewayRoutes {
+    fn resolve(&self, token: &str) -> Option<ProviderRoute> {
+        if let Some(pg_store) = self
+            .store
+            .gateway_route_store_with_key(self.master_key.clone())
+        {
+            return pg_store
+                .resolve_by_token(token)
+                .ok()
+                .flatten()
+                .map(stored_route_to_provider_route);
+        }
+        self.memory.resolve(token)
+    }
+}
+
+fn protocol_str(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::AnthropicMessages => "anthropic_messages",
+        Protocol::OpenAiChat => "openai_chat",
+        Protocol::OpenAiResponses => "openai_responses",
+    }
+}
+
+fn protocol_from_stored(stored: &str, harness: &str) -> Protocol {
+    match stored {
+        "anthropic_messages" => Protocol::AnthropicMessages,
+        "openai_chat" => Protocol::OpenAiChat,
+        "openai_responses" => Protocol::OpenAiResponses,
+        _ => protocol_of(harness),
+    }
+}
+
+fn stored_route_to_provider_route(r: StoredGatewayRoute) -> ProviderRoute {
+    ProviderRoute {
+        agent: r.agent_name,
+        provider: provider_of(&r.base_url).to_string(),
+        protocol: protocol_from_stored(&r.protocol, &r.harness),
+        base_url: r.base_url.trim_end_matches('/').to_string(),
+        model: r.model,
+        api_key: r.api_key,
+    }
+}
+
 /// Start the gateway once, as part of the server starting. It is bound to the
 /// server's lifetime: a server that cannot serve harnesses reports why.
+///
+/// Under `ANYAGENTS_SANDBOX_MODE=remote_required` (stateless coordinator mode),
+/// skips binding a pod-local random loopback port and NEVER overwrites
+/// `agents.launch_env` in PostgreSQL across replicas; gateway traffic is served
+/// exclusively on the public/HTTP router via [`http_router_for_store`].
 pub fn start(data: &Path) -> Result<Started, Error> {
     let guard = START.lock().unwrap_or_else(PoisonError::into_inner);
+    if anyagents_tools::SandboxMode::from_env().is_remote_required() {
+        let store = Store::open(data.join("state.db"))?;
+        let agents = if store.is_postgres() {
+            store
+                .gateway_route_store()
+                .and_then(|pg| pg.list_live().ok())
+                .map(|rows| rows.into_iter().map(|r| r.agent_id).collect())
+                .unwrap_or_default()
+        } else {
+            ensure_routes_loaded(data).unwrap_or_default()
+        };
+        drop(guard);
+        return Ok(Started {
+            moved: false,
+            agents,
+        });
+    }
     if GATEWAY.get().is_some() {
         return Ok(Started {
             moved: false,
@@ -168,12 +268,26 @@ pub fn public_origin(data: Option<&Path>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Populate `shared_routes()` from stored agent `provider.json` images on startup.
+/// Populate `shared_routes()` from stored agent `provider.json` images (or
+/// PostgreSQL `public.gateway_routes`) on startup.
 pub fn ensure_routes_loaded(data: &Path) -> Result<Vec<AgentId>, Error> {
     let routes = shared_routes();
     let store = Store::open(data.join("state.db"))?;
     let mut loaded = Vec::new();
+    if let Some(pg_routes) = store.gateway_route_store()
+        && let Ok(rows) = pg_routes.list_live()
+    {
+        for row in rows {
+            let tok = row.token.clone();
+            let id = row.agent_id.clone();
+            routes.insert(tok, stored_route_to_provider_route(row));
+            loaded.push(id);
+        }
+    }
     for agent in store.list_live_agents()? {
+        if loaded.contains(&agent.id) {
+            continue;
+        }
         if let Some(image) = ProviderImage::load(data, &agent.id)? {
             routes.insert(token(data, &agent.id)?, image.route(&agent.name));
             loaded.push(agent.id);
@@ -185,12 +299,29 @@ pub fn ensure_routes_loaded(data: &Path) -> Result<Vec<AgentId>, Error> {
 /// Environment variables injecting the coordinator's public gateway URL and
 /// per-agent gateway token (without raw provider API keys) into an isolated sandbox.
 pub fn sandbox_env(data: &Path, id: &AgentId) -> Result<Vec<(String, String)>, String> {
+    let store = Store::open(data.join("state.db")).ok();
+    if let Some(ref store) = store
+        && let Some(pg_routes) = store.gateway_route_store()
+        && let Ok(Some(stored)) = pg_routes.get_for_agent(id)
+    {
+        let origin = public_origin(Some(data)).ok_or_else(|| {
+            format!(
+                "agent `{}` requires a public gateway URL ({ENV_PUBLIC_GATEWAY_URL} or server public_url) so the remote sandbox never dials 127.0.0.1",
+                stored.agent_name
+            )
+        })?;
+        return Ok(env_for_parts(
+            &stored.harness,
+            &stored.model,
+            &stored.token,
+            &origin,
+        ));
+    }
     let Some(image) = ProviderImage::load(data, id).map_err(|e| e.to_string())? else {
         return Ok(Vec::new());
     };
     let tok = token(data, id).map_err(|e| e.to_string())?;
-    let agent_name = Store::open(data.join("state.db"))
-        .ok()
+    let agent_name = store
         .and_then(|s| s.agent(id).ok())
         .map(|a| a.name)
         .unwrap_or_else(|| id.to_string());
@@ -209,25 +340,42 @@ pub fn http_router() -> Router {
     http_router_with(shared_routes().clone(), shared_usage().clone())
 }
 
+/// Build the store-aware protocol gateway Axum router: backed by PostgreSQL
+/// `public.gateway_routes` when `store` uses PostgreSQL, or in-process
+/// `shared_routes()` on SQLite.
+pub fn http_router_for_store(store: Arc<Store>) -> Router {
+    if store.is_postgres() {
+        http_router_with(PgGatewayRoutes::new(store), shared_usage().clone())
+    } else {
+        http_router()
+    }
+}
+
 /// Build the protocol gateway Axum router against explicit route/usage stores.
 /// Serves both `/v1/{messages,responses,chat/completions}` and
 /// `/gateway/v1/{messages,responses,chat/completions}` so ingress routing without
 /// path rewrite works cleanly.
-pub fn http_router_with(routes: MemoryRoutes, usage: MemoryUsage) -> Router {
-    let responses_state = std::sync::Arc::new((routes.clone(), usage.clone()));
+pub fn http_router_with<R>(routes: R, usage: MemoryUsage) -> Router
+where
+    R: RouteResolver + Clone + Send + Sync + 'static,
+{
+    let responses_state = Arc::new((routes.clone(), usage.clone()));
     let core = anyagents_gateway::router(routes, usage).merge(
         Router::new()
-            .route("/v1/responses", post(on_responses))
+            .route("/v1/responses", post(on_responses::<R>))
             .with_state(responses_state),
     );
     core.clone().nest("/gateway", core)
 }
 
-async fn on_responses(
-    State(state): State<std::sync::Arc<(MemoryRoutes, MemoryUsage)>>,
+async fn on_responses<R>(
+    State(state): State<Arc<(R, MemoryUsage)>>,
     headers: HeaderMap,
     body: Bytes,
-) -> Response {
+) -> Response
+where
+    R: RouteResolver + Clone + Send + Sync + 'static,
+{
     let token = match bearer_token(&headers) {
         Some(t) => t,
         None => {
@@ -439,6 +587,14 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 /// Point one agent at the gateway. Called when the agent's key is stored, with
 /// the server running or not: the next start rebuilds it from the same file.
 pub fn add_route(data: &Path, agent: &Agent) -> Result<Option<String>, Error> {
+    if let Ok(store) = Store::open(data.join("state.db"))
+        && let Some(pg_routes) = store.gateway_route_store()
+        && let Ok(Some(stored)) = pg_routes.get_for_agent(&agent.id)
+    {
+        let tok = stored.token.clone();
+        shared_routes().insert(tok.clone(), stored_route_to_provider_route(stored));
+        return Ok(Some(tok));
+    }
     let Some(image) = ProviderImage::load(data, &agent.id)? else {
         return Ok(None);
     };
@@ -452,11 +608,12 @@ pub fn add_route(data: &Path, agent: &Agent) -> Result<Option<String>, Error> {
     // Local agents keep using the loopback listener; remote-sandbox agents must
     // use the external public gateway origin so sandboxes never dial 127.0.0.1.
     let config_dir = anyagents_core::agent_config_dir(data, &agent.id);
+    let remote_required = anyagents_tools::SandboxMode::from_env().is_remote_required();
     let runs_in_sandbox = anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir)
         .is_some()
         || anyagents_tools::SandboxConfig::resolve(Some(&config_dir))
             .is_some_and(|s| s.remote_spawn)
-        || anyagents_tools::SandboxMode::from_env().is_remote_required();
+        || remote_required;
     let origin = if runs_in_sandbox {
         public_origin(Some(data))
     } else {
@@ -465,13 +622,17 @@ pub fn add_route(data: &Path, agent: &Agent) -> Result<Option<String>, Error> {
             .or_else(|| public_origin(Some(data)))
     };
     if let Some(origin) = origin {
-        store_launch_env(data, &agent.id, &origin)?;
+        if !remote_required {
+            store_launch_env(data, &agent.id, &origin)?;
+        }
     }
     Ok(Some(token))
 }
 
 /// Store the provider key for one agent and point its route at the gateway.
-/// The file is 0600 and nothing prints the key. Called by `anyagents model`.
+/// On PostgreSQL, persists the encrypted route directly into `public.gateway_routes`
+/// so all coordinator replicas resolve it immediately. On SQLite, writes 0600
+/// `provider.json` + `gateway-token.txt` on disk. Never prints the key.
 pub fn store_key(
     data: &Path,
     agent: &Agent,
@@ -479,11 +640,56 @@ pub fn store_key(
     model: &str,
     api_key: &str,
 ) -> Result<(), Error> {
+    let store = Store::open(data.join("state.db"))?;
+    store_key_in(&store, agent, base_url, model, api_key, None)?;
+    Ok(())
+}
+
+/// Store one agent's gateway route against an explicit [`Store`] (and optional
+/// [`MasterKey`] override for tests). Returns the agent's gateway bearer token.
+pub fn store_key_in(
+    store: &Store,
+    agent: &Agent,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    master_key: Option<MasterKey>,
+) -> Result<String, Error> {
+    if let Some(pg_routes) = store.gateway_route_store_with_key(master_key) {
+        let tok = match pg_routes.get_for_agent(&agent.id)? {
+            Some(existing) if !existing.token.is_empty() => existing.token,
+            _ => random_token()?,
+        };
+        let protocol = protocol_str(protocol_of(&agent.harness)).to_string();
+        let stored = pg_routes.upsert(&UpsertGatewayRoute {
+            agent_id: agent.id.clone(),
+            agent_name: agent.name.clone(),
+            harness: agent.harness.clone(),
+            protocol,
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            token: tok.clone(),
+        })?;
+        shared_routes().insert(tok.clone(), stored_route_to_provider_route(stored));
+        if !anyagents_tools::SandboxMode::from_env().is_remote_required()
+            && let Some(origin) = public_origin(Some(store.data_dir())).or_else(origin)
+        {
+            let env = env_for_parts(&agent.harness, model, &tok, &origin);
+            if !env.is_empty() && agent.launch_env != env {
+                store.set_agent_launch_env(&agent.id, &env)?;
+            }
+        }
+        return Ok(tok);
+    }
+    let data = store.data_dir();
     ProviderImage::store(data, agent, base_url, model, api_key)?;
     // With the gateway running the route answers at once; either way the agent
     // is told the gateway origin and its own token from its next start.
-    add_route(data, agent)?;
-    Ok(())
+    let tok = add_route(data, agent)?.ok_or_else(|| {
+        Error::Message("provider image disappeared immediately after write".into())
+    })?;
+    Ok(tok)
 }
 
 /// The origin the running server published on its socket, for a client process
@@ -534,8 +740,13 @@ fn env_for(data: &Path, id: &AgentId, origin: &str) -> Vec<(String, String)> {
     let Ok(token) = token(data, id) else {
         return Vec::new();
     };
+    env_for_parts(&image.harness, &image.model, &token, origin)
+}
+
+fn env_for_parts(harness: &str, model: &str, token: &str, origin: &str) -> Vec<(String, String)> {
     let origin = origin.to_string();
-    let mut env = match protocol_of(&image.harness) {
+    let token = token.to_string();
+    let mut env = match protocol_of(harness) {
         Protocol::AnthropicMessages => vec![
             ("ANTHROPIC_BASE_URL".to_string(), origin),
             ("ANTHROPIC_AUTH_TOKEN".to_string(), token),
@@ -545,8 +756,8 @@ fn env_for(data: &Path, id: &AgentId, origin: &str) -> Vec<(String, String)> {
             ("OPENAI_API_KEY".to_string(), token),
         ],
     };
-    if !image.model.is_empty() && image.harness == "claude-code" {
-        env.push(("ANTHROPIC_MODEL".to_string(), image.model.clone()));
+    if !model.is_empty() && harness == "claude-code" {
+        env.push(("ANTHROPIC_MODEL".to_string(), model.to_string()));
     }
     env
 }

@@ -1784,6 +1784,7 @@ fn db_cmd(data: &Path, action: DbCommand) -> Result<(), anyagents_core::Error> {
                 skip_index,
                 batch_size,
                 reconcile_stale_runtime,
+                master_key: anyagents_core::MasterKey::from_env()?,
             };
             let report = anyagents_core::db::migrate_sqlite_dir_to_postgres(&opts)?;
             if json {
@@ -1796,8 +1797,13 @@ fn db_cmd(data: &Path, action: DbCommand) -> Result<(), anyagents_core::Error> {
             } else {
                 let total_rows: i64 = report.tables.iter().map(|t| t.pg_rows_after).sum();
                 println!(
-                    "Migrated {} tables ({total_rows} PG rows) in {} ms (reconciled: archived_runtime={}, legacy_faults={}, stale_turns={})",
+                    "Migrated {} tables ({total_rows} PG rows; agent_files={}, deployment_blobs={}, gateway_routes={}, sandbox_bindings={}, skipped_secrets={}) in {} ms (reconciled: archived_runtime={}, legacy_faults={}, stale_turns={})",
                     report.tables.len(),
+                    report.agent_files_migrated,
+                    report.deployment_blobs_migrated,
+                    report.gateway_routes_migrated,
+                    report.sandbox_bindings_migrated,
+                    report.skipped_secret_files,
                     report.elapsed_ms,
                     report.reconciled_archived_runtime,
                     report.reconciled_legacy_faults,

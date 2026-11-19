@@ -43,6 +43,17 @@ impl FileStamp {
     pub fn same_file(&self, other: &Self) -> bool {
         self.device == other.device && self.inode == other.inode
     }
+
+    /// Deterministic stamp for a virtual blob stored in PostgreSQL `agent_files`.
+    pub fn virtual_blob(len: u64, version: i64, updated_at_ms: i64) -> Self {
+        Self {
+            len,
+            device: 0,
+            inode: version.max(0) as u64,
+            modified: (updated_at_ms, 0),
+            changed: (updated_at_ms, 0),
+        }
+    }
     /// The last change predates `ms` by more than any filesystem timestamp
     /// granularity, so a later change cannot reuse this exact stamp.
     pub fn settled_before(&self, ms: i64) -> bool {

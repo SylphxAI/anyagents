@@ -260,6 +260,18 @@ impl HostIndex {
             index,
         }))))
     }
+
+    /// Borrow a PostgreSQL-backed [`HostIndex`] directly from an existing pool
+    /// without checking or touching any local SQLite index file.
+    pub(crate) fn shared_postgres_pool(pool: sqlx::PgPool) -> Result<SharedHostIndex, IndexError> {
+        pool.db_execute(
+            "INSERT INTO host_index.host_generation (id, generation) VALUES (1, ?1) ON CONFLICT (id) DO NOTHING",
+            &db_params![uuid::Uuid::now_v7().to_string()],
+        )?;
+        Ok(SharedHostIndex(SharedHostInner::Postgres(Self {
+            backend: HostIndexBackend::Postgres { pool, tx: None },
+        })))
+    }
 }
 
 #[cfg(test)]
@@ -1714,8 +1726,36 @@ pub(crate) fn prepare_document(
     if raw.segment != file.path() {
         return Err(io::Error::other("indexed coordinate names another source").into());
     }
-    let mut windows = Vec::new();
     let mut reader = file.range(raw.offset, raw.length);
+    prepare_document_from_reader(&mut reader, id, metadata, raw)
+}
+
+/// Project an in-memory blob (such as a PostgreSQL `agent_files` entry) into a
+/// [`PreparedDocument`] without reading from local disk.
+pub(crate) fn prepare_document_from_bytes(
+    bytes: &[u8],
+    id: &str,
+    metadata: &IndexMetadata,
+    raw: &RawCoordinate,
+) -> Result<PreparedDocument, IndexError> {
+    #[cfg(test)]
+    PREPARED.with(|n| n.set(n.get() + 1));
+    let start = usize::try_from(raw.offset).map_err(|_| integrity_mismatch())?;
+    let end = start
+        .checked_add(usize::try_from(raw.length).map_err(|_| integrity_mismatch())?)
+        .ok_or_else(integrity_mismatch)?;
+    let slice = bytes.get(start..end).ok_or_else(integrity_mismatch)?;
+    let mut cursor = io::Cursor::new(slice);
+    prepare_document_from_reader(&mut cursor, id, metadata, raw)
+}
+
+fn prepare_document_from_reader(
+    reader: &mut impl Read,
+    id: &str,
+    metadata: &IndexMetadata,
+    raw: &RawCoordinate,
+) -> Result<PreparedDocument, IndexError> {
+    let mut windows = Vec::new();
     let mut hash = Sha256::new();
     let mut carried = 0;
     let mut relative = 0u64;

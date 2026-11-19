@@ -49,7 +49,8 @@ pub use sqlite_to_pg::{
 pub const DATABASE_URL_POINTER_FILE: &str = "database-url";
 
 pub const PG_INIT_SQL: &str = include_str!("../migrations_pg/001_init.sql");
-pub const PG_LATEST_VERSION: i64 = 1;
+pub const PG_STATELESS_SQL: &str = include_str!("../migrations_pg/002_stateless_coordinator.sql");
+pub const PG_LATEST_VERSION: i64 = 2;
 const PG_MIGRATION_LOCK_KEY: i64 = 0x616e_7961_676e_7473_u64 as i64; // "anyagnts"
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +243,10 @@ static PG_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .expect("failed to build anyagents postgres runtime")
 });
 
+pub(crate) fn pg_runtime() -> &'static tokio::runtime::Runtime {
+    &PG_RUNTIME
+}
+
 pub(crate) fn block_on_pg<F: std::future::Future>(fut: F) -> F::Output {
     if let Ok(handle) = tokio::runtime::Handle::try_current()
         && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
@@ -414,6 +419,17 @@ impl PgHandle {
                          VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
                     )
                     .bind(compat_ver)
+                    .bind(now)
+                    .execute(&mut *conn)
+                    .await?;
+                }
+                if current < 2 {
+                    sqlx::raw_sql(PG_STATELESS_SQL).execute(&mut *conn).await?;
+                    let now = now_ms();
+                    sqlx::query(
+                        "INSERT INTO public.pg_schema_migrations (version, applied_at_ms)
+                         VALUES (2, $1) ON CONFLICT (version) DO NOTHING",
+                    )
                     .bind(now)
                     .execute(&mut *conn)
                     .await?;

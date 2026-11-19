@@ -123,15 +123,57 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Read `<data>/anyagents.toml`. A missing file is the defaults; a file
-    /// that cannot be read or parsed is an error, never a silent default.
+    /// Read `<data>/anyagents.toml` with optional environment overrides
+    /// (`ANYAGENTS_PUBLIC_URL`, `ANYAGENTS_PUBLIC_LISTEN`,
+    /// `ANYAGENTS_REMOTE_SESSION_TTL_SECS`) when host storage env is active.
+    /// A missing file uses defaults plus env; a file or env value that cannot
+    /// be parsed is an error, never a silent default.
     pub fn load(data_dir: &Path) -> Result<Self, String> {
         let path = data_dir.join(CONFIG_FILE);
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Self::parse(&text, &path),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(format!("cannot read {}: {err}", path.display())),
+        let mut settings = match std::fs::read_to_string(&path) {
+            Ok(text) => Self::parse(&text, &path)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => return Err(format!("cannot read {}: {err}", path.display())),
+        };
+        if anyagents_core::storage_env_enabled() {
+            if settings.public_url.is_none()
+                && let Ok(raw) = std::env::var("ANYAGENTS_PUBLIC_URL")
+                && !raw.trim().is_empty()
+            {
+                settings.public_url = Some(
+                    normalize_public_url(&raw)
+                        .map_err(|err| format!("ANYAGENTS_PUBLIC_URL {err}"))?,
+                );
+            }
+            if settings.public_listen.is_none()
+                && let Ok(raw) = std::env::var("ANYAGENTS_PUBLIC_LISTEN")
+                && !raw.trim().is_empty()
+            {
+                settings.public_listen = Some(raw.trim().parse::<SocketAddr>().map_err(|_| {
+                    format!(
+                        "ANYAGENTS_PUBLIC_LISTEN `{raw}` must be an `address:port` such as `0.0.0.0:8789`"
+                    )
+                })?);
+            }
+            if settings.remote_session_ttl == DEFAULT_TTL
+                && let Ok(raw) = std::env::var("ANYAGENTS_REMOTE_SESSION_TTL_SECS")
+                && !raw.trim().is_empty()
+            {
+                let secs = raw.trim().parse::<u64>().map_err(|_| {
+                    format!("ANYAGENTS_REMOTE_SESSION_TTL_SECS `{raw}` must be an integer")
+                })?;
+                let ttl = Duration::from_secs(secs);
+                if ttl < MIN_TTL || ttl > MAX_TTL {
+                    return Err(format!(
+                        "ANYAGENTS_REMOTE_SESSION_TTL_SECS must be between {} and {}",
+                        MIN_TTL.as_secs(),
+                        MAX_TTL.as_secs()
+                    ));
+                }
+                settings.remote_session_ttl = ttl;
+            }
         }
+        Ok(settings)
     }
 
     pub fn parse(text: &str, origin: &Path) -> Result<Self, String> {
@@ -254,8 +296,18 @@ pub fn normalize_public_url(raw: &str) -> Result<String, String> {
 /// remote session tokens.
 pub fn runs_off_host(agent: &Agent, config_dir: &Path) -> bool {
     crate::vendor::is_cloud_harness(&agent.harness)
+        || anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(config_dir).is_some()
         || anyagents_tools::SandboxConfig::resolve(Some(config_dir))
             .is_some_and(|sandbox| sandbox.remote_spawn)
+}
+
+/// Store-aware check for whether this agent runs off-host, consulting
+/// PostgreSQL `agent_sandbox_bindings` and `remote_required` mode so peer
+/// replicas without pod-local `sandbox*.json` files admit HTTP MCP properly.
+pub fn runs_off_host_in(store: &Store, agent: &Agent, config_dir: &Path) -> bool {
+    runs_off_host(agent, config_dir)
+        || anyagents_tools::SandboxMode::from_env().is_remote_required()
+        || store.sandbox_binding(&agent.id).ok().flatten().is_some()
 }
 
 /// Why a remote agent cannot be created or started here, when it cannot.

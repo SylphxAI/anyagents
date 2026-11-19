@@ -18,6 +18,47 @@ use std::{
 
 pub const INDEX_FILE: &str = "host-history-index-v1.db";
 
+/// Virtual segment prefix for PostgreSQL `public.agent_files` blobs indexed into `host_index`.
+const PG_AGENT_FILE_PREFIX: &str = "pg://agent_files/";
+
+pub(crate) fn pg_agent_file_segment(agent_id: &str, namespace: &str, path: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "{PG_AGENT_FILE_PREFIX}{agent_id}/{namespace}/{path}"
+    ))
+}
+
+fn parse_pg_agent_file_segment(segment: &Path) -> Option<(String, String, String)> {
+    let raw = segment.to_str()?;
+    let rest = raw.strip_prefix(PG_AGENT_FILE_PREFIX)?;
+    let (agent_id, rest) = rest.split_once('/')?;
+    let (namespace, rel_path) = rest.split_once('/')?;
+    if agent_id.is_empty() || namespace.is_empty() || rel_path.is_empty() {
+        return None;
+    }
+    Some((
+        agent_id.to_string(),
+        namespace.to_string(),
+        rel_path.to_string(),
+    ))
+}
+
+fn extract_migrated_agent_blob_ref(owner: &str, segment: &Path) -> Option<(&'static str, String)> {
+    let raw = segment.to_str()?;
+    let mem_needle = format!("/agents/{owner}/memory/");
+    if let Some((_, rel)) = raw.split_once(&mem_needle)
+        && !rel.is_empty()
+    {
+        return Some(("memory", rel.to_string()));
+    }
+    let arch_needle = format!("/agents/{owner}/history/archive/memory/");
+    if let Some((_, rel)) = raw.split_once(&arch_needle)
+        && !rel.is_empty()
+    {
+        return Some(("memory_archive", rel.to_string()));
+    }
+    None
+}
+
 /// A raw byte range another retriever cites inside an indexed document:
 /// absolute offsets in the document's segment and the range's SHA-256.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,9 +96,123 @@ fn store_error(error: crate::Error) -> IndexError {
 }
 
 impl Store {
+    fn open_host_index(&self) -> Result<crate::host_index::SharedHostIndex, IndexError> {
+        if let Some(pool) = self.pg_pool() {
+            return HostIndex::shared_postgres_pool(pool);
+        }
+        HostIndex::shared(&self.data_dir().join(INDEX_FILE))
+    }
+
+    fn read_blob_bytes_for_segment(
+        &self,
+        owner: &str,
+        segment: &Path,
+    ) -> Result<Option<Vec<u8>>, IndexError> {
+        if !self.is_postgres() {
+            return Ok(None);
+        }
+        let target = if let Some((seg_agent, ns, rel)) = parse_pg_agent_file_segment(segment) {
+            if seg_agent != owner {
+                return Ok(None);
+            }
+            Some((ns, rel))
+        } else {
+            extract_migrated_agent_blob_ref(owner, segment).map(|(ns, rel)| (ns.to_string(), rel))
+        };
+        let Some((ns, rel)) = target else {
+            return Ok(None);
+        };
+        let aid = AgentId::parse(owner).map_err(store_error)?;
+        let entry = self
+            .blob_store()
+            .get_agent_file(&aid, &ns, &rel)
+            .map_err(store_error)?;
+        Ok(entry.map(|e| e.content))
+    }
+
+    fn read_coordinate_bytes(
+        &self,
+        owner: &str,
+        coord: &crate::raw_segment::RawCoordinate,
+    ) -> Result<Vec<u8>, IndexError> {
+        if let Some(bytes) = self.read_blob_bytes_for_segment(owner, &coord.segment)? {
+            let start = usize::try_from(coord.offset)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "offset out of range"))?;
+            let len = usize::try_from(coord.length)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "length out of range"))?;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "range overflow"))?;
+            let slice = bytes
+                .get(start..end)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "short blob slice"))?;
+            if sha256(slice) != coord.sha256 {
+                return Err(
+                    io::Error::new(io::ErrorKind::InvalidData, "raw blob digest mismatch").into(),
+                );
+            }
+            return Ok(slice.to_vec());
+        }
+        Ok(read_raw(coord)?)
+    }
+
+    fn read_coordinate_range(
+        &self,
+        owner: &str,
+        raw: &crate::raw_segment::RawCoordinate,
+        offset: u64,
+        length: u64,
+    ) -> Result<(crate::raw_segment::RawCoordinate, Vec<u8>), IndexError> {
+        if let Some(bytes) = self.read_blob_bytes_for_segment(owner, &raw.segment)? {
+            let doc_start = usize::try_from(raw.offset)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "offset out of range"))?;
+            let doc_len = usize::try_from(raw.length)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "length out of range"))?;
+            let doc_end = doc_start
+                .checked_add(doc_len)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "range overflow"))?;
+            let doc_slice = bytes
+                .get(doc_start..doc_end)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "short blob doc"))?;
+            if sha256(doc_slice) != raw.sha256 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "raw document changed since search",
+                )
+                .into());
+            }
+            if offset > raw.length {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "range offset past end of document",
+                )
+                .into());
+            }
+            let clamped = length.min(raw.length - offset);
+            let rel_start = usize::try_from(offset)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset out of range"))?;
+            let rel_end = rel_start
+                .checked_add(usize::try_from(clamped).unwrap_or(0))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "range overflow"))?;
+            let sub = doc_slice[rel_start..rel_end].to_vec();
+            let window = crate::raw_segment::RawCoordinate {
+                segment: raw.segment.clone(),
+                offset: raw.offset + offset,
+                length: clamped,
+                sha256: sha256(&sub),
+                seq: raw.seq,
+            };
+            return Ok((window, sub));
+        }
+        Ok(crate::raw_segment::read_raw_range(raw, offset, length)?)
+    }
+
     pub fn is_host_path_redacted(&self, owner: &str, path: &Path) -> Result<bool, IndexError> {
         let root = self.data_dir().join("agents").join(owner);
-        if !safe_components(&mut Walk::new(&root), self.data_dir(), &root)? {
+        let skip_local_walk = parse_pg_agent_file_segment(path).is_some()
+            || (self.is_postgres()
+                && fs::symlink_metadata(&root).is_err_and(|e| e.kind() == io::ErrorKind::NotFound));
+        if !skip_local_walk && !safe_components(&mut Walk::new(&root), self.data_dir(), &root)? {
             return Ok(true);
         }
         Ok(self
@@ -95,10 +250,10 @@ impl Store {
     /// others; frontier/documents remain the previous atomic publication.
     pub fn verify_one_host_history_source(&self, now_ms: i64) -> Result<bool, IndexError> {
         let index_path = self.data_dir().join(INDEX_FILE);
-        if !index_path.exists() {
+        if !self.is_postgres() && !index_path.exists() {
             return Ok(false);
         }
-        let index = HostIndex::shared(&index_path)?;
+        let index = self.open_host_index()?;
         let Some((owner, path)) = index.verification_candidate(now_ms)? else {
             return Ok(false);
         };
@@ -115,7 +270,39 @@ impl Store {
         let Some(mut cursor) = index.source_cursor(&owner, &path)? else {
             return Ok(false);
         };
+        if self.is_postgres()
+            && let Some((seg_agent, ns, rel)) = parse_pg_agent_file_segment(&path)
+        {
+            let still_exists = seg_agent == owner
+                && !self
+                    .unresolved_host_paths(&owner)?
+                    .iter()
+                    .any(|p| path.starts_with(p))
+                && self
+                    .blob_store()
+                    .get_agent_file(&agent.id, &ns, &rel)
+                    .map_err(store_error)?
+                    .is_some();
+            if !still_exists {
+                index.clear_source(&owner, &path)?;
+                index.checkpoint()?;
+            } else {
+                cursor.verification_attempt_ms = now_ms;
+                cursor.full_verified_ms = now_ms;
+                index.save_source(&owner, &path, &cursor)?;
+            }
+            return Ok(true);
+        }
         let root = self.data_dir().join("agents").join(agent.id.as_str());
+        if self.is_postgres()
+            && fs::symlink_metadata(&root).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        {
+            // Stateless PG replica without local agent files on disk: never wipe
+            // shared index sources owned by another host or migrated from SQLite.
+            cursor.verification_attempt_ms = now_ms;
+            index.save_source(&owner, &path, &cursor)?;
+            return Ok(true);
+        }
         let mut walk = Walk::new(&root);
         let found = safe_components(&mut walk, self.data_dir(), &root)?
             && native_sources(&mut walk, &root)?
@@ -169,10 +356,10 @@ impl Store {
             return Ok(None);
         }
         let index_path = self.data_dir().join(INDEX_FILE);
-        if !index_path.exists() {
+        if !self.is_postgres() && !index_path.exists() {
             return Ok(None);
         }
-        let index = HostIndex::shared(&index_path)?;
+        let index = self.open_host_index()?;
         let Some(hit) = index.document(&visible, scope, request.id)? else {
             return Ok(None);
         };
@@ -195,14 +382,30 @@ impl Store {
             )
             .into());
         }
+        if self
+            .unresolved_host_paths(agent.id.as_str())?
+            .iter()
+            .any(|p| hit.raw.segment.starts_with(p))
+        {
+            return Ok(None);
+        }
+        if self.is_postgres()
+            && self
+                .read_blob_bytes_for_segment(agent.id.as_str(), &hit.raw.segment)?
+                .is_some()
+        {
+            let (window, bytes) = self.read_coordinate_range(
+                agent.id.as_str(),
+                &hit.raw,
+                request.offset,
+                request.length,
+            )?;
+            hit.window = window;
+            return Ok(Some((hit, bytes)));
+        }
         let root = self.data_dir().join("agents").join(agent.id.as_str());
         let mut walk = Walk::new(&root);
-        if !safe_components(&mut walk, self.data_dir(), &root)?
-            || self
-                .unresolved_host_paths(agent.id.as_str())?
-                .iter()
-                .any(|p| hit.raw.segment.starts_with(p))
-        {
+        if !safe_components(&mut walk, self.data_dir(), &root)? {
             return Ok(None);
         }
         let paths = match hit.metadata.source {
@@ -236,7 +439,7 @@ impl Store {
     /// The caller holds the agent's lifecycle lock, so publishing needs no
     /// other; learned-memory topics are small whole files.
     pub fn sync_agent_memory_index(&self, agent: &Agent) -> Result<(), IndexError> {
-        let mut index = HostIndex::shared(&self.data_dir().join(INDEX_FILE))?;
+        let mut index = self.open_host_index()?;
         let unresolved = self.unresolved_host_paths(agent.id.as_str())?;
         let mut budget = u64::MAX;
         let mut held =
@@ -323,7 +526,7 @@ impl Store {
             .map(|(id, name)| Owner { id, name })
             .collect();
         owners.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-        let mut index = HostIndex::shared(&self.data_dir().join(INDEX_FILE))?;
+        let mut index = self.open_host_index()?;
         let unresolved = self.unresolved_host_paths_of(&owners)?;
         let agents = agents_identity(self.data_dir())?;
         let mut remaining = budget;
@@ -369,7 +572,7 @@ impl Store {
             }
             // Return the matching bounded window, not an unbounded tool payload.
             // The whole-event coordinate remains available for explicit readback.
-            let bytes = read_raw(&hit.window)?;
+            let bytes = self.read_coordinate_bytes(&hit.metadata.agent_id, &hit.window)?;
             out.push((hit, bytes));
         }
         Ok((out, pending))
@@ -390,7 +593,7 @@ impl Store {
         cited: &[CitedRange],
     ) -> Result<Vec<(IndexHit, Vec<u8>)>, IndexError> {
         let index_path = self.data_dir().join(INDEX_FILE);
-        if cited.is_empty() || !index_path.exists() {
+        if cited.is_empty() || (!self.is_postgres() && !index_path.exists()) {
             return Ok(Vec::new());
         }
         let selected = query
@@ -406,7 +609,7 @@ impl Store {
             .filter(|id| selected.as_ref().is_none_or(|s| s == *id))
             .cloned()
             .collect();
-        let index = HostIndex::shared(&index_path)?;
+        let index = self.open_host_index()?;
         let ids: Vec<String> = cited.iter().map(|c| c.document_id.clone()).collect();
         let mut request = query.clone();
         request.agent = None;
@@ -446,7 +649,7 @@ impl Store {
                 sha256: range.sha256.clone(),
                 seq: hit.raw.seq,
             };
-            let Ok(bytes) = read_raw(&window) else {
+            let Ok(bytes) = self.read_coordinate_bytes(&hit.metadata.agent_id, &window) else {
                 continue;
             };
             let mut hit = hit.clone();
@@ -468,6 +671,43 @@ impl Store {
             .collect();
         receipts.sort();
         Ok(sha256(receipts.join("\n").as_bytes()))
+    }
+
+    fn pg_memory_blob_fingerprint(
+        &self,
+        owner: &Owner,
+        class: MemoryScope,
+    ) -> Result<Option<String>, IndexError> {
+        if !self.is_postgres() || class != MemoryScope::Memory {
+            return Ok(None);
+        }
+        let metas = self
+            .blob_store()
+            .list_agent_files(&owner.id, "memory")
+            .map_err(store_error)?;
+        let mut sig = String::new();
+        for m in metas {
+            sig.push_str(&m.path);
+            sig.push(':');
+            sig.push_str(&m.sha256);
+            sig.push(':');
+            sig.push_str(&m.version.to_string());
+            sig.push('\n');
+        }
+        Ok(Some(sha256(sig.as_bytes())))
+    }
+
+    fn effective_tree_policy(
+        &self,
+        owner: &Owner,
+        class: MemoryScope,
+        unresolved: &[PathBuf],
+    ) -> Result<String, IndexError> {
+        let base = tree_policy(owner, unresolved)?;
+        match self.pg_memory_blob_fingerprint(owner, class)? {
+            Some(fp) => Ok(format!("{base}|pg-mem:{fp}")),
+            None => Ok(base),
+        }
     }
 
     /// Skip a class whose recorded walk still matches the filesystem and the
@@ -494,7 +734,7 @@ impl Store {
             .ok_or_else(|| io::Error::other("a history class is memory or transcripts"))?;
         let root = self.data_dir().join("agents").join(owner.id.as_str());
         if let Some((recorded, tree)) = index.agent_tree(owner.id.as_str(), class_name)?
-            && recorded == tree_policy(owner, unresolved)?
+            && recorded == self.effective_tree_policy(owner, class, unresolved)?
             && serde_json::from_str::<Tree>(&tree).is_ok_and(|t| t.is_current(&root, agents))
         {
             return Ok(ClassRefresh::complete());
@@ -503,7 +743,7 @@ impl Store {
         tests::CLASS_WALKS.with(|n| n.set(n.get() + 1));
         let epoch = self.redaction_epoch(owner.id.as_str())?;
         let unresolved = self.unresolved_host_paths(owner.id.as_str())?;
-        let policy = tree_policy(owner, &unresolved)?;
+        let policy = self.effective_tree_policy(owner, class, &unresolved)?;
         let mut gate = || -> Result<Option<Box<dyn std::any::Any>>, IndexError> {
             let guard = self.lock_agent_lifecycle(&owner.id).map_err(store_error)?;
             if self.redaction_epoch(owner.id.as_str())? != epoch {
@@ -560,7 +800,8 @@ impl Store {
         // pending/failed copy excludes precisely that path and descendants;
         // an unrelated unsupported store does not hide scrubbed local data.
         let blocked = |path: &Path| unresolved.iter().any(|b| path.starts_with(b));
-        if agent_root_safe(&mut walk, agents)? {
+        let local_root_present = agent_root_safe(&mut walk, agents)?;
+        if local_root_present {
             match class {
                 MemoryScope::Memory => {
                     for path in memory_indexable_files(&mut walk, &root.join("memory"))? {
@@ -655,11 +896,109 @@ impl Store {
                 }
             }
         }
+        // In PostgreSQL stateless mode, also index per-agent memory blobs stored in
+        // `public.agent_files(namespace = 'memory')` so replicas with empty local
+        // filesystems search and read learned memory directly from PostgreSQL.
+        if self.is_postgres() && class == MemoryScope::Memory {
+            let blob_store = self.blob_store();
+            let metas = blob_store
+                .list_agent_files(&owner.id, "memory")
+                .map_err(store_error)?;
+            let visible_metas: Vec<_> = metas
+                .into_iter()
+                .filter(|m| !m.path.starts_with('.') && !m.path.contains("/."))
+                .collect();
+            let has_topic_files = visible_metas
+                .iter()
+                .any(|m| !m.path.eq_ignore_ascii_case("MEMORY.md") && m.path.ends_with(".md"));
+            for meta in visible_metas {
+                if has_topic_files && meta.path.eq_ignore_ascii_case("MEMORY.md") {
+                    continue;
+                }
+                let seg = pg_agent_file_segment(owner.id.as_str(), "memory", &meta.path);
+                if blocked(&seg) {
+                    continue;
+                }
+                let id = format!(
+                    "memory:{}:{}",
+                    owner.id,
+                    sha256(seg.as_os_str().as_encoded_bytes())
+                );
+                let metadata = memory_metadata(owner, Some(meta.updated_at_ms));
+                let stamp = FileStamp::virtual_blob(
+                    meta.size_bytes as u64,
+                    meta.version,
+                    meta.updated_at_ms,
+                );
+                let policy = serde_json::to_string(&metadata)?;
+                let unchanged = index
+                    .source_cursor(&metadata.agent_id, &seg)?
+                    .is_some_and(|old| old.stamp == stamp && old.policy == policy);
+                if !unchanged
+                    && let Some(entry) = blob_store
+                        .get_agent_file(&owner.id, "memory", &meta.path)
+                        .map_err(store_error)?
+                {
+                    let raw = crate::raw_segment::RawCoordinate {
+                        segment: seg.clone(),
+                        offset: 0,
+                        length: entry.content.len() as u64,
+                        sha256: entry.sha256.clone(),
+                        seq: 1,
+                    };
+                    let prepared = if index.is_current(&id, &metadata, &raw)? {
+                        None
+                    } else {
+                        Some(crate::host_index::prepare_document_from_bytes(
+                            &entry.content,
+                            &id,
+                            &metadata,
+                            &raw,
+                        )?)
+                    };
+                    if let Some(_guard) = gate()? {
+                        index.refresh_source(|index| {
+                            if let Some(doc) = &prepared {
+                                index.publish_document(doc)?;
+                            }
+                            index.save_source(
+                                &metadata.agent_id,
+                                &seg,
+                                &SourceCursor {
+                                    stamp: stamp.clone(),
+                                    policy,
+                                    end: raw.length,
+                                    next_seq: 2,
+                                    boundary_sha256: String::new(),
+                                    full_verified_ms: 0,
+                                    verification_attempt_ms: 0,
+                                    complete: true,
+                                    rebuilding: false,
+                                },
+                            )
+                        })?;
+                    } else {
+                        refresh.complete = false;
+                    }
+                }
+                keep.insert(seg.to_string_lossy().into_owned());
+            }
+        }
         let stale: Vec<String> = index
             .agent_sources(owner.id.as_str())?
             .into_iter()
             .filter(|(segment, cursor)| {
-                !keep.contains(segment) && source_class(cursor).is_none_or(|c| c == class)
+                if keep.contains(segment) || !source_class(cursor).is_none_or(|c| c == class) {
+                    return false;
+                }
+                // On a stateless PostgreSQL replica whose local `<data>/agents/<id>`
+                // directory does not exist, never wipe pre-indexed host or migrated
+                // sources belonging to another pod; only prune deleted `pg://agent_files/`
+                // blobs we authoritatively listed above.
+                if self.is_postgres() && !local_root_present {
+                    return segment.starts_with(PG_AGENT_FILE_PREFIX);
+                }
+                true
             })
             .map(|(segment, _)| segment)
             .collect();
@@ -828,8 +1167,7 @@ impl Store {
                 }
             }
         };
-        let index_path = data.join(INDEX_FILE);
-        let mut index = HostIndex::shared(&index_path)?;
+        let mut index = self.open_host_index()?;
         let agents = agents_identity(&data)?;
         for job in jobs {
             let owner = match &job {

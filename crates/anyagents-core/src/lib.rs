@@ -24,6 +24,7 @@ pub mod quote;
 pub mod raw_segment;
 pub mod redaction;
 mod secret;
+pub mod stateless;
 pub mod storage;
 mod store;
 
@@ -35,6 +36,17 @@ pub use error::Error;
 pub use id::{AgentId, ChannelId, MessageId, UsageId};
 pub use quote::{Quote, QuoteRef};
 pub use secret::{CredentialStore, FileCredentialStore, Secret};
+pub use stateless::{
+    AGENT_FILE_NAMESPACES, BlobEntry, BlobMeta, CAPABILITY_KEY_ENV, CoordinatorLease,
+    CoordinatorLeaseGuard, CoordinatorLockBackend, DEFAULT_LEASE_TTL,
+    DEFAULT_REMOTE_SANDBOX_WORKDIR, DEPLOYMENT_BLOB_NAMESPACES, DurableObligation,
+    DurableObligationStore, FsDurableObligationStore, FsSandboxBindingStore, FsStateBlobStore,
+    LocalFlockLockBackend, MASTER_KEY_ENV, MasterKey, PG_WAKE_CHANNEL, PgCoordinatorLockBackend,
+    PgCredentialStore, PgDurableObligationStore, PgGatewayRouteStore, PgSandboxBindingStore,
+    PgStateBlobStore, PgWakeEvent, PgWakeListener, SandboxBinding, SandboxBindingStore,
+    StateBlobStore, StoredGatewayRoute, UpsertGatewayRoute, decode_wake_payload,
+    encode_wake_payload, hash_gateway_token, publish_pg_wake, validate_blob_path,
+};
 pub use storage::{
     GIT_POOL_DIR_ENV, SCRATCH_DIR_ENV, STATE_DIR_ENV, TEST_STORAGE_TIERS_ENV, WORKSPACES_DIR_ENV,
     agent_scratch_build_dir, agent_scratch_tmp_dir, configured_git_pool_dir,
@@ -58,8 +70,8 @@ pub use store::{
     AgentRuntime, BackfillReport, CredentialBinding, CredentialBindingAudit, CredentialKind,
     CredentialObservation, CredentialSlot, CredentialTarget, Fault, FaultKind, HarnessLease,
     LifecycleKind, LifecycleOp, LifecyclePhase, NewLifecycleOp, ProcessIdentity, QUOTA_ESTIMATE_MS,
-    QuotaBlock, QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState,
-    SchedulePending, SessionLease, Turn, TurnOutcome, TurnState,
+    QuotaBlock, QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeHeartbeat,
+    RuntimeState, SchedulePending, SessionLease, Turn, TurnOutcome, TurnState,
 };
 pub use store::{
     AgentTurnSnapshot, ErroredTurn, MAX_ERRORED_TURNS, SYSTEM_SENDER, TurnErrors,

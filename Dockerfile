@@ -38,7 +38,7 @@ COPY --from=bun-bin /usr/local/bin/bun /usr/local/bin/bun
 COPY --from=builder /src/target/release/anyagents /usr/local/bin/anyagents
 
 ENV HOME=/home/anyagents \
-    ANYAGENTS_DATA_DIR=/var/lib/anyagents \
+    ANYAGENTS_DATA=/var/lib/anyagents \
     ANYAGENTS_SANDBOX_MODE=remote_required
 
 WORKDIR /var/lib/anyagents

@@ -22,6 +22,9 @@ pub struct MigrateToPostgresOptions {
     pub skip_index: bool,
     pub batch_size: usize,
     pub reconcile_stale_runtime: bool,
+    /// Optional AEAD master key for encrypting migrated secret files, gateway
+    /// routes, and sandbox transport tokens. Defaults to `MasterKey::from_env()`.
+    pub master_key: Option<crate::stateless::MasterKey>,
 }
 
 impl MigrateToPostgresOptions {
@@ -32,6 +35,7 @@ impl MigrateToPostgresOptions {
             skip_index: false,
             batch_size: 2500,
             reconcile_stale_runtime: true,
+            master_key: crate::stateless::MasterKey::from_env().ok().flatten(),
         }
     }
 }
@@ -49,6 +53,11 @@ pub struct TableMigrationStat {
 #[derive(Clone, Debug, Serialize)]
 pub struct MigrateToPostgresReport {
     pub tables: Vec<TableMigrationStat>,
+    pub agent_files_migrated: u64,
+    pub deployment_blobs_migrated: u64,
+    pub gateway_routes_migrated: u64,
+    pub sandbox_bindings_migrated: u64,
+    pub skipped_secret_files: u64,
     pub reconciled_archived_runtime: u64,
     pub reconciled_legacy_faults: u64,
     pub reconciled_stale_turns: u64,
@@ -1389,10 +1398,732 @@ const HOST_INDEX_TABLES: &[TableSpec] = &[
     },
 ];
 
-/// Migrates `state.db`, `memory-index.db`, and `host-history-index-v1.db` from
-/// `opts.source_dir` into the target PostgreSQL database with batched `UNNEST`
-/// inserts, `\0` byte sanitization, topological `agents` ordering, identity
-/// sequence reset, optional stale runtime reconciliation, and row-count checks.
+const MAX_MIGRATED_BLOB_BYTES: u64 = 16 * 1024 * 1024;
+const BLOB_BATCH_MAX_ROWS: usize = 250;
+const BLOB_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
+struct BlobBackfillCounts {
+    agent_files_migrated: u64,
+    deployment_blobs_migrated: u64,
+    gateway_routes_migrated: u64,
+    sandbox_bindings_migrated: u64,
+    skipped_secret_files: u64,
+}
+
+struct AgentFileBatch {
+    agent_ids: Vec<String>,
+    namespaces: Vec<String>,
+    paths: Vec<String>,
+    contents: Vec<Vec<u8>>,
+    sha256s: Vec<String>,
+    encrypted: Vec<bool>,
+    updated_at_ms: Vec<i64>,
+    total_bytes: usize,
+}
+
+impl AgentFileBatch {
+    fn new() -> Self {
+        Self {
+            agent_ids: Vec::new(),
+            namespaces: Vec::new(),
+            paths: Vec::new(),
+            contents: Vec::new(),
+            sha256s: Vec::new(),
+            encrypted: Vec::new(),
+            updated_at_ms: Vec::new(),
+            total_bytes: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.agent_ids.is_empty()
+    }
+
+    fn should_flush(&self) -> bool {
+        self.agent_ids.len() >= BLOB_BATCH_MAX_ROWS || self.total_bytes >= BLOB_BATCH_MAX_BYTES
+    }
+
+    fn push(
+        &mut self,
+        agent_id: String,
+        namespace: &str,
+        path: String,
+        content: Vec<u8>,
+        sha256: String,
+        encrypted: bool,
+        updated_at_ms: i64,
+    ) {
+        self.total_bytes += content.len();
+        self.agent_ids.push(agent_id);
+        self.namespaces.push(namespace.to_string());
+        self.paths.push(path);
+        self.contents.push(content);
+        self.sha256s.push(sha256);
+        self.encrypted.push(encrypted);
+        self.updated_at_ms.push(updated_at_ms);
+    }
+
+    fn flush(&mut self, pool: &PgPool) -> Result<u64, Error> {
+        if self.is_empty() {
+            return Ok(0);
+        }
+        let count = self.agent_ids.len() as u64;
+        let agent_ids = std::mem::take(&mut self.agent_ids);
+        let namespaces = std::mem::take(&mut self.namespaces);
+        let paths = std::mem::take(&mut self.paths);
+        let contents = std::mem::take(&mut self.contents);
+        let sha256s = std::mem::take(&mut self.sha256s);
+        let encrypted = std::mem::take(&mut self.encrypted);
+        let updated_at_ms = std::mem::take(&mut self.updated_at_ms);
+        self.total_bytes = 0;
+
+        block_on_pg(async move {
+            sqlx::query(
+                "INSERT INTO public.agent_files
+                    (agent_id, namespace, path, content, sha256, encrypted, version, updated_at_ms)
+                 SELECT t.agent_id, t.namespace, t.path, t.content, t.sha256, t.encrypted, 1, t.updated_at_ms
+                 FROM UNNEST(
+                     $1::text[], $2::text[], $3::text[], $4::bytea[],
+                     $5::text[], $6::boolean[], $7::bigint[]
+                 ) AS t(agent_id, namespace, path, content, sha256, encrypted, updated_at_ms)
+                 ON CONFLICT (agent_id, namespace, path) DO UPDATE
+                 SET content       = EXCLUDED.content,
+                     sha256        = EXCLUDED.sha256,
+                     encrypted     = EXCLUDED.encrypted,
+                     version       = CASE
+                                       WHEN public.agent_files.sha256 IS DISTINCT FROM EXCLUDED.sha256
+                                         OR public.agent_files.encrypted IS DISTINCT FROM EXCLUDED.encrypted
+                                       THEN public.agent_files.version + 1
+                                       ELSE public.agent_files.version
+                                     END,
+                     updated_at_ms = EXCLUDED.updated_at_ms",
+            )
+            .bind(&agent_ids)
+            .bind(&namespaces)
+            .bind(&paths)
+            .bind(&contents)
+            .bind(&sha256s)
+            .bind(&encrypted)
+            .bind(&updated_at_ms)
+            .execute(pool)
+            .await
+            .map_err(|e| Error::Message(format!("postgres agent_files backfill failed: {e}")))
+        })?;
+        Ok(count)
+    }
+}
+
+struct DeploymentBlobBatch {
+    namespaces: Vec<String>,
+    paths: Vec<String>,
+    contents: Vec<Vec<u8>>,
+    sha256s: Vec<String>,
+    encrypted: Vec<bool>,
+    updated_at_ms: Vec<i64>,
+    total_bytes: usize,
+}
+
+impl DeploymentBlobBatch {
+    fn new() -> Self {
+        Self {
+            namespaces: Vec::new(),
+            paths: Vec::new(),
+            contents: Vec::new(),
+            sha256s: Vec::new(),
+            encrypted: Vec::new(),
+            updated_at_ms: Vec::new(),
+            total_bytes: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.namespaces.is_empty()
+    }
+
+    fn should_flush(&self) -> bool {
+        self.namespaces.len() >= BLOB_BATCH_MAX_ROWS || self.total_bytes >= BLOB_BATCH_MAX_BYTES
+    }
+
+    fn push(
+        &mut self,
+        namespace: &str,
+        path: String,
+        content: Vec<u8>,
+        sha256: String,
+        encrypted: bool,
+        updated_at_ms: i64,
+    ) {
+        self.total_bytes += content.len();
+        self.namespaces.push(namespace.to_string());
+        self.paths.push(path);
+        self.contents.push(content);
+        self.sha256s.push(sha256);
+        self.encrypted.push(encrypted);
+        self.updated_at_ms.push(updated_at_ms);
+    }
+
+    fn flush(&mut self, pool: &PgPool) -> Result<u64, Error> {
+        if self.is_empty() {
+            return Ok(0);
+        }
+        let count = self.namespaces.len() as u64;
+        let namespaces = std::mem::take(&mut self.namespaces);
+        let paths = std::mem::take(&mut self.paths);
+        let contents = std::mem::take(&mut self.contents);
+        let sha256s = std::mem::take(&mut self.sha256s);
+        let encrypted = std::mem::take(&mut self.encrypted);
+        let updated_at_ms = std::mem::take(&mut self.updated_at_ms);
+        self.total_bytes = 0;
+
+        block_on_pg(async move {
+            sqlx::query(
+                "INSERT INTO public.deployment_blobs
+                    (namespace, path, content, sha256, encrypted, version, updated_at_ms)
+                 SELECT t.namespace, t.path, t.content, t.sha256, t.encrypted, 1, t.updated_at_ms
+                 FROM UNNEST(
+                     $1::text[], $2::text[], $3::bytea[], $4::text[], $5::boolean[], $6::bigint[]
+                 ) AS t(namespace, path, content, sha256, encrypted, updated_at_ms)
+                 ON CONFLICT (namespace, path) DO UPDATE
+                 SET content       = EXCLUDED.content,
+                     sha256        = EXCLUDED.sha256,
+                     encrypted     = EXCLUDED.encrypted,
+                     version       = CASE
+                                       WHEN public.deployment_blobs.sha256 IS DISTINCT FROM EXCLUDED.sha256
+                                         OR public.deployment_blobs.encrypted IS DISTINCT FROM EXCLUDED.encrypted
+                                       THEN public.deployment_blobs.version + 1
+                                       ELSE public.deployment_blobs.version
+                                     END,
+                     updated_at_ms = EXCLUDED.updated_at_ms",
+            )
+            .bind(&namespaces)
+            .bind(&paths)
+            .bind(&contents)
+            .bind(&sha256s)
+            .bind(&encrypted)
+            .bind(&updated_at_ms)
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                Error::Message(format!("postgres deployment_blobs backfill failed: {e}"))
+            })
+        })?;
+        Ok(count)
+    }
+}
+
+fn file_mtime_ms(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_else(now_ms)
+}
+
+fn walk_regular_files_bounded(
+    base: &Path,
+    dir: &Path,
+    skip_dirs: &[&str],
+    out: &mut Vec<(String, PathBuf, i64)>,
+) -> Result<(), Error> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if meta.is_dir() {
+            if skip_dirs.iter().any(|skip| *skip == name_str.as_ref()) {
+                continue;
+            }
+            walk_regular_files_bounded(base, &path, skip_dirs, out)?;
+        } else if meta.is_file() {
+            if meta.len() > MAX_MIGRATED_BLOB_BYTES {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(base) else {
+                continue;
+            };
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if crate::stateless::validate_blob_path(&rel_str).is_err() {
+                continue;
+            }
+            out.push((rel_str, path, file_mtime_ms(&meta)));
+        }
+    }
+    Ok(())
+}
+
+fn is_agent_config_transient(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    name.ends_with(".lock")
+        || matches!(
+            name,
+            "opencode-service-pid"
+                | "opencode-service-port"
+                | "spiron.sock"
+                | "spiron.log"
+                | "sandbox.json"
+                | "sandbox-sylphx.json"
+        )
+}
+
+fn is_agent_config_secret(rel: &str) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    matches!(
+        name,
+        "mcp-capability"
+            | "remote-session-token"
+            | ".credentials.json"
+            | "credentials.json"
+            | "auth.json"
+            | "antigravity-oauth-token"
+    ) || name.ends_with(".key")
+}
+
+fn is_profile_secret(rel: &str) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    matches!(
+        name,
+        ".credentials.json" | "credentials.json" | "auth.json" | "key"
+    ) || name.contains("token")
+        || name.ends_with(".key")
+}
+
+fn classify_agent_config(rel: &str) -> (&'static str, bool) {
+    if is_agent_config_secret(rel) {
+        return ("secrets", true);
+    }
+    if rel.starts_with("spiron-cloud-") || rel.starts_with("spiron-cloud-inputs/") {
+        return ("spiron_cloud", false);
+    }
+    if rel.ends_with("-acp.json") {
+        return ("acp", false);
+    }
+    if rel.starts_with(".anyagents-") {
+        return ("markers", false);
+    }
+    ("config", false)
+}
+
+fn parse_sandbox_binding_from_config(
+    agent_id: &crate::AgentId,
+    config_dir: &Path,
+) -> Option<crate::stateless::SandboxBinding> {
+    let sylphx_path = config_dir.join("sandbox-sylphx.json");
+    if let Ok(raw) = std::fs::read(&sylphx_path)
+        && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&raw)
+    {
+        let mut binding = crate::stateless::SandboxBinding::new(agent_id.clone(), "sylphx");
+        binding.template = val
+            .get("template")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        binding.image = val
+            .get("image")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if let Some(wd) = val
+            .get("workdir")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty() && !s.ends_with("/launcher"))
+        {
+            binding.remote_workdir = wd.to_string();
+        }
+        binding.volume_id = val
+            .get("volume_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        binding.volume_resource = val
+            .get("volume_resource")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        binding.volume_size_gib = val.get("volume_size_gib").and_then(|v| v.as_i64());
+        binding.lease_id = val
+            .get("lease_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        binding.lease_resource = val
+            .get("lease_resource")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        binding.data_plane_resource = val
+            .get("data_plane_resource")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        binding.transport_url = val
+            .get("envd_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        binding.guest_endpoint = binding.transport_url.clone();
+        binding.transport_token = val
+            .get("envd_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        binding.lease_state = if binding.lease_id.is_some() {
+            "ready".to_string()
+        } else {
+            "detached".to_string()
+        };
+        let spec = serde_json::json!({
+            "endpoint": val.get("endpoint").and_then(|v| v.as_str()).unwrap_or_default(),
+            "parent": val.get("parent").and_then(|v| v.as_str()).unwrap_or_default(),
+            "shape": val.get("shape").and_then(|v| v.as_str()).unwrap_or_default(),
+            "mount_path": val.get("mount_path").and_then(|v| v.as_str()).unwrap_or("/home/user/agent-data"),
+        });
+        binding.spec_json = spec.to_string();
+        return Some(binding);
+    }
+
+    let legacy_path = config_dir.join("sandbox.json");
+    if let Ok(raw) = std::fs::read(&legacy_path)
+        && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&raw)
+        && val
+            .get("remote_spawn")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
+        let mut binding = crate::stateless::SandboxBinding::new(agent_id.clone(), "legacy_http");
+        if let Some(wd) = val
+            .get("workdir")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty() && !s.ends_with("/launcher"))
+        {
+            binding.remote_workdir = wd.to_string();
+        }
+        binding.lease_id = val
+            .get("sandbox_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        binding.transport_url = val
+            .get("api_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        binding.guest_endpoint = binding.transport_url.clone();
+        binding.transport_token = val
+            .get("token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        binding.lease_state = if binding.lease_id.is_some() {
+            "ready".to_string()
+        } else {
+            "detached".to_string()
+        };
+        return Some(binding);
+    }
+    None
+}
+
+fn backfill_on_disk_blobs(
+    source_dir: &Path,
+    valid_agents: &HashSet<String>,
+    agent_names: &HashMap<String, String>,
+    master_key: Option<&crate::stateless::MasterKey>,
+    pool: &PgPool,
+) -> Result<(BlobBackfillCounts, Vec<TableMigrationStat>), Error> {
+    let af_before = block_on_pg(pg_count(pool, "public.agent_files"))?;
+    let db_before = block_on_pg(pg_count(pool, "public.deployment_blobs"))?;
+
+    let mut counts = BlobBackfillCounts::default();
+    let mut af_batch = AgentFileBatch::new();
+    let mut db_batch = DeploymentBlobBatch::new();
+
+    let binding_store =
+        crate::stateless::PgSandboxBindingStore::new(pool.clone(), master_key.cloned());
+    let route_store = crate::stateless::PgGatewayRouteStore::new(pool.clone(), master_key.cloned());
+
+    // 1. Per-agent files under `<source_dir>/agents/<id>/{memory,history/archive/memory,skills,sessions,config}`
+    let agents_root = source_dir.join("agents");
+    let mut sorted_agents: Vec<&String> = valid_agents.iter().collect();
+    sorted_agents.sort();
+
+    for aid_str in sorted_agents {
+        let agent_dir = agents_root.join(aid_str);
+        if !agent_dir.is_dir() {
+            continue;
+        }
+        let Ok(agent_id) = crate::AgentId::parse(aid_str) else {
+            continue;
+        };
+
+        // Direct 1:1 namespace subtrees
+        for (subdir, namespace) in [
+            (agent_dir.join("memory"), "memory"),
+            (
+                agent_dir.join("history").join("archive").join("memory"),
+                "memory_archive",
+            ),
+            (agent_dir.join("skills"), "skills"),
+            (agent_dir.join("sessions"), "sessions"),
+        ] {
+            let mut files = Vec::new();
+            walk_regular_files_bounded(&subdir, &subdir, &[], &mut files)?;
+            for (rel, full_path, mtime_ms) in files {
+                if namespace == "sessions" && rel.ends_with(".lock") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&full_path) else {
+                    continue;
+                };
+                let digest = crate::learned_memory::sha256(&bytes);
+                af_batch.push(
+                    aid_str.clone(),
+                    namespace,
+                    rel,
+                    bytes,
+                    digest,
+                    false,
+                    mtime_ms,
+                );
+                if af_batch.should_flush() {
+                    counts.agent_files_migrated += af_batch.flush(pool)?;
+                }
+            }
+        }
+
+        // `agents/<id>/config/**`
+        let config_dir = agent_dir.join("config");
+        if config_dir.is_dir() {
+            // Migrate sandbox binding into `agent_sandbox_bindings`
+            if let Some(mut binding) = parse_sandbox_binding_from_config(&agent_id, &config_dir) {
+                if binding.transport_token.is_some() && master_key.is_none() {
+                    // Preserve non-secret binding metadata while never writing plaintext token.
+                    binding.transport_token = None;
+                    counts.skipped_secret_files += 1;
+                }
+                use crate::stateless::SandboxBindingStore as _;
+                binding_store.upsert(&binding)?;
+                counts.sandbox_bindings_migrated += 1;
+            }
+
+            let mut files = Vec::new();
+            const SKIP_CONFIG_DIRS: &[&str] = &[
+                "cache-home",
+                "data-home",
+                "state-home",
+                ".cache",
+                "tmp",
+                "projects",
+            ];
+            walk_regular_files_bounded(&config_dir, &config_dir, SKIP_CONFIG_DIRS, &mut files)?;
+            for (rel, full_path, mtime_ms) in files {
+                if is_agent_config_transient(&rel) {
+                    continue;
+                }
+                let (ns, is_secret) = classify_agent_config(&rel);
+                let Ok(bytes) = std::fs::read(&full_path) else {
+                    continue;
+                };
+                let digest = crate::learned_memory::sha256(&bytes);
+                let (stored, encrypted) = if is_secret {
+                    let Some(key) = master_key else {
+                        counts.skipped_secret_files += 1;
+                        continue;
+                    };
+                    let aad = format!("agent_files:{aid_str}:{ns}:{rel}");
+                    (key.encrypt(aad.as_bytes(), &bytes)?, true)
+                } else {
+                    (bytes, false)
+                };
+                af_batch.push(
+                    aid_str.clone(),
+                    ns,
+                    rel,
+                    stored,
+                    digest,
+                    encrypted,
+                    mtime_ms,
+                );
+                if af_batch.should_flush() {
+                    counts.agent_files_migrated += af_batch.flush(pool)?;
+                }
+            }
+        }
+
+        // `agents/<id>/provider.json` + `gateway-token.txt` -> `public.gateway_routes`
+        let provider_path = agent_dir.join("provider.json");
+        let token_path = agent_dir.join("gateway-token.txt");
+        if provider_path.is_file() && token_path.is_file() {
+            if master_key.is_some()
+                && let Ok(raw) = std::fs::read(&provider_path)
+                && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&raw)
+                && let Ok(tok_raw) = std::fs::read_to_string(&token_path)
+            {
+                let token = tok_raw.trim().to_string();
+                let str_field = |k: &str| {
+                    val.get(k)
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                };
+                if let (Some(harness), Some(model), Some(base_url), Some(api_key)) = (
+                    str_field("harness"),
+                    str_field("model"),
+                    str_field("baseUrl"),
+                    str_field("apiKey"),
+                ) && !token.is_empty()
+                {
+                    let protocol = match harness.as_str() {
+                        "codex" => "openai_responses",
+                        "opencode" => "openai_chat",
+                        _ => "anthropic_messages",
+                    }
+                    .to_string();
+                    let agent_name = agent_names
+                        .get(aid_str)
+                        .cloned()
+                        .unwrap_or_else(|| aid_str.clone());
+                    route_store.upsert(&crate::stateless::UpsertGatewayRoute {
+                        agent_id,
+                        agent_name,
+                        harness,
+                        protocol,
+                        model,
+                        base_url,
+                        api_key,
+                        token,
+                    })?;
+                    counts.gateway_routes_migrated += 1;
+                }
+            } else {
+                counts.skipped_secret_files += 1;
+            }
+        }
+    }
+    counts.agent_files_migrated += af_batch.flush(pool)?;
+
+    // 2. Deployment-level config files -> `deployment_blobs(namespace = 'config')`
+    for filename in [
+        "anyagents.toml",
+        "subagent-defaults.json",
+        "sandbox-provider.json",
+    ] {
+        let path = source_dir.join(filename);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() > MAX_MIGRATED_BLOB_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let contains_secret = match filename {
+            "anyagents.toml" => String::from_utf8_lossy(&bytes).contains("github_webhook_secret"),
+            "sandbox-provider.json" => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| {
+                    v.get("token")
+                        .and_then(|t| t.as_str())
+                        .map(|t| !t.trim().is_empty())
+                })
+                .unwrap_or(false),
+            _ => false,
+        };
+        let digest = crate::learned_memory::sha256(&bytes);
+        let (stored, encrypted) = if contains_secret {
+            let Some(key) = master_key else {
+                counts.skipped_secret_files += 1;
+                continue;
+            };
+            let aad = format!("deployment_blobs:config:{filename}");
+            (key.encrypt(aad.as_bytes(), &bytes)?, true)
+        } else {
+            (bytes, false)
+        };
+        db_batch.push(
+            "config",
+            filename.to_string(),
+            stored,
+            digest,
+            encrypted,
+            file_mtime_ms(&meta),
+        );
+        if db_batch.should_flush() {
+            counts.deployment_blobs_migrated += db_batch.flush(pool)?;
+        }
+    }
+
+    // 3. Deployment-level directories: `profiles/**`, `skills/**`, `secrets/**`, `media/**`
+    for (dir_name, namespace) in [
+        ("profiles", "profiles"),
+        ("skills", "skills"),
+        ("secrets", "secrets"),
+        ("media", "media"),
+    ] {
+        let root = source_dir.join(dir_name);
+        let mut files = Vec::new();
+        walk_regular_files_bounded(&root, &root, &[], &mut files)?;
+        for (rel, full_path, mtime_ms) in files {
+            if rel.ends_with(".lock") {
+                continue;
+            }
+            let is_secret =
+                namespace == "secrets" || (namespace == "profiles" && is_profile_secret(&rel));
+            let Ok(bytes) = std::fs::read(&full_path) else {
+                continue;
+            };
+            let digest = crate::learned_memory::sha256(&bytes);
+            let (stored, encrypted) = if is_secret {
+                let Some(key) = master_key else {
+                    counts.skipped_secret_files += 1;
+                    continue;
+                };
+                let aad = format!("deployment_blobs:{namespace}:{rel}");
+                (key.encrypt(aad.as_bytes(), &bytes)?, true)
+            } else {
+                (bytes, false)
+            };
+            db_batch.push(namespace, rel, stored, digest, encrypted, mtime_ms);
+            if db_batch.should_flush() {
+                counts.deployment_blobs_migrated += db_batch.flush(pool)?;
+            }
+        }
+    }
+    counts.deployment_blobs_migrated += db_batch.flush(pool)?;
+
+    let af_after = block_on_pg(pg_count(pool, "public.agent_files"))?;
+    let db_after = block_on_pg(pg_count(pool, "public.deployment_blobs"))?;
+    let extra_stats = vec![
+        TableMigrationStat {
+            pg_table: "public.agent_files".to_owned(),
+            sqlite_rows: counts.agent_files_migrated as i64,
+            pg_rows_before: af_before,
+            pg_rows_after: af_after,
+        },
+        TableMigrationStat {
+            pg_table: "public.deployment_blobs".to_owned(),
+            sqlite_rows: counts.deployment_blobs_migrated as i64,
+            pg_rows_before: db_before,
+            pg_rows_after: db_after,
+        },
+    ];
+    Ok((counts, extra_stats))
+}
+
+/// Migrates `state.db`, `memory-index.db`, `host-history-index-v1.db`, and
+/// on-disk agent/deployment files from `opts.source_dir` into the target
+/// PostgreSQL database with batched `UNNEST` inserts, `\0` byte sanitization,
+/// topological `agents` ordering, identity sequence reset, optional stale
+/// runtime reconciliation, and row-count checks.
 pub fn migrate_sqlite_dir_to_postgres(
     opts: &MigrateToPostgresOptions,
 ) -> Result<MigrateToPostgresReport, Error> {
@@ -1430,10 +2161,24 @@ pub fn migrate_sqlite_dir_to_postgres(
     for spec in STATE_WAVE_BEFORE_AGENTS {
         stats.push(copy_table(&state_sqlite, &pool, spec, batch_size)?);
     }
-    let (agents_stat, _valid_agents) = copy_agents_topological(&state_sqlite, &pool, batch_size)?;
+    let (agents_stat, valid_agents) = copy_agents_topological(&state_sqlite, &pool, batch_size)?;
     stats.push(agents_stat);
     for spec in STATE_WAVE_AFTER_AGENTS {
         stats.push(copy_table(&state_sqlite, &pool, spec, batch_size)?);
+    }
+
+    let mut agent_names = HashMap::new();
+    {
+        let mut stmt = state_sqlite.prepare("SELECT id, name FROM agents")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            if let (Some(id), Some(name)) = (
+                sqlite_cell_to_string(row.get_ref(0)?)?,
+                sqlite_cell_to_string(row.get_ref(1)?)?,
+            ) {
+                agent_names.insert(id, name);
+            }
+        }
     }
 
     if !opts.skip_index {
@@ -1453,6 +2198,15 @@ pub fn migrate_sqlite_dir_to_postgres(
         }
     }
 
+    let (blob_counts, blob_stats) = backfill_on_disk_blobs(
+        &opts.source_dir,
+        &valid_agents,
+        &agent_names,
+        opts.master_key.as_ref(),
+        &pool,
+    )?;
+    stats.extend(blob_stats);
+
     block_on_pg(reset_identity_sequences(&pool))?;
     let (reconciled_archived_runtime, reconciled_legacy_faults, reconciled_stale_turns) =
         if opts.reconcile_stale_runtime {
@@ -1463,6 +2217,11 @@ pub fn migrate_sqlite_dir_to_postgres(
 
     Ok(MigrateToPostgresReport {
         tables: stats,
+        agent_files_migrated: blob_counts.agent_files_migrated,
+        deployment_blobs_migrated: blob_counts.deployment_blobs_migrated,
+        gateway_routes_migrated: blob_counts.gateway_routes_migrated,
+        sandbox_bindings_migrated: blob_counts.sandbox_bindings_migrated,
+        skipped_secret_files: blob_counts.skipped_secret_files,
         reconciled_archived_runtime,
         reconciled_legacy_faults,
         reconciled_stale_turns,

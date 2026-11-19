@@ -326,6 +326,12 @@ pub const AGENT_ID_HEADER: &str = "x-anyagents-agent-id";
 #[derive(Clone, Debug)]
 pub struct RouteAgent(pub String);
 
+/// Authenticated principal injected directly into an in-process Axum router
+/// call (for example HTTP MCP after verifying a remote session token). External
+/// HTTP and Unix-socket requests never carry this extension.
+#[derive(Clone, Debug)]
+pub(crate) struct InjectedPrincipal(pub Principal);
+
 fn header(parts: &Parts, name: &'static str) -> Option<String> {
     parts
         .headers
@@ -343,6 +349,9 @@ impl FromRequestParts<AppState> for Principal {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        if let Some(injected) = parts.extensions.get::<InjectedPrincipal>() {
+            return Ok(injected.0.clone());
+        }
         let presented = Presented::of(parts);
         if let Some(decided) = state.auth.principal_without_store(&presented) {
             return decided.map_err(AuthRejection);

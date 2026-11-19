@@ -111,6 +111,17 @@ pub fn try_parse_from_raw_argv(argv: &[String]) -> Option<SandboxExecArgs> {
 }
 
 pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
+    run_with_io(args, BufReader::new(std::io::stdin()), std::io::stdout())
+}
+
+/// Drive the `sandbox-exec` stream-json protocol against arbitrary reader/writer
+/// streams so `HarnessHost::InProcess` under `remote_required` runs remote
+/// sandbox harnesses in-process without spawning local OS shim processes.
+pub fn run_with_io<R: BufRead + Send + 'static, W: Write + Send + 'static>(
+    args: SandboxExecArgs,
+    reader: R,
+    writer: W,
+) -> Result<(), Error> {
     let config = args
         .config
         .or_else(|| std::env::var_os("ANYAGENTS_AGENT_CONFIG").map(PathBuf::from));
@@ -137,6 +148,8 @@ pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
         .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
         .map(str::to_string);
+
+    let out_writer: Arc<Mutex<dyn Write + Send>> = Arc::new(Mutex::new(writer));
 
     // Check native Sylphx Sandboxes v1 driver first (either already persisted
     // `sandbox-sylphx.json` or configured via `sandbox-provider.json` / env).
@@ -166,6 +179,8 @@ pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
                 args.resume.as_deref(),
                 args.oneshot,
                 &args.args,
+                reader,
+                out_writer,
             );
         }
     }
@@ -200,7 +215,9 @@ pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
             .exec(&cmd_str, None, Some(300_000))
             .map_err(Error::Message)?;
         if !out.stdout.is_empty() {
-            print!("{}", out.stdout);
+            let mut guard = out_writer.lock().unwrap_or_else(|e| e.into_inner());
+            write!(guard, "{}", out.stdout)?;
+            guard.flush()?;
         }
         if !out.stderr.is_empty() {
             eprint!("{}", out.stderr);
@@ -220,10 +237,7 @@ pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
             .and_then(|c| read_persisted_session_id(c, &harness))
     });
 
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-
-    for line in BufReader::new(stdin.lock()).lines() {
+    for line in reader.lines() {
         let Ok(line) = line else { break };
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -237,10 +251,13 @@ pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
             continue;
         }
 
-        // Echo the user message back immediately so `ClaudeHarness` records the
-        // message marker as echoed.
-        writeln!(stdout, "{trimmed}")?;
-        stdout.flush()?;
+        // Echo the user message back immediately so `ClaudeHarness` / `InProcessRemoteHarness`
+        // records the message marker as echoed.
+        {
+            let mut stdout = out_writer.lock().unwrap_or_else(|e| e.into_inner());
+            writeln!(stdout, "{trimmed}")?;
+            stdout.flush()?;
+        }
 
         let prompt_text = extract_user_prompt(&event);
         refresh_remote_mcp_config(&sbx, config.as_deref(), &mut mcp_token);
@@ -257,6 +274,7 @@ pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
                 if let Some(ref cfg_dir) = config {
                     persist_session_id(cfg_dir, &harness, &outcome.session_id);
                 }
+                let mut stdout = out_writer.lock().unwrap_or_else(|e| e.into_inner());
                 for raw_line in &outcome.forwarded_stream_lines {
                     writeln!(stdout, "{raw_line}")?;
                 }
@@ -303,6 +321,7 @@ pub fn run(args: SandboxExecArgs) -> Result<(), Error> {
                     "session_id": fallback_sid,
                     "result": err_msg,
                 });
+                let mut stdout = out_writer.lock().unwrap_or_else(|e| e.into_inner());
                 writeln!(stdout, "{result_event}")?;
                 stdout.flush()?;
             }
@@ -898,7 +917,7 @@ fn collect_dereferenced_tree(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_sylphx_sandbox(
+fn run_sylphx_sandbox<R: BufRead + Send + 'static>(
     lease: SylphxLeaseConfig,
     data_dir: Option<&Path>,
     config_dir: &Path,
@@ -908,6 +927,8 @@ fn run_sylphx_sandbox(
     resume: Option<&str>,
     oneshot: bool,
     extra_args: &[String],
+    reader: R,
+    out_writer: Arc<Mutex<dyn Write + Send>>,
 ) -> Result<(), Error> {
     sync_agent_bundle_to_sylphx(
         &lease,
@@ -944,7 +965,9 @@ fn run_sylphx_sandbox(
             )
             .map_err(Error::Message)?;
         if !out.stdout.is_empty() {
-            print!("{}", out.stdout);
+            let mut guard = out_writer.lock().unwrap_or_else(|e| e.into_inner());
+            write!(guard, "{}", out.stdout)?;
+            guard.flush()?;
         }
         if !out.stderr.is_empty() {
             eprint!("{}", out.stderr);
@@ -990,6 +1013,8 @@ fn run_sylphx_sandbox(
         program_arg,
         resume,
         extra_args,
+        reader,
+        out_writer,
     );
 
     if let Ok(mut stopped) = renew_stop.0.lock() {
@@ -1003,7 +1028,7 @@ fn run_sylphx_sandbox(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_sylphx_envd_bridge(
+fn run_sylphx_envd_bridge<R: BufRead + Send + 'static>(
     lease: &SylphxLeaseConfig,
     data_dir: Option<&Path>,
     config_dir: &Path,
@@ -1012,6 +1037,8 @@ fn run_sylphx_envd_bridge(
     program_arg: Option<&str>,
     resume: Option<&str>,
     extra_args: &[String],
+    reader: R,
+    out_writer: Arc<Mutex<dyn Write + Send>>,
 ) -> Result<(), Error> {
     let client = lease.client();
     let envd_url = lease.resolved_envd_url().map_err(Error::Message)?;
@@ -1070,6 +1097,7 @@ fn run_sylphx_envd_bridge(
     let envd_url_for_stream = envd_url.clone();
     let envd_tok_for_stream = envd_token.clone();
     let workdir_for_stream = lease.workdir.clone();
+    let out_for_stream = Arc::clone(&out_writer);
     let stream_thread = std::thread::Builder::new()
         .name("anyagents-sylphx-envd-stdout".into())
         .spawn(move || -> Result<(), String> {
@@ -1123,7 +1151,9 @@ fn run_sylphx_envd_bridge(
                                         {
                                             persist_session_id(&cfg_clone, &harness_clone, sid);
                                         }
-                                        let mut out = std::io::stdout().lock();
+                                        let mut out = out_for_stream
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner());
                                         let _ = writeln!(out, "{trimmed}");
                                         let _ = out.flush();
                                     }
@@ -1180,11 +1210,12 @@ fn run_sylphx_envd_bridge(
             program_arg.unwrap_or(default_remote_program(harness)),
             resume,
             extra_args,
+            reader,
+            out_writer,
         );
     }
 
-    let stdin = std::io::stdin();
-    for line in BufReader::new(stdin.lock()).lines() {
+    for line in reader.lines() {
         let Ok(line) = line else { break };
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -1233,7 +1264,7 @@ fn run_sylphx_envd_bridge(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_sylphx_exec_fallback_loop(
+fn run_sylphx_exec_fallback_loop<R: BufRead + Send + 'static>(
     lease: &SylphxLeaseConfig,
     data_dir: Option<&Path>,
     config_dir: &Path,
@@ -1242,6 +1273,8 @@ fn run_sylphx_exec_fallback_loop(
     program: &str,
     resume: Option<&str>,
     extra_args: &[String],
+    reader: R,
+    out_writer: Arc<Mutex<dyn Write + Send>>,
 ) -> Result<(), Error> {
     let mut session_id = resume
         .map(str::trim)
@@ -1250,10 +1283,8 @@ fn run_sylphx_exec_fallback_loop(
         .or_else(|| read_persisted_session_id(config_dir, harness));
     let client = lease.client();
     let resource = lease.active_data_resource().map_err(Error::Message)?;
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
 
-    for line in BufReader::new(stdin.lock()).lines() {
+    for line in reader.lines() {
         let Ok(line) = line else { break };
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -1265,8 +1296,11 @@ fn run_sylphx_exec_fallback_loop(
         if event.get("type").and_then(Value::as_str) != Some("user") {
             continue;
         }
-        writeln!(stdout, "{trimmed}")?;
-        stdout.flush()?;
+        {
+            let mut stdout = out_writer.lock().unwrap_or_else(|e| e.into_inner());
+            writeln!(stdout, "{trimmed}")?;
+            stdout.flush()?;
+        }
 
         let _ = sync_agent_bundle_to_sylphx(
             lease,
@@ -1303,6 +1337,7 @@ fn run_sylphx_exec_fallback_loop(
                 );
                 session_id = Some(outcome.session_id.clone());
                 persist_session_id(config_dir, harness, &outcome.session_id);
+                let mut stdout = out_writer.lock().unwrap_or_else(|e| e.into_inner());
                 for raw_line in &outcome.forwarded_stream_lines {
                     writeln!(stdout, "{raw_line}")?;
                 }
@@ -1344,6 +1379,7 @@ fn run_sylphx_exec_fallback_loop(
                     "session_id": fallback_sid,
                     "result": err_msg,
                 });
+                let mut stdout = out_writer.lock().unwrap_or_else(|e| e.into_inner());
                 writeln!(stdout, "{result_event}")?;
                 stdout.flush()?;
             }

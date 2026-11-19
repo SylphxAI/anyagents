@@ -938,6 +938,9 @@ pub(crate) struct Client {
     /// calls go straight through it instead of dialing the external socket,
     /// which closes at the start of a stop while admitted calls still drain.
     in_process: Option<axum::Router>,
+    /// Verified principal injected directly into `in_process` router calls so
+    /// HTTP MCP never reads pod-local `mcp-capability` or calls `operator::ensure()`.
+    in_process_principal: Option<crate::auth::Principal>,
     /// What every clone of this client shares: idle connections to the
     /// server and the capability file as last read.
     link: Arc<ServerLink>,
@@ -993,6 +996,7 @@ impl Client {
             via_http: false,
             turn_context: None,
             in_process: None,
+            in_process_principal: None,
             link: Arc::default(),
         }
     }
@@ -1005,10 +1009,11 @@ impl Client {
     }
 
     /// The client of an HTTP MCP tool server running inside `router`'s own
-    /// server process.
-    fn over_http_router(mut self, router: axum::Router) -> Self {
+    /// server process with a directly injected authenticated principal.
+    fn over_http_router(mut self, router: axum::Router, principal: crate::auth::Principal) -> Self {
         self.via_http = true;
         self.in_process = Some(router);
+        self.in_process_principal = Some(principal);
         self
     }
 
@@ -1050,16 +1055,26 @@ impl Client {
         agent_id: Option<&str>,
     ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
         let payload = body.unwrap_or_default();
+        let cap_header = if self.in_process_principal.is_some() {
+            None
+        } else {
+            Some(capability)
+        };
         let fresh = || {
             let mut request = build_request(
                 method,
                 path,
                 Some(payload.clone()),
-                Some(capability),
+                cap_header,
                 None,
                 agent_id,
                 self.via_http,
             )?;
+            if let Some(principal) = &self.in_process_principal {
+                request
+                    .extensions_mut()
+                    .insert(crate::auth::InjectedPrincipal(principal.clone()));
+            }
             if path == "/v1/send"
                 && let Some(context) = self.turn_context.as_deref()
             {
@@ -5218,13 +5233,13 @@ impl AgentMcp {
         agent: AgentRef,
         socket: PathBuf,
         config: PathBuf,
-        capability: String,
+        principal: crate::auth::Principal,
         profile: McpProfile,
         router: axum::Router,
     ) -> Self {
         Self {
             agent,
-            client: Client::new(socket, config, capability).over_http_router(router),
+            client: Client::new(socket, config, String::new()).over_http_router(router, principal),
             profile,
         }
     }
