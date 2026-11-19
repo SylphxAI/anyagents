@@ -482,33 +482,6 @@ pub fn resolve_public_mcp_url(config: &Path) -> Result<String, String> {
     ))
 }
 
-/// The MCP profile a remote session asks for: `coordination` when `cloud.json`
-/// names it, else `remote`. A remote session token never gets more.
-fn remote_mcp_profile(config: &Path) -> &'static str {
-    let named = read_cloud_json(config).and_then(|v| {
-        v.get("mcp_profile")
-            .and_then(Value::as_str)
-            .and_then(crate::mcp::McpProfile::from_str_opt)
-    });
-    match named {
-        Some(crate::mcp::McpProfile::Coordination) => "coordination",
-        Some(crate::mcp::McpProfile::CoordinationMemory) => "coordination-memory",
-        _ => "remote",
-    }
-}
-
-pub fn mcp_url_with_profile(base_url: &str, profile: &str) -> String {
-    let trimmed = base_url.trim();
-    if trimmed.contains("profile=") {
-        return trimmed.to_string();
-    }
-    if trimmed.contains('?') {
-        format!("{trimmed}&profile={profile}")
-    } else {
-        format!("{trimmed}?profile={profile}")
-    }
-}
-
 pub(super) fn validate_remote_mcp_url(config: &Path, url: &str) -> Result<String, String> {
     let parsed = url::Url::parse(url.trim()).map_err(|_| "invalid cloud MCP callback URL")?;
     let env_override = std::env::var("ANYAGENTS_ALLOW_LOOPBACK_MCP")
@@ -1210,7 +1183,7 @@ fn dispatch_cloud_turn_detailed(
         })?;
     let canonical = normalize_harness_name(harness);
 
-    let mcp_url = mcp_url_with_profile(&mcp_base_url, remote_mcp_profile(config));
+    let mcp_url = mcp_base_url;
     let system_prompt = build_cloud_system_prompt(config);
     let disabled_tools = resolve_cloud_disabled_tools(config);
 
@@ -2890,19 +2863,11 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_session_asks_for_the_remote_profile_and_keeps_unreplaced_vendor_tools() {
+    fn a_remote_session_keeps_unreplaced_vendor_tools() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path();
-        assert_eq!(remote_mcp_profile(cfg), "remote");
-        std::fs::write(
-            cfg.join("cloud.json"),
-            r#"{"mcp_profile":"full","disable_builtin_tools":true}"#,
-        )
-        .unwrap();
-        assert_eq!(remote_mcp_profile(cfg), "remote");
+        std::fs::write(cfg.join("cloud.json"), r#"{"disable_builtin_tools":true}"#).unwrap();
         assert_eq!(resolve_cloud_disabled_tools(cfg), vec!["memory", "skills"]);
-        std::fs::write(cfg.join("cloud.json"), r#"{"mcp_profile":"coordination"}"#).unwrap();
-        assert_eq!(remote_mcp_profile(cfg), "coordination");
     }
 
     #[test]
@@ -3276,12 +3241,5 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("<learned_memory>"), "{rendered}");
-
-        std::fs::write(
-            cfg.join("cloud.json"),
-            r#"{"mcp_profile": "coordination-memory"}"#,
-        )
-        .unwrap();
-        assert_eq!(remote_mcp_profile(&cfg), "coordination-memory");
     }
 }

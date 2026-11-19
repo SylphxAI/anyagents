@@ -226,7 +226,7 @@ mod spawn_args_tests {
             "---\nname: builder\ndescription: Isolated builder specialist\n---\nBuild.",
         )
         .unwrap();
-        let tools = tool_definitions_with_roles(McpProfile::Full, None, Some(dir.path()));
+        let tools = tool_definitions_with_roles(None, Some(dir.path()));
         let role_tools: Vec<_> = tools
             .iter()
             .filter(|t| {
@@ -263,8 +263,7 @@ mod spawn_args_tests {
                 .unwrap_or_default()
                 .contains("Available roles (")
         );
-        let empty_dir_tools =
-            tool_definitions_with_roles(McpProfile::Full, None, Some(&dir.path().join("empty")));
+        let empty_dir_tools = tool_definitions_with_roles(None, Some(&dir.path().join("empty")));
         let empty_agents_desc = empty_dir_tools
             .iter()
             .find(|t| t.name == "agents")
@@ -276,10 +275,10 @@ mod spawn_args_tests {
             ),
             "{empty_agents_desc}"
         );
-        let without_data_dir = tool_definitions_with_roles(McpProfile::Full, None, None);
+        let without_data_dir = tool_definitions_with_roles(None, None);
         assert_eq!(
             serde_json::to_value(&without_data_dir).unwrap(),
-            serde_json::to_value(tool_definitions(McpProfile::Full)).unwrap()
+            serde_json::to_value(tool_definitions()).unwrap()
         );
         let agents_schema = serde_json::to_value(schemars::schema_for!(AgentsArgs)).unwrap();
         let role_doc = agents_schema["properties"]["role"]["description"]
@@ -774,7 +773,6 @@ mod spawn_args_tests {
                 dir.path().join("config"),
                 "synthetic-test-capability".into(),
             ),
-            profile: McpProfile::Full,
         };
         for legacy in [false, true] {
             for (arguments, expected_len, next, first) in [
@@ -909,7 +907,6 @@ mod spawn_args_tests {
                 dir.path().join("config"),
                 "synthetic-test-capability".into(),
             ),
-            profile: McpProfile::Full,
         };
         let inspected = mcp
             .agents(Parameters(
@@ -1008,7 +1005,6 @@ mod spawn_args_tests {
                 dir.path().join("config"),
                 "synthetic-test-capability".into(),
             ),
-            profile: McpProfile::Full,
         };
         for legacy in [false, true] {
             for (state, expected) in [
@@ -1077,1171 +1073,123 @@ mod spawn_args_tests {
         }
     }
 
-    #[tokio::test]
-    async fn files_tool_supports_read_write_atomic_multi_edit_glob_and_grep() {
-        let dir = tempfile::tempdir().unwrap();
-        let workdir = dir.path().join("work");
-        std::fs::create_dir_all(&workdir).unwrap();
-        std::fs::write(workdir.join(".gitignore"), "ignored_dir\n*.log\n").unwrap();
-        std::fs::create_dir_all(workdir.join("target")).unwrap();
-        std::fs::write(workdir.join("target/skip.rs"), "fn skipped() {}\n").unwrap();
-        std::fs::create_dir_all(workdir.join("ignored_dir")).unwrap();
-        std::fs::write(workdir.join("ignored_dir/skip2.rs"), "fn skipped2() {}\n").unwrap();
-
-        let mcp = AgentMcp {
-            agent: AgentRef {
-                id: AgentId::generate(),
-                name: "tester".into(),
-                workdir: Some(workdir.clone()),
-            },
-            client: Client::new(
-                dir.path().join("unused.sock"),
-                dir.path().join("config"),
-                "test-cap".into(),
-            ),
-            profile: McpProfile::Full,
-        };
-
-        // 1. Write a nested file (auto-creating parent directories).
-        let write_res = mcp
-            .files(Parameters(
-                serde_json::from_value(json!({
-                    "action": "write",
-                    "path": "src/engine.rs",
-                    "content": "pub fn alpha() -> i32 {\n    10\n}\npub fn beta() -> i32 {\n    20\n}\n"
-                }))
-                .unwrap(),
-            ))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(write_res["action"], "write");
-        assert_eq!(write_res["bytes_written"], 65);
-        let initial_sha = write_res["sha256"].as_str().unwrap().to_string();
-        assert_eq!(initial_sha.len(), 64);
-
-        // 2. Append to the file.
-        let append_res = mcp
-            .files(Parameters(
-                serde_json::from_value(json!({
-                    "action": "write",
-                    "path": "src/engine.rs",
-                    "content": "pub fn gamma() -> i32 {\n    30\n}\n",
-                    "append": true
-                }))
-                .unwrap(),
-            ))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(append_res["append"], true);
-        assert_ne!(append_res["sha256"].as_str().unwrap(), initial_sha);
-
-        // 3. Read line range.
-        let read_res = mcp
-            .files(Parameters(
-                serde_json::from_value(json!({
-                    "action": "read",
-                    "path": "src/engine.rs",
-                    "start_line": 4,
-                    "end_line": 6
-                }))
-                .unwrap(),
-            ))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(read_res["start_line"], 4);
-        assert_eq!(read_res["end_line"], 6);
-        assert_eq!(read_res["total_lines"], 9);
-        assert_eq!(read_res["content"], "pub fn beta() -> i32 {\n    20\n}");
-        assert!(
-            read_res["numbered"]
-                .as_str()
-                .unwrap()
-                .contains("4: pub fn beta()")
-        );
-
-        // 4. Atomic multi_edit: if second edit fails, first edit must NOT be written to disk.
-        let failed_edit = mcp
-            .files(Parameters(
-                serde_json::from_value(json!({
-                    "action": "multi_edit",
-                    "path": "src/engine.rs",
-                    "edits": [
-                        { "target": "    10", "replacement": "    100" },
-                        { "target": "pub fn beta() -> u64", "replacement": "pub fn beta() -> i64" }
-                    ]
-                }))
-                .unwrap(),
-            ))
-            .await;
-        let err_msg = match failed_edit {
-            Err(msg) => msg,
-            Ok(_) => panic!("expected missing target edit to fail"),
-        };
-        assert!(err_msg.contains("target` not found"), "{err_msg}");
-        assert!(err_msg.contains("4: pub fn beta() -> i32"), "{err_msg}");
-        let unchanged = std::fs::read_to_string(workdir.join("src/engine.rs")).unwrap();
-        assert!(unchanged.contains("    10\n"));
-
-        // 5. Valid multi_edit succeeds atomically.
-        let edit_res = mcp
-            .files(Parameters(
-                serde_json::from_value(json!({
-                    "action": "multi_edit",
-                    "path": "src/engine.rs",
-                    "edits": [
-                        { "target": "    10", "replacement": "    100" },
-                        { "target": "    20", "replacement": "    200\n    + 1" }
-                    ]
-                }))
-                .unwrap(),
-            ))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(edit_res["replacements_made"], 2);
-        assert_eq!(edit_res["lines_removed"], 2);
-        assert_eq!(edit_res["lines_added"], 3);
-
-        // 6. Glob respects .gitignore and skips target/.git by default.
-        let glob_res = mcp
-            .files(Parameters(
-                serde_json::from_value(json!({
-                    "action": "glob",
-                    "pattern": "**/*.rs"
-                }))
-                .unwrap(),
-            ))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(glob_res["files"], json!(["src/engine.rs"]));
-
-        // 7. Grep with regex and context_lines.
-        let grep_res = mcp
-            .files(Parameters(
-                serde_json::from_value(json!({
-                    "action": "grep",
-                    "query": r"pub fn (beta|gamma)\(\)",
-                    "glob": "*.rs",
-                    "context_lines": 1
-                }))
-                .unwrap(),
-            ))
-            .await
-            .unwrap()
-            .0;
-        let hits = grep_res["matches"].as_array().unwrap();
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0]["path"], "src/engine.rs");
-        assert_eq!(hits[0]["line"], 4);
-        assert_eq!(hits[0]["context_after"], json!(["    200"]));
-        assert_eq!(hits[1]["line"], 8);
-
-        // 8. Null bytes in path are rejected.
-        let null_err = mcp
-            .files(Parameters(
-                serde_json::from_value(json!({
-                    "action": "read",
-                    "path": "bad\0path.rs"
-                }))
-                .unwrap(),
-            ))
-            .await;
-        assert!(null_err.is_err());
-    }
-
-    #[tokio::test]
-    async fn code_delivery_receipts_are_host_observed_not_snippet_authored() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("proof.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let mcp = AgentMcp {
-            agent: AgentRef {
-                id: AgentId::generate(),
-                name: "receipt-worker".into(),
-                workdir: Some(dir.path().into()),
-            },
-            client: Client::new(
-                socket,
-                dir.path().join("config"),
-                "synthetic-receipt-capability".into(),
-            ),
-            profile: McpProfile::Full,
-        };
-        let fabricated = mcp
-            .code(Parameters(CodeArgs {
-                code: r#"
-                console.log('send(');
-                try { await anyagents.send({to: 123}); } catch {}
-                return {deliveries: [{to:'agent:parent', id:'invented'}]};
-            "#
-                .into(),
-                timeout_ms: Some(15000),
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(fabricated["result"]["deliveries"][0]["id"], "invented");
-        assert_eq!(fabricated["deliveries"], json!([]));
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            loop {
-                request.push(stream.read_u8().await.unwrap());
-                if request.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let header = String::from_utf8(request).unwrap();
-            let mut request_line = header.lines().next().unwrap().split_whitespace();
-            assert_eq!(request_line.next(), Some("POST"));
-            let uri: hyper::Uri = request_line.next().unwrap().parse().unwrap();
-            assert_eq!(uri.path(), "/v1/send");
-            let len: usize = header
-                .lines()
-                .find_map(|l| {
-                    l.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(|n| n.trim().parse().unwrap())
-                })
-                .unwrap();
-            let mut body = vec![0; len];
-            stream.read_exact(&mut body).await.unwrap();
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["text"],
-                "real delivery"
-            );
-            let body = json!({"deliveries":[{"to":"agent:parent","id":"msg-observed","seq":1,"duplicate":false}]}).to_string();
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(header.as_bytes()).await.unwrap();
-            stream.write_all(body.as_bytes()).await.unwrap();
-        });
-        let observed = mcp
-            .code(Parameters(CodeArgs {
-                code:
-                    "await anyagents.send({to:'agent:parent', text:'real delivery'}); return null;"
-                        .into(),
-                timeout_ms: Some(15000),
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(observed["result"], serde_json::Value::Null);
-        assert_eq!(observed["deliveries"][0]["id"], "msg-observed");
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn code_tool_executes_typescript_parallel_rpc_and_blocks_process_and_child_process() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let dir = tempfile::tempdir().unwrap();
-        let workdir = dir.path().join("work");
-        std::fs::create_dir_all(&workdir).unwrap();
-        std::fs::write(
-            workdir.join("notes.txt"),
-            "alpha-line\nbeta-target-line\ngamma-line\n",
-        )
-        .unwrap();
-
-        let socket = dir.path().join("test.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let parent_id = AgentId::generate();
-        let population = vec![
-            dummy_agent_view("agt_1", "alpha-worker", "running", "working", Some("First")),
-            dummy_agent_view("agt_2", "beta-worker", "idle", "idle", Some("Second")),
-        ];
-        let body = serde_json::to_vec(&AgentsResponse {
-            archived_count: 0,
-            agents: population,
-            gateway: None,
-        })
-        .unwrap();
-        let (served, server) = tokio::sync::oneshot::channel::<()>();
-        let later = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            loop {
-                let byte = stream.read_u8().await.unwrap();
-                request.push(byte);
-                if request.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(header.as_bytes()).await.unwrap();
-            stream.write_all(&body).await.unwrap();
-            drop(stream);
-            let _ = served.send(());
-            // The server stays up, as a real one does: what it does not
-            // serve here (memory reads) is answered `404`, and the tools fall
-            // back to the agent's own files.
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut request = Vec::new();
-                while !request.ends_with(b"\r\n\r\n") {
-                    match stream.read_u8().await {
-                        Ok(byte) => request.push(byte),
-                        Err(_) => break,
-                    }
-                }
-                let body = br#"{"error":"not served here"}"#;
-                let head = format!(
-                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(head.as_bytes()).await;
-                let _ = stream.write_all(body).await;
-            }
-        });
-
-        let mcp = AgentMcp {
-            agent: AgentRef {
-                id: parent_id,
-                name: "parent".into(),
-                workdir: Some(workdir.clone()),
-            },
-            client: Client::new(
-                socket,
-                dir.path().join("config"),
-                "synthetic-test-capability".into(),
-            ),
-            profile: McpProfile::Full,
-        };
-
-        // 1. Parallel Promise.all across `tools.anyagents.agents` and `tools.anyagents.files` / `tools.workspace` with TypeScript syntax.
-        let code_res = mcp
-            .code(Parameters(CodeArgs {
-                code: r#"
-                    interface Summary {
-                        activeAgents: string[];
-                        matchedLines: number[];
-                        editedSha: string;
-                    }
-                    const [roster, grepRes, editRes] = await Promise.all([
-                        tools.anyagents.agents({ action: "list", state: "all" }),
-                        tools.workspace.grep({ query: "beta-target", path: "notes.txt" }),
-                        tools.workspace.write({ path: "computed.txt", content: "ok\n" }),
-                    ]);
-                    console.log("parallel calls done", roster.agents.length);
-                    const out: Summary = {
-                        activeAgents: roster.agents
-                            .filter((a: any) => a.state === "running")
-                            .map((a: any) => a.name),
-                        matchedLines: grepRes.matches.map((m: any) => m.line),
-                        editedSha: editRes.sha256,
-                    };
-                    return out;
-                "#
-                .to_string(),
-                timeout_ms: Some(15_000),
-            }))
-            .await
-            .unwrap()
-            .0;
-
-        assert_eq!(code_res["truncated"], false);
-        assert_eq!(code_res["result"]["activeAgents"], json!(["alpha-worker"]));
-        assert_eq!(code_res["result"]["matchedLines"], json!([2]));
-        assert_eq!(code_res["logs"], json!(["parallel calls done 2"]));
-        assert!(workdir.join("computed.txt").is_file());
-        server.await.unwrap();
-        let _serving = &later;
-
-        // 2. Verify capability sandbox blocks `process`, `process.env`, `require`, `child_process`, `fs`, `fetch`, and Function constructor escapes.
-        let sandbox_probe = mcp
-            .code(Parameters(CodeArgs {
-                code: r#"
-                    let constructorEscapeBlocked = false;
-                    try {
-                        (tools as any).constructor.constructor("return process")();
-                    } catch {
-                        constructorEscapeBlocked = true;
-                    }
-                    let fnEscapeBlocked = false;
-                    try {
-                        tools.anyagents.files.constructor("return process")();
-                    } catch {
-                        fnEscapeBlocked = true;
-                    }
-                    return {
-                        typeofProcess: typeof (globalThis as any).process,
-                        typeofRequire: typeof (globalThis as any).require,
-                        typeofChildProcess: typeof (globalThis as any).child_process,
-                        typeofFs: typeof (globalThis as any).fs,
-                        typeofFetch: typeof (globalThis as any).fetch,
-                        typeofBun: typeof (globalThis as any).Bun,
-                        constructorEscapeBlocked,
-                        fnEscapeBlocked,
-                    };
-                "#
-                .to_string(),
-                timeout_ms: Some(10_000),
-            }))
-            .await
-            .unwrap()
-            .0;
-
+    #[test]
+    fn universal_mcp_surface_exposes_exact_seven_tools_and_blocks_removed_tools() {
+        let tools = tool_definitions();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert_eq!(names, UNIVERSAL_MCP_TOOLS);
         assert_eq!(
-            sandbox_probe["result"],
-            json!({
-                "typeofProcess": "undefined",
-                "typeofRequire": "undefined",
-                "typeofChildProcess": "undefined",
-                "typeofFs": "undefined",
-                "typeofFetch": "undefined",
-                "typeofBun": "undefined",
-                "constructorEscapeBlocked": true,
-                "fnEscapeBlocked": true,
-            })
+            names,
+            [
+                "agents",
+                "send",
+                "inbox",
+                "conversation",
+                "memory",
+                "schedules",
+                "groups",
+            ]
         );
-
-        // 3. Direct attempt to call `require("child_process")` or read `process.env` throws an error.
-        for forbidden_snippet in [
-            r#"return require("child_process").execSync("id").toString();"#,
-            r#"return process.env.PATH;"#,
+        for blocked in [
+            "code",
+            "files",
+            "skills",
+            "web",
+            "web_search",
+            "web_fetch",
+            "browser",
+            "computer",
+            "device",
+            "media",
         ] {
-            let res = mcp
-                .code(Parameters(CodeArgs {
-                    code: forbidden_snippet.to_string(),
-                    timeout_ms: Some(5_000),
-                }))
-                .await;
             assert!(
-                res.is_err(),
-                "expected `{forbidden_snippet}` to fail in sandbox"
+                !profile::allows_tool(blocked),
+                "{blocked} must not be allowed on the universal MCP surface"
             );
         }
+    }
 
-        // Oversized compact Unicode JSON is reconstructed through the supported
-        // code -> workspace.read consumer, not by opening the spill in the test.
-        let expected = serde_json::json!({"text":"é漢字\"\\".repeat(20_000),"meta":{"ok":true}});
-        let huge_res = mcp
-            .code(Parameters(CodeArgs {
-                code: r#"return {text:'é漢字"\\'.repeat(20000),meta:{ok:true}};"#.to_string(),
-                timeout_ms: Some(10_000),
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(huge_res["truncated"], false);
-        assert_eq!(huge_res["offloaded"], true);
-        // Independently recover a complete MCP frame (not just a code value),
-        // including structured content and the original error status.
-        let frame_expected = serde_json::json!({
-            "jsonrpc":"2.0", "id":"unicode-frame",
-            "result":{"content":[{"type":"text","text":"\u{0001}é漢字\"\\".repeat(20_000)}],
-                      "isError":true,"structuredContent":{"nested":[1,{"preserved":true}]}}
-        });
-        let full_frame = serde_json::to_vec(&frame_expected).unwrap();
-        let mut gate = FrameArtifactStdout::with_spill_dir(Vec::new(), workdir.clone());
-        gate.write_all(&full_frame).await.unwrap();
-        gate.write_all(b"\n").await.unwrap();
-        gate.flush().await.unwrap();
-        let reference: serde_json::Value = serde_json::from_slice(&gate.inner).unwrap();
-        assert_eq!(reference["id"], "unicode-frame");
-        assert_eq!(reference["result"]["isError"], true);
-        let reference: serde_json::Value =
-            serde_json::from_str(reference["result"]["content"][0]["text"].as_str().unwrap())
-                .unwrap();
-        let frame_res = serde_json::json!({"result_file":reference["artifact"]["path"],"artifact":reference["artifact"]});
-        for (expected, huge_res) in [(expected, huge_res), (frame_expected, frame_res)] {
-            let path = huge_res["result_file"].as_str().unwrap();
-            let mut rebuilt = String::new();
-            let mut offset = 0;
-            loop {
-                let code = format!(
-                    "const p=await workspace.read({{path:{},byte_offset:{offset},max_bytes:4096}}); return {{content:p.content,byte_offset:p.byte_offset,bytes_read:p.bytes_read,total_bytes:p.total_bytes,sha256:p.sha256,truncated:p.truncated}};",
-                    serde_json::to_string(path).unwrap()
-                );
-                let page = mcp
-                    .code(Parameters(CodeArgs {
-                        code,
-                        timeout_ms: Some(10_000),
-                    }))
-                    .await
-                    .unwrap()
-                    .0;
-                assert!(
-                    page.get("result_file").is_none(),
-                    "reader page offloaded: {page}"
-                );
-                let frame = serde_json::to_vec(&serde_json::json!({
-                "jsonrpc":"2.0", "id":offset,
-                "result":{"content":[{"type":"text","text":serde_json::to_string(&page).unwrap()}],"isError":false}
-            })).unwrap();
-                assert!(frame.len() < MCP_TEXT_SPILL_BYTES);
-                let mut gate = FrameArtifactStdout::with_spill_dir(Vec::new(), workdir.clone());
-                use tokio::io::AsyncWriteExt as _;
-                gate.write_all(&frame).await.unwrap();
-                gate.write_all(b"\n").await.unwrap();
-                gate.flush().await.unwrap();
-                assert_eq!(&gate.inner[..frame.len()], frame.as_slice());
-                assert_eq!(gate.inner.len(), frame.len() + 1);
-                let page = &page["result"];
-                assert_eq!(page["byte_offset"].as_u64().unwrap(), offset);
-                let content = page["content"].as_str().unwrap();
-                assert_eq!(content.len() as u64, page["bytes_read"].as_u64().unwrap());
-                rebuilt.push_str(content);
-                offset += page["bytes_read"].as_u64().unwrap();
-                assert_eq!(page["sha256"], huge_res["artifact"]["sha256"]);
-                assert_eq!(page["total_bytes"], huge_res["artifact"]["bytes"]);
-                if page["truncated"] == false {
-                    break;
-                }
-                assert!(!content.is_empty());
-            }
-            assert_eq!(
-                rebuilt.len() as u64,
-                huge_res["artifact"]["bytes"].as_u64().unwrap()
-            );
-            assert_eq!(
-                sha256_hex(rebuilt.as_bytes()),
-                huge_res["artifact"]["sha256"]
-            );
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&rebuilt).unwrap(),
-                expected
-            );
-        }
-        // Encoded media nested inside code results remains available inline.
-        let media = mcp
-            .code(Parameters(CodeArgs {
-                code:
-                    r#"return {nested:{type:'image',mimeType:'image/png',data:'A'.repeat(70000)}};"#
-                        .to_string(),
-                timeout_ms: Some(10_000),
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(
-            media["result"]["nested"]["data"].as_str().unwrap().len(),
-            70000
-        );
-        assert!(media.get("result_file").is_none());
-
-        // 5. Pure Code Mode exposes only `code` in CANONICAL_MCP_TOOLS, and `anyagents.memory` + `workspace.{list,patch,edit}` work end-to-end inside `code`.
-        assert_eq!(CANONICAL_MCP_TOOLS, &["code"]);
-        std::fs::write(
-            workdir.join("indent.rs"),
-            "fn outer() {\n        let value = 41;\n        println!(\"{value}\");\n}\n",
-        )
+    #[test]
+    fn send_reads_null_placeholders_as_absent() {
+        use serde_json::json;
+        let args: SendArgs = serde_json::from_value(json!({
+            "action": "send",
+            "article": "null",
+            "bot": "null",
+            "checklist": "null",
+            "emoji": "null",
+            "idempotency_key": "null",
+            "location": "null",
+            "media": "null",
+            "options": "null",
+            "poll": "null",
+            "quote": "null",
+            "reply_to": "null",
+            "target": "null",
+            "text": "report",
+            "to": ["agent:planner", "null"],
+        }))
         .unwrap();
-
-        let evo_res = mcp
-            .code(Parameters(CodeArgs {
-                code: r##"
-                    await anyagents.memory.write({
-                        topic: "build-invariants",
-                        description: "Verified build and deployment invariants",
-                        content: "# Build Invariants\n\nAlways verify live receipts.\n",
-                    });
-                    const readTopic = await anyagents.memory.read("build-invariants");
-                    const listedMem = await anyagents.memory.list();
-                    const searchedMem = await anyagents.memory.search("receipts");
-                    const deletedMem = await anyagents.memory.delete("build-invariants");
-
-                    // Indentation-tolerant edit (target has 0 spaces, file has 8 spaces)
-                    await workspace.edit({
-                        path: "indent.rs",
-                        target: "let value = 41;\nprintln!(\"{value}\");",
-                        replacement: "let value = 42;\nprintln!(\"answer={value}\");",
-                    });
-
-                    // V4A patch (Add + Update)
-                    await workspace.patch([
-                        "*** Begin Patch",
-                        "*** Add File: src/patched.txt",
-                        "+line one",
-                        "+line two",
-                        "*** Update File: src/patched.txt",
-                        "@@",
-                        " line one",
-                        "-line two",
-                        "+line two updated",
-                        "*** End Patch",
-                    ].join("\n"));
-
-                    // Unified diff patch
-                    await workspace.patch([
-                        "--- a/src/patched.txt",
-                        "+++ b/src/patched.txt",
-                        "@@ -1,2 +1,3 @@",
-                        " line one",
-                        " line two updated",
-                        "+line three unified",
-                    ].join("\n"));
-
-                    const dirList = await workspace.list("src");
-                    const patchedRead = await workspace.read("src/patched.txt");
-                    const indentRead = await workspace.read("indent.rs");
-                    const execRes = await tools.workspace.exec({ cmd: "printf 'hello-%s' exec", cwd: "src" });
-                    const hasWebHelpers = typeof tools.web.search === "function"
-                        && typeof tools.web.fetch === "function"
-                        && typeof web.search === "function"
-                        && typeof anyagents.web.fetch === "function";
-
-                    return {
-                        topicSlug: readTopic.topic,
-                        hasFact: readTopic.content.includes("Always verify live receipts."),
-                        listedCount: listedMem.count,
-                        searchCount: searchedMem.count,
-                        deleted: deletedMem.deleted,
-                        dirNames: dirList.entries.map((e: any) => e.name),
-                        patchedContent: patchedRead.content,
-                        indentContent: indentRead.content,
-                        execExit: execRes.exit_code,
-                        execStdout: execRes.stdout,
-                        hasWebHelpers,
-                    };
-                "##
-                .to_string(),
-                timeout_ms: Some(15_000),
-            }))
-            .await
-            .unwrap()
-            .0;
-
-        assert_eq!(evo_res["result"]["topicSlug"], "build-invariants");
-        assert_eq!(evo_res["result"]["hasFact"], true);
-        assert_eq!(evo_res["result"]["listedCount"], 1);
-        assert_eq!(evo_res["result"]["searchCount"], 1);
-        assert_eq!(evo_res["result"]["deleted"], true);
-        assert_eq!(evo_res["result"]["dirNames"], json!(["patched.txt"]));
-        assert_eq!(
-            evo_res["result"]["patchedContent"],
-            "line one\nline two updated\nline three unified"
-        );
-        assert_eq!(
-            evo_res["result"]["indentContent"],
-            "fn outer() {\n        let value = 42;\n        println!(\"answer={value}\");\n}"
-        );
-        assert_eq!(evo_res["result"]["execExit"], 0);
-        assert_eq!(evo_res["result"]["execStdout"], "hello-exec");
-        assert_eq!(evo_res["result"]["hasWebHelpers"], true);
-        later.abort();
-    }
-
-    #[tokio::test]
-    async fn files_and_code_tools_emit_native_mcp_multimedia_content_blocks() {
-        use rmcp::handler::server::tool::IntoCallToolResult as _;
-        let dir = tempfile::tempdir().unwrap();
-        let workdir = dir.path().join("work");
-        std::fs::create_dir_all(&workdir).unwrap();
-
-        // 1. Write a 640x480 PNG, a WAV header, and a minimal PDF file.
-        let mut png_bytes = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(image::RgbaImage::new(640, 480))
-            .write_to(&mut png_bytes, image::ImageFormat::Png)
-            .unwrap();
-        let png_bytes = png_bytes.into_inner();
-        std::fs::write(workdir.join("frame.png"), &png_bytes).unwrap();
-
-        let mut wav_bytes = Vec::new();
-        wav_bytes.extend_from_slice(b"RIFF");
-        wav_bytes.extend_from_slice(&36u32.to_le_bytes());
-        wav_bytes.extend_from_slice(b"WAVEfmt ");
-        wav_bytes.extend_from_slice(&[16, 0, 0, 0, 1, 0, 1, 0]);
-        std::fs::write(workdir.join("clip.wav"), &wav_bytes).unwrap();
-
-        let pdf_bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
-        std::fs::write(workdir.join("spec.pdf"), pdf_bytes).unwrap();
-
-        let mcp = AgentMcp {
-            agent: AgentRef {
-                id: AgentId::generate(),
-                name: "multimedia-worker".into(),
-                workdir: Some(workdir.clone()),
-            },
-            client: Client::new(
-                dir.path().join("unused.sock"),
-                dir.path().join("config"),
-                "test-cap".into(),
-            ),
-            profile: McpProfile::Full,
-        };
-        assert!(
-            rmcp::ServerHandler::get_info(&mcp)
-                .capabilities
-                .tools
-                .is_some(),
-            "stdio ServerHandler::get_info() must advertise tools capability so MCP clients call tools/list"
-        );
-
-        // Direct `files` read on PNG returns clean metadata + native MCP Image ContentBlock.
-        let MultimediaJson(png_json, png_media) = mcp
-            .files(Parameters(
-                serde_json::from_value(json!({
-                    "action": "read",
-                    "path": "frame.png",
-                }))
-                .unwrap(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(png_json["mime_type"], "image/png");
-        assert_eq!(png_json["media_kind"], "image");
-        assert_eq!(png_json["width"], 640);
-        assert_eq!(png_json["height"], 480);
-        assert_eq!(png_json["image_attached"], true);
-        assert_eq!(png_media.len(), 1);
-        match &png_media[0] {
-            rmcp::model::ContentBlock::Image(img) => {
-                assert_eq!(img.mime_type, "image/png");
-                assert_eq!(img.data, crate::computer::base64_encode(&png_bytes));
-            }
-            other => panic!("expected ContentBlock::Image, got {other:?}"),
-        }
-
-        // Calling `workspace.read` inside `code` attaches Image, Audio, and PDF Resource ContentBlocks to the outer `code` tool result!
-        let code_multimedia = mcp
-            .code(Parameters(CodeArgs {
-                code: r#"
-                    const [img, aud, doc] = await Promise.all([
-                        workspace.read("frame.png"),
-                        workspace.read("clip.wav"),
-                        workspace.read("spec.pdf"),
-                    ]);
-                    return {
-                        imgDims: [img.width, img.height],
-                        audMime: aud.mime_type,
-                        docMime: doc.mime_type,
-                    };
-                "#
-                .to_string(),
-                timeout_ms: Some(15_000),
-            }))
-            .await
-            .unwrap();
-
-        assert_eq!(code_multimedia.0["result"]["imgDims"], json!([640, 480]));
-        assert_eq!(code_multimedia.0["result"]["audMime"], "audio/wav");
-        assert_eq!(code_multimedia.0["result"]["docMime"], "application/pdf");
-        assert!(
-            code_multimedia.1.len() >= 3,
-            "expected at least 3 native multimedia content blocks, got {}",
-            code_multimedia.1.len()
-        );
-
-        let call_tool_resp = code_multimedia.into_call_tool_result().unwrap();
-        let rmcp::model::CallToolResponse::Complete(call_res) = call_tool_resp else {
-            panic!("expected CallToolResponse::Complete");
-        };
-        // The JSON goes as text, not also as structured content, which a
-        // client that prefers it would give its model instead of the media.
-        assert!(call_res.structured_content.is_none());
-        assert!(matches!(
-            &call_res.content[0],
-            rmcp::model::ContentBlock::Text(text) if text.text.contains("\"imgDims\":[640,480]")
-        ));
-        assert!(call_res.content.iter().any(
-            |c| matches!(c, rmcp::model::ContentBlock::Image(i) if i.mime_type == "image/png")
-        ));
-        assert!(call_res.content.iter().any(
-            |c| matches!(c, rmcp::model::ContentBlock::Audio(a) if a.mime_type == "audio/wav")
-        ));
-        assert!(call_res.content.iter().any(|c| matches!(
-            c,
-            rmcp::model::ContentBlock::Resource(r)
-                if matches!(
-                    &r.resource,
-                    rmcp::model::ResourceContents::BlobResourceContents { mime_type: Some(m), .. }
-                        if m == "application/pdf"
-                )
-        )));
-    }
-
-    /// What each harness's model is given when its agent reads a media path
-    /// with `code`, by that vendor's MCP client rules
-    /// (`tests/invariants/fakes/mcp_client.py`): the photo itself on every
-    /// harness whose client gives MCP images to its model; on AGY, which
-    /// gives one only up to 10,240 bytes, the path of the file it offloaded,
-    /// which its native `read_file` opens; and a small image inline there.
-    #[tokio::test]
-    async fn an_image_an_agent_reads_from_the_media_directory_reaches_each_model() {
-        use rmcp::handler::server::tool::IntoCallToolResult as _;
-        use sha2::Digest as _;
-        let dir = tempfile::tempdir().unwrap();
-        let workdir = dir.path().join("work");
-        let media = dir.path().join(anyagents_harness::media::MEDIA_DIR);
-        std::fs::create_dir_all(&workdir).unwrap();
-        std::fs::create_dir_all(&media).unwrap();
-        // A Telegram photo's shape: a 1280x697 JPEG of tens of kilobytes.
-        let jpeg = |width: u32, height: u32| {
-            let image = image::RgbImage::from_fn(width, height, |x, y| {
-                let noise = (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503)) >> 13;
-                image::Rgb([(x % 251) as u8, (y % 241) as u8, noise as u8])
-            });
-            let mut bytes = std::io::Cursor::new(Vec::new());
-            image::DynamicImage::ImageRgb8(image)
-                .write_to(&mut bytes, image::ImageFormat::Jpeg)
+        assert!(args.article.is_none() && args.media.is_none() && args.poll.is_none());
+        assert!(args.location.is_none() && args.checklist.is_none());
+        assert!(args.reply_to.is_none() && args.target.is_none() && args.quote.is_none());
+        assert!(args.idempotency_key.is_none() && args.bot.is_none());
+        assert!(args.options.is_empty());
+        assert_eq!(args.to, vec!["agent:planner".to_string()]);
+        assert!(args.emoji.is_none());
+        let clear: SendArgs =
+            serde_json::from_value(json!({"action": "react", "emoji": "", "target": "msg_1"}))
                 .unwrap();
-            bytes.into_inner()
-        };
-        let photo = jpeg(1280, 697);
-        assert!(photo.len() > 10_240, "{} bytes", photo.len());
-        let thumb = jpeg(32, 32);
-        assert!(thumb.len() <= 10_240, "{} bytes", thumb.len());
-        let digest = |bytes: &[u8]| {
-            sha2::Sha256::digest(bytes)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        };
-        let mcp = AgentMcp {
-            agent: AgentRef {
-                id: AgentId::generate(),
-                name: "media-reader".into(),
-                workdir: Some(workdir.clone()),
-            },
-            client: Client::new(
-                dir.path().join("unused.sock"),
-                dir.path().join("config"),
-                "test-cap".into(),
-            ),
-            profile: McpProfile::Full,
-        };
-        let read = |name: &str, bytes: &[u8]| {
-            let path = media.join(name);
-            std::fs::write(&path, bytes).unwrap();
-            let line = anyagents_harness::media::local_media_line("photo", &path);
-            assert!(line.contains(&path.display().to_string()));
-            let mcp = mcp.clone();
-            async move {
-                let result = mcp
-                    .code(Parameters(CodeArgs {
-                        code: format!(
-                            "const img = await workspace.read({{ path: {:?} }}); return img.mime_type;",
-                            path.display().to_string()
-                        ),
-                        timeout_ms: Some(15_000),
-                    }))
-                    .await
-                    .unwrap();
-                let rmcp::model::CallToolResponse::Complete(result) =
-                    result.into_call_tool_result().unwrap()
-                else {
-                    panic!("expected a complete result");
-                };
-                serde_json::to_vec(&result).unwrap()
-            }
-        };
-        let seen_by = |harness: &str, result: &[u8]| -> serde_json::Value {
-            use std::io::Write as _;
-            let mut child = std::process::Command::new("python3")
-                .args(["-I", anyagents_invariants::conformance::MCP_CLIENT, harness])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(result).unwrap();
-            let out = child.wait_with_output().unwrap();
-            assert!(out.status.success(), "{harness}");
-            serde_json::from_slice(&out.stdout).unwrap()
-        };
-        let photo_result = read("complete_photo_large.jpg", &photo).await;
-        for harness in ["claude-code", "codex", "muse", "omp", "opencode"] {
-            let seen = seen_by(harness, &photo_result);
-            assert_eq!(
-                seen["images"],
-                json!([{"mime": "image/jpeg", "sha256": digest(&photo)}]),
-                "{harness}: {seen}"
-            );
-        }
-        let agy = seen_by("agy", &photo_result);
-        assert_eq!(agy["images"], json!([]), "{agy}");
-        assert_eq!(agy["offloaded"].as_array().unwrap().len(), 1, "{agy}");
-        let thumb_result = read("complete_photo_small.jpg", &thumb).await;
-        let agy = seen_by("agy", &thumb_result);
-        assert_eq!(
-            agy["images"],
-            json!([{"mime": "image/jpeg", "sha256": digest(&thumb)}]),
-            "{agy}"
-        );
-    }
-
-    #[tokio::test]
-    async fn remote_sandbox_backend_executes_files_and_code_and_never_upgrades_http_mcp_profile() {
-        use axum::{
-            Router,
-            body::Bytes,
-            extract::{Path as AxumPath, Query},
-            http::{HeaderMap, StatusCode},
-            routing::{get, post},
-        };
-        use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Default)]
-        struct MockSandboxState {
-            files: Mutex<HashMap<String, Vec<u8>>>,
-            exec_log: Mutex<Vec<serde_json::Value>>,
-        }
-
-        let sandbox_state = Arc::new(MockSandboxState::default());
-        let app = Router::new()
-            .route(
-                "/v1/sandboxes/{id}/exec",
-                post({
-                    let state = Arc::clone(&sandbox_state);
-                    move |AxumPath(id): AxumPath<String>,
-                          headers: HeaderMap,
-                          axum::Json(payload): axum::Json<serde_json::Value>| {
-                        let state = Arc::clone(&state);
-                        async move {
-                            let auth = headers
-                                .get("authorization")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            if auth != "Bearer sbx-token-123" || id != "sbx-42" {
-                                return (
-                                    StatusCode::UNAUTHORIZED,
-                                    axum::Json(json!({"error": "unauthorized"})),
-                                );
-                            }
-                            state.exec_log.lock().unwrap().push(payload.clone());
-                            let cmd = payload
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let cwd = payload.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-                            (
-                                StatusCode::OK,
-                                axum::Json(json!({
-                                    "stdout": format!("remote-exec:{cmd}@{cwd}"),
-                                    "stderr": "",
-                                    "exit_code": 0
-                                })),
-                            )
-                        }
-                    }
-                }),
-            )
-            .route(
-                "/v1/sandboxes/{id}/files",
-                get({
-                    let state = Arc::clone(&sandbox_state);
-                    move |AxumPath(id): AxumPath<String>,
-                          headers: HeaderMap,
-                          Query(params): Query<HashMap<String, String>>| {
-                        let state = Arc::clone(&state);
-                        async move {
-                            let auth = headers
-                                .get("authorization")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            if auth != "Bearer sbx-token-123" || id != "sbx-42" {
-                                return (
-                                    StatusCode::UNAUTHORIZED,
-                                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                                    Bytes::from_static(b"{\"error\":\"unauthorized\"}"),
-                                );
-                            }
-                            let path = params.get("path").cloned().unwrap_or_default();
-                            if params.get("list").is_some_and(|v| v == "true") {
-                                let files = state.files.lock().unwrap();
-                                let prefix = format!("{}/", path.trim_end_matches('/'));
-                                let mut entries = Vec::new();
-                                for (k, v) in files.iter() {
-                                    if let Some(rel) = k.strip_prefix(&prefix)
-                                        && !rel.contains('/')
-                                    {
-                                        entries.push(json!({
-                                            "name": rel,
-                                            "path": rel,
-                                            "kind": "file",
-                                            "bytes": v.len()
-                                        }));
-                                    }
-                                }
-                                let body =
-                                    serde_json::to_vec(&json!({ "entries": entries })).unwrap();
-                                return (
-                                    StatusCode::OK,
-                                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                                    Bytes::from(body),
-                                );
-                            }
-                            let files = state.files.lock().unwrap();
-                            if let Some(bytes) = files.get(&path) {
-                                (
-                                    StatusCode::OK,
-                                    [(
-                                        axum::http::header::CONTENT_TYPE,
-                                        "application/octet-stream",
-                                    )],
-                                    Bytes::from(bytes.clone()),
-                                )
-                            } else {
-                                (
-                                    StatusCode::NOT_FOUND,
-                                    [(axum::http::header::CONTENT_TYPE, "text/plain")],
-                                    Bytes::from_static(b"not found"),
-                                )
-                            }
-                        }
-                    }
-                })
-                .put({
-                    let state = Arc::clone(&sandbox_state);
-                    move |AxumPath(id): AxumPath<String>,
-                          headers: HeaderMap,
-                          Query(params): Query<HashMap<String, String>>,
-                          body: Bytes| {
-                        let state = Arc::clone(&state);
-                        async move {
-                            let auth = headers
-                                .get("authorization")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            if auth != "Bearer sbx-token-123" || id != "sbx-42" {
-                                return StatusCode::UNAUTHORIZED;
-                            }
-                            let path = params.get("path").cloned().unwrap_or_default();
-                            state.files.lock().unwrap().insert(path, body.to_vec());
-                            StatusCode::OK
-                        }
-                    }
-                }),
-            );
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let dir = tempfile::tempdir().unwrap();
-        let config_dir = dir.path().join("config");
-        let host_workdir = dir.path().join("host-work");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::create_dir_all(&host_workdir).unwrap();
-
-        // HTTP MCP defaults to the Remote profile (code disabled).
-        assert_eq!(McpProfile::resolve_http(None), Ok(McpProfile::Remote));
-
-        // Write sandbox.json into agent config_dir.
-        std::fs::write(
-            config_dir.join("sandbox.json"),
-            serde_json::to_vec(&json!({
-                "endpoint": format!("http://{addr}"),
-                "sandbox_id": "sbx-42",
-                "token": "sbx-token-123",
-                "workdir": "/workspace"
-            }))
-            .unwrap(),
-        )
+        assert_eq!(clear.emoji.as_deref(), Some(""));
+        let article: SendArgs = serde_json::from_value(json!({
+            "to": "planner",
+            "article": {"title": "Report", "content": "body", "url": "undefined", "author_name": ""},
+        }))
         .unwrap();
+        let article = article.article.unwrap();
+        assert_eq!(article.content.as_deref(), Some("body"));
+        assert!(article.url.is_none());
+        assert_eq!(article.author_name.as_deref(), Some(""));
+        let vote: SendArgs = serde_json::from_value(json!({
+            "action": "vote",
+            "target": "msg_1",
+            "options": ["None", "nil", "Null", "NULL"],
+            "quote": "None",
+            "reply_to": null,
+        }))
+        .unwrap();
+        assert_eq!(vote.options, vec!["None", "nil", "Null", "NULL"]);
+        assert_eq!(vote.quote.as_deref(), Some("None"));
+        assert!(vote.reply_to.is_none());
+    }
 
-        // A sandbox.json never upgrades HTTP MCP: over HTTP the tools would run
-        // as the server, so `full` is refused there and served only over stdio.
-        assert_eq!(McpProfile::resolve_http(None), Ok(McpProfile::Remote));
-        assert!(McpProfile::resolve_http(Some("full")).is_err());
+    #[test]
+    fn interact_reads_a_null_bot_as_absent_and_keeps_a_named_one() {
+        use serde_json::json;
+        let unnamed: InteractArgs = serde_json::from_value(json!({
+            "action": "react",
+            "target": "telegram:chat:-1007:91",
+            "emoji": "👍",
+            "bot": "null",
+        }))
+        .unwrap();
+        assert!(unnamed.bot.is_none());
+        let named: InteractArgs = serde_json::from_value(json!({
+            "action": "react",
+            "target": "telegram:chat:-1007:91",
+            "bot": "@ada_promo_bot",
+        }))
+        .unwrap();
+        assert_eq!(named.bot.as_deref(), Some("@ada_promo_bot"));
+    }
 
-        let mcp = AgentMcp {
-            agent: AgentRef {
-                id: AgentId::generate(),
-                name: "remote-sandbox-worker".into(),
-                workdir: Some(host_workdir.clone()),
-            },
-            client: Client::new(
-                dir.path().join("unused.sock"),
-                config_dir.clone(),
-                "test-cap".into(),
-            ),
-            profile: McpProfile::Full,
-        };
-
-        // 1. Direct `files` write/edit/read/list/exec routes through RemoteSandbox, NOT host_workdir.
-        let write_res = mcp
-            .files(Parameters(
-                serde_json::from_value(json!({
-                    "action": "write",
-                    "path": "src/hello.txt",
-                    "content": "hello world\nline two\n",
-                }))
-                .unwrap(),
-            ))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(write_res["path"], "/workspace/src/hello.txt");
-        assert!(!host_workdir.join("src/hello.txt").exists());
-
-        let edit_res = mcp
-            .files(Parameters(
-                serde_json::from_value(json!({
-                    "action": "edit",
-                    "path": "src/hello.txt",
-                    "target": "hello world",
-                    "replacement": "hello remote sandbox",
-                }))
-                .unwrap(),
-            ))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(edit_res["replacements_made"], 1);
-
-        let read_res = mcp
-            .files(Parameters(
-                serde_json::from_value(json!({
-                    "action": "read",
-                    "path": "src/hello.txt",
-                }))
-                .unwrap(),
-            ))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(read_res["content"], "hello remote sandbox\nline two");
-
-        // 2. `code` tool's `workspace.read`, `workspace.write`, `workspace.list`, and `workspace.exec` transparently route through RemoteSandbox.
-        let code_res = mcp
-            .code(Parameters(CodeArgs {
-                code: r#"
-                    await workspace.write("src/from_code.txt", "created via code");
-                    const readBack = await workspace.read("src/hello.txt");
-                    const listed = await workspace.list("src");
-                    const execOut = await workspace.exec({ cmd: "cargo --version", cwd: "src" });
-                    return {
-                        readContent: readBack.content,
-                        entryCount: listed.count,
-                        execStdout: execOut.stdout,
-                        execExit: execOut.exit_code,
-                    };
-                "#
-                .to_string(),
-                timeout_ms: Some(15_000),
-            }))
-            .await
-            .unwrap()
-            .0;
-
-        assert_eq!(
-            code_res["result"]["readContent"],
-            "hello remote sandbox\nline two"
-        );
-        assert_eq!(code_res["result"]["entryCount"], 2);
-        assert_eq!(
-            code_res["result"]["execStdout"],
-            "remote-exec:cargo --version@/workspace/src"
-        );
-        assert_eq!(code_res["result"]["execExit"], 0);
-
-        server_handle.abort();
+    #[test]
+    fn relation_words_read_alike_in_any_case() {
+        assert_eq!(relation_word("Parent"), Some("parent"));
+        assert_eq!(relation_word(" agent:parent "), Some("parent"));
+        assert_eq!(relation_word("children"), Some("children"));
+        assert_eq!(relation_word("planner"), None);
+        assert_eq!(relation_word("agent:parent-of-x"), None);
     }
 }
 
@@ -2285,7 +1233,6 @@ mod tool_server_runtime_tests {
                 workdir: Some(dir.path().to_path_buf()),
             },
             client: Client::new(socket, dir.path().join("config"), "test-cap".into()),
-            profile: McpProfile::Full,
         };
 
         for (agent, expected) in [
@@ -2298,7 +1245,7 @@ mod tool_server_runtime_tests {
             if let Some(agent) = agent {
                 args["agent"] = json!(agent);
             }
-            let (result, _) = mcp.dispatch_any_tool("memory", args).await.unwrap();
+            let result = mcp.dispatch_any_tool("memory", args).await.unwrap();
             assert_eq!(result["agent"], expected, "agent argument: {agent:?}");
         }
 
@@ -2332,14 +1279,12 @@ mod tool_server_runtime_tests {
                     workdir: Some(dir.path().to_path_buf()),
                 },
                 client: Client::new(socket, dir.path().join("config"), "test-cap".into()),
-                profile: McpProfile::Full,
             };
             // A command that blocks for two seconds runs on the blocking
             // pool, so the one runtime thread keeps answering other calls.
-            let slow = mcp.dispatch_any_tool(
-                "files",
-                serde_json::json!({"action": "exec", "cmd": "sleep 2"}),
-            );
+            let slow = tokio::task::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_millis(500));
+            });
             let quick = async {
                 let started = Instant::now();
                 mcp.dispatch_any_tool("schedule", serde_json::json!({"action": "list"}))
@@ -2352,252 +1297,5 @@ mod tool_server_runtime_tests {
             assert!(quick < Duration::from_secs(1), "quick call took {quick:?}");
             server.abort();
         });
-    }
-
-    #[tokio::test]
-    async fn remote_profile_code_mode_forbids_host_fs_and_supports_sandbox_and_memory() {
-        use axum::{
-            Router,
-            body::Bytes,
-            extract::{Path as AxumPath, Query},
-            http::{HeaderMap, StatusCode},
-            routing::{get, post},
-        };
-        use serde_json::json;
-        use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
-
-        let dir = tempfile::tempdir().unwrap();
-        let config_dir = dir.path().join("agents/agt_remote/config");
-        let host_workdir = dir.path().join("host-work");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::create_dir_all(&host_workdir).unwrap();
-        let host_secret = host_workdir.join("secret.txt");
-        std::fs::write(&host_secret, "coordinator-host-secret").unwrap();
-
-        let socket = dir.path().join("test.sock");
-        let uds = tokio::net::UnixListener::bind(&socket).unwrap();
-        let uds_srv = tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-            loop {
-                let Ok((mut stream, _)) = uds.accept().await else {
-                    return;
-                };
-                let mut req = Vec::new();
-                while !req.ends_with(b"\r\n\r\n") {
-                    match stream.read_u8().await {
-                        Ok(b) => req.push(b),
-                        Err(_) => break,
-                    }
-                }
-                let body = br#"{"error":"not served here"}"#;
-                let head = format!(
-                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(head.as_bytes()).await;
-                let _ = stream.write_all(body).await;
-            }
-        });
-
-        let mcp = AgentMcp {
-            agent: AgentRef {
-                id: AgentId::generate(),
-                name: "remote-parity-worker".into(),
-                workdir: Some(host_workdir.clone()),
-            },
-            client: Client::new(socket, config_dir.clone(), "test-cap".into()),
-            profile: McpProfile::Remote,
-        };
-
-        // 1. Without a remote sandbox, `McpProfile::Remote` executes host-free `code`
-        //    (`memory.*` + `Promise.all`) while failing closed on `workspace.*` and `web.*`.
-        let parity_res = mcp
-            .code(Parameters(CodeArgs {
-                code: r#"
-                    await memory.write({
-                        topic: "remote-parity",
-                        description: "Verified under Remote profile",
-                        content: "host-free code mode works",
-                    });
-                    const [readBack, listed] = await Promise.all([
-                        memory.read("remote-parity"),
-                        memory.list(),
-                    ]);
-                    let wsBlocked = false;
-                    try {
-                        await workspace.read("secret.txt");
-                    } catch (e) {
-                        wsBlocked = String(e).includes("coordinator-host filesystem access is forbidden");
-                    }
-                    let webBlocked = false;
-                    try {
-                        await web.fetch("https://example.com");
-                    } catch (e) {
-                        webBlocked = String(e).includes("disabled by active MCP profile");
-                    }
-                    return {
-                        content: readBack.content,
-                        topicCount: listed.topics.length,
-                        wsBlocked,
-                        webBlocked,
-                    };
-                "#
-                .into(),
-                timeout_ms: Some(15_000),
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert!(
-            parity_res["result"]["content"]
-                .as_str()
-                .is_some_and(|s| s.contains("host-free code mode works")),
-            "{parity_res}"
-        );
-        assert_eq!(parity_res["result"]["topicCount"], 1);
-        assert_eq!(parity_res["result"]["wsBlocked"], true);
-        assert_eq!(parity_res["result"]["webBlocked"], true);
-
-        // 2. With a remote sandbox bound, `McpProfile::Remote` executes `workspace.*`
-        //    strictly against the remote sandbox (never touching `host_workdir`).
-        #[derive(Default)]
-        struct Sbx {
-            files: Mutex<HashMap<String, Vec<u8>>>,
-        }
-        let sbx = Arc::new(Sbx::default());
-        let app = Router::new()
-            .route(
-                "/v1/sandboxes/{id}/exec",
-                post(|AxumPath(_id): AxumPath<String>, body: Bytes| async move {
-                    let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-                    let cmd = v["command"].as_str().unwrap_or("");
-                    (
-                        StatusCode::OK,
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        serde_json::to_vec(&json!({
-                            "stdout": format!("sbx-ok:{cmd}"),
-                            "stderr": "",
-                            "exit_code": 0
-                        }))
-                        .unwrap(),
-                    )
-                }),
-            )
-            .route(
-                "/v1/sandboxes/{id}/files",
-                get({
-                    let sbx = Arc::clone(&sbx);
-                    move |Query(q): Query<HashMap<String, String>>| {
-                        let sbx = Arc::clone(&sbx);
-                        async move {
-                            let path = q.get("path").cloned().unwrap_or_default();
-                            if let Some(bytes) = sbx.files.lock().unwrap().get(&path) {
-                                (
-                                    StatusCode::OK,
-                                    [(
-                                        axum::http::header::CONTENT_TYPE,
-                                        "application/octet-stream",
-                                    )],
-                                    Bytes::from(bytes.clone()),
-                                )
-                            } else {
-                                (
-                                    StatusCode::NOT_FOUND,
-                                    [(axum::http::header::CONTENT_TYPE, "text/plain")],
-                                    Bytes::from_static(b"not found"),
-                                )
-                            }
-                        }
-                    }
-                })
-                .put({
-                    let sbx = Arc::clone(&sbx);
-                    move |Query(q): Query<HashMap<String, String>>,
-                          _headers: HeaderMap,
-                          body: Bytes| {
-                        let sbx = Arc::clone(&sbx);
-                        async move {
-                            let path = q.get("path").cloned().unwrap_or_default();
-                            sbx.files.lock().unwrap().insert(path, body.to_vec());
-                            StatusCode::OK
-                        }
-                    }
-                }),
-            )
-            .with_state(());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        std::fs::write(
-            config_dir.join("sandbox.json"),
-            serde_json::to_vec(&json!({
-                "endpoint": format!("http://{addr}"),
-                "sandbox_id": "sbx-remote-1",
-                "workdir": "/workspace"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let sbx_res = mcp
-            .code(Parameters(CodeArgs {
-                code: r#"
-                    await workspace.write("hello.txt", "inside-sandbox");
-                    const [rd, ex] = await Promise.all([
-                        workspace.read("hello.txt"),
-                        workspace.exec("echo hi"),
-                    ]);
-                    return { content: rd.content, stdout: ex.stdout };
-                "#
-                .into(),
-                timeout_ms: Some(15_000),
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(sbx_res["result"]["content"], "inside-sandbox");
-        assert_eq!(sbx_res["result"]["stdout"], "sbx-ok:echo hi");
-        assert!(!host_workdir.join("hello.txt").exists());
-
-        // 3. Mounted ToolRegistry generates TypeScript declarations and serves JSON-RPC 2.0 batch RPC.
-        let dts = mcp.code_mode_ts_declarations();
-        for ns in ["workspace", "web", "memory", "workstation", "coordination"] {
-            assert!(
-                dts.contains(&format!("declare namespace {ns}")),
-                "missing namespace `{ns}` in .d.ts"
-            );
-        }
-        let runner = agent_tools::code_mode::CodeModeRunner::new(
-            mcp.code_mode_registry_for_inspection().into_dispatcher(),
-        );
-        let rpc = runner
-            .serve_http_rpc("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let endpoint = rpc.endpoint_url();
-        let token = rpc.token().to_string();
-        let resp_val = tokio::task::spawn_blocking(move || {
-            let mut resp = ureq::post(&endpoint)
-                .header("authorization", &format!("Bearer {token}"))
-                .header("content-type", "application/json")
-                .send_json(json!([
-                    {"jsonrpc": "2.0", "id": 1, "method": "memory.list", "params": {}},
-                    {"jsonrpc": "2.0", "id": 2, "method": "workspace.read", "params": {"path": "hello.txt"}}
-                ]))
-                .unwrap();
-            resp.body_mut().read_json::<serde_json::Value>().unwrap()
-        })
-        .await
-        .unwrap();
-        let batch = resp_val.as_array().unwrap();
-        assert_eq!(batch.len(), 2);
-        assert_eq!(batch[0]["id"], 1);
-        assert_eq!(batch[1]["id"], 2);
-        assert_eq!(batch[1]["result"]["content"], "inside-sandbox");
-        drop(rpc);
-        srv.abort();
-        uds_srv.abort();
     }
 }

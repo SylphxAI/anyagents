@@ -298,7 +298,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`role` defaulting to `\"general\"`, `name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git repository; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed checkouts while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); use `verdict` (`name`, `verdict`: `accepted` | `rework` | `rejected` | `abandoned`, `reason`) to judge a descendant's work, and `outcomes` (like `usage`) for successes and cost per success; or use `create`, `rename`, `role`, `harness`, `models`."
+        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models` | `usage`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`role` defaulting to `\"general\"`, `name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git repository; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed checkouts while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `usage`, `create`, `rename`, `role`, `harness`, `models`."
     )]
     pub(super) async fn agents(
         &self,
@@ -334,7 +334,7 @@ impl AgentMcp {
             args.name = Some(self.resolve_agent_word(raw).await?);
         }
         match action.as_str() {
-            "usage" | "outcomes" => {
+            "usage" => {
                 let mut qs = String::new();
                 let mut push = |k: &str, v: String| {
                     if !qs.is_empty() {
@@ -362,37 +362,12 @@ impl AgentMcp {
                 if let Some(v) = args.group_by.as_deref().filter(|v| !v.trim().is_empty()) {
                     push("group_by", v.to_string());
                 }
-                let route = format!("/v1/{action}");
                 let path = if qs.is_empty() {
-                    route
+                    "/v1/usage".to_string()
                 } else {
-                    format!("{route}?{qs}")
+                    format!("/v1/usage?{qs}")
                 };
                 let response = self.client.get(&path, None).await?;
-                Ok(rmcp::handler::server::wrapper::Json(response))
-            }
-            "verdict" => {
-                let target = args
-                    .name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        "verdict requires the agent `name` whose work is judged".to_string()
-                    })?;
-                let verdict = args.verdict.as_deref().ok_or_else(|| {
-                    "verdict requires `verdict`: accepted, rework, rejected or abandoned"
-                        .to_string()
-                })?;
-                let body = serde_json::json!({ "verdict": verdict, "reason": args.reason });
-                let path = format!(
-                    "/v1/agents/{}/verdict",
-                    urlencoding_simple(target.strip_prefix("agent:").unwrap_or(target))
-                );
-                let response = self
-                    .client
-                    .get(&path, Some(body.to_string().into_bytes()))
-                    .await?;
                 Ok(rmcp::handler::server::wrapper::Json(response))
             }
             "redact" => {
@@ -952,7 +927,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `steer` | `wake` | `pause` | `archive` | `delete`, supporting multi-level sub-agent trees). Use `list` (default) to view your sub-agents and their live status (`running`, `paused`, `archived`, `turn_state`); use `inspect` with `agent` to view live status AND recent conversation turns; use `spawn` to launch a sub-agent on any harness (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`), model, profile, and workspace (`repo`: `\"<org>/<repo>\"` or `\"inherit\"` for an isolated Git repository at `<data>/agents/<id>/work`; `workdir`: path, `\"worktree\"`, `\"private\"`, or `\"inherit\"` for explicit parent sharing; omitting both `repo` and `workdir` gives a private directory); use `steer` to send follow-up instructions; use `pause`, `archive` (auto-reaps clean/pushed managed checkouts while preserving dirty ones), `wake`, or `delete` to control its lifecycle."
+        description = "Unified cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `steer` | `wake` | `pause` | `archive` | `delete`, supporting multi-level sub-agent trees). Use `list` (default) to view your sub-agents and their live status (`running`, `paused`, `archived`, `turn_state`); use `inspect` with `agent` to view live status AND recent conversation turns; use `spawn` to launch a sub-agent on any harness (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `spiron`), model, profile, and workspace (`repo`: `\"<org>/<repo>\"` or `\"inherit\"` for an isolated Git repository at `<data>/agents/<id>/work`; `workdir`: path, `\"worktree\"`, `\"private\"`, or `\"inherit\"` for explicit parent sharing; omitting both `repo` and `workdir` gives a private directory); use `steer` to send follow-up instructions; use `pause`, `archive` (auto-reaps clean/pushed managed checkouts while preserving dirty ones), `wake`, or `delete` to control its lifecycle."
     )]
     pub(super) async fn subagents(
         &self,
@@ -1502,35 +1477,6 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Your browser: one headful browser on your own headless desktop, with a persistent login profile that one agent drives at a time (`action`: `open` | `back` | `forward` | `reload` | `snapshot` | `read` | `html` | `click` | `fill` | `press` | `hold` | `key_down` | `key_up` | `release_keys` | `eval` | `cookies` | `screenshot` | `tabs` | `takeover` | `takeover_status` | `wait_for_user` | `release_takeover` | `status` | `profiles` | `close`). Pass `action: \"open\"` with `url` to navigate and receive an accessibility snapshot whose interactive elements carry refs (`@<snapshot_id>:e1`); pass `action: \"click\"` or `\"fill\"` with `selector` set to a ref or a CSS selector (refs fail with `STALE_REF` once the page navigates; take a new snapshot). Fill credentials with `secret_ref` (`op://...`, `op-otp://...`, `secret://...`) so the value never enters your context; `submit: true` presses Enter in the field. `press`/`hold`/`key_down` act inside the page. `screenshot` captures the whole desktop (browser chrome and dialogs included), or the page with `full_page`; `tools.computer` acts on the same desktop's pixels. When a CAPTCHA or 2FA challenge needs a person, call `action: \"takeover\"` with a `reason` and send `takeover_url` (plus `screenshot_path` via `send` media) to the user: they control the whole desktop until they hand back, and you receive `[Browser Takeover Completed]`. Pass `target_id` to target a specific tab across actions; if that `target_id` no longer exists in the live browser, the call fails closed with `STALE_TARGET` rather than falling back to `about:blank` or another tab. Calls fail with `HUMAN_IN_CONTROL` while they hold it, and with `DESKTOP_IN_USE` when another agent holds the profile. `close` stops the desktop; logins stay on disk."
-    )]
-    pub(super) async fn browser(
-        &self,
-        Parameters(mut args): Parameters<crate::workstation::BrowserRequest>,
-    ) -> Result<MultimediaJson, String> {
-        if let Some(raw_path) = args
-            .path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            && !Path::new(raw_path).is_absolute()
-            && let Ok(resolved) =
-                resolve_workspace_path(&self.resolve_workdir(), Some(raw_path), true)
-        {
-            args.path = Some(resolved.display().to_string());
-        }
-        let mut response: serde_json::Value = self
-            .client
-            .get(
-                "/v1/browser",
-                Some(serde_json::to_vec(&args).map_err(|err| err.to_string())?),
-            )
-            .await?;
-        let media = extract_media_blocks_from_tool_value("browser", &mut response);
-        Ok(MultimediaJson(response, media))
-    }
-
-    #[tool(
         description = SCHEDULES_TOOL_DESCRIPTION
     )]
     pub(super) async fn schedule(
@@ -1626,164 +1572,6 @@ impl AgentMcp {
         let val = self.execute_memory_tool(args).await?;
         Ok(rmcp::handler::server::wrapper::Json(val))
     }
-
-    #[tool(
-        description = "Discover, search, and read reusable Agent Skills (`action`: `\"list\"` | `\"read\"` | `\"search\"`). Pass `name: \"<skill-slug>\"` to read `SKILL.md` (or a colocated `file` such as `\"references/...\"`), or `query` to search skill instructions."
-    )]
-    pub(super) async fn skills(
-        &self,
-        Parameters(args): Parameters<SkillsArgs>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
-        let val = self.execute_skills_tool(args)?;
-        self.record_skill_read(&val).await;
-        Ok(rmcp::handler::server::wrapper::Json(val))
-    }
-
-    #[tool(
-        description = "Policy-aware multi-provider web search (`query`, optional `engine`: `\"auto\"` | `\"parallel\"` | `\"exa\"` | `\"tavily\"` | `\"firecrawl\"` | `\"perplexity\"` | `\"brave\"` | `\"anysearch\"`, `allowed_domains`, `blocked_domains`, `country`, `max_results`, `mode`, `external_web_access`)."
-    )]
-    pub(super) async fn web_search(
-        &self,
-        Parameters(mut args): Parameters<crate::web::WebRequest>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
-        args.action = Some("search".to_string());
-        self.web(Parameters(args)).await
-    }
-
-    #[tool(
-        description = "Policy-aware multi-provider web URL extraction and fetch (`url`, optional `engine`: `\"auto\"` | `\"firecrawl\"` | `\"exa\"` | `\"parallel\"` | `\"tavily\"` | `\"anysearch\"` | `\"direct\"`, `allowed_domains`, `blocked_domains`, `max_chars`, `external_web_access`)."
-    )]
-    pub(super) async fn web_fetch(
-        &self,
-        Parameters(mut args): Parameters<crate::web::WebRequest>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
-        args.action = Some("fetch".to_string());
-        self.web(Parameters(args)).await
-    }
-
-    #[tool(
-        description = "Multi-provider policy-aware web search and URL extraction tool (`action`: `\"search\"` | `\"fetch\"`; `engine`: `\"auto\"` | `\"parallel\"` | `\"exa\"` | `\"tavily\"` | `\"firecrawl\"` | `\"perplexity\"` | `\"brave\"` | `\"anysearch\"` | `\"direct\"`). Supports `allowed_domains`, `blocked_domains`, `country`, `max_results`, `max_chars`, `mode`, and `external_web_access` with bounded automatic failover."
-    )]
-    pub(super) async fn web(
-        &self,
-        Parameters(args): Parameters<crate::web::WebRequest>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
-        let data_dir = self.client.socket.parent().map(Path::to_path_buf);
-        let local_has_keys = !crate::web::load_web_keys(data_dir.as_deref()).is_empty();
-        let server_available = self.client.via_http || self.client.socket.exists();
-        if !local_has_keys && server_available {
-            let body = serde_json::to_vec(&args).map_err(|e| e.to_string())?;
-            if let Ok(val) = self
-                .client
-                .get::<serde_json::Value>("/v1/web", Some(body))
-                .await
-            {
-                return Ok(rmcp::handler::server::wrapper::Json(val));
-            }
-        }
-        let val = tokio::task::spawn_blocking(move || {
-            crate::web::execute_web_request(data_dir.as_deref(), args)
-        })
-        .await
-        .map_err(|e| format!("web task join error: {e}"))??;
-        Ok(rmcp::handler::server::wrapper::Json(val))
-    }
-
-    #[tool(
-        description = "Desktop computer use. Without a host target it drives your own session desktop (the headless desktop your browser runs on): `screenshot`, `zoom`, `cursor_position`, `move`, `click` (with `modifiers`, and `back`/`forward` buttons), `mouse_down`, `mouse_up`, `drag`, `scroll`, `type`, `key`, `hold_key`, `wait`, `clipboard_get`, `clipboard_set`, `snapshot` (the browser's refs), `list_windows`, or an Anthropic/OpenAI computer-use `action`. With `platform` (`linux` | `macos` | `windows` | `chromeos`), `display`, or `wayland_display` it drives that host desktop instead, adding Semantic Accessibility Snapshot Mode (`@<snapshot_id>:e<N>` refs, `STALE_REF` guard) and `focus_window`; on a non-Linux host the host desktop is the default. `session_id` or `provider: \"cloud\"` forwards to a cloud sandbox."
-    )]
-    pub(super) async fn computer(
-        &self,
-        Parameters(args): Parameters<DynamicObjectArgs>,
-    ) -> Result<MultimediaJson, String> {
-        let req = args.into_value();
-        let mut val = if crate::computer::target(&req) == crate::computer::Target::Session {
-            self.client
-                .get(
-                    "/v1/computer",
-                    Some(serde_json::to_vec(&req).map_err(|err| err.to_string())?),
-                )
-                .await?
-        } else {
-            let data_dir = self.client.socket.parent().map(Path::to_path_buf);
-            crate::computer::execute_local(data_dir.as_deref(), &self.client.config, req).await?
-        };
-        let media = extract_media_blocks_from_tool_value("computer", &mut val);
-        Ok(MultimediaJson(val, media))
-    }
-
-    #[tool(
-        description = "Android (adb, including ChromeOS ARC) / iOS (simctl + idb or WebDriverAgent wda_url) control. Select platform: android|ios and serial|udid|wda_url. Actions: snapshot (pruned semantic tree with @<snapshot_id>:e<N> refs), screenshot, tap, swipe, type, press, install_app, launch_app, terminate_app, open_url, rotate. tap/type accept ref with STALE_REF validation. iOS app installs use app_path (.app/.ipa); set backend:idb for physical devices. WDA install_app also requires udid + idb."
-    )]
-    pub(super) async fn device(
-        &self,
-        Parameters(args): Parameters<DynamicObjectArgs>,
-    ) -> Result<MultimediaJson, String> {
-        let work_dir = self.resolve_workdir();
-        let mut val = crate::computer::execute_device_request(&work_dir, args.into_value()).await?;
-        let media = extract_media_blocks_from_tool_value("device", &mut val);
-        Ok(MultimediaJson(val, media))
-    }
-
-    #[tool(
-        description = "Multimodal media through the configured AI gateway (action: image_generate | video_generate | speech | transcribe). video_generate takes prompt and optional model, size and seconds, waits up to five minutes, and saves an MP4 under workspace/media. It returns {path, id, model, mime_type, bytes} and attaches smaller videos."
-    )]
-    pub(super) async fn media(
-        &self,
-        Parameters(args): Parameters<DynamicObjectArgs>,
-    ) -> Result<MultimediaJson, String> {
-        let data_dir = self.client.socket.parent().map(Path::to_path_buf);
-        let work_dir = self.resolve_workdir();
-        let (mut val, video) = crate::computer::execute_media_request(
-            data_dir.as_deref(),
-            &self.client.config,
-            &work_dir,
-            args.into_value(),
-        )
-        .await?;
-        let media = if let Some(bytes) = video {
-            video_attachment(&val, &bytes).into_iter().collect()
-        } else {
-            extract_media_blocks_from_tool_value("media", &mut val)
-        };
-        Ok(MultimediaJson(val, media))
-    }
-
-    #[tool(
-        description = "Unified cross-harness file, edit, patch, list, glob, grep, and command exec tool (`action`: `\"read\"` | `\"write\"` | `\"edit\"` | `\"multi_edit\"` | `\"patch\"` | `\"list\"` | `\"glob\"` | `\"grep\"` | `\"exec\"`), resolving relative paths deterministically against your `workdir`. Calling `action: \"read\"` on multimedia files (`image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`, `image/avif`, `image/x-icon`, `application/pdf`, `audio/wav`, `audio/mpeg`, `audio/ogg`, `audio/flac`, `audio/mp4`, `audio/aac`, `video/mp4`, `video/webm`, `video/quicktime`) natively attaches MCP multimedia content blocks (`image`, `audio`, `resource`) for direct model inspection."
-    )]
-    pub(super) async fn files(
-        &self,
-        Parameters(args): Parameters<FilesArgs>,
-    ) -> Result<MultimediaJson, String> {
-        let base_dir = self.resolve_workdir();
-        let config_dir = self.client.config.clone();
-        let limits = CodeLimits::current();
-        // The blocking thread outlives an aborted await: it carries what it
-        // needs to stop a command once the call that started it is over.
-        let scope = current_call().scope();
-        let (val, media) = tokio::task::spawn_blocking(move || {
-            let _scope = code_children::enter(scope);
-            let mode = crate::sandbox_providers::SandboxMode::from_env();
-            let backend = crate::sandbox_providers::resolve_workspace_backend_for_mode(
-                Some(&config_dir),
-                base_dir.clone(),
-                mode,
-            )?;
-            execute_files_tool_with_media_backend(backend.as_ref(), &base_dir, args, limits)
-        })
-        .await
-        .map_err(|e| format!("files task join error: {e}"))??;
-        Ok(MultimediaJson(val, media))
-    }
-
-    #[tool(description = CODE_TOOL_DESCRIPTION)]
-    pub(super) async fn code(
-        &self,
-        Parameters(args): Parameters<CodeArgs>,
-    ) -> Result<MultimediaJson, String> {
-        self.execute_code_tool(args).await
-    }
 }
 
 impl AgentMcp {
@@ -1817,28 +1605,10 @@ impl AgentMcp {
         Ok(parent.name)
     }
 
-    /// The tools this agent sees, with the `code` limits its workspace
-    /// backend enforces.
+    /// The universal 7-tool surface every agent sees on every harness.
     pub(super) fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
         let wd = self.resolve_workdir();
-        let mut tools =
-            tool_definitions_with_roles(self.profile, Some(&wd), self.client.socket.parent());
-        if tools.iter().any(|t| t.name == "code") {
-            let mode = crate::sandbox_providers::SandboxMode::from_env();
-            let kind = match crate::sandbox_providers::resolve_workspace_backend_for_mode(
-                Some(&self.client.config),
-                wd,
-                mode,
-            ) {
-                Ok(backend) => backend.kind(),
-                Err(_) => "remote-sandbox",
-            };
-            let description = code_tool_description(CodeLimits::current(), kind);
-            for tool in tools.iter_mut().filter(|t| t.name == "code") {
-                tool.description = Some(description.clone().into());
-            }
-        }
-        tools
+        tool_definitions_with_roles(Some(&wd), self.client.socket.parent())
     }
 
     pub(super) fn resolve_workdir(&self) -> PathBuf {
@@ -2357,307 +2127,11 @@ impl AgentMcp {
         socket: PathBuf,
         config: PathBuf,
         principal: crate::auth::Principal,
-        profile: McpProfile,
         router: axum::Router,
     ) -> Self {
         Self {
             agent,
             client: Client::new(socket, config, String::new()).over_http_router(router, principal),
-            profile,
-        }
-    }
-
-    /// One skill file's text. Over stdio this tool server runs as the agent
-    /// and reads what the agent can read. Over HTTP it runs as the server, and
-    /// the skill directories it scans are writable by the agent's seat, so it
-    /// resolves directory links only into shared/own skill roots (or the exact
-    /// own view from a vendor projection). The final descriptor-relative open
-    /// rejects links in every component, including resource files.
-    pub(super) fn read_skill_text(&self, dir: &Path, rel: &Path) -> std::io::Result<String> {
-        if !self.client.via_http {
-            return std::fs::read_to_string(dir.join(rel));
-        }
-        // Canonicalize trusted host-level roots (`data_dir`, `agent_root`, and
-        // `workdir`'s parent) so system symlinks above them (such as macOS
-        // `/var -> private/var` or `/tmp -> private/tmp`) do not trip the
-        // seat-planted symlink guards or descriptor-relative `O_NOFOLLOW` walk.
-        let mut trusted_bases: Vec<(PathBuf, PathBuf)> = Vec::new();
-        let mut register_trusted_base = |raw: &Path| {
-            if let (Ok(abs), Ok(canon)) = (std::path::absolute(raw), std::fs::canonicalize(raw))
-                && !trusted_bases.iter().any(|(existing, _)| existing == &abs)
-            {
-                trusted_bases.push((abs, canon));
-            }
-        };
-        if let Some(data_dir) = self.client.socket.parent() {
-            register_trusted_base(data_dir);
-        }
-        if let Some(agent_root) = self.client.config.parent() {
-            register_trusted_base(agent_root);
-        }
-        let wd = self.resolve_workdir();
-        if let Some(wd_parent) = wd.parent() {
-            register_trusted_base(wd_parent);
-        }
-        trusted_bases.sort_by_key(|(a, _)| std::cmp::Reverse(a.as_os_str().len()));
-        let normalize_host_prefix = |p: &Path| -> PathBuf {
-            let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
-            for (raw_base, canon_base) in &trusted_bases {
-                if let Ok(suffix) = abs.strip_prefix(raw_base) {
-                    return canon_base.join(suffix);
-                }
-            }
-            abs
-        };
-
-        let mut roots = Vec::new();
-        if let Some(data_dir) = self.client.socket.parent() {
-            roots.push(normalize_host_prefix(&data_dir.join("skills")));
-        }
-        if let Some(agent_root) = self.client.config.parent() {
-            roots.push(normalize_host_prefix(&agent_root.join("skills")));
-        }
-        let view = self
-            .client
-            .config
-            .parent()
-            .map(|root| normalize_host_prefix(&root.join("skills-view")));
-        let vendor_projections = [
-            normalize_host_prefix(&self.client.config.join("skills")),
-            normalize_host_prefix(&self.client.config.join(".agents/skills")),
-        ];
-        // Resolve projection directories only. Every link destination stays in
-        // the shared/own roots; resources below the skill remain no-follow.
-        let mut base = normalize_host_prefix(dir);
-        let mut links = std::collections::BTreeSet::new();
-        loop {
-            let mut prefix = PathBuf::new();
-            let mut next = None;
-            for component in base.components() {
-                prefix.push(component.as_os_str());
-                if !std::fs::symlink_metadata(&prefix)?.file_type().is_symlink() {
-                    continue;
-                }
-                if links.len() >= 40 || !links.insert(prefix.clone()) {
-                    return Err(std::io::Error::other("cyclic skill projection"));
-                }
-                let link = std::fs::read_link(&prefix)?;
-                let raw_target = if link.is_relative() {
-                    prefix
-                        .parent()
-                        .ok_or_else(|| std::io::Error::other("skill parent missing"))?
-                        .join(link)
-                } else {
-                    link
-                };
-                if raw_target.components().any(|c| {
-                    !matches!(
-                        c,
-                        std::path::Component::RootDir | std::path::Component::Normal(_)
-                    )
-                }) {
-                    return Err(std::io::Error::other(
-                        "a linked skill directory points outside the skill roots",
-                    ));
-                }
-                let target = normalize_host_prefix(&raw_target);
-                if !(roots.iter().any(|root| target.starts_with(root))
-                    || (view.as_ref().is_some_and(|view| target == *view)
-                        && vendor_projections.contains(&prefix)))
-                {
-                    return Err(std::io::Error::other(
-                        "a linked skill directory points outside the skill roots",
-                    ));
-                }
-                next =
-                    Some(target.join(base.strip_prefix(&prefix).map_err(std::io::Error::other)?));
-                break;
-            }
-            match next {
-                Some(path) => base = path,
-                None => break,
-            }
-        }
-        let mut file = anyagents_core::raw_segment::open_readonly(&base.join(rel))?;
-        let mut text = String::new();
-        std::io::Read::read_to_string(&mut file, &mut text)?;
-        Ok(text)
-    }
-
-    pub(super) fn collect_skill_directories(&self) -> std::collections::BTreeMap<String, PathBuf> {
-        let mut roots = Vec::new();
-        if let Some(data_dir) = self.client.socket.parent() {
-            roots.push(data_dir.join("skills"));
-        }
-        if let Some(agent_root) = self.client.config.parent() {
-            roots.push(agent_root.join("skills-view"));
-            roots.push(agent_root.join("skills"));
-        }
-        roots.push(self.client.config.join("skills"));
-        roots.push(self.client.config.join(".agents/skills"));
-        let wd = self.resolve_workdir();
-        roots.push(wd.join(".agents/skills"));
-        roots.push(wd.join("skills"));
-
-        anyagents_core::host_skills::discover(&roots)
-    }
-
-    /// Tell the server which skill file this agent read and the digest of the
-    /// bytes it got (ADR 0008). Telemetry never fails the read itself.
-    pub(super) async fn record_skill_read(&self, answer: &serde_json::Value) {
-        if answer.get("action").and_then(serde_json::Value::as_str) != Some("read") {
-            return;
-        }
-        let field = |key| answer.get(key).and_then(serde_json::Value::as_str);
-        let (Some(skill), Some(file), Some(content)) =
-            (field("name"), field("file"), field("content"))
-        else {
-            return;
-        };
-        let body = serde_json::json!({
-            "skill": skill,
-            "file": file,
-            "sha256": anyagents_core::learned_memory::sha256(content.as_bytes()),
-        });
-        if let Err(err) = self
-            .client
-            .get::<serde_json::Value>("/v1/skills/reads", Some(body.to_string().into_bytes()))
-            .await
-        {
-            eprintln!("skill read of `{skill}/{file}` not recorded: {err}");
-        }
-    }
-
-    pub(super) fn execute_skills_tool(
-        &self,
-        args: SkillsArgs,
-    ) -> Result<serde_json::Value, String> {
-        let raw_name = args
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let raw_query = args
-            .query
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let action = args
-            .action
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_else(|| {
-                if raw_name.is_some() {
-                    "read".to_string()
-                } else if raw_query.is_some() {
-                    "search".to_string()
-                } else {
-                    "list".to_string()
-                }
-            });
-
-        let skill_dirs = self.collect_skill_directories();
-        match action.as_str() {
-            "list" | "ls" => {
-                let limit = args.limit.unwrap_or(50).max(1);
-                let mut skills = Vec::new();
-                for (slug, dir) in skill_dirs.into_iter().take(limit) {
-                    let md = self
-                        .read_skill_text(&dir, Path::new("SKILL.md"))
-                        .unwrap_or_default();
-                    let (_, description) =
-                        anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &md);
-                    skills.push(serde_json::json!({
-                        "name": slug,
-                        "description": description,
-                    }));
-                }
-                let count = skills.len();
-                Ok(serde_json::json!({
-                    "action": "list",
-                    "skills": skills,
-                    "count": count,
-                }))
-            }
-            "read" | "get" => {
-                let name = raw_name.ok_or_else(|| "`skills` read requires `name`".to_string())?;
-                if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
-                    return Err(format!("invalid skill name `{name}`"));
-                }
-                let dir = skill_dirs
-                    .get(&name)
-                    .ok_or_else(|| format!("skill `{name}` not found"))?;
-                let rel_file = args
-                    .file
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("SKILL.md");
-                let rel_path = Path::new(rel_file);
-                if rel_path.is_absolute()
-                    || rel_path
-                        .components()
-                        .any(|c| !matches!(c, std::path::Component::Normal(_)))
-                {
-                    return Err(format!("invalid skill file path `{rel_file}`"));
-                }
-                let content = self
-                    .read_skill_text(dir, rel_path)
-                    .map_err(|e| format!("cannot read `{name}/{rel_file}`: {e}"))?;
-                let (_, description) =
-                    anyagents_core::learned_memory::parse_topic_frontmatter(&name, &content);
-                Ok(serde_json::json!({
-                    "action": "read",
-                    "name": name,
-                    "file": rel_file,
-                    "description": description,
-                    "content": content,
-                }))
-            }
-            "search" | "query" | "find" => {
-                let q = raw_query
-                    .or(raw_name)
-                    .ok_or_else(|| "`skills` search requires `query`".to_string())?;
-                let tokens: Vec<String> = q
-                    .to_ascii_lowercase()
-                    .split_whitespace()
-                    .filter(|t| !t.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                let limit = args.limit.unwrap_or(20).max(1);
-                let mut hits = Vec::new();
-                for (slug, dir) in skill_dirs {
-                    let md = self
-                        .read_skill_text(&dir, Path::new("SKILL.md"))
-                        .unwrap_or_default();
-                    let (_, description) =
-                        anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &md);
-                    let hay = format!("{slug} {description} {md}").to_ascii_lowercase();
-                    if tokens.iter().all(|tok| hay.contains(tok)) {
-                        hits.push(serde_json::json!({
-                            "name": slug,
-                            "description": description,
-                        }));
-                        if hits.len() >= limit {
-                            break;
-                        }
-                    }
-                }
-                let count = hits.len();
-                Ok(serde_json::json!({
-                    "action": "search",
-                    "query": q,
-                    "skills": hits,
-                    "count": count,
-                }))
-            }
-            other => Err(format!(
-                "unknown `skills` action `{other}`; expected `list`, `read`, or `search`"
-            )),
         }
     }
 
@@ -2769,15 +2243,14 @@ impl AgentMcp {
                         }
                     }));
                 };
-                if !self.profile.allows_tool(tool_name) {
+                if !profile::allows_tool(tool_name) {
                     return Some(serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": id_val,
                         "error": {
                             "code": -32601,
                             "message": format!(
-                                "tool `{tool_name}` is disabled by active MCP profile `{}`",
-                                self.profile.as_str()
+                                "tool `{tool_name}` is not available on the AnyAgents MCP surface"
                             )
                         }
                     }));
@@ -2788,11 +2261,7 @@ impl AgentMcp {
                     .unwrap_or_else(|| serde_json::json!({}));
                 let call_result =
                     match self.dispatch_any_tool(tool_name, args).await {
-                        Ok((val, media)) => {
-                            let mut res = rmcp::model::CallToolResult::structured(val);
-                            res.content.extend(media);
-                            res
-                        }
+                        Ok(val) => rmcp::model::CallToolResult::structured(val),
                         Err(err_msg) => rmcp::model::CallToolResult::error(vec![
                             rmcp::model::ContentBlock::text(err_msg),
                         ]),
@@ -2818,178 +2287,91 @@ impl AgentMcp {
         &self,
         tool: &str,
         args: serde_json::Value,
-    ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
+    ) -> Result<serde_json::Value, String> {
         let norm = tool
             .trim()
             .strip_prefix("mcp__anyagents__")
             .unwrap_or(tool.trim());
-        if !self.profile.allows_tool(norm) {
+        if !profile::allows_tool(norm) {
             return Err(format!(
-                "tool `{norm}` is not available under the `{}` MCP profile",
-                self.profile.as_str()
+                "tool `{norm}` is not available on the AnyAgents MCP surface"
             ));
         }
-        if norm == "code" {
-            let parsed: CodeArgs = serde_json::from_value(args)
-                .map_err(|e| format!("invalid `code` arguments: {e}"))?;
-            let MultimediaJson(val, media) = self.code(Parameters(parsed)).await?;
-            return Ok((val, media));
-        }
-        self.dispatch_code_tool(norm, args).await
-    }
-
-    pub(super) async fn dispatch_code_tool(
-        &self,
-        tool: &str,
-        args: serde_json::Value,
-    ) -> Result<(serde_json::Value, Vec<rmcp::model::ContentBlock>), String> {
-        let norm = tool
-            .trim()
-            .strip_prefix("mcp__anyagents__")
-            .unwrap_or(tool.trim());
         match norm {
             "inbox" => {
                 let parsed: InboxArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `inbox` arguments: {e}"))?;
                 let res = self.inbox(Parameters(parsed)).await?.0;
-                Ok((
-                    serde_json::to_value(res).map_err(|e| e.to_string())?,
-                    Vec::new(),
-                ))
-            }
-            "skills" => {
-                let parsed: SkillsArgs = serde_json::from_value(args)
-                    .map_err(|e| format!("invalid `skills` arguments: {e}"))?;
-                Ok((self.skills(Parameters(parsed)).await?.0, Vec::new()))
+                serde_json::to_value(res).map_err(|e| e.to_string())
             }
             "memory" => {
                 let parsed: MemoryArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `memory` arguments: {e}"))?;
-                Ok((self.memory(Parameters(parsed)).await?.0, Vec::new()))
+                Ok(self.memory(Parameters(parsed)).await?.0)
             }
             "agents" => {
                 let parsed: AgentsArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `agents` arguments: {e}"))?;
-                Ok((self.agents(Parameters(parsed)).await?.0, Vec::new()))
+                Ok(self.agents(Parameters(parsed)).await?.0)
             }
             "send" => {
                 let parsed: SendArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `send` arguments: {e}"))?;
-                Ok((self.send(Parameters(parsed)).await?.0, Vec::new()))
+                Ok(self.send(Parameters(parsed)).await?.0)
             }
             "conversation" | "search" => {
                 let parsed: ConversationArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `conversation` arguments: {e}"))?;
                 let res = self.conversation(Parameters(parsed)).await?.0;
-                Ok((
-                    serde_json::to_value(res).map_err(|e| e.to_string())?,
-                    Vec::new(),
-                ))
+                serde_json::to_value(res).map_err(|e| e.to_string())
             }
             "groups" => {
                 let parsed: GroupsArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `groups` arguments: {e}"))?;
                 let res = self.groups(Parameters(parsed)).await?.0;
-                Ok((
-                    serde_json::to_value(res).map_err(|e| e.to_string())?,
-                    Vec::new(),
-                ))
+                serde_json::to_value(res).map_err(|e| e.to_string())
             }
             "schedule" | "schedules" => {
                 let parsed: ScheduleArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `schedule` arguments: {e}"))?;
-                Ok((self.schedule(Parameters(parsed)).await?.0, Vec::new()))
-            }
-            "browser" => {
-                let parsed: crate::workstation::BrowserRequest = serde_json::from_value(args)
-                    .map_err(|e| format!("invalid `browser` arguments: {e}"))?;
-                let MultimediaJson(val, media) = self.browser(Parameters(parsed)).await?;
-                Ok((val, media))
-            }
-            "web" | "web_search" | "web_fetch" => {
-                let mut parsed: crate::web::WebRequest = serde_json::from_value(args)
-                    .map_err(|e| format!("invalid `web` arguments: {e}"))?;
-                if parsed.action.is_none() {
-                    if norm == "web_search" {
-                        parsed.action = Some("search".to_string());
-                    } else if norm == "web_fetch" {
-                        parsed.action = Some("fetch".to_string());
-                    }
-                }
-                Ok((self.web(Parameters(parsed)).await?.0, Vec::new()))
-            }
-            "computer" => {
-                let MultimediaJson(val, media) = self
-                    .computer(Parameters(DynamicObjectArgs::from_value(args)?))
-                    .await?;
-                Ok((val, media))
-            }
-            "device" => {
-                let MultimediaJson(val, media) = self
-                    .device(Parameters(DynamicObjectArgs::from_value(args)?))
-                    .await?;
-                Ok((val, media))
-            }
-            "media" => {
-                let MultimediaJson(val, media) = self
-                    .media(Parameters(DynamicObjectArgs::from_value(args)?))
-                    .await?;
-                Ok((val, media))
-            }
-            "files" => {
-                let parsed: FilesArgs = serde_json::from_value(args)
-                    .map_err(|e| format!("invalid `files` arguments: {e}"))?;
-                let MultimediaJson(val, media) = self.files(Parameters(parsed)).await?;
-                Ok((val, media))
+                Ok(self.schedule(Parameters(parsed)).await?.0)
             }
             "subagents" => {
                 let parsed: SubagentsArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `subagents` arguments: {e}"))?;
-                Ok((self.subagents(Parameters(parsed)).await?.0, Vec::new()))
+                Ok(self.subagents(Parameters(parsed)).await?.0)
             }
             "spawn" => {
                 let parsed: SpawnArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `spawn` arguments: {e}"))?;
                 let res = self.spawn(Parameters(parsed)).await?.0;
-                Ok((
-                    serde_json::to_value(res).map_err(|e| e.to_string())?,
-                    Vec::new(),
-                ))
+                serde_json::to_value(res).map_err(|e| e.to_string())
             }
             "describe" => {
                 let parsed: DescribeArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `describe` arguments: {e}"))?;
-                Ok((self.describe(Parameters(parsed)).await?.0, Vec::new()))
+                Ok(self.describe(Parameters(parsed)).await?.0)
             }
             "archive" => {
                 let parsed: ArchiveArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `archive` arguments: {e}"))?;
                 let res = self.archive(Parameters(parsed)).await?.0;
-                Ok((
-                    serde_json::to_value(res).map_err(|e| e.to_string())?,
-                    Vec::new(),
-                ))
+                serde_json::to_value(res).map_err(|e| e.to_string())
             }
             "wake" => {
                 let parsed: WakeArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `wake` arguments: {e}"))?;
                 let res = self.wake(Parameters(parsed)).await?.0;
-                Ok((
-                    serde_json::to_value(res).map_err(|e| e.to_string())?,
-                    Vec::new(),
-                ))
+                serde_json::to_value(res).map_err(|e| e.to_string())
             }
             "interact" => {
                 let parsed: InteractArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `interact` arguments: {e}"))?;
                 let res = self.interact(Parameters(parsed)).await?.0;
-                Ok((
-                    serde_json::to_value(res).map_err(|e| e.to_string())?,
-                    Vec::new(),
-                ))
+                serde_json::to_value(res).map_err(|e| e.to_string())
             }
             other => Err(format!(
-                "unknown AnyAgents tool `{other}` in code mode; expected one of `memory`, `web`, `agents`, `send`, `conversation`, `groups`, `schedule`, `browser`, `files`"
+                "unknown AnyAgents tool `{other}`; expected one of `agents`, `send`, `inbox`, `conversation`, `memory`, `schedules`, `groups`"
             )),
         }
     }

@@ -1184,7 +1184,7 @@ pub(crate) fn write_agent_instructions_with_continuity_and_store(
         doc.push_str("- **Parent**: none (root)\n");
     }
 
-    doc.push_str("- **Lifecycle**: Role templates may declare `lifecycle: standing | task`. Sub-agents never archive themselves; the spawning parent records its verdict on the deliverable (`action: \"verdict\"`) and closes/archives a task sub-agent (`action: \"archive\"`) once it is accepted. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
+    doc.push_str("- **Lifecycle**: Role templates may declare `lifecycle: standing | task`. Sub-agents never archive themselves; the spawning parent closes/archives a task sub-agent (`action: \"archive\"`) once its work is complete. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
 
     let data_dir_guess = config
         .parent()
@@ -1205,7 +1205,7 @@ pub(crate) fn write_agent_instructions_with_continuity_and_store(
     }
 
     doc.push_str(
-        "\n## 3. Hierarchy, Topology & Communication Rules\n\n         - `description` is public; `instructions` are private. Supervision is downward-only; role labels impose no preset persona or lifecycle policy.\n         - Stdout never reaches peers or channels. Reply via `send` (`to`, `reply_to`, `text`) using `<message ... answer_to=\"...\">`; emit `NO_REPLY` in non-matching group turns.\n         - Never poll: `<message>`, child completions, and `schedule` watches wake you reactively.\n         - Any agent may call `agents` (`spawn`/`archive`) or `code` (`anyagents.*`, `workspace.*`, `web.*`, `computer.*`) instead of vendor sub-agent/timer tools; pass `secret_ref: \"op://...\"` to `browser` without reading secrets, and use `action: \"takeover\"` on `captcha_detected: true`.\n",
+        "\n## 3. Hierarchy, Topology & Communication Rules\n\n         - `description` is public; `instructions` are private. Supervision is downward-only; role labels impose no preset persona or lifecycle policy.\n         - Stdout never reaches peers or channels. Reply via `send` (`to`, `reply_to`, `text`) using `<message ... answer_to=\"...\">`; emit `NO_REPLY` in non-matching group turns.\n         - Never poll: `<message>`, child completions, and `schedules` watches wake you reactively.\n         - Any agent may call the 7 AnyAgents MCP tools (`agents`, `send`, `inbox`, `conversation`, `memory`, `schedules`, `groups`) instead of vendor sub-agent/timer tools.\n",
     );
     if let Some(parent) = parent_name {
         doc.push_str(&format!(
@@ -1334,8 +1334,6 @@ pub(crate) fn write_agent_instructions_with_continuity_and_store(
         (config.join(".config/muse/AGENTS.md"), &native_doc),
         (config.join(".omp/agent/APPEND_SYSTEM.md"), &native_doc),
         (config.join(".omp/agent/AGENTS.md"), &native_doc),
-        (config.join(".dsh/AGENTS.md"), &native_doc),
-        (config.join(".grok/AGENTS.md"), &native_doc),
     ];
     for (path, contents) in &paths {
         if std::fs::read(path).ok().as_deref() == Some(contents.as_bytes()) {
@@ -3378,13 +3376,7 @@ fn reconcile_agent_runtime_config_inner(
                 muse_config::point_vendor_home(config)?;
             }
             "omp" => {
-                crate::grok::write_omp_mcp_config(config, &command, &args)?;
-            }
-            "dsh" => {
-                crate::dsh::write_dsh_mcp_patch(config, agent.model.as_deref(), &command, &args)?;
-            }
-            "grok" => {
-                crate::grok::write_grok_config(config, agent.model.as_deref(), &command, &args)?;
+                crate::mcp_config::write_omp_mcp_config(config, &command, &args)?;
             }
             "spiron" | "spiron-local" | "spiron-cloud" => {
                 if !spiron_cloud_active || config.join("config.toml").exists() {
@@ -3685,26 +3677,6 @@ pub(crate) fn verify_harness_runtime_config(
             })?;
             if !text.contains("\"anyagents\"") {
                 return Err(Error::Message("omp mcp.json missing anyagents".into()));
-            }
-        }
-        "dsh" => {
-            let path = config.join("dsh-mcp-patch.yml");
-            let text = std::fs::read_to_string(&path).map_err(|_| {
-                Error::Message(format!("dsh runtime config missing: {}", path.display()))
-            })?;
-            if !text.contains("anyagents") {
-                return Err(Error::Message("dsh-mcp-patch.yml missing anyagents".into()));
-            }
-        }
-        "grok" => {
-            let path = config.join(".grok/config.toml");
-            let text = std::fs::read_to_string(&path).map_err(|_| {
-                Error::Message(format!("grok runtime config missing: {}", path.display()))
-            })?;
-            if !text.contains("[mcp_servers.anyagents]") {
-                return Err(Error::Message(
-                    "grok config.toml missing [mcp_servers.anyagents]".into(),
-                ));
             }
         }
         selector
@@ -7307,90 +7279,6 @@ fn read_dsh_yaml_ref(base: &Path, key_name: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn extract_agy_oauth_clients() -> Vec<(String, String)> {
-    static AGY_CLIENTS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
-    AGY_CLIENTS
-        .get_or_init(|| {
-            let mut candidates = Vec::new();
-            let cache_path = crate::sandbox::host_home_dir()
-                .map(|h| h.join(".cache/anyagents-agy-oauth-clients.json"));
-            if let Some(override_bin) = std::env::var_os("ANYAGENTS_AGY_BIN") {
-                candidates.push(PathBuf::from(override_bin));
-            }
-            if let Some(home) = crate::sandbox::host_home_dir() {
-                candidates.push(home.join(".local/bin/agy"));
-            }
-            candidates.push(PathBuf::from("/usr/local/bin/agy"));
-            if let Some(path_var) = std::env::var_os("PATH") {
-                for entry in std::env::split_paths(&path_var) {
-                    candidates.push(entry.join("agy"));
-                }
-            }
-            let Some(agy_bin) = candidates.into_iter().find(|p| p.is_file()) else {
-                return Vec::new();
-            };
-            let bin_meta = std::fs::metadata(&agy_bin).ok();
-            let bin_size = bin_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            if let Some(ref cp) = cache_path
-                && let Ok(raw) = std::fs::read_to_string(cp)
-                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
-                && val.get("bin_size").and_then(|v| v.as_u64()) == Some(bin_size)
-                && let Some(arr) = val.get("clients").and_then(|v| v.as_array())
-            {
-                let parsed: Vec<(String, String)> = arr
-                    .iter()
-                    .filter_map(|item| {
-                        Some((
-                            item.get(0)?.as_str()?.to_string(),
-                            item.get(1)?.as_str()?.to_string(),
-                        ))
-                    })
-                    .collect();
-                if !parsed.is_empty() {
-                    return parsed;
-                }
-            }
-            let Ok(bytes) = std::fs::read(&agy_bin) else {
-                return Vec::new();
-            };
-            let cid_needle =
-                b"1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-            if !bytes.windows(cid_needle.len()).any(|w| w == cid_needle) {
-                return Vec::new();
-            }
-            let Ok(cid) = String::from_utf8(cid_needle.to_vec()) else {
-                return Vec::new();
-            };
-            let sec_prefix = b"GOCSPX-";
-            let mut out = Vec::new();
-            for idx in 0..bytes.len().saturating_sub(35) {
-                if &bytes[idx..idx + 7] == sec_prefix {
-                    let candidate = &bytes[idx..idx + 35];
-                    if candidate[7..]
-                        .iter()
-                        .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
-                        && let Ok(secret) = String::from_utf8(candidate.to_vec())
-                        && !out.iter().any(|(_, s)| s == &secret)
-                    {
-                        out.push((cid.clone(), secret));
-                    }
-                }
-            }
-            if let Some(ref cp) = cache_path {
-                if let Some(parent) = cp.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let cache_obj = serde_json::json!({
-                    "bin_size": bin_size,
-                    "clients": out,
-                });
-                write_seat_shared_file(cp, cache_obj.to_string().as_bytes(), 0o600);
-            }
-            out
-        })
-        .clone()
-}
-
 fn extract_cursor_oauth_from_db(prof_dir: &Path) -> Option<(String, String)> {
     let db_path = ["agent.db", ".omp/agent/agent.db"]
         .into_iter()
@@ -8394,11 +8282,18 @@ pub(crate) fn probe_one_profile_usage(
                         write_seat_shared_file(&last_usage_path, b"oauth expired\n", 0o600);
                         return Some("oauth expired".to_string());
                     }
-                    let oauth_clients = extract_agy_oauth_clients();
+                    let oauth_clients: Vec<(String, String)> =
+                        std::env::var("ANYAGENTS_AGY_CLIENT_SECRET")
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .map(|secret| {
+                                vec![(crate::signin::AGY_OAUTH_CLIENT_ID.to_string(), secret)]
+                            })
+                            .unwrap_or_default();
                     if oauth_clients.is_empty() {
-                        // Stateless/thin coordinators without a host `agy` binary rely on
-                        // native harness refreshes inside sandboxes synced back to storage.
-                        // Do not record a bogus local refresh attempt backoff marker.
+                        // Native harness OAuth refresh inside sandboxes syncs back to
+                        // storage; do not scrape host binaries or record a bogus backoff.
                         write_seat_shared_file(&last_usage_path, b"oauth expired\n", 0o600);
                         return Some("oauth expired".to_string());
                     }
@@ -15528,8 +15423,6 @@ mod runtime_config_tests {
             ".config/muse/AGENTS.md",
             ".omp/agent/APPEND_SYSTEM.md",
             ".omp/agent/AGENTS.md",
-            ".dsh/AGENTS.md",
-            ".grok/AGENTS.md",
         ] {
             let mirror = std::fs::read_to_string(config.join(name)).unwrap();
             assert!(mirror.contains(&last), "{name} contains another render");

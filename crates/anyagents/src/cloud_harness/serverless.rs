@@ -1223,7 +1223,7 @@ mod tests {
                 instructions: None,
                 mcp_servers: Some(json!([{
                     "name": "anyagents",
-                    "url": "https://coord.example/v1/webhooks/mcp?profile=remote",
+                    "url": "https://coord.example/v1/webhooks/mcp",
                     "bearer_token": "rst_test_tok"
                 }])),
                 callback_url: None,

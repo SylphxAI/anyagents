@@ -299,6 +299,50 @@ pub fn sync_codex_developer_instructions(
     atomic_write_shared(path, updated.as_bytes())
 }
 
+pub const OMP_NATIVE_TOOL_POLICY_YAML: &str = "\
+mcp:
+  enableProjectConfig: false
+web_search:
+  enabled: false
+task:
+  maxRecursionDepth: 0
+memory:
+  backend: \"off\"
+hindsight:
+  autoRecall: false
+  mentalModelAutoSeed: false
+  mentalModelsEnabled: false
+mnemopi:
+  autoRecall: false
+  autoRetain: false
+ask:
+  enabled: false
+";
+
+pub fn ensure_omp_policy(omp_dir: &Path) -> Result<std::path::PathBuf, Error> {
+    std::fs::create_dir_all(omp_dir)?;
+    let policy_path = omp_dir.join("anyagents-policy.yml");
+    anyagents_harness::atomic_write_nonempty_file(
+        &policy_path,
+        OMP_NATIVE_TOOL_POLICY_YAML.as_bytes(),
+        0o664,
+    )?;
+    Ok(policy_path)
+}
+
+pub fn write_omp_mcp_config(
+    config_dir: &Path,
+    command: &Path,
+    args: &[String],
+) -> Result<(), Error> {
+    let omp_dir = config_dir.join(".omp").join("agent");
+    std::fs::create_dir_all(&omp_dir)?;
+    if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+        ensure_omp_policy(&omp_dir)?;
+    }
+    write_claude(&omp_dir.join("mcp.json"), command, args)
+}
+
 fn remove_top_key(text: &str, key: &str) -> String {
     let prefix = format!("{key} =");
     let tight = format!("{key}=");
@@ -716,6 +760,46 @@ mod tests {
                     .and_then(serde_json::Value::as_str),
                 Some("/usr/local/bin/anyagents")
             );
+        }
+    }
+
+    #[test]
+    fn write_codex_enables_native_code_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_codex_with_model(
+            &path,
+            Some("openai/gpt-6.2-sol"),
+            Path::new("/usr/local/bin/anyagents"),
+            &["mcp".to_string()],
+        )
+        .unwrap();
+        let cfg: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+            assert_eq!(cfg["features"]["code_mode"].as_bool(), Some(true));
+            assert_eq!(cfg["features"]["multi_agent"].as_bool(), Some(false));
+        }
+    }
+
+    #[test]
+    fn write_omp_mcp_config_writes_native_tool_policy_and_mcp_json() {
+        let dir = tempfile::tempdir().unwrap();
+        write_omp_mcp_config(
+            dir.path(),
+            Path::new("/opt/bin/anyagents"),
+            &["mcp".to_string()],
+        )
+        .unwrap();
+        let mcp_path = dir.path().join(".omp/agent/mcp.json");
+        assert!(mcp_path.is_file());
+        if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+            let policy =
+                std::fs::read_to_string(dir.path().join(".omp/agent/anyagents-policy.yml"))
+                    .unwrap();
+            assert!(policy.contains("enableProjectConfig: false"), "{policy}");
+            assert!(policy.contains("web_search:\n  enabled: false"), "{policy}");
+            assert!(policy.contains("maxRecursionDepth: 0"), "{policy}");
+            assert!(policy.contains("backend: \"off\""), "{policy}");
         }
     }
 }

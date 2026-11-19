@@ -33,7 +33,6 @@ use crate::activity::{
     DEFAULT_HEARTBEAT_INTERVAL_MS, GuestActivitySnapshot, clear_activity_snapshot,
     write_activity_snapshot,
 };
-use crate::dsh_grok::{DshGuestHarness, GrokGuestHarness};
 use crate::gemini::GeminiGuestHarness;
 
 /// Default unified persistent volume mount root inside sandboxes.
@@ -59,7 +58,7 @@ pub struct HealthArgs {
 
 #[derive(Args, Clone, Debug)]
 pub struct ServeArgs {
-    /// Target harness selector (`claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, `spiron`).
+    /// Target harness selector (`claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `spiron`).
     #[arg(long)]
     pub harness: Option<String>,
     /// Explicit path to the underlying vendor CLI binary inside the sandbox.
@@ -523,84 +522,6 @@ impl GuestHarness for SpironAdapter {
     }
 }
 
-struct DshAdapter(DshGuestHarness);
-impl Harness for DshAdapter {
-    fn deliver(&mut self, msg: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        self.0.deliver(msg)
-    }
-    fn proven(&self, id: &str) -> Option<Proof> {
-        self.0.proven(id)
-    }
-    fn stop(&mut self) {
-        self.0.stop();
-    }
-    fn background(&mut self) -> Result<(), HarnessError> {
-        self.0.background()
-    }
-    fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
-        self.0.resume(session)
-    }
-    fn cancel(&mut self) -> Result<(), HarnessError> {
-        self.0.cancel()
-    }
-    fn health(&self) -> anyagents_harness::HarnessHealth {
-        self.0.health()
-    }
-    fn turns_served(&self) -> u32 {
-        self.0.turns_served()
-    }
-    fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
-        self.0.watch_activity(notify);
-    }
-}
-impl GuestHarness for DshAdapter {
-    fn session_id(&self) -> Option<String> {
-        self.0.session_id()
-    }
-    fn answer_for(&self, id: &str, _state_dir: &Path) -> Option<String> {
-        self.0.answer(id)
-    }
-}
-
-struct GrokAdapter(GrokGuestHarness);
-impl Harness for GrokAdapter {
-    fn deliver(&mut self, msg: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        self.0.deliver(msg)
-    }
-    fn proven(&self, id: &str) -> Option<Proof> {
-        self.0.proven(id)
-    }
-    fn stop(&mut self) {
-        self.0.stop();
-    }
-    fn background(&mut self) -> Result<(), HarnessError> {
-        self.0.background()
-    }
-    fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
-        self.0.resume(session)
-    }
-    fn cancel(&mut self) -> Result<(), HarnessError> {
-        self.0.cancel()
-    }
-    fn health(&self) -> anyagents_harness::HarnessHealth {
-        self.0.health()
-    }
-    fn turns_served(&self) -> u32 {
-        self.0.turns_served()
-    }
-    fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
-        self.0.watch_activity(notify);
-    }
-}
-impl GuestHarness for GrokAdapter {
-    fn session_id(&self) -> Option<String> {
-        self.0.session_id()
-    }
-    fn answer_for(&self, id: &str, _state_dir: &Path) -> Option<String> {
-        self.0.answer(id)
-    }
-}
-
 struct GeminiAdapter(GeminiGuestHarness);
 impl Harness for GeminiAdapter {
     fn deliver(&mut self, msg: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
@@ -755,8 +676,6 @@ pub(crate) fn run_serve_io<R: BufRead + Send + 'static, W: Write>(
     }
 
     let env = build_guest_env(&state_dir, &work_dir, file_cfg.as_ref());
-    let guest_exe =
-        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/anyagents-guest"));
 
     let mut adapter = launch_guest_harness(
         &harness_name,
@@ -768,7 +687,6 @@ pub(crate) fn run_serve_io<R: BufRead + Send + 'static, W: Write>(
         &work_dir,
         &env,
         file_cfg.as_ref(),
-        &guest_exe,
     )
     .map_err(|err| format!("failed to start guest harness `{harness_name}`: {err}"))?;
 
@@ -1236,7 +1154,6 @@ pub(crate) fn launch_guest_harness(
     work_dir: &Path,
     env: &[(String, String)],
     file_cfg: Option<&GuestConfig>,
-    guest_exe: &Path,
 ) -> Result<Box<dyn GuestHarness>, HarnessError> {
     let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     match harness_name {
@@ -1370,20 +1287,6 @@ pub(crate) fn launch_guest_harness(
             })?;
             Ok(Box::new(SpironAdapter(h)))
         }
-        "dsh" => {
-            let patch = state_dir.join("dsh-mcp-patch.yml");
-            let patch_opt = patch.is_file().then_some(patch.as_path());
-            let h = DshGuestHarness::start(program, patch_opt, session, &pairs, work_dir)?;
-            Ok(Box::new(DshAdapter(h)))
-        }
-        "grok" => {
-            let mcp_url = file_cfg.and_then(|c| c.mcp_url.as_deref());
-            let mcp_tok = file_cfg.and_then(|c| c.mcp_token_file.as_deref());
-            let h = GrokGuestHarness::start(
-                program, model, session, &pairs, work_dir, guest_exe, mcp_url, mcp_tok,
-            )?;
-            Ok(Box::new(GrokAdapter(h)))
-        }
         "gemini" => {
             let h =
                 GeminiGuestHarness::start(program, model, session, extra_args, &pairs, work_dir)?;
@@ -1406,8 +1309,6 @@ pub(crate) fn resolve_guest_program(harness: &str) -> PathBuf {
         "muse" => "muse",
         "omp" => "omp",
         "spiron" | "spiron-local" => "spiron",
-        "dsh" => "dsh",
-        "grok" => "grok",
         other => other,
     };
     if let Ok(resolved) = anyagents_toolchain::tool(bin_name, "anyagents-guest.serve") {

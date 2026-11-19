@@ -484,7 +484,7 @@ impl Session {
         let capability = crate::remote::session_token(config)?;
         Ok(Some(json!([{
             "name": "anyagents",
-            "url": mcp_url_with_profile(&validated, remote_mcp_profile(config)),
+            "url": validated,
             "bearer_token": capability
         }])))
     }

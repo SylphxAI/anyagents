@@ -82,10 +82,8 @@ pub fn host() -> Result<HarnessHost, String> {
     )))
 }
 
-/// Harness processes that outlive the kernel: in keepers, and v2 Spiron
-/// processes, which need none (`crate::spiron_native`).
+/// Harness processes that outlive the kernel in keepers.
 pub struct KeeperCustody {
-    data: PathBuf,
     root: PathBuf,
     /// Agents whose kept harnesses must not be taken over: they would send
     /// their gateway token to a port this kernel no longer holds.
@@ -95,7 +93,6 @@ pub struct KeeperCustody {
 impl KeeperCustody {
     pub fn new(data: &Path, refused: impl IntoIterator<Item = AgentId>) -> Self {
         Self {
-            data: data.to_path_buf(),
             root: anyagents_keeper::root(data),
             refused: refused.into_iter().collect(),
         }
@@ -108,9 +105,7 @@ impl Custody<VendorHarness> for KeeperCustody {
     }
 
     fn retained(&self) -> Vec<AgentId> {
-        let mut agents: BTreeSet<String> = crate::spiron_native::agents(&self.data)
-            .into_iter()
-            .collect();
+        let mut agents: BTreeSet<String> = BTreeSet::new();
         if let Err(error) = anyagents_keeper::check_root(&self.root) {
             eprintln!("anyagents-keeper: no keeper is taken over: {error}");
         } else {
@@ -130,53 +125,8 @@ impl Custody<VendorHarness> for KeeperCustody {
         if self.refused.contains(agent) {
             // Its harness has the gateway's old origin and token: end it, and
             // the worker starts one with the new ones.
-            crate::spiron_native::end_recorded(&self.data, agent.as_str());
             anyagents_keeper::stop_agent(&self.root, agent.as_str())?;
             return Ok(None);
-        }
-        // A v2 Spiron an earlier kernel left: attached again with no keeper.
-        // Keepers of the same agent are older processes beside it: v1 ones a
-        // server without v2 started (a rollback), or the one a switch to
-        // Spiron was replacing. They hold the agent's lock, which is taken
-        // from them; the worker retires them (their proofs committed) before
-        // it delivers, and the v2 process goes on.
-        if crate::spiron_native::alive(&self.data, agent.as_str()) {
-            let mut lock = None;
-            let mut older = Vec::new();
-            match anyagents_keeper::attach_all(&self.root, agent.as_str()) {
-                Ok(found) => {
-                    for mut remote in found {
-                        if lock.is_none()
-                            && let Some(fd) = remote.take_lock()
-                        {
-                            lock = Some(AgentLock::adopt(fd));
-                        }
-                        older.push(VendorHarness::kept(remote));
-                    }
-                }
-                Err(error) => eprintln!("anyagents-keeper: {agent}: {error}"),
-            }
-            let lock = match lock {
-                Some(lock) => lock,
-                None => crate::spiron_native::take_lock(&self.data, agent)?,
-            };
-            let Some((harness, record)) =
-                crate::spiron_native::reattach(&self.data, agent.as_str())
-            else {
-                // It was ended: so are the keepers, before their lock goes.
-                drop(older);
-                drop(lock);
-                return Ok(None);
-            };
-            return Ok(Some(Attached {
-                harness: VendorHarness::native(harness, &record.labels),
-                lock,
-                harness_name: record.harness,
-                model: record.model,
-                started_at_ms: Some(record.started_at_ms),
-                note: record.note,
-                older,
-            }));
         }
         let mut found = anyagents_keeper::attach_all(&self.root, agent.as_str())?.into_iter();
         let Some(mut remote) = found.next() else {
@@ -203,7 +153,6 @@ impl Custody<VendorHarness> for KeeperCustody {
     }
 
     fn release(&self, agent: &AgentId) {
-        crate::spiron_native::end_recorded(&self.data, agent.as_str());
         if let Err(error) = anyagents_keeper::stop_agent(&self.root, agent.as_str()) {
             eprintln!("anyagents-keeper: {agent}: {error}");
         }
@@ -351,12 +300,10 @@ pub fn stop(data: &Path, agent: Option<&str>, force: bool) -> Result<(), anyagen
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let _server = hold_server_lock(data)?;
-            if !stop_native(data, agent)? {
-                if ui::is_pretty() {
-                    ui::note("No keepers.");
-                } else {
-                    println!("no keepers");
-                }
+            if ui::is_pretty() {
+                ui::note("No keepers.");
+            } else {
+                println!("no keepers");
             }
             return Ok(());
         }
@@ -373,7 +320,6 @@ pub fn stop(data: &Path, agent: Option<&str>, force: bool) -> Result<(), anyagen
     }
     anyagents_keeper::check_root(&root).map_err(fail)?;
     let _server = hold_server_lock(data)?;
-    stop_native(data, agent)?;
     let instances = anyagents_keeper::instances(&root);
     let agents: BTreeSet<String> = match agent {
         Some(name) => [resolve_agent(data, name)?].into(),
@@ -424,29 +370,6 @@ pub fn stop(data: &Path, agent: Option<&str>, force: bool) -> Result<(), anyagen
             failures.join("; ")
         )))
     }
-}
-
-/// End the v2 Spiron processes (`crate::spiron_native`) of `agent`, or of
-/// every agent: they need no keeper, but outlive the server all the same.
-/// Whether there was any.
-fn stop_native(data: &Path, agent: Option<&str>) -> Result<bool, anyagents_core::Error> {
-    let agents = match agent {
-        Some(name) => vec![resolve_agent(data, name)?],
-        None => crate::spiron_native::agents(data),
-    };
-    let mut any = false;
-    for agent in agents {
-        if crate::spiron_native::record_path(data, &agent).exists() {
-            crate::spiron_native::end_recorded(data, &agent);
-            if ui::is_pretty() {
-                ui::success(&format!("Stopped {agent} (spiron)"));
-            } else {
-                println!("{agent}\tstopped (spiron)");
-            }
-            any = true;
-        }
-    }
-    Ok(any)
 }
 
 /// Hold the data directory's server lock, which a running server holds:

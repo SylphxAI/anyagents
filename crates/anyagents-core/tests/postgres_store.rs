@@ -4,9 +4,8 @@ use anyagents_core::host_index::{HostIndex, IndexMetadata, MemoryScope};
 use anyagents_core::raw_segment::RawSegment;
 use anyagents_core::redaction::{Actor, Request as RedactRequest, Span, SpanUnit};
 use anyagents_core::{
-    BillingMode, HistorySearchQuery, Incoming, NewAgent, NewOutcome, NewSchedule, NewUsage, Origin,
-    OutcomeGroupBy, OutcomeKind, ReceiveOutcome, RuntimeChange, RuntimeState, Store,
-    read_children_roster, read_root_roster,
+    BillingMode, HistorySearchQuery, Incoming, NewAgent, NewSchedule, NewUsage, Origin,
+    ReceiveOutcome, RuntimeChange, RuntimeState, Store, read_children_roster, read_root_roster,
 };
 
 fn test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -155,32 +154,6 @@ fn postgres_end_to_end_store_search_host_index_redaction_and_concurrency() {
         .unwrap();
     let usage = store.list_usage(Some(&child.id)).unwrap();
     assert_eq!(usage.len(), 1);
-
-    let now = anyagents_core::now_ms();
-    let pr_number = u64::from_str_radix(&tag, 16).unwrap_or(101);
-    let mut outcome = NewOutcome::pull_request(
-        child.id.clone(),
-        "SylphxAI",
-        "anyagents",
-        pr_number,
-        OutcomeKind::PrMerged,
-        Some("deadbeef"),
-        now,
-        now,
-        None,
-    );
-    outcome.note = Some("verified pg".into());
-    store.record_outcome(outcome).unwrap();
-    let report = store
-        .outcome_report(
-            std::slice::from_ref(&child.id),
-            None,
-            i64::MAX,
-            OutcomeGroupBy::Agent,
-        )
-        .unwrap();
-    assert_eq!(report.groups.len(), 1);
-    assert_eq!(report.groups[0].succeeded, 1);
 
     // 4. Schedules + claim_schedule_tick_with_wake.
     let sched = store
@@ -469,9 +442,6 @@ fn sqlite_to_postgres_migration_preserves_data_and_sequences() {
     let ReceiveOutcome::New(msg) = src_store.receive(&child.id, inc).unwrap() else {
         panic!("expected new message in SQLite");
     };
-    src_store
-        .record_skill_read(&child.id, "prove-it", "SKILL.md", &"b".repeat(64))
-        .unwrap();
     let _sqlite_hits = src_store
         .search_history(&HistorySearchQuery {
             query: Some("資料遷移".into()),
@@ -551,9 +521,6 @@ fn sqlite_to_postgres_migration_preserves_data_and_sequences() {
         panic!("expected post-migration insert");
     };
     assert_eq!(post_mig.seq, 2);
-    pg_store
-        .record_skill_read(&child.id, "deliver-and-verify", "SKILL.md", &"c".repeat(64))
-        .unwrap();
 
     // Verify migrated CJK text is immediately searchable in PG memory_index.
     let hits = pg_store

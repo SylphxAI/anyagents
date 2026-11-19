@@ -37,7 +37,6 @@ mod lifecycle;
 mod mcp_ops;
 pub mod memory_index;
 mod operator_inbox;
-mod outcomes;
 mod registry;
 mod remote_sessions;
 mod retired_search;
@@ -66,9 +65,6 @@ pub use lifecycle::{LifecycleKind, LifecycleOp, LifecyclePhase, NewLifecycleOp, 
 pub use operator_inbox::{
     OPERATOR_BURST, OPERATOR_FLEET_BURST, OPERATOR_FLEET_HOURLY_CAP, OPERATOR_HOURLY_CAP,
     OperatorMessage, OperatorReceipt, OperatorReport,
-};
-pub use outcomes::{
-    NewOutcome, Outcome, OutcomeCost, OutcomeGroup, OutcomeGroupBy, OutcomeKind, OutcomeReport,
 };
 pub use remote_sessions::{
     REMOTE_SESSION_TOKEN_PREFIX, RemoteSession, RemoteSessionGrant, RemoteSessionToken,

@@ -421,11 +421,6 @@ pub fn google_antigravity_pkce_sign_in(
     }
     let _ = std::io::stdout().flush();
 
-    let (ctx, crx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = ctx.send(crate::create::extract_agy_oauth_clients());
-    });
-
     let raw_input = if input::interactive() {
         let deadline = std::time::Instant::now() + endpoints.timeout;
         loop {
@@ -480,9 +475,7 @@ pub fn google_antigravity_pkce_sign_in(
     #[cfg(unix)]
     drop(terminal);
     let code = parse_google_oauth_input(&raw_input, &state)?;
-    let mut clients = crx
-        .recv_timeout(Duration::from_secs(30))
-        .unwrap_or_default();
+    let mut clients = Vec::new();
     if let Ok(env_secret) = std::env::var("ANYAGENTS_AGY_CLIENT_SECRET")
         && !env_secret.trim().is_empty()
     {

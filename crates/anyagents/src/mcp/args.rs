@@ -210,11 +210,6 @@ pub(super) struct AgentsArgs {
     ///   `agent`/`day`/`model`/`harness`. Callers with `scope == "public"`, roots and
     ///   the local operator see the whole workspace; other callers see only self plus
     ///   causal descendants, and an explicit out-of-scope target is refused.)
-    /// - `"verdict"` (judge the work of `name`, a descendant: `verdict` is `accepted`,
-    ///   `rework`, `rejected` or `abandoned`, with an optional `reason`; never your own work)
-    /// - `"outcomes"` (successes, failures, recovery and cost per success, with the same
-    ///   target, window and visibility as `usage`; `group_by` is `model`, `harness`,
-    ///   `role`, `profile`, `agent` or `skill`)
     #[serde(default)]
     pub(super) action: Option<String>,
     /// Target body id when action = "redact"; `transcript:<zero-based-line>` addresses
@@ -227,13 +222,9 @@ pub(super) struct AgentsArgs {
     /// Optional end-exclusive decoded-text span. Omit to tombstone the whole body.
     #[serde(default)]
     pub(super) span: Option<crate::api::RedactionSpan>,
-    /// Required audit reason for redact (never repeat sensitive text here); the
-    /// optional reason for a verdict.
+    /// Required audit reason for redact (never repeat sensitive text here).
     #[serde(default)]
     pub(super) reason: Option<String>,
-    /// For `verdict`: `"accepted"`, `"rework"`, `"rejected"` or `"abandoned"`.
-    #[serde(default)]
-    pub(super) verdict: Option<String>,
     /// Optional state filter for `list`: `"running"`, `"working"`, `"errored"`, `"idle"`, `"paused"`, `"archived"`, or `"all"` (default `"all"`).
     #[serde(default)]
     pub(super) state: Option<String>,
@@ -640,9 +631,7 @@ pub(super) struct ScheduleArgs {
     #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     pub(super) every: Option<String>,
     /// Event watch specification:
-    /// - `"github:pr:<owner>/<repo>#<num>"` (GitHub PR reaching a terminal state: merged/closed or checks terminal)
-    /// - `"github:check:<owner>/<repo>@<ref>"` (GitHub check runs reaching a terminal state)
-    /// - `"spiron:promise:<id>"` (Spiron promise state change pulled from the public API)
+    /// - `"webhook:<topic>"` / `"event:<topic>"` (generic authenticated webhook/event trigger)
     /// - `"agent:idle:<name_or_id>"` (AnyAgents agent transitioning to idle)
     /// - `"pid:<pid>"` / `"process:<pid>"` (local background process PID exiting)
     /// - `"file:<path>"` / `"path:<path>"` (local file/directory created or modified)
@@ -727,189 +716,6 @@ pub(super) struct InboxArgs {
     /// Optional sender substring filter.
     #[serde(default, alias = "from")]
     pub(super) sender: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub(super) struct SkillsArgs {
-    /// Skill operation to perform:
-    /// - `"list"` (default when `name` and `query` are omitted): List available skills and their trigger descriptions.
-    /// - `"read"` (inferred when `name` is provided): Read a skill's `SKILL.md` (or relative `file`).
-    /// - `"search"` (inferred when `query` is provided): Search skills by name, description, or body.
-    #[serde(default)]
-    pub(super) action: Option<String>,
-    /// Skill slug / directory name (e.g. `"deliver-and-verify"`, `"prove-it"`).
-    #[serde(
-        default,
-        alias = "skill",
-        alias = "slug",
-        alias = "topic",
-        alias = "id"
-    )]
-    pub(super) name: Option<String>,
-    /// Optional relative file path inside the skill directory when `action = "read"` (defaults to `"SKILL.md"`).
-    #[serde(default, alias = "path")]
-    pub(super) file: Option<String>,
-    /// Search query when `action = "search"`.
-    #[serde(default, alias = "q", alias = "search")]
-    pub(super) query: Option<String>,
-    /// Maximum number of skills to return when listing or searching (default 50).
-    #[serde(default)]
-    pub(super) limit: Option<usize>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
-pub(super) struct FileEditSpec {
-    /// Target string in the file to replace (supports exact, CRLF-normalized, trailing-whitespace-trimmed, and indentation-tolerant matching).
-    #[serde(
-        default,
-        alias = "old_str",
-        alias = "old_string",
-        alias = "search",
-        alias = "find"
-    )]
-    pub(super) target: String,
-    /// Replacement string to substitute in place of `target`.
-    #[serde(default, alias = "new_str", alias = "new_string", alias = "replace")]
-    pub(super) replacement: String,
-    /// Optional per-edit override for whether multiple occurrences of `target` should all be replaced (`true` by default).
-    #[serde(default)]
-    pub(super) replace_all: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub(super) struct FilesArgs {
-    /// File/workspace operation to perform:
-    /// - `"read"`: Read a file with optional 1-based `start_line`, `end_line`, `byte_offset`, and `max_bytes` (default 46080).
-    /// - `"write"`: Create, overwrite, or append (`append: true`) a file, automatically creating parent directories and returning `{ path, bytes_written, sha256 }`.
-    /// - `"edit"` / `"multi_edit"`: Apply a `target` -> `replacement` edit (or an atomic array of `edits: [{ target, replacement }]`) with 4-stage cascade matching, returning `{ path, replacements_made, lines_added, lines_removed, sha256 }`.
-    /// - `"patch"`: Apply an OpenAI V4A patch (`*** Begin Patch` / `*** Update File:` / `*** Add File:` / `*** Delete File:`) or standard unified diff (`--- a/...` / `+++ b/...`).
-    /// - `"list"`: List directory entries (`name`, `path`, `kind`: `"file" | "dir" | "symlink"`, `bytes`) sorted deterministically.
-    /// - `"glob"`: Fast glob file listing (`pattern`, optional `path`, `max_results` default 200), skipping `.git`/`target`/`node_modules` and respecting `.gitignore` by default.
-    /// - `"grep"`: Fast regex/literal content search (`query`, optional `path`, `glob`, `max_results` default 100, `context_lines`), returning `{ matches: [{ path, line, text }] }`.
-    #[serde(default)]
-    pub(super) action: Option<String>,
-    /// File or directory path (relative paths are resolved against the agent's `workdir`).
-    #[serde(
-        default,
-        alias = "file",
-        alias = "file_path",
-        alias = "filepath",
-        alias = "dir",
-        alias = "directory"
-    )]
-    pub(super) path: Option<String>,
-    /// 1-based inclusive start line when `action = "read"`.
-    #[serde(default, alias = "from_line", alias = "offset_line")]
-    pub(super) start_line: Option<usize>,
-    /// 1-based inclusive end line when `action = "read"`.
-    #[serde(default, alias = "to_line", alias = "limit_line")]
-    pub(super) end_line: Option<usize>,
-    /// Byte offset into the selected line window when `action = "read"` (default 0).
-    #[serde(default, alias = "offset")]
-    pub(super) byte_offset: Option<usize>,
-    /// Maximum bytes to read when `action = "read"` (default 46080, max 262144).
-    #[serde(default)]
-    pub(super) max_bytes: Option<usize>,
-    /// File content to write when `action = "write"`.
-    #[serde(default, alias = "text", alias = "body")]
-    pub(super) content: Option<String>,
-    /// Whether to allow overwriting an existing file when `action = "write"` (`true` by default; set `false` to fail if the file already exists).
-    #[serde(default)]
-    pub(super) overwrite: Option<bool>,
-    /// Whether to append `content` to the end of the file when `action = "write"` (`false` by default).
-    #[serde(default)]
-    pub(super) append: Option<bool>,
-    /// Target string to replace when `action = "edit"`.
-    #[serde(default, alias = "old_str", alias = "old_string")]
-    pub(super) target: Option<String>,
-    /// Replacement string when `action = "edit"`.
-    #[serde(default, alias = "new_str", alias = "new_string", alias = "replace")]
-    pub(super) replacement: Option<String>,
-    /// Array of `{ target, replacement }` edits applied atomically when `action = "edit"` or `"multi_edit"`.
-    #[serde(default)]
-    pub(super) edits: Vec<FileEditSpec>,
-    /// Whether multiple occurrences of `target` should all be replaced (`true` by default; set `false` to require a unique match).
-    #[serde(default)]
-    pub(super) replace_all: Option<bool>,
-    /// OpenAI V4A patch (`*** Begin Patch` ...) or unified diff (`--- a/...` / `+++ b/...`) when `action = "patch"`.
-    #[serde(default, alias = "diff")]
-    pub(super) patch: Option<String>,
-    /// Glob pattern when `action = "glob"` (e.g. `"**/*.rs"`, `"src/**/*.ts"`).
-    #[serde(default)]
-    pub(super) pattern: Option<String>,
-    /// Optional file filter glob when `action = "grep"` (or alias for `pattern` when `action = "glob"`).
-    #[serde(default)]
-    pub(super) glob: Option<String>,
-    /// Search regex or literal string when `action = "grep"`.
-    #[serde(default, alias = "q", alias = "search", alias = "regex")]
-    pub(super) query: Option<String>,
-    /// Maximum number of results to return (`200` default for `glob`, `100` default for `grep`, `500` default for `list`).
-    #[serde(default, alias = "limit")]
-    pub(super) max_results: Option<usize>,
-    /// Number of context lines (`0..=10`) before and after each match when `action = "grep"`.
-    #[serde(default, alias = "context")]
-    pub(super) context_lines: Option<usize>,
-    /// Case-insensitive matching when `action = "grep"` (`false` by default).
-    #[serde(default, alias = "ignore_case")]
-    pub(super) case_insensitive: Option<bool>,
-    /// Force literal substring matching when `action = "grep"` (`false` by default).
-    #[serde(default)]
-    pub(super) literal: Option<bool>,
-    /// Include hidden dotfiles/directories during `glob`, `grep`, or `list` (`false` by default for `glob`/`grep`, `true` by default for `list`).
-    #[serde(default)]
-    pub(super) include_hidden: Option<bool>,
-    /// Include `.git`, `target`, `node_modules`, and `.gitignore`-matched paths during `glob` or `grep` (`false` by default).
-    #[serde(default)]
-    pub(super) include_ignored: Option<bool>,
-    /// Shell command string (`bash -c <cmd>`) when `action = "exec"`.
-    #[serde(default, alias = "command")]
-    pub(super) cmd: Option<String>,
-    /// Optional working directory (relative to the agent's `workdir` or absolute) when `action = "exec"`.
-    #[serde(default, alias = "workdir")]
-    pub(super) cwd: Option<String>,
-    /// Optional execution timeout in milliseconds when `action = "exec"` (default `30000`, max
-    /// `600000` unless the server sets another ceiling; a remote sandbox stops at `120000`).
-    #[serde(default, alias = "timeout")]
-    pub(super) timeout_ms: Option<u64>,
-    /// The `timeout_ms` a `code` snippet asked for, when its call had less
-    /// time left to give; only the result's note reads it.
-    #[serde(default)]
-    #[schemars(skip)]
-    pub(super) requested_timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub(super) struct DynamicObjectArgs {
-    /// Action name to execute on the target capability (`computer`, `device`, or `media`).
-    #[serde(default)]
-    pub(super) action: Option<String>,
-    /// Additional action-specific fields.
-    #[serde(flatten)]
-    pub(super) extra: serde_json::Map<String, serde_json::Value>,
-}
-
-impl DynamicObjectArgs {
-    pub(super) fn from_value(val: serde_json::Value) -> Result<Self, String> {
-        serde_json::from_value(val).map_err(|e| format!("invalid object arguments: {e}"))
-    }
-
-    pub(super) fn into_value(self) -> serde_json::Value {
-        let mut map = self.extra;
-        if let Some(act) = self.action {
-            map.insert("action".to_string(), serde_json::Value::String(act));
-        }
-        serde_json::Value::Object(map)
-    }
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub(super) struct CodeArgs {
-    /// TypeScript body of an async function, run in the AnyAgents capability sandbox.
-    #[serde(alias = "script", alias = "source")]
-    pub(super) code: String,
-    /// Wall time for the call in milliseconds (default `30000`, max `600000` unless configured).
-    #[serde(default, alias = "timeout")]
-    pub(super) timeout_ms: Option<u64>,
 }
 
 pub(super) fn generate_subagent_name(parent_name: &str) -> String {

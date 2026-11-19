@@ -17,14 +17,10 @@ mod auth;
 mod channel;
 mod client;
 mod cloud_harness;
-mod computer;
 mod create;
 mod data;
-mod dsh;
 mod fake_opencode;
 mod gateway;
-mod github_webhook;
-mod grok;
 mod harness_double;
 mod host_memory;
 mod identity;
@@ -48,12 +44,9 @@ mod seat_tree;
 mod server;
 mod signin;
 mod spiron;
-mod spiron_native;
 mod telegram;
 mod ui;
 mod vendor;
-mod web;
-mod workstation;
 
 #[derive(Parser)]
 #[command(
@@ -349,37 +342,6 @@ enum Command {
         #[arg(long)]
         days: Option<i64>,
     },
-    /// Outcomes, recovery and cost per successful outcome (ADR 0008).
-    /// Queried through the daemon socket when it is running; the operator
-    /// falls back to a read of the store otherwise.
-    Outcomes {
-        #[arg(long)]
-        agent: Option<String>,
-        /// `model` (harness and model, the default), `harness`, `role`,
-        /// `profile`, `agent` or `skill`.
-        #[arg(long = "group-by")]
-        group_by: Option<String>,
-        /// Include causal descendants of `--agent`.
-        #[arg(long)]
-        include_descendants: bool,
-        /// Outcomes observed from, inclusive (unix ms).
-        #[arg(long = "since-ms")]
-        since_ms: Option<i64>,
-        /// Outcomes observed until, inclusive (unix ms).
-        #[arg(long = "until-ms")]
-        until_ms: Option<i64>,
-        /// Trailing window in days.
-        #[arg(long)]
-        days: Option<i64>,
-    },
-    /// Record a verdict on an agent's work: `accepted`, `rework`, `rejected`
-    /// or `abandoned`. Only its ancestor, a root admin or the operator may.
-    Verdict {
-        agent: String,
-        verdict: String,
-        #[arg(long)]
-        reason: Option<String>,
-    },
     /// Speak MCP for one agent. Its capability comes from its config
     /// directory, never from a name.
     #[command(hide = true)]
@@ -388,10 +350,9 @@ enum Command {
         /// harness it starts, so a harness that omits it is read from there.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Optional MCP tool profile (`full`, `remote`, or `coordination`).
-        /// Defaults to `coordination` for `spiron` agents and `full` for third-party local CLI harnesses.
-        #[arg(long)]
-        profile: Option<mcp::McpProfile>,
+        /// Ignored legacy MCP tool profile flag retained for config backward compatibility.
+        #[arg(long = "profile", hide = true)]
+        _profile: Option<String>,
     },
     /// Start one agent command inside the deployment's OS boundary, or refuse
     /// and name the admission it needs. Never starts it unisolated.
@@ -408,7 +369,7 @@ enum Command {
     /// may write.
     #[command(hide = true)]
     Boundary,
-    /// The keepers that hold harness processes across server restarts, and the detached harness processes (v2 Spiron) that need none.
+    /// The keepers that hold harness processes across server restarts.
     Keepers {
         #[command(subcommand)]
         action: KeepersCommand,
@@ -422,7 +383,7 @@ enum Command {
     Harness {
         /// Agent name (`owner-anymd`) or `agt_...` ID (or `adapter.json` path for the test double).
         config: PathBuf,
-        /// Target harness ID (`codex`, `opencode`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+        /// Target harness ID (`codex`, `opencode`, `claude-code`, `agy`, `spiron`, `muse`, `omp`).
         harness: Option<String>,
         /// Optional target harness ID flag (`--harness codex`).
         #[arg(long = "harness")]
@@ -493,8 +454,6 @@ enum Command {
         #[arg(long)]
         clear: bool,
     },
-    /// The browser on a profile's desktop session, with persistent logins (`open`, `snapshot`, `click`, `fill`, `press`, `eval`, `screenshot`, `cookies`, `tabs`, `takeover`, `status`, `profiles`, `close`).
-    Browser(Box<BrowserArgs>),
     /// List, create, or cancel scheduled wakes.
     #[command(name = "schedules", aliases = ["schedule", "cron"], display_order = 6)]
     Schedule(Box<ScheduleArgs>),
@@ -635,53 +594,6 @@ struct SendArgs {
 }
 
 #[derive(Args)]
-struct BrowserArgs {
-    /// Action: `open` / `goto`, `back`, `forward`, `reload`, `snapshot`, `read`, `html`, `click`, `fill` / `type`, `press`, `hold`, `key_down`, `key_up`, `release_keys`, `eval`, `cookies`, `screenshot`, `tabs`, `takeover`, `wait_for_user`, `release_takeover`, `status`, `profiles`, or `close` / `stop`. Runs in the server's desktop session for the profile, held by the operator while the operator uses it.
-    #[arg(default_value = "status")]
-    action: String,
-    /// Primary argument: URL (for `open`), snapshot ref such as `@e1` or a CSS selector (for `click` / `fill` / `html`), key name (for `press` / `hold` / `key_down` / `key_up`), JavaScript (for `eval`), or output path (for `screenshot`).
-    target: Option<String>,
-    /// Secondary argument: text to enter when `action` is `fill` / `type`.
-    value: Option<String>,
-    /// Persistent browser profile name (e.g. `default`, `reviewer`, `github`).
-    #[arg(short = 'p', long)]
-    profile: Option<String>,
-    /// Explicit URL override.
-    #[arg(long)]
-    url: Option<String>,
-    /// Explicit element override: a snapshot ref (`@e1` or `@<snapshot_id>:e1`) or a CSS selector.
-    #[arg(long)]
-    selector: Option<String>,
-    /// Explicit text override for `fill` / `type`.
-    #[arg(long)]
-    text: Option<String>,
-    /// Secret reference (`op://vault/item/field`, `op-otp://vault/item`, or `secret://key`) resolved in memory for `fill` / `type`.
-    #[arg(long = "secret-ref")]
-    secret_ref: Option<String>,
-    /// Explicit JavaScript override for `eval`.
-    #[arg(long)]
-    script: Option<String>,
-    /// Explicit output path for `screenshot`.
-    #[arg(long)]
-    path: Option<String>,
-    /// Press Enter in the field after `fill` / `type`.
-    #[arg(long)]
-    submit: bool,
-    /// Capture the full scrollable page on `screenshot` (the page only, without browser chrome).
-    #[arg(long = "full-page")]
-    full_page: bool,
-    /// Wait duration in milliseconds after `open` or `click`.
-    #[arg(long = "wait-ms")]
-    wait_ms: Option<u64>,
-    /// Hold duration in milliseconds for `press` / `hold` (at most 10 s).
-    #[arg(long = "hold-ms", alias = "duration-ms")]
-    hold_ms: Option<u64>,
-    /// Key or chord override for `press` / `hold` / `key_down` / `key_up` (e.g. `Enter`, `ctrl+a`).
-    #[arg(long)]
-    key: Option<String>,
-}
-
-#[derive(Args)]
 struct ScheduleArgs {
     /// List visible schedules across all agents (read-only).
     #[arg(long, conflicts_with_all = ["agent", "at", "every", "watch", "prompt", "cancel"])]
@@ -694,7 +606,7 @@ struct ScheduleArgs {
     /// Recurring wake interval (`1m`, `5m`, `15m`, `1h`).
     #[arg(long)]
     every: Option<String>,
-    /// Event watch (`github:pr:<owner>/<repo>#<num>`, `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name_or_id>`).
+    /// Event watch (`webhook:<topic>`, `event:<topic>`, `agent:idle:<name_or_id>`, `pid:<pid>`, `file:<path>`).
     #[arg(long)]
     watch: Option<String>,
     /// Prompt delivered when the schedule or event watch fires.
@@ -1232,7 +1144,6 @@ fn internal(args: &[std::ffi::OsString]) -> ExitCode {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("admission-probe") => repo::admission_probe_main(&args[1..]),
         Some("seat-file") => seat_tree::seat_file_main(&args[1..]),
-        Some("browser-jail") => workstation::jail::main(&args[1..]),
         _ => {
             eprintln!("anyagents internal: unknown helper");
             ExitCode::from(2)
@@ -1296,7 +1207,10 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             target.as_deref(),
             key_file.as_deref(),
         ),
-        Command::Mcp { config, profile } => mcp::run(&data, config.as_deref(), profile),
+        Command::Mcp {
+            config,
+            _profile: _,
+        } => mcp::run(&data, config.as_deref()),
         Command::AgentRun { config, command } => sandbox::run(&data, config.as_deref(), &command),
         Command::Boundary => print_boundary(&data),
         Command::Keepers { action } => match action {
@@ -1676,33 +1590,6 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             agent::UsageError::Store(err) => err,
             agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
         }),
-        Command::Outcomes {
-            agent,
-            group_by,
-            include_descendants,
-            since_ms,
-            until_ms,
-            days,
-        } => agent::outcomes(
-            &data,
-            &agent::UsageParams {
-                agent,
-                group_by,
-                since_ms,
-                until_ms,
-                days,
-                include_descendants: include_descendants.then_some(true),
-            },
-        )
-        .map_err(|err| match err {
-            agent::UsageError::Store(err) => err,
-            agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
-        }),
-        Command::Verdict {
-            agent,
-            verdict,
-            reason,
-        } => agent::verdict_cmd(&data, &agent, &verdict, reason.as_deref()),
         Command::Channels { action } => channel::channels(&data, action),
         Command::Groups { action } => groups(&data, action),
         Command::Describe {
@@ -1715,46 +1602,6 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Rename { agent, new_name } => agent::rename_cmd(&data, &agent, &new_name),
         Command::Role { agent, role, clear } => {
             agent::role_cmd(&data, &agent, role.as_deref(), clear)
-        }
-        Command::Browser(browser_args) => {
-            let BrowserArgs {
-                action,
-                target,
-                value,
-                profile,
-                url,
-                selector,
-                text,
-                secret_ref,
-                script,
-                path,
-                submit,
-                full_page,
-                wait_ms,
-                hold_ms,
-                key,
-            } = *browser_args;
-            browser_cmd(
-                &data,
-                action,
-                target,
-                value,
-                workstation::BrowserRequest {
-                    profile,
-                    url,
-                    selector,
-                    text,
-                    secret_ref,
-                    script,
-                    key,
-                    path,
-                    submit: submit.then_some(true),
-                    full_page: full_page.then_some(true),
-                    wait_ms,
-                    hold_ms,
-                    ..Default::default()
-                },
-            )
         }
         Command::Schedule(schedule_args) => {
             let ScheduleArgs {
@@ -2080,111 +1927,6 @@ fn inspect_cmd(data: &Path, agent: Option<String>, limit: usize, json: bool) -> 
         );
         channel::emit_turns(&turns, true, false)?;
     }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-/// `anyagents browser`: `flags` carries every explicit option; `target` and
-/// `value` fill the field the action takes positionally.
-fn browser_cmd(
-    data: &Path,
-    action: String,
-    target: Option<String>,
-    value: Option<String>,
-    flags: workstation::BrowserRequest,
-) -> Result<(), anyagents_core::Error> {
-    let act = action.trim().to_ascii_lowercase();
-    let mut req = workstation::BrowserRequest {
-        action: act.clone(),
-        ..flags
-    };
-    match act.as_str() {
-        "takeover" | "human_takeover" | "user_takeover" => {
-            if req.reason.is_none() {
-                req.reason = target.or(value);
-            }
-        }
-        "open" | "goto" | "navigate" => {
-            if req.url.is_none() {
-                req.url = target;
-            }
-        }
-        "click" | "html" => {
-            if req.selector.is_none() {
-                req.selector = target;
-            }
-        }
-        "eval" | "evaluate" | "js" => {
-            if req.script.is_none() {
-                req.script = target;
-            }
-        }
-        "fill" | "type" | "input" => {
-            if req.selector.is_none() {
-                req.selector = target;
-            }
-            if req.text.is_none() && req.secret_ref.is_none() {
-                req.text = value;
-            }
-        }
-        "press" | "key" | "hold" | "key_down" | "keydown" | "key_up" | "keyup" => {
-            if req.key.is_none() {
-                req.key = target;
-            }
-        }
-        "screenshot" | "shot" => {
-            if req.path.is_none() {
-                req.path = target;
-            }
-        }
-        "tabs" => {
-            req.tab_action = target;
-            req.target_id = value.clone();
-            if req.url.is_none() {
-                req.url = value;
-            }
-        }
-        "release_takeover" | "end_takeover" | "resume_agent" => {
-            if req.reason.is_none() {
-                req.reason = target;
-            }
-        }
-        "close" | "stop" | "status" | "info" | "fingerprint"
-            if req.profile.is_none() && target.is_some() =>
-        {
-            req.profile = target;
-        }
-        _ => {}
-    }
-    // Desktop sessions live in the server; a one-shot CLI process would stop
-    // the browser as soon as it printed.
-    if !client::can_call_server(data) {
-        return Err(anyagents_core::Error::Message(
-            "the browser runs in the AnyAgents server's desktop session; start the server (`anyagents serve`) and run this again".into(),
-        ));
-    }
-    let bytes =
-        serde_json::to_vec(&req).map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
-    let out = match client::call::<serde_json::Value>(
-        data,
-        "POST",
-        "/v1/browser",
-        Some(bytes),
-        &client::authority(data),
-    ) {
-        Ok(Some(val)) => val,
-        Ok(None) => {
-            return Err(anyagents_core::Error::Message(
-                "the server answered nothing".into(),
-            ));
-        }
-        Err(err) => return Err(anyagents_core::Error::Message(err)),
-    };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&out)
-            .map_err(|err| anyagents_core::Error::Message(err.to_string()))?
-    );
     Ok(())
 }
 

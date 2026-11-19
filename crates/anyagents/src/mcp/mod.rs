@@ -29,20 +29,10 @@ use crate::api::{
 use crate::operator::CAPABILITY_FILE;
 use crate::server;
 
-mod code_children;
-pub(crate) mod code_contract;
-#[cfg(test)]
-mod contract_tests;
-
-pub(crate) use code_contract::CodeLimits;
-
 mod agent_list;
 mod args;
 mod client;
-mod code_mode;
-mod files;
 mod frame_cap;
-mod media;
 mod profile;
 #[cfg(test)]
 mod tests;
@@ -52,22 +42,27 @@ pub(crate) use agent_list::*;
 use args::*;
 #[cfg(test)]
 pub(crate) use client::request;
-use client::{Call, SERVED_HARNESS, as_call, current_call};
+use client::{Call, SERVED_HARNESS, as_call};
 pub(crate) use client::{
     Client, HTTP_MCP_HEADER, RECONNECT_WITHIN, TASK_TURN_CONTEXT_HEADER, is_task_turn_context,
     request_waiting,
 };
-use code_mode::*;
-use files::*;
 pub(crate) use frame_cap::FrameArtifactStdout;
 #[cfg(test)]
 pub(crate) use frame_cap::MCP_TEXT_SPILL_BYTES;
-use frame_cap::{agent_spill_dir, artifact_info, contains_media, spill_file};
-pub use media::MultimediaJson;
-use media::*;
-pub use profile::McpProfile;
-#[cfg(test)]
-pub use profile::{CANONICAL_MCP_TOOLS, COORDINATION_MCP_TOOLS, REMOTE_MCP_TOOLS};
+use frame_cap::agent_spill_dir;
+pub use profile::UNIVERSAL_MCP_TOOLS;
+
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
 
 /// The agent whose tools run here: the id and name the server resolved from
 /// the capability, never a name the caller wrote.
@@ -146,7 +141,7 @@ fn harness_gone() -> (
 /// server names the directory it started this agent with as
 /// `ANYAGENTS_AGENT_CONFIG`; a command line that omits it is read from there,
 /// and from nowhere else.
-pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> Result<(), Error> {
+pub fn run(data: &Path, config: Option<&Path>) -> Result<(), Error> {
     let owned;
     let config = match config {
         Some(config) => config,
@@ -178,13 +173,10 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
             use std::sync::atomic::Ordering;
             stop.store(true, Ordering::Relaxed);
         }
-        let (who, harness, limits) = who.map_err(Error::Message)?;
+        let (who, harness) = who.map_err(Error::Message)?;
         // A call waits out a server restart only while its harness still
         // waits for the answer.
-        let _ = SERVED_HARNESS.set(harness.clone());
-        // The limits come from the server's environment only; a server that
-        // names none leaves the defaults.
-        CodeLimits::serve(limits.unwrap_or_default());
+        let _ = SERVED_HARNESS.set(harness);
         // A harness names the agent id it was given; the server already
         // answered with the agent this session acts as, and the two may not
         // differ.
@@ -195,22 +187,17 @@ pub fn run(data: &Path, config: Option<&Path>, profile: Option<McpProfile>) -> R
                 "this config directory belongs to another agent".into(),
             ));
         }
-        let resolved_profile = McpProfile::resolve_stdio(profile, harness.as_deref(), &config_buf);
         let spill_dir = agent_spill_dir(&config_buf, &who.id);
-        let service = AgentMcp {
-            agent: who,
-            client,
-            profile: resolved_profile,
-        }
-        .serve({
-            let (stdin, stdout) = rmcp::transport::io::stdio();
-            (
-                stdin,
-                FrameArtifactStdout::with_spill_dir(stdout, spill_dir),
-            )
-        })
-        .await
-        .map_err(|err| Error::Message(err.to_string()))?;
+        let service = AgentMcp { agent: who, client }
+            .serve({
+                let (stdin, stdout) = rmcp::transport::io::stdio();
+                (
+                    stdin,
+                    FrameArtifactStdout::with_spill_dir(stdout, spill_dir),
+                )
+            })
+            .await
+            .map_err(|err| Error::Message(err.to_string()))?;
         service
             .waiting()
             .await
@@ -254,39 +241,10 @@ pub(crate) fn capability_of(config: &Path) -> Result<String, Error> {
 pub(crate) struct AgentMcp {
     pub(crate) agent: AgentRef,
     pub(crate) client: Client,
-    pub(crate) profile: McpProfile,
 }
 
 /// The `schedules` tool's contract, with the exact shape of each action.
-const SCHEDULES_TOOL_DESCRIPTION: &str = "List authorized fleet automations with {action: list, agent: all}; fleet reads include owner names and never permit mutation. Wake yourself later or on an event. Create: `{action: \"create\", prompt, <one trigger>}` with `at` (\"20m\" or an ISO time), `every` (\"15m\") or `watch`: `github:pr:<owner>/<repo>#<num>` (PR or its checks terminal), `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name_or_id>`. `action: \"at\"|\"every\"|\"watch\"` with that field also creates. One trigger per schedule; make two calls for a watch plus a deadline. `{action: \"list\"}`; `{action: \"cancel\", id: \"sch_...\"|\"all\"}`. A fired schedule enters your mailbox like any message (steered into a running turn, held while you are paused or quota-blocked) and never queues a second wake while its last one is undelivered.";
-
-/// The `code` tool's contract: language, scope, limits and every callable
-/// name, compact because every agent turn pays for it.
-/// `tool_definitions_with_roles` rewrites the limits to the configured ones.
-const CODE_TOOL_DESCRIPTION: &str = "Run a TypeScript snippet (plain JS works; NOT Python). `code` is the body of an async function: `await` calls, `return` a JSON value; you get `{result, logs, duration_ms}`. No `import`, `require`, `process`, `Buffer`, `fs` or `fetch`; use the globals below. `timeout_ms`: default 30000, max 600000. An inner `workspace.exec` gets the remaining time, or its own `timeout_ms` (the call stretches to fit, up to the max).\n\
-workspace: read(path|{path, start_line?, end_line?}), write(path, content), edit({path, target, replacement}), multi_edit({path, edits: [{target, replacement}]}), patch(text), glob(pattern|{pattern, path?}), grep(query|{query, path?, glob?}), list(path?), exec(cmd|{cmd, cwd?, timeout_ms?}) -> {exit_code, stdout, stderr}.\n\
-anyagents: send, inbox, agents, schedule, conversation, groups, browser, skills, interact; each takes its MCP tool's object, e.g. `anyagents.schedule({action: \"create\", watch: \"github:pr:o/r#1\", prompt: \"...\"})`. memory: read(topic), write({topic, description, content}), search(query), list(). web: search(query), fetch(url). computer, device, media: `<ns>.<action>(opts)`. All also under `tools.`. For `media.video_generate({prompt, model?})`, set the outer `code` `timeout_ms` above 300000 when the configured ceiling allows it.\n\
-`console.log` goes to `logs`. Use `Promise.all` for independent calls. Run other languages from a file you `workspace.write`, not a quoted one-liner. Reading images, PDF, audio or video, and screenshots, attach the media.";
-
-const CODE_TOOL_LIMITS_TEXT: &str = "default 30000, max 600000";
-
-/// The `code` description with the limits this server enforces and what the
-/// agent's workspace backend (`WorkspaceBackend::kind`) does with an exec's
-/// `timeout_ms`.
-fn code_tool_description(limits: CodeLimits, backend: &str) -> String {
-    let mut limits_text = format!("default {}, max {}", limits.default_ms, limits.max_ms);
-    match backend {
-        "local" => {}
-        "docker" => limits_text.push_str(
-            "; `workspace.exec` runs in your container, which does not stop a command at its `timeout_ms`",
-        ),
-        _ => limits_text.push_str(&format!(
-            "; `workspace.exec` runs in your remote sandbox, which stops a command at {}",
-            agent_tools::REMOTE_EXEC_MAX_TIMEOUT_MS
-        )),
-    }
-    CODE_TOOL_DESCRIPTION.replace(CODE_TOOL_LIMITS_TEXT, &limits_text)
-}
+const SCHEDULES_TOOL_DESCRIPTION: &str = "List authorized fleet automations with {action: list, agent: all}; fleet reads include owner names and never permit mutation. Wake yourself later or on an event. Create: `{action: \"create\", prompt, <one trigger>}` with `at` (\"20m\" or an ISO time), `every` (\"15m\") or `watch`: `webhook:<topic>` (generic webhook/event trigger), `agent:idle:<name_or_id>`, `pid:<pid>`, or `file:<path>`. `action: \"at\"|\"every\"|\"watch\"` with that field also creates. One trigger per schedule; make two calls for a watch plus a deadline. `{action: \"list\"}`; `{action: \"cancel\", id: \"sch_...\"|\"all\"}`. A fired schedule enters your mailbox like any message (steered into a running turn, held while you are paused or quota-blocked) and never queues a second wake while its last one is undelivered.";
 
 /// Remove prose keys (`description`, `title`) from a JSON Schema tree. Field
 /// prose duplicates the tool-level description and is the main driver of
@@ -329,10 +287,9 @@ fn compact_tool_definition(mut tool: rmcp::model::Tool) -> rmcp::model::Tool {
     tool
 }
 
-pub fn tool_definitions(profile: McpProfile) -> Vec<rmcp::model::Tool> {
-    let allowed = profile.exposed_tools();
+pub fn tool_definitions() -> Vec<rmcp::model::Tool> {
     let all = AgentMcp::tool_router().list_all();
-    allowed
+    UNIVERSAL_MCP_TOOLS
         .iter()
         .filter_map(|wanted| all.iter().find(|t| t.name.as_ref() == *wanted).cloned())
         .map(compact_tool_definition)
@@ -344,11 +301,10 @@ pub fn tool_definitions(profile: McpProfile) -> Vec<rmcp::model::Tool> {
 /// every exposed tool with a `role` argument, because schema prose is stripped
 /// by `compact_tool_definition`.
 pub fn tool_definitions_with_roles(
-    profile: McpProfile,
     workdir: Option<&Path>,
     data_dir: Option<&Path>,
 ) -> Vec<rmcp::model::Tool> {
-    let mut tools = tool_definitions(profile);
+    let mut tools = tool_definitions();
     let Some(dd) = data_dir else {
         return tools;
     };
@@ -418,19 +374,18 @@ impl rmcp::ServerHandler for AgentMcp {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
-        if !self.profile.allows_tool(request.name.as_ref()) {
+        if !profile::allows_tool(request.name.as_ref()) {
             return Err(rmcp::ErrorData::invalid_params(
                 format!(
-                    "tool `{}` is not available under the `{}` MCP profile",
-                    request.name,
-                    self.profile.as_str()
+                    "tool `{}` is not available on the AnyAgents MCP surface",
+                    request.name
                 ),
                 None,
             ));
         }
         let ct = context.ct.clone();
         // rmcp moves params._meta into RequestContext. Scope the opaque
-        // opener credential to this dispatch, including nested code calls.
+        // opener credential to this dispatch.
         let mut scoped = self.clone();
         if !scoped.client.via_http {
             scoped.client.turn_context = context
@@ -449,7 +404,7 @@ impl rmcp::ServerHandler for AgentMcp {
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        if !self.profile.allows_tool(name) {
+        if !profile::allows_tool(name) {
             return None;
         }
         Self::tool_router().get(name).cloned()
