@@ -2607,21 +2607,15 @@ pub(crate) fn hydrate_agent_files_from_store(
         ("secrets", 0o600u32),
     ] {
         let entries = blobs
-            .list_agent_files(agent_id, ns)
-            .map_err(|e| format!("list agent_files({ns}) failed: {e}"))?;
-        for meta in entries {
-            if meta.size_bytes as u64 > MAX_AGENT_BUNDLE_FILE_BYTES
-                || is_excluded_agent_sync_rel(&meta.path)
+            .get_agent_files_all(agent_id, ns)
+            .map_err(|e| format!("batch load agent_files({ns}) failed: {e}"))?;
+        for blob in entries {
+            if blob.content.len() as u64 > MAX_AGENT_BUNDLE_FILE_BYTES
+                || is_excluded_agent_sync_rel(&blob.path)
             {
                 continue;
             }
-            let Some(blob) = blobs
-                .get_agent_file(agent_id, ns, &meta.path)
-                .map_err(|e| format!("read agent_files({ns}, {}) failed: {e}", meta.path))?
-            else {
-                continue;
-            };
-            let dest = config_dir.join(&meta.path);
+            let dest = config_dir.join(&blob.path);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("create dir {}: {e}", parent.display()))?;
@@ -2691,8 +2685,8 @@ pub(crate) fn hydrate_agent_memory_from_store(store: &Store, agent_id: &AgentId)
         .join(agent_id.as_str())
         .join("memory");
     let _ = std::fs::create_dir_all(&mem_dir);
-    let mut hydrated = 0usize;
-    for meta in entries {
+    let mut needs_sync = false;
+    for meta in &entries {
         if anyagents_core::stateless::validate_blob_path(&meta.path).is_err()
             || meta.size_bytes as u64 > MAX_AGENT_BUNDLE_FILE_BYTES
         {
@@ -2704,12 +2698,33 @@ pub(crate) fn hydrate_agent_memory_from_store(store: &Store, agent_id: &AgentId)
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
-        if local_mtime_ms.is_some_and(|local_ms| local_ms >= meta.updated_at_ms) {
+        if !local_mtime_ms.is_some_and(|local_ms| local_ms >= meta.updated_at_ms) {
+            needs_sync = true;
+            break;
+        }
+    }
+    if !needs_sync {
+        return 0;
+    }
+    let Ok(all_blobs) = blobs.get_agent_files_all(agent_id, "memory") else {
+        return 0;
+    };
+    let mut hydrated = 0usize;
+    for blob in all_blobs {
+        if anyagents_core::stateless::validate_blob_path(&blob.path).is_err()
+            || blob.content.len() as u64 > MAX_AGENT_BUNDLE_FILE_BYTES
+        {
             continue;
         }
-        let Ok(Some(blob)) = blobs.get_agent_file(agent_id, "memory", &meta.path) else {
+        let dest = mem_dir.join(&blob.path);
+        let local_mtime_ms = std::fs::metadata(&dest)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        if local_mtime_ms.is_some_and(|local_ms| local_ms >= blob.updated_at_ms) {
             continue;
-        };
+        }
         if let Some(parent) = dest.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

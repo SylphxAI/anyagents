@@ -189,19 +189,16 @@ fn hydrate_deployment_blobs_on_start(store: &Store, data: &Path) -> Result<usize
         let _ = std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o700));
     }
     for ns in ["config", "secrets", "profiles"] {
-        let metas = blobs.list_deployment_blobs(ns)?;
-        for meta in metas {
-            if anyagents_core::stateless::validate_blob_path(&meta.path).is_err() {
+        let entries = blobs.get_deployment_blobs_all(ns)?;
+        for entry in entries {
+            if anyagents_core::stateless::validate_blob_path(&entry.path).is_err() {
                 continue;
             }
             let dest = match ns {
-                "config" => data.join(&meta.path),
-                "secrets" => data.join("secrets").join(&meta.path),
-                "profiles" => data.join("profiles").join(&meta.path),
+                "config" => data.join(&entry.path),
+                "secrets" => data.join("secrets").join(&entry.path),
+                "profiles" => data.join("profiles").join(&entry.path),
                 _ => continue,
-            };
-            let Some(entry) = blobs.get_deployment_blob(ns, &meta.path)? else {
-                continue;
             };
             let mode = if entry.encrypted || ns == "secrets" {
                 0o600
@@ -3021,6 +3018,10 @@ fn list_fleet_schedules(
     store: &Store,
     principal: &Principal,
 ) -> Result<serde_json::Value, ApiError> {
+    // Reject unknown/absent agent principals fail-closed even when no schedules exist.
+    if let Principal::Agent { agent_id, .. } = principal {
+        store.agent(agent_id).map_err(ApiError::from_store)?;
+    }
     // Load all schedules in a single query instead of iterating every archived/active
     // agent (which caused O(N) queries across thousands of archived agents).
     let all_schedules = store
