@@ -21,8 +21,8 @@ use std::time::Duration;
 use rusqlite::{Connection, Row};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow};
 use sqlx::{
-    Arguments as _, Column as _, Executor as _, PgPool, Postgres, Row as _, Transaction,
-    TypeInfo as _, ValueRef as _,
+    Arguments as _, Column as _, PgPool, Postgres, Row as _, Transaction, TypeInfo as _,
+    ValueRef as _,
 };
 
 use crate::error::Error;
@@ -288,13 +288,6 @@ pub(crate) fn build_pg_pool(url: &str, max_connections: Option<u32>) -> Result<P
             .max_connections(max_conns)
             .acquire_timeout(Duration::from_secs(30))
             .idle_timeout(Some(Duration::from_secs(300)))
-            .after_connect(|conn, _meta| {
-                Box::pin(async move {
-                    conn.execute("SET search_path TO public, memory_index, host_index")
-                        .await?;
-                    Ok(())
-                })
-            })
             .connect_with(opts)
             .await
             .map_err(Error::from)
@@ -467,10 +460,13 @@ pub fn migrate_postgres(url: &str) -> Result<(), Error> {
 }
 
 /// Convert SQLite `?N` and anonymous `?` bind placeholders to PostgreSQL `$N`
-/// placeholders while preserving string literals, quoted identifiers, SQL
-/// comments, and PostgreSQL `$$...$$` dollar-quoted blocks.
+/// Translate SQLite `?` / `?N` placeholders into PostgreSQL `$N` placeholders
+/// and schema-qualify `memory_index.*` / `host_index.*` tables so queries stay
+/// independent of session `search_path` under transaction-mode PgBouncer, while
+/// preserving string literals, quoted identifiers, SQL comments, and PostgreSQL
+/// `$$...$$` dollar-quoted blocks.
 pub fn to_pg_sql(sql: &str) -> Cow<'_, str> {
-    if !sql.as_bytes().contains(&b'?') {
+    if !needs_pg_sql_translation(sql) {
         return Cow::Borrowed(sql);
     }
     static CACHE: LazyLock<RwLock<HashMap<String, Arc<str>>>> =
@@ -489,8 +485,32 @@ pub fn to_pg_sql(sql: &str) -> Cow<'_, str> {
     Cow::Owned(translated)
 }
 
+fn needs_pg_sql_translation(sql: &str) -> bool {
+    sql.as_bytes().contains(&b'?')
+        || sql.contains("index_")
+        || sql.contains("rag_chunks")
+        || sql.contains("host_")
+}
+
+fn qualify_non_public_table(ident: &str) -> Option<&'static str> {
+    match ident {
+        "index_meta" => Some("memory_index.index_meta"),
+        "index_pending" => Some("memory_index.index_pending"),
+        "index_redactions" => Some("memory_index.index_redactions"),
+        "rag_chunks" => Some("memory_index.rag_chunks"),
+        "host_generation" => Some("host_index.host_generation"),
+        "host_sources" => Some("host_index.host_sources"),
+        "host_agent_trees" => Some("host_index.host_agent_trees"),
+        "host_documents" => Some("host_index.host_documents"),
+        "host_document_tools" => Some("host_index.host_document_tools"),
+        "host_calls" => Some("host_index.host_calls"),
+        "host_windows" => Some("host_index.host_windows"),
+        _ => None,
+    }
+}
+
 fn translate_placeholders_utf8(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len() + 16);
+    let mut out = String::with_capacity(sql.len() + 32);
     let mut chars = sql.char_indices().peekable();
     let mut next_anon = 1usize;
 
@@ -578,6 +598,28 @@ fn translate_placeholders_utf8(sql: &str) -> String {
                         next_anon = n + 1;
                     }
                     out.push_str(&num);
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                let prev_is_dot = out.ends_with('.');
+                let mut ident = String::new();
+                ident.push(c);
+                while let Some(&(_, next)) = chars.peek() {
+                    if next.is_ascii_alphanumeric() || next == '_' {
+                        ident.push(next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let next_is_dot = chars.peek().is_some_and(|&(_, next)| next == '.');
+                if !prev_is_dot
+                    && !next_is_dot
+                    && let Some(qualified) = qualify_non_public_table(&ident)
+                {
+                    out.push_str(qualified);
+                } else {
+                    out.push_str(&ident);
                 }
             }
             _ => out.push(ch),
@@ -1231,7 +1273,8 @@ impl DbExec for PgPool {
     }
 
     fn execute_batch_raw(&self, sql: &str) -> Result<(), Error> {
-        block_on_pg(sqlx::raw_sql(sql).execute(self))?;
+        let pg_sql = to_pg_sql(sql);
+        block_on_pg(sqlx::raw_sql(pg_sql.as_ref()).execute(self))?;
         Ok(())
     }
 
@@ -1328,11 +1371,12 @@ impl DbExec for PgTx {
     }
 
     fn execute_batch_raw(&self, sql: &str) -> Result<(), Error> {
+        let pg_sql = to_pg_sql(sql);
         let mut guard = self.tx.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard
             .as_mut()
             .ok_or_else(|| Error::Message("postgres transaction already closed".into()))?;
-        block_on_pg(sqlx::raw_sql(sql).execute(&mut **tx))?;
+        block_on_pg(sqlx::raw_sql(pg_sql.as_ref()).execute(&mut **tx))?;
         self.wrote.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -1538,13 +1582,41 @@ mod tests {
             to_pg_sql(
                 "SELECT * FROM host_documents WHERE agent_id=? AND seq>=? -- comment ?\nAND \"col?\"=?"
             ),
-            "SELECT * FROM host_documents WHERE agent_id=$1 AND seq>=$2 -- comment ?\nAND \"col?\"=$3"
+            "SELECT * FROM host_index.host_documents WHERE agent_id=$1 AND seq>=$2 -- comment ?\nAND \"col?\"=$3"
         );
         assert_eq!(
             to_pg_sql("SELECT /* skipped ?1 */ $$?literal$$, ?2, ?"),
             "SELECT /* skipped ?1 */ $$?literal$$, $2, $3"
         );
         assert_eq!(to_pg_sql("SELECT '中文?1' || ?1"), "SELECT '中文?1' || $1");
+    }
+
+    #[test]
+    fn to_pg_sql_qualifies_memory_and_host_index_tables_without_search_path() {
+        assert_eq!(
+            to_pg_sql("SELECT value FROM index_meta WHERE key = 'layout'"),
+            "SELECT value FROM memory_index.index_meta WHERE key = 'layout'"
+        );
+        assert_eq!(
+            to_pg_sql("SELECT EXISTS(SELECT 1 FROM index_pending)"),
+            "SELECT EXISTS(SELECT 1 FROM memory_index.index_pending)"
+        );
+        assert_eq!(
+            to_pg_sql(
+                "INSERT INTO index_pending (agent_id, cap_messages) VALUES (?1, ?2) ON CONFLICT (agent_id) DO UPDATE SET cap_messages = COALESCE(index_pending.cap_messages, excluded.cap_messages)"
+            ),
+            "INSERT INTO memory_index.index_pending (agent_id, cap_messages) VALUES ($1, $2) ON CONFLICT (agent_id) DO UPDATE SET cap_messages = COALESCE(index_pending.cap_messages, excluded.cap_messages)"
+        );
+        assert_eq!(
+            to_pg_sql(
+                "SELECT count(*) FROM memory_index.rag_chunks WHERE 'index_meta' != 'host_windows'"
+            ),
+            "SELECT count(*) FROM memory_index.rag_chunks WHERE 'index_meta' != 'host_windows'"
+        );
+        assert_eq!(
+            to_pg_sql("SELECT id FROM host_windows JOIN host_calls ON host_calls.id = ?1"),
+            "SELECT id FROM host_index.host_windows JOIN host_index.host_calls ON host_calls.id = $1"
+        );
     }
 
     #[test]
