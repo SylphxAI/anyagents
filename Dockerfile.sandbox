@@ -187,7 +187,7 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 # Space- or comma-separated list of public CLI harnesses to pre-install.
 # Supported values: claude-code, codex, opencode, gemini, omp, none
-ARG INSTALL_HARNESSES="claude-code codex opencode"
+ARG INSTALL_HARNESSES="claude-code codex opencode gemini omp"
 
 LABEL org.opencontainers.image.title="anyagents-sandbox-full" \
       org.opencontainers.image.description="Open-source AnyAgents sandbox image with configurable public CLI harnesses" \
