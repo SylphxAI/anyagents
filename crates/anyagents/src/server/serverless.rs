@@ -2303,6 +2303,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
     async fn serverless_scale_to_zero_restart_survival_sandbox_turn_pg_and_local() {
         let _env = crate::server::tests::env_lock();
         let dir_a = crate::test_tempdir();
@@ -2327,10 +2328,10 @@ mod tests {
         };
 
         let parent = store_a
-            .create_agent(NewAgent::new(&format!("sl_parent_{tag}"), "claude-code"))
+            .create_agent(NewAgent::new(format!("sl_parent_{tag}"), "claude-code"))
             .unwrap();
         let worker = store_a
-            .create_agent(NewAgent::new(&format!("sl_worker_{tag}"), "claude-code"))
+            .create_agent(NewAgent::new(format!("sl_worker_{tag}"), "claude-code"))
             .unwrap();
 
         // Bind a stable listener port that Router A will NOT serve — instead, we simulate
@@ -2568,7 +2569,7 @@ done
             let mut resp = agent
                 .post(&replay_url)
                 .header("authorization", &format!("Bearer {tok_replay}"))
-                .send_json(&json!({
+                .send_json(json!({
                     "event_type": "turn_complete",
                     "turn_id": tid_replay,
                     "result_text": "duplicate overwrite attempt",
@@ -2593,6 +2594,7 @@ done
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
     async fn serverless_cloud_spiron_and_generic_http_survive_restart_via_webhook_and_tick_idempotently()
      {
         let _env = crate::server::tests::env_lock();
@@ -2688,10 +2690,10 @@ done
 
         // Router A creates agents and submits both cloud turns.
         let spiron_agent = store_a
-            .create_agent(NewAgent::new(&format!("spiron_cld_{tag}"), "spiron-cloud"))
+            .create_agent(NewAgent::new(format!("spiron_cld_{tag}"), "spiron-cloud"))
             .unwrap();
         let generic_agent = store_a
-            .create_agent(NewAgent::new(&format!("http_cld_{tag}"), "http-cloud"))
+            .create_agent(NewAgent::new(format!("http_cld_{tag}"), "http-cloud"))
             .unwrap();
 
         let mut spiron_req =
@@ -2892,6 +2894,7 @@ done
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
     async fn serverless_security_fail_closed_guest_tokens_tick_token_and_jwks_eddsa() {
         let _env = crate::server::tests::env_lock();
         clear_jwks_cache();
@@ -3182,6 +3185,7 @@ done
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn serverless_webhook_router_mounts_confined_api_only_with_operator_token() {
         let _env = crate::server::tests::env_lock();
         let saved: Vec<(&str, Option<std::ffi::OsString>)> = [

@@ -218,7 +218,7 @@ fn hydrate_deployment_blobs_on_start(store: &Store, data: &Path) -> Result<usize
                 }
             }
             if entry.content.is_empty() {
-                std::fs::write(&dest, &[])?;
+                std::fs::write(&dest, [])?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt as _;
@@ -425,10 +425,11 @@ async fn serve(
     let store = Arc::new(Store::open(data.join("state.db"))?);
     let remote_required = anyagents_tools::SandboxMode::from_env().is_remote_required();
     let stateless_pg = store.is_postgres() && remote_required;
-    if store.is_postgres() && (serverless || remote_required) {
-        if let Err(err) = hydrate_deployment_blobs_on_start(&store, data) {
-            eprintln!("anyagents-blobs: startup hydration warning: {err}");
-        }
+    if store.is_postgres()
+        && (serverless || remote_required)
+        && let Err(err) = hydrate_deployment_blobs_on_start(&store, data)
+    {
+        eprintln!("anyagents-blobs: startup hydration warning: {err}");
     }
     for (id, name) in release_stale_unadmitted_names_on_start(&store, UNADMITTED_STALE_AGE_MS)? {
         eprintln!("released name `{name}` held by failed creation {id}");
@@ -19347,7 +19348,7 @@ exec '{}' "$@"
         //    and a public cloud `launch_env`.
         let agent = store_a
             .create_agent(anyagents_core::NewAgent::new(
-                &format!("rep_sbx_{tag}"),
+                format!("rep_sbx_{tag}"),
                 "claude-code",
             ))
             .unwrap();

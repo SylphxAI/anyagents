@@ -230,15 +230,17 @@ impl ProviderRegistry {
                 Arc::new(DaytonaProvider::new(dc))
             }
             ProviderKind::Docker => {
-                let mut dk = DockerConfig::default();
-                dk.docker_host = clean_opt(&cfg.docker_host);
-                dk.docker_executable = cfg.docker_executable.clone();
+                let mut dk = DockerConfig {
+                    docker_host: clean_opt(&cfg.docker_host),
+                    docker_executable: cfg.docker_executable.clone(),
+                    default_network: clean_opt(&cfg.docker_network),
+                    memory_limit: clean_opt(&cfg.docker_memory),
+                    cpus: clean_opt(&cfg.docker_cpus),
+                    ..DockerConfig::default()
+                };
                 if let Some(img) = default_image.image.clone() {
                     dk.default_image = img;
                 }
-                dk.default_network = clean_opt(&cfg.docker_network);
-                dk.memory_limit = clean_opt(&cfg.docker_memory);
-                dk.cpus = clean_opt(&cfg.docker_cpus);
                 Arc::new(DockerProvider::new(dk))
             }
             ProviderKind::Cloudflare => {

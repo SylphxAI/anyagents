@@ -58,7 +58,7 @@ fn pg_two_replicas_share_blobs_locks_bindings_routes_obligations_heartbeats_and_
     // Create agent on replica A; replica B sees it immediately with zero local files.
     let agent = store_a
         .create_agent(NewAgent::new(
-            &format!("stateless_agent_{tag}"),
+            format!("stateless_agent_{tag}"),
             "claude-code",
         ))
         .unwrap();
@@ -359,7 +359,7 @@ fn pg_two_replicas_share_blobs_locks_bindings_routes_obligations_heartbeats_and_
     // 8. Stale unadmitted name release respects age threshold (does NOT reap fresh concurrent create).
     let fresh_unadmitted = store_a
         .create_agent(NewAgent::new(
-            &format!("fresh_unadmitted_{tag}"),
+            format!("fresh_unadmitted_{tag}"),
             "claude-code",
         ))
         .unwrap();
@@ -401,7 +401,7 @@ fn pg_host_retrieval_works_with_zero_local_sqlite_or_agent_files_on_disk() {
 
     let agent = store_a
         .create_agent(NewAgent::new(
-            &format!("retrieval_agent_{tag}"),
+            format!("retrieval_agent_{tag}"),
             "claude-code",
         ))
         .unwrap();
@@ -429,9 +429,11 @@ fn pg_host_retrieval_works_with_zero_local_sqlite_or_agent_files_on_disk() {
 
     // 1. Search on replica B against PG with zero local files.
     let authorized = vec![agent.id.to_string()];
-    let mut query = HistorySearchQuery::default();
-    query.query = Some(needle.clone());
-    query.limit = 10;
+    let query = HistorySearchQuery {
+        query: Some(needle.clone()),
+        limit: 10,
+        ..HistorySearchQuery::default()
+    };
     let hits = store_b
         .search_host_files(&authorized, MemoryScope::Memory, &query)
         .expect("search_host_files on stateless PG replica B");
@@ -521,7 +523,7 @@ fn pg_migrate_to_postgres_backfills_sqlite_and_disk_files_idempotently() {
     assert!(!sqlite_store.is_postgres());
 
     let agent = sqlite_store
-        .create_agent(NewAgent::new(&format!("mig_agent_{tag}"), "claude-code"))
+        .create_agent(NewAgent::new(format!("mig_agent_{tag}"), "claude-code"))
         .unwrap();
     sqlite_store
         .receive(&agent.id, Incoming::new("migrated inbox payload"))
@@ -739,7 +741,7 @@ fn pg_remote_turn_store_survives_replica_handoff_and_settles_idempotently() {
 
     let agent = store_a
         .create_agent(NewAgent::new(
-            &format!("serverless_turn_agent_{tag}"),
+            format!("serverless_turn_agent_{tag}"),
             "claude-code",
         ))
         .unwrap();

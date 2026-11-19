@@ -51,6 +51,7 @@ pub(crate) struct GrokGuestHarness {
 }
 
 impl GrokGuestHarness {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         program: impl Into<PathBuf>,
         model: Option<&str>,

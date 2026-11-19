@@ -398,7 +398,7 @@ fn notify_agent_takeover_completed(
         return Ok(());
     };
     let db_path = data.join("state.db");
-    if anyagents_core::db::configured_database_url_for_data_dir(&data).is_none()
+    if anyagents_core::db::configured_database_url_for_data_dir(data).is_none()
         && !db_path.try_exists()?
     {
         return Err(Error::Message(

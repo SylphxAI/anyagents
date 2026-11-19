@@ -960,7 +960,7 @@ impl RemoteTurnStore for FsRemoteTurnStore {
                     && kind.is_none_or(|hk| t.harness_kind == hk)
             })
             .collect();
-        matches.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        matches.sort_by_key(|t| std::cmp::Reverse(t.created_at_ms));
         Ok(matches.into_iter().next())
     }
 
@@ -1238,7 +1238,7 @@ impl RemoteTurnStore for InMemoryRemoteTurnStore {
             })
             .cloned()
             .collect();
-        matches.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        matches.sort_by_key(|t| std::cmp::Reverse(t.created_at_ms));
         Ok(matches.into_iter().next())
     }
 

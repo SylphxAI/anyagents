@@ -4752,21 +4752,20 @@ impl Store {
         if !all_queries.is_empty() {
             // 1. Lexical FTS5 / PostgreSQL GIN tsvector leg with filter pushdown.
             let fts_limit = i64::try_from((limit * 8).max(120)).unwrap_or(120);
-            let fts_rows: Option<
-                Vec<(
-                    String,
-                    String,
-                    String,
-                    String,
-                    String,
-                    i64,
-                    String,
-                    String,
-                    String,
-                    i64,
-                    f64,
-                )>,
-            > = match conn.backend() {
+            type FtsChunkRow = (
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                String,
+                String,
+                String,
+                i64,
+                f64,
+            );
+            let fts_rows: Option<Vec<FtsChunkRow>> = match conn.backend() {
                 DbBackend::Sqlite => {
                     let fts_query = build_fts5_query_with_filters(
                         &all_queries,

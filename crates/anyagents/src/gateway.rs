@@ -621,10 +621,10 @@ pub fn add_route(data: &Path, agent: &Agent) -> Result<Option<String>, Error> {
             .or_else(|| published_origin(data))
             .or_else(|| public_origin(Some(data)))
     };
-    if let Some(origin) = origin {
-        if !remote_required {
-            store_launch_env(data, &agent.id, &origin)?;
-        }
+    if let Some(origin) = origin
+        && !remote_required
+    {
+        store_launch_env(data, &agent.id, &origin)?;
     }
     Ok(Some(token))
 }

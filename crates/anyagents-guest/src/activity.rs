@@ -300,7 +300,7 @@ fn is_mcp_proxy_cmdline(cmdline_nul: &[u8]) -> bool {
         .filter(|s| !s.is_empty())
         .filter_map(|s| std::str::from_utf8(s).ok())
         .collect();
-    args.iter().any(|a| *a == "mcp-proxy")
+    args.contains(&"mcp-proxy")
 }
 
 fn now_unix_ms() -> u64 {

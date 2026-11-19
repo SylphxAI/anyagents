@@ -172,7 +172,12 @@ fn postgres_end_to_end_store_search_host_index_redaction_and_concurrency() {
     outcome.note = Some("verified pg".into());
     store.record_outcome(outcome).unwrap();
     let report = store
-        .outcome_report(&[child.id.clone()], None, i64::MAX, OutcomeGroupBy::Agent)
+        .outcome_report(
+            std::slice::from_ref(&child.id),
+            None,
+            i64::MAX,
+            OutcomeGroupBy::Agent,
+        )
         .unwrap();
     assert_eq!(report.groups.len(), 1);
     assert_eq!(report.groups[0].succeeded, 1);

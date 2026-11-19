@@ -16,6 +16,19 @@ use crate::id::AgentId;
 use crate::learned_memory::sha256;
 use crate::migrate::now_ms;
 
+type GatewayRouteRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Vec<u8>,
+    Vec<u8>,
+    i64,
+);
+
 /// Compute the indexed SHA-256 lookup key for a gateway bearer token.
 pub fn hash_gateway_token(token: &str) -> String {
     sha256(token.as_bytes())
@@ -179,18 +192,7 @@ impl PgGatewayRouteStore {
     pub fn resolve_by_token(&self, token: &str) -> Result<Option<StoredGatewayRoute>, Error> {
         let token_hash = hash_gateway_token(token);
         let pool = self.pool.clone();
-        let row: Option<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Vec<u8>,
-            Vec<u8>,
-            i64,
-        )> = block_on_pg(async move {
+        let row: Option<GatewayRouteRow> = block_on_pg(async move {
             sqlx::query_as(
                 "SELECT r.token_hash, r.agent_id, COALESCE(NULLIF(a.name, ''), r.agent_name),
                         r.harness, r.protocol, r.model, r.base_url,
@@ -214,18 +216,7 @@ impl PgGatewayRouteStore {
     pub fn get_for_agent(&self, agent_id: &AgentId) -> Result<Option<StoredGatewayRoute>, Error> {
         let pool = self.pool.clone();
         let aid = agent_id.as_str().to_string();
-        let row: Option<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Vec<u8>,
-            Vec<u8>,
-            i64,
-        )> = block_on_pg(async move {
+        let row: Option<GatewayRouteRow> = block_on_pg(async move {
             sqlx::query_as(
                 "SELECT r.token_hash, r.agent_id, COALESCE(NULLIF(a.name, ''), r.agent_name),
                         r.harness, r.protocol, r.model, r.base_url,
@@ -248,18 +239,7 @@ impl PgGatewayRouteStore {
     /// List all stored gateway routes for live (non-archived) agents.
     pub fn list_live(&self) -> Result<Vec<StoredGatewayRoute>, Error> {
         let pool = self.pool.clone();
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Vec<u8>,
-            Vec<u8>,
-            i64,
-        )> = block_on_pg(async move {
+        let rows: Vec<GatewayRouteRow> = block_on_pg(async move {
             sqlx::query_as(
                 "SELECT r.token_hash, r.agent_id, COALESCE(NULLIF(a.name, ''), r.agent_name),
                         r.harness, r.protocol, r.model, r.base_url,

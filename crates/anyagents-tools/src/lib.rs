@@ -781,6 +781,7 @@ pub mod sylphx {
         }
 
         /// Create a sandbox lease attaching `volume_resource` (`POST /v1/{parent}/leases`).
+        #[allow(clippy::too_many_arguments)]
         pub fn create_lease(
             &self,
             parent: &str,
@@ -1289,6 +1290,7 @@ pub mod sylphx {
         ///
         /// Reads Connect-RPC 5-byte server-stream frames incrementally without a global timeout
         /// (preventing 120s/300s truncation) and invokes `on_event` for each frame as it arrives.
+        #[allow(clippy::too_many_arguments)]
         pub fn start_envd_stream<F>(
             &self,
             envd_base: &str,

@@ -275,7 +275,7 @@ impl Api {
             req = req.header("authorization", &format!("Bearer {token}"));
         }
         let response = req
-            .send_json(&json!({ "mcp_servers": servers }))
+            .send_json(json!({ "mcp_servers": servers }))
             .map_err(|_| CloudErrorDetail::generic("Spiron MCP server registration failed"))?;
         let status = response.status().as_u16();
         if (200..300).contains(&status) {

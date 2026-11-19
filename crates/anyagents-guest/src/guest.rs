@@ -668,6 +668,7 @@ pub fn run_serve(mut args: ServeArgs) -> Result<(), String> {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum StdinEvent {
     User {
         msg: OutboundMessage,

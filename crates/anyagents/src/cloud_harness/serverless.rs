@@ -617,7 +617,7 @@ impl CloudTurnDriver for SpironServerlessDriver {
             // If completed without inline reply/events reply, check agent conversation projection.
             if state == CloudTurnState::Completed
                 && result_text.is_none()
-                && let Some(ref remote_agent) = driver.remote_agent_id.as_deref().or_else(|| {
+                && let Some(remote_agent) = driver.remote_agent_id.as_deref().or_else(|| {
                     receipt
                         .get("agent_id")
                         .and_then(Value::as_str)
@@ -1235,10 +1235,11 @@ mod tests {
         assert_eq!(submitted.remote_run_id, "rcpt_spiron_001");
         assert_eq!(submitted.status, CloudTurnState::Dispatched);
 
-        let bodies = state.submitted_bodies.lock().unwrap();
-        assert_eq!(bodies[0]["content"], "Hello Spiron");
-        assert_eq!(bodies[0]["mcp_servers"][0]["name"], "anyagents");
-        drop(bodies);
+        {
+            let bodies = state.submitted_bodies.lock().unwrap();
+            assert_eq!(bodies[0]["content"], "Hello Spiron");
+            assert_eq!(bodies[0]["mcp_servers"][0]["name"], "anyagents");
+        }
 
         let poll1 = driver.poll_turn("rcpt_spiron_001", None).await.unwrap();
         assert_eq!(poll1.status, CloudTurnState::Running);

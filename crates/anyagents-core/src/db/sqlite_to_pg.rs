@@ -1497,6 +1497,7 @@ impl AgentFileBatch {
         self.agent_ids.len() >= BLOB_BATCH_MAX_ROWS || self.total_bytes >= BLOB_BATCH_MAX_BYTES
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push(
         &mut self,
         agent_id: String,
@@ -1933,6 +1934,7 @@ fn parse_sandbox_binding_from_config(
 fn backfill_on_disk_blobs(
     source_dir: &Path,
     valid_agents: &HashSet<String>,
+    archived_agents: &HashSet<String>,
     agent_names: &HashMap<String, String>,
     master_key: Option<&crate::stateless::MasterKey>,
     pool: &PgPool,
@@ -2025,6 +2027,8 @@ fn backfill_on_disk_blobs(
                 counts.sandbox_bindings_migrated += 1;
             }
 
+            let is_archived = archived_agents.contains(aid_str)
+                || config_dir.join(".anyagents-archived").exists();
             let mut files = Vec::new();
             const SKIP_CONFIG_DIRS: &[&str] = &[
                 "cache",
@@ -2035,9 +2039,12 @@ fn backfill_on_disk_blobs(
                 "tmp",
                 "projects",
                 "shell-snapshots",
+                "shell_snapshots",
                 "plugins",
                 "session-env",
                 "backups",
+                "leases",
+                "thread-writer-locks",
                 "node_modules",
                 ".git",
                 "brain",
@@ -2048,22 +2055,97 @@ fn backfill_on_disk_blobs(
                 ".npm",
                 ".bun",
                 ".cargo",
+                ".rustup",
+                ".dotnet",
+                ".android",
+                ".nuget",
+                ".mozilla",
+                ".camoufox",
+                ".fontconfig",
+                ".biome",
+                ".gsutil",
+                "cargo-home",
+                "cargo-home-test",
+                "work",
+                "workspace",
+                "target",
+                "dist",
+                "build",
+                "vendor",
                 "sessions",
                 ".local",
                 "chromium",
+                "rustup",
+                "sdk",
+                "toolchains",
                 "tools",
                 "bin",
                 "history",
             ];
-            walk_regular_files_bounded(
-                &config_dir,
-                &config_dir,
-                SKIP_CONFIG_DIRS,
-                MAX_MIGRATED_CONFIG_FILE_BYTES,
-                true,
-                &mut skipped_unreadable_dirs,
-                &mut files,
-            )?;
+            const ARCHIVED_CONFIG_SUBDIRS: &[&str] =
+                &["memory", "memory-imports", "preserved-memory"];
+            const ACTIVE_CONFIG_NAMED_SUBDIRS: &[&str] = &[
+                "memory",
+                "memory-imports",
+                "preserved-memory",
+                "claude",
+                "codex",
+                "gemini",
+                "opencode",
+                "muse",
+                "skills",
+                "state",
+                "spiron-cloud-inputs",
+            ];
+            // Agent `config/` often doubles as `$HOME`, so tools may leave arbitrary
+            // SDKs, browser binaries, or git checkouts at top level. Always migrate
+            // top-level config files, and only recurse into known config subtrees
+            // (memory-only subtrees for archived agents).
+            if let Ok(entries) = std::fs::read_dir(&config_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                        continue;
+                    };
+                    if meta.file_type().is_symlink() {
+                        continue;
+                    }
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if meta.is_file() {
+                        if meta.len() > MAX_MIGRATED_CONFIG_FILE_BYTES {
+                            continue;
+                        }
+                        let Ok(rel) = path.strip_prefix(&config_dir) else {
+                            continue;
+                        };
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        if crate::stateless::validate_blob_path(&rel_str).is_ok() {
+                            files.push((rel_str, path, file_mtime_ms(&meta)));
+                        }
+                    } else if meta.is_dir() {
+                        let allowed_subdir = if is_archived {
+                            ARCHIVED_CONFIG_SUBDIRS.contains(&name_str.as_ref())
+                        } else {
+                            !SKIP_CONFIG_DIRS.contains(&name_str.as_ref())
+                                && (name_str.starts_with('.')
+                                    || ACTIVE_CONFIG_NAMED_SUBDIRS.contains(&name_str.as_ref()))
+                        };
+                        if !allowed_subdir {
+                            continue;
+                        }
+                        walk_regular_files_bounded(
+                            &config_dir,
+                            &path,
+                            SKIP_CONFIG_DIRS,
+                            MAX_MIGRATED_CONFIG_FILE_BYTES,
+                            true,
+                            &mut skipped_unreadable_dirs,
+                            &mut files,
+                        )?;
+                    }
+                }
+            }
             for (rel, full_path, mtime_ms) in files {
                 if is_agent_config_transient(&rel) {
                     continue;
@@ -2346,14 +2428,18 @@ pub fn migrate_sqlite_dir_to_postgres(
     }
 
     let mut agent_names = HashMap::new();
+    let mut archived_agents = HashSet::new();
     {
-        let mut stmt = state_sqlite.prepare("SELECT id, name FROM agents")?;
+        let mut stmt = state_sqlite.prepare("SELECT id, name, state FROM agents")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             if let (Some(id), Some(name)) = (
                 sqlite_cell_to_string(row.get_ref(0)?)?,
                 sqlite_cell_to_string(row.get_ref(1)?)?,
             ) {
+                if sqlite_cell_to_string(row.get_ref(2)?)?.as_deref() == Some("archived") {
+                    archived_agents.insert(id.clone());
+                }
                 agent_names.insert(id, name);
             }
         }
@@ -2391,6 +2477,7 @@ pub fn migrate_sqlite_dir_to_postgres(
     let (blob_counts, blob_stats) = backfill_on_disk_blobs(
         &opts.source_dir,
         &valid_agents,
+        &archived_agents,
         &agent_names,
         opts.master_key.as_ref(),
         &pool,

@@ -16,13 +16,13 @@ fn write_executable(path: &Path, body: &str) {
     }
 }
 
-fn spawn_mock_callback_server(
-    fail_first_complete_once: bool,
-) -> (
+type MockCallbackServer = (
     String,
     Arc<Mutex<Vec<(String, Value)>>>,
     std::thread::JoinHandle<()>,
-) {
+);
+
+fn spawn_mock_callback_server(fail_first_complete_once: bool) -> MockCallbackServer {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();

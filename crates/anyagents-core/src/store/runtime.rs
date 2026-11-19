@@ -1105,14 +1105,15 @@ impl Store {
             return Ok(None);
         };
         let aid = agent_id.as_str().to_string();
-        let row: Option<(
+        type RuntimeHeartbeatRow = (
             Option<String>,
             String,
             Option<i64>,
             Option<i64>,
             Option<i64>,
             i32,
-        )> = crate::db::block_on_pg(async move {
+        );
+        let row: Option<RuntimeHeartbeatRow> = crate::db::block_on_pg(async move {
             sqlx::query_as(
                     "SELECT owner_replica_id, turn_state, retry_at_ms, heartbeat_at_ms, idle_since_ms, inflight_children
                      FROM public.agent_runtime

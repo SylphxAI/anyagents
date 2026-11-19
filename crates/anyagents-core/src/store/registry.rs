@@ -148,8 +148,9 @@ pub(super) enum Backend {
     Postgres(Arc<PgShared>),
 }
 
-static OPEN_PG: LazyLock<Mutex<HashMap<String, Arc<Mutex<Weak<PgShared>>>>>> =
-    LazyLock::new(Mutex::default);
+type OpenPgRegistry = Mutex<HashMap<String, Arc<Mutex<Weak<PgShared>>>>>;
+
+static OPEN_PG: LazyLock<OpenPgRegistry> = LazyLock::new(Mutex::default);
 
 pub(super) fn shared_postgres(
     url: &str,

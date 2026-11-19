@@ -13494,7 +13494,7 @@ mod client_link_tests {
                 Ok(serde_json::json!({
                     "action": "list",
                     "path": resolved,
-                    "entries": entries.drain(..).collect::<Vec<_>>(),
+                    "entries": std::mem::take(&mut entries),
                     "count": count,
                     "truncated": false,
                 }))

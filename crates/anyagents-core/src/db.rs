@@ -264,13 +264,11 @@ fn pg_connect_options(url: &str) -> Result<PgConnectOptions, Error> {
             redact_database_url(url)
         ))
     })?;
+    // Default to 0 (unnamed extended queries) so transaction-mode PgBouncer
+    // endpoints never fail on prepared statement collisions.
     let stmt_cache = non_empty_trimmed_env(PG_STATEMENT_CACHE_ENV)
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            // Default to 0 (unnamed extended queries) so transaction-mode PgBouncer
-            // endpoints never fail on prepared statement collisions.
-            0
-        });
+        .unwrap_or(0);
     opts = opts
         .application_name("anyagents")
         .statement_cache_capacity(stmt_cache);
@@ -483,10 +481,10 @@ pub fn to_pg_sql(sql: &str) -> Cow<'_, str> {
         return Cow::Owned(hit.to_string());
     }
     let translated = translate_placeholders_utf8(sql);
-    if let Ok(mut write) = CACHE.write() {
-        if write.len() < 4096 {
-            write.insert(sql.to_string(), Arc::from(translated.as_str()));
-        }
+    if let Ok(mut write) = CACHE.write()
+        && write.len() < 4096
+    {
+        write.insert(sql.to_string(), Arc::from(translated.as_str()));
     }
     Cow::Owned(translated)
 }
@@ -803,7 +801,7 @@ macro_rules! db_params {
         Vec::<$crate::db::DbParam>::new()
     };
     ($($x:expr),+ $(,)?) => {
-        vec![$($crate::db::ToDbParam::to_db_param(&$x)),+]
+        Vec::from([$($crate::db::ToDbParam::to_db_param(&$x)),+])
     };
 }
 pub(crate) use db_params;
