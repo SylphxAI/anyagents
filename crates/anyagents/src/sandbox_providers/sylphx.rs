@@ -3167,7 +3167,7 @@ mod tests {
 
     #[test]
     fn list_files_accepts_proto3_empty_object_and_string_size_bytes() {
-        let base_url = spawn_mock_http(|method, path, _body| match (method, path) {
+        let (base_url, _server) = spawn_mock_http(|method, path, _body| match (method, path) {
             ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/sbx_1:listFiles") => (
                 200,
                 vec![("Content-Type".into(), "application/json".into())],
