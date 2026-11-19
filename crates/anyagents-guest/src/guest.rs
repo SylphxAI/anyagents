@@ -2034,7 +2034,7 @@ kill "$bg_pid" 2>/dev/null || true
         let spec = build_agy_stream_spec(Some("gemini-4-carbon-high"), &[]);
         assert_eq!(spec.resume_flag, "--conversation");
         assert_eq!(
-            spec.resume_args(Some("conv-123")),
+            spec.args,
             vec![
                 "--input-format",
                 "stream-json",
@@ -2043,8 +2043,6 @@ kill "$bg_pid" 2>/dev/null || true
                 "--dangerously-skip-permissions",
                 "--model",
                 "gemini-4-carbon-high",
-                "--conversation",
-                "conv-123",
             ]
         );
 
