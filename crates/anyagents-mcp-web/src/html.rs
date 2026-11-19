@@ -64,11 +64,7 @@ pub fn html_to_markdown(raw: &str) -> (Option<String>, String) {
                 "h3" => out.push_str(if is_closing { "\n" } else { "\n### " }),
                 "h4" | "h5" | "h6" => out.push_str(if is_closing { "\n" } else { "\n#### " }),
                 "li" => out.push_str(if is_closing { "\n" } else { "\n- " }),
-                "td" | "th" => {
-                    if !is_closing {
-                        out.push(' ');
-                    }
-                }
+                "td" | "th" if !is_closing => out.push(' '),
                 _ => {}
             }
         } else if in_tag {
