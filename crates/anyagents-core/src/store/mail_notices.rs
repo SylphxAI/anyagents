@@ -265,10 +265,11 @@ impl Store {
             &ancestor.id,
             format!("anyagents:faulted:{}:{faulted_at}", agent.id),
             format!(
-                "[Sub-Agent Faulted] {relation} `{}` (`{}`) was paused: {streak} turns in a row ended in an error of its own session. Its mail is held until it is resumed. Last error: {}\n\nFix the cause (or decide the work is done), then resume it (`anyagents agents resume {}`) or archive it.",
+                "[Sub-Agent Faulted] {relation} `{}` (`{}`) was paused: {streak} turns in a row ended in an error of its own session. Its mail is held until it is resumed. Last error: {}\n\nFix the cause (or decide the work is done), then resume it via `agents(action: \"resume\", name: \"{}\")` or archive it via `agents(action: \"archive\", name: \"{}\")`.",
                 agent.name,
                 agent.id,
                 error.trim(),
+                agent.name,
                 agent.name,
             ),
         )?;

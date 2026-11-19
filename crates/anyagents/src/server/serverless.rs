@@ -532,53 +532,68 @@ async fn dispatch_sandbox_turn(
     let provider_ensure = Arc::clone(&provider);
     let agent_ensure = input.agent.clone();
     let extra_args_ensure = input.guest_extra_args.clone();
-    let ensured: Result<_, String> = tokio::task::spawn_blocking(move || {
-        let cfg_dir = anyagents_core::agent_config_dir(store_ensure.data_dir(), &agent_ensure.id);
-        let remote_workdir = resolve_remote_sandbox_workdir(&store_ensure, &agent_ensure);
-        let ensured = ensure_sandbox_with_provider(
-            &store_ensure,
-            Arc::clone(&provider_ensure),
-            &ImageSpec::default(),
-            &LeasePolicy::default(),
-            None,
-            None,
-            &agent_ensure.id,
-            Some(&agent_ensure.name),
-            &cfg_dir,
-            Some(&remote_workdir),
-            &BTreeMap::new(),
-        )?;
-
-        // Hydrate persisted PostgreSQL `agent_files` (`config` + decrypted `secrets`)
-        // into the ephemeral config dir, ensure a live remote MCP session exists when
-        // public_url is configured, and sync the full bundle tar into `/home/user/agent-data/state`.
-        let _ = hydrate_agent_files_from_store(&store_ensure, &agent_ensure.id, &cfg_dir)?;
-        if crate::remote::session_token(&cfg_dir).is_err()
-            && crate::remote::require_public_url(store_ensure.data_dir()).is_ok()
-        {
-            crate::remote::begin_session(&store_ensure, &agent_ensure)?;
-        }
-        if crate::remote::session_token(&cfg_dir).is_ok()
-            && crate::cloud_harness::resolve_public_mcp_url(&cfg_dir).is_ok()
-        {
-            sync_agent_bundle_tar_to_provider(
-                provider_ensure.as_ref(),
-                &ensured.handle,
-                Some(&store_ensure),
-                Some(store_ensure.data_dir()),
+    let prompt_for_media = input.prompt.clone();
+    let ensured: Result<(crate::sandbox_exec::EnsuredSandbox, String), String> =
+        tokio::task::spawn_blocking(move || {
+            let cfg_dir =
+                anyagents_core::agent_config_dir(store_ensure.data_dir(), &agent_ensure.id);
+            let remote_workdir = resolve_remote_sandbox_workdir(&store_ensure, &agent_ensure);
+            let lease_env: BTreeMap<String, String> =
+                crate::sandbox_exec::filter_sandbox_launch_env(&agent_ensure.launch_env)
+                    .into_iter()
+                    .collect();
+            let ensured = ensure_sandbox_with_provider(
+                &store_ensure,
+                Arc::clone(&provider_ensure),
+                &ImageSpec::default(),
+                &LeasePolicy::default(),
+                None,
+                None,
+                &agent_ensure.id,
+                Some(&agent_ensure.name),
                 &cfg_dir,
-                agent_ensure.id.as_str(),
-                &agent_ensure.harness,
-                &extra_args_ensure,
+                Some(&remote_workdir),
+                &lease_env,
             )?;
-        }
-        Ok(ensured)
-    })
-    .await
-    .map_err(|e| format!("sandbox ensure join error: {e}"))?;
 
-    let ensured = match ensured {
-        Ok(e) => e,
+            // Hydrate persisted PostgreSQL `agent_files` (`config` + decrypted `secrets`)
+            // into the ephemeral config dir, stage any inbound Telegram media blobs referenced
+            // by the prompt into `<cfg_dir>/media/<file>` (rewriting coordinator paths to
+            // `<state_dir>/media/<file>`), ensure a live remote MCP session exists when
+            // public_url is configured, and sync the full bundle tar into `<state_dir>`.
+            let _ = hydrate_agent_files_from_store(&store_ensure, &agent_ensure.id, &cfg_dir)?;
+            let rewritten_prompt = hydrate_prompt_media_for_sandbox(
+                &store_ensure,
+                &cfg_dir,
+                &ensured.handle.state_dir,
+                &prompt_for_media,
+            );
+            if crate::remote::session_token(&cfg_dir).is_err()
+                && crate::remote::require_public_url(store_ensure.data_dir()).is_ok()
+            {
+                crate::remote::begin_session(&store_ensure, &agent_ensure)?;
+            }
+            if crate::remote::session_token(&cfg_dir).is_ok()
+                && crate::cloud_harness::resolve_public_mcp_url(&cfg_dir).is_ok()
+            {
+                sync_agent_bundle_tar_to_provider(
+                    provider_ensure.as_ref(),
+                    &ensured.handle,
+                    Some(&store_ensure),
+                    Some(store_ensure.data_dir()),
+                    &cfg_dir,
+                    agent_ensure.id.as_str(),
+                    &agent_ensure.harness,
+                    &extra_args_ensure,
+                )?;
+            }
+            Ok((ensured, rewritten_prompt))
+        })
+        .await
+        .map_err(|e| format!("sandbox ensure join error: {e}"))?;
+
+    let (ensured, effective_prompt) = match ensured {
+        Ok(pair) => pair,
         Err(err) => {
             let store_fail = Arc::clone(&store);
             let tid_fail = turn_id.clone();
@@ -649,7 +664,7 @@ async fn dispatch_sandbox_turn(
 
     let exec_req = ExecRequest::argv(argv)
         .with_cwd(ensured.handle.workdir.clone())
-        .with_stdin(input.prompt.into_bytes())
+        .with_stdin(effective_prompt.into_bytes())
         .with_timeout_ms(DETACHED_EXEC_TIMEOUT_MS);
 
     let out = match provider.exec(&ensured.handle, &exec_req).await {
@@ -750,9 +765,80 @@ async fn dispatch_sandbox_turn(
     })
 }
 
-/// When `ANYAGENTS_SERVERLESS=true`, synchronously dispatch the next undelivered mailbox
-/// message for `agent_id` (if no remote turn is already active for it). Returns `Ok(None)`
-/// immediately when not in serverless mode or when nothing is eligible.
+/// Hydrate any coordinator-side `<data_dir>/media/<file_name>` references in `prompt`
+/// from PostgreSQL `deployment_blobs(namespace = 'media')` (or local fallback) into
+/// `<cfg_dir>/media/<file_name>` so the sandbox tar sync uploads them to
+/// `<state_dir>/media/<file_name>`, and rewrite the paths in the returned prompt.
+fn hydrate_prompt_media_for_sandbox(
+    store: &Store,
+    cfg_dir: &Path,
+    state_dir: &str,
+    prompt: &str,
+) -> String {
+    let media_dir = store.data_dir().join(anyagents_harness::media::MEDIA_DIR);
+    let mut prefixes = Vec::new();
+    let dir_str = media_dir.to_string_lossy().trim_end_matches('/').to_string();
+    if !dir_str.is_empty() {
+        prefixes.push(format!("{dir_str}/"));
+    }
+    if dir_str != "/var/lib/anyagents/media" {
+        prefixes.push("/var/lib/anyagents/media/".to_string());
+    }
+    let remote_media_prefix = format!("{}/media", state_dir.trim_end_matches('/'));
+    let mut rewritten = prompt.to_string();
+    let mut hydrated_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for prefix in &prefixes {
+        let mut search_from = 0usize;
+        while let Some(rel_idx) = rewritten[search_from..].find(prefix.as_str()) {
+            let start = search_from + rel_idx + prefix.len();
+            let rest = &rewritten[start..];
+            let end_offset = rest
+                .find(|c: char| {
+                    c.is_whitespace() || matches!(c, ']' | ')' | '"' | '\'' | '>' | ',' | ';')
+                })
+                .unwrap_or(rest.len());
+            let fname = rest[..end_offset].trim();
+            if !fname.is_empty()
+                && !fname.contains('/')
+                && !fname.contains('\\')
+                && !fname.contains("..")
+            {
+                hydrated_names.insert(fname.to_string());
+            }
+            search_from = start + end_offset;
+        }
+    }
+    if hydrated_names.is_empty() {
+        return rewritten;
+    }
+    let stage_dir = cfg_dir.join("media");
+    let _ = std::fs::create_dir_all(&stage_dir);
+    for fname in hydrated_names {
+        let bytes_opt = store
+            .blob_store()
+            .get_deployment_blob("media", &fname)
+            .ok()
+            .flatten()
+            .map(|b| b.content)
+            .or_else(|| std::fs::read(media_dir.join(&fname)).ok());
+        if let Some(bytes) = bytes_opt
+            && !bytes.is_empty()
+            && std::fs::write(stage_dir.join(&fname), &bytes).is_ok()
+        {
+            for prefix in &prefixes {
+                let from = format!("{prefix}{fname}");
+                let to = format!("{remote_media_prefix}/{fname}");
+                rewritten = rewritten.replace(&from, &to);
+            }
+        }
+    }
+    rewritten
+}
+
+/// When `ANYAGENTS_SERVERLESS=true`, synchronously dispatch all pending undelivered
+/// mailbox messages (batched up to 20) for `agent_id` once no live remote turn is running.
+/// Automatically settles timed-out remote turns and clears orphaned `turn_recovery` locks
+/// so dead detached turns can never deadlock subsequent messages.
 pub(crate) async fn dispatch_next_mailbox_message_if_serverless(
     store: Arc<Store>,
     agent_id: &AgentId,
@@ -762,35 +848,85 @@ pub(crate) async fn dispatch_next_mailbox_message_if_serverless(
     }
     let store_r = Arc::clone(&store);
     let aid = agent_id.clone();
-    let next_item = run_store_blocking(move || {
+    let next_batch = run_store_blocking(move || {
         let agent = store_r
             .agent(&aid)
             .map_err(|e| format!("load agent {aid}: {e}"))?;
         if matches!(agent.state.as_str(), "paused" | "archived") {
             return Ok(None);
         }
+        let now = now_ms();
+        let stale_before = now.saturating_sub(sandbox_stale_threshold_ms());
         let active = store_r
             .remote_turn_store()
             .list_active_for_agent(&aid)
             .map_err(|e| e.to_string())?;
-        if !active.is_empty() {
+        let mut live_active = 0usize;
+        for turn in active {
+            if turn.harness_kind == "sandbox" && turn.last_event_at_ms <= stale_before {
+                let _ = settle_remote_turn_and_deliver(
+                    &store_r,
+                    &turn.turn_id,
+                    SettleRemoteTurn {
+                        status: "failed".to_string(),
+                        result_text: None,
+                        error_text: Some("sandbox turn heartbeat timed out".to_string()),
+                        usage_json: None,
+                        cursor: None,
+                        settled_at_ms: now,
+                    },
+                    None,
+                    0,
+                );
+            } else {
+                live_active += 1;
+            }
+        }
+        if live_active > 0 {
             return Ok(None);
         }
-        let Some(msg) = store_r.next_undelivered(&aid).map_err(|e| e.to_string())? else {
+        if store_r.has_open_turn(&aid).unwrap_or(false) {
+            let _ = store_r.reconcile_stale_open_turn(&aid);
+        }
+        let msgs = store_r.list_undelivered(&aid, 20).map_err(|e| e.to_string())?;
+        if msgs.is_empty() {
             return Ok(None);
-        };
-        Ok(Some((agent, msg)))
+        }
+        Ok(Some((agent, msgs)))
     })
     .await?;
 
-    let Some((agent, msg)) = next_item else {
+    let Some((agent, msgs)) = next_batch else {
         return Ok(None);
     };
 
-    let reply_target = infer_reply_target_from_message(&msg);
-    let mut input = ServerlessDispatchInput::for_agent(agent, msg.text);
-    input.message_seq = Some(msg.seq);
-    input.opener_id = Some(msg.id.to_string());
+    let last = msgs.last().expect("non-empty batch");
+    let prompt = if msgs.len() == 1 {
+        last.text.clone()
+    } else {
+        let mut combined = String::new();
+        for (idx, m) in msgs.iter().enumerate() {
+            if idx > 0 {
+                combined.push_str("\n\n---\n\n");
+            }
+            let sender = m.sender.as_deref().unwrap_or("unknown");
+            combined.push_str(&format!("[Message seq={} from {}]\n{}", m.seq, sender, m.text));
+        }
+        combined
+    };
+    // Prefer the latest human/Telegram reply target in the batch over older scheduled reminders.
+    let reply_target = msgs
+        .iter()
+        .rev()
+        .find_map(|m| match infer_reply_target_from_message(m) {
+            Some(rt @ ReplyTarget::Telegram { .. }) => Some(rt),
+            _ => None,
+        })
+        .or_else(|| msgs.iter().rev().find_map(infer_reply_target_from_message));
+
+    let mut input = ServerlessDispatchInput::for_agent(agent, prompt);
+    input.message_seq = Some(last.seq);
+    input.opener_id = Some(last.id.to_string());
     input.reply_target = reply_target;
     dispatch_serverless_turn(store, input).await.map(Some)
 }
@@ -987,6 +1123,16 @@ pub(crate) fn settle_remote_turn_and_deliver(
             let _ = store.note_turn_errored_for(&turn.agent_id, seq, err_text, false);
         }
     }
+    // Always close any remaining stale `turn_recovery` open-turn lock if no active
+    // remote turns remain for this agent.
+    if store
+        .remote_turn_store()
+        .list_active_for_agent(&turn.agent_id)
+        .map(|v| v.is_empty())
+        .unwrap_or(false)
+    {
+        let _ = store.reconcile_stale_open_turn(&turn.agent_id);
+    }
 
     // 5. Update `agent_runtime` heartbeat & `agent_sandbox_bindings` idle marker.
     let still_active = store
@@ -1166,7 +1312,18 @@ pub(crate) async fn guest_events_route(
     }
 
     let store = Arc::clone(&state.store);
-    spawn_store(move || {
+    let store_for_drain = Arc::clone(&state.store);
+    let is_terminal_event = matches!(
+        payload.event_type.trim().to_ascii_lowercase().as_str(),
+        "turn_complete"
+            | "completed"
+            | "turn_failed"
+            | "failed"
+            | "turn_cancelled"
+            | "cancelled"
+            | "canceled"
+    );
+    let (json_resp, settled_agent_id) = spawn_store(move || {
         let Some(turn) = store
             .remote_turn_store()
             .verify_callback_token(&payload.turn_id, &token)
@@ -1233,11 +1390,14 @@ pub(crate) async fn guest_events_route(
                 apply_guest_heartbeat(&store, &turn.agent_id, &frame, ts)
                     .map_err(ApiError::from_store)?;
 
-                Ok(Json(json!({
-                    "ok": true,
-                    "turn_id": turn.turn_id,
-                    "event_type": "heartbeat",
-                })))
+                Ok((
+                    Json(json!({
+                        "ok": true,
+                        "turn_id": turn.turn_id,
+                        "event_type": "heartbeat",
+                    })),
+                    None::<AgentId>,
+                ))
             }
             "delta" => {
                 let cursor = payload.seq.map(|s| format!("delta:{s}"));
@@ -1254,11 +1414,14 @@ pub(crate) async fn guest_events_route(
                         },
                     )
                     .map_err(ApiError::from_store)?;
-                Ok(Json(json!({
-                    "ok": true,
-                    "turn_id": turn.turn_id,
-                    "event_type": "delta",
-                })))
+                Ok((
+                    Json(json!({
+                        "ok": true,
+                        "turn_id": turn.turn_id,
+                        "event_type": "delta",
+                    })),
+                    None,
+                ))
             }
             "turn_complete" | "completed" => {
                 let settled = settle_remote_turn_and_deliver(
@@ -1277,14 +1440,18 @@ pub(crate) async fn guest_events_route(
                 )
                 .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
                 .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
-                Ok(Json(json!({
-                    "ok": true,
-                    "turn_id": settled.turn.turn_id,
-                    "status": settled.turn.status,
-                    "settled": settled.settled_now,
-                    "idempotent_replay": !settled.settled_now,
-                    "delivered_reply": settled.delivered_reply,
-                })))
+                let drain_aid = settled.settled_now.then(|| settled.turn.agent_id.clone());
+                Ok((
+                    Json(json!({
+                        "ok": true,
+                        "turn_id": settled.turn.turn_id,
+                        "status": settled.turn.status,
+                        "settled": settled.settled_now,
+                        "idempotent_replay": !settled.settled_now,
+                        "delivered_reply": settled.delivered_reply,
+                    })),
+                    drain_aid,
+                ))
             }
             "turn_failed" | "failed" => {
                 let settled = settle_remote_turn_and_deliver(
@@ -1305,13 +1472,17 @@ pub(crate) async fn guest_events_route(
                 )
                 .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
                 .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
-                Ok(Json(json!({
-                    "ok": true,
-                    "turn_id": settled.turn.turn_id,
-                    "status": settled.turn.status,
-                    "settled": settled.settled_now,
-                    "idempotent_replay": !settled.settled_now,
-                })))
+                let drain_aid = settled.settled_now.then(|| settled.turn.agent_id.clone());
+                Ok((
+                    Json(json!({
+                        "ok": true,
+                        "turn_id": settled.turn.turn_id,
+                        "status": settled.turn.status,
+                        "settled": settled.settled_now,
+                        "idempotent_replay": !settled.settled_now,
+                    })),
+                    drain_aid,
+                ))
             }
             "turn_cancelled" | "cancelled" | "canceled" => {
                 let settled = settle_remote_turn_and_deliver(
@@ -1330,13 +1501,17 @@ pub(crate) async fn guest_events_route(
                 )
                 .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
                 .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
-                Ok(Json(json!({
-                    "ok": true,
-                    "turn_id": settled.turn.turn_id,
-                    "status": settled.turn.status,
-                    "settled": settled.settled_now,
-                    "idempotent_replay": !settled.settled_now,
-                })))
+                let drain_aid = settled.settled_now.then(|| settled.turn.agent_id.clone());
+                Ok((
+                    Json(json!({
+                        "ok": true,
+                        "turn_id": settled.turn.turn_id,
+                        "status": settled.turn.status,
+                        "settled": settled.settled_now,
+                        "idempotent_replay": !settled.settled_now,
+                    })),
+                    drain_aid,
+                ))
             }
             other => Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -1344,7 +1519,22 @@ pub(crate) async fn guest_events_route(
             )),
         }
     })
-    .await
+    .await?;
+    if is_terminal_event
+        && is_serverless_mode()
+        && let Some(drain_aid) = settled_agent_id
+    {
+        tokio::spawn(async move {
+            if let Err(err) =
+                dispatch_next_mailbox_message_if_serverless(store_for_drain, &drain_aid).await
+            {
+                eprintln!(
+                    "anyagents-serverless: post-turn mailbox drain failed for {drain_aid}: {err}"
+                );
+            }
+        });
+    }
+    Ok(json_resp)
 }
 
 // ============================================================================
@@ -1897,6 +2087,10 @@ pub(crate) struct TickSummary {
     pub schedules_fired: usize,
     pub cloud_turns_polled: usize,
     pub turns_settled: usize,
+    #[serde(default)]
+    pub stale_open_turns_cleared: usize,
+    #[serde(default)]
+    pub backlog_dispatched: usize,
     pub leases_renewed: usize,
     pub sandboxes_swept: usize,
 }
@@ -2075,6 +2269,37 @@ pub(crate) async fn run_tick_pass(
     })
     .await?;
     summary.turns_settled += stale_settled;
+
+    // 2c. Reconcile orphaned `turn_recovery` locks (`has_open_turn=true` with zero active
+    // remote turns) and drain queued undelivered mailbox messages for idle running agents.
+    if is_serverless_mode() {
+        let store_rec = Arc::clone(&store);
+        let (cleared, pending_agents) = spawn_store(move || {
+            let cleared = store_rec
+                .reconcile_all_stale_serverless_open_turns()
+                .unwrap_or(0);
+            let agents = store_rec
+                .list_running_agents_with_undelivered(8)
+                .unwrap_or_default();
+            Ok((cleared, agents))
+        })
+        .await?;
+        summary.stale_open_turns_cleared = cleared;
+
+        for aid in pending_agents {
+            let store_disp = Arc::clone(&store);
+            // Bound each tick backlog dispatch so `/v1/internal/tick` responds promptly;
+            // slow cold-start sandbox ensures continue running in the spawned task.
+            let handle = tokio::spawn(async move {
+                dispatch_next_mailbox_message_if_serverless(store_disp, &aid).await
+            });
+            if let Ok(Ok(Ok(Some(_)))) =
+                tokio::time::timeout(Duration::from_millis(750), handle).await
+            {
+                summary.backlog_dispatched += 1;
+            }
+        }
+    }
 
     // 3. Renew leases for active non-idle sandbox bindings.
     let store_renew = Arc::clone(&store);

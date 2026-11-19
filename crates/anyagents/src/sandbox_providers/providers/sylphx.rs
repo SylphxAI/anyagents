@@ -7,8 +7,9 @@
 //! mutation, and decouples compute leases (default 5m warm idle / 15m safety TTL) from
 //! persistent volume lifetimes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -17,6 +18,26 @@ use super::super::sylphx::{DEFAULT_SHAPE, DEFAULT_TEMPLATE, SylphxSandboxClient}
 use agent_tools::base64_encode;
 
 static TAR_UPLOAD_SEQ: AtomicU64 = AtomicU64::new(1);
+static VOLUME_ENSURE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn volume_ensure_lock(key: &str) -> Arc<Mutex<()>> {
+    let map = VOLUME_ENSURE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(
+        guard
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
+fn is_lease_collision_or_timeout(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("409")
+        || lower.contains("resource_in_use")
+        || lower.contains("attached to another lease")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+}
 
 use super::{
     DEFAULT_MOUNT_PATH, EnsureSandboxRequest, ExecOutput, ExecRequest, LeasePolicy,
@@ -144,6 +165,12 @@ impl SandboxProvider for SylphxProvider {
                 size_gib,
             )?;
 
+            // Serialize concurrent `ensure()` calls for the same volume within this
+            // coordinator replica so two simultaneous requests never race `POST /leases`.
+            let vol_lock_key = format!("{}::{}", cfg.parent, volume.resource_name);
+            let vol_lock = volume_ensure_lock(&vol_lock_key);
+            let _vol_guard = vol_lock.lock().unwrap_or_else(|e| e.into_inner());
+
             let ttl_str = req.lease.ttl_duration_string();
             let mut reused_lease = None;
             if let Some(prev_ref) = req.existing.as_ref().and_then(|h| {
@@ -156,6 +183,17 @@ impl SandboxProvider for SylphxProvider {
             {
                 reused_lease =
                     Some(client.wait_lease_ready(&cfg.parent, fetched, LEASE_READY_TIMEOUT)?);
+            }
+
+            // If persisted binding had no active lease (or another replica created/owned
+            // a live lease for this volume), discover and reuse any active lease attached
+            // to `volume.resource_name` before attempting `POST /leases`.
+            if reused_lease.is_none()
+                && let Ok(Some(discovered)) =
+                    client.find_active_lease_for_volume(&cfg.parent, &volume.resource_name)
+            {
+                reused_lease =
+                    Some(client.wait_lease_ready(&cfg.parent, discovered, LEASE_READY_TIMEOUT)?);
             }
 
             let (lease, freshly_created) = match reused_lease {
@@ -192,20 +230,60 @@ impl SandboxProvider for SylphxProvider {
                         .filter(|s| !s.is_empty())
                         .unwrap_or(&cfg.default_shape);
 
-                    let created = client.create_lease_with_options(
-                        &cfg.parent,
-                        &volume.resource_name,
-                        &mount_path,
-                        image,
-                        Some(template),
-                        shape,
-                        &req.image.env,
-                        Some(&ttl_str),
-                        Some(&req.network),
-                    )?;
-                    let ready =
-                        client.wait_lease_ready(&cfg.parent, created, LEASE_READY_TIMEOUT)?;
-                    (ready, true)
+                    const COLLISION_BACKOFF_MS: &[u64] = &[1_500, 3_000, 5_000, 8_000];
+                    let mut attempt = 0usize;
+                    loop {
+                        match client.create_lease_with_options(
+                            &cfg.parent,
+                            &volume.resource_name,
+                            &mount_path,
+                            image,
+                            Some(template),
+                            shape,
+                            &req.image.env,
+                            Some(&ttl_str),
+                            Some(&req.network),
+                        ) {
+                            Ok(created) => {
+                                let ready = client.wait_lease_ready(
+                                    &cfg.parent,
+                                    created,
+                                    LEASE_READY_TIMEOUT,
+                                )?;
+                                break (ready, true);
+                            }
+                            Err(err) if is_lease_collision_or_timeout(&err) => {
+                                // Recover when a concurrent replica or a timed-out POST
+                                // already attached `volume.resource_name` to a live lease.
+                                if let Ok(Some(discovered)) = client
+                                    .find_active_lease_for_volume(&cfg.parent, &volume.resource_name)
+                                {
+                                    let ready = client.wait_lease_ready(
+                                        &cfg.parent,
+                                        discovered,
+                                        LEASE_READY_TIMEOUT,
+                                    )?;
+                                    let renewed = client
+                                        .renew_lease(
+                                            &cfg.parent,
+                                            &ready.resource_name,
+                                            Some(&ttl_str),
+                                        )
+                                        .unwrap_or(ready);
+                                    break (renewed, false);
+                                }
+                                if attempt < COLLISION_BACKOFF_MS.len() {
+                                    std::thread::sleep(Duration::from_millis(
+                                        COLLISION_BACKOFF_MS[attempt],
+                                    ));
+                                    attempt += 1;
+                                    continue;
+                                }
+                                return Err(err);
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
                 }
             };
 

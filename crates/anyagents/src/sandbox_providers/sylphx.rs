@@ -366,9 +366,26 @@ pub struct SylphxLease {
     pub envd_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 impl SylphxLease {
+    /// Whether this lease attaches `volume_resource` (by full resource name or volume id suffix).
+    pub fn attaches_volume(&self, volume_resource: &str) -> bool {
+        let target = volume_resource.trim().trim_matches('/');
+        if target.is_empty() {
+            return false;
+        }
+        let target_short = target.rsplit('/').next().unwrap_or(target);
+        self.volumes.iter().any(|v| {
+            let candidate = v.trim().trim_matches('/');
+            candidate == target || candidate.rsplit('/').next() == Some(target_short)
+        })
+    }
+
     /// Whether this lease is in a runnable state (`READY` / `RUNNING` / `ACTIVE`).
     pub fn is_ready(&self) -> bool {
         let s = self.state.trim().to_ascii_uppercase();
@@ -930,7 +947,10 @@ impl SylphxSandboxClient {
         const MAX_CAPACITY_RETRIES: usize = 3;
         let mut attempt = 0usize;
         let (status, val) = loop {
-            let (status, val) = self.request_json("POST", &url, Some(&body), 45_000)?;
+            // `POST /v1/{parent}/leases` waits server-side up to 60s for cold BYO-OCI
+            // boot unless skipped; give the client a 120s global timeout so we never
+            // prematurely abort a healthy in-flight grant and orphan its volume lock.
+            let (status, val) = self.request_json("POST", &url, Some(&body), 120_000)?;
             if (200..300).contains(&status) {
                 break (status, val);
             }
@@ -1048,6 +1068,78 @@ impl SylphxSandboxClient {
             ));
         }
         Ok(Some(parse_lease_response(&val, parent)?))
+    }
+
+    /// List sandbox leases under `parent` (`GET /v1/{parent}/leases`), following pagination
+    /// up to 10 pages so callers can recover active leases holding a persistent volume.
+    pub fn list_leases(&self, parent: &str) -> Result<Vec<SylphxLease>, String> {
+        let base_url = self.collection_url(parent, "leases");
+        let mut leases = Vec::new();
+        let mut page_token: Option<String> = None;
+        for _ in 0..10 {
+            let url = match page_token.as_deref().filter(|t| !t.is_empty()) {
+                Some(tok) => format!("{base_url}?page_token={}", url_encode_query(tok)),
+                None => base_url.clone(),
+            };
+            let (status, val) = self.request_json("GET", &url, None, 20_000)?;
+            if !(200..300).contains(&status) {
+                return Err(format!(
+                    "Sylphx GET {url} returned HTTP {status}: {}",
+                    compact_error_body(&val)
+                ));
+            }
+            let items = val
+                .get("leases")
+                .or_else(|| val.get("items"))
+                .or_else(|| val.get("data"))
+                .and_then(serde_json::Value::as_array)
+                .or_else(|| val.as_array());
+            if let Some(arr) = items {
+                for item in arr {
+                    if let Ok(parsed) = parse_lease_response(item, parent) {
+                        leases.push(parsed);
+                    }
+                }
+            }
+            let next = val
+                .get("next_page_token")
+                .or_else(|| val.get("nextPageToken"))
+                .or_else(|| val.get("next_cursor"))
+                .or_else(|| val.get("nextCursor"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            if next.is_none() || next == page_token {
+                break;
+            }
+            page_token = next;
+        }
+        Ok(leases)
+    }
+
+    /// Find an existing non-terminal lease already attaching `volume_resource` (preferring
+    /// `READY` leases over still-booting ones).
+    pub fn find_active_lease_for_volume(
+        &self,
+        parent: &str,
+        volume_resource: &str,
+    ) -> Result<Option<SylphxLease>, String> {
+        let leases = self.list_leases(parent)?;
+        let mut matching: Vec<SylphxLease> = leases
+            .into_iter()
+            .filter(|l| !l.is_terminal() && l.attaches_volume(volume_resource))
+            .collect();
+        if matching.is_empty() {
+            return Ok(None);
+        }
+        // Prefer ready leases first; break ties by latest expires_at.
+        matching.sort_by(|a, b| {
+            b.is_ready()
+                .cmp(&a.is_ready())
+                .then_with(|| b.expires_at.cmp(&a.expires_at))
+        });
+        Ok(matching.into_iter().next())
     }
 
     /// Poll `GET /v1/{lease_resource}` until the lease transitions to `READY`.
@@ -2172,6 +2264,37 @@ fn parse_lease_response(val: &serde_json::Value, parent: &str) -> Result<SylphxL
         .or_else(|| root.get("expireTime"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    let mut volumes = Vec::new();
+    if let Some(arr) = root
+        .pointer("/spec/volumes")
+        .or_else(|| root.get("volumes"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for entry in arr {
+            if let Some(vol) = entry
+                .get("volume")
+                .or_else(|| entry.get("name"))
+                .or_else(|| entry.as_str().map(|_| entry))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                volumes.push(vol.to_string());
+            }
+        }
+    }
+    let mut labels = BTreeMap::new();
+    if let Some(obj) = root
+        .pointer("/meta/labels")
+        .or_else(|| root.get("labels"))
+        .and_then(serde_json::Value::as_object)
+    {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                labels.insert(k.clone(), s.to_string());
+            }
+        }
+    }
     Ok(SylphxLease {
         resource_name,
         id,
@@ -2181,7 +2304,21 @@ fn parse_lease_response(val: &serde_json::Value, parent: &str) -> Result<SylphxL
         envd_url,
         envd_token,
         expires_at,
+        volumes,
+        labels,
     })
+}
+
+fn url_encode_query(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn decode_output_stream(
@@ -2852,5 +2989,157 @@ mod tests {
             .unwrap();
         assert_eq!(lease.id, "lease_ok");
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn find_active_lease_for_volume_matches_ready_lease_and_ignores_terminal() {
+        let (base_url, _server) = spawn_mock_http(move |method, path, _body| {
+            if method == "GET" && path == "/v1/orgs/o1/projects/p1/envs/e1/leases" {
+                return (
+                    200,
+                    vec![("Content-Type".into(), "application/json".into())],
+                    serde_json::to_vec(&serde_json::json!({
+                        "leases": [
+                            {
+                                "name": "orgs/o1/projects/p1/envs/e1/leases/lease_ended",
+                                "spec": {
+                                    "volumes": [{
+                                        "volume": "orgs/o1/projects/p1/envs/e1/volumes/anyagents-agt-1",
+                                        "mount_path": "/home/user/agent-data"
+                                    }]
+                                },
+                                "status": { "state": "ended" }
+                            },
+                            {
+                                "name": "orgs/o1/projects/p1/envs/e1/leases/lease_live",
+                                "spec": {
+                                    "volumes": [{
+                                        "volume": "orgs/o1/projects/p1/envs/e1/volumes/anyagents-agt-1",
+                                        "mount_path": "/home/user/agent-data"
+                                    }]
+                                },
+                                "status": {
+                                    "state": "ready",
+                                    "expire_time": "2026-11-19T18:00:00Z"
+                                }
+                            }
+                        ]
+                    }))
+                    .unwrap(),
+                );
+            }
+            (404, vec![], br#"{"error":"not found"}"#.to_vec())
+        });
+
+        let client = SylphxSandboxClient::new(base_url, Some("tok".into()));
+        let found = client
+            .find_active_lease_for_volume(
+                "orgs/o1/projects/p1/envs/e1",
+                "orgs/o1/projects/p1/envs/e1/volumes/anyagents-agt-1",
+            )
+            .unwrap()
+            .expect("expected active lease for volume");
+        assert_eq!(found.id, "lease_live");
+        assert!(found.attaches_volume("anyagents-agt-1"));
+    }
+
+    #[test]
+    fn provider_ensure_recovers_from_409_resource_in_use_by_reusing_active_lease() {
+        use super::super::providers::sylphx::{SylphxConfig, SylphxProvider};
+        use super::super::providers::{EnsureSandboxRequest, ImageSpec, LeasePolicy, SandboxProvider, VolumeSpec};
+
+        let list_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let post_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let list_ref = Arc::clone(&list_calls);
+        let post_ref = Arc::clone(&post_calls);
+        let (base_url, _server) = spawn_mock_http(move |method, path, _body| {
+            match (method, path) {
+                ("GET", "/v1/orgs/o1/projects/p1/envs/e1/volumes/anyagents-agt-race") => (
+                    200,
+                    vec![("Content-Type".into(), "application/json".into())],
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "orgs/o1/projects/p1/envs/e1/volumes/anyagents-agt-race",
+                        "status": { "state": "available" }
+                    }))
+                    .unwrap(),
+                ),
+                ("GET", "/v1/orgs/o1/projects/p1/envs/e1/leases") => {
+                    let n = list_ref.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // First check before POST sees no lease yet (simulates race with another replica).
+                        (
+                            200,
+                            vec![("Content-Type".into(), "application/json".into())],
+                            serde_json::to_vec(&serde_json::json!({ "leases": [] })).unwrap(),
+                        )
+                    } else {
+                        // Recovery check after 409 sees the winning replica's active lease!
+                        (
+                            200,
+                            vec![("Content-Type".into(), "application/json".into())],
+                            serde_json::to_vec(&serde_json::json!({
+                                "leases": [{
+                                    "name": "orgs/o1/projects/p1/envs/e1/leases/lease_winner",
+                                    "spec": {
+                                        "volumes": [{
+                                            "volume": "orgs/o1/projects/p1/envs/e1/volumes/anyagents-agt-race",
+                                            "mount_path": "/home/user/agent-data"
+                                        }]
+                                    },
+                                    "status": { "state": "ready" }
+                                }]
+                            }))
+                            .unwrap(),
+                        )
+                    }
+                }
+                ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases") => {
+                    post_ref.fetch_add(1, Ordering::SeqCst);
+                    (
+                        409,
+                        vec![("Content-Type".into(), "application/json".into())],
+                        serde_json::to_vec(&serde_json::json!({
+                            "code": "RESOURCE_IN_USE",
+                            "detail": "orgs/o1/projects/p1/envs/e1/volumes/anyagents-agt-race is attached to another lease."
+                        }))
+                        .unwrap(),
+                    )
+                }
+                ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_winner:renew") => (
+                    200,
+                    vec![("Content-Type".into(), "application/json".into())],
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "orgs/o1/projects/p1/envs/e1/leases/lease_winner",
+                        "status": { "state": "ready" }
+                    }))
+                    .unwrap(),
+                ),
+                _ => (404, vec![], br#"{"error":"not found"}"#.to_vec()),
+            }
+        });
+
+        let mut cfg = SylphxConfig::new("orgs/o1/projects/p1/envs/e1");
+        cfg.endpoint = base_url;
+        cfg.token = Some("tok".into());
+        let provider = SylphxProvider::new(cfg).unwrap();
+        let req = EnsureSandboxRequest {
+            agent_id: "agt_race".into(),
+            agent_name: Some("race".into()),
+            image: ImageSpec::default(),
+            volume: Some(VolumeSpec::for_agent("agt_race")),
+            shape: None,
+            network: super::super::providers::NetworkPolicySpec::Allow,
+            lease: LeasePolicy::default(),
+            existing: None,
+            workdir: None,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.block_on(provider.ensure(&req)).unwrap();
+        assert_eq!(handle.sandbox_id, "lease_winner");
+        assert_eq!(post_calls.load(Ordering::SeqCst), 1);
+        assert!(list_calls.load(Ordering::SeqCst) >= 2);
     }
 }

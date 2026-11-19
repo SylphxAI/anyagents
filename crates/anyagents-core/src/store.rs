@@ -5642,6 +5642,100 @@ impl Store {
         Ok(None)
     }
 
+    /// Return up to `limit` undelivered messages for `agent_id` in ascending `seq` order
+    /// within a single read snapshot. Used by serverless dispatchers to batch queued mail
+    /// instead of draining one old message per webhook.
+    pub fn list_undelivered(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> Result<Vec<Message>, Error> {
+        let cap = limit.clamp(1, 100) as i64;
+        let conn = self.read_conn();
+        let snapshot = conn.snapshot()?;
+        agent_exists(&snapshot, agent_id)?;
+        let delivered = cursor(&snapshot, agent_id)?;
+        let rows = snapshot.db_query_vec(
+            concat!(
+                "SELECT ",
+                message_cols!(),
+                " FROM messages
+                 WHERE agent_id = ?1 AND seq > ?2
+                 ORDER BY seq ASC
+                 LIMIT ?3"
+            ),
+            &db_params![agent_id.as_str(), delivered, cap],
+            |r| message_from_row_with_cursor_db(r, delivered),
+        )?;
+        Ok(rows)
+    }
+
+    /// List up to `limit` live (`running`) agent IDs that currently have at least one
+    /// undelivered message (`messages.seq > COALESCE(mailbox_cursors.delivered_seq, 0)`),
+    /// ordered by oldest undelivered message first.
+    pub fn list_running_agents_with_undelivered(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AgentId>, Error> {
+        let cap = limit.clamp(1, 100) as i64;
+        let conn = self.read_conn();
+        let rows: Vec<String> = conn.db_query_vec(
+            "SELECT a.id
+             FROM agents a
+             JOIN messages m ON m.agent_id = a.id
+             LEFT JOIN mailbox_cursors c ON c.agent_id = a.id
+             WHERE a.state = 'running'
+               AND m.seq > COALESCE(c.delivered_seq, 0)
+             GROUP BY a.id
+             ORDER BY MIN(m.received_at_ms) ASC
+             LIMIT ?1",
+            &db_params![cap],
+            |r| r.get::<String>(0),
+        )?;
+        let mut out = Vec::with_capacity(rows.len());
+        for raw in rows {
+            if let Ok(id) = AgentId::parse(&raw) {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Close a stale `turn_recovery` row (`opened_seq > completed_seq`) when a serverless
+    /// replica confirms no remote turn is currently running for `agent_id`. Returns `true`
+    /// if a stale open-turn lock was cleared.
+    pub fn reconcile_stale_open_turn(&self, agent_id: &AgentId) -> Result<bool, Error> {
+        self.write_tx(|tx| {
+            let changed = tx.db_execute(
+                "UPDATE turn_recovery
+                 SET completed_seq = opened_seq, recovery_count = 0
+                 WHERE agent_id = ?1 AND opened_seq > completed_seq",
+                &db_params![agent_id.as_str()],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// Close stale `turn_recovery` rows (`opened_seq > completed_seq`) for all running
+    /// agents that have no active `pending_remote_turns`. Returns the count cleared.
+    pub fn reconcile_all_stale_serverless_open_turns(&self) -> Result<usize, Error> {
+        self.write_tx(|tx| {
+            let changed = tx.db_execute(
+                "UPDATE turn_recovery
+                 SET completed_seq = opened_seq, recovery_count = 0
+                 WHERE opened_seq > completed_seq
+                   AND agent_id IN (SELECT id FROM agents WHERE state = 'running')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pending_remote_turns p
+                       WHERE p.agent_id = turn_recovery.agent_id
+                         AND p.status IN ('dispatched', 'running')
+                   )",
+                &[],
+            )?;
+            Ok(changed)
+        })
+    }
+
     /// True if there is at least one undelivered message that should wake an idle
     /// agent (`event != "reaction_passive"`). Passive group reactions remain in
     /// the mailbox and are delivered on the agent's next active turn.

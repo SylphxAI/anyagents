@@ -1889,6 +1889,52 @@ struct CollectedBundle {
     dirs: std::collections::BTreeSet<String>,
 }
 
+/// Filter per-agent `launch_env` pairs before forwarding them into a remote sandbox
+/// lease or `guest-config.json`. Preserves agent-scoped operational variables while
+/// failing closed against leaking coordinator host secrets or overriding protected
+/// sandbox runtime/gateway paths.
+pub(crate) fn filter_sandbox_launch_env(raw: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (k, v) in raw {
+        let key = k.trim();
+        if key.is_empty() || key.contains('=') || key.contains('\0') {
+            continue;
+        }
+        let upper = key.to_ascii_uppercase();
+        if matches!(
+            upper.as_str(),
+            "HOME"
+                | "ANYAGENTS_OPERATOR_TOKEN"
+                | "ANYAGENTS_OPERATOR_TOKEN_FILE"
+                | "ANYAGENTS_DATABASE_URL"
+                | "ANYAGENTS_DIRECT_DATABASE_URL"
+                | "ANYAGENTS_MASTER_KEY"
+                | "ANYAGENTS_CAPABILITY_KEY"
+                | "ANYAGENTS_TICK_TOKEN"
+                | "ANYAGENTS_TICK_AUD"
+                | "ANYAGENTS_TICK_ISS"
+                | "ANYAGENTS_TICK_JWKS_URL"
+                | "ANYAGENTS_TICK_SIGNATURE_HEADER"
+                | "ANYAGENTS_SANDBOX_TOKEN"
+                | "ANYAGENTS_SYLPHX_TOKEN"
+                | "ANYAGENTS_CLOUD_WEBHOOK_SECRET"
+                | "ANYAGENTS_SPIRON_WEBHOOK_SECRET"
+                | "ANYAGENTS_GUEST_STATE_DIR"
+                | "ANYAGENTS_GUEST_WORKDIR"
+                | "ANYAGENTS_MCP_URL"
+                | "ANYAGENTS_MCP_TOKEN_FILE"
+                | "ANYAGENTS_GATEWAY_URL"
+                | "ANYAGENTS_GATEWAY_TOKEN"
+        ) || upper.starts_with("ANYAGENTS_OPERATOR_")
+            || upper.starts_with("ANYAGENTS_TICK_")
+        {
+            continue;
+        }
+        out.push((key.to_string(), v.clone()));
+    }
+    out
+}
+
 /// Collect relative `(rel_path, bytes)` bundle files + remote directories for
 /// syncing into `<state_root>` inside any remote sandbox provider.
 #[allow(clippy::too_many_arguments)]
@@ -2052,32 +2098,44 @@ fn collect_agent_bundle_entries(
         uploads.push(("repo-spec.json".to_string(), spec_bytes));
     }
 
-    // 6. Agent metadata, Gateway URL + per-agent gateway token (without raw upstream API keys).
-    let (agent_name, agent_model, gateway_env) = if let Ok(aid) = agent_id_str.parse::<AgentId>() {
-        let (name, model) = store
-            .and_then(|s| s.agent(&aid).ok())
-            .or_else(|| {
-                data_dir
-                    .and_then(|d| Store::open(d.join("state.db")).ok())
-                    .and_then(|s| s.agent(&aid).ok())
-            })
-            .map(|a| (Some(a.name), a.model))
-            .unwrap_or((None, None));
-        let gw_env = if let Some(d) = data_dir {
-            crate::gateway::sandbox_env(d, &aid)?
+    // 6. Agent metadata, filtered per-agent `launch_env`, Gateway URL + per-agent gateway token
+    //    (strictly excluding host coordinator secrets and protected sandbox runtime vars).
+    let (agent_name, agent_model, agent_launch_env, gateway_env) =
+        if let Ok(aid) = agent_id_str.parse::<AgentId>() {
+            let (name, model, launch_env) = store
+                .and_then(|s| s.agent(&aid).ok())
+                .or_else(|| {
+                    data_dir
+                        .and_then(|d| Store::open(d.join("state.db")).ok())
+                        .and_then(|s| s.agent(&aid).ok())
+                })
+                .map(|a| (Some(a.name), a.model, a.launch_env))
+                .unwrap_or((None, None, Vec::new()));
+            let gw_env = if let Some(d) = data_dir {
+                crate::gateway::sandbox_env(d, &aid)?
+            } else {
+                Vec::new()
+            };
+            (name, model, launch_env, gw_env)
         } else {
-            Vec::new()
+            (None, None, Vec::new(), Vec::new())
         };
-        (name, model, gw_env)
-    } else {
-        (None, None, Vec::new())
-    };
-    let mut env = gateway_env;
-    env.push(("HOME".into(), state_root.to_string()));
-    env.push(("ANYAGENTS_GUEST_STATE_DIR".into(), state_root.to_string()));
-    env.push(("ANYAGENTS_GUEST_WORKDIR".into(), workdir.to_string()));
-    env.push(("ANYAGENTS_MCP_URL".into(), mcp_url.clone()));
-    env.push(("ANYAGENTS_MCP_TOKEN_FILE".into(), token_path_in_vm.clone()));
+    let mut env_map: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in filter_sandbox_launch_env(&agent_launch_env) {
+        env_map.insert(k, v);
+    }
+    for (k, v) in gateway_env {
+        env_map.insert(k, v);
+    }
+    env_map.insert("HOME".into(), state_root.to_string());
+    env_map.insert("XDG_CONFIG_HOME".into(), format!("{state_root}/.config"));
+    env_map.insert("XDG_DATA_HOME".into(), format!("{state_root}/.local/share"));
+    env_map.insert("XDG_CACHE_HOME".into(), format!("{state_root}/.cache"));
+    env_map.insert("ANYAGENTS_GUEST_STATE_DIR".into(), state_root.to_string());
+    env_map.insert("ANYAGENTS_GUEST_WORKDIR".into(), workdir.to_string());
+    env_map.insert("ANYAGENTS_MCP_URL".into(), mcp_url.clone());
+    env_map.insert("ANYAGENTS_MCP_TOKEN_FILE".into(), token_path_in_vm.clone());
+    let env: Vec<(String, String)> = env_map.into_iter().collect();
 
     let session_id = read_persisted_session_id(config_dir, harness);
     let guest_cfg = json!({
@@ -4490,5 +4548,50 @@ mod tests {
         assert!(workflow.contains("target: sandbox-full"));
         assert!(workflow.contains("anyagents-sandbox"));
         assert!(workflow.contains("steps.build.outputs.digest"));
+    }
+
+    #[test]
+    fn filter_sandbox_launch_env_forwards_agent_vars_and_blocks_coordinator_secrets() {
+        let raw = vec![
+            ("ANYAGENTS_SCOPE".into(), "repo".into()),
+            ("ANYAGENTS_LIFECYCLE".into(), "service".into()),
+            ("CUSTOM_TOOL_ENDPOINT".into(), "https://example.invalid".into()),
+            ("ANYAGENTS_OPERATOR_TOKEN".into(), "op-secret".into()),
+            ("ANYAGENTS_DATABASE_URL".into(), "postgres://secret".into()),
+            ("ANYAGENTS_MASTER_KEY".into(), "master-secret".into()),
+            ("ANYAGENTS_CAPABILITY_KEY".into(), "cap-secret".into()),
+            ("ANYAGENTS_TICK_TOKEN".into(), "tick-secret".into()),
+            ("ANYAGENTS_SANDBOX_TOKEN".into(), "sbx-secret".into()),
+            ("HOME".into(), "/wrong".into()),
+            ("ANYAGENTS_MCP_URL".into(), "https://evil.invalid".into()),
+            ("ANYAGENTS_GATEWAY_TOKEN".into(), "stale-gw".into()),
+        ];
+        let filtered = filter_sandbox_launch_env(&raw);
+        let map: BTreeMap<String, String> = filtered.into_iter().collect();
+        assert_eq!(map.get("ANYAGENTS_SCOPE").map(String::as_str), Some("repo"));
+        assert_eq!(
+            map.get("ANYAGENTS_LIFECYCLE").map(String::as_str),
+            Some("service")
+        );
+        assert_eq!(
+            map.get("CUSTOM_TOOL_ENDPOINT").map(String::as_str),
+            Some("https://example.invalid")
+        );
+        for blocked in [
+            "ANYAGENTS_OPERATOR_TOKEN",
+            "ANYAGENTS_DATABASE_URL",
+            "ANYAGENTS_MASTER_KEY",
+            "ANYAGENTS_CAPABILITY_KEY",
+            "ANYAGENTS_TICK_TOKEN",
+            "ANYAGENTS_SANDBOX_TOKEN",
+            "HOME",
+            "ANYAGENTS_MCP_URL",
+            "ANYAGENTS_GATEWAY_TOKEN",
+        ] {
+            assert!(
+                !map.contains_key(blocked),
+                "coordinator/protected var `{blocked}` must not be forwarded"
+            );
+        }
     }
 }
