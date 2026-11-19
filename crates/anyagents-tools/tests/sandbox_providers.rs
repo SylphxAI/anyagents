@@ -239,22 +239,21 @@ async fn provider_2_sylphx_supports_byo_oci_image_agent_data_tar_sync_and_set_ne
             Some("Bearer sylphx-tok")
         );
         match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/v1/orgs/o1/projects/p1/envs/e1/shapes") => (
+            ("GET", "/v1/sandbox_shapes") => (
                 200,
                 json_headers(),
-                br#"{"shapes":[{"name":"linux-m"}]}"#.to_vec(),
+                br#"{"sandbox_shapes":[{"name":"sandbox_shapes/linux-m"}]}"#.to_vec(),
             ),
             ("GET", "/v1/orgs/o1/projects/p1/envs/e1/volumes/anyagents-agt-sylphx") => {
                 (404, json_headers(), br#"{"error":"not found"}"#.to_vec())
             }
-            ("POST", "/v1/orgs/o1/projects/p1/envs/e1/volumes") => (
+            ("POST", "/v1/orgs/o1/projects/p1/envs/e1/volumes?volume_id=anyagents-agt-sylphx") => (
                 201,
                 json_headers(),
                 serde_json::to_vec(&serde_json::json!({
                     "name": "orgs/o1/projects/p1/envs/e1/volumes/vol_s1",
-                    "volumeId": "vol_s1",
-                    "sizeGib": 20,
-                    "state": "READY"
+                    "spec": { "size_gib": 10 },
+                    "status": { "state": "available" }
                 }))
                 .unwrap(),
             ),
@@ -263,11 +262,13 @@ async fn provider_2_sylphx_supports_byo_oci_image_agent_data_tar_sync_and_set_ne
                 json_headers(),
                 serde_json::to_vec(&serde_json::json!({
                     "name": "orgs/o1/projects/p1/envs/e1/leases/lease_s1",
-                    "leaseId": "lease_s1",
-                    "state": "READY",
-                    "envdUrl": "https://envd.example.test/lease_s1",
-                    "envdToken": "envd-tok-1",
-                    "expiresAt": "2026-11-19T00:15:00Z"
+                    "status": {
+                        "state": "ready",
+                        "expire_time": "2026-11-19T00:15:00Z",
+                        "endpoints": {
+                            "guest_uri": "https://envd.example.test/lease_s1"
+                        }
+                    }
                 }))
                 .unwrap(),
             ),
@@ -275,23 +276,29 @@ async fn provider_2_sylphx_supports_byo_oci_image_agent_data_tar_sync_and_set_ne
                 200,
                 json_headers(),
                 serde_json::to_vec(&serde_json::json!({
-                    "stdout_base64": base64_encode(b"sylphx-ok\n"),
-                    "stderr_base64": base64_encode(b""),
+                    "stdout": base64_encode(b"sylphx-ok\n"),
+                    "stderr": base64_encode(b""),
                     "exit_code": 0
                 }))
                 .unwrap(),
             ),
             ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_s1:writeFile") => {
-                let b64 = json_body["content_base64"].as_str().unwrap();
+                let b64 = json_body["content"].as_str().unwrap();
                 *tar_srv.lock().unwrap() = Some(base64_decode(b64).unwrap());
                 (200, json_headers(), br#"{}"#.to_vec())
             }
             ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_s1:setNetwork") => {
                 (200, json_headers(), br#"{"updated":true}"#.to_vec())
             }
-            ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_s1:release") => {
-                (200, json_headers(), br#"{"released":true}"#.to_vec())
-            }
+            ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_s1:release") => (
+                200,
+                json_headers(),
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "orgs/o1/projects/p1/envs/e1/leases/lease_s1",
+                    "status": { "state": "ended" }
+                }))
+                .unwrap(),
+            ),
             ("DELETE", "/v1/orgs/o1/projects/p1/envs/e1/volumes/vol_s1") => {
                 (200, json_headers(), br#"{"deleted":true}"#.to_vec())
             }
@@ -347,23 +354,31 @@ async fn provider_2_sylphx_supports_byo_oci_image_agent_data_tar_sync_and_set_ne
     provider.destroy(&handle).await.unwrap();
 
     let calls = log.lock().unwrap();
+    let create_vol = calls
+        .iter()
+        .find(|(r, _)| {
+            r == "POST /v1/orgs/o1/projects/p1/envs/e1/volumes?volume_id=anyagents-agt-sylphx"
+        })
+        .unwrap();
+    assert_eq!(create_vol.1["spec"]["size_gib"], 10);
+
     let create_lease = calls
         .iter()
         .find(|(r, _)| r == "POST /v1/orgs/o1/projects/p1/envs/e1/leases")
         .unwrap();
-    assert_eq!(create_lease.1["image"], digest_image);
-    assert_eq!(create_lease.1["ttl"], "900s");
+    assert_eq!(create_lease.1["spec"]["image"], digest_image);
+    assert_eq!(create_lease.1["spec"]["ttl"], "900s");
     assert_eq!(
-        create_lease.1["mounts"][0]["mountPath"],
+        create_lease.1["spec"]["volumes"][0]["mount_path"],
         "/home/user/agent-data"
     );
-    assert_eq!(create_lease.1["network"]["egress"], "ALLOWLIST");
+    assert_eq!(create_lease.1["spec"]["network"]["egress"], "allowlist");
     assert_eq!(
-        create_lease.1["network"]["allowedDomains"][0],
+        create_lease.1["spec"]["network"]["allowed_domains"][0],
         "api.github.com"
     );
     assert_eq!(
-        create_lease.1["network"]["allowedCidrs"][0],
+        create_lease.1["spec"]["network"]["allowed_cidrs"][0],
         "203.0.113.0/24"
     );
 
@@ -371,7 +386,7 @@ async fn provider_2_sylphx_supports_byo_oci_image_agent_data_tar_sync_and_set_ne
         .iter()
         .find(|(r, _)| r.ends_with(":setNetwork"))
         .unwrap();
-    assert_eq!(set_net.1["egress"], "DENY");
+    assert_eq!(set_net.1["network"]["egress"], "deny");
     assert!(calls.iter().any(|(r, _)| r.ends_with(":release")));
     assert!(calls.iter().any(|(r, _)| r.starts_with("DELETE ")));
 }

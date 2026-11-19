@@ -8,6 +8,7 @@
 //! persistent volume lifetimes.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -21,6 +22,8 @@ use super::{
     SandboxProvider, http_call_json, normalize_unix_dir, persistent_layout_init_script,
     resolve_layout, run_blocking, sanitize_name, shell_single_quote,
 };
+
+static TAR_UPLOAD_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_SYLPHX_ENDPOINT: &str = "https://api.sylphx.com";
 const LEASE_READY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -306,7 +309,8 @@ impl SandboxProvider for SylphxProvider {
         let payload = tar_gz.to_vec();
 
         run_blocking(move || {
-            let tmp_archive = format!("/tmp/.anyagents-bundle-{}.tar.gz", std::process::id());
+            let seq = TAR_UPLOAD_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp_archive = format!("/tmp/.anyagents-bundle-{}-{seq}.tar.gz", std::process::id());
             client.write_file(&resource, &tmp_archive, &payload)?;
             let script = format!(
                 "set -e; mkdir -p {dst}; tar -xzf {tmp} -C {dst}; rm -f {tmp}",
@@ -375,7 +379,6 @@ impl SandboxProvider for SylphxProvider {
 
     async fn health(&self) -> Result<ProviderHealth, String> {
         let endpoint = self.config.endpoint.clone();
-        let parent = self.config.parent.clone();
         let token = self.config.token.clone();
 
         run_blocking(move || {
@@ -384,7 +387,7 @@ impl SandboxProvider for SylphxProvider {
             if let Some(ref tok) = token {
                 headers.push(("authorization".to_string(), format!("Bearer {tok}")));
             }
-            let shapes_url = format!("{endpoint}/v1/{parent}/shapes");
+            let shapes_url = format!("{endpoint}/v1/sandbox_shapes");
             let (status, body) = http_call_json("GET", &shapes_url, &headers, None, 10_000)?;
             let healthy = (200..300).contains(&status);
             Ok(ProviderHealth {

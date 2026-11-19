@@ -3550,7 +3550,7 @@ mod tests {
                         async move {
                             let path = payload["path"].as_str().unwrap().to_string();
                             let bytes = anyagents_tools::base64_decode(
-                                payload["content_base64"].as_str().unwrap(),
+                                payload["content"].as_str().unwrap(),
                             )
                             .unwrap();
                             written_ref.lock().unwrap().insert(path, bytes);
