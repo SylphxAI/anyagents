@@ -5,8 +5,9 @@ use anyagents_core::db::sqlite_to_pg::{MigrateToPostgresOptions, migrate_sqlite_
 use anyagents_core::host_index::MemoryScope;
 use anyagents_core::host_retrieval::{CitedRange, HostRawRead};
 use anyagents_core::stateless::{
-    DEFAULT_REMOTE_SANDBOX_WORKDIR, DurableObligation, MasterKey, SandboxBinding,
-    UpsertGatewayRoute,
+    DEFAULT_REMOTE_SANDBOX_WORKDIR, DurableObligation, MasterKey, NewRemoteTurn,
+    RemoteTurnEventUpdate, SandboxBinding, SettleRemoteTurn, UpsertGatewayRoute,
+    generate_callback_token, generate_turn_id, hash_callback_token,
 };
 use anyagents_core::{
     HistorySearchQuery, Incoming, NewAgent, ReceiveOutcome, RuntimeHeartbeat, Store, Wake,
@@ -697,4 +698,157 @@ fn pg_migrate_to_postgres_backfills_sqlite_and_disk_files_idempotently() {
     let _ = blobs.delete_deployment_blob("secrets", &format!("mig_{tag}.secret"));
     let _ = blobs.delete_deployment_blob("profiles", &format!("mig_{tag}/profile.json"));
     pg_store.delete_agent(&agent.id).unwrap();
+}
+
+#[test]
+fn pg_remote_turn_store_survives_replica_handoff_and_settles_idempotently() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping pg_remote_turn_store test: ANYAGENTS_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _guard = test_lock();
+    let tag = unique_tag();
+
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let store_a = Store::open_postgres_isolated(&url, dir_a.path(), format!("rturn-a-{tag}"))
+        .expect("open replica A");
+    let store_b = Store::open_postgres_isolated(&url, dir_b.path(), format!("rturn-b-{tag}"))
+        .expect("open replica B");
+
+    assert_eq!(anyagents_core::db::PG_LATEST_VERSION, 3);
+
+    let agent = store_a
+        .create_agent(NewAgent::new(
+            &format!("serverless_turn_agent_{tag}"),
+            "claude-code",
+        ))
+        .unwrap();
+
+    let turns_a = store_a.remote_turn_store();
+    let turns_b = store_b.remote_turn_store();
+    let turn_id = generate_turn_id();
+    let token = generate_callback_token();
+    let now = anyagents_core::now_ms();
+
+    let created = turns_a
+        .create_turn(&NewRemoteTurn {
+            turn_id: turn_id.clone(),
+            agent_id: agent.id.clone(),
+            harness_kind: "spiron".to_string(),
+            provider_kind: Some("cloud".to_string()),
+            remote_run_id: Some(format!("tsk_{tag}")),
+            callback_token_hash: hash_callback_token(&token),
+            cursor: None,
+            status: "dispatched".to_string(),
+            next_poll_at_ms: Some(now - 500),
+            metadata_json: Some(serde_json::json!({
+                "reply_target": { "kind": "agent", "agent_id": agent.id.as_str() }
+            })),
+        })
+        .expect("replica A inserts pending remote turn");
+    assert_eq!(created.status, "dispatched");
+
+    // Replica B verifies constant-time callback token and rejects wrong tokens.
+    assert!(
+        turns_b
+            .verify_callback_token(&turn_id, &token)
+            .unwrap()
+            .is_some(),
+        "replica B must verify exact callback token"
+    );
+    assert!(
+        turns_b
+            .verify_callback_token(&turn_id, "wrong-callback-token")
+            .unwrap()
+            .is_none(),
+        "replica B must reject wrong callback token"
+    );
+
+    // Replica B sees the turn as due for polling and active for the agent.
+    let due = turns_b.list_due_polls(now, 64).unwrap();
+    assert!(due.iter().any(|t| t.turn_id == turn_id));
+    let active = turns_b.list_active_for_agent(&agent.id).unwrap();
+    assert!(active.iter().any(|t| t.turn_id == turn_id));
+
+    // Replica B records a streaming delta + cursor update.
+    let progressed = turns_b
+        .record_event(
+            &turn_id,
+            &RemoteTurnEventUpdate {
+                status: Some("running".to_string()),
+                remote_run_id: None,
+                cursor: Some("evt_42".to_string()),
+                last_event_at_ms: now + 100,
+                next_poll_at_ms: Some(Some(now + 10_000)),
+            },
+        )
+        .unwrap()
+        .expect("turn exists for event update");
+    assert_eq!(progressed.status, "running");
+    assert_eq!(progressed.cursor.as_deref(), Some("evt_42"));
+
+    // Drop replica A completely; replica B settles idempotently (including NUL byte sanitization).
+    drop(turns_a);
+    drop(store_a);
+    let settled = turns_b
+        .settle_turn(
+            &turn_id,
+            &SettleRemoteTurn {
+                status: "completed".to_string(),
+                result_text: Some("verified\0serverless output".to_string()),
+                error_text: None,
+                usage_json: Some(serde_json::json!({
+                    "input_tokens": 120,
+                    "output_tokens": 45
+                })),
+                cursor: Some("evt_99".to_string()),
+                settled_at_ms: now + 200,
+            },
+        )
+        .unwrap()
+        .expect("turn exists for settlement");
+    assert!(settled.transitioned);
+    assert_eq!(settled.turn.status, "completed");
+    assert_eq!(
+        settled.turn.result_text.as_deref(),
+        Some("verified\u{FFFD}serverless output")
+    );
+    assert!(settled.turn.next_poll_at_ms.is_none());
+
+    // Duplicate settlement (e.g. webhook + tick race) is a clean idempotent no-op.
+    let duplicate = turns_b
+        .settle_turn(
+            &turn_id,
+            &SettleRemoteTurn {
+                status: "failed".to_string(),
+                result_text: None,
+                error_text: Some("late duplicate must be ignored".to_string()),
+                usage_json: None,
+                cursor: None,
+                settled_at_ms: now + 300,
+            },
+        )
+        .unwrap()
+        .expect("turn exists for duplicate settlement");
+    assert!(!duplicate.transitioned);
+    assert_eq!(duplicate.turn.status, "completed");
+    assert_eq!(
+        duplicate.turn.result_text.as_deref(),
+        Some("verified\u{FFFD}serverless output")
+    );
+
+    // Settled turn is no longer due or active.
+    assert!(
+        !turns_b
+            .list_due_polls(now + 60_000, 64)
+            .unwrap()
+            .iter()
+            .any(|t| t.turn_id == turn_id)
+    );
+    assert!(turns_b.list_active_for_agent(&agent.id).unwrap().is_empty());
+
+    // Clean up test rows.
+    turns_b.delete_turn(&turn_id).unwrap();
+    store_b.delete_agent(&agent.id).unwrap();
 }

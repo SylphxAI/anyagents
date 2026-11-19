@@ -78,7 +78,11 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 enum Command {
     /// Run the server.
-    Serve,
+    Serve {
+        /// TCP port for the HTTP listener (overrides `ANYAGENTS_PORT` and `PORT`).
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// See server and fleet health (also the default).
     #[command(display_order = 1)]
     Status {
@@ -1194,7 +1198,7 @@ fn main() -> ExitCode {
     // an I/O error, not terminate the entire service. Only operator output uses
     // the default pipeline disposition installed above.
     #[cfg(unix)]
-    if matches!(cli.command, Some(Command::Serve)) {
+    if matches!(cli.command, Some(Command::Serve { .. })) {
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         }
@@ -1236,14 +1240,16 @@ fn resolve_data_dir(raw: PathBuf, _is_serve: bool) -> PathBuf {
 
 fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
     anyagents_core::db::set_cli_database_url(cli.database_url.clone());
-    let data = resolve_data_dir(cli.data, matches!(cli.command, Some(Command::Serve)));
+    let is_serve = matches!(cli.command, Some(Command::Serve { .. }));
+    let data = resolve_data_dir(cli.data, is_serve);
     sandbox::load_principal_registry(&data)?;
     // Helpers a command runs use the deployment's manifest, as the server's do.
-    if !matches!(cli.command, Some(Command::Serve)) {
+    if !is_serve {
         anyagents_toolchain::init_cli(&data, sandbox::host_home_dir());
     }
     match cli.command.unwrap_or(Command::Status { json: false }) {
-        Command::Serve => server::run(&data),
+        Command::Serve { port: Some(port) } => server::run_with_port(&data, Some(port)),
+        Command::Serve { port: None } => server::run(&data),
         Command::Status { json } => status_cmd(&data, json),
         Command::Auth { action } => match action.unwrap_or(AuthCommand::List { filter: None }) {
             AuthCommand::List { filter } => list_profiles_cmd(&data, filter.as_deref(), false),

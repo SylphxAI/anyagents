@@ -1804,8 +1804,20 @@ where
             Ok(None) => false,
             Err(_) => true,
         };
+        let has_active_remote_turn = match store
+            .remote_turn_store()
+            .list_active_for_agent(&binding.agent_id)
+        {
+            Ok(turns) => !turns.is_empty(),
+            Err(_) => true,
+        };
 
-        if busy_from_hb || has_unfinished_turn || has_undelivered || is_starting {
+        if busy_from_hb
+            || has_unfinished_turn
+            || has_undelivered
+            || is_starting
+            || has_active_remote_turn
+        {
             let _ =
                 store
                     .sandbox_binding_store()

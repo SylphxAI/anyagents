@@ -34,6 +34,7 @@ use crate::activity::{
     write_activity_snapshot,
 };
 use crate::dsh_grok::{DshGuestHarness, GrokGuestHarness};
+use crate::gemini::GeminiGuestHarness;
 
 /// Default unified persistent volume mount root inside sandboxes.
 pub const DEFAULT_DATA_MOUNT_DIR: &str = "/home/user/agent-data";
@@ -166,7 +167,7 @@ pub struct GuestRepoSpec {
     pub base: Option<String>,
 }
 
-trait GuestHarness: Harness {
+pub(crate) trait GuestHarness: Harness {
     fn session_id(&self) -> Option<String>;
     fn answer_for(&self, id: &str, state_dir: &Path) -> Option<String>;
     fn usage_for_id(&self, _id: &str) -> Option<TurnUsage> {
@@ -174,6 +175,16 @@ trait GuestHarness: Harness {
     }
     fn failure_for_id(&self, _id: &str) -> Option<String> {
         None
+    }
+}
+
+/// Normalize CLI harness selectors accepted by `anyagents-guest serve` and `anyagents-guest turn`.
+pub(crate) fn canonical_guest_harness(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "claude" | "claude-code" | "claude_code" => "claude-code".to_string(),
+        "gemini" | "gemini-cli" | "gemini_cli" => "gemini".to_string(),
+        "spiron-local" | "spiron_local" => "spiron".to_string(),
+        other => normalize_harness_name(other).to_string(),
     }
 }
 
@@ -219,8 +230,8 @@ impl GuestHarness for ClaudeAdapter {
     }
     fn answer_for(&self, id: &str, state_dir: &Path) -> Option<String> {
         self.0
-            .task_turn_result(id)
-            .map(|(_, text)| text)
+            .result_for(id)
+            .or_else(|| self.0.task_turn_result(id).map(|(_, text)| text))
             .or_else(|| read_claude_transcript_reply(state_dir, self.0.session_id().as_deref()))
     }
     fn usage_for_id(&self, id: &str) -> Option<TurnUsage> {
@@ -590,6 +601,54 @@ impl GuestHarness for GrokAdapter {
     }
 }
 
+struct GeminiAdapter(GeminiGuestHarness);
+impl Harness for GeminiAdapter {
+    fn deliver(&mut self, msg: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+        self.0.deliver(msg)
+    }
+    fn proven(&self, id: &str) -> Option<Proof> {
+        self.0.proven(id)
+    }
+    fn stop(&mut self) {
+        self.0.stop();
+    }
+    fn background(&mut self) -> Result<(), HarnessError> {
+        self.0.background()
+    }
+    fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
+        self.0.resume(session)
+    }
+    fn cancel(&mut self) -> Result<(), HarnessError> {
+        self.0.cancel()
+    }
+    fn health(&self) -> anyagents_harness::HarnessHealth {
+        self.0.health()
+    }
+    fn served_usage(&self) -> TurnUsage {
+        self.0.served_usage()
+    }
+    fn turns_served(&self) -> u32 {
+        self.0.turns_served()
+    }
+    fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        self.0.watch_activity(notify);
+    }
+}
+impl GuestHarness for GeminiAdapter {
+    fn session_id(&self) -> Option<String> {
+        self.0.session_id()
+    }
+    fn answer_for(&self, id: &str, _state_dir: &Path) -> Option<String> {
+        self.0.answer(id)
+    }
+    fn usage_for_id(&self, id: &str) -> Option<TurnUsage> {
+        self.0.usage_for(id)
+    }
+    fn failure_for_id(&self, id: &str) -> Option<String> {
+        self.0.failure_for(id)
+    }
+}
+
 /// Entry point for `anyagents-guest serve`.
 pub fn run_serve(mut args: ServeArgs) -> Result<(), String> {
     if args.harness.is_none() {
@@ -671,10 +730,7 @@ pub(crate) fn run_serve_io<R: BufRead + Send + 'static, W: Write>(
         .clone()
         .or_else(|| file_cfg.as_ref().and_then(|c| c.harness.clone()))
         .unwrap_or_else(|| "claude-code".to_string());
-    let harness_name = match raw_harness.trim() {
-        "spiron-local" => "spiron".to_string(),
-        other => normalize_harness_name(other).to_string(),
-    };
+    let harness_name = canonical_guest_harness(&raw_harness);
     let program = args
         .program
         .clone()
@@ -1078,7 +1134,7 @@ pub(crate) fn run_serve_io<R: BufRead + Send + 'static, W: Write>(
     Ok(())
 }
 
-fn turn_state_label(state: TurnState) -> &'static str {
+pub(crate) fn turn_state_label(state: TurnState) -> &'static str {
     match state {
         TurnState::Idle => "idle",
         TurnState::InTurn => "in_turn",
@@ -1150,12 +1206,13 @@ fn emit_turn_completion<W: Write>(
     )
 }
 
-fn usage_json(usage: &TurnUsage) -> Value {
+pub(crate) fn usage_json(usage: &TurnUsage) -> Value {
     json!({
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
         "cache_read_input_tokens": usage.cache_read_tokens,
         "cache_creation_input_tokens": usage.cache_write_tokens,
+        "reported_cost_micros": usage.reported_cost_micros,
     })
 }
 
@@ -1168,7 +1225,7 @@ fn emit_line<W: Write>(writer: &mut W, value: &Value) -> Result<(), String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_guest_harness(
+pub(crate) fn launch_guest_harness(
     harness_name: &str,
     program: &Path,
     model: Option<&str>,
@@ -1321,17 +1378,24 @@ fn launch_guest_harness(
             )?;
             Ok(Box::new(GrokAdapter(h)))
         }
+        "gemini" => {
+            let h =
+                GeminiGuestHarness::start(program, model, session, extra_args, &pairs, work_dir)?;
+            Ok(Box::new(GeminiAdapter(h)))
+        }
         other => Err(HarnessError::Failed(format!(
             "unsupported guest harness `{other}`"
         ))),
     }
 }
 
-fn resolve_guest_program(harness: &str) -> PathBuf {
-    let bin_name = match normalize_harness_name(harness) {
+pub(crate) fn resolve_guest_program(harness: &str) -> PathBuf {
+    let canonical = canonical_guest_harness(harness);
+    let bin_name = match canonical.as_str() {
         "claude-code" => "claude",
         "codex" => "codex",
         "opencode" => "opencode",
+        "gemini" => "gemini",
         "agy" => "agy",
         "muse" => "muse",
         "omp" => "omp",
@@ -1352,7 +1416,7 @@ fn resolve_guest_program(harness: &str) -> PathBuf {
     PathBuf::from(format!("/usr/local/bin/{bin_name}"))
 }
 
-fn build_guest_env(
+pub(crate) fn build_guest_env(
     state_dir: &Path,
     work_dir: &Path,
     file_cfg: Option<&GuestConfig>,
@@ -1389,12 +1453,12 @@ fn build_guest_env(
     env
 }
 
-fn load_guest_config(state_dir: &Path) -> Option<GuestConfig> {
+pub(crate) fn load_guest_config(state_dir: &Path) -> Option<GuestConfig> {
     let raw = std::fs::read_to_string(state_dir.join(GUEST_CONFIG_FILE)).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
-fn load_repo_spec(state_dir: &Path) -> Option<GuestRepoSpec> {
+pub(crate) fn load_repo_spec(state_dir: &Path) -> Option<GuestRepoSpec> {
     let raw = std::fs::read_to_string(state_dir.join(REPO_SPEC_FILE)).ok()?;
     serde_json::from_str(&raw).ok()
 }
@@ -1456,13 +1520,17 @@ pub(crate) fn ensure_repo_checked_out(
     Ok(())
 }
 
-fn read_persisted_session(state_dir: &Path, harness: &str) -> Option<String> {
+pub(crate) fn read_persisted_session(state_dir: &Path, harness: &str) -> Option<String> {
     let raw = std::fs::read_to_string(state_dir.join(format!("{harness}-session-id"))).ok()?;
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn persist_session(state_dir: &Path, harness: &str, session_id: &str) -> Result<(), String> {
+pub(crate) fn persist_session(
+    state_dir: &Path,
+    harness: &str,
+    session_id: &str,
+) -> Result<(), String> {
     let trimmed = session_id.trim();
     if trimmed.is_empty() {
         return Ok(());
@@ -1550,7 +1618,7 @@ fn split_marker_or_uuid(val: &Value, raw_text: &str, seq: u64) -> (String, Strin
     (uuid, raw_text.to_string())
 }
 
-fn signal_wake(wakeup: &(Mutex<bool>, Condvar)) {
+pub(crate) fn signal_wake(wakeup: &(Mutex<bool>, Condvar)) {
     let (lock, cv) = wakeup;
     if let Ok(mut dirty) = lock.lock() {
         *dirty = true;
@@ -1558,7 +1626,7 @@ fn signal_wake(wakeup: &(Mutex<bool>, Condvar)) {
     cv.notify_all();
 }
 
-fn wait_wake(wakeup: &(Mutex<bool>, Condvar), timeout: Duration) {
+pub(crate) fn wait_wake(wakeup: &(Mutex<bool>, Condvar), timeout: Duration) {
     let (lock, cv) = wakeup;
     let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let (mut guard, _) = cv

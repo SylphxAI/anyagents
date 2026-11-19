@@ -22,6 +22,7 @@ use clap::Args;
 use serde_json::{Value, json};
 
 mod acp;
+pub mod serverless;
 mod spiron;
 
 #[derive(Args, Clone, Debug)]

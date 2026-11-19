@@ -120,6 +120,7 @@ struct State {
     sign_in_fault: Option<String>,
     session_id: Option<String>,
     usages: Vec<(String, TurnUsage)>,
+    results: Vec<(String, String)>,
     /// The session's running `total_cost_usd` at the last turn that counted
     /// it, or as a resumed session's transcript last saved it: each turn
     /// costs what it added.
@@ -353,6 +354,17 @@ impl ClaudeHarness {
             .rev()
             .find(|(item, _)| item == id)
             .map(|(_, usage)| usage.clone())
+    }
+
+    /// Final assistant result text from the `result` event that finished `id`, if present.
+    pub fn result_for(&self, id: &str) -> Option<String> {
+        let state = lock(&self.shared);
+        state
+            .results
+            .iter()
+            .rev()
+            .find(|(item, _)| item == id)
+            .map(|(_, text)| text.clone())
     }
 
     /// Why the result that finished `id` reported an error, if it did.
@@ -846,13 +858,16 @@ fn accept_message(state: &mut State, id: &str) {
     state.written_now.insert(id.to_string());
 }
 
-fn finish_open(state: &mut State, usage: TurnUsage) {
+fn finish_open(state: &mut State, usage: TurnUsage, result_text: Option<&str>) {
     if state.open.is_empty() {
         return;
     }
     state.sign_in_fault = None;
     for (idx, id) in state.open.drain(..).enumerate() {
         state.finished.insert(id.clone());
+        if let Some(text) = result_text {
+            state.results.push((id.clone(), text.to_string()));
+        }
         let item_usage = if idx == 0 {
             usage.clone()
         } else {
@@ -1111,7 +1126,11 @@ fn apply_result(state: &mut State, value: &Value) {
         usage.reported_cost_micros = Some((total - state.cost_seen.unwrap_or(0)).max(0));
         state.cost_seen = Some(total);
     }
-    finish_open(state, usage);
+    let result_text = value
+        .get("result")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty());
+    finish_open(state, usage, result_text);
 }
 
 /// Explicit completion membership is distinct from consumption proof. Failed
@@ -1142,11 +1161,19 @@ fn apply_scoped_result(state: &mut State, value: &Value) {
         return;
     }
     let usage = usage_from_claude(value);
+    let result_text = value
+        .get("result")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string);
     for (index, id) in ids.iter().enumerate() {
         state.finished.insert(id.clone());
         if let Some(reason) = &error {
             state.failures.push((id.clone(), reason.clone()));
         } else {
+            if let Some(ref text) = result_text {
+                state.results.push((id.clone(), text.clone()));
+            }
             state.usages.push((
                 id.clone(),
                 if index == 0 {

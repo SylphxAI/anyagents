@@ -137,13 +137,19 @@ impl Settings {
         };
         if anyagents_core::storage_env_enabled() {
             if settings.public_url.is_none()
-                && let Ok(raw) = std::env::var("ANYAGENTS_PUBLIC_URL")
-                && !raw.trim().is_empty()
+                && let Some((env_name, raw)) = std::env::var("ANYAGENTS_PUBLIC_URL")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| ("ANYAGENTS_PUBLIC_URL", v))
+                    .or_else(|| {
+                        std::env::var("ANYAGENTS_WEBHOOK_URL")
+                            .ok()
+                            .filter(|v| !v.trim().is_empty())
+                            .map(|v| ("ANYAGENTS_WEBHOOK_URL", v))
+                    })
             {
-                settings.public_url = Some(
-                    normalize_public_url(&raw)
-                        .map_err(|err| format!("ANYAGENTS_PUBLIC_URL {err}"))?,
-                );
+                settings.public_url =
+                    Some(normalize_public_url(&raw).map_err(|err| format!("{env_name} {err}"))?);
             }
             if settings.public_listen.is_none()
                 && let Ok(raw) = std::env::var("ANYAGENTS_PUBLIC_LISTEN")

@@ -162,6 +162,7 @@ pub trait SandboxBindingStore: Send + Sync {
     fn clear_lease(&self, agent_id: &AgentId) -> Result<bool, Error>;
     fn touch_heartbeat(&self, agent_id: &AgentId, at_ms: i64) -> Result<bool, Error>;
     fn list_idle_due(&self, now_ms: i64) -> Result<Vec<SandboxBinding>, Error>;
+    fn list_active_ready(&self) -> Result<Vec<SandboxBinding>, Error>;
     fn delete(&self, agent_id: &AgentId) -> Result<bool, Error>;
 }
 
@@ -464,6 +465,24 @@ impl SandboxBindingStore for PgSandboxBindingStore {
         rows.into_iter().map(|r| self.decode_row(r)).collect()
     }
 
+    fn list_active_ready(&self) -> Result<Vec<SandboxBinding>, Error> {
+        let pool = self.pool.clone();
+        let sql = format!(
+            "SELECT {SELECT_BINDING_COLS}
+             FROM public.agent_sandbox_bindings
+             WHERE lease_state = 'ready'
+               AND lease_id IS NOT NULL
+             ORDER BY updated_at_ms ASC"
+        );
+        let rows = block_on_pg(async move {
+            sqlx::query(&sql)
+                .fetch_all(&pool)
+                .await
+                .map_err(Error::from)
+        })?;
+        rows.into_iter().map(|r| self.decode_row(r)).collect()
+    }
+
     fn delete(&self, agent_id: &AgentId) -> Result<bool, Error> {
         let pool = self.pool.clone();
         let aid = agent_id.as_str().to_string();
@@ -593,6 +612,31 @@ impl SandboxBindingStore for FsSandboxBindingStore {
         }
         due.sort_by_key(|b| b.idle_since_ms.unwrap_or(i64::MAX));
         Ok(due)
+    }
+
+    fn list_active_ready(&self) -> Result<Vec<SandboxBinding>, Error> {
+        let mut ready = Vec::new();
+        let agents_dir = self.data_dir.join("agents");
+        let Ok(entries) = fs::read_dir(&agents_dir) else {
+            return Ok(ready);
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(id_str) = name.to_str() else {
+                continue;
+            };
+            let Ok(agent_id) = AgentId::parse(id_str) else {
+                continue;
+            };
+            if let Ok(Some(b)) = self.get(&agent_id)
+                && b.lease_state == "ready"
+                && b.lease_id.is_some()
+            {
+                ready.push(b);
+            }
+        }
+        ready.sort_by_key(|b| b.updated_at_ms);
+        Ok(ready)
     }
 
     fn delete(&self, agent_id: &AgentId) -> Result<bool, Error> {

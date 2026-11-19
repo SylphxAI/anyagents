@@ -1476,6 +1476,19 @@ impl Store {
         }
     }
 
+    /// Durable serverless remote turn ledger (`public.pending_remote_turns` on PostgreSQL;
+    /// local `<data_dir>/remote-turns/` on SQLite).
+    pub fn remote_turn_store(&self) -> Box<dyn crate::stateless::RemoteTurnStore> {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => Box::new(crate::stateless::PgRemoteTurnStore::new(
+                pg.handle.pool.clone(),
+            )),
+            registry::Backend::Sqlite(_) => {
+                Box::new(crate::stateless::FsRemoteTurnStore::new(&self.data_dir))
+            }
+        }
+    }
+
     pub fn backend_kind(&self) -> DbBackend {
         match &self.backend {
             registry::Backend::Sqlite(_) => DbBackend::Sqlite,

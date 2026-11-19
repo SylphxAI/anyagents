@@ -10,8 +10,10 @@
 
 pub mod activity;
 mod dsh_grok;
+mod gemini;
 mod guest;
 mod mcp_proxy;
+pub mod turn;
 
 pub use guest::{DEFAULT_DATA_MOUNT_DIR, DEFAULT_STATE_DIR, DEFAULT_WORKDIR};
 
@@ -34,6 +36,8 @@ struct Cli {
 enum Command {
     /// Run a long-lived embedded harness supervisor speaking `stream-json`.
     Serve(guest::ServeArgs),
+    /// Execute a single serverless turn (optionally `--detached`) with HTTP push callbacks.
+    Turn(turn::TurnArgs),
     /// Bridge stdio MCP JSON-RPC requests to the coordinator HTTPS `/mcp` endpoint.
     #[command(name = "mcp-proxy")]
     McpProxy(mcp_proxy::McpProxyArgs),
@@ -46,6 +50,7 @@ pub fn run_cli_exit_code() -> ExitCode {
     let cli = Cli::parse();
     let res = match cli.command {
         Command::Serve(args) => guest::run_serve(args),
+        Command::Turn(args) => turn::run_turn(args),
         Command::McpProxy(args) => mcp_proxy::run_mcp_proxy(args),
         Command::Health(args) => {
             let state_dir = guest::resolve_default_state_dir(args.state_dir);

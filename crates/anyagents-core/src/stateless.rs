@@ -10,6 +10,7 @@ pub mod crypto;
 pub mod gateway_routes;
 pub mod locks;
 pub mod obligations;
+pub mod remote_turns;
 pub mod sandbox_bindings;
 pub mod wakes;
 
@@ -27,6 +28,14 @@ pub use locks::{
 };
 pub use obligations::{
     DurableObligation, DurableObligationStore, FsDurableObligationStore, PgDurableObligationStore,
+};
+pub use remote_turns::{
+    FsRemoteTurnStore, InMemoryRemoteTurnStore, NewRemoteTurn, PendingRemoteTurn,
+    PgRemoteTurnStore, RemoteTurnEventUpdate, RemoteTurnStore, SettleOutcome, SettleRemoteTurn,
+    TERMINAL_REMOTE_TURN_STATUSES, VALID_REMOTE_TURN_STATUSES, constant_time_eq,
+    generate_callback_token, generate_turn_id, hash_callback_token, hmac_sha256_hex,
+    is_terminal_remote_turn_status, sanitize_pg_json, sanitize_pg_text, verify_callback_token_hash,
+    verify_hmac_sha256_signature,
 };
 pub use sandbox_bindings::{
     DEFAULT_REMOTE_SANDBOX_WORKDIR, FsSandboxBindingStore, PgSandboxBindingStore, SandboxBinding,

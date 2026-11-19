@@ -1361,7 +1361,6 @@ struct Timer {
 }
 
 impl Timer {
-    #[cfg(test)]
     fn local() -> Self {
         Self {
             plan: Plan::new(false, false),
@@ -1497,6 +1496,7 @@ impl Timer {
         let mut step = Step {
             worked: false,
             fired: 0,
+            fired_agents: Vec::new(),
             deadline: self.deadline,
         };
         if now < self.deadline && generation == self.plan.generation {
@@ -1519,6 +1519,7 @@ impl Timer {
             step.worked = true;
             let pass = self.plan.pass(store, health, now, &self.stop);
             step.fired = pass.fired;
+            step.fired_agents = pass.fired_agents;
             if pass.wrote {
                 self.plan.reload(store, generation, now);
             }
@@ -1540,8 +1541,21 @@ struct Step {
     worked: bool,
     /// Wakes written.
     fired: usize,
+    /// Distinct agents woken by schedules that fired in this step.
+    fired_agents: Vec<AgentId>,
     /// When the next step is due.
     deadline: i64,
+}
+
+/// Evaluate due local schedules and reminders in one bounded on-demand pass
+/// for `POST /v1/internal/tick` in pure serverless mode. Returns `(fired_count, woken_agents)`.
+pub(crate) fn tick_serverless_schedules(
+    store: &Store,
+    health: &HealthBoard,
+    now: i64,
+) -> (usize, Vec<AgentId>) {
+    let step = Timer::local().step(store, health, 0, now);
+    (step.fired, step.fired_agents)
 }
 
 /// Evaluate local timers and watches (and the turn-ownership rules) without
@@ -2054,6 +2068,7 @@ struct Plan {
 #[derive(Default)]
 struct PassOutcome {
     fired: usize,
+    fired_agents: Vec<AgentId>,
     /// A schedule row was (or may have been) written, so the plan is re-read.
     wrote: bool,
 }
@@ -2231,7 +2246,13 @@ impl Plan {
                 &self.local_fallback,
                 now,
             );
-            outcome.fired += usize::from(step.fired);
+            if step.fired {
+                outcome.fired += 1;
+                let aid = self.entries[i].sched.agent_id.clone();
+                if !outcome.fired_agents.contains(&aid) {
+                    outcome.fired_agents.push(aid);
+                }
+            }
             outcome.wrote |= step.wrote;
         }
         outcome

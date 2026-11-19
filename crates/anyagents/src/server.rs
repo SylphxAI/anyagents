@@ -46,6 +46,7 @@ pub(crate) mod outbound_history;
 mod profiles;
 mod quota_rotation;
 mod reap_queue;
+pub(crate) mod serverless;
 
 pub(crate) use profiles::ServedProfile;
 
@@ -63,14 +64,21 @@ pub fn socket_path(data: &Path) -> PathBuf {
 /// Run the server. Every harness runs in a keeper started from this binary,
 /// so stopping, crashing or upgrading the server ends no agent's work.
 pub fn run(data: &Path) -> Result<(), Error> {
+    run_with_port(data, None)
+}
+
+/// Run the server with an optional explicit `--port` override for the HTTP
+/// webhook/public TCP listener.
+pub fn run_with_port(data: &Path, port: Option<u16>) -> Result<(), Error> {
     let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let host = crate::keeper::host().map_err(Error::Message)?;
-    run_with_identity(
+    run_with_identity_and_port(
         data,
         Arc::new(Mutex::new(ProcessRunner)),
         stop_rx,
         Arc::new(ServingIdentity::capture()),
         host,
+        port,
     )
 }
 
@@ -92,17 +100,29 @@ pub fn run_with(
     )
 }
 
+#[cfg(test)]
 fn run_with_identity(
+    data: &Path,
+    runner: Arc<Mutex<dyn CommandRunner + Send>>,
+    stop: tokio::sync::oneshot::Receiver<()>,
+    identity: Arc<ServingIdentity>,
+    host: HarnessHost,
+) -> Result<(), Error> {
+    run_with_identity_and_port(data, runner, stop, identity, host, None)
+}
+
+fn run_with_identity_and_port(
     data: &Path,
     runner: Arc<Mutex<dyn CommandRunner + Send>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
     identity: Arc<ServingIdentity>,
     host: HarnessHost,
+    port_override: Option<u16>,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async {
         tokio::select! {
-            result = serve(data, runner, identity, host) => result,
+            result = serve(data, runner, identity, host, port_override) => result,
             _ = &mut stop => Ok(()),
         }
     });
@@ -329,8 +349,15 @@ async fn serve(
     sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
     identity: Arc<ServingIdentity>,
     host: HarnessHost,
+    port_override: Option<u16>,
 ) -> Result<(), Error> {
-    let _server_lock = acquire_server_lock(data)?;
+    let serverless = serverless::is_serverless_mode();
+    std::fs::create_dir_all(data)?;
+    let _server_lock = if serverless {
+        None
+    } else {
+        Some(acquire_server_lock(data)?)
+    };
     anyagents_toolchain::init_server(data, crate::sandbox::host_home_dir());
     let store = Arc::new(Store::open(data.join("state.db"))?);
     let remote_required = anyagents_tools::SandboxMode::from_env().is_remote_required();
@@ -430,35 +457,43 @@ async fn serve(
     if auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&path);
     }
-    let launch_store = Arc::clone(&store);
-    // A harness kept from the last server on a gateway origin that moved
-    // would send its token wherever that port now leads: it is replaced.
-    let refused = if gateway.moved {
-        gateway.agents
+    let kept = !serverless && matches!(host, HarnessHost::Keeper(_));
+    let (supervisor, health) = if serverless {
+        // Pure serverless mode (`ANYAGENTS_SERVERLESS=true`): zero long-running
+        // keeper/supervisor loops, zero coordinator-side `envd` pipes or SSE
+        // streams across HTTP requests.
+        (None, HealthBoard::default())
     } else {
-        Vec::new()
+        let launch_store = Arc::clone(&store);
+        // A harness kept from the last server on a gateway origin that moved
+        // would send its token wherever that port now leads: it is replaced.
+        let refused = if gateway.moved {
+            gateway.agents
+        } else {
+            Vec::new()
+        };
+        let custody = crate::keeper::custody(data, &host, refused);
+        let sup = Supervisor::<VendorHarness>::start_with_custody(
+            Arc::clone(&store),
+            Arc::new(SystemClock::new()),
+            Arc::new(move |request| vendor::vendor_launch_hosted(request, &launch_store, &host)),
+            vendor::child_env(),
+            custody,
+        )
+        .map_err(Error::Message)?;
+        let idle_release_store = Arc::clone(&store);
+        sup.set_on_idle_released(Arc::new(move |agent_id, cfg| {
+            crate::sandbox_exec::handle_agent_idle_release(&idle_release_store, agent_id, cfg);
+        }));
+        let board = sup.board();
+        (Some(Retaining(Some(sup), kept)), board)
     };
-    let custody = crate::keeper::custody(data, &host, refused);
-    let kept = matches!(host, HarnessHost::Keeper(_));
-    let sup = Supervisor::<VendorHarness>::start_with_custody(
-        Arc::clone(&store),
-        Arc::new(SystemClock::new()),
-        Arc::new(move |request| vendor::vendor_launch_hosted(request, &launch_store, &host)),
-        vendor::child_env(),
-        custody,
-    )
-    .map_err(Error::Message)?;
-    let idle_release_store = Arc::clone(&store);
-    sup.set_on_idle_released(Arc::new(move |agent_id, cfg| {
-        crate::sandbox_exec::handle_agent_idle_release(&idle_release_store, agent_id, cfg);
-    }));
-    let supervisor = Retaining(Some(sup), kept);
-    if auth.is_confined() {
+    if !serverless && auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&data.join("wake.sock"));
     }
     let state = AppState {
         store: Arc::clone(&store),
-        health: supervisor.board(),
+        health,
         sign_in,
         auth,
         identity,
@@ -466,13 +501,21 @@ async fn serve(
     };
     let _ = boundary;
     let listener = api_listener;
-    let poller = crate::telegram::Poller::start(Arc::clone(&store), data.to_path_buf())
-        .map_err(Error::Message)?;
+    let poller = if serverless {
+        None
+    } else {
+        Some(
+            crate::telegram::Poller::start(Arc::clone(&store), data.to_path_buf())
+                .map_err(Error::Message)?,
+        )
+    };
     // Set once a stop is requested: every listener (the socket and both TCP
     // listeners) stops taking connections at once, calls running on any of
     // them drain together, and every background loop ends at once.
     let (stopping, _) = tokio::sync::watch::channel(false);
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
+    if !serverless
+        && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+        && !crate::sandbox::is_isolated_test_env()
     {
         quota_rotation::start(Arc::clone(&store));
         start_host_history_indexer(Arc::clone(&store));
@@ -690,8 +733,8 @@ async fn serve(
         }
     }
     let mut webhook_listener = None;
-    if let Some(addr) = webhook_listen_addr(public_configured) {
-        if public_configured && !binds_loopback(&addr) {
+    if let Some(addr) = webhook_listen_addr(public_configured, port_override) {
+        if public_configured && !serverless && !binds_loopback(&addr) {
             eprintln!(
                 "warning: the local TCP listener ({addr}) is not loopback while `public_listen` is set; \
                  it accepts every local credential, so bind it to 127.0.0.1"
@@ -716,7 +759,7 @@ async fn serve(
             }
         }
     }
-    {
+    if !serverless {
         // A spawn the last server stopped part way gets the rest of it (most
         // often its prompt) before any call is answered on any listener: a call
         // to list, inspect or delete that agent then sees it whole. Every
@@ -785,7 +828,7 @@ async fn serve(
             }
 
             let preserve_webhook = preserve_webhooks_on_shutdown(data);
-            if !preserve_webhook {
+            if !preserve_webhook && let Some(ref poller) = poller {
                 // A long poll ends at Telegram, not here: signal the poller to
                 // stop so released long polls exit instead of re-entering a 30s
                 // wait, and release every bot while the calls drain, so each
@@ -858,24 +901,30 @@ async fn serve(
         match releasing {
             Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
             None => {
-                poller.signal_stop();
-                crate::telegram::poller::release_every_bot(
-                    &store,
-                    store.data_dir(),
-                    TELEGRAM_RELEASE_WITHIN,
-                )
+                if let Some(ref poller) = poller {
+                    poller.signal_stop();
+                    crate::telegram::poller::release_every_bot(
+                        &store,
+                        store.data_dir(),
+                        TELEGRAM_RELEASE_WITHIN,
+                    )
+                } else {
+                    Ok(())
+                }
             }
         }
     };
     if let Err(reason) = released {
         eprintln!("anyagents-telegram: shutdown did not release every bot: {reason}");
     }
-    if preserve_webhook {
-        // Stateless K8s webhook pods keep Telegram webhooks active on pod
-        // SIGTERM so rolling replacements never drop incoming updates.
-        std::mem::forget(poller);
-    } else {
-        poller.stop();
+    if let Some(poller) = poller {
+        if preserve_webhook {
+            // Stateless webhook pods keep Telegram webhooks active on pod
+            // SIGTERM so rolling replacements never drop incoming updates.
+            std::mem::forget(poller);
+        } else {
+            poller.stop();
+        }
     }
     drop(supervisor);
     let _ = std::fs::remove_file(&path);
@@ -883,7 +932,8 @@ async fn serve(
 }
 
 fn preserve_webhooks_on_shutdown(data: &Path) -> bool {
-    anyagents_tools::SandboxMode::from_env().is_remote_required()
+    serverless::is_serverless_mode()
+        || anyagents_tools::SandboxMode::from_env().is_remote_required()
         || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
         || std::env::var("ANYAGENTS_PUBLIC_URL")
             .ok()
@@ -1348,6 +1398,31 @@ async fn github_webhook(
         Ok(changed) => {
             if changed {
                 crate::schedule::schedules_changed(state.store.data_dir());
+                if serverless::is_serverless_mode() {
+                    let store = Arc::clone(&state.store);
+                    let health = state.health.clone();
+                    let (_, fired_agents) = spawn_store(move || {
+                        Ok::<_, ApiError>(crate::schedule::tick_serverless_schedules(
+                            &store,
+                            &health,
+                            anyagents_core::now_ms(),
+                        ))
+                    })
+                    .await
+                    .unwrap_or_default();
+                    for agent_id in fired_agents {
+                        if let Err(err) = serverless::dispatch_next_mailbox_message_if_serverless(
+                            Arc::clone(&state.store),
+                            &agent_id,
+                        )
+                        .await
+                        {
+                            eprintln!(
+                                "anyagents-serverless: github schedule dispatch failed for {agent_id}: {err}"
+                            );
+                        }
+                    }
+                }
             }
             StatusCode::ACCEPTED
         }
@@ -1367,7 +1442,8 @@ async fn telegram_webhook(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let store = Arc::clone(&state.store);
-    spawn_store(move || {
+    let channel_for_dispatch = channel_id.clone();
+    let target_agents = spawn_store(move || {
         crate::telegram::receive_webhook(
             &store,
             store.data_dir(),
@@ -1389,9 +1465,38 @@ async fn telegram_webhook(
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, why)
             }
         })?;
-        Ok(Json(serde_json::json!({ "ok": true })))
+        let agents = if serverless::is_serverless_mode() {
+            store
+                .list_channels()
+                .ok()
+                .and_then(|channels| {
+                    channels
+                        .into_iter()
+                        .find(|c| c.id.as_str() == channel_for_dispatch)
+                        .map(|c| c.agents)
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Ok(agents)
     })
-    .await
+    .await?;
+    if serverless::is_serverless_mode() {
+        for agent_id in target_agents {
+            if let Err(err) = serverless::dispatch_next_mailbox_message_if_serverless(
+                Arc::clone(&state.store),
+                &agent_id,
+            )
+            .await
+            {
+                eprintln!(
+                    "anyagents-serverless: telegram webhook dispatch failed for {agent_id}: {err}"
+                );
+            }
+        }
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// The TCP listener for the local API surface: readiness, Telegram webhooks
@@ -1402,22 +1507,56 @@ async fn telegram_webhook(
 pub(crate) fn public_entry_listening(data: &Path) -> bool {
     match crate::remote::Settings::load(data) {
         Ok(settings) if settings.public_listen.is_some() => true,
-        Ok(_) => webhook_listen_addr(false).is_some(),
+        Ok(_) => webhook_listen_addr(false, None).is_some(),
         Err(_) => false,
     }
 }
 
-fn webhook_listen_addr(public_configured: bool) -> Option<String> {
-    local_listen_addr(
+fn parse_port_env(name: &str) -> Option<u16> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|&p| p > 0)
+}
+
+fn webhook_listen_addr(public_configured: bool, port_override: Option<u16>) -> Option<String> {
+    local_listen_addr_with_port(
         std::env::var("ANYAGENTS_WEBHOOK_LISTEN").ok().as_deref(),
+        port_override,
+        parse_port_env("ANYAGENTS_PORT"),
+        parse_port_env("PORT"),
+        serverless::is_serverless_mode(),
         std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
             || std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some(),
         public_configured,
     )
 }
 
+#[cfg(test)]
 fn local_listen_addr(
     explicit: Option<&str>,
+    test_double: bool,
+    public_configured: bool,
+) -> Option<String> {
+    local_listen_addr_with_port(
+        explicit,
+        None,
+        None,
+        None,
+        false,
+        test_double,
+        public_configured,
+    )
+}
+
+fn local_listen_addr_with_port(
+    explicit: Option<&str>,
+    cli_port: Option<u16>,
+    anyagents_port: Option<u16>,
+    std_port: Option<u16>,
+    serverless: bool,
     test_double: bool,
     public_configured: bool,
 ) -> Option<String> {
@@ -1428,10 +1567,18 @@ fn local_listen_addr(
         }
         return Some(trimmed.to_string());
     }
-    if test_double {
+    if test_double && cli_port.is_none() {
         return None;
     }
-    Some(if public_configured {
+    if let Some(port) = cli_port.or(anyagents_port).or(std_port) {
+        let host = if serverless || std_port.is_some() || !public_configured {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
+        return Some(format!("{host}:{port}"));
+    }
+    Some(if public_configured && !serverless {
         "127.0.0.1:8788".to_string()
     } else {
         "0.0.0.0:8788".to_string()
@@ -1464,6 +1611,15 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
         .route("/v1/webhooks/healthz", get(public_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .route("/v1/webhooks/github", post(github_webhook))
+        .route(
+            "/v1/internal/guest/events",
+            post(serverless::guest_events_route),
+        )
+        .route(
+            "/v1/internal/cloud/events",
+            post(serverless::cloud_events_route),
+        )
+        .route("/v1/internal/tick", post(serverless::tick_route))
         .route(
             "/v1/webhooks/mcp",
             get(public_mcp_get_route).post(public_mcp_post_route),
@@ -1536,6 +1692,15 @@ fn build_webhook_router(state: AppState) -> Router {
         .route("/v1/webhooks/healthz", get(public_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .route("/v1/webhooks/github", post(github_webhook))
+        .route(
+            "/v1/internal/guest/events",
+            post(serverless::guest_events_route),
+        )
+        .route(
+            "/v1/internal/cloud/events",
+            post(serverless::cloud_events_route),
+        )
+        .route("/v1/internal/tick", post(serverless::tick_route))
         .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
@@ -1624,6 +1789,15 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/webhooks/healthz", get(webhook_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .route("/v1/webhooks/github", post(github_webhook))
+        .route(
+            "/v1/internal/guest/events",
+            post(serverless::guest_events_route),
+        )
+        .route(
+            "/v1/internal/cloud/events",
+            post(serverless::cloud_events_route),
+        )
+        .route("/v1/internal/tick", post(serverless::tick_route))
         .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
@@ -7410,7 +7584,8 @@ async fn send(
     // On a machine without the boundary, its own agent route names the sender;
     // that is the one place a body chooses the author, and an inbox is still
     // only ever its own.
-    spawn_store(move || {
+    let dispatch_store = Arc::clone(&state.store);
+    let response = spawn_store(move || {
         let route_named = match &principal {
             Principal::Agent { name, .. } if state.auth.is_trusted() => body
                 .sender
@@ -7483,7 +7658,32 @@ async fn send(
         let key = send_key(&key_body);
         send_sync(&state.store, &actor, body, plan, key)
     })
-    .await
+    .await?;
+    if serverless::is_serverless_mode() {
+        let mut dispatched_agents = HashSet::new();
+        for delivery in &response.0.deliveries {
+            if delivery.duplicate {
+                continue;
+            }
+            let Some(agent_name) = delivery.to.strip_prefix("agent:") else {
+                continue;
+            };
+            if let Ok(agent) = dispatch_store.agent_by_name(agent_name)
+                && dispatched_agents.insert(agent.id.clone())
+                && let Err(err) = serverless::dispatch_next_mailbox_message_if_serverless(
+                    Arc::clone(&dispatch_store),
+                    &agent.id,
+                )
+                .await
+            {
+                eprintln!(
+                    "anyagents-serverless: /v1/send dispatch failed for {}: {err}",
+                    agent.name
+                );
+            }
+        }
+    }
+    Ok(response)
 }
 
 async fn interact_route(
@@ -16311,6 +16511,59 @@ exec '{}' "$@"
         assert!(binds_loopback("localhost:8788"));
         assert!(!binds_loopback("0.0.0.0:8788"));
         assert!(!binds_loopback("10.0.0.5:8788"));
+    }
+
+    #[test]
+    fn serverless_listen_addr_honors_port_precedence_and_binds_all_interfaces() {
+        // Explicit `ANYAGENTS_WEBHOOK_LISTEN` always takes priority.
+        assert_eq!(
+            local_listen_addr_with_port(
+                Some("127.0.0.1:9999"),
+                Some(9090),
+                Some(8081),
+                Some(8080),
+                true,
+                false,
+                true,
+            )
+            .as_deref(),
+            Some("127.0.0.1:9999")
+        );
+        // CLI `--port` beats `ANYAGENTS_PORT` and `PORT`.
+        assert_eq!(
+            local_listen_addr_with_port(
+                None,
+                Some(9090),
+                Some(8081),
+                Some(8080),
+                false,
+                false,
+                false
+            )
+            .as_deref(),
+            Some("0.0.0.0:9090")
+        );
+        // `ANYAGENTS_PORT` beats `PORT`.
+        assert_eq!(
+            local_listen_addr_with_port(None, None, Some(8081), Some(8080), false, false, false)
+                .as_deref(),
+            Some("0.0.0.0:8081")
+        );
+        // Standard `PORT` fallback binds `0.0.0.0:${PORT}` even if `public_configured`.
+        assert_eq!(
+            local_listen_addr_with_port(None, None, None, Some(8080), false, false, true)
+                .as_deref(),
+            Some("0.0.0.0:8080")
+        );
+        // `ANYAGENTS_SERVERLESS=true` binds `0.0.0.0:${PORT}` even when `public_configured`.
+        assert_eq!(
+            local_listen_addr_with_port(None, Some(8080), None, None, true, false, true).as_deref(),
+            Some("0.0.0.0:8080")
+        );
+        assert_eq!(
+            local_listen_addr_with_port(None, None, None, None, true, false, true).as_deref(),
+            Some("0.0.0.0:8788")
+        );
     }
 
     #[test]

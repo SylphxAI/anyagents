@@ -35,6 +35,8 @@ pub mod sylphx {
 
     /// Environment variable selecting the sandbox isolation mode.
     pub const ENV_SANDBOX_MODE: &str = "ANYAGENTS_SANDBOX_MODE";
+    /// Environment variable enabling pure serverless scale-to-zero mode (`true` | `false`).
+    pub const ENV_SERVERLESS: &str = "ANYAGENTS_SERVERLESS";
     /// Environment variable selecting the sandbox provider driver (`"sylphx"` | `"legacy_http"`).
     pub const ENV_SANDBOX_DRIVER: &str = "ANYAGENTS_SANDBOX_DRIVER";
     /// Environment variable naming the Sylphx resource parent (`orgs/{o}/projects/{p}/envs/{e}`).
@@ -68,6 +70,16 @@ pub mod sylphx {
     const LEASE_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
     const LEASE_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
+    /// Return `true` when `ANYAGENTS_SERVERLESS` is explicitly enabled (`1` | `true` | `yes` | `on`).
+    pub fn serverless_enabled_from_env() -> bool {
+        std::env::var(ENV_SERVERLESS).ok().is_some_and(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    }
+
     /// Orchestrator sandbox isolation policy (`ANYAGENTS_SANDBOX_MODE`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
@@ -97,7 +109,16 @@ pub mod sylphx {
         }
 
         /// Parse [`SandboxMode`] from `ANYAGENTS_SANDBOX_MODE`, validating unrecognized values.
+        /// Automatically enables `RemoteRequired` when `ANYAGENTS_SERVERLESS=true`.
         pub fn checked_from_env() -> Result<Self, String> {
+            if serverless_enabled_from_env() {
+                if let Ok(val) = std::env::var(ENV_SANDBOX_MODE)
+                    && !val.trim().is_empty()
+                {
+                    let _ = Self::parse(&val)?;
+                }
+                return Ok(Self::RemoteRequired);
+            }
             match std::env::var(ENV_SANDBOX_MODE) {
                 Ok(val) => Self::parse(&val),
                 Err(_) => Ok(Self::Off),
@@ -105,8 +126,11 @@ pub mod sylphx {
         }
 
         /// Read [`SandboxMode`] from `ANYAGENTS_SANDBOX_MODE`, failing closed to `RemoteRequired`
-        /// if a non-empty value cannot be parsed.
+        /// if a non-empty value cannot be parsed or if `ANYAGENTS_SERVERLESS=true`.
         pub fn from_env() -> Self {
+            if serverless_enabled_from_env() {
+                return Self::RemoteRequired;
+            }
             match std::env::var(ENV_SANDBOX_MODE) {
                 Ok(val) if !val.trim().is_empty() => {
                     Self::parse(&val).unwrap_or(Self::RemoteRequired)
@@ -2534,10 +2558,11 @@ pub use providers::{
 };
 pub use sandbox::{SandboxConfig, SandboxProvider, SandboxProviderConfig};
 pub use sylphx::{
-    EnvdProcessEvent, EnvdSignal, SandboxDriver, SandboxMode, SylphxFileEntry, SylphxLease,
-    SylphxLeaseConfig, SylphxProviderConfig, SylphxSandboxClient, SylphxSandboxWorkspace,
-    SylphxVolume, destroy_sandbox_for_config_dir, ensure_leased_for_config_dir,
-    release_sandbox_for_config_dir, renew_lease_for_config_dir, resolve_workspace_backend_for_mode,
+    ENV_SERVERLESS, EnvdProcessEvent, EnvdSignal, SandboxDriver, SandboxMode, SylphxFileEntry,
+    SylphxLease, SylphxLeaseConfig, SylphxProviderConfig, SylphxSandboxClient,
+    SylphxSandboxWorkspace, SylphxVolume, destroy_sandbox_for_config_dir,
+    ensure_leased_for_config_dir, release_sandbox_for_config_dir, renew_lease_for_config_dir,
+    resolve_workspace_backend_for_mode, serverless_enabled_from_env,
 };
 pub use workspace::{
     DockerWorkspace, ExecEnv, ExecOutput, LocalWorkspace, REMOTE_EXEC_MAX_TIMEOUT_MS,
