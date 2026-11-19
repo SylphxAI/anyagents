@@ -683,10 +683,15 @@ async fn dispatch_sandbox_turn(
         argv.extend(input.guest_extra_args.iter().cloned());
     }
 
-    let exec_req = ExecRequest::argv(argv)
+    let mut exec_req = ExecRequest::argv(argv)
         .with_cwd(ensured.handle.workdir.clone())
         .with_stdin(effective_prompt.into_bytes())
         .with_timeout_ms(DETACHED_EXEC_TIMEOUT_MS);
+    exec_req
+        .env
+        .extend(crate::sandbox_exec::filter_sandbox_launch_env(
+            &input.agent.launch_env,
+        ));
 
     let out = match provider.exec(&ensured.handle, &exec_req).await {
         Ok(o) => o,
@@ -1131,13 +1136,14 @@ pub(crate) fn settle_remote_turn_and_deliver(
         }
     }
 
-    // 4. Advance durable mailbox turn terminal ledger if `message_seq` was recorded.
+    // 4. Advance durable mailbox delivery cursor & turn terminal ledger if `message_seq` was recorded.
     if let Some(seq) = turn
         .metadata_json
         .as_ref()
         .and_then(|m| m.get("message_seq").and_then(Value::as_i64))
     {
         if turn.status == "completed" {
+            let _ = store.mark_delivered_up_to(&turn.agent_id, seq);
             let opener = turn
                 .metadata_json
                 .as_ref()
@@ -1258,10 +1264,38 @@ pub(crate) fn settle_remote_turn_and_deliver(
                         delivered_reply = true;
                     }
                     Err(err) => {
-                        eprintln!(
-                            "anyagents-serverless: telegram reply delivery failed for {} (chat {}): {err}",
-                            turn.agent_id, chat_id
-                        );
+                        let err_str = err.to_string();
+                        if reply_to_message_id.is_some()
+                            && (err_str.contains("invalid_reply")
+                                || err_str.contains("message to be replied not found")
+                                || err_str.contains("replied message not found"))
+                        {
+                            match crate::telegram::post_text(
+                                store,
+                                store.data_dir(),
+                                from_name,
+                                bot.as_deref(),
+                                chat_id,
+                                reply_text,
+                                None,
+                                thread_id,
+                            ) {
+                                Ok(_) => {
+                                    delivered_reply = true;
+                                }
+                                Err(retry_err) => {
+                                    eprintln!(
+                                        "anyagents-serverless: telegram reply fallback delivery failed for {} (chat {}): {retry_err}",
+                                        turn.agent_id, chat_id
+                                    );
+                                }
+                            }
+                        } else {
+                            eprintln!(
+                                "anyagents-serverless: telegram reply delivery failed for {} (chat {}): {err}",
+                                turn.agent_id, chat_id
+                            );
+                        }
                     }
                 }
             }
@@ -2349,16 +2383,13 @@ pub(crate) async fn guest_events_route(
     let store = Arc::clone(&state.store);
     let store_for_drain = Arc::clone(&state.store);
     let profiles_for_sync = Arc::clone(&state.profiles);
-    let is_terminal_event = matches!(
-        payload.event_type.trim().to_ascii_lowercase().as_str(),
-        "turn_complete"
-            | "completed"
-            | "turn_failed"
-            | "failed"
-            | "turn_cancelled"
-            | "cancelled"
-            | "canceled"
-    );
+    let normalized_event = payload.event_type.trim().to_ascii_lowercase();
+    let is_completed_event = matches!(normalized_event.as_str(), "turn_complete" | "completed");
+    let is_terminal_event = is_completed_event
+        || matches!(
+            normalized_event.as_str(),
+            "turn_failed" | "failed" | "turn_cancelled" | "cancelled" | "canceled"
+        );
     let (json_resp, settled_agent_id, synced_auth_updates) = spawn_store(move || {
         let Some(turn) = store
             .remote_turn_store()
@@ -2587,8 +2618,13 @@ pub(crate) async fn guest_events_route(
                 )
                 .await;
             }
-            if let Err(err) =
-                dispatch_next_mailbox_message_if_serverless(store_for_drain, &drain_aid).await
+            // Only immediately drain queued mailbox messages after a *completed* turn.
+            // Failed/cancelled turns do not advance the delivery cursor, so re-dispatching
+            // immediately would cause an unbounded tight retry storm; `/v1/internal/tick`
+            // retries them after the failure backoff window instead.
+            if is_completed_event
+                && let Err(err) =
+                    dispatch_next_mailbox_message_if_serverless(store_for_drain, &drain_aid).await
             {
                 eprintln!(
                     "anyagents-serverless: post-turn mailbox drain failed for {drain_aid}: {err}"
@@ -3341,7 +3377,7 @@ pub(crate) async fn run_tick_pass(
                 .reconcile_all_stale_serverless_open_turns()
                 .unwrap_or(0);
             let agents = store_rec
-                .list_running_agents_with_undelivered(8)
+                .list_running_agents_with_undelivered(24)
                 .unwrap_or_default();
             Ok((cleared, agents))
         })
@@ -4856,5 +4892,101 @@ done
             assert!(!settled.delivered_reply, "must suppress `{text}`");
         }
         assert!(store.list_undelivered(&peer.id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn settle_completed_turn_advances_mailbox_cursor_while_failed_turn_preserves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("cursor-advancer", "agy"))
+            .unwrap();
+        store.set_agent_running(&agent.id, "/work").unwrap();
+        let _m1 = store.receive(&agent.id, Incoming::new("msg 1")).unwrap();
+        let anyagents_core::ReceiveOutcome::New(m2) =
+            store.receive(&agent.id, Incoming::new("msg 2")).unwrap()
+        else {
+            panic!("expected new message");
+        };
+        assert_eq!(m2.seq, 2);
+
+        // Failed turn must NOT advance `mailbox_cursors.delivered_seq`.
+        let now = now_ms();
+        store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "turn_fail_cursor".to_string(),
+                agent_id: agent.id.clone(),
+                harness_kind: "sandbox".to_string(),
+                provider_kind: Some("sylphx".to_string()),
+                remote_run_id: None,
+                callback_token_hash: "hash1".to_string(),
+                cursor: None,
+                status: "dispatched".to_string(),
+                metadata_json: Some(json!({
+                    "message_seq": m2.seq,
+                    "opener_id": m2.id.to_string(),
+                })),
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+        let failed = settle_remote_turn_and_deliver(
+            &store,
+            "turn_fail_cursor",
+            SettleRemoteTurn {
+                status: "failed".to_string(),
+                result_text: None,
+                error_text: Some("transient error".to_string()),
+                usage_json: None,
+                cursor: None,
+                settled_at_ms: now + 10,
+            },
+            None,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(failed.settled_now);
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), 0);
+        assert_eq!(store.list_undelivered(&agent.id, 10).unwrap().len(), 2);
+
+        // Completed turn MUST advance `mailbox_cursors.delivered_seq` through `m2.seq`.
+        store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "turn_ok_cursor".to_string(),
+                agent_id: agent.id.clone(),
+                harness_kind: "sandbox".to_string(),
+                provider_kind: Some("sylphx".to_string()),
+                remote_run_id: None,
+                callback_token_hash: "hash2".to_string(),
+                cursor: None,
+                status: "dispatched".to_string(),
+                metadata_json: Some(json!({
+                    "message_seq": m2.seq,
+                    "opener_id": m2.id.to_string(),
+                })),
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+        let ok = settle_remote_turn_and_deliver(
+            &store,
+            "turn_ok_cursor",
+            SettleRemoteTurn {
+                status: "completed".to_string(),
+                result_text: Some("all done".to_string()),
+                error_text: None,
+                usage_json: None,
+                cursor: None,
+                settled_at_ms: now + 30,
+            },
+            None,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(ok.settled_now);
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), m2.seq);
+        assert!(store.list_undelivered(&agent.id, 10).unwrap().is_empty());
     }
 }

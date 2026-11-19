@@ -5672,33 +5672,121 @@ impl Store {
 
     /// List up to `limit` live (`running`) agent IDs that currently have at least one
     /// undelivered message (`messages.seq > COALESCE(mailbox_cursors.delivered_seq, 0)`),
-    /// ordered by oldest undelivered message first.
+    /// excluding agents that already have an active remote turn or failed within the
+    /// recent failure cooldown (`failure_cooldown_ms`), ordered by freshest undelivered
+    /// message first so active human conversations are never starved by old backlogs.
     pub fn list_running_agents_with_undelivered(
         &self,
         limit: usize,
     ) -> Result<Vec<AgentId>, Error> {
+        self.list_running_agents_with_undelivered_backoff(limit, 120_000)
+    }
+
+    /// Variant of [`Self::list_running_agents_with_undelivered`] with an explicit
+    /// cooldown window (in milliseconds) after a failed/timed-out remote turn.
+    pub fn list_running_agents_with_undelivered_backoff(
+        &self,
+        limit: usize,
+        failure_cooldown_ms: i64,
+    ) -> Result<Vec<AgentId>, Error> {
         let cap = limit.clamp(1, 100) as i64;
+        let cooldown_cutoff = now_ms().saturating_sub(failure_cooldown_ms.max(0));
         let conn = self.read_conn();
-        let rows: Vec<String> = conn.db_query_vec(
-            "SELECT a.id
-             FROM agents a
-             JOIN messages m ON m.agent_id = a.id
-             LEFT JOIN mailbox_cursors c ON c.agent_id = a.id
-             WHERE a.state = 'running'
-               AND m.seq > COALESCE(c.delivered_seq, 0)
-             GROUP BY a.id
-             ORDER BY MIN(m.received_at_ms) ASC
-             LIMIT ?1",
-            &db_params![cap],
-            |r| r.get::<String>(0),
-        )?;
+        let rows: Vec<String> = if conn.backend() == DbBackend::Postgres {
+            conn.db_query_vec(
+                "SELECT a.id
+                 FROM agents a
+                 JOIN messages m ON m.agent_id = a.id
+                 LEFT JOIN mailbox_cursors c ON c.agent_id = a.id
+                 WHERE a.state = 'running'
+                   AND m.seq > COALESCE(c.delivered_seq, 0)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pending_remote_turns p
+                       WHERE p.agent_id = a.id
+                         AND p.status IN ('dispatched', 'running')
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pending_remote_turns p
+                       WHERE p.agent_id = a.id
+                         AND p.status IN ('failed', 'timed_out', 'cancelled')
+                         AND p.last_event_at_ms >= ?1
+                         AND NOT EXISTS (
+                             SELECT 1 FROM pending_remote_turns p2
+                             WHERE p2.agent_id = a.id
+                               AND p2.status = 'completed'
+                               AND p2.last_event_at_ms > p.last_event_at_ms
+                         )
+                   )
+                 GROUP BY a.id
+                 ORDER BY MAX(m.received_at_ms) DESC
+                 LIMIT ?2",
+                &db_params![cooldown_cutoff, cap],
+                |r| r.get::<String>(0),
+            )?
+        } else {
+            conn.db_query_vec(
+                "SELECT a.id
+                 FROM agents a
+                 JOIN messages m ON m.agent_id = a.id
+                 LEFT JOIN mailbox_cursors c ON c.agent_id = a.id
+                 WHERE a.state = 'running'
+                   AND m.seq > COALESCE(c.delivered_seq, 0)
+                 GROUP BY a.id
+                 ORDER BY MAX(m.received_at_ms) DESC
+                 LIMIT ?1",
+                &db_params![cap],
+                |r| r.get::<String>(0),
+            )?
+        };
         let mut out = Vec::with_capacity(rows.len());
         for raw in rows {
             if let Ok(id) = AgentId::parse(&raw) {
+                if !self.is_postgres()
+                    && self
+                        .remote_turn_store()
+                        .list_active_for_agent(&id)
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
                 out.push(id);
             }
         }
         Ok(out)
+    }
+
+    /// Monotonically advance `mailbox_cursors.delivered_seq` up to `seq` and stamp
+    /// `messages.delivered_at_ms` for any messages `<= seq` that have not been stamped yet.
+    ///
+    /// Used by stateless serverless turn settlement, where a single remote turn can
+    /// process a batch of multiple undelivered messages in one shot.
+    pub fn mark_delivered_up_to(&self, agent_id: &AgentId, seq: i64) -> Result<i64, Error> {
+        if seq <= 0 {
+            return self.delivered_cursor(agent_id);
+        }
+        self.write_tx(|tx| {
+            agent_exists(tx, agent_id)?;
+            let now = now_ms();
+            tx.db_execute(
+                "INSERT INTO mailbox_cursors (agent_id, delivered_seq)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(agent_id) DO UPDATE SET
+                     delivered_seq = CASE
+                         WHEN excluded.delivered_seq > mailbox_cursors.delivered_seq
+                         THEN excluded.delivered_seq
+                         ELSE mailbox_cursors.delivered_seq
+                     END",
+                &db_params![agent_id.as_str(), seq],
+            )?;
+            tx.db_execute(
+                "UPDATE messages
+                 SET delivered_at_ms = COALESCE(delivered_at_ms, ?1)
+                 WHERE agent_id = ?2 AND seq <= ?3 AND delivered_at_ms IS NULL",
+                &db_params![now, agent_id.as_str(), seq],
+            )?;
+            cursor(tx, agent_id)
+        })
     }
 
     /// Close a stale `turn_recovery` row (`opened_seq > completed_seq`) when a serverless
@@ -13575,5 +13663,70 @@ mod tests {
                 "note_delivered must not retry"
             );
         }
+    }
+
+    #[test]
+    fn mark_delivered_up_to_is_monotonic_and_clears_undelivered() {
+        let (_dir, store) = setup();
+        let worker = agent(&store, "serverless-cursor");
+        store.set_agent_running(&worker.id, "/work").unwrap();
+        for i in 1..=5 {
+            store
+                .receive(&worker.id, Incoming::new(format!("batch msg {i}")))
+                .unwrap();
+        }
+        assert_eq!(store.delivered_cursor(&worker.id).unwrap(), 0);
+        assert_eq!(store.list_undelivered(&worker.id, 10).unwrap().len(), 5);
+
+        let cur = store.mark_delivered_up_to(&worker.id, 3).unwrap();
+        assert_eq!(cur, 3);
+        assert_eq!(store.delivered_cursor(&worker.id).unwrap(), 3);
+        assert_eq!(store.list_undelivered(&worker.id, 10).unwrap().len(), 2);
+
+        // Monotonic: a smaller sequence never rewinds the cursor.
+        let cur2 = store.mark_delivered_up_to(&worker.id, 1).unwrap();
+        assert_eq!(cur2, 3);
+        assert_eq!(store.delivered_cursor(&worker.id).unwrap(), 3);
+
+        let cur3 = store.mark_delivered_up_to(&worker.id, 5).unwrap();
+        assert_eq!(cur3, 5);
+        assert!(store.list_undelivered(&worker.id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_running_agents_with_undelivered_prefers_freshest_and_skips_active_turns() {
+        let (_dir, store) = setup();
+        let older = agent(&store, "older-unread");
+        let newer = agent(&store, "newer-unread");
+        store.set_agent_running(&older.id, "/work/a").unwrap();
+        store.set_agent_running(&newer.id, "/work/b").unwrap();
+
+        store
+            .receive(&older.id, Incoming::new("old backlog"))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        store.receive(&newer.id, Incoming::new("fresh dm")).unwrap();
+
+        let ranked = store.list_running_agents_with_undelivered(10).unwrap();
+        assert_eq!(ranked, vec![newer.id.clone(), older.id.clone()]);
+
+        // An agent with an active remote turn must be skipped by tick backlog drain.
+        let _ = store
+            .remote_turn_store()
+            .create_turn(&crate::NewRemoteTurn {
+                turn_id: "turn_active_skip_test".to_string(),
+                agent_id: newer.id.clone(),
+                harness_kind: "sandbox".to_string(),
+                provider_kind: Some("sylphx".to_string()),
+                remote_run_id: None,
+                callback_token_hash: "hash".to_string(),
+                cursor: None,
+                status: "dispatched".to_string(),
+                metadata_json: None,
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+        let ranked_after = store.list_running_agents_with_undelivered(10).unwrap();
+        assert_eq!(ranked_after, vec![older.id]);
     }
 }
