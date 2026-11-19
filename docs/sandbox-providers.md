@@ -89,18 +89,24 @@ Provider-specific variables:
 
 ## 4. Building & Pinning Custom Images (`Dockerfile.sandbox`)
 
-Build the minimal base image or the full image with selected public CLI harnesses:
+Build the minimal base image, the developer toolchain image (`rustc`/`cargo` via `rustup` + `bun`), or the full image with selected public CLI harnesses:
 
 ```bash
 # Minimal base sandbox (anyagents-guest + git, rg, fd, jq, python3, node/npm, gh, tini)
 docker build -f Dockerfile.sandbox --target sandbox-base \
   -t ghcr.io/<your-org>/anyagents-sandbox:base .
 
+# Developer toolchain sandbox (extends sandbox-base with rustc/cargo via rustup + bun)
+docker build -f Dockerfile.sandbox --target sandbox-dev \
+  -t ghcr.io/<your-org>/anyagents-sandbox:dev .
+
 # Full sandbox with selected public CLI harnesses
 docker build -f Dockerfile.sandbox --target sandbox-full \
   --build-arg INSTALL_HARNESSES="claude-code codex opencode" \
   -t ghcr.io/<your-org>/anyagents-sandbox:full .
 ```
+
+The vendor-neutral [`.github/workflows/docker-publish.yml`](../.github/workflows/docker-publish.yml) workflow builds and publishes both `Dockerfile` (Coordinator) and all three `Dockerfile.sandbox` targets (`sandbox-base`, `sandbox-dev`, `sandbox-full`) on version tags, GitHub releases, or manual `workflow_dispatch` (with configurable `registry`), outputting exact immutable `@sha256:...` digests.
 
 Extend `sandbox-base` with your own SDKs, language toolchains, or private CLIs:
 

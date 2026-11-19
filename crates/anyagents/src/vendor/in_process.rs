@@ -13,6 +13,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use anyagents_core::{AgentId, Store};
 use anyagents_harness::{
     DeliverOutcome, Delivery, Harness, HarnessError, HarnessHealth, OutboundMessage, Proof,
     TurnState, TurnUsage, compose_message, message_id_in_text,
@@ -151,6 +152,23 @@ impl InProcessRemoteHarness {
             + Send
             + 'static,
     {
+        Self::start_with_worker_and_heartbeat(cloud, label, None, worker_fn)
+    }
+
+    pub fn start_with_worker_and_heartbeat<F>(
+        cloud: bool,
+        label: &'static str,
+        heartbeat_sink: Option<(Arc<Store>, AgentId)>,
+        worker_fn: F,
+    ) -> Result<Self, String>
+    where
+        F: FnOnce(
+                BufReader<Box<dyn Read + Send>>,
+                Box<dyn Write + Send>,
+            ) -> Result<(), anyagents_core::Error>
+            + Send
+            + 'static,
+    {
         let (in_tx, in_rx) = mem_pipe();
         let (out_tx, out_rx) = mem_pipe();
 
@@ -203,6 +221,11 @@ impl InProcessRemoteHarness {
                     let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
                         continue;
                     };
+                    if let Some((ref hb_store, ref hb_agent)) = heartbeat_sink {
+                        let _ = crate::sandbox_exec::ingest_guest_heartbeat_value(
+                            hb_store, hb_agent, &val,
+                        );
+                    }
                     let mut st = reader_shared.lock().unwrap_or_else(|e| e.into_inner());
                     ingest_event(&mut st, &val);
                     st.notify_watchers();
@@ -235,10 +258,19 @@ impl InProcessRemoteHarness {
         })
     }
 
-    pub fn start_sandbox(args: crate::sandbox_exec::SandboxExecArgs) -> Result<Self, String> {
-        Self::start_with_worker(false, "sandbox", move |reader, writer| {
-            crate::sandbox_exec::run_with_io(args, reader, writer)
-        })
+    pub fn start_sandbox_with_store(
+        args: crate::sandbox_exec::SandboxExecArgs,
+        store_target: Option<(Arc<Store>, AgentId)>,
+    ) -> Result<Self, String> {
+        let worker_store = store_target.as_ref().map(|(s, _)| Arc::clone(s));
+        Self::start_with_worker_and_heartbeat(
+            false,
+            "sandbox",
+            store_target,
+            move |reader, writer| {
+                crate::sandbox_exec::run_with_io_in_store(args, reader, writer, worker_store)
+            },
+        )
     }
 
     fn write_line(&self, line: &str) -> Result<(), HarnessError> {
@@ -280,7 +312,7 @@ fn ingest_event(st: &mut SharedState, val: &Value) {
             }
         }
         "result" => {
-            let drained: Vec<String> = st.open.drain(..).collect();
+            let drained = std::mem::take(&mut st.open);
             for id in drained {
                 st.in_flight.remove(&id);
                 st.consumed.insert(id.clone());

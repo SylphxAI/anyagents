@@ -440,13 +440,14 @@ fn create_with_seat_and_sandbox_mode(
             crate::vendor::is_effective_cloud_harness(&agent.harness, Some(&data), None);
         if sandbox_mode.is_remote_required()
             && !effective_cloud
+            && !crate::sandbox_exec::has_remote_sandbox_provider(Some(&data))
             && anyagents_tools::SylphxProviderConfig::resolve(Some(&data))
                 .map_err(Error::Message)?
                 .is_none()
             && anyagents_tools::SandboxProviderConfig::resolve(Some(&data)).is_none()
         {
             return Err(Error::Message(
-                "ANYAGENTS_SANDBOX_MODE=remote_required requires a remote sandbox provider (`ANYAGENTS_SYLPHX_PARENT`)"
+                "ANYAGENTS_SANDBOX_MODE=remote_required requires a remote sandbox provider (`ANYAGENTS_SANDBOX_PROVIDER` or `ANYAGENTS_SYLPHX_PARENT`)"
                     .into(),
             ));
         }
@@ -642,6 +643,7 @@ fn create_with_seat_and_sandbox_mode(
         if !remote_placement
             && !effective_cloud
             && anyagents_tools::SandboxConfig::from_config_dir(&config).is_none()
+            && !crate::sandbox_exec::has_remote_sandbox_provider(Some(&data))
             && anyagents_tools::SylphxProviderConfig::resolve(Some(&data))
                 .map_err(Error::Message)?
                 .is_none()

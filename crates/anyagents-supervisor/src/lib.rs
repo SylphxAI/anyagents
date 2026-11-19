@@ -2865,6 +2865,17 @@ impl<H: Harness + 'static> Session<H> {
             );
         }
         if running.is_empty() {
+            if self
+                .inner
+                .store
+                .runtime_heartbeat(&self.id)
+                .ok()
+                .flatten()
+                .is_some_and(|hb| hb.inflight_children > 0)
+            {
+                self.review_children = true;
+                return true;
+            }
             return false;
         }
         match ExitWatch::start(&running, Arc::clone(&self.notify)) {

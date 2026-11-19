@@ -324,58 +324,6 @@ pub(crate) fn resolve_remote_sandbox_workdir(store: &Store, agent: &Agent) -> St
     anyagents_core::DEFAULT_REMOTE_SANDBOX_WORKDIR.to_string()
 }
 
-fn sync_sylphx_lease_to_binding_store(
-    store: &Store,
-    agent_id: &anyagents_core::AgentId,
-    leased: &anyagents_tools::sylphx::SylphxLeaseConfig,
-) {
-    if !store.is_postgres() {
-        return;
-    }
-    let mut binding = store
-        .sandbox_binding(agent_id)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| anyagents_core::SandboxBinding::new(agent_id.clone(), "sylphx"));
-    binding.provider = "sylphx".to_string();
-    binding.template = Some(leased.template.clone());
-    if !leased.workdir.trim().is_empty() && !leased.workdir.ends_with("/launcher") {
-        binding.remote_workdir = leased.workdir.clone();
-    }
-    binding.volume_id = leased.volume_id.clone();
-    binding.volume_resource = leased.volume_resource.clone();
-    binding.volume_size_gib = leased.volume_size_gib.map(|v| v as i64);
-    binding.lease_id = leased.lease_id.clone();
-    binding.lease_resource = leased.lease_resource.clone();
-    binding.data_plane_resource = leased.data_plane_resource.clone();
-    binding.transport_url = leased.envd_url.clone();
-    binding.guest_endpoint = leased.envd_url.clone();
-    if anyagents_core::MasterKey::from_env()
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        binding.transport_token = leased.envd_token.clone();
-    }
-    binding.lease_state = if leased.lease_id.is_some() {
-        "ready".to_string()
-    } else {
-        "detached".to_string()
-    };
-    binding.idle_since_ms = None;
-    binding.last_heartbeat_ms = Some(now_ms());
-    binding.spec_json = serde_json::json!({
-        "endpoint": leased.endpoint,
-        "parent": leased.parent,
-        "shape": leased.shape,
-        "mount_path": leased.mount_path,
-    })
-    .to_string();
-    if let Err(err) = store.sandbox_binding_store().upsert(&binding) {
-        eprintln!("anyagents-sandbox: failed to persist sandbox binding to postgres: {err}");
-    }
-}
-
 async fn serve(
     data: &Path,
     sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
@@ -502,12 +450,7 @@ async fn serve(
     .map_err(Error::Message)?;
     let idle_release_store = Arc::clone(&store);
     sup.set_on_idle_released(Arc::new(move |agent_id, cfg| {
-        if let Err(err) = anyagents_tools::release_sandbox_for_config_dir(cfg) {
-            eprintln!("anyagents-sandbox: idle release failed: {err}");
-        }
-        let _ = idle_release_store
-            .sandbox_binding_store()
-            .clear_lease(agent_id);
+        crate::sandbox_exec::handle_agent_idle_release(&idle_release_store, agent_id, cfg);
     }));
     let supervisor = Retaining(Some(sup), kept);
     if auth.is_confined() {
@@ -615,7 +558,17 @@ async fn serve(
                     crate::create::sync_fresher_bound_agent_credentials_in(&store, &root);
                     #[cfg(unix)]
                     crate::create::sync_canonical_skills(&root);
-                    if run_verify
+                    // 2-tier idle-TTL sandbox sweeper under singleton maintenance lease:
+                    // releases compute ONLY when idle_since_ms + idle_ttl_ms <= now AND
+                    // inflight_children == 0 AND no active turn (preserving persistent volumes).
+                    if let Err(err) = crate::sandbox_exec::sweep_idle_sandboxes(
+                        &store,
+                        &root,
+                        anyagents_core::now_ms(),
+                    ) {
+                        eprintln!("anyagents-sandbox: idle sweep deferred: {err}");
+                    }
+                    if tick_count.is_multiple_of(5)
                         && let Ok(live) = store.list_live_agents()
                     {
                         for a in live {
@@ -5483,10 +5436,10 @@ fn finish_agent_archive_locked(
     mark_explicitly_archived_locked(&state.store, state.store.data_dir(), agent)
         .map_err(ApiError::from_store)?;
     let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-    if let Err(err) = anyagents_tools::release_sandbox_for_config_dir(&cfg) {
+    if let Err(err) = crate::sandbox_exec::release_sandbox_for_agent(&state.store, &agent.id, &cfg)
+    {
         eprintln!("anyagents-sandbox: archive release failed: {err}");
     }
-    let _ = state.store.sandbox_binding_store().clear_lease(&agent.id);
     let mut process_guard = None;
     if !is_self {
         let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
@@ -6014,10 +5967,11 @@ async fn pause_agent_route(
             .set_agent_state(&found.id, "paused")
             .map_err(ApiError::from_store)?;
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &found.id);
-        if let Err(err) = anyagents_tools::release_sandbox_for_config_dir(&cfg) {
+        if let Err(err) =
+            crate::sandbox_exec::release_sandbox_for_agent(&state.store, &found.id, &cfg)
+        {
             eprintln!("anyagents-sandbox: pause release failed: {err}");
         }
-        let _ = state.store.sandbox_binding_store().clear_lease(&found.id);
         drop(lifecycle);
         let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
         while std::time::Instant::now() < deadline {
@@ -6366,18 +6320,16 @@ fn prepare_agent_wake_with_options(
         Some(&cfg),
     ) {
         let remote_workdir = resolve_remote_sandbox_workdir(store, found);
-        match anyagents_tools::ensure_leased_for_config_dir(
-            Some(store.data_dir()),
+        match crate::sandbox_exec::ensure_sandbox_for_agent(
+            store,
+            found,
             &cfg,
-            found.id.as_str(),
             Some(remote_workdir.as_str()),
             &std::collections::BTreeMap::new(),
         ) {
-            Ok(Some(leased)) => {
-                sync_sylphx_lease_to_binding_store(store, &found.id, &leased);
-            }
+            Ok(Some(_)) => {}
             Ok(None) => {
-                // Only dispatch legacy HTTP resume when no leased driver handled wake.
+                // Only dispatch legacy HTTP resume when no leased/registry provider handled wake.
                 if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&cfg) {
                     let _ = anyagents_tools::SandboxProvider::resume(&sbx);
                 }
@@ -9149,17 +9101,14 @@ fn deliver_agent_with_media(
             Some(&cfg),
         ) {
             let remote_workdir = resolve_remote_sandbox_workdir(store, &agent);
-            match anyagents_tools::ensure_leased_for_config_dir(
-                Some(store.data_dir()),
+            match crate::sandbox_exec::ensure_sandbox_for_agent(
+                store,
+                &agent,
                 &cfg,
-                agent.id.as_str(),
                 Some(remote_workdir.as_str()),
                 &std::collections::BTreeMap::new(),
             ) {
-                Ok(Some(leased)) => {
-                    sync_sylphx_lease_to_binding_store(store, &agent.id, &leased);
-                }
-                Ok(None) => {}
+                Ok(Some(_)) | Ok(None) => {}
                 Err(err) if anyagents_tools::SandboxMode::from_env().is_remote_required() => {
                     return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
                 }

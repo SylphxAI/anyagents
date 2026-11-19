@@ -7,11 +7,14 @@
 #   - sandbox-base  : minimal Debian Bookworm developer sandbox with `anyagents-guest`,
 #                     persistent `/home/user/agent-data/{state,workspace}` layout, and
 #                     standard CLI utilities (git, rg, fd, jq, python3, node/npm, gh, tini)
+#   - sandbox-dev   : extends `sandbox-base` with open-source `rustc`/`cargo` (via rustup)
+#                     and `bun` for building and testing Rust + JS/TS repositories
 #   - sandbox-full  : extends `sandbox-base` with optional public CLI harnesses selected
 #                     via `--build-arg INSTALL_HARNESSES="..."`
 #
 # Example builds:
 #   docker build -f Dockerfile.sandbox --target sandbox-base -t ghcr.io/<org>/anyagents-sandbox:base .
+#   docker build -f Dockerfile.sandbox --target sandbox-dev -t ghcr.io/<org>/anyagents-sandbox:dev .
 #   docker build -f Dockerfile.sandbox --target sandbox-full \
 #     --build-arg INSTALL_HARNESSES="claude-code codex opencode" \
 #     -t ghcr.io/<org>/anyagents-sandbox:full .
@@ -22,8 +25,10 @@
 #   ANYAGENTS_SANDBOX_IMAGE="ghcr.io/<org>/anyagents-sandbox@sha256:<digest>"
 
 ARG RUST_IMAGE=rust:1-bookworm
+ARG BUN_IMAGE=oven/bun:1-slim
 ARG RUNTIME_IMAGE=debian:bookworm-slim
 ARG NODE_MAJOR=22
+ARG RUST_TOOLCHAIN=stable
 ARG USER_UID=1000
 ARG USER_GID=1000
 
@@ -127,7 +132,49 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/usr/local/bin/anyagents-guest", "health"]
 
 # ------------------------------------------------------------------------------
-# Stage 3: Full sandbox with opt-in public/open-source CLI harnesses (`sandbox-full`)
+# Stage 3: Developer toolchain sandbox (`sandbox-dev`)
+# Extends `sandbox-base` with open-source Rust (`rustup`/`rustc`/`cargo`) + `bun`.
+# ------------------------------------------------------------------------------
+FROM ${BUN_IMAGE} AS bun-bin
+
+FROM sandbox-base AS sandbox-dev
+
+ARG RUST_TOOLCHAIN=stable
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+LABEL org.opencontainers.image.title="anyagents-sandbox-dev" \
+      org.opencontainers.image.description="Vendor-neutral open-source AnyAgents developer sandbox image with rustc/cargo (rustup) and bun" \
+      org.opencontainers.image.licenses="MIT"
+
+USER root
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        libssl-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}" --component clippy,rustfmt --no-modify-path \
+    && chmod -R a+rX "${RUSTUP_HOME}" "${CARGO_HOME}" \
+    && chown -R "${USER_UID}:${USER_GID}" "${CARGO_HOME}" \
+    && rustc --version \
+    && cargo --version
+
+COPY --from=bun-bin /usr/local/bin/bun /usr/local/bin/bun
+RUN ln -sf /usr/local/bin/bun /usr/local/bin/bunx \
+    && bun --version
+
+WORKDIR /home/user/agent-data/workspace
+USER ${USER_UID}:${USER_GID}
+
+# ------------------------------------------------------------------------------
+# Stage 4: Full sandbox with opt-in public/open-source CLI harnesses (`sandbox-full`)
 # ------------------------------------------------------------------------------
 FROM sandbox-base AS sandbox-full
 

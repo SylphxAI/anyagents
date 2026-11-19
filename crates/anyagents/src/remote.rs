@@ -295,17 +295,24 @@ pub fn normalize_public_url(raw: &str) -> Result<String, String> {
 /// harness spawned into a remote sandbox. These are the agents that hold
 /// remote session tokens.
 pub fn runs_off_host(agent: &Agent, config_dir: &Path) -> bool {
+    let data_dir = config_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent);
     crate::vendor::is_cloud_harness(&agent.harness)
+        || crate::sandbox_exec::has_remote_sandbox_provider(data_dir)
         || anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(config_dir).is_some()
         || anyagents_tools::SandboxConfig::resolve(Some(config_dir))
             .is_some_and(|sandbox| sandbox.remote_spawn)
 }
 
 /// Store-aware check for whether this agent runs off-host, consulting
-/// PostgreSQL `agent_sandbox_bindings` and `remote_required` mode so peer
-/// replicas without pod-local `sandbox*.json` files admit HTTP MCP properly.
+/// PostgreSQL `agent_sandbox_bindings`, active `ProviderRegistry` providers,
+/// and `remote_required` mode so peer replicas without pod-local `sandbox*.json`
+/// files admit HTTP MCP properly.
 pub fn runs_off_host_in(store: &Store, agent: &Agent, config_dir: &Path) -> bool {
     runs_off_host(agent, config_dir)
+        || crate::sandbox_exec::has_remote_sandbox_provider(Some(store.data_dir()))
         || anyagents_tools::SandboxMode::from_env().is_remote_required()
         || store.sandbox_binding(&agent.id).ok().flatten().is_some()
 }

@@ -4,6 +4,7 @@
 //! the process at another home.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyagents_harness::{
@@ -138,6 +139,7 @@ impl VendorHarness {
         planned: Planned,
         request: &LaunchRequest,
         host: &HarnessHost,
+        shared_store: Option<Arc<anyagents_core::Store>>,
     ) -> Result<Self, String> {
         let Planned {
             launch,
@@ -176,10 +178,14 @@ impl VendorHarness {
             launch,
             AdapterLaunch::InProcessCloud { .. } | AdapterLaunch::InProcessSandbox { .. }
         ) {
-            Host::Local(launch.start()?)
+            Host::Local(
+                launch.start_with_store(shared_store.map(|s| (s, request.agent.id.clone())))?,
+            )
         } else {
             match host {
-                HarnessHost::InProcess => Host::Local(launch.start()?),
+                HarnessHost::InProcess => Host::Local(
+                    launch.start_with_store(shared_store.map(|s| (s, request.agent.id.clone())))?,
+                ),
                 HarnessHost::Keeper(program) => {
                     use std::os::fd::AsFd as _;
                     let seat = launch
@@ -589,6 +595,13 @@ impl AdapterLaunch {
 
     /// Start the vendor process and its adapter.
     pub fn start(self) -> Result<LocalAdapter, String> {
+        self.start_with_store(None)
+    }
+
+    pub(crate) fn start_with_store(
+        self,
+        store_target: Option<(Arc<anyagents_core::Store>, anyagents_core::AgentId)>,
+    ) -> Result<LocalAdapter, String> {
         Ok(match self {
             Self::Contract {
                 program,
@@ -799,16 +812,19 @@ impl AdapterLaunch {
                 program,
                 session,
                 ..
-            } => LocalAdapter::InProcessRemote(Box::new(InProcessRemoteHarness::start_sandbox(
-                crate::sandbox_exec::SandboxExecArgs {
-                    config: Some(config_dir),
-                    harness: Some(harness),
-                    program,
-                    resume: session,
-                    oneshot: false,
-                    args: Vec::new(),
-                },
-            )?)),
+            } => LocalAdapter::InProcessRemote(Box::new(
+                InProcessRemoteHarness::start_sandbox_with_store(
+                    crate::sandbox_exec::SandboxExecArgs {
+                        config: Some(config_dir),
+                        harness: Some(harness),
+                        program,
+                        resume: session,
+                        oneshot: false,
+                        args: Vec::new(),
+                    },
+                    store_target,
+                )?,
+            )),
         })
     }
 }
@@ -1054,7 +1070,7 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
 
 #[cfg(test)]
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
-    vendor_launch_authorized(request, None, &HarnessHost::InProcess)
+    vendor_launch_authorized(request, None, None, &HarnessHost::InProcess)
 }
 
 /// Reuse the daemon's admitted in-memory authority; reopening SQLite alone does
@@ -1063,21 +1079,22 @@ pub fn vendor_launch_with_store(
     request: LaunchRequest,
     store: &anyagents_core::Store,
 ) -> Result<VendorHarness, String> {
-    vendor_launch_authorized(request, Some(store), &HarnessHost::InProcess)
+    vendor_launch_authorized(request, Some(store), None, &HarnessHost::InProcess)
 }
 
 /// Launch with the daemon's authority, hosting the adapter where `host` says.
 pub fn vendor_launch_hosted(
     request: LaunchRequest,
-    store: &anyagents_core::Store,
+    store: &Arc<anyagents_core::Store>,
     host: &HarnessHost,
 ) -> Result<VendorHarness, String> {
-    vendor_launch_authorized(request, Some(store), host)
+    vendor_launch_authorized(request, Some(store.as_ref()), Some(Arc::clone(store)), host)
 }
 
 fn vendor_launch_authorized(
     request: LaunchRequest,
     store: Option<&anyagents_core::Store>,
+    shared_store: Option<Arc<anyagents_core::Store>>,
     host: &HarnessHost,
 ) -> Result<VendorHarness, String> {
     // The supervisor owns the agent process lock. Allocate the host generation
@@ -1103,7 +1120,7 @@ fn vendor_launch_authorized(
         settle_legacy_spiron_hold(&request.config_dir)?;
     }
     let config_dir = request.config_dir.clone();
-    let res = vendor_launch_inner(request, store, host);
+    let res = vendor_launch_inner(request, store, shared_store, host);
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
         match &res {
             Ok(vh) => {
@@ -1285,6 +1302,7 @@ fn read_opencode_exit_error(config_dir: &Path) -> Option<String> {
 fn vendor_launch_inner(
     mut request: LaunchRequest,
     authority: Option<&anyagents_core::Store>,
+    shared_store: Option<Arc<anyagents_core::Store>>,
     host: &HarnessHost,
 ) -> Result<VendorHarness, String> {
     // Strip any untrusted launch or authority variables from caller/stored env.
@@ -1446,6 +1464,7 @@ fn vendor_launch_inner(
         .and_then(|s| s.sandbox_binding(&request.agent.id).ok().flatten())
         .is_some();
     let sylphx_backed = pg_sandbox_backed
+        || crate::sandbox_exec::has_remote_sandbox_provider(Some(&request.data_dir))
         || anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&request.config_dir)
             .is_some()
         || anyagents_tools::SylphxProviderConfig::resolve(Some(&request.data_dir))
@@ -1674,7 +1693,7 @@ fn vendor_launch_inner(
     if planned.launch.runs_off_host() {
         begin_remote_session(store_opt, &request.agent)?;
     }
-    let vh = VendorHarness::start(planned, &request, host)?;
+    let vh = VendorHarness::start(planned, &request, host, shared_store)?;
     vh.sync_session()?;
     Ok(vh)
 }
@@ -1721,6 +1740,7 @@ fn plan_adapter(
         Some(&request.config_dir),
     );
     let sylphx_backed = pg_sandbox_backed
+        || crate::sandbox_exec::has_remote_sandbox_provider(Some(&request.data_dir))
         || anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&request.config_dir)
             .is_some()
         || anyagents_tools::SylphxProviderConfig::resolve(Some(&request.data_dir))
