@@ -333,7 +333,7 @@ async fn dispatch_cloud_turn(
             .begin_remote_session(&aid_mcp, 3_782_000)
             .ok()
             .map(|issued| {
-                let mcp_url = format!("{base_url_mcp}{}?profile=remote", crate::remote::MCP_PATH);
+                let mcp_url = format!("{base_url_mcp}{}", crate::remote::MCP_PATH);
                 json!([{
                     "name": "anyagents",
                     "url": mcp_url,

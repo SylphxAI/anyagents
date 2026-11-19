@@ -18772,6 +18772,19 @@ exec '{}' "$@"
             !body.contains("ANYAGENTS_DATA_DIR"),
             "Dockerfile must not reference dead ANYAGENTS_DATA_DIR env var"
         );
+        for heavy in [
+            "chromium",
+            "sway",
+            "wayvnc",
+            "fonts-noto-core",
+            "nodejs",
+            "oven/bun",
+        ] {
+            assert!(
+                !body.contains(heavy),
+                "slim coordinator Dockerfile must not install `{heavy}`"
+            );
+        }
     }
 
     #[test]

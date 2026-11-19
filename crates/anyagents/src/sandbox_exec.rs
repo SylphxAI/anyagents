@@ -4622,6 +4622,10 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let dockerfile = std::fs::read_to_string(root.join("Dockerfile.sandbox")).unwrap();
         assert!(dockerfile.contains("-p anyagents-guest --bin anyagents-guest"));
+        assert!(dockerfile.contains("-p anyagents-mcp-browser --bin anyagents-mcp-browser"));
+        assert!(dockerfile.contains("-p anyagents-mcp-web --bin anyagents-mcp-web"));
+        assert!(dockerfile.contains("/usr/local/bin/anyagents-mcp-web"));
+        assert!(dockerfile.contains("/usr/local/bin/anyagents-mcp-browser"));
         assert!(dockerfile.contains("select(.name == \"agent-tools\")"));
         assert!(dockerfile.contains("--bin agent-code-mode"));
         assert!(dockerfile.contains("/usr/local/bin/agent-code-mode"));

@@ -2371,7 +2371,7 @@ mod tests {
             assert_eq!(calls[0].0, "mcp-client-2025-04-04");
             assert_eq!(
                 calls[0].1["mcp_servers"][0]["url"],
-                "https://mcp.example.test/mcp?profile=remote"
+                "https://mcp.example.test/mcp"
             );
             assert_eq!(
                 calls[0].1["mcp_servers"][0]["authorization_token"],
@@ -2413,7 +2413,7 @@ mod tests {
             assert_eq!(calls[0]["tools"][0]["type"], "mcp");
             assert_eq!(
                 calls[0]["tools"][0]["server_url"],
-                "https://mcp.example.test/mcp?profile=remote"
+                "https://mcp.example.test/mcp"
             );
             assert_eq!(
                 calls[0]["tools"][0]["headers"]["Authorization"],
@@ -2447,7 +2447,7 @@ mod tests {
             assert_eq!(calls[0]["prompt"]["text"], "ping cursor");
             assert_eq!(
                 calls[0]["mcp_servers"][0]["url"],
-                "https://mcp.example.test/mcp?profile=remote"
+                "https://mcp.example.test/mcp"
             );
             assert_eq!(calls[0]["mcp_servers"][0]["bearer_token"], remote.as_str());
             let sys = calls[0]["system_prompt"].as_str().unwrap();

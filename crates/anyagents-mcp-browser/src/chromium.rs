@@ -28,22 +28,26 @@ const PLAYWRIGHT_RELATIVE_BINS: &[&str] = &[
 ];
 
 /// Discover a usable Chromium executable using:
-/// 1. Explicit CLI/env override (`--chromium-bin` / `ANYAGENTS_CHROMIUM_BIN`).
-/// 2. `$PATH` (`chromium`, `chromium-browser`, `google-chrome-stable`, `google-chrome`, `chrome`).
-/// 3. Well-known system locations for Linux, macOS, and Windows.
-/// 4. Playwright browser installations (`PLAYWRIGHT_BROWSERS_PATH`, `/opt/playwright`,
+/// 1. Explicit CLI/env override (`--chromium-bin` / `ANYAGENTS_CHROMIUM_BIN`, parsed by
+///    `BrowserServerConfig` and passed as `explicit`).
+/// 2. Standard system binary directories (`/usr/local/bin`, `/usr/bin`, `/opt/homebrew/bin`,
+///    `/snap/bin`) and well-known system application paths for Linux, macOS, and Windows.
+/// 3. Playwright browser installations (`PLAYWRIGHT_BROWSERS_PATH`, `/opt/playwright`,
 ///    `$HOME/.cache/ms-playwright`, `$HOME/Library/Caches/ms-playwright`).
 pub fn discover_chromium(explicit: Option<&Path>) -> Result<PathBuf, String> {
-    let env_override = std::env::var_os("ANYAGENTS_CHROMIUM_BIN")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
-    let override_path = explicit.or(env_override.as_deref());
-    let path_dirs = std::env::var_os("PATH")
-        .map(|raw| std::env::split_paths(&raw).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let bin_dirs = default_system_bin_dirs();
     let system_paths = default_system_paths();
     let playwright_roots = default_playwright_roots();
-    discover_chromium_in(override_path, &path_dirs, &system_paths, &playwright_roots)
+    discover_chromium_in(explicit, &bin_dirs, &system_paths, &playwright_roots)
+}
+
+fn default_system_bin_dirs() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/snap/bin"),
+    ]
 }
 
 /// Pure, testable discovery implementation decoupled from global process env.

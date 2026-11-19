@@ -19,6 +19,9 @@ members = [
     "crates/anyagents-channel-telegram",
     "crates/anyagents-gateway",
     "crates/anyagents-guest",
+    "crates/anyagents-mcp-browser",
+    "crates/anyagents-mcp-web",
+    "crates/anyagents-mcp-computer",
     "crates/anyagents",
     "tests/invariants",
 ]
