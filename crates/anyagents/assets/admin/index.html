@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AnyAgents Admin Console</title>
+  <link rel="stylesheet" href="/admin/assets/styles.css" />
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">AA</span>
+        <div>
+          <h1 class="brand-title">AnyAgents</h1>
+          <span class="brand-subtitle">Admin Console</span>
+        </div>
+      </div>
+      <nav id="main-nav" class="nav-tabs hidden" aria-label="Console sections">
+        <button class="nav-tab active" data-tab="fleet" type="button">Fleet</button>
+        <button class="nav-tab" data-tab="profiles" type="button">Profiles &amp; Quota</button>
+        <button class="nav-tab" data-tab="telemetry" type="button">Usage &amp; Outcomes</button>
+        <button class="nav-tab" data-tab="automations" type="button">Automations &amp; Ticks</button>
+        <button class="nav-tab" data-tab="channels" type="button">Channels &amp; Groups</button>
+      </nav>
+      <div class="topbar-actions">
+        <span id="env-badge" class="pill pill-muted hidden"></span>
+        <span id="auth-badge" class="pill pill-muted">Checking auth...</span>
+        <button id="theme-toggle" class="btn btn-ghost btn-sm" type="button" title="Toggle theme">Theme</button>
+        <button id="logout-btn" class="btn btn-ghost btn-sm hidden" type="button">Sign Out</button>
+      </div>
+    </header>
+
+    <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+    <!-- Authentication gate -->
+    <main id="auth-gate" class="auth-gate hidden">
+      <section class="auth-card">
+        <h2>Operator Sign-In</h2>
+        <p id="auth-gate-message" class="muted"></p>
+        <div id="auth-gate-actions" class="auth-gate-actions"></div>
+      </section>
+    </main>
+
+    <!-- Main authenticated console -->
+    <main id="console-main" class="console-main hidden">
+      <!-- Tab 1: Fleet Tree & Inspector -->
+      <section id="tab-fleet" class="tab-panel active">
+        <div class="panel-toolbar">
+          <div class="toolbar-group">
+            <input id="fleet-search" class="input" type="search" placeholder="Filter agents by name, role, harness..." />
+            <select id="fleet-state-filter" class="select" aria-label="Filter by state">
+              <option value="active">Active &amp; Paused</option>
+              <option value="all">All (incl. Archived)</option>
+              <option value="running">Running only</option>
+              <option value="paused">Paused only</option>
+              <option value="archived">Archived only</option>
+            </select>
+          </div>
+          <div class="toolbar-group">
+            <button id="fleet-refresh-btn" class="btn btn-secondary" type="button">Refresh</button>
+            <button id="spawn-root-btn" class="btn btn-primary" type="button">+ Spawn Agent</button>
+          </div>
+        </div>
+
+        <div class="fleet-layout">
+          <aside class="card fleet-tree-card">
+            <div class="card-header">
+              <h2>Fleet Hierarchy</h2>
+              <span id="fleet-count" class="muted text-sm">0 agents</span>
+            </div>
+            <div id="fleet-tree" class="fleet-tree"></div>
+          </aside>
+
+          <section class="card fleet-inspector-card">
+            <div id="inspector-empty" class="empty-state">
+              Select an agent from the fleet tree to inspect live state, manage lifecycle, or view its conversation.
+            </div>
+            <div id="inspector-content" class="hidden">
+              <div class="inspector-header">
+                <div>
+                  <div class="inspector-title-row">
+                    <h2 id="insp-name"></h2>
+                    <div id="insp-badges" class="badge-row"></div>
+                  </div>
+                  <div id="insp-subtitle" class="muted text-sm mono"></div>
+                </div>
+                <div class="action-bar">
+                  <button id="btn-spawn-child" class="btn btn-secondary btn-sm" type="button">+ Child</button>
+                  <button id="btn-switch-runtime" class="btn btn-secondary btn-sm" type="button">Switch Runtime</button>
+                  <button id="btn-toggle-admin" class="btn btn-secondary btn-sm" type="button">Toggle Admin</button>
+                  <button id="btn-pause-agent" class="btn btn-warning btn-sm" type="button">Pause</button>
+                  <button id="btn-wake-agent" class="btn btn-success btn-sm" type="button">Wake</button>
+                  <button id="btn-archive-agent" class="btn btn-danger btn-sm" type="button">Archive</button>
+                </div>
+              </div>
+
+              <div id="insp-error-banner" class="alert alert-danger hidden"></div>
+              <div id="insp-meta-grid" class="meta-grid"></div>
+
+              <div class="inspector-section">
+                <h3>Send Test Message</h3>
+                <form id="send-msg-form" class="inline-form">
+                  <input id="send-msg-input" class="input flex-1" type="text" placeholder="Type a test message from operator..." required />
+                  <button class="btn btn-primary" type="submit">Send</button>
+                </form>
+              </div>
+
+              <div class="inspector-section">
+                <div class="section-header">
+                  <h3>Live Conversation <span class="muted text-sm">(last 50 turns)</span></h3>
+                  <div class="toolbar-group">
+                    <label class="checkbox-label">
+                      <input id="conv-autorefresh" type="checkbox" checked />
+                      Auto-refresh (5s)
+                    </label>
+                    <button id="conv-refresh-btn" class="btn btn-ghost btn-sm" type="button">Refresh</button>
+                  </div>
+                </div>
+                <div id="conv-viewer" class="conv-viewer"></div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <!-- Tab 2: Profiles & Live Quota Pool -->
+      <section id="tab-profiles" class="tab-panel">
+        <div class="panel-toolbar">
+          <div class="toolbar-group">
+            <h2>Provider Profiles &amp; Live Quota Pool</h2>
+            <span id="profiles-age" class="muted text-sm"></span>
+          </div>
+          <div class="toolbar-group">
+            <button id="profiles-refresh-btn" class="btn btn-secondary" type="button">Refresh</button>
+            <button id="profiles-fresh-btn" class="btn btn-secondary" type="button">Refresh (?fresh=1)</button>
+            <button id="add-profile-btn" class="btn btn-primary" type="button">+ Add Profile</button>
+          </div>
+        </div>
+        <div id="profiles-grid" class="profiles-grid"></div>
+      </section>
+
+      <!-- Tab 3: Usage & Outcomes Telemetry -->
+      <section id="tab-telemetry" class="tab-panel">
+        <div class="panel-toolbar">
+          <div class="toolbar-group">
+            <h2>Usage &amp; Outcomes Telemetry</h2>
+          </div>
+          <div class="toolbar-group">
+            <label for="telemetry-days" class="muted text-sm">Window:</label>
+            <select id="telemetry-days" class="select">
+              <option value="1">Last 24h (1d)</option>
+              <option value="7" selected>Last 7 days</option>
+              <option value="14">Last 14 days</option>
+              <option value="30">Last 30 days</option>
+            </select>
+            <button id="telemetry-refresh-btn" class="btn btn-secondary" type="button">Refresh</button>
+          </div>
+        </div>
+
+        <div id="telemetry-cards" class="kpi-grid"></div>
+
+        <div class="split-grid">
+          <section class="card">
+            <div class="card-header"><h3>Usage by Agent</h3></div>
+            <div id="usage-by-agent-table" class="table-wrap"></div>
+          </section>
+          <section class="card">
+            <div class="card-header"><h3>Usage by Model</h3></div>
+            <div id="usage-by-model-table" class="table-wrap"></div>
+          </section>
+        </div>
+
+        <section class="card mt-16">
+          <div class="card-header">
+            <h3>Outcomes by Model</h3>
+            <span id="outcomes-unattributed" class="muted text-sm"></span>
+          </div>
+          <div id="outcomes-table" class="table-wrap"></div>
+        </section>
+      </section>
+
+      <!-- Tab 4: Automations & Ticks -->
+      <section id="tab-automations" class="tab-panel">
+        <div class="panel-toolbar">
+          <div class="toolbar-group">
+            <h2>Automations, Outbound Queue &amp; Ticks</h2>
+          </div>
+          <div class="toolbar-group">
+            <button id="automations-refresh-btn" class="btn btn-secondary" type="button">Refresh</button>
+            <button id="run-tick-btn" class="btn btn-primary" type="button">Run Tick Pass</button>
+          </div>
+        </div>
+
+        <section class="card">
+          <div class="card-header">
+            <h3>Coordinator Tick &amp; Remote Turn Status</h3>
+            <span id="tick-auth-status" class="muted text-sm"></span>
+          </div>
+          <div id="tick-status-body" class="card-body"></div>
+          <div id="tick-last-result" class="card-body hidden"></div>
+        </section>
+
+        <section class="card mt-16">
+          <div class="card-header">
+            <h3>Agent Schedules</h3>
+            <div class="toolbar-group">
+              <select id="schedules-agent-select" class="select select-sm" aria-label="Schedule agent filter">
+                <option value="all">All agents</option>
+              </select>
+            </div>
+          </div>
+          <div id="schedules-table" class="table-wrap"></div>
+        </section>
+
+        <section class="card mt-16">
+          <div class="card-header">
+            <h3>Unsettled Outbound Queue</h3>
+            <span id="outbound-count" class="muted text-sm">0 held</span>
+          </div>
+          <div id="outbound-table" class="table-wrap"></div>
+        </section>
+      </section>
+
+      <!-- Tab 5: Channels & Groups -->
+      <section id="tab-channels" class="tab-panel">
+        <div class="panel-toolbar">
+          <div class="toolbar-group">
+            <h2>Channels &amp; Multi-Agent Groups</h2>
+          </div>
+          <div class="toolbar-group">
+            <button id="channels-refresh-btn" class="btn btn-secondary" type="button">Refresh</button>
+          </div>
+        </div>
+
+        <div class="split-grid">
+          <section class="card">
+            <div class="card-header">
+              <h3>Channel Bindings</h3>
+              <span id="channels-count" class="muted text-sm"></span>
+            </div>
+            <div id="channels-table" class="table-wrap"></div>
+          </section>
+
+          <section class="card">
+            <div class="card-header">
+              <h3>Multi-Agent Groups</h3>
+              <span id="groups-count" class="muted text-sm"></span>
+            </div>
+            <div id="groups-list" class="card-body"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <!-- Modal: Spawn Agent -->
+    <div id="modal-spawn" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-spawn-title">
+      <div class="modal">
+        <div class="modal-header">
+          <h3 id="modal-spawn-title">Spawn Agent</h3>
+          <button class="btn btn-ghost btn-sm modal-close" data-close="modal-spawn" type="button">&times;</button>
+        </div>
+        <form id="form-spawn" class="modal-body">
+          <div class="form-grid">
+            <label class="field">
+              <span>Agent Name *</span>
+              <input id="spawn-name" class="input" type="text" required placeholder="e.g. planner" />
+            </label>
+            <label class="field">
+              <span>Parent Agent (optional)</span>
+              <input id="spawn-parent" class="input" type="text" placeholder="Leave blank for root agent" />
+            </label>
+            <label class="field">
+              <span>Harness</span>
+              <select id="spawn-harness" class="select">
+                <option value="claude-code">claude-code</option>
+                <option value="codex">codex</option>
+                <option value="agy">agy</option>
+                <option value="opencode">opencode</option>
+                <option value="spiron">spiron</option>
+                <option value="spiron-cloud">spiron-cloud</option>
+                <option value="omp">omp</option>
+                <option value="muse">muse</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Model (optional)</span>
+              <input id="spawn-model" class="input" type="text" placeholder="Provider default if empty" />
+            </label>
+            <label class="field">
+              <span>Profile (optional)</span>
+              <input id="spawn-profile" class="input" type="text" placeholder="e.g. anthropic/default" />
+            </label>
+            <label class="field">
+              <span>Role (optional)</span>
+              <input id="spawn-role" class="input" type="text" placeholder="e.g. engineer, researcher" />
+            </label>
+          </div>
+          <label class="field">
+            <span>Public Description (optional)</span>
+            <input id="spawn-description" class="input" type="text" placeholder="Short capability summary" />
+          </label>
+          <label class="field">
+            <span>Private Instructions (optional)</span>
+            <textarea id="spawn-instructions" class="textarea" rows="3" placeholder="Operating instructions for this agent"></textarea>
+          </label>
+          <label class="field">
+            <span>Initial Prompt (optional)</span>
+            <textarea id="spawn-prompt" class="textarea" rows="2" placeholder="Optional initial task prompt"></textarea>
+          </label>
+          <div class="modal-footer">
+            <button class="btn btn-ghost modal-close" data-close="modal-spawn" type="button">Cancel</button>
+            <button class="btn btn-primary" type="submit">Spawn Agent</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Modal: Switch Harness / Model / Profile -->
+    <div id="modal-runtime" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-runtime-title">
+      <div class="modal">
+        <div class="modal-header">
+          <h3 id="modal-runtime-title">Switch Harness / Model / Profile</h3>
+          <button class="btn btn-ghost btn-sm modal-close" data-close="modal-runtime" type="button">&times;</button>
+        </div>
+        <form id="form-runtime" class="modal-body">
+          <input id="runtime-agent-name" type="hidden" />
+          <div class="form-grid">
+            <label class="field">
+              <span>Harness</span>
+              <select id="runtime-harness" class="select">
+                <option value="claude-code">claude-code</option>
+                <option value="codex">codex</option>
+                <option value="agy">agy</option>
+                <option value="opencode">opencode</option>
+                <option value="spiron">spiron</option>
+                <option value="spiron-cloud">spiron-cloud</option>
+                <option value="omp">omp</option>
+                <option value="muse">muse</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Model (optional)</span>
+              <input id="runtime-model" class="input" type="text" placeholder="Keep or override model" />
+            </label>
+          </div>
+          <label class="field">
+            <span>Profile (optional)</span>
+            <input id="runtime-profile" class="input" type="text" placeholder="e.g. openai/default" />
+          </label>
+          <div class="modal-footer">
+            <button class="btn btn-ghost modal-close" data-close="modal-runtime" type="button">Cancel</button>
+            <button class="btn btn-primary" type="submit">Apply Switch</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Modal: Add Profile from Web -->
+    <div id="modal-profile" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-profile-title">
+      <div class="modal modal-lg">
+        <div class="modal-header">
+          <h3 id="modal-profile-title">Add Provider Profile</h3>
+          <button class="btn btn-ghost btn-sm modal-close" data-close="modal-profile" type="button">&times;</button>
+        </div>
+        <div class="modal-tabs">
+          <button class="modal-tab active" data-profile-tab="apikey" type="button">API Key / Coding Plan</button>
+          <button class="modal-tab" data-profile-tab="native" type="button">Subscription Native Login</button>
+        </div>
+
+        <!-- Tab A: API Key / Coding Plan -->
+        <form id="form-profile-apikey" class="modal-body">
+          <div class="form-grid">
+            <label class="field">
+              <span>Provider</span>
+              <select id="apikey-provider-preset" class="select">
+                <option value="openrouter">openrouter</option>
+                <option value="deepseek">deepseek</option>
+                <option value="google-gemini">google-gemini</option>
+                <option value="kimi-code-plan">kimi-code-plan</option>
+                <option value="qwen-token-plan">qwen-token-plan</option>
+                <option value="glm-code-plan">glm-code-plan</option>
+                <option value="minimax-code-plan">minimax-code-plan</option>
+                <option value="custom">Custom provider...</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Profile Name *</span>
+              <input id="apikey-profile-name" class="input" type="text" required value="default" placeholder="e.g. default, team-a" />
+            </label>
+          </div>
+          <label id="apikey-custom-provider-wrap" class="field hidden">
+            <span>Custom Provider Slug *</span>
+            <input id="apikey-custom-provider" class="input" type="text" placeholder="e.g. openai, anthropic, custom-plan" />
+          </label>
+          <label class="field">
+            <span>API Key / Token (write-only, never displayed back) *</span>
+            <input id="apikey-secret" class="input" type="password" autocomplete="off" spellcheck="false" required placeholder="Paste API key" />
+          </label>
+          <div class="modal-footer">
+            <button class="btn btn-ghost modal-close" data-close="modal-profile" type="button">Cancel</button>
+            <button class="btn btn-primary" type="submit">Save Profile Key</button>
+          </div>
+        </form>
+
+        <!-- Tab B: Subscription Harness Native Login -->
+        <div id="panel-profile-native" class="modal-body hidden">
+          <form id="form-profile-native" class="form-grid">
+            <label class="field">
+              <span>Subscription Harness</span>
+              <select id="native-harness" class="select">
+                <option value="agy">agy (Antigravity)</option>
+                <option value="claude-code">claude-code (Anthropic)</option>
+                <option value="codex">codex (OpenAI)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Profile Name *</span>
+              <input id="native-profile-name" class="input" type="text" required value="default" placeholder="e.g. seat-1" />
+            </label>
+            <div class="field field-align-end">
+              <button id="native-start-btn" class="btn btn-primary" type="submit">Start Native Login</button>
+            </div>
+          </form>
+
+          <div id="native-signin-stage" class="signin-stage hidden">
+            <div id="native-links" class="signin-callouts"></div>
+            <div id="native-codes" class="signin-callouts"></div>
+            <div id="native-status" class="signin-status"></div>
+            <pre id="native-log" class="signin-log"></pre>
+          </div>
+
+          <div class="modal-footer">
+            <button id="native-cancel-btn" class="btn btn-ghost" type="button">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="/admin/assets/app.js" defer></script>
+</body>
+</html>

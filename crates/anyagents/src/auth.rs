@@ -114,6 +114,13 @@ impl Mode {
                 operator_digest: Some(operator_digest(&token)),
             };
         }
+        if crate::server::serverless::is_serverless_mode()
+            || crate::server::admin_auth::is_oidc_configured()
+        {
+            return Self::Confined {
+                operator_digest: None,
+            };
+        }
         match std::env::var_os("ANYAGENTS_AGENT_ROUTE") {
             Some(route) if !route.is_empty() => Self::Trusted {
                 data_dir: std::path::PathBuf::from(route),
@@ -156,6 +163,8 @@ impl Mode {
             // is the agent the tool server reads from its own config directory,
             // which the server resolves to an existing agent and nothing else.
             if self.is_trusted()
+                && !crate::server::serverless::is_serverless_mode()
+                && !crate::server::admin_auth::is_oidc_configured()
                 && let Some(id) = presented.agent_id.as_deref()
             {
                 return agent_named(store, id);
@@ -163,13 +172,18 @@ impl Mode {
             return agent_for_capability(store, token);
         }
         match self {
-            Self::Trusted { data_dir } if same_dir(data_dir, store.data_dir()) => {
+            Self::Trusted { data_dir }
+                if same_dir(data_dir, store.data_dir())
+                    && !crate::server::serverless::is_serverless_mode()
+                    && !crate::server::admin_auth::is_oidc_configured() =>
+            {
                 match presented
                     .route_agent
                     .as_deref()
                     .or(presented.agent_id.as_deref())
                 {
                     Some(route) => agent_named(store, route),
+                    None if presented.admin_csrf => Ok(Principal::Operator),
                     None => Err(AuthError::Unauthenticated(
                         "this call names no agent".to_string(),
                     )),
@@ -181,35 +195,52 @@ impl Mode {
         }
     }
 
-    /// The answer when it needs no store and no file: two authorities, or the
-    /// operator token checked against its digest. `None` when the store decides.
+    /// The answer when it needs no store and no file: two authorities, the
+    /// operator token checked against its digest, or a stateless HMAC-verified
+    /// admin OIDC session cookie. `None` when the store decides.
     fn principal_without_store(
         &self,
         presented: &Presented,
     ) -> Option<Result<Principal, AuthError>> {
         // One request carries one authority, never two.
-        if presented.agent_token.is_some() && presented.operator_token.is_some() {
+        let authorities = usize::from(presented.agent_token.is_some())
+            + usize::from(presented.operator_token.is_some())
+            + usize::from(presented.admin_session.is_some());
+        if authorities > 1 {
             return Some(Err(AuthError::Unauthenticated(
                 "one authority per call".to_string(),
             )));
         }
-        let token = presented.operator_token.as_deref()?;
-        let expected = match self {
-            Self::Confined {
-                operator_digest: Some(expected),
-            } => expected,
-            _ => {
+        if let Some(token) = presented.operator_token.as_deref() {
+            let expected = match self {
+                Self::Confined {
+                    operator_digest: Some(expected),
+                } => expected,
+                _ => {
+                    return Some(Err(AuthError::Unauthenticated(
+                        "this server has no operator".to_string(),
+                    )));
+                }
+            };
+            if digest("anyagents-operator", token) != *expected {
                 return Some(Err(AuthError::Unauthenticated(
-                    "this server has no operator".to_string(),
+                    "the operator token is not valid".to_string(),
                 )));
             }
-        };
-        if digest("anyagents-operator", token) != *expected {
-            return Some(Err(AuthError::Unauthenticated(
-                "the operator token is not valid".to_string(),
-            )));
+            return Some(Ok(Principal::Operator));
         }
-        Some(Ok(Principal::Operator))
+        if let Some(cookie_val) = presented.admin_session.as_deref() {
+            if presented.is_state_changing && !presented.admin_csrf {
+                return Some(Err(AuthError::Forbidden(
+                    "missing required x-anyagents-admin-csrf header".to_string(),
+                )));
+            }
+            return match crate::server::admin_auth::verify_session_cookie_from_env(cookie_val) {
+                Ok(_session) => Some(Ok(Principal::Operator)),
+                Err(why) => Some(Err(AuthError::Unauthenticated(why))),
+            };
+        }
+        None
     }
 }
 
@@ -219,6 +250,9 @@ impl Mode {
 pub struct Presented {
     agent_token: Option<String>,
     operator_token: Option<String>,
+    admin_session: Option<String>,
+    admin_csrf: bool,
+    is_state_changing: bool,
     agent_id: Option<String>,
     route_agent: Option<String>,
 }
@@ -228,6 +262,16 @@ impl Presented {
         Self {
             agent_token: header(parts, operator::AGENT_HEADER),
             operator_token: header(parts, operator::HEADER),
+            admin_session: crate::server::admin_auth::extract_session_cookie(&parts.headers),
+            admin_csrf: header(parts, crate::server::admin_auth::ADMIN_CSRF_HEADER).as_deref()
+                == Some("1"),
+            is_state_changing: matches!(
+                parts.method,
+                axum::http::Method::POST
+                    | axum::http::Method::PUT
+                    | axum::http::Method::PATCH
+                    | axum::http::Method::DELETE
+            ),
             agent_id: header(parts, AGENT_ID_HEADER),
             route_agent: parts
                 .extensions
@@ -457,5 +501,174 @@ mod tests {
         assert!(!mode.is_confined());
         assert!(!same_dir(Path::new("/tmp/one/"), Path::new("/tmp/two")));
         assert!(same_dir(Path::new("/tmp/one"), Path::new("/tmp/./one")));
+    }
+
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(keys.iter().map(|&k| (k, std::env::var_os(k))).collect())
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(val) => unsafe { std::env::set_var(k, val) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn admin_session_cookie_auth_enforces_csrf_single_authority_and_allowlist() {
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(&[
+            "ANYAGENTS_ADMIN_OIDC_ISSUER",
+            "ANYAGENTS_ADMIN_OIDC_CLIENT_ID",
+            "ANYAGENTS_ADMIN_EMAILS",
+            "ANYAGENTS_ADMIN_SESSION_SECRET",
+            "ANYAGENTS_MASTER_KEY",
+            "ANYAGENTS_OPERATOR_TOKEN",
+            "ANYAGENTS_SERVERLESS",
+        ]);
+
+        unsafe {
+            std::env::set_var("ANYAGENTS_ADMIN_OIDC_ISSUER", "https://idp.example.com");
+            std::env::set_var("ANYAGENTS_ADMIN_OIDC_CLIENT_ID", "console-client");
+            std::env::set_var("ANYAGENTS_ADMIN_EMAILS", "admin@example.com");
+            std::env::set_var(
+                "ANYAGENTS_ADMIN_SESSION_SECRET",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            );
+            std::env::set_var("ANYAGENTS_SERVERLESS", "true");
+        }
+
+        let key = crate::server::admin_auth::session_signing_key_from_env().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let cookie_val = crate::server::admin_auth::sign_admin_session(
+            &key,
+            &crate::server::admin_auth::AdminSession {
+                email: "admin@example.com".to_string(),
+                name: Some("Admin".to_string()),
+                sub: "sub-admin".to_string(),
+                iat: now,
+                exp: now + 3600,
+            },
+        )
+        .unwrap();
+        let cookie_hdr = format!(
+            "{}={cookie_val}",
+            crate::server::admin_auth::ADMIN_SESSION_COOKIE
+        );
+        let mode = Mode::Confined {
+            operator_digest: Some(operator_digest("op-secret-0123456789")),
+        };
+
+        // 1. GET with valid admin cookie authenticates as Principal::Operator.
+        let get_req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/agents")
+            .header(axum::http::header::COOKIE, &cookie_hdr)
+            .body(())
+            .unwrap();
+        let (get_parts, ()) = get_req.into_parts();
+        let get_presented = Presented::of(&get_parts);
+        assert_eq!(
+            mode.principal_without_store(&get_presented)
+                .unwrap()
+                .unwrap(),
+            Principal::Operator
+        );
+
+        // 2. POST with valid admin cookie + CSRF header authenticates as Principal::Operator.
+        let post_ok_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/agents")
+            .header(axum::http::header::COOKIE, &cookie_hdr)
+            .header(crate::server::admin_auth::ADMIN_CSRF_HEADER, "1")
+            .body(())
+            .unwrap();
+        let (post_ok_parts, ()) = post_ok_req.into_parts();
+        let post_ok_presented = Presented::of(&post_ok_parts);
+        assert_eq!(
+            mode.principal_without_store(&post_ok_presented)
+                .unwrap()
+                .unwrap(),
+            Principal::Operator
+        );
+
+        // 3. POST/PUT/PATCH/DELETE with valid admin cookie WITHOUT CSRF header is rejected (403).
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let mut_req = axum::http::Request::builder()
+                .method(method)
+                .uri("/v1/agents")
+                .header(axum::http::header::COOKIE, &cookie_hdr)
+                .body(())
+                .unwrap();
+            let (mut_parts, ()) = mut_req.into_parts();
+            let mut_presented = Presented::of(&mut_parts);
+            let err = mode
+                .principal_without_store(&mut_presented)
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN, "{method}");
+        }
+
+        // 4. Dual authority (agent capability + admin cookie, or operator token + admin cookie) fails closed.
+        let dual_agent = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/agents")
+            .header(axum::http::header::COOKIE, &cookie_hdr)
+            .header(operator::AGENT_HEADER, "agent-cap-token")
+            .body(())
+            .unwrap();
+        let (dual_agent_parts, ()) = dual_agent.into_parts();
+        let err = mode
+            .principal_without_store(&Presented::of(&dual_agent_parts))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(err.message(), "one authority per call");
+
+        let dual_op = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/agents")
+            .header(axum::http::header::COOKIE, &cookie_hdr)
+            .header(operator::HEADER, "op-secret-0123456789")
+            .body(())
+            .unwrap();
+        let (dual_op_parts, ()) = dual_op.into_parts();
+        let err = mode
+            .principal_without_store(&Presented::of(&dual_op_parts))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(err.message(), "one authority per call");
+
+        // 5. Revoking email from ANYAGENTS_ADMIN_EMAILS immediately invalidates the cookie.
+        unsafe {
+            std::env::set_var("ANYAGENTS_ADMIN_EMAILS", "other@example.com");
+        }
+        assert!(
+            mode.principal_without_store(&get_presented)
+                .unwrap()
+                .is_err()
+        );
+
+        // 6. Unconfigured OIDC fails closed even with a previously signed cookie.
+        unsafe {
+            std::env::remove_var("ANYAGENTS_ADMIN_OIDC_ISSUER");
+        }
+        assert!(
+            mode.principal_without_store(&get_presented)
+                .unwrap()
+                .is_err()
+        );
     }
 }

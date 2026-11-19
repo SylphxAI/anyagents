@@ -1629,6 +1629,670 @@ async fn pull_sandbox_auth_files_if_needed(
     }
 }
 
+fn is_secret_profile_rel(rel: &str) -> bool {
+    let fname = rel.rsplit('/').next().unwrap_or(rel);
+    fname.ends_with(".key")
+        || fname == "antigravity-oauth-token"
+        || fname == "credentials.json"
+        || fname == ".credentials.json"
+        || fname == "auth.json"
+}
+
+/// Persist all files under `<data>/profiles/<provider>/<profile>` into PostgreSQL
+/// `deployment_blobs(namespace = 'profiles')`, encrypting credential files so every
+/// stateless replica sees newly added API-key and OAuth profiles immediately.
+pub(crate) fn persist_profile_dir_to_deployment_blobs(
+    store: &Store,
+    provider: &str,
+    profile: &str,
+) -> Result<usize, anyagents_core::Error> {
+    let base_dir = store
+        .data_dir()
+        .join("profiles")
+        .join(provider)
+        .join(profile);
+    if !base_dir.is_dir() {
+        return Ok(0);
+    }
+    let blobs = store.blob_store();
+    let mut stack = vec![base_dir.clone()];
+    let mut persisted = 0usize;
+    while let Some(dir) = stack.pop() {
+        for entry_res in std::fs::read_dir(&dir)? {
+            let entry = entry_res?;
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            let Ok(rel_path) = path.strip_prefix(&base_dir) else {
+                continue;
+            };
+            let rel = rel_path
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            if rel.is_empty() || rel.ends_with(".tmp") || rel.ends_with(".new") {
+                continue;
+            }
+            let blob_path = format!("{provider}/{profile}/{rel}");
+            if anyagents_core::stateless::validate_blob_path(&blob_path).is_err() {
+                continue;
+            }
+            let bytes = std::fs::read(&path)?;
+            let encrypted = is_secret_profile_rel(&rel);
+            blobs.put_deployment_blob("profiles", &blob_path, &bytes, encrypted)?;
+            persisted += 1;
+        }
+    }
+    for stale_marker in [
+        ".anyagents-oauth-refresh-attempt-ms",
+        ".anyagents-last-usage.txt",
+    ] {
+        let _ = blobs
+            .delete_deployment_blob("profiles", &format!("{provider}/{profile}/{stale_marker}"));
+    }
+    Ok(persisted)
+}
+
+/// Persist allowlisted native-generated OAuth credential files from an ephemeral
+/// serverless sign-in sandbox into `deployment_blobs(namespace = 'profiles')` and
+/// the local ephemeral profile mirror, updating `profile.json` and clearing stale
+/// OAuth backoff caches.
+pub(crate) fn persist_signed_in_profile_auth_files(
+    store: &Store,
+    provider: &str,
+    profile: &str,
+    compatible_harnesses: &[&str],
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<usize, String> {
+    if parse_valid_provider_profile(&format!("{provider}/{profile}")).is_none() {
+        return Err(format!("invalid provider/profile `{provider}/{profile}`"));
+    }
+    let blobs = store.blob_store();
+    let prof_dir = store
+        .data_dir()
+        .join("profiles")
+        .join(provider)
+        .join(profile);
+    let _ = std::fs::create_dir_all(&prof_dir);
+    let mut persisted = 0usize;
+
+    for (rel, raw_bytes) in files {
+        if !is_syncable_auth_rel(rel)
+            || !auth_file_matches_profile_provider(rel, provider)
+            || raw_bytes.is_empty()
+            || raw_bytes.len() > MAX_SYNCED_AUTH_FILE_BYTES
+        {
+            continue;
+        }
+        if !is_incoming_auth_fresher(rel, None, raw_bytes) {
+            continue;
+        }
+        let single_rel = rel.as_str();
+        let targets: &[&str] = match (provider, single_rel) {
+            ("anthropic", ".claude/.credentials.json" | ".credentials.json") => {
+                &[".claude/.credentials.json", ".credentials.json"]
+            }
+            _ => std::slice::from_ref(&single_rel),
+        };
+        for &target_rel in targets {
+            let blob_path = format!("{provider}/{profile}/{target_rel}");
+            blobs
+                .put_deployment_blob("profiles", &blob_path, raw_bytes, true)
+                .map_err(|e| format!("failed to persist profile blob `{blob_path}`: {e}"))?;
+            let _ = anyagents_harness::atomic_write_nonempty_file(
+                &prof_dir.join(target_rel),
+                raw_bytes,
+                0o600,
+            );
+        }
+        persisted += 1;
+    }
+
+    if persisted == 0 {
+        return Ok(0);
+    }
+
+    let meta = json!({
+        "provider": provider,
+        "kind": "subscription",
+        "compatible_harnesses": compatible_harnesses,
+    });
+    if let Ok(meta_bytes) = serde_json::to_vec_pretty(&meta) {
+        let _ = blobs.put_deployment_blob(
+            "profiles",
+            &format!("{provider}/{profile}/profile.json"),
+            &meta_bytes,
+            false,
+        );
+        let _ = anyagents_harness::atomic_write_nonempty_file(
+            &prof_dir.join("profile.json"),
+            &meta_bytes,
+            0o644,
+        );
+    }
+    for stale_marker in [
+        ".anyagents-oauth-refresh-attempt-ms",
+        ".anyagents-last-usage.txt",
+    ] {
+        let _ = std::fs::remove_file(prof_dir.join(stale_marker));
+        let _ = blobs
+            .delete_deployment_blob("profiles", &format!("{provider}/{profile}/{stale_marker}"));
+    }
+    Ok(persisted)
+}
+
+struct ServerlessSignInSpec {
+    canonical_harness: &'static str,
+    provider: &'static str,
+    compatible_harnesses: &'static [&'static str],
+    native_command: &'static str,
+    auth_candidates: &'static [&'static str],
+}
+
+fn serverless_sign_in_spec(harness: &str) -> Result<ServerlessSignInSpec, String> {
+    match anyagents_harness::normalize_harness_name(harness) {
+        "agy" => Ok(ServerlessSignInSpec {
+            canonical_harness: "agy",
+            provider: "google-antigravity",
+            compatible_harnesses: &["agy"],
+            native_command: "agy login",
+            auth_candidates: &[".gemini/antigravity-cli/antigravity-oauth-token"],
+        }),
+        "claude-code" => Ok(ServerlessSignInSpec {
+            canonical_harness: "claude-code",
+            provider: "anthropic",
+            compatible_harnesses: &["claude-code"],
+            native_command: "claude auth login",
+            auth_candidates: &[".claude/.credentials.json", ".credentials.json"],
+        }),
+        "codex" => Ok(ServerlessSignInSpec {
+            canonical_harness: "codex",
+            provider: "openai",
+            compatible_harnesses: &["codex"],
+            native_command: "codex login --device-auth",
+            auth_candidates: &[".codex/auth.json"],
+        }),
+        other => Err(format!(
+            "serverless native sign-in supports agy, claude-code, and codex (got `{other}`)"
+        )),
+    }
+}
+
+fn strip_ansi_escapes(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'[' {
+                i += 1;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else if i < bytes.len() && bytes[i] == b']' {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if !raw.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let ch = raw[i..].chars().next().unwrap();
+        if ch != '\r' {
+            out.push(ch);
+        }
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn line_looks_sensitive(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("access_token")
+        || lower.contains("refresh_token")
+        || lower.contains("id_token")
+        || lower.contains("bearer ")
+        || lower.contains("client_secret")
+        || line.contains("eyJ")
+        || line.contains("sk-ant-")
+        || line.contains("sk-proj-")
+}
+
+fn looks_like_device_code(token: &str) -> bool {
+    let clean = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+    let Some((left, right)) = clean.split_once('-') else {
+        return false;
+    };
+    if right.contains('-') {
+        return false;
+    }
+    let valid_part = |p: &str| {
+        (3..=6).contains(&p.len())
+            && p.bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    };
+    if !valid_part(left) || !valid_part(right) {
+        return false;
+    }
+    clean.bytes().any(|b| b.is_ascii_uppercase())
+}
+
+fn extract_signin_events_from_line(raw_line: &str) -> Vec<(&'static str, String)> {
+    let cleaned = strip_ansi_escapes(raw_line);
+    let line = cleaned.trim();
+    if line.is_empty() || line_looks_sensitive(line) {
+        return Vec::new();
+    }
+    if let Some(rest) = line.strip_prefix("LINK ") {
+        let url = rest.trim();
+        if !url.is_empty() {
+            return vec![("link", url.to_string())];
+        }
+    }
+    if let Some(rest) = line.strip_prefix("DEVICE ") {
+        let code = rest.trim();
+        if !code.is_empty() {
+            return vec![("code", code.to_string())];
+        }
+    }
+    if let Some(rest) = line.strip_prefix("PROMPT ") {
+        let prompt = rest.trim();
+        if !prompt.is_empty() {
+            return vec![("prompt", prompt.to_string())];
+        }
+    }
+
+    let mut events = Vec::new();
+    let mut found_structured = false;
+    for token in line.split_whitespace() {
+        let trimmed = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';' | '`'
+            )
+        });
+        let trimmed = trimmed.trim_end_matches('.');
+        if trimmed.starts_with("https://") || trimmed.starts_with("http://localhost") {
+            events.push(("link", trimmed.to_string()));
+            found_structured = true;
+            continue;
+        }
+        if looks_like_device_code(trimmed) {
+            let code = trimmed
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                .to_string();
+            events.push(("code", code));
+            found_structured = true;
+        }
+    }
+    if !found_structured {
+        events.push(("prompt", line.to_string()));
+    }
+    events
+}
+
+fn extract_non_secret_account_label(files: &BTreeMap<String, Vec<u8>>) -> Option<String> {
+    for bytes in files.values() {
+        let Ok(val) = serde_json::from_slice::<Value>(bytes) else {
+            continue;
+        };
+        for ptr in [
+            "/email",
+            "/account/email",
+            "/user/email",
+            "/claudeAiOauth/email",
+            "/tokens/email",
+            "/account_id",
+        ] {
+            if let Some(s) = val
+                .pointer(ptr)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.contains("eyJ"))
+            {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn send_sign_in_line(
+    tx: &tokio::sync::mpsc::Sender<String>,
+    kind: &'static str,
+    text: String,
+) {
+    let payload = serde_json::to_string(&super::SignInLine { kind, text }).unwrap_or_default();
+    let _ = tx.send(payload).await;
+}
+
+/// Run a native vendor CLI login inside a short-lived ephemeral sandbox in Pure Serverless mode,
+/// streaming OAuth URLs, device codes, and status prompts over NDJSON, persisting the allowlisted
+/// native-generated credential file into `deployment_blobs(namespace = 'profiles')`, invalidating
+/// the profile listing snapshot, and destroying/releasing the ephemeral sandbox on exit.
+pub(crate) async fn run_serverless_sandbox_sign_in(
+    store: Arc<Store>,
+    profiles: Arc<super::profiles::ProfileSnapshots>,
+    harness: String,
+    profile: String,
+    tx: tokio::sync::mpsc::Sender<String>,
+) {
+    let spec = match serverless_sign_in_spec(&harness) {
+        Ok(s) => s,
+        Err(err) => {
+            send_sign_in_line(&tx, "error", err).await;
+            return;
+        }
+    };
+    if parse_valid_provider_profile(&format!("{}/{profile}", spec.provider)).is_none() {
+        send_sign_in_line(&tx, "error", format!("invalid profile name `{profile}`")).await;
+        return;
+    }
+
+    let data_dir = store.data_dir().to_path_buf();
+    let reg_res =
+        tokio::task::spawn_blocking(move || resolve_remote_provider_registry(Some(&data_dir)))
+            .await
+            .map_err(|e| format!("sandbox provider resolution join error: {e}"))
+            .and_then(|r| r);
+    let registry = match reg_res {
+        Ok(Some(reg)) => reg,
+        Ok(None) => {
+            send_sign_in_line(
+                &tx,
+                "error",
+                "serverless native sign-in requires a configured SandboxProvider (`ANYAGENTS_SANDBOX_PROVIDER`)"
+                    .to_string(),
+            )
+            .await;
+            return;
+        }
+        Err(err) => {
+            send_sign_in_line(&tx, "error", err).await;
+            return;
+        }
+    };
+
+    let provider = registry.active();
+    let suffix = generate_turn_id();
+    let short_suffix = suffix.chars().take(16).collect::<String>();
+    let ephemeral_id = format!("signin-{}-{short_suffix}", spec.canonical_harness);
+    let mut ensure_req = registry.default_ensure_request(&ephemeral_id);
+    ensure_req.lease = LeasePolicy {
+        idle_ttl_ms: 0,
+        max_lease_ttl_ms: 300_000,
+    };
+
+    send_sign_in_line(
+        &tx,
+        "prompt",
+        format!(
+            "Provisioning ephemeral sandbox ({}) for native `{}` login...",
+            provider.kind(),
+            spec.canonical_harness
+        ),
+    )
+    .await;
+
+    let handle = match provider.ensure(&ensure_req).await {
+        Ok(h) => h,
+        Err(err) => {
+            send_sign_in_line(
+                &tx,
+                "error",
+                format!("failed to provision ephemeral sign-in sandbox: {err}"),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let outcome = run_serverless_sandbox_sign_in_with_handle(
+        Arc::clone(&store),
+        Arc::clone(&profiles),
+        Arc::clone(&provider),
+        &handle,
+        &spec,
+        &profile,
+        &tx,
+    )
+    .await;
+
+    // Always clean up the ephemeral sandbox & volume on exit, error, timeout, or disconnect.
+    if provider.destroy(&handle).await.is_err() {
+        let _ = provider.release(&handle).await;
+    }
+
+    match outcome {
+        Ok(label) => {
+            send_sign_in_line(&tx, "done", label).await;
+        }
+        Err(err) => {
+            send_sign_in_line(&tx, "error", err).await;
+        }
+    }
+}
+
+async fn run_serverless_sandbox_sign_in_with_handle(
+    store: Arc<Store>,
+    profiles: Arc<super::profiles::ProfileSnapshots>,
+    provider: Arc<dyn AsyncSandboxProvider>,
+    handle: &crate::sandbox_providers::providers::SandboxHandle,
+    spec: &ServerlessSignInSpec,
+    profile: &str,
+    tx: &tokio::sync::mpsc::Sender<String>,
+) -> Result<String, String> {
+    let launch_script = format!(
+        "set -eu\n\
+         HOME_DIR=/tmp/anyagents-signin-home\n\
+         rm -rf \"$HOME_DIR\" /tmp/anyagents-signin.log /tmp/anyagents-signin.exit /tmp/anyagents-signin.pid\n\
+         mkdir -p \"$HOME_DIR/.gemini/antigravity-cli\" \"$HOME_DIR/.claude\" \"$HOME_DIR/.codex\"\n\
+         export HOME=\"$HOME_DIR\"\n\
+         export AGY_CONFIG_DIR=\"$HOME_DIR/.gemini/antigravity-cli\"\n\
+         export CLAUDE_CONFIG_DIR=\"$HOME_DIR/.claude\"\n\
+         export CODEX_HOME=\"$HOME_DIR/.codex\"\n\
+         export NO_BROWSER=1\n\
+         export BROWSER=true\n\
+         export DISABLE_AUTOUPDATER=1\n\
+         export TERM=dumb\n\
+         export NO_COLOR=1\n\
+         : > /tmp/anyagents-signin.log\n\
+         ( if command -v stdbuf >/dev/null 2>&1; then stdbuf -oL -eL {cmd}; else {cmd}; fi > /tmp/anyagents-signin.log 2>&1; printf '%s\\n' \"$?\" > /tmp/anyagents-signin.exit ) </dev/null >/dev/null 2>&1 &\n\
+         printf '%s\\n' \"$!\" > /tmp/anyagents-signin.pid\n",
+        cmd = spec.native_command,
+    );
+
+    let launch_out = provider
+        .exec(
+            handle,
+            &ExecRequest::shell(launch_script).with_timeout_ms(15_000),
+        )
+        .await
+        .map_err(|e| format!("failed to start native login command in sandbox: {e}"))?;
+    if launch_out.exit_code != 0 {
+        return Err(format!(
+            "native login launcher failed (exit {}): {}",
+            launch_out.exit_code,
+            launch_out.stderr.trim()
+        ));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let mut byte_offset: usize = 0;
+    let mut pending_buf = String::new();
+    let mut emitted_links = std::collections::HashSet::<String>::new();
+    let mut emitted_codes = std::collections::HashSet::<String>::new();
+    let mut exit_code_opt: Option<i32> = None;
+
+    while Instant::now() < deadline {
+        if tx.is_closed() {
+            return Err("sign-in cancelled by client".to_string());
+        }
+
+        let tail_start = byte_offset + 1;
+        let poll_req = ExecRequest::shell(format!(
+            "tail -c +{tail_start} /tmp/anyagents-signin.log 2>/dev/null || true"
+        ))
+        .with_timeout_ms(10_000);
+        if let Ok(chunk) = provider.exec(handle, &poll_req).await
+            && !chunk.stdout.is_empty()
+        {
+            byte_offset = byte_offset.saturating_add(chunk.stdout.len());
+            pending_buf.push_str(&chunk.stdout);
+            while let Some(nl) = pending_buf.find('\n') {
+                let line = pending_buf[..nl].to_string();
+                pending_buf.drain(..=nl);
+                for (kind, text) in extract_signin_events_from_line(&line) {
+                    if kind == "link" && !emitted_links.insert(text.clone()) {
+                        continue;
+                    }
+                    if kind == "code" && !emitted_codes.insert(text.clone()) {
+                        continue;
+                    }
+                    send_sign_in_line(tx, kind, text).await;
+                }
+            }
+            // Flush partial lines that already contain a URL or device code (no trailing newline).
+            if !pending_buf.is_empty()
+                && (pending_buf.contains("https://") || pending_buf.contains("http://localhost"))
+            {
+                let partial = std::mem::take(&mut pending_buf);
+                for (kind, text) in extract_signin_events_from_line(&partial) {
+                    if kind == "link" && !emitted_links.insert(text.clone()) {
+                        continue;
+                    }
+                    if kind == "code" && !emitted_codes.insert(text.clone()) {
+                        continue;
+                    }
+                    send_sign_in_line(tx, kind, text).await;
+                }
+            }
+        }
+
+        let exit_req = ExecRequest::shell("cat /tmp/anyagents-signin.exit 2>/dev/null || true")
+            .with_timeout_ms(5_000);
+        if let Ok(exit_out) = provider.exec(handle, &exit_req).await {
+            let trimmed = exit_out.stdout.trim();
+            if !trimmed.is_empty()
+                && let Ok(code) = trimmed.parse::<i32>()
+            {
+                exit_code_opt = Some(code);
+                break;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+
+    // Drain any final bytes written right before exit.
+    let final_tail = ExecRequest::shell(format!(
+        "tail -c +{} /tmp/anyagents-signin.log 2>/dev/null || true",
+        byte_offset + 1
+    ))
+    .with_timeout_ms(5_000);
+    if let Ok(chunk) = provider.exec(handle, &final_tail).await
+        && !chunk.stdout.is_empty()
+    {
+        pending_buf.push_str(&chunk.stdout);
+    }
+    for line in pending_buf.lines() {
+        for (kind, text) in extract_signin_events_from_line(line) {
+            if kind == "link" && !emitted_links.insert(text.clone()) {
+                continue;
+            }
+            if kind == "code" && !emitted_codes.insert(text.clone()) {
+                continue;
+            }
+            send_sign_in_line(tx, kind, text).await;
+        }
+    }
+
+    let Some(exit_code) = exit_code_opt else {
+        return Err("native sign-in timed out after 4 minutes".to_string());
+    };
+    if exit_code != 0 {
+        return Err(format!(
+            "native `{}` login exited with status {exit_code}",
+            spec.canonical_harness
+        ));
+    }
+
+    let mut fetched = BTreeMap::new();
+    for &rel in spec.auth_candidates {
+        let req = ExecRequest::argv(vec![
+            "cat".to_string(),
+            format!("/tmp/anyagents-signin-home/{rel}"),
+        ])
+        .with_timeout_ms(SANDBOX_AUTH_PULL_TIMEOUT_MS);
+        if let Ok(out) = provider.exec(handle, &req).await
+            && out.exit_code == 0
+            && !out.stdout.trim().is_empty()
+            && out.stdout.len() <= MAX_SYNCED_AUTH_FILE_BYTES
+        {
+            fetched.insert(rel.to_string(), out.stdout.into_bytes());
+        }
+    }
+    if fetched.is_empty() {
+        return Err(format!(
+            "native `{}` login succeeded but no allowlisted credential file was found",
+            spec.canonical_harness
+        ));
+    }
+
+    let account_label = extract_non_secret_account_label(&fetched)
+        .unwrap_or_else(|| format!("{}/{profile}", spec.provider));
+    let provider_name = spec.provider;
+    let compatible = spec.compatible_harnesses;
+    let profile_owned = profile.to_string();
+    let store_w = Arc::clone(&store);
+    let persisted = run_store_blocking(move || {
+        persist_signed_in_profile_auth_files(
+            &store_w,
+            provider_name,
+            &profile_owned,
+            compatible,
+            &fetched,
+        )
+    })
+    .await?;
+    if persisted == 0 {
+        return Err(
+            "native sign-in credential file failed validation (invalid JSON or missing access token)"
+                .to_string(),
+        );
+    }
+
+    profiles.invalidate(&store);
+    super::quota_rotation::profiles_changed(Some(provider_name));
+    Ok(account_label)
+}
+
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)?
@@ -4032,5 +4696,83 @@ done
             .unwrap()
             .unwrap();
         assert_eq!(still_fresh.content, fresh_tok);
+    }
+
+    #[test]
+    fn profile_secret_classification_and_signin_line_parsing_work() {
+        assert!(is_secret_profile_rel(".config/opencode/openrouter.key"));
+        assert!(is_secret_profile_rel(
+            ".gemini/antigravity-cli/antigravity-oauth-token"
+        ));
+        assert!(is_secret_profile_rel(".claude/.credentials.json"));
+        assert!(is_secret_profile_rel("credentials.json"));
+        assert!(is_secret_profile_rel(".codex/auth.json"));
+        assert!(!is_secret_profile_rel("profile.json"));
+        assert!(!is_secret_profile_rel(".config/opencode/opencode.json"));
+
+        // ANSI-colored OAuth URL and device code are cleanly extracted.
+        let events = extract_signin_events_from_line(
+            "\x1b[32mOpen https://auth.example.com/device and enter code ABCD-1234.\x1b[0m",
+        );
+        assert!(events.contains(&("link", "https://auth.example.com/device".to_string())));
+        assert!(events.contains(&("code", "ABCD-1234".to_string())));
+
+        // Sensitive lines containing raw JWTs or tokens are never echoed.
+        let synthetic_jwt = format!("{}.{}.{}", "eyJhbGciOiJFUzI1NiJ9", "abc", "def");
+        let sensitive_line = format!(r#"{{"access_token":"{synthetic_jwt}"}}"#);
+        assert!(extract_signin_events_from_line(&sensitive_line).is_empty());
+    }
+
+    #[test]
+    fn persist_signed_in_profile_auth_files_persists_valid_and_rejects_disallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+
+        let claude_cred =
+            br#"{"claudeAiOauth":{"accessToken":"tok-abc","expiresAt":4102444800000}}"#;
+        let mut files = BTreeMap::new();
+        files.insert(
+            ".claude/.credentials.json".to_string(),
+            claude_cred.to_vec(),
+        );
+        files.insert(".ssh/id_ed25519".to_string(), b"secret".to_vec());
+
+        let persisted = persist_signed_in_profile_auth_files(
+            &store,
+            "anthropic",
+            "web-seat",
+            &["claude-code"],
+            &files,
+        )
+        .unwrap();
+        assert_eq!(persisted, 1);
+
+        let stored = store
+            .blob_store()
+            .get_deployment_blob("profiles", "anthropic/web-seat/.claude/.credentials.json")
+            .unwrap()
+            .expect("anthropic credentials persisted");
+        assert_eq!(stored.content, claude_cred);
+        let mirror = store
+            .blob_store()
+            .get_deployment_blob("profiles", "anthropic/web-seat/.credentials.json")
+            .unwrap()
+            .expect("anthropic mirror credentials persisted");
+        assert_eq!(mirror.content, claude_cred);
+        let meta = store
+            .blob_store()
+            .get_deployment_blob("profiles", "anthropic/web-seat/profile.json")
+            .unwrap()
+            .expect("profile.json persisted");
+        let meta_val: Value = serde_json::from_slice(&meta.content).unwrap();
+        assert_eq!(meta_val["provider"], json!("anthropic"));
+        assert_eq!(meta_val["kind"], json!("subscription"));
+        assert!(
+            store
+                .blob_store()
+                .get_deployment_blob("profiles", "anthropic/web-seat/.ssh/id_ed25519")
+                .unwrap()
+                .is_none()
+        );
     }
 }
