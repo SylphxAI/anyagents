@@ -1460,11 +1460,24 @@ impl SylphxSandboxClient {
                 compact_error_body(&val)
             ));
         }
-        let arr = val
-            .get("entries")
-            .or_else(|| val.get("files"))
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| format!("Sylphx `:listFiles` {path} missing `entries` array"))?;
+        let empty_arr = Vec::new();
+        let arr: &[serde_json::Value] =
+            if let Some(raw_entries) = val.get("entries").or_else(|| val.get("files")) {
+                if raw_entries.is_null() {
+                    &empty_arr
+                } else {
+                    raw_entries.as_array().ok_or_else(|| {
+                        format!("Sylphx `:listFiles` {path} `entries` is not an array")
+                    })?
+                }
+            } else if val.is_object() {
+                // Proto3 JSON omits empty repeated fields (returning `{}` for an empty directory).
+                &empty_arr
+            } else {
+                return Err(format!(
+                    "Sylphx `:listFiles` {path} missing `entries` array"
+                ));
+            };
         let mut entries = Vec::with_capacity(arr.len());
         for item in arr {
             let name = item
@@ -1503,13 +1516,20 @@ impl SylphxSandboxClient {
                         .is_some_and(|k| {
                             k.eq_ignore_ascii_case("dir") || k.eq_ignore_ascii_case("directory")
                         })
+                        || item
+                            .get("mode")
+                            .and_then(serde_json::Value::as_u64)
+                            .is_some_and(|m| (m & 0o170000) == 0o040000)
                 });
             let size_bytes = item
                 .get("size_bytes")
                 .or_else(|| item.get("sizeBytes"))
                 .or_else(|| item.get("size"))
                 .or_else(|| item.get("bytes"))
-                .and_then(serde_json::Value::as_u64);
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                });
             entries.push(SylphxFileEntry {
                 name,
                 path: entry_path,
@@ -3143,5 +3163,59 @@ mod tests {
         assert_eq!(handle.sandbox_id, "lease_winner");
         assert_eq!(post_calls.load(Ordering::SeqCst), 1);
         assert!(list_calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn list_files_accepts_proto3_empty_object_and_string_size_bytes() {
+        let base_url = spawn_mock_sylphx(|method, path, _body| match (method, path) {
+            ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/sbx_1:listFiles") => (
+                200,
+                vec![("Content-Type".into(), "application/json".into())],
+                b"{}".to_vec(),
+            ),
+            ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/sbx_2:listFiles") => (
+                200,
+                vec![("Content-Type".into(), "application/json".into())],
+                serde_json::to_vec(&serde_json::json!({
+                    "entries": [
+                        {
+                            "path": "/home/user/agent-data/workspace/hello.txt",
+                            "size_bytes": "27",
+                            "mode": 420
+                        },
+                        {
+                            "path": "/home/user/agent-data/workspace/subdir",
+                            "size_bytes": "4096",
+                            "mode": 16877
+                        }
+                    ]
+                }))
+                .unwrap(),
+            ),
+            _ => (404, vec![], br#"{"error":"not found"}"#.to_vec()),
+        });
+
+        let client = SylphxSandboxClient::new(base_url, Some("tok".into()));
+        let empty = client
+            .list_files(
+                "orgs/o1/projects/p1/envs/e1/leases/sbx_1",
+                "/home/user/agent-data/workspace",
+            )
+            .unwrap();
+        assert!(empty.is_empty());
+
+        let populated = client
+            .list_files(
+                "orgs/o1/projects/p1/envs/e1/leases/sbx_2",
+                "/home/user/agent-data/workspace",
+            )
+            .unwrap();
+        assert_eq!(populated.len(), 2);
+        assert_eq!(populated[0].name, "hello.txt");
+        assert_eq!(populated[0].size_bytes, Some(27));
+        assert!(!populated[0].is_dir);
+        assert_eq!(populated[1].name, "subdir");
+        assert_eq!(populated[1].size_bytes, Some(4096));
+        assert!(populated[1].is_dir);
     }
 }

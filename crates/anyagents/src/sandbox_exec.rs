@@ -2639,6 +2639,117 @@ pub(crate) fn hydrate_agent_files_from_store(
     Ok(hydrated)
 }
 
+/// Hydrate `<config_dir>/sandbox-sylphx.json` from PostgreSQL `agent_sandbox_bindings`
+/// so stateless coordinator replicas handling remote MCP `workspace.*` calls always resolve
+/// the agent's active remote sandbox lease without relying on local ephemeral disk state.
+///
+/// Returns the active sandbox's `workdir` when a `ready` binding exists.
+pub(crate) fn hydrate_sandbox_lease_file_from_store(
+    store: &Store,
+    agent_id: &AgentId,
+    config_dir: &Path,
+) -> Option<String> {
+    let binding = store.sandbox_binding(agent_id).ok().flatten()?;
+    if binding.lease_state != "ready" {
+        return None;
+    }
+    let handle = sandbox_handle_from_binding(&binding)?;
+    if handle.provider == ProviderKind::Sylphx
+        && let Ok(reg) = resolve_registry_for_binding(Some(store.data_dir()), &binding)
+        && let Ok(lease_cfg) = sylphx_lease_from_handle(
+            &handle,
+            &reg,
+            Some(&binding),
+            Some(store.data_dir()),
+            config_dir,
+        )
+    {
+        let _ = std::fs::create_dir_all(config_dir);
+        let _ = lease_cfg.save_to_config_dir(config_dir);
+    }
+    Some(handle.workdir)
+}
+
+/// Materialize an agent's persisted PostgreSQL `agent_files(namespace = 'memory')`
+/// blobs into `<data_dir>/agents/<agent_id>/memory/` so stateless replicas serve
+/// `memory(list/read/write/delete)` and `conversation(topic=...)` identically across
+/// scale-to-zero and replica switches.
+pub(crate) fn hydrate_agent_memory_from_store(store: &Store, agent_id: &AgentId) -> usize {
+    if !store.is_postgres() {
+        return 0;
+    }
+    let blobs = store.blob_store();
+    let Ok(entries) = blobs.list_agent_files(agent_id, "memory") else {
+        return 0;
+    };
+    if entries.is_empty() {
+        return 0;
+    }
+    let mem_dir = store
+        .data_dir()
+        .join("agents")
+        .join(agent_id.as_str())
+        .join("memory");
+    let _ = std::fs::create_dir_all(&mem_dir);
+    let mut hydrated = 0usize;
+    for meta in entries {
+        if anyagents_core::stateless::validate_blob_path(&meta.path).is_err()
+            || meta.size_bytes as u64 > MAX_AGENT_BUNDLE_FILE_BYTES
+        {
+            continue;
+        }
+        let dest = mem_dir.join(&meta.path);
+        let local_mtime_ms = std::fs::metadata(&dest)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        if local_mtime_ms.is_some_and(|local_ms| local_ms >= meta.updated_at_ms) {
+            continue;
+        }
+        let Ok(Some(blob)) = blobs.get_agent_file(agent_id, "memory", &meta.path) else {
+            continue;
+        };
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&dest, &blob.content).is_ok() {
+            hydrated += 1;
+        }
+    }
+    hydrated
+}
+
+/// Persist a single learned-memory file (`<slug>.md` or `MEMORY.md`) back into
+/// PostgreSQL `agent_files(namespace = 'memory')` when running on PostgreSQL.
+pub(crate) fn persist_agent_memory_file_to_store(
+    store: &Store,
+    agent_id: &AgentId,
+    filename: &str,
+    content: &[u8],
+) {
+    if !store.is_postgres() {
+        return;
+    }
+    let _ = store
+        .blob_store()
+        .put_agent_file(agent_id, "memory", filename, content, false);
+}
+
+/// Remove a deleted learned-memory topic file from PostgreSQL `agent_files(namespace = 'memory')`.
+pub(crate) fn delete_agent_memory_file_from_store(
+    store: &Store,
+    agent_id: &AgentId,
+    filename: &str,
+) {
+    if !store.is_postgres() {
+        return;
+    }
+    let _ = store
+        .blob_store()
+        .delete_agent_file(agent_id, "memory", filename);
+}
+
 fn collect_agent_config_tree(
     config_dir: &Path,
     state_root: &str,

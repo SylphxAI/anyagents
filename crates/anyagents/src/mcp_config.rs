@@ -270,7 +270,7 @@ pub fn write_codex_with_model(
         updated = upsert_named_table(
             &updated,
             "[features]",
-            "[features]\napps = false\ncode_mode = false\ncode_mode_only = false\nmulti_agent = false\n",
+            "[features]\napps = false\ncode_mode = true\ncode_mode_only = false\nmulti_agent = false\n",
         );
     }
     atomic_write_shared(path, updated.as_bytes())
