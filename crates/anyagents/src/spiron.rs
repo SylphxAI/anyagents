@@ -44,6 +44,26 @@ pub fn is_jwt_token(token: &str) -> bool {
     }
 }
 
+/// Ensure Spiron's mounted `anyagents mcp` server defaults to the
+/// `coordination-memory` profile (coordination + unified `agent-memory` only,
+/// with zero duplicate `code`, `files`, `web`, `skills`, `browser`, or
+/// `computer` schemas alongside Spiron's native durable runtime).
+pub fn spiron_mcp_args(mcp_args: &[String]) -> Vec<String> {
+    let mut args = mcp_args.to_vec();
+    let has_profile = args
+        .iter()
+        .any(|arg| arg == "--profile" || arg.starts_with("--profile="));
+    if !has_profile && args.iter().any(|arg| arg == "mcp") {
+        args.push("--profile".to_string());
+        args.push(
+            crate::mcp::McpProfile::CoordinationMemory
+                .as_str()
+                .to_string(),
+        );
+    }
+    args
+}
+
 /// Write the narrow JSON mount passed to Spiron with `--mcp-config` and the
 /// seat's `config.toml` (`always_approve = true`) for headless tool execution.
 ///
@@ -55,11 +75,12 @@ pub fn write_spiron_config(
     mcp_command: &Path,
     mcp_args: &[String],
 ) -> Result<(), Error> {
+    let effective_args = spiron_mcp_args(mcp_args);
     let value = serde_json::json!({
         "mcpServers": {
             "anyagents": {
                 "command": mcp_command.display().to_string(),
-                "args": mcp_args,
+                "args": effective_args,
                 "env": {},
             }
         }
@@ -598,5 +619,69 @@ mod tests {
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbg"
         ));
         assert!(!is_jwt_token("sylphx_sk_live_abc123"));
+    }
+
+    #[test]
+    fn write_spiron_config_mounts_coordination_and_unified_memory_without_duplicate_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = temp.path();
+        write_spiron_config(
+            cfg,
+            Some("sylphx/openai/gpt-6.2-sol#high"),
+            Path::new("/usr/bin/anyagents"),
+            &[
+                "--data".to_string(),
+                "/tmp/data".to_string(),
+                "mcp".to_string(),
+                "--config".to_string(),
+                cfg.display().to_string(),
+            ],
+        )
+        .unwrap();
+
+        let mcp_doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cfg.join("spiron-mcp.json")).unwrap()).unwrap();
+        let args: Vec<&str> = mcp_doc["mcpServers"]["anyagents"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let prof_idx = args.iter().position(|a| *a == "--profile").unwrap();
+        assert_eq!(args[prof_idx + 1], "coordination-memory");
+
+        // Resolve stdio profile for spiron harness (both explicit and default)
+        let profile = crate::mcp::McpProfile::resolve_stdio(None, Some("spiron"), cfg);
+        assert_eq!(profile, crate::mcp::McpProfile::CoordinationMemory);
+        assert_eq!(
+            profile.exposed_tools(),
+            &[
+                "send",
+                "inbox",
+                "agents",
+                "groups",
+                "schedules",
+                "conversation",
+                "memory",
+            ]
+        );
+        // Zero duplicate built-in tool schemas that durable `spiron` natively embeds:
+        for duplicate in [
+            "code",
+            "files",
+            "web_search",
+            "web_fetch",
+            "skills",
+            "browser",
+            "computer",
+        ] {
+            assert!(
+                !profile.allows_tool(duplicate),
+                "spiron MCP mount must not duplicate native `{duplicate}` tool"
+            );
+        }
+        assert!(profile.allows_tool("memory"));
+        assert!(profile.allows_tool("send"));
+        assert!(profile.allows_tool("agents"));
     }
 }

@@ -492,6 +492,7 @@ fn remote_mcp_profile(config: &Path) -> &'static str {
     });
     match named {
         Some(crate::mcp::McpProfile::Coordination) => "coordination",
+        Some(crate::mcp::McpProfile::CoordinationMemory) => "coordination-memory",
         _ => "remote",
     }
 }
@@ -821,15 +822,18 @@ pub fn build_cloud_system_prompt(config: &Path) -> Option<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let has_learned_memory = base_prompt
+    let has_memory = base_prompt
         .as_deref()
-        .is_some_and(|p| p.contains("<learned_memory>"));
+        .is_some_and(|p| p.contains("<learned_memory>") || p.contains("<memory>"));
+    let has_skills = base_prompt
+        .as_deref()
+        .is_some_and(|p| p.contains("<available_skills>") || p.contains("<mounted_skills>"));
 
     if let Some(base) = base_prompt {
         sections.push(base);
     }
 
-    if !has_learned_memory {
+    if !has_memory {
         let mut memory_candidates = vec![config.join("memory/MEMORY.md")];
         if let Some(root) = config.parent() {
             memory_candidates.insert(0, root.join("memory/MEMORY.md"));
@@ -845,17 +849,19 @@ pub fn build_cloud_system_prompt(config: &Path) -> Option<String> {
         }
     }
 
-    let skills = collect_agent_skills_catalog(config);
-    if !skills.is_empty() {
-        let mut block = String::from(
-            "<available_skills>\n\
-             When a task matches a skill's description below, call the `skills` MCP tool with `{\"action\": \"read\", \"name\": \"<skill-name>\"}` to load its full `SKILL.md` instructions before proceeding:\n",
-        );
-        for (name, desc) in skills {
-            block.push_str(&format!("- `{name}`: {desc}\n"));
+    if !has_skills {
+        let skills = collect_agent_skills_catalog(config);
+        if !skills.is_empty() {
+            let mut block = String::from(
+                "<available_skills>\n\
+                 When a task matches a skill's description below, call the `skills` MCP tool with `{\"action\": \"read\", \"name\": \"<skill-name>\"}` to load its full `SKILL.md` instructions before proceeding:\n",
+            );
+            for (name, desc) in skills {
+                block.push_str(&format!("- `{name}`: {desc}\n"));
+            }
+            block.push_str("</available_skills>");
+            sections.push(block);
         }
-        block.push_str("</available_skills>");
-        sections.push(block);
     }
 
     if sections.is_empty() {
@@ -3239,5 +3245,43 @@ mod tests {
         let out_str = String::from_utf8(out_buf.0.lock().unwrap().clone()).unwrap();
         assert!(out_str.contains("\"request_id\":\"req_int\""), "{out_str}");
         assert!(out_str.contains("\"is_error\":true"), "{out_str}");
+    }
+
+    #[test]
+    fn build_cloud_system_prompt_deduplicates_memory_and_skills_blocks_and_supports_coord_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(cfg.join("memory")).unwrap();
+        std::fs::create_dir_all(cfg.join(".agents/skills/demo-skill")).unwrap();
+        std::fs::write(cfg.join("memory/MEMORY.md"), "duplicate memory sentinel").unwrap();
+        std::fs::write(
+            cfg.join(".agents/skills/demo-skill/SKILL.md"),
+            "---\nname: demo-skill\ndescription: demo\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("SYSTEM_PROMPT.md"),
+            "Base prompt\n<memory>\nAlready mounted memory\n</memory>\n<available_skills>\n- `demo-skill`: demo\n</available_skills>\n",
+        )
+        .unwrap();
+
+        let rendered = build_cloud_system_prompt(&cfg).unwrap();
+        assert_eq!(
+            rendered.matches("<available_skills>").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("duplicate memory sentinel"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("<learned_memory>"), "{rendered}");
+
+        std::fs::write(
+            cfg.join("cloud.json"),
+            r#"{"mcp_profile": "coordination-memory"}"#,
+        )
+        .unwrap();
+        assert_eq!(remote_mcp_profile(&cfg), "coordination-memory");
     }
 }

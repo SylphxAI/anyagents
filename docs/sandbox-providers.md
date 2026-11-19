@@ -92,7 +92,7 @@ Provider-specific variables:
 Build the minimal base image, the developer toolchain image (`rustc`/`cargo` via `rustup` + `bun`), or the full image with selected public CLI harnesses:
 
 ```bash
-# Minimal base sandbox (anyagents-guest + git, rg, fd, jq, python3, node/npm, gh, tini)
+# Minimal base sandbox (anyagents-guest + agent-code-mode + agent-workstation + git, rg, fd, jq, python3, node/npm, gh, tini)
 docker build -f Dockerfile.sandbox --target sandbox-base \
   -t ghcr.io/<your-org>/anyagents-sandbox:base .
 
@@ -100,7 +100,7 @@ docker build -f Dockerfile.sandbox --target sandbox-base \
 docker build -f Dockerfile.sandbox --target sandbox-dev \
   -t ghcr.io/<your-org>/anyagents-sandbox:dev .
 
-# Full sandbox with selected public CLI harnesses
+# Full sandbox with selected CLI harnesses (add `spiron` with SPIRON_INSTALL_URL or SPIRON_NPM_PKG if desired)
 docker build -f Dockerfile.sandbox --target sandbox-full \
   --build-arg INSTALL_HARNESSES="claude-code codex opencode" \
   -t ghcr.io/<your-org>/anyagents-sandbox:full .

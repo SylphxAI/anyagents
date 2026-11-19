@@ -1956,9 +1956,30 @@ fn collect_agent_bundle_entries(
     }))
     .map_err(|e| e.to_string())?;
     stdio_mcp_bytes.push(b'\n');
-    for target in [".mcp.json", ".claude.json", "mcp.json", "spiron-mcp.json"] {
+    for target in [".mcp.json", ".claude.json", "mcp.json"] {
         uploads.push((target.to_string(), stdio_mcp_bytes.clone()));
     }
+    // Durable `spiron` natively embeds `agent-tools`, `agent-workstation`, and skill loading,
+    // so mount only coordination + unified `agent-memory` to avoid duplicate tool schemas.
+    let spiron_mcp_url =
+        crate::cloud_harness::mcp_url_with_profile(&mcp_base, "coordination-memory");
+    let mut spiron_mcp_bytes = serde_json::to_vec_pretty(&json!({
+        "mcpServers": {
+            "anyagents": {
+                "command": guest_bin,
+                "args": [
+                    "mcp-proxy",
+                    "--url",
+                    spiron_mcp_url,
+                    "--token-file",
+                    token_path_in_vm,
+                ],
+            }
+        }
+    }))
+    .map_err(|e| e.to_string())?;
+    spiron_mcp_bytes.push(b'\n');
+    uploads.push(("spiron-mcp.json".to_string(), spiron_mcp_bytes));
     dirs_to_create.insert(format!("{state_root}/.gemini/config"));
     uploads.push((
         ".gemini/config/mcp_config.json".to_string(),
@@ -3857,6 +3878,11 @@ mod tests {
         assert!(mcp_json_raw.contains("mcp-proxy"));
         assert!(mcp_json_raw.contains("profile=full"));
 
+        let spiron_mcp_raw =
+            String::from_utf8(files["/home/user/agent-state/spiron-mcp.json"].clone()).unwrap();
+        assert!(spiron_mcp_raw.contains("mcp-proxy"));
+        assert!(spiron_mcp_raw.contains("profile=coordination-memory"));
+
         assert!(files.contains_key("/home/user/agent-state/repo-spec.json"));
         // Custom provider config + key files sync and merge `mcp.anyagents` across all opencode paths.
         assert_eq!(
@@ -4443,10 +4469,16 @@ mod tests {
     fn stateless_dockerfile_sandbox_dev_and_oci_workflow_targets_present() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let dockerfile = std::fs::read_to_string(root.join("Dockerfile.sandbox")).unwrap();
+        assert!(dockerfile.contains("-p anyagents-guest --bin anyagents-guest"));
+        assert!(dockerfile.contains("-p agent-tools --bin agent-code-mode"));
+        assert!(dockerfile.contains("-p agent-workstation --bin agent-workstation"));
+        assert!(dockerfile.contains("/usr/local/bin/agent-code-mode"));
+        assert!(dockerfile.contains("/usr/local/bin/agent-workstation"));
         assert!(dockerfile.contains("FROM sandbox-base AS sandbox-dev"));
         assert!(dockerfile.contains("https://sh.rustup.rs"));
         assert!(dockerfile.contains("COPY --from=bun-bin /usr/local/bin/bun /usr/local/bin/bun"));
         assert!(dockerfile.contains("FROM sandbox-dev AS sandbox-full"));
+        assert!(dockerfile.contains("\"spiron\""));
 
         let workflow =
             std::fs::read_to_string(root.join(".github/workflows/docker-publish.yml")).unwrap();

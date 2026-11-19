@@ -37,6 +37,46 @@ pub struct SpironLaunch {
     pub state_dir: PathBuf,
 }
 
+impl SpironLaunch {
+    /// Opt this launch into the durable Spiron CLI's `--cloud` handoff mode,
+    /// optionally targeting a specific cloud agent slug or ID (`--cloud-agent`).
+    pub fn with_cloud(mut self, cloud_agent: Option<&str>) -> Self {
+        if !self.args.iter().any(|a| a == "--cloud") {
+            self.args.push("--cloud".to_string());
+        }
+        if let Some(target) = cloud_agent.map(str::trim).filter(|s| !s.is_empty())
+            && !self
+                .args
+                .iter()
+                .any(|a| a == "--cloud-agent" || a.starts_with("--cloud-agent="))
+        {
+            self.args.push("--cloud-agent".to_string());
+            self.args.push(target.to_string());
+        }
+        self
+    }
+
+    /// Assemble final CLI arguments for `spiron --headless --json --listen <socket>`
+    /// without duplicating `--session` or `--listen`.
+    pub fn build_launch_args(&self, socket: &Path) -> Vec<String> {
+        let mut args = self.args.clone();
+        if let Some(session) = &self.session
+            && !args
+                .iter()
+                .any(|a| a == "--session" || a.starts_with("--session="))
+        {
+            args.extend(["--session".to_string(), session.clone()]);
+        }
+        if !args
+            .iter()
+            .any(|a| a == "--listen" || a.starts_with("--listen="))
+        {
+            args.extend(["--listen".to_string(), socket.display().to_string()]);
+        }
+        args
+    }
+}
+
 /// How long a v2 process may take to end after `stop` (it cancels its turn,
 /// which waits for a running tool's receipt) before its group is ended,
 /// which takes its own TERM grace: together inside
@@ -150,11 +190,7 @@ impl SpironHarness {
                 socket.display()
             )));
         }
-        let mut args = launch.args.clone();
-        if let Some(session) = &launch.session {
-            args.extend(["--session".to_string(), session.clone()]);
-        }
-        args.extend(["--listen".to_string(), socket.display().to_string()]);
+        let args = launch.build_launch_args(socket);
         let output = std::fs::File::create(log)
             .map_err(|err| failed(format!("cannot open {}: {err}", log.display())))?;
         let errors = output
@@ -479,5 +515,34 @@ mod tests {
             !log.exists(),
             "oversized socket must fail before opening log"
         );
+    }
+
+    #[test]
+    fn launch_args_support_durable_local_and_cloud_handoff_without_duplicate_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let sock = temp.path().join("spiron.sock");
+        let launch = SpironLaunch {
+            program: PathBuf::from("spiron"),
+            args: vec![
+                "--headless".into(),
+                "--json".into(),
+                "--mcp-config".into(),
+                temp.path().join("spiron-mcp.json").display().to_string(),
+            ],
+            environment: Vec::new(),
+            work_dir: temp.path().to_path_buf(),
+            session: Some("sess-123".into()),
+            state_dir: temp.path().to_path_buf(),
+        }
+        .with_cloud(Some("worker-slug"))
+        .with_cloud(Some("ignored-duplicate"));
+
+        let built = launch.build_launch_args(&sock);
+        assert_eq!(built.iter().filter(|a| *a == "--cloud").count(), 1);
+        assert_eq!(built.iter().filter(|a| *a == "--cloud-agent").count(), 1);
+        let agent_idx = built.iter().position(|a| a == "--cloud-agent").unwrap();
+        assert_eq!(built[agent_idx + 1], "worker-slug");
+        assert_eq!(built.iter().filter(|a| *a == "--session").count(), 1);
+        assert_eq!(built.iter().filter(|a| *a == "--listen").count(), 1);
     }
 }
