@@ -36,6 +36,8 @@ use crate::identity::ServingIdentity;
 use crate::operator;
 use crate::vendor::{self, HarnessHost, VendorHarness};
 
+pub(crate) mod admin_auth;
+mod admin_ui;
 mod file_cache;
 mod hybrid;
 mod in_flight;
@@ -1314,6 +1316,9 @@ pub(crate) fn clear_explicitly_archived(data_dir: &Path, agent_id: &anyagents_co
 /// operator token the server is the identity boundary and reads nothing from a
 /// name.
 fn deployment_mode(data: &Path) -> auth::Mode {
+    if serverless::is_serverless_mode() || admin_auth::is_oidc_configured() {
+        return auth::Mode::from_env(data);
+    }
     match auth::Mode::from_env(data) {
         auth::Mode::Confined {
             operator_digest: None,
@@ -1771,10 +1776,13 @@ fn build_webhook_router(state: AppState) -> Router {
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route));
     // In Pure Serverless mode there is no reachable host Unix socket, so expose
-    // the full authenticated control/agent API on the HTTP listener strictly
-    // when fail-closed operator auth (`ANYAGENTS_OPERATOR_TOKEN`) is active.
-    let router = if serverless::is_serverless_mode() && state.auth.has_operator() {
-        mount_authenticated_api_routes(base)
+    // the full authenticated control/agent API and embedded `/admin` console on
+    // the HTTP listener strictly when fail-closed operator auth
+    // (`ANYAGENTS_OPERATOR_TOKEN`) or Admin OIDC is configured.
+    let router = if serverless::is_serverless_mode()
+        && (state.auth.has_operator() || admin_auth::is_oidc_configured())
+    {
+        admin_ui::mount_admin_routes(mount_authenticated_api_routes(base))
     } else {
         base
     };
@@ -1865,7 +1873,7 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
 }
 
 pub(crate) fn build_router(state: AppState) -> Router {
-    mount_authenticated_api_routes(Router::new())
+    admin_ui::mount_admin_routes(mount_authenticated_api_routes(Router::new()))
         .route("/v1/webhooks/healthz", get(webhook_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .route("/v1/webhooks/github", post(github_webhook))
@@ -3499,6 +3507,10 @@ async fn set_profile_route(
         let (provider, profile) =
             create::set_provider_profile(state.store.data_dir(), &body.profile, &body.key)
                 .map_err(ApiError::from_store)?;
+        if state.store.is_postgres() {
+            serverless::persist_profile_dir_to_deployment_blobs(&state.store, &provider, &profile)
+                .map_err(ApiError::from_store)?;
+        }
         state.profiles.invalidate(&state.store);
         quota_rotation::profiles_changed(Some(provider.as_str()));
         Ok(Json(serde_json::json!({
@@ -4214,49 +4226,69 @@ async fn sign_in_route(
         .filter(|s| !s.is_empty())
         .unwrap_or("default")
         .to_string();
+    if profile == "."
+        || profile == ".."
+        || !profile
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid profile name",
+        ));
+    }
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(16);
-    let runner = Arc::clone(&state.sign_in);
-    let root = state.store.data_dir().to_path_buf();
-    let mark = capability_mark(Arc::clone(&state.store));
     // The response streams while the sign-in runs, so the call's future ends
     // before its work: the work holds the call open for a stop (`in_flight`).
     let call = in_flight::carry();
-    let spawned = tokio::task::spawn_blocking(move || {
-        let _call = call;
-        let mut sink = ChannelSink { tx };
-        let mut guard = runner.lock().unwrap_or_else(|err| err.into_inner());
-        let result = sign_in(
-            &builtin_catalog(),
-            &root,
-            &id,
-            &profile,
-            &mut *guard,
-            &mut sink,
-        );
-        let line = match &result {
-            Ok(outcome) => {
-                // A new sign-in is a new instance: the harness restarts with a
-                // capability this sign-in minted, and the last one is retired.
-                if let Err(err) = mark() {
-                    eprintln!("capability after sign-in: {err}");
+    if serverless::is_serverless_mode() {
+        let store = Arc::clone(&state.store);
+        let profiles = Arc::clone(&state.profiles);
+        tokio::spawn(async move {
+            let _call = call;
+            serverless::run_serverless_sandbox_sign_in(store, profiles, id, profile, tx).await;
+        });
+    } else {
+        let runner = Arc::clone(&state.sign_in);
+        let root = state.store.data_dir().to_path_buf();
+        let mark = capability_mark(Arc::clone(&state.store));
+        let spawned = tokio::task::spawn_blocking(move || {
+            let _call = call;
+            let mut sink = ChannelSink { tx };
+            let mut guard = runner.lock().unwrap_or_else(|err| err.into_inner());
+            let result = sign_in(
+                &builtin_catalog(),
+                &root,
+                &id,
+                &profile,
+                &mut *guard,
+                &mut sink,
+            );
+            let line = match &result {
+                Ok(outcome) => {
+                    // A new sign-in is a new instance: the harness restarts with a
+                    // capability this sign-in minted, and the last one is retired.
+                    if let Err(err) = mark() {
+                        eprintln!("capability after sign-in: {err}");
+                    }
+                    SignInLine {
+                        kind: "done",
+                        text: outcome.account.clone().unwrap_or_default(),
+                    }
                 }
-                SignInLine {
-                    kind: "done",
-                    text: outcome.account.clone().unwrap_or_default(),
-                }
-            }
-            Err(err) => SignInLine {
-                kind: "error",
-                text: err.to_string(),
-            },
-        };
-        sink.send(&line);
-        result
-    });
-    // The task sends the final line before it returns, so the stream ends only
-    // after the command has finished. Dropping the handle detaches it; the
-    // channel keeps the lines ordered.
-    drop(spawned);
+                Err(err) => SignInLine {
+                    kind: "error",
+                    text: err.to_string(),
+                },
+            };
+            sink.send(&line);
+            result
+        });
+        // The task sends the final line before it returns, so the stream ends only
+        // after the command has finished. Dropping the handle detaches it; the
+        // channel keeps the lines ordered.
+        drop(spawned);
+    }
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = Body::from_stream(stream.map(|line| Ok::<_, std::io::Error>(format!("{line}\n"))));
     Ok(Response::builder()
