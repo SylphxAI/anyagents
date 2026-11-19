@@ -4834,7 +4834,11 @@ done
             .unwrap();
         store.set_agent_running(&agent.id, "/work").unwrap();
         let _m1 = store.receive(&agent.id, Incoming::new("msg 1")).unwrap();
-        let m2 = store.receive(&agent.id, Incoming::new("msg 2")).unwrap();
+        let anyagents_core::ReceiveOutcome::New(m2) =
+            store.receive(&agent.id, Incoming::new("msg 2")).unwrap()
+        else {
+            panic!("expected new message");
+        };
         assert_eq!(m2.seq, 2);
 
         // Failed turn must NOT advance `mailbox_cursors.delivered_seq`.
