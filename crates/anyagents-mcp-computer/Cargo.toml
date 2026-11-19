@@ -1,0 +1,31 @@
+[package]
+name = "anyagents-mcp-computer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Optional standalone stdio MCP server for desktop GUI, screenshot, and accessibility automation"
+
+[[bin]]
+name = "anyagents-mcp-computer"
+path = "src/main.rs"
+
+[dependencies]
+agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "c4470c9a095f46f6bdb6af2f1fc39359104f2fe4" }
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+rmcp = { version = "3.5", features = ["macros", "schemars", "server", "transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "time",
+] }
+
+[dev-dependencies]
+tempfile = "3"

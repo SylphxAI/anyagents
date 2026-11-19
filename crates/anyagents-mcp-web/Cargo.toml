@@ -1,0 +1,24 @@
+[package]
+name = "anyagents-mcp-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Optional standalone stdio MCP server for web search and SSRF-safe web fetch"
+
+[[bin]]
+name = "anyagents-mcp-web"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+rmcp = { version = "3.5", features = ["macros", "schemars", "server", "transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+ureq = { version = "3", features = ["json"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
