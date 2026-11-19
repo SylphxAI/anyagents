@@ -68,6 +68,7 @@ roxmltree = "0.21"
 # until 0.2.0 is published; then this becomes `agent-workstation = "0.2"`.
 [target.'cfg(target_os = "linux")'.dependencies]
 agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "9587cbc7d0850afa315111b764cc9cde9d62e646" }
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { version = "0.7", features = ["background_threads_runtime_support"] }
