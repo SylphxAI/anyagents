@@ -1028,8 +1028,17 @@ pub(crate) fn settle_remote_turn_and_deliver(
     }
 
     // 6. Trigger outbound reply delivery if configured and turn completed with text.
+    // Skip automatic fallback delivery when the agent already sent an explicit
+    // outbound message via MCP during this turn (avoids double-posting internal
+    // turn summaries into Telegram chats or peer mailboxes).
+    let already_replied_via_mcp = store
+        .turn_ownership_snapshot(&turn.agent_id)
+        .ok()
+        .and_then(|snap| snap.last_outbound_at_ms)
+        .is_some_and(|ts| ts >= turn.created_at_ms);
     let mut delivered_reply = false;
-    if turn.status == "completed"
+    if !already_replied_via_mcp
+        && turn.status == "completed"
         && let Some(ref reply_text) = turn.result_text
         && !reply_text.trim().is_empty()
         && let Some(rt_val) = turn
@@ -1059,7 +1068,7 @@ pub(crate) fn settle_remote_turn_and_deliver(
                     .as_ref()
                     .map(|a| a.name.as_str())
                     .unwrap_or(turn.agent_id.as_str());
-                if crate::telegram::post_text(
+                match crate::telegram::post_text(
                     store,
                     store.data_dir(),
                     from_name,
@@ -1068,10 +1077,16 @@ pub(crate) fn settle_remote_turn_and_deliver(
                     reply_text,
                     reply_to_message_id,
                     thread_id,
-                )
-                .is_ok()
-                {
-                    delivered_reply = true;
+                ) {
+                    Ok(_) => {
+                        delivered_reply = true;
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "anyagents-serverless: telegram reply delivery failed for {} (chat {}): {err}",
+                            turn.agent_id, chat_id
+                        );
+                    }
                 }
             }
         }

@@ -6387,178 +6387,184 @@ async fn wake_agent_route(
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_guard = CancelWakeOnDrop(Arc::clone(&cancelled));
     let dispatch_store = Arc::clone(&state.store);
-    let out: Result<(Json<AgentView>, AgentId), ApiError> = spawn_store(move || {
-        use std::sync::atomic::Ordering;
-        let found = state
-            .store
-            .agent_by_name(&name)
-            .map_err(ApiError::from_store)?;
-        if via_http && !runs_off_host(&state.store, &found) {
-            return Err(ApiError::forbidden(format!(
-                "`{}` runs on this host; a call over HTTP MCP cannot wake it",
-                found.name
-            )));
-        }
-        if let Principal::Agent {
-            agent_id: ref caller_id,
-            name: ref caller_name,
-        } = principal
-        {
-            let actor = Actor::Agent(caller_name.clone());
-            if !is_self_or_ancestor(&state.store, caller_id, &found)
-                && can_actor_message_agent(&state.store, &actor, &found).is_err()
+    let out: Result<(Json<AgentView>, anyagents_core::AgentId), ApiError> =
+        spawn_store(move || {
+            use std::sync::atomic::Ordering;
+            let found = state
+                .store
+                .agent_by_name(&name)
+                .map_err(ApiError::from_store)?;
+            if via_http && !runs_off_host(&state.store, &found) {
+                return Err(ApiError::forbidden(format!(
+                    "`{}` runs on this host; a call over HTTP MCP cannot wake it",
+                    found.name
+                )));
+            }
+            if let Principal::Agent {
+                agent_id: ref caller_id,
+                name: ref caller_name,
+            } = principal
             {
-                require_admin_or_operator(&state.store, &principal, "agents.wake", &found.name)?;
+                let actor = Actor::Agent(caller_name.clone());
+                if !is_self_or_ancestor(&state.store, caller_id, &found)
+                    && can_actor_message_agent(&state.store, &actor, &found).is_err()
+                {
+                    require_admin_or_operator(
+                        &state.store,
+                        &principal,
+                        "agents.wake",
+                        &found.name,
+                    )?;
+                }
             }
-        }
-        let _lifecycle = state
-            .store
-            .lock_agent_lifecycle(&found.id)
-            .map_err(ApiError::from_store)?;
-        if cancelled.load(Ordering::SeqCst) {
-            return Err(ApiError::conflict("wake recovery cancelled"));
-        }
-        let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
-        let now = now_ms();
-        let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &found.id);
-        let files = file_cache::cache();
-        files.catch_up();
-        let markers = Markers { files, cfg: &cfg };
-        let rotated_ms = markers.ms(PROFILE_ROTATED);
-        let (session_quota, session_error) =
-            persisted_fault(&found.harness, &markers, rotated_ms, now);
-        let live = state.health.get(&found.id);
-        let live_quota_active = live
-            .as_ref()
-            .and_then(|l| l.quota_reset_at_ms)
-            .is_some_and(|ms| ms > now);
-        let persisted_quota_active = session_quota.is_some_and(|ms| ms > now);
-        let live_err = live.as_ref().and_then(|l| l.last_error.clone());
-        let live_err_kind = live_err
-            .as_deref()
-            .and_then(|err| compute_block_reason(None, Some(err), now));
-        let persisted_err_kind = session_error
-            .as_deref()
-            .and_then(|err| compute_block_reason(None, Some(err), now));
-        let live_delivery_err = if live_err_kind.as_deref() == Some("delivery_error") {
-            live_err.clone()
-        } else {
-            None
-        };
-        let persisted_delivery_err = persisted_err_kind.as_deref() == Some("delivery_error");
-        let has_unrelated_fault = live_quota_active
-            || persisted_quota_active
-            || matches!(
-                live_err_kind.as_deref(),
-                Some("sign_in_required" | "quota_exhausted" | "memory_migration_wait")
-            )
-            || matches!(
-                persisted_err_kind.as_deref(),
-                Some("sign_in_required" | "quota_exhausted" | "memory_migration_wait")
-            );
-
-        if live_delivery_err.is_some() || persisted_delivery_err {
-            if let Some(ref expected) = live_delivery_err {
-                state
-                    .health
-                    .stop_for_wake_cancellable(
-                        &found.id,
-                        anyagents_supervisor::WakeFault::Error(expected),
-                        WAKE_RECOVERY_TIMEOUT,
-                        &cancelled,
-                    )
-                    .map_err(ApiError::conflict)?;
-            }
+            let _lifecycle = state
+                .store
+                .lock_agent_lifecycle(&found.id)
+                .map_err(ApiError::from_store)?;
             if cancelled.load(Ordering::SeqCst) {
                 return Err(ApiError::conflict("wake recovery cancelled"));
             }
-            let custody = match state.store.try_lock_agent(&found.id) {
-                Ok(custody) => custody,
-                // This server's own worker keeps the lock through a restart
-                // backoff or quota hold after its process died. Retire that
-                // exact generation with checked custody, as for a live fault;
-                // a lock held by anything else (a live process, a keeper or
-                // another server) is still refused.
-                Err(anyagents_core::Error::AgentBusy)
-                    if live_delivery_err.is_none()
-                        && live.as_ref().is_some_and(|l| !l.process_alive) =>
-                {
+            let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
+            let now = now_ms();
+            let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &found.id);
+            let files = file_cache::cache();
+            files.catch_up();
+            let markers = Markers { files, cfg: &cfg };
+            let rotated_ms = markers.ms(PROFILE_ROTATED);
+            let (session_quota, session_error) =
+                persisted_fault(&found.harness, &markers, rotated_ms, now);
+            let live = state.health.get(&found.id);
+            let live_quota_active = live
+                .as_ref()
+                .and_then(|l| l.quota_reset_at_ms)
+                .is_some_and(|ms| ms > now);
+            let persisted_quota_active = session_quota.is_some_and(|ms| ms > now);
+            let live_err = live.as_ref().and_then(|l| l.last_error.clone());
+            let live_err_kind = live_err
+                .as_deref()
+                .and_then(|err| compute_block_reason(None, Some(err), now));
+            let persisted_err_kind = session_error
+                .as_deref()
+                .and_then(|err| compute_block_reason(None, Some(err), now));
+            let live_delivery_err = if live_err_kind.as_deref() == Some("delivery_error") {
+                live_err.clone()
+            } else {
+                None
+            };
+            let persisted_delivery_err = persisted_err_kind.as_deref() == Some("delivery_error");
+            let has_unrelated_fault = live_quota_active
+                || persisted_quota_active
+                || matches!(
+                    live_err_kind.as_deref(),
+                    Some("sign_in_required" | "quota_exhausted" | "memory_migration_wait")
+                )
+                || matches!(
+                    persisted_err_kind.as_deref(),
+                    Some("sign_in_required" | "quota_exhausted" | "memory_migration_wait")
+                );
+
+            if live_delivery_err.is_some() || persisted_delivery_err {
+                if let Some(ref expected) = live_delivery_err {
                     state
                         .health
                         .stop_for_wake_cancellable(
                             &found.id,
-                            anyagents_supervisor::WakeFault::ProcessDown(live_err.as_deref()),
+                            anyagents_supervisor::WakeFault::Error(expected),
                             WAKE_RECOVERY_TIMEOUT,
                             &cancelled,
                         )
                         .map_err(ApiError::conflict)?;
-                    if cancelled.load(Ordering::SeqCst) {
-                        return Err(ApiError::conflict("wake recovery cancelled"));
+                }
+                if cancelled.load(Ordering::SeqCst) {
+                    return Err(ApiError::conflict("wake recovery cancelled"));
+                }
+                let custody = match state.store.try_lock_agent(&found.id) {
+                    Ok(custody) => custody,
+                    // This server's own worker keeps the lock through a restart
+                    // backoff or quota hold after its process died. Retire that
+                    // exact generation with checked custody, as for a live fault;
+                    // a lock held by anything else (a live process, a keeper or
+                    // another server) is still refused.
+                    Err(anyagents_core::Error::AgentBusy)
+                        if live_delivery_err.is_none()
+                            && live.as_ref().is_some_and(|l| !l.process_alive) =>
+                    {
+                        state
+                            .health
+                            .stop_for_wake_cancellable(
+                                &found.id,
+                                anyagents_supervisor::WakeFault::ProcessDown(live_err.as_deref()),
+                                WAKE_RECOVERY_TIMEOUT,
+                                &cancelled,
+                            )
+                            .map_err(ApiError::conflict)?;
+                        if cancelled.load(Ordering::SeqCst) {
+                            return Err(ApiError::conflict("wake recovery cancelled"));
+                        }
+                        state.store.try_lock_agent(&found.id).map_err(|_| {
+                            ApiError::conflict(
+                                "agent process lock is still held; refusing wake recovery",
+                            )
+                        })?
                     }
-                    state.store.try_lock_agent(&found.id).map_err(|_| {
-                        ApiError::conflict(
+                    Err(_) => {
+                        return Err(ApiError::conflict(
                             "agent process lock is still held; refusing wake recovery",
-                        )
-                    })?
+                        ));
+                    }
+                };
+                let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
+                if let Some(ref expected) = live_delivery_err {
+                    state
+                        .health
+                        .clear_wake_fault(&found.id, expected)
+                        .map_err(ApiError::conflict)?;
                 }
-                Err(_) => {
-                    return Err(ApiError::conflict(
-                        "agent process lock is still held; refusing wake recovery",
-                    ));
-                }
-            };
-            let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
-            if let Some(ref expected) = live_delivery_err {
-                state
-                    .health
-                    .clear_wake_fault(&found.id, expected)
-                    .map_err(ApiError::conflict)?;
+                prepare_agent_wake_with_options(
+                    &state.store,
+                    &found,
+                    persisted_delivery_err || session_error.is_none(),
+                    false,
+                    !has_unrelated_fault,
+                )?;
+                drop(custody);
+                let agent = state
+                    .store
+                    .set_agent_state(&found.id, "running")
+                    .map_err(ApiError::from_store)?;
+                create::poke_agent_wake_socket(state.store.data_dir(), &agent.id);
+                return Ok((
+                    Json(agent_view(&state.store, &state.health, &agent)?),
+                    agent.id,
+                ));
             }
+
+            if found.state == "running" {
+                create::poke_agent_wake_socket(state.store.data_dir(), &found.id);
+                return Ok((
+                    Json(agent_view(&state.store, &state.health, &found)?),
+                    found.id,
+                ));
+            }
+
             prepare_agent_wake_with_options(
                 &state.store,
                 &found,
-                persisted_delivery_err || session_error.is_none(),
-                false,
+                !has_unrelated_fault,
+                !has_unrelated_fault,
                 !has_unrelated_fault,
             )?;
-            drop(custody);
             let agent = state
                 .store
                 .set_agent_state(&found.id, "running")
                 .map_err(ApiError::from_store)?;
             create::poke_agent_wake_socket(state.store.data_dir(), &agent.id);
-            return Ok((
+            Ok((
                 Json(agent_view(&state.store, &state.health, &agent)?),
                 agent.id,
-            ));
-        }
-
-        if found.state == "running" {
-            create::poke_agent_wake_socket(state.store.data_dir(), &found.id);
-            return Ok((
-                Json(agent_view(&state.store, &state.health, &found)?),
-                found.id,
-            ));
-        }
-
-        prepare_agent_wake_with_options(
-            &state.store,
-            &found,
-            !has_unrelated_fault,
-            !has_unrelated_fault,
-            !has_unrelated_fault,
-        )?;
-        let agent = state
-            .store
-            .set_agent_state(&found.id, "running")
-            .map_err(ApiError::from_store)?;
-        create::poke_agent_wake_socket(state.store.data_dir(), &agent.id);
-        Ok((
-            Json(agent_view(&state.store, &state.health, &agent)?),
-            agent.id,
-        ))
-    })
-    .await;
+            ))
+        })
+        .await;
     drop(cancel_guard);
     let (view, agent_id) = out?;
     if serverless::is_serverless_mode()
