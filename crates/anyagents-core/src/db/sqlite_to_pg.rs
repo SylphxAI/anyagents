@@ -22,6 +22,9 @@ pub struct MigrateToPostgresOptions {
     pub skip_index: bool,
     pub batch_size: usize,
     pub reconcile_stale_runtime: bool,
+    /// When true, tables whose PostgreSQL row count already equals or exceeds
+    /// the SQLite source row count are verified and skipped without re-streaming.
+    pub resume: bool,
     /// Optional AEAD master key for encrypting migrated secret files, gateway
     /// routes, and sandbox transport tokens. Defaults to `MasterKey::from_env()`.
     pub master_key: Option<crate::stateless::MasterKey>,
@@ -35,6 +38,7 @@ impl MigrateToPostgresOptions {
             skip_index: false,
             batch_size: 2500,
             reconcile_stale_runtime: true,
+            resume: false,
             master_key: crate::stateless::MasterKey::from_env().ok().flatten(),
         }
     }
@@ -353,6 +357,7 @@ fn copy_table(
     pool: &PgPool,
     spec: &TableSpec,
     batch_size: usize,
+    resume: bool,
 ) -> Result<TableMigrationStat, Error> {
     let pg_before = block_on_pg(pg_count(pool, spec.pg_table))?;
     if !sqlite_table_exists(sqlite, spec.sqlite_table)? {
@@ -368,6 +373,18 @@ fn copy_table(
         return Ok(TableMigrationStat {
             pg_table: spec.pg_table.to_owned(),
             sqlite_rows: 0,
+            pg_rows_before: pg_before,
+            pg_rows_after: pg_before,
+        });
+    }
+    if resume && pg_before >= expected {
+        eprintln!(
+            "  [migrate] {}: {} rows OK (resumed: pg={} >= sqlite={})",
+            spec.pg_table, pg_before, pg_before, expected
+        );
+        return Ok(TableMigrationStat {
+            pg_table: spec.pg_table.to_owned(),
+            sqlite_rows: expected,
             pg_rows_before: pg_before,
             pg_rows_after: pg_before,
         });
@@ -391,6 +408,8 @@ fn copy_table(
     let insert_sql = build_unnest_insert_sql(spec, &bufs);
 
     let started = Instant::now();
+    let progress_step = (batch_size as i64 * 10).max(50_000);
+    let mut next_progress = progress_step;
     let mut copied = 0_i64;
     while let Some(row) = rows.next()? {
         for (idx, col) in spec.cols.iter().enumerate() {
@@ -399,7 +418,7 @@ fn copy_table(
         copied += 1;
         if bufs[0].len() >= batch_size {
             block_on_pg(flush_batch(pool, &insert_sql, &mut bufs))?;
-            if expected >= 10_000 && copied % (batch_size as i64 * 20) == 0 {
+            if expected >= 10_000 && copied >= next_progress {
                 eprintln!(
                     "  [migrate] {}: {}/{} ({:.1}s)",
                     spec.pg_table,
@@ -407,6 +426,7 @@ fn copy_table(
                     expected,
                     started.elapsed().as_secs_f64()
                 );
+                next_progress = copied + progress_step;
             }
         }
     }
@@ -439,9 +459,32 @@ fn copy_agents_topological(
     sqlite: &Connection,
     pool: &PgPool,
     batch_size: usize,
+    resume: bool,
 ) -> Result<(TableMigrationStat, HashSet<String>), Error> {
     let pg_before = block_on_pg(pg_count(pool, "public.agents"))?;
     let expected = sqlite_count(sqlite, "agents")?;
+    if resume && expected > 0 && pg_before >= expected {
+        let mut ids = HashSet::with_capacity(expected as usize);
+        let mut stmt = sqlite.prepare("SELECT id FROM agents")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            if let Some(id) = sqlite_cell_to_string(row.get_ref(0)?)? {
+                ids.insert(id);
+            }
+        }
+        eprintln!(
+            "  [migrate] public.agents: {pg_before} rows OK (resumed: pg={pg_before} >= sqlite={expected})"
+        );
+        return Ok((
+            TableMigrationStat {
+                pg_table: "public.agents".to_owned(),
+                sqlite_rows: expected,
+                pg_rows_before: pg_before,
+                pg_rows_after: pg_before,
+            },
+            ids,
+        ));
+    }
 
     #[derive(Clone)]
     struct AgentRow {
@@ -1363,7 +1406,10 @@ const HOST_INDEX_TABLES: &[TableSpec] = &[
     ),
     TableSpec {
         sqlite_table: "host_windows",
-        sqlite_from: "host_windows w LEFT JOIN host_fts f ON f.rowid = w.id",
+        // `host_fts` is a contentless FTS5 virtual table (`content=''`), so reading
+        // `f.tokens` via `LEFT JOIN host_fts` always yields NULL while triggering a
+        // random per-row virtual-table probe across millions of rows.
+        sqlite_from: "host_windows w",
         pg_table: "host_index.host_windows",
         cols: &[
             ColSpec {
@@ -1391,7 +1437,7 @@ const HOST_INDEX_TABLES: &[TableSpec] = &[
                 pg_col: "sha256",
                 kind: ColKind::Text { default: "" },
             },
-            ColSpec::expr_txt("COALESCE(NULLIF(CAST(f.tokens AS TEXT), ''), '')", "tokens"),
+            ColSpec::expr_txt("''", "tokens"),
         ],
         extra_pg_cols: Some("\"tokens_tsv\""),
         extra_pg_expr: Some("to_tsvector('simple', coalesce(t.\"tokens\", ''))"),
@@ -2139,7 +2185,7 @@ pub fn migrate_sqlite_dir_to_postgres(
             state_path.display()
         )));
     }
-    let batch_size = opts.batch_size.clamp(100, 10_000);
+    let batch_size = opts.batch_size.clamp(100, 50_000);
     let started = Instant::now();
     let direct_url = configured_direct_database_url(&opts.target_url);
     migrate_postgres(&direct_url)?;
@@ -2159,12 +2205,25 @@ pub fn migrate_sqlite_dir_to_postgres(
 
     let mut stats = Vec::new();
     for spec in STATE_WAVE_BEFORE_AGENTS {
-        stats.push(copy_table(&state_sqlite, &pool, spec, batch_size)?);
+        stats.push(copy_table(
+            &state_sqlite,
+            &pool,
+            spec,
+            batch_size,
+            opts.resume,
+        )?);
     }
-    let (agents_stat, valid_agents) = copy_agents_topological(&state_sqlite, &pool, batch_size)?;
+    let (agents_stat, valid_agents) =
+        copy_agents_topological(&state_sqlite, &pool, batch_size, opts.resume)?;
     stats.push(agents_stat);
     for spec in STATE_WAVE_AFTER_AGENTS {
-        stats.push(copy_table(&state_sqlite, &pool, spec, batch_size)?);
+        stats.push(copy_table(
+            &state_sqlite,
+            &pool,
+            spec,
+            batch_size,
+            opts.resume,
+        )?);
     }
 
     let mut agent_names = HashMap::new();
@@ -2186,14 +2245,26 @@ pub fn migrate_sqlite_dir_to_postgres(
         if mem_path.is_file() {
             let mem_sqlite = open_sqlite_readonly(&mem_path)?;
             for spec in MEMORY_INDEX_TABLES {
-                stats.push(copy_table(&mem_sqlite, &pool, spec, batch_size)?);
+                stats.push(copy_table(
+                    &mem_sqlite,
+                    &pool,
+                    spec,
+                    batch_size,
+                    opts.resume,
+                )?);
             }
         }
         let host_path = opts.source_dir.join(crate::host_retrieval::INDEX_FILE);
         if host_path.is_file() {
             let host_sqlite = open_sqlite_readonly(&host_path)?;
             for spec in HOST_INDEX_TABLES {
-                stats.push(copy_table(&host_sqlite, &pool, spec, batch_size)?);
+                stats.push(copy_table(
+                    &host_sqlite,
+                    &pool,
+                    spec,
+                    batch_size,
+                    opts.resume,
+                )?);
             }
         }
     }

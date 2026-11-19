@@ -694,6 +694,25 @@ fn pg_migrate_to_postgres_backfills_sqlite_and_disk_files_idempotently() {
         .expect("unchanged skill in PG");
     assert_eq!(skill_after.content, b"# Ops Playbook\n");
 
+    // Re-run with `resume = true`: already-matched SQLite tables skip re-streaming while
+    // `valid_agents` and on-disk blob backfill still run end-to-end.
+    std::fs::write(mem_dir.join("MEMORY.md"), b"# Memory v3\nResumed notes.\n").unwrap();
+    opts.resume = true;
+    let report3 = migrate_sqlite_dir_to_postgres(&opts)
+        .expect("third resumed migrate_sqlite_dir_to_postgres");
+    let agents_stat = report3
+        .tables
+        .iter()
+        .find(|t| t.pg_table == "public.agents")
+        .expect("public.agents stat in resumed report");
+    assert_eq!(agents_stat.pg_rows_before, agents_stat.pg_rows_after);
+    assert_eq!(report3.agent_files_migrated, report1.agent_files_migrated);
+    let mem_v3 = blobs
+        .get_agent_file(&agent.id, "memory", "MEMORY.md")
+        .unwrap()
+        .expect("resumed MEMORY.md update in PG");
+    assert_eq!(mem_v3.content, b"# Memory v3\nResumed notes.\n");
+
     // Clean up test rows.
     let _ = blobs.delete_deployment_blob("secrets", &format!("mig_{tag}.secret"));
     let _ = blobs.delete_deployment_blob("profiles", &format!("mig_{tag}/profile.json"));

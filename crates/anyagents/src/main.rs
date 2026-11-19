@@ -718,6 +718,9 @@ enum DbCommand {
         /// Align archived agent runtime states, clear legacy fault markers, and close unclosed turns.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         reconcile_stale_runtime: bool,
+        /// Skip re-streaming tables whose PostgreSQL row count already matches or exceeds SQLite.
+        #[arg(long, default_value_t = false)]
+        resume: bool,
         /// Output machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -1773,6 +1776,7 @@ fn db_cmd(data: &Path, action: DbCommand) -> Result<(), anyagents_core::Error> {
             skip_index,
             batch_size,
             reconcile_stale_runtime,
+            resume,
             json,
         } => {
             let source_dir = source.unwrap_or_else(|| data.to_path_buf());
@@ -1790,6 +1794,7 @@ fn db_cmd(data: &Path, action: DbCommand) -> Result<(), anyagents_core::Error> {
                 skip_index,
                 batch_size,
                 reconcile_stale_runtime,
+                resume,
                 master_key: anyagents_core::MasterKey::from_env()?,
             };
             let report = anyagents_core::db::migrate_sqlite_dir_to_postgres(&opts)?;
