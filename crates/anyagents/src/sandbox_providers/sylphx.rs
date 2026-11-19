@@ -56,6 +56,7 @@ const DEFAULT_SYLPHX_ENDPOINT: &str = "https://api.sylphx.com";
 const LEASE_READY_POLL_INITIAL: Duration = Duration::from_millis(25);
 const LEASE_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const LEASE_READY_TIMEOUT: Duration = Duration::from_secs(120);
+const VOLUME_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const EXEC_IN_PROGRESS_POLL_DELAY: Duration = Duration::from_millis(1_000);
 
 /// Return `true` when `ANYAGENTS_SERVERLESS` is explicitly enabled (`1` | `true` | `yes` | `on`).
@@ -761,7 +762,62 @@ impl SylphxSandboxClient {
         ))
     }
 
-    /// Ensure a persistent volume exists for an agent. Reuses `existing_volume` if found via `GET`.
+    /// Poll `GET /v1/{volume_resource}` until a newly created volume leaves `creating`.
+    pub fn wait_volume_available(
+        &self,
+        parent: &str,
+        volume: SylphxVolume,
+        timeout: Duration,
+    ) -> Result<SylphxVolume, String> {
+        let is_creating = |v: &SylphxVolume| {
+            v.state
+                .as_deref()
+                .is_some_and(|s| s.trim().eq_ignore_ascii_case("creating"))
+        };
+        let is_failed = |v: &SylphxVolume| {
+            v.state.as_deref().is_some_and(|s| {
+                let u = s.trim().to_ascii_uppercase();
+                matches!(u.as_str(), "FAILED" | "DELETING" | "DELETED")
+            })
+        };
+        if !is_creating(&volume) {
+            if is_failed(&volume) {
+                return Err(format!(
+                    "Sylphx volume {} entered unusable state `{}`",
+                    volume.resource_name,
+                    volume.state.as_deref().unwrap_or("")
+                ));
+            }
+            return Ok(volume);
+        }
+        let deadline = Instant::now() + timeout;
+        let resource = volume.resource_name.clone();
+        let mut poll_delay = LEASE_READY_POLL_INITIAL;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for Sylphx volume {resource} to become available"
+                ));
+            }
+            std::thread::sleep(poll_delay);
+            poll_delay = (poll_delay * 2).min(LEASE_READY_POLL_INTERVAL);
+            let current = self.get_volume(parent, &resource)?.ok_or_else(|| {
+                format!("Sylphx volume {resource} disappeared while waiting for available")
+            })?;
+            if !is_creating(&current) {
+                if is_failed(&current) {
+                    return Err(format!(
+                        "Sylphx volume {resource} entered unusable state `{}`",
+                        current.state.as_deref().unwrap_or("")
+                    ));
+                }
+                return Ok(current);
+            }
+        }
+    }
+
+    /// Ensure a persistent volume exists for an agent and is no longer `creating`.
+    /// Reuses `existing_volume` if found via `GET`.
     pub fn ensure_volume(
         &self,
         parent: &str,
@@ -772,23 +828,24 @@ impl SylphxSandboxClient {
         if let Some(existing) = existing_volume.map(str::trim).filter(|s| !s.is_empty())
             && let Some(found) = self.get_volume(parent, existing)?
         {
-            return Ok(found);
+            return self.wait_volume_available(parent, found, VOLUME_READY_TIMEOUT);
         }
         let volume_id = normalize_resource_id(preferred_name);
         if let Some(by_name) = self.get_volume(parent, &volume_id)? {
-            return Ok(by_name);
+            return self.wait_volume_available(parent, by_name, VOLUME_READY_TIMEOUT);
         }
-        match self.create_volume(parent, &volume_id, size_gib) {
-            Ok(vol) => Ok(vol),
+        let vol = match self.create_volume(parent, &volume_id, size_gib) {
+            Ok(vol) => vol,
             Err(err) if err.contains("HTTP 409") || err.contains("RESOURCE_ALREADY_EXISTS") => {
                 if let Some(by_name) = self.get_volume(parent, &volume_id)? {
-                    Ok(by_name)
+                    by_name
                 } else {
-                    Err(err)
+                    return Err(err);
                 }
             }
-            Err(err) => Err(err),
-        }
+            Err(err) => return Err(err),
+        };
+        self.wait_volume_available(parent, vol, VOLUME_READY_TIMEOUT)
     }
 
     /// Create a sandbox lease attaching `volume_resource` (`POST /v1/{parent}/leases`).
@@ -2321,11 +2378,21 @@ mod tests {
                         serde_json::to_vec(&serde_json::json!({
                             "name": "orgs/o1/projects/p1/envs/e1/volumes/vol_123",
                             "spec": { "size_gib": 20 },
-                            "status": { "state": "available" }
+                            "status": { "state": "creating" }
                         }))
                         .unwrap(),
                     )
                 }
+                ("GET", "/v1/orgs/o1/projects/p1/envs/e1/volumes/vol_123") => (
+                    200,
+                    json_hdr,
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "orgs/o1/projects/p1/envs/e1/volumes/vol_123",
+                        "spec": { "size_gib": 20 },
+                        "status": { "state": "available" }
+                    }))
+                    .unwrap(),
+                ),
                 ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases") => {
                     assert_eq!(parsed["spec"]["shape"], "linux-m");
                     assert_eq!(parsed["spec"]["ttl"], "900s");
