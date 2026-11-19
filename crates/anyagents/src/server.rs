@@ -6386,7 +6386,8 @@ async fn wake_agent_route(
     let via_http = via_http_mcp(&headers);
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_guard = CancelWakeOnDrop(Arc::clone(&cancelled));
-    let out = spawn_store(move || {
+    let dispatch_store = Arc::clone(&state.store);
+    let out: Result<(Json<AgentView>, AgentId), ApiError> = spawn_store(move || {
         use std::sync::atomic::Ordering;
         let found = state
             .store
@@ -6526,12 +6527,18 @@ async fn wake_agent_route(
                 .set_agent_state(&found.id, "running")
                 .map_err(ApiError::from_store)?;
             create::poke_agent_wake_socket(state.store.data_dir(), &agent.id);
-            return Ok(Json(agent_view(&state.store, &state.health, &agent)?));
+            return Ok((
+                Json(agent_view(&state.store, &state.health, &agent)?),
+                agent.id,
+            ));
         }
 
         if found.state == "running" {
             create::poke_agent_wake_socket(state.store.data_dir(), &found.id);
-            return Ok(Json(agent_view(&state.store, &state.health, &found)?));
+            return Ok((
+                Json(agent_view(&state.store, &state.health, &found)?),
+                found.id,
+            ));
         }
 
         prepare_agent_wake_with_options(
@@ -6546,11 +6553,24 @@ async fn wake_agent_route(
             .set_agent_state(&found.id, "running")
             .map_err(ApiError::from_store)?;
         create::poke_agent_wake_socket(state.store.data_dir(), &agent.id);
-        Ok(Json(agent_view(&state.store, &state.health, &agent)?))
+        Ok((
+            Json(agent_view(&state.store, &state.health, &agent)?),
+            agent.id,
+        ))
     })
     .await;
     drop(cancel_guard);
-    out
+    let (view, agent_id) = out?;
+    if serverless::is_serverless_mode()
+        && let Err(err) =
+            serverless::dispatch_next_mailbox_message_if_serverless(dispatch_store, &agent_id).await
+    {
+        eprintln!(
+            "anyagents-serverless: wake dispatch failed for `{}`: {err}",
+            agent_id.as_str()
+        );
+    }
+    Ok(view)
 }
 
 /// Restore the same runtime and archive-marker state for an explicit wake or
