@@ -16010,6 +16010,7 @@ exec '{}' "$@"
                 "groups",
                 "schedules",
                 "conversation",
+                "code",
                 "memory",
                 "skills"
             ]
@@ -16039,14 +16040,13 @@ exec '{}' "$@"
                     .unwrap_err();
                 assert_eq!(err.status, expected, "{asked}: {}", err.message);
             }
-            // Nothing that runs on or from the host can be called, even by an
-            // alias or the vendor-prefixed name.
+            // Nothing that runs directly on or from the host can be called,
+            // even by an alias or the vendor-prefixed name.
             for host_tool in [
                 "browser",
                 "computer",
                 "device",
                 "media",
-                "code",
                 "files",
                 "web",
                 "web_search",
@@ -16070,6 +16070,30 @@ exec '{}' "$@"
                     "{host_tool}: {refused}"
                 );
             }
+            // Host-free `code` is exposed on `remote` but forbids coordinator-host
+            // filesystem access when no remote sandbox is bound.
+            let (_, code_fs_refused) = post_mcp_as(
+                &state,
+                &remote,
+                None,
+                tool_call(
+                    "code",
+                    serde_json::json!({ "code": "return await workspace.read('Cargo.toml');" }),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                code_fs_refused["result"]["isError"],
+                serde_json::json!(true),
+                "{code_fs_refused}"
+            );
+            assert!(
+                code_fs_refused
+                    .to_string()
+                    .contains("coordinator-host filesystem access is forbidden"),
+                "{code_fs_refused}"
+            );
             // Coordination works, as the agent the token names.
             let (_, sent) = post_mcp_as(
                 &state,
