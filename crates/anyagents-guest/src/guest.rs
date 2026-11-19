@@ -1514,6 +1514,19 @@ pub(crate) fn ensure_repo_checked_out(
             .unwrap_or_else(|_| PathBuf::from("/usr/bin/git")),
     };
     let mut cmd = spawn_command(&git_bin, &[]).map_err(|e| format!("git spawn: {e}"))?;
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    let gh_token = std::env::var("GH_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("GITHUB_TOKEN").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(tok) = gh_token
+        && (repo.starts_with("https://github.com/") || repo.starts_with("https://www.github.com/"))
+    {
+        cmd.env("ANYAGENTS_GIT_TOKEN", tok);
+        cmd.arg("-c")
+            .arg("credential.helper=!f() { echo username=x-access-token; echo password=\"$ANYAGENTS_GIT_TOKEN\"; }; f");
+    }
     cmd.arg("clone");
     if let Some(branch) = spec
         .branch
