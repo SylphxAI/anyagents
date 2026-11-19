@@ -1186,33 +1186,23 @@
     });
   }
 
-  // ---------- Tab 3: Usage & Outcomes Telemetry ----------
+  // ---------- Tab 3: Usage Telemetry ----------
 
   async function loadTelemetry() {
     const days = Number($("telemetry-days").value) || 7;
     try {
-      const [usageByAgent, usageByModel, outcomes] = await Promise.all([
+      const [usageByAgent, usageByModel] = await Promise.all([
         api(`/v1/usage?days=${days}&group_by=agent`),
         api(`/v1/usage?days=${days}&group_by=model`),
-        api(`/v1/outcomes?days=${days}&group_by=model`),
       ]);
-      renderTelemetry(usageByAgent, usageByModel, outcomes, days);
+      renderTelemetry(usageByAgent, usageByModel, days);
     } catch (err) {
       toast(`Failed to load telemetry: ${err.message}`, "error");
     }
   }
 
-  function renderTelemetry(usageAgent, usageModel, outcomes, days) {
+  function renderTelemetry(usageAgent, usageModel, days) {
     const totals = (usageAgent && usageAgent.totals) || {};
-    const outcomeGroups = (outcomes && outcomes.groups) || [];
-    let succeeded = 0;
-    let failed = 0;
-    let recovered = 0;
-    for (const g of outcomeGroups) {
-      succeeded += g.succeeded || 0;
-      failed += g.failed || 0;
-      recovered += g.recovered || 0;
-    }
 
     const cards = $("telemetry-cards");
     clearNode(cards);
@@ -1221,7 +1211,6 @@
       ["Input Tokens", fmtNumber(totals.input_tokens || 0), `Cache read: ${fmtNumber(totals.cache_read_tokens || 0)}`],
       ["Output Tokens", fmtNumber(totals.output_tokens || 0), `Cache write: ${fmtNumber(totals.cache_write_tokens || 0)}`],
       ["Reported Cost", fmtUsdFromMicros(totals.reported_cost_micros), "API billed turns"],
-      ["Outcomes Succeeded", fmtNumber(succeeded), `Failed: ${fmtNumber(failed)} • Recovered: ${fmtNumber(recovered)}`],
     ];
     for (const [label, value, sub] of kpis) {
       cards.appendChild(
@@ -1239,55 +1228,6 @@
     renderUsageTable($("usage-by-agent-table"), (usageAgent && usageAgent.buckets) || [], "agent");
     // Usage by Model table
     renderUsageTable($("usage-by-model-table"), (usageModel && usageModel.buckets) || [], "model");
-
-    // Outcomes table
-    const unattr = outcomes && outcomes.unattributed;
-    $("outcomes-unattributed").textContent = unattr
-      ? `Unattributed spend: ${fmtNumber(unattr.turns || 0)} turns / ${fmtUsdFromMicros(unattr.reported_cost_micros)}`
-      : "";
-    const outWrap = $("outcomes-table");
-    clearNode(outWrap);
-    if (outcomeGroups.length === 0) {
-      outWrap.appendChild(el("div", { class: "empty-state", text: `No outcomes recorded in the last ${days} day(s).` }));
-      return;
-    }
-    const tbl = el(
-      "table",
-      {},
-      el(
-        "thead",
-        {},
-        el(
-          "tr",
-          {},
-          el("th", { text: "Harness / Model" }),
-          el("th", { text: "Agents" }),
-          el("th", { text: "Succeeded" }),
-          el("th", { text: "Failed" }),
-          el("th", { text: "Reworked / Recovered" }),
-          el("th", { text: "Cost / Success" }),
-          el("th", { text: "Median Time" })
-        )
-      ),
-      el(
-        "tbody",
-        {},
-        ...outcomeGroups.map((g) =>
-          el(
-            "tr",
-            {},
-            el("td", { class: "mono", text: `${g.harness || "-"} / ${g.model || "default"}` }),
-            el("td", { class: "mono", text: fmtNumber(g.agents) }),
-            el("td", { class: "mono", text: fmtNumber(g.succeeded) }),
-            el("td", { class: "mono", text: fmtNumber(g.failed) }),
-            el("td", { class: "mono", text: `${fmtNumber(g.reworked)} / ${fmtNumber(g.recovered)}` }),
-            el("td", { class: "mono", text: fmtUsdFromMicros(g.cost_per_success_micros) }),
-            el("td", { class: "mono", text: fmtRelativeMs(g.median_ms_to_success) })
-          )
-        )
-      )
-    );
-    outWrap.appendChild(tbl);
   }
 
   function renderUsageTable(container, buckets, mode) {

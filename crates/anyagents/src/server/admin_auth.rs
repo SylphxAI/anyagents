@@ -129,8 +129,9 @@ pub(crate) fn parse_allowed_emails(raw: &str) -> BTreeSet<String> {
 fn hkdf_derive_32(ikm: &[u8], info: &[u8]) -> [u8; 32] {
     let salt = Salt::new(HKDF_SHA256, b"anyagents-admin-cookie-hkdf-salt-v1");
     let prk = salt.extract(ikm);
+    let info_slices = [info];
     let okm = prk
-        .expand(&[info], HKDF_SHA256)
+        .expand(&info_slices, HKDF_SHA256)
         .expect("32-byte HKDF-SHA256 expansion");
     let mut key = [0u8; 32];
     okm.fill(&mut key).expect("32-byte key buffer");

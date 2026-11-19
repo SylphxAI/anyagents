@@ -19,7 +19,7 @@
       <nav id="main-nav" class="nav-tabs hidden" aria-label="Console sections">
         <button class="nav-tab active" data-tab="fleet" type="button">Fleet</button>
         <button class="nav-tab" data-tab="profiles" type="button">Profiles &amp; Quota</button>
-        <button class="nav-tab" data-tab="telemetry" type="button">Usage &amp; Outcomes</button>
+        <button class="nav-tab" data-tab="telemetry" type="button">Usage</button>
         <button class="nav-tab" data-tab="automations" type="button">Automations &amp; Ticks</button>
         <button class="nav-tab" data-tab="channels" type="button">Channels &amp; Groups</button>
       </nav>
@@ -140,11 +140,11 @@
         <div id="profiles-grid" class="profiles-grid"></div>
       </section>
 
-      <!-- Tab 3: Usage & Outcomes Telemetry -->
+      <!-- Tab 3: Usage Telemetry -->
       <section id="tab-telemetry" class="tab-panel">
         <div class="panel-toolbar">
           <div class="toolbar-group">
-            <h2>Usage &amp; Outcomes Telemetry</h2>
+            <h2>Usage Telemetry</h2>
           </div>
           <div class="toolbar-group">
             <label for="telemetry-days" class="muted text-sm">Window:</label>
@@ -170,14 +170,6 @@
             <div id="usage-by-model-table" class="table-wrap"></div>
           </section>
         </div>
-
-        <section class="card mt-16">
-          <div class="card-header">
-            <h3>Outcomes by Model</h3>
-            <span id="outcomes-unattributed" class="muted text-sm"></span>
-          </div>
-          <div id="outcomes-table" class="table-wrap"></div>
-        </section>
       </section>
 
       <!-- Tab 4: Automations & Ticks -->
