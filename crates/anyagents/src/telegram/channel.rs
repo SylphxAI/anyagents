@@ -958,20 +958,15 @@ fn ingest_updates(
                 continue;
             }
             if !inbound.media.is_empty() {
-                let downloaded =
-                    download_inbound_media(store.data_dir(), token, &channel.id, &inbound.media);
+                let downloaded = download_inbound_media(store, token, &channel.id, &inbound.media);
                 if !downloaded.is_empty() {
                     inbound.text.push('\n');
                     inbound.text.push_str(&downloaded.join("\n"));
                 }
             }
             if !inbound.quoted_media.is_empty() {
-                let downloaded = download_inbound_media(
-                    store.data_dir(),
-                    token,
-                    &channel.id,
-                    &inbound.quoted_media,
-                );
+                let downloaded =
+                    download_inbound_media(store, token, &channel.id, &inbound.quoted_media);
                 if !downloaded.is_empty()
                     && let Some(ref mut quote) = inbound.quote
                 {
@@ -1171,11 +1166,12 @@ fn detach_removed_own_bots_from_chat(
 }
 
 fn download_inbound_media(
-    data_dir: &std::path::Path,
+    store: &Store,
     token: &str,
     channel_id: &anyagents_core::ChannelId,
     media: &[MediaAttachment],
 ) -> Vec<String> {
+    let data_dir = store.data_dir();
     let media_dir = data_dir.join(anyagents_harness::media::MEDIA_DIR);
     let _ = std::fs::create_dir_all(&media_dir);
     // An agent's seat reads a file it was told about by name; none lists the
@@ -1259,6 +1255,14 @@ fn download_inbound_media(
             }
         }
         if dest.is_file() {
+            if store.is_postgres()
+                && let Some(blob_name) = dest.file_name().and_then(|n| n.to_str())
+                && let Ok(bytes) = std::fs::read(&dest)
+            {
+                let _ = store
+                    .blob_store()
+                    .put_deployment_blob("media", blob_name, &bytes, false);
+            }
             notes.push(anyagents_harness::media::local_media_line(&att.kind, &dest));
         }
     }

@@ -1816,6 +1816,7 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
         .route("/v1/browser", post(browser_route))
         .route("/v1/computer", post(computer_route))
         .route("/v1/web", post(web_route))
+        .route("/v1/media/{file_name}", get(media_file_route))
         .route("/v1/profiles", get(profiles_route).post(set_profile_route))
         .route("/v1/profiles/models", get(profile_models_route))
         .route(
@@ -5251,6 +5252,11 @@ pub(crate) fn unsettled_view(
 /// `installed` once this harness is on the machine, `needed` when the reason it
 /// is not, `pending` when nothing has been recorded yet.
 fn install_state(store: &Store, files: &file_cache::FileCache, agent: &Agent) -> String {
+    if crate::sandbox_providers::SandboxMode::from_env().is_remote_required()
+        || serverless::is_serverless_mode()
+    {
+        return "installed".to_string();
+    }
     match crate::install::recorded(&agent.harness) {
         Some(Ok(())) => "installed".to_string(),
         Some(Err(reason)) => reason,
@@ -5289,6 +5295,49 @@ fn installed_on_disk(files: &file_cache::FileCache, root: &Path, harness: &str) 
     )
 }
 
+async fn media_file_route(
+    _principal: Principal,
+    State(state): State<AppState>,
+    axum::extract::Path(file_name): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let trimmed = file_name.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.contains('\0')
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid media filename",
+        ));
+    }
+    let fname = trimmed.to_string();
+    let store = Arc::clone(&state.store);
+    let bytes = spawn_store(move || {
+        if let Ok(Some(blob)) = store.blob_store().get_deployment_blob("media", &fname) {
+            return Ok(Some(blob.content));
+        }
+        let local = store
+            .data_dir()
+            .join(anyagents_harness::media::MEDIA_DIR)
+            .join(&fname);
+        if local.is_file()
+            && let Ok(raw) = std::fs::read(&local)
+        {
+            return Ok(Some(raw));
+        }
+        Ok(None)
+    })
+    .await?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "media file not found"))?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    ))
+}
+
 async fn create_agent_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -5296,11 +5345,12 @@ async fn create_agent_route(
     Json(mut body): Json<CreateAgentRequest>,
 ) -> Result<(StatusCode, Json<AgentView>), ApiError> {
     let via_http = via_http_mcp(&headers);
+    let state_for_wake = state.clone();
     let caller_agent = match &principal {
         Principal::Operator => None,
         Principal::Agent { agent_id, name } => Some((agent_id.clone(), name.clone())),
     };
-    spawn_store(move || {
+    let created = spawn_store(move || {
         let requested_groups: Vec<String> = body
             .group
             .as_deref()
@@ -5442,9 +5492,23 @@ async fn create_agent_route(
             create::poke_agent_wake_socket(state.store.data_dir(), &agent.id);
         }
         let view = agent_view(&state.store, &state.health, &agent)?;
-        Ok((StatusCode::CREATED, Json(view)))
+        Ok((agent.id, has_prompt, view))
     })
-    .await
+    .await?;
+    if created.1 && serverless::is_serverless_mode() {
+        let store_wake = Arc::clone(&state_for_wake.store);
+        let aid_wake = created.0;
+        tokio::spawn(async move {
+            if let Err(err) =
+                serverless::dispatch_next_mailbox_message_if_serverless(store_wake, &aid_wake).await
+            {
+                eprintln!(
+                    "anyagents-serverless: initial prompt dispatch failed for {aid_wake}: {err}"
+                );
+            }
+        });
+    }
+    Ok((StatusCode::CREATED, Json(created.2)))
 }
 
 /// What a spawn does once its agent is admitted: scope, lifecycle, groups,

@@ -485,9 +485,13 @@ fn create_with_seat_and_sandbox_mode(
                 request.branch.as_deref(),
                 request.base.as_deref(),
             )?;
-            let launcher = root.join("launcher");
-            create_dir_all_recorded(&launcher, &made)?;
-            launcher
+            if sandbox_mode.is_remote_required() {
+                PathBuf::from(crate::sandbox_providers::sylphx::DEFAULT_SANDBOX_WORKDIR)
+            } else {
+                let launcher = root.join("launcher");
+                create_dir_all_recorded(&launcher, &made)?;
+                launcher
+            }
         } else if let Some(repo_raw) = effective_repo {
             if (sandbox_mode.is_remote_required())
                 || (crate::vendor::is_spiron_harness(&agent.harness)
@@ -993,6 +997,30 @@ fn provision_cloud_sandbox_worktree_marker(
         &bytes,
         0o664,
     )?;
+    if store.is_postgres() {
+        let _ = store.blob_store().put_agent_file(
+            &agent.id,
+            "config",
+            ".anyagents-managed-worktree.json",
+            &bytes,
+            false,
+        );
+        if !resolved_repo.is_empty() {
+            let repo_spec_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+                "repo": resolved_repo,
+                "branch": branch,
+                "base": initial_head,
+            }))
+            .unwrap_or_else(|_| bytes.clone());
+            let _ = store.blob_store().put_agent_file(
+                &agent.id,
+                "config",
+                "repo-spec.json",
+                &repo_spec_bytes,
+                false,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1952,6 +1980,15 @@ pub(crate) fn write_profile_marker(
     marker_file: &str,
     content: &str,
 ) -> Result<(), Error> {
+    if crate::server::serverless::is_serverless_mode()
+        && !config_dir.is_dir()
+        && !config_dir.parent().is_some_and(Path::is_dir)
+    {
+        // Stateless serverless coordinators store durable state in PostgreSQL and do
+        // not maintain local per-agent trees under `<data>/agents/<id>`; skip local
+        // marker persistence cleanly instead of spamming ENOENT errors.
+        return Ok(());
+    }
     if !config_dir.is_dir() {
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
@@ -3961,8 +3998,10 @@ pub(crate) fn configure_agent_runtime(
         None => normalize_harness_name(&existing.harness).to_string(),
     };
     crate::install::adapter(&target_harness)?;
+    let remote_required = crate::sandbox_providers::SandboxMode::from_env().is_remote_required();
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
         && !crate::sandbox::is_isolated_test_env()
+        && !remote_required
         && actor != "system:profile-rebalance"
     {
         install_changed_harness(
@@ -4243,6 +4282,9 @@ fn propagate_credentials(
     change: CredentialChange,
 ) -> Result<(), Error> {
     let prof_dir = data.join("profiles").join(provider).join(profile);
+    if crate::server::serverless::is_serverless_mode() && !prof_dir.is_dir() {
+        return Ok(());
+    }
     let target_tag = format!("{provider}/{profile}");
     let store_opt = Store::open(data.join("state.db")).ok();
     let all_agents = store_opt
@@ -6630,7 +6672,10 @@ fn sync_and_list_provider_profiles_inner(
         let normalized = format!("{bound_prov}/{bound_prof}");
         // A listing never writes into an agent whose creation is in flight or
         // failed: its tree may be gone, and a write would bring it back.
-        if agent.state != "created" && bound.as_deref() != Some(normalized.as_str()) {
+        if !crate::server::serverless::is_serverless_mode()
+            && agent.state != "created"
+            && bound.as_deref() != Some(normalized.as_str())
+        {
             write_profile_marker(&cfg, ".anyagents-profile", &format!("{normalized}\n"))
                 .unwrap_or_else(|err| eprintln!("runtime persistence failed: {err}"));
         }
