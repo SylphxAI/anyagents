@@ -48,7 +48,7 @@ COPY crates ./crates
 COPY tests ./tests
 
 RUN cargo build --release --locked -p anyagents-guest --bin anyagents-guest \
-    && strip /src/target/release/anyagents-guest || true
+    && (strip /src/target/release/anyagents-guest || true)
 
 # ------------------------------------------------------------------------------
 # Stage 2: Minimal vendor-neutral developer sandbox (`sandbox-base`)
