@@ -39,7 +39,7 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -65,6 +65,14 @@ const JWKS_CACHE_TTL: Duration = Duration::from_secs(3600);
 const JWS_CLOCK_SKEW_SECS: i64 = 60;
 const TICK_CLOUD_POLL_LIMIT: usize = 32;
 const TICK_STALE_SANDBOX_LIMIT: usize = 32;
+const SYNCABLE_AUTH_FILES: &[&str] = &[
+    ".gemini/antigravity-cli/antigravity-oauth-token",
+    ".claude/.credentials.json",
+    ".credentials.json",
+    ".codex/auth.json",
+];
+const MAX_SYNCED_AUTH_FILE_BYTES: usize = 64 * 1024;
+const SANDBOX_AUTH_PULL_TIMEOUT_MS: u64 = 5_000;
 
 /// Return `true` when `ANYAGENTS_SERVERLESS=true` is enabled.
 pub(crate) fn is_serverless_mode() -> bool {
@@ -1285,6 +1293,340 @@ pub(crate) struct GuestEventPayload {
     pub error_text: Option<String>,
     #[serde(default)]
     pub usage: Option<Value>,
+    /// Optional base64-encoded allowlisted OAuth credential files refreshed natively
+    /// by the vendor harness inside the sandbox during this turn.
+    #[serde(default)]
+    pub synced_auth_files: Option<BTreeMap<String, String>>,
+}
+
+fn is_syncable_auth_rel(rel: &str) -> bool {
+    SYNCABLE_AUTH_FILES.contains(&rel)
+}
+
+fn auth_file_matches_profile_provider(rel: &str, provider: &str) -> bool {
+    match rel {
+        ".gemini/antigravity-cli/antigravity-oauth-token" => provider == "google-antigravity",
+        ".claude/.credentials.json" | ".credentials.json" => provider == "anthropic",
+        ".codex/auth.json" => provider == "openai",
+        _ => false,
+    }
+}
+
+fn harness_syncable_auth_candidates(harness: &str) -> &'static [&'static str] {
+    match anyagents_harness::normalize_harness_name(harness) {
+        "agy" => &[".gemini/antigravity-cli/antigravity-oauth-token"],
+        "claude-code" => &[".claude/.credentials.json", ".credentials.json"],
+        "codex" => &[".codex/auth.json"],
+        _ => &[],
+    }
+}
+
+fn extract_auth_token_and_expiry_ms(rel: &str, val: &Value) -> (Option<String>, Option<i64>) {
+    match rel {
+        ".gemini/antigravity-cli/antigravity-oauth-token" => {
+            let tok = val
+                .pointer("/token/access_token")
+                .or_else(|| val.get("access_token"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let expiry_ms = val
+                .pointer("/token/expiry")
+                .or_else(|| val.get("expiry"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp_millis());
+            (tok, expiry_ms)
+        }
+        ".claude/.credentials.json" | ".credentials.json" => {
+            let tok = val
+                .pointer("/claudeAiOauth/accessToken")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let expiry_ms = val
+                .pointer("/claudeAiOauth/expiresAt")
+                .and_then(Value::as_i64);
+            (tok, expiry_ms)
+        }
+        ".codex/auth.json" => {
+            let tok = val
+                .pointer("/tokens/access_token")
+                .or_else(|| val.get("OPENAI_API_KEY"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let expiry_ms = val
+                .get("last_refresh")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp_millis());
+            (tok, expiry_ms)
+        }
+        _ => (None, None),
+    }
+}
+
+fn is_incoming_auth_fresher(rel: &str, existing: Option<&[u8]>, incoming: &[u8]) -> bool {
+    let Ok(in_val) = serde_json::from_slice::<Value>(incoming) else {
+        return false;
+    };
+    if !in_val.is_object() {
+        return false;
+    }
+    let (in_tok, in_exp) = extract_auth_token_and_expiry_ms(rel, &in_val);
+    if in_tok.is_none() {
+        return false;
+    }
+    let Some(ex_bytes) = existing else {
+        return true;
+    };
+    if ex_bytes == incoming {
+        return false;
+    }
+    let Ok(ex_val) = serde_json::from_slice::<Value>(ex_bytes) else {
+        return true;
+    };
+    let (ex_tok, ex_exp) = extract_auth_token_and_expiry_ms(rel, &ex_val);
+    match (in_exp, ex_exp) {
+        (Some(in_ms), Some(ex_ms)) => {
+            if in_ms < ex_ms {
+                return false;
+            }
+            if in_ms == ex_ms && in_tok == ex_tok {
+                return false;
+            }
+            true
+        }
+        (None, Some(_)) => in_tok != ex_tok,
+        _ => in_tok != ex_tok || in_exp != ex_exp,
+    }
+}
+
+fn parse_valid_provider_profile(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    let (provider, profile) = trimmed.split_once('/')?;
+    let provider = provider.trim();
+    let profile = profile.trim();
+    if provider.is_empty()
+        || profile.is_empty()
+        || provider.starts_with('.')
+        || profile.starts_with('.')
+        || profile.contains('/')
+        || anyagents_core::stateless::validate_blob_path(&format!("{provider}/{profile}")).is_err()
+    {
+        return None;
+    }
+    Some((provider.to_string(), profile.to_string()))
+}
+
+fn resolve_agent_bound_profile_from_store(
+    store: &Store,
+    agent_id: &AgentId,
+) -> Option<(String, String)> {
+    let blobs = store.blob_store();
+    for (ns, path) in [
+        ("markers", ".anyagents-profile"),
+        ("markers", ".anyagents-seeded-profile"),
+        ("config", ".anyagents-profile"),
+        ("config", ".anyagents-seeded-profile"),
+    ] {
+        if let Ok(Some(entry)) = blobs.get_agent_file(agent_id, ns, path)
+            && let Ok(text) = String::from_utf8(entry.content)
+            && let Some(pair) = parse_valid_provider_profile(&text)
+        {
+            return Some(pair);
+        }
+    }
+    let cfg = anyagents_core::agent_config_dir(store.data_dir(), agent_id);
+    crate::create::bound_profile_name(&cfg)
+        .or_else(|| crate::create::seeded_profile_name(&cfg))
+        .and_then(|s| parse_valid_provider_profile(&s))
+}
+
+fn decode_synced_auth_files(encoded: &BTreeMap<String, String>) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for (rel, b64) in encoded {
+        if !is_syncable_auth_rel(rel) {
+            continue;
+        }
+        let Ok(bytes) = STANDARD.decode(b64.trim()) else {
+            continue;
+        };
+        if bytes.is_empty() || bytes.len() > MAX_SYNCED_AUTH_FILE_BYTES {
+            continue;
+        }
+        out.insert(rel.clone(), bytes);
+    }
+    out
+}
+
+/// Persist native-harness refreshed OAuth credential files back from a remote sandbox
+/// into durable storage (`agent_files(secrets)` and the bound profile's
+/// `deployment_blobs(profiles)` + local ephemeral profile mirror) under single-writer
+/// monotonic freshness custody.
+///
+/// Returns the number of persisted updates across agent and profile stores.
+pub(crate) fn persist_synced_auth_files(
+    store: &Store,
+    agent_id: &AgentId,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> usize {
+    if files.is_empty() {
+        return 0;
+    }
+    let blobs = store.blob_store();
+    let bound_profile = resolve_agent_bound_profile_from_store(store, agent_id);
+    let cfg_dir = anyagents_core::agent_config_dir(store.data_dir(), agent_id);
+    let mut updated = 0usize;
+
+    for (rel, raw_bytes) in files {
+        if !is_syncable_auth_rel(rel)
+            || raw_bytes.is_empty()
+            || raw_bytes.len() > MAX_SYNCED_AUTH_FILE_BYTES
+        {
+            continue;
+        }
+        // Validate JSON + non-empty token up front.
+        if !is_incoming_auth_fresher(rel, None, raw_bytes) {
+            continue;
+        }
+
+        // 1. Update agent's own encrypted `agent_files(secrets)` when fresher.
+        let existing_agent = blobs
+            .get_agent_file(agent_id, "secrets", rel)
+            .ok()
+            .flatten()
+            .map(|e| e.content);
+        if is_incoming_auth_fresher(rel, existing_agent.as_deref(), raw_bytes)
+            && blobs
+                .put_agent_file(agent_id, "secrets", rel, raw_bytes, true)
+                .is_ok()
+        {
+            if cfg_dir.is_dir() {
+                let _ = anyagents_harness::atomic_write_nonempty_file(
+                    &cfg_dir.join(rel),
+                    raw_bytes,
+                    0o600,
+                );
+            }
+            updated += 1;
+        }
+
+        // 2. Update bound provider profile in `deployment_blobs(profiles)` when fresher.
+        if let Some((ref provider, ref profile)) = bound_profile
+            && auth_file_matches_profile_provider(rel, provider)
+        {
+            let profile_blob_path = format!("{provider}/{profile}/{rel}");
+            let existing_profile = blobs
+                .get_deployment_blob("profiles", &profile_blob_path)
+                .ok()
+                .flatten()
+                .map(|e| e.content);
+            if is_incoming_auth_fresher(rel, existing_profile.as_deref(), raw_bytes)
+                && blobs
+                    .put_deployment_blob("profiles", &profile_blob_path, raw_bytes, true)
+                    .is_ok()
+            {
+                let prof_dir = store
+                    .data_dir()
+                    .join("profiles")
+                    .join(provider)
+                    .join(profile);
+                let _ = anyagents_harness::atomic_write_nonempty_file(
+                    &prof_dir.join(rel),
+                    raw_bytes,
+                    0o600,
+                );
+                // Clear stale OAuth error/backoff caches locally and in Postgres so
+                // `/v1/profiles` on every stateless replica immediately probes fresh quota.
+                for stale_marker in [
+                    ".anyagents-oauth-refresh-attempt-ms",
+                    ".anyagents-last-usage.txt",
+                ] {
+                    let _ = std::fs::remove_file(prof_dir.join(stale_marker));
+                    let _ = blobs.delete_deployment_blob(
+                        "profiles",
+                        &format!("{provider}/{profile}/{stale_marker}"),
+                    );
+                }
+                updated += 1;
+            }
+        }
+    }
+
+    updated
+}
+
+/// Fallback sync-back for older sandbox images whose `anyagents-guest` binary does not yet
+/// attach `synced_auth_files` to terminal callbacks: reads allowlisted OAuth files from the
+/// active `ready` sandbox and persists any fresher native-refreshed token to Postgres.
+async fn pull_sandbox_auth_files_if_needed(
+    store: Arc<Store>,
+    profiles: Arc<super::profiles::ProfileSnapshots>,
+    agent_id: AgentId,
+) {
+    let store_r = Arc::clone(&store);
+    let aid_r = agent_id.clone();
+    let target = run_store_blocking(move || {
+        let Ok(agent) = store_r.agent(&aid_r) else {
+            return Ok(None);
+        };
+        let candidates = harness_syncable_auth_candidates(&agent.harness);
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let Some(binding) = store_r.sandbox_binding(&aid_r).ok().flatten() else {
+            return Ok(None);
+        };
+        if binding.lease_state != "ready"
+            || binding.provider == "legacy_http"
+            || binding.provider == "local"
+        {
+            return Ok(None);
+        }
+        let Some(handle) = sandbox_handle_from_binding(&binding) else {
+            return Ok(None);
+        };
+        let reg = resolve_registry_for_binding(Some(store_r.data_dir()), &binding)?;
+        Ok(Some((reg.active(), handle, candidates)))
+    })
+    .await;
+
+    let Ok(Some((provider, handle, candidates))) = target else {
+        return;
+    };
+
+    let mut fetched = BTreeMap::new();
+    let state_root = handle.state_dir.trim_end_matches('/');
+    for &rel in candidates {
+        let req = ExecRequest::argv(vec!["cat".to_string(), format!("{state_root}/{rel}")])
+            .with_timeout_ms(SANDBOX_AUTH_PULL_TIMEOUT_MS);
+        if let Ok(out) = provider.exec(&handle, &req).await
+            && out.exit_code == 0
+            && !out.stdout.trim().is_empty()
+            && out.stdout.len() <= MAX_SYNCED_AUTH_FILE_BYTES
+        {
+            fetched.insert(rel.to_string(), out.stdout.into_bytes());
+        }
+    }
+    if fetched.is_empty() {
+        return;
+    }
+
+    let store_w = Arc::clone(&store);
+    let aid_w = agent_id.clone();
+    if let Ok(updated) =
+        run_store_blocking(move || Ok(persist_synced_auth_files(&store_w, &aid_w, &fetched))).await
+        && updated > 0
+    {
+        profiles.invalidate(&store);
+    }
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -1321,6 +1663,7 @@ pub(crate) async fn guest_events_route(
 
     let store = Arc::clone(&state.store);
     let store_for_drain = Arc::clone(&state.store);
+    let profiles_for_sync = Arc::clone(&state.profiles);
     let is_terminal_event = matches!(
         payload.event_type.trim().to_ascii_lowercase().as_str(),
         "turn_complete"
@@ -1331,7 +1674,7 @@ pub(crate) async fn guest_events_route(
             | "cancelled"
             | "canceled"
     );
-    let (json_resp, settled_agent_id) = spawn_store(move || {
+    let (json_resp, settled_agent_id, synced_auth_updates) = spawn_store(move || {
         let Some(turn) = store
             .remote_turn_store()
             .verify_callback_token(&payload.turn_id, &token)
@@ -1351,6 +1694,16 @@ pub(crate) async fn guest_events_route(
                 "agent_id mismatch for callback token",
             ));
         }
+
+        let synced_updates = if is_terminal_event
+            && let Some(ref encoded) = payload.synced_auth_files
+            && !encoded.is_empty()
+        {
+            let decoded = decode_synced_auth_files(encoded);
+            persist_synced_auth_files(&store, &turn.agent_id, &decoded)
+        } else {
+            0
+        };
 
         let ts = payload
             .timestamp_ms
@@ -1405,6 +1758,7 @@ pub(crate) async fn guest_events_route(
                         "event_type": "heartbeat",
                     })),
                     None::<AgentId>,
+                    0usize,
                 ))
             }
             "delta" => {
@@ -1429,6 +1783,7 @@ pub(crate) async fn guest_events_route(
                         "event_type": "delta",
                     })),
                     None,
+                    0usize,
                 ))
             }
             "turn_complete" | "completed" => {
@@ -1459,6 +1814,7 @@ pub(crate) async fn guest_events_route(
                         "delivered_reply": settled.delivered_reply,
                     })),
                     drain_aid,
+                    synced_updates,
                 ))
             }
             "turn_failed" | "failed" => {
@@ -1490,6 +1846,7 @@ pub(crate) async fn guest_events_route(
                         "idempotent_replay": !settled.settled_now,
                     })),
                     drain_aid,
+                    synced_updates,
                 ))
             }
             "turn_cancelled" | "cancelled" | "canceled" => {
@@ -1519,6 +1876,7 @@ pub(crate) async fn guest_events_route(
                         "idempotent_replay": !settled.settled_now,
                     })),
                     drain_aid,
+                    synced_updates,
                 ))
             }
             other => Err(ApiError::new(
@@ -1528,11 +1886,22 @@ pub(crate) async fn guest_events_route(
         }
     })
     .await?;
+    if synced_auth_updates > 0 {
+        state.profiles.invalidate(&state.store);
+    }
     if is_terminal_event
         && is_serverless_mode()
         && let Some(drain_aid) = settled_agent_id
     {
         tokio::spawn(async move {
+            if synced_auth_updates == 0 {
+                pull_sandbox_auth_files_if_needed(
+                    Arc::clone(&store_for_drain),
+                    profiles_for_sync,
+                    drain_aid.clone(),
+                )
+                .await;
+            }
             if let Err(err) =
                 dispatch_next_mailbox_message_if_serverless(store_for_drain, &drain_aid).await
             {
@@ -3554,5 +3923,114 @@ done
                 None => unsafe { std::env::remove_var(k) },
             }
         }
+    }
+
+    #[test]
+    fn persist_synced_auth_files_updates_agent_and_profile_monotonically_and_rejects_disallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("agy_sync_worker", "agy"))
+            .unwrap();
+        let agy_rel = ".gemini/antigravity-cli/antigravity-oauth-token";
+        let prof_name = "seat-alpha";
+        let prof_dir = dir
+            .path()
+            .join("profiles")
+            .join("google-antigravity")
+            .join(prof_name);
+        std::fs::create_dir_all(&prof_dir).unwrap();
+
+        // Bind agent to `google-antigravity/seat-alpha` via markers namespace.
+        store
+            .blob_store()
+            .put_agent_file(
+                &agent.id,
+                "markers",
+                ".anyagents-profile",
+                format!("google-antigravity/{prof_name}\n").as_bytes(),
+                false,
+            )
+            .unwrap();
+
+        // Seed stale cache markers and older token in profile store.
+        let old_tok =
+            br#"{"token":{"access_token":"old-acc","refresh_token":"rt1","expiry":"2026-11-19T10:00:00Z"}}"#;
+        store
+            .blob_store()
+            .put_deployment_blob(
+                "profiles",
+                &format!("google-antigravity/{prof_name}/{agy_rel}"),
+                old_tok,
+                true,
+            )
+            .unwrap();
+        std::fs::write(
+            prof_dir.join(".anyagents-oauth-refresh-attempt-ms"),
+            b"9999999999999\n",
+        )
+        .unwrap();
+        std::fs::write(
+            prof_dir.join(".anyagents-last-usage.txt"),
+            b"oauth expired\n",
+        )
+        .unwrap();
+
+        // 1. Disallowed path + mismatched provider file must be rejected.
+        let mut rejected = BTreeMap::new();
+        rejected.insert(".ssh/id_rsa".to_string(), b"{\"k\":\"v\"}".to_vec());
+        rejected.insert("../escape".to_string(), b"{\"k\":\"v\"}".to_vec());
+        let bad_encoded = BTreeMap::from([
+            (".ssh/id_rsa".to_string(), STANDARD.encode(b"{\"k\":\"v\"}")),
+            (agy_rel.to_string(), "not-valid-base64!!!".to_string()),
+        ]);
+        assert!(decode_synced_auth_files(&bad_encoded).is_empty());
+        assert_eq!(persist_synced_auth_files(&store, &agent.id, &rejected), 0);
+
+        // 2. Newer native-refreshed token updates agent secrets + profile blob and clears stale markers.
+        let fresh_tok =
+            br#"{"token":{"access_token":"fresh-acc","refresh_token":"rt1","expiry":"2026-11-19T23:30:00Z"}}"#;
+        let encoded = BTreeMap::from([(agy_rel.to_string(), STANDARD.encode(fresh_tok))]);
+        let decoded = decode_synced_auth_files(&encoded);
+        assert_eq!(decoded.len(), 1);
+        let updated = persist_synced_auth_files(&store, &agent.id, &decoded);
+        assert_eq!(updated, 2);
+
+        let stored_agent = store
+            .blob_store()
+            .get_agent_file(&agent.id, "secrets", agy_rel)
+            .unwrap()
+            .expect("agent secret persisted");
+        assert_eq!(stored_agent.content, fresh_tok);
+        let stored_profile = store
+            .blob_store()
+            .get_deployment_blob(
+                "profiles",
+                &format!("google-antigravity/{prof_name}/{agy_rel}"),
+            )
+            .unwrap()
+            .expect("profile blob persisted");
+        assert_eq!(stored_profile.content, fresh_tok);
+        assert!(
+            !prof_dir
+                .join(".anyagents-oauth-refresh-attempt-ms")
+                .exists()
+        );
+        assert!(!prof_dir.join(".anyagents-last-usage.txt").exists());
+
+        // 3. Monotonic guard: an older expiry token MUST NOT overwrite the newer token.
+        let stale_tok =
+            br#"{"token":{"access_token":"stale-acc","refresh_token":"rt1","expiry":"2026-11-19T12:00:00Z"}}"#;
+        let stale_map = BTreeMap::from([(agy_rel.to_string(), stale_tok.to_vec())]);
+        assert_eq!(persist_synced_auth_files(&store, &agent.id, &stale_map), 0);
+        let still_fresh = store
+            .blob_store()
+            .get_deployment_blob(
+                "profiles",
+                &format!("google-antigravity/{prof_name}/{agy_rel}"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_fresh.content, fresh_tok);
     }
 }

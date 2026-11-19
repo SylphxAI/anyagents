@@ -2601,7 +2601,11 @@ pub(crate) fn hydrate_agent_files_from_store(
     }
     let blobs = store.blob_store();
     let mut hydrated = 0usize;
-    for (ns, mode) in [("config", 0o644u32), ("secrets", 0o600u32)] {
+    for (ns, mode) in [
+        ("config", 0o644u32),
+        ("markers", 0o644u32),
+        ("secrets", 0o600u32),
+    ] {
         let entries = blobs
             .list_agent_files(agent_id, ns)
             .map_err(|e| format!("list agent_files({ns}) failed: {e}"))?;
