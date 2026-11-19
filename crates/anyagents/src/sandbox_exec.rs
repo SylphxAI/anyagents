@@ -4528,8 +4528,10 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let dockerfile = std::fs::read_to_string(root.join("Dockerfile.sandbox")).unwrap();
         assert!(dockerfile.contains("-p anyagents-guest --bin anyagents-guest"));
-        assert!(dockerfile.contains("-p agent-tools --bin agent-code-mode"));
-        assert!(dockerfile.contains("-p agent-workstation --bin agent-workstation"));
+        assert!(dockerfile.contains("select(.name == \"agent-tools\")"));
+        assert!(dockerfile.contains("--bin agent-code-mode"));
+        assert!(dockerfile.contains("select(.name == \"agent-workstation\")"));
+        assert!(dockerfile.contains("--bin agent-workstation"));
         assert!(dockerfile.contains("/usr/local/bin/agent-code-mode"));
         assert!(dockerfile.contains("/usr/local/bin/agent-workstation"));
         assert!(dockerfile.contains("FROM sandbox-base AS sandbox-dev"));
