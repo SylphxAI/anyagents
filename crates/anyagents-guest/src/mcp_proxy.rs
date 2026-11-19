@@ -201,14 +201,13 @@ fn forward_rpc(
     use_base64_payload: &mut bool,
     body: &str,
 ) -> Result<Vec<String>, String> {
-    let mut attempt_b64 = *use_base64_payload;
+    let attempt_b64 = *use_base64_payload;
     let (mut status, mut next_sid, mut advertises_b64, mut content_type, mut raw_body) =
         send_rpc_once(http, url, token, session_id.as_deref(), body, attempt_b64)?;
 
     // If an intermediate WAF blocks plaintext JSON containing shell/SQL fragments with
     // HTTP 403, retry once with opaque base64 framing (`application/octet-stream`).
     if status == 403 && !attempt_b64 {
-        attempt_b64 = true;
         if let Ok(retry) = send_rpc_once(http, url, token, session_id.as_deref(), body, true)
             && retry.0 != 415
             && retry.0 != 400
