@@ -45,20 +45,26 @@ pub mod sylphx {
     pub const ENV_SANDBOX_SHAPE: &str = "ANYAGENTS_SANDBOX_SHAPE";
     /// Environment variable configuring persistent agent volume size in GiB.
     pub const ENV_SANDBOX_VOLUME_SIZE_GIB: &str = "ANYAGENTS_SANDBOX_VOLUME_SIZE_GIB";
-    /// Persistent mount path of the per-agent volume inside Sylphx sandboxes.
-    pub const DEFAULT_MOUNT_PATH: &str = "/home/user/agent-state";
-    /// Default working directory inside Sylphx sandboxes.
-    pub const DEFAULT_SANDBOX_WORKDIR: &str = "/home/user/workspace";
+    /// Single persistent volume mount root inside sandboxes (`/home/user/agent-data`).
+    ///
+    /// Contains BOTH `state/` and `workspace/` so agent state, git checkouts, and
+    /// uncommitted edits all survive compute lease `:release` / microVM recycling.
+    pub const DEFAULT_MOUNT_PATH: &str = "/home/user/agent-data";
+    /// Default persistent agent state directory inside the mounted volume (`/home/user/agent-data/state`).
+    pub const DEFAULT_STATE_DIR: &str = "/home/user/agent-data/state";
+    /// Default persistent working directory inside sandboxes (`/home/user/agent-data/workspace`).
+    pub const DEFAULT_SANDBOX_WORKDIR: &str = "/home/user/agent-data/workspace";
     /// Default Sylphx template name.
     pub const DEFAULT_TEMPLATE: &str = "agent";
     /// Default Sylphx machine shape.
     pub const DEFAULT_SHAPE: &str = "linux-m";
-    /// Default lease TTL string passed to `POST /v1/{parent}/leases` and `:renew`.
-    pub const DEFAULT_LEASE_TTL: &str = "86400s";
+    /// Default safety lease TTL passed to `POST /v1/{parent}/leases` and `:renew` (15 minutes).
+    pub const DEFAULT_LEASE_TTL: &str = "900s";
     /// Per-agent Sylphx lease and persistent volume state file inside `<config_dir>`.
     pub const SYLPHX_STATE_FILE: &str = "sandbox-sylphx.json";
 
     const DEFAULT_SYLPHX_ENDPOINT: &str = "https://api.sylphx.com";
+    const LEASE_READY_POLL_INITIAL: Duration = Duration::from_millis(25);
     const LEASE_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
     const LEASE_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -296,12 +302,15 @@ pub mod sylphx {
                 })
                 .unwrap_or_else(|| DEFAULT_SANDBOX_WORKDIR.to_string());
 
-            let mount_path = file_cfg
-                .as_ref()
-                .and_then(|c| c.mount_path.as_deref())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
+            let mount_path = env_non_empty("ANYAGENTS_SANDBOX_MOUNT_PATH")
+                .or_else(|| {
+                    file_cfg
+                        .as_ref()
+                        .and_then(|c| c.mount_path.as_deref())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
                 .unwrap_or_else(|| DEFAULT_MOUNT_PATH.to_string());
 
             Ok(Some(Self {
@@ -485,6 +494,25 @@ pub mod sylphx {
         /// Build a client configured for this lease's endpoint and bearer token.
         pub fn client(&self) -> SylphxSandboxClient {
             SylphxSandboxClient::new(self.endpoint.clone(), self.token.clone())
+        }
+
+        /// Persistent agent state directory inside the mounted volume.
+        ///
+        /// Under the unified `/home/user/agent-data` mount this resolves to
+        /// `/home/user/agent-data/state`; legacy `/home/user/agent-state` configs keep
+        /// `/home/user/agent-state` directly.
+        pub fn state_dir(&self) -> String {
+            let mp = normalize_unix_dir(&self.mount_path, DEFAULT_MOUNT_PATH);
+            if mp == "/home/user/agent-state" {
+                mp
+            } else {
+                format!("{mp}/state")
+            }
+        }
+
+        /// Persistent workspace directory inside the mounted volume.
+        pub fn workspace_dir(&self) -> String {
+            normalize_unix_dir(&self.workdir, DEFAULT_SANDBOX_WORKDIR)
         }
     }
 
@@ -739,23 +767,71 @@ pub mod sylphx {
             env: &BTreeMap<String, String>,
             ttl: Option<&str>,
         ) -> Result<SylphxLease, String> {
+            self.create_lease_with_options(
+                parent,
+                volume_resource,
+                mount_path,
+                None,
+                Some(template),
+                shape,
+                env,
+                ttl,
+                None,
+            )
+        }
+
+        /// Create a sandbox lease supporting BYO digest-pinned OCI `image`, `template`,
+        /// persistent volume mount, and per-lease [`crate::providers::NetworkPolicySpec`].
+        #[allow(clippy::too_many_arguments)]
+        pub fn create_lease_with_options(
+            &self,
+            parent: &str,
+            volume_resource: &str,
+            mount_path: &str,
+            image: Option<&str>,
+            template: Option<&str>,
+            shape: &str,
+            env: &BTreeMap<String, String>,
+            ttl: Option<&str>,
+            network: Option<&crate::providers::NetworkPolicySpec>,
+        ) -> Result<SylphxLease, String> {
             let url = self.collection_url(parent, "leases");
             let ttl_val = ttl
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or(DEFAULT_LEASE_TTL);
-            let body = serde_json::json!({
-                "template": template,
-                "shape": shape,
-                "ttl": ttl_val,
-                "env": env,
-                "mounts": [
+            let mut body = serde_json::Map::new();
+            if let Some(img) = image.map(str::trim).filter(|s| !s.is_empty()) {
+                body.insert("image".into(), serde_json::json!(img));
+            } else {
+                let tpl = template
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(DEFAULT_TEMPLATE);
+                body.insert("template".into(), serde_json::json!(tpl));
+                let image_ref = if tpl.starts_with("template:") {
+                    tpl.to_string()
+                } else {
+                    format!("template:{tpl}")
+                };
+                body.insert("image".into(), serde_json::json!(image_ref));
+            }
+            body.insert("shape".into(), serde_json::json!(shape));
+            body.insert("ttl".into(), serde_json::json!(ttl_val));
+            body.insert("env".into(), serde_json::json!(env));
+            body.insert(
+                "mounts".into(),
+                serde_json::json!([
                     {
                         "volume": volume_resource,
                         "mountPath": mount_path,
                     }
-                ],
-            });
-            let (status, val) = self.request_json("POST", &url, Some(&body), 45_000)?;
+                ]),
+            );
+            if let Some(policy) = network {
+                body.insert("network".into(), sylphx_network_json(policy));
+            }
+            let (status, val) =
+                self.request_json("POST", &url, Some(&serde_json::Value::Object(body)), 45_000)?;
             if !(200..300).contains(&status) {
                 return Err(format!(
                     "Sylphx POST {url} returned HTTP {status}: {}",
@@ -763,6 +839,54 @@ pub mod sylphx {
                 ));
             }
             parse_lease_response(&val, parent)
+        }
+
+        /// Update outbound egress policy on a live lease (`POST /v1/{lease_resource}:setNetwork`).
+        pub fn set_network(
+            &self,
+            parent: &str,
+            lease_id_or_name: &str,
+            policy: &crate::providers::NetworkPolicySpec,
+        ) -> Result<(), String> {
+            let resource = self.resolve_resource(parent, "leases", lease_id_or_name);
+            let url = format!("{}:setNetwork", self.v1_resource_url(&resource));
+            let body = sylphx_network_json(policy);
+            let (status, val) = self.request_json("POST", &url, Some(&body), 20_000)?;
+            if !(200..300).contains(&status) {
+                return Err(format!(
+                    "Sylphx POST {url} returned HTTP {status}: {}",
+                    compact_error_body(&val)
+                ));
+            }
+            Ok(())
+        }
+
+        /// Initialize `/home/user/agent-data/{state,workspace}` and backwards-compatible
+        /// symlinks (`/home/user/agent-state`, `/home/user/workspace`) on a ready lease.
+        pub fn init_persistent_layout(
+            &self,
+            resource: &str,
+            mount_path: &str,
+            state_dir: &str,
+            workdir: &str,
+        ) -> Result<(), String> {
+            let script =
+                crate::providers::persistent_layout_init_script(mount_path, state_dir, workdir);
+            let out = self.exec(
+                resource,
+                &["/bin/sh".to_string(), "-lc".to_string(), script],
+                Some("/"),
+                &BTreeMap::new(),
+                Some(20_000),
+            )?;
+            if out.exit_code != 0 {
+                return Err(format!(
+                    "Sylphx persistent layout init failed (exit {}): {}",
+                    out.exit_code,
+                    out.stderr.trim()
+                ));
+            }
+            Ok(())
         }
 
         /// Fetch lease state (`GET /v1/{lease_resource}`). Returns `Ok(None)` on HTTP 404.
@@ -804,13 +928,15 @@ pub mod sylphx {
             }
             let deadline = Instant::now() + timeout;
             let resource = lease.resource_name.clone();
+            let mut poll_delay = LEASE_READY_POLL_INITIAL;
             loop {
                 if Instant::now() >= deadline {
                     return Err(format!(
                         "timed out waiting for Sylphx lease {resource} to become READY"
                     ));
                 }
-                std::thread::sleep(LEASE_READY_POLL_INTERVAL);
+                std::thread::sleep(poll_delay);
+                poll_delay = (poll_delay * 2).min(LEASE_READY_POLL_INTERVAL);
                 let current = self.get_lease(parent, &resource)?.ok_or_else(|| {
                     format!("Sylphx lease {resource} disappeared while waiting for READY")
                 })?;
@@ -896,14 +1022,14 @@ pub mod sylphx {
                     Some(self.wait_lease_ready(&provider.parent, fetched, LEASE_READY_TIMEOUT)?);
             }
 
-            let lease = match reused_lease {
+            let (lease, freshly_created) = match reused_lease {
                 Some(active) => {
                     let _ = self.renew_lease(
                         &provider.parent,
                         &active.resource_name,
                         Some(DEFAULT_LEASE_TTL),
                     );
-                    active
+                    (active, false)
                 }
                 None => {
                     let created = self.create_lease(
@@ -915,9 +1041,20 @@ pub mod sylphx {
                         env,
                         Some(DEFAULT_LEASE_TTL),
                     )?;
-                    self.wait_lease_ready(&provider.parent, created, LEASE_READY_TIMEOUT)?
+                    (
+                        self.wait_lease_ready(&provider.parent, created, LEASE_READY_TIMEOUT)?,
+                        true,
+                    )
                 }
             };
+
+            let resolved_workdir = workdir
+                .map(|w| normalize_unix_dir(w, &provider.default_workdir))
+                .unwrap_or_else(|| provider.default_workdir.clone());
+            let data_plane_resource = lease
+                .data_plane_resource
+                .clone()
+                .unwrap_or_else(|| lease.resource_name.clone());
 
             let state = SylphxLeaseConfig {
                 endpoint: self.endpoint.clone(),
@@ -926,22 +1063,25 @@ pub mod sylphx {
                 template: provider.template.clone(),
                 shape: provider.shape.clone(),
                 volume_size_gib: provider.volume_size_gib.or(vol.size_gib),
-                workdir: workdir
-                    .map(|w| normalize_unix_dir(w, &provider.default_workdir))
-                    .unwrap_or_else(|| provider.default_workdir.clone()),
+                workdir: resolved_workdir,
                 mount_path: provider.mount_path.clone(),
                 volume_id: vol.id.clone(),
                 volume_resource: vol.resource_name.clone(),
                 lease_id: Some(lease.id.clone()),
                 lease_resource: Some(lease.resource_name.clone()),
-                data_plane_resource: lease
-                    .data_plane_resource
-                    .clone()
-                    .or_else(|| Some(lease.resource_name.clone())),
+                data_plane_resource: Some(data_plane_resource.clone()),
                 envd_url: lease.envd_url.clone(),
                 envd_token: lease.envd_token.clone(),
                 expires_at: lease.expires_at.clone(),
             };
+            if freshly_created {
+                let _ = self.init_persistent_layout(
+                    &data_plane_resource,
+                    &state.mount_path,
+                    &state.state_dir(),
+                    &state.workdir,
+                );
+            }
             state.save_to_config_dir(config_dir)?;
             Ok(state)
         }
@@ -1664,6 +1804,27 @@ pub mod sylphx {
         std::fs::rename(&tmp, path).map_err(|err| format!("rename {}: {err}", path.display()))
     }
 
+    fn sylphx_network_json(policy: &crate::providers::NetworkPolicySpec) -> serde_json::Value {
+        match policy {
+            crate::providers::NetworkPolicySpec::Allow => serde_json::json!({
+                "egress": "ALLOW",
+            }),
+            crate::providers::NetworkPolicySpec::Deny => serde_json::json!({
+                "egress": "DENY",
+            }),
+            crate::providers::NetworkPolicySpec::Allowlist(entries) => {
+                let (domains, cidrs) = crate::providers::split_allowlist_domains_and_cidrs(entries);
+                serde_json::json!({
+                    "egress": "ALLOWLIST",
+                    "allowedDomains": domains,
+                    "allowed_domains": domains,
+                    "allowedCidrs": cidrs,
+                    "allowed_cidrs": cidrs,
+                })
+            }
+        }
+    }
+
     fn compact_error_body(val: &serde_json::Value) -> String {
         val.get("error")
             .or_else(|| val.get("message"))
@@ -2356,6 +2517,7 @@ pub mod sylphx {
         }
     }
 }
+pub mod providers;
 pub mod web;
 
 mod encoding;
@@ -2365,6 +2527,11 @@ mod workspace;
 
 pub use encoding::{base64_decode, base64_encode, sha256_hex};
 pub use path::{normalize_lexical_path, resolve_workspace_path};
+pub use providers::{
+    EnsureSandboxRequest, ExecRequest, ImageSpec, LeasePolicy, NetworkPolicySpec, ProviderHealth,
+    ProviderKind, ProviderRegistry, SandboxCapabilities, SandboxHandle, SandboxRegistryConfig,
+    VolumeSpec, build_bundle_tar_gz, extract_bundle_tar_gz, persistent_layout_init_script,
+};
 pub use sandbox::{SandboxConfig, SandboxProvider, SandboxProviderConfig};
 pub use sylphx::{
     EnvdProcessEvent, EnvdSignal, SandboxDriver, SandboxMode, SylphxFileEntry, SylphxLease,

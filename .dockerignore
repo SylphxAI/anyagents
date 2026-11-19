@@ -1,0 +1,12 @@
+.git
+.gitignore
+.anyagents
+.sylphx
+target
+target-release
+node_modules
+*.db
+*.db-wal
+*.db-shm
+*.sock
+pr-body.md

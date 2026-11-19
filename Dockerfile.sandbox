@@ -1,0 +1,166 @@
+# syntax=docker/dockerfile:1
+#
+# Open-source, vendor-neutral multi-stage sandbox image for AnyAgents.
+#
+# Targets:
+#   - guest-builder : compiles the release `anyagents-guest` binary
+#   - sandbox-base  : minimal Debian Bookworm developer sandbox with `anyagents-guest`,
+#                     persistent `/home/user/agent-data/{state,workspace}` layout, and
+#                     standard CLI utilities (git, rg, fd, jq, python3, node/npm, gh, tini)
+#   - sandbox-full  : extends `sandbox-base` with optional public CLI harnesses selected
+#                     via `--build-arg INSTALL_HARNESSES="..."`
+#
+# Example builds:
+#   docker build -f Dockerfile.sandbox --target sandbox-base -t ghcr.io/<org>/anyagents-sandbox:base .
+#   docker build -f Dockerfile.sandbox --target sandbox-full \
+#     --build-arg INSTALL_HARNESSES="claude-code codex opencode" \
+#     -t ghcr.io/<org>/anyagents-sandbox:full .
+#
+# Push & pin by immutable digest (`@sha256:...`) for ANY provider (Sylphx, Docker, Modal,
+# Daytona, Cloudflare, Generic HTTP OCI):
+#   docker push ghcr.io/<org>/anyagents-sandbox:full
+#   ANYAGENTS_SANDBOX_IMAGE="ghcr.io/<org>/anyagents-sandbox@sha256:<digest>"
+
+ARG RUST_IMAGE=rust:1-bookworm
+ARG RUNTIME_IMAGE=debian:bookworm-slim
+ARG NODE_MAJOR=22
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+# ------------------------------------------------------------------------------
+# Stage 1: Build standalone release `anyagents-guest` binary
+# ------------------------------------------------------------------------------
+FROM ${RUST_IMAGE} AS guest-builder
+
+WORKDIR /src
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY tests ./tests
+
+RUN cargo build --release --locked -p anyagents-guest --bin anyagents-guest \
+    && strip /src/target/release/anyagents-guest || true
+
+# ------------------------------------------------------------------------------
+# Stage 2: Minimal vendor-neutral developer sandbox (`sandbox-base`)
+# ------------------------------------------------------------------------------
+FROM ${RUNTIME_IMAGE} AS sandbox-base
+
+ARG NODE_MAJOR=22
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+LABEL org.opencontainers.image.title="anyagents-sandbox-base" \
+      org.opencontainers.image.description="Vendor-neutral open-source sandbox image with anyagents-guest and persistent /home/user/agent-data layout" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Core developer toolchain: git, curl, ca-certificates, ripgrep, fd-find, jq, python3, tini, tar/gzip.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        fd-find \
+        git \
+        gnupg \
+        gzip \
+        jq \
+        openssh-client \
+        procps \
+        python3 \
+        python3-pip \
+        python3-venv \
+        ripgrep \
+        tar \
+        tini \
+        unzip \
+        xz-utils \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs gh \
+    && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install `anyagents-guest` runtime supervisor + MCP proxy.
+COPY --from=guest-builder /src/target/release/anyagents-guest /usr/local/bin/anyagents-guest
+RUN chmod 0755 /usr/local/bin/anyagents-guest
+
+# Create non-root `user` and unified persistent volume layout under `/home/user/agent-data`.
+# Mounting a single persistent volume at `/home/user/agent-data` preserves BOTH agent runtime
+# state (`state/`) AND git checkouts / uncommitted edits (`workspace/`) across compute releases.
+# Symlinks at `/home/user/agent-state` and `/home/user/workspace` retain backwards compatibility.
+RUN groupadd --gid "${USER_GID}" user \
+    && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home --home-dir /home/user --shell /bin/bash user \
+    && mkdir -p /home/user/agent-data/state /home/user/agent-data/workspace /home/user/.local/bin \
+    && ln -sfn /home/user/agent-data/state /home/user/agent-state \
+    && ln -sfn /home/user/agent-data/workspace /home/user/workspace \
+    && chown -R "${USER_UID}:${USER_GID}" /home/user
+
+ENV HOME=/home/user \
+    PATH="/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    ANYAGENTS_SANDBOX_DATA_DIR=/home/user/agent-data \
+    ANYAGENTS_GUEST_STATE_DIR=/home/user/agent-data/state \
+    ANYAGENTS_GUEST_WORKDIR=/home/user/agent-data/workspace \
+    ANYAGENTS_SANDBOX_GUEST_PATH=/usr/local/bin/anyagents-guest
+
+WORKDIR /home/user/agent-data/workspace
+USER ${USER_UID}:${USER_GID}
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/anyagents-guest", "health"]
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/usr/local/bin/anyagents-guest", "health"]
+
+# ------------------------------------------------------------------------------
+# Stage 3: Full sandbox with opt-in public/open-source CLI harnesses (`sandbox-full`)
+# ------------------------------------------------------------------------------
+FROM sandbox-base AS sandbox-full
+
+ARG USER_UID=1000
+ARG USER_GID=1000
+# Space- or comma-separated list of public CLI harnesses to pre-install.
+# Supported values: claude-code, codex, opencode, gemini, omp, none
+ARG INSTALL_HARNESSES="claude-code codex opencode"
+
+LABEL org.opencontainers.image.title="anyagents-sandbox-full" \
+      org.opencontainers.image.description="Open-source AnyAgents sandbox image with configurable public CLI harnesses" \
+      org.opencontainers.image.licenses="MIT"
+
+USER root
+
+RUN set -eu; \
+    raw="$(printf '%s' "${INSTALL_HARNESSES}" | tr ',' ' ')"; \
+    npm_pkgs=""; \
+    for item in $raw; do \
+        case "$item" in \
+            ""|"none") ;; \
+            "claude"|"claude-code") npm_pkgs="$npm_pkgs @anthropic-ai/claude-code" ;; \
+            "codex") npm_pkgs="$npm_pkgs @openai/codex" ;; \
+            "opencode") npm_pkgs="$npm_pkgs opencode-ai" ;; \
+            "gemini") npm_pkgs="$npm_pkgs @google/gemini-cli" ;; \
+            "omp") npm_pkgs="$npm_pkgs @oh-my-pi/pi-coding-agent" ;; \
+            *) echo "Unsupported INSTALL_HARNESSES token: $item" >&2; exit 1 ;; \
+        esac; \
+    done; \
+    if [ -n "$npm_pkgs" ]; then \
+        npm install -g --no-audit --no-fund $npm_pkgs; \
+        npm cache clean --force; \
+    fi
+
+WORKDIR /home/user/agent-data/workspace
+USER ${USER_UID}:${USER_GID}
