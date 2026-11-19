@@ -274,97 +274,7 @@ enum Command {
         profile: Option<String>,
     },
     /// Send a message, media file, GPS location/venue, or poll to one or more agents, groups, or channels.
-    Send {
-        /// Target(s): `agent:<name>`, bare name, comma-separated names (`planner,builder`), `parent`, `children`, `group:<name>`, `all`, `operator`, or `telegram:chat:<id>[:<topic>]`.
-        to: String,
-        /// Message text or caption (optional when sending media, location, or poll).
-        #[arg(default_value = "")]
-        text: String,
-        #[arg(long)]
-        source_key: Option<String>,
-        #[arg(long)]
-        source_time_ms: Option<i64>,
-        #[arg(long)]
-        reply_to: Option<String>,
-        /// The agent or operator this message is from.
-        #[arg(long)]
-        from: Option<String>,
-        /// Optional quoted excerpt from the message being replied to.
-        #[arg(long)]
-        quote: Option<String>,
-        /// Attach a photo by local file path, URL, or file_id.
-        #[arg(long)]
-        photo: Option<String>,
-        /// Attach a video by local file path, URL, or file_id.
-        #[arg(long)]
-        video: Option<String>,
-        /// Attach an audio file by local file path, URL, or file_id.
-        #[arg(long)]
-        audio: Option<String>,
-        /// Attach a music track by local file path, URL, or file_id.
-        #[arg(long)]
-        music: Option<String>,
-        /// Optional music/audio track title.
-        #[arg(long = "music-title")]
-        music_title: Option<String>,
-        /// Optional music/audio artist or performer name.
-        #[arg(long = "music-performer")]
-        music_performer: Option<String>,
-        /// Attach a voice note by local file path, URL, or file_id.
-        #[arg(long)]
-        voice: Option<String>,
-        /// Attach a document by local file path, URL, or file_id.
-        #[arg(long)]
-        document: Option<String>,
-        /// Explicit media kind (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`).
-        #[arg(long = "media-kind")]
-        media_kind: Option<String>,
-        /// Explicit media source path, URL, or file_id.
-        #[arg(long)]
-        media: Option<String>,
-        /// GPS latitude in degrees.
-        #[arg(long)]
-        lat: Option<f64>,
-        /// GPS longitude in degrees.
-        #[arg(long)]
-        lon: Option<f64>,
-        /// Optional venue title for GPS location.
-        #[arg(long = "venue-title")]
-        venue_title: Option<String>,
-        /// Optional venue address for GPS location.
-        #[arg(long = "venue-address")]
-        venue_address: Option<String>,
-        /// Interactive poll question.
-        #[arg(long = "poll-question")]
-        poll_question: Option<String>,
-        /// Interactive poll option (specify 2 to 10 times).
-        #[arg(long = "poll-option")]
-        poll_options: Vec<String>,
-        /// Whether the poll is anonymous.
-        #[arg(long = "poll-anonymous")]
-        poll_anonymous: Option<bool>,
-        /// Whether the poll allows multiple answers.
-        #[arg(long = "poll-multiple")]
-        poll_multiple: Option<bool>,
-        /// Interactive checklist title.
-        #[arg(long = "checklist-title")]
-        checklist_title: Option<String>,
-        /// Interactive checklist task item (specify 1 to 30 times).
-        #[arg(long = "checklist-task")]
-        checklist_tasks: Vec<String>,
-        /// Article title (published as a Telegraph Instant View article when `--article-content` is given).
-        #[arg(long = "article-title")]
-        article_title: Option<String>,
-        /// Article Markdown/text content.
-        #[arg(long = "article-content")]
-        article_content: Option<String>,
-        /// Optional existing article URL.
-        #[arg(long = "article-url")]
-        article_url: Option<String>,
-        /// Optional article author name.
-        #[arg(long = "article-author")]
-        article_author: Option<String>,
-    },
+    Send(Box<SendArgs>),
     /// Perform an IM channel or message interaction (`react`, `vote`, `edit`, `delete`, `pin`, `unpin`, `stop_poll`).
     #[command(hide = true)]
     Interact {
@@ -583,78 +493,10 @@ enum Command {
         clear: bool,
     },
     /// The browser on a profile's desktop session, with persistent logins (`open`, `snapshot`, `click`, `fill`, `press`, `eval`, `screenshot`, `cookies`, `tabs`, `takeover`, `status`, `profiles`, `close`).
-    Browser {
-        /// Action: `open` / `goto`, `back`, `forward`, `reload`, `snapshot`, `read`, `html`, `click`, `fill` / `type`, `press`, `hold`, `key_down`, `key_up`, `release_keys`, `eval`, `cookies`, `screenshot`, `tabs`, `takeover`, `wait_for_user`, `release_takeover`, `status`, `profiles`, or `close` / `stop`. Runs in the server's desktop session for the profile, held by the operator while the operator uses it.
-        #[arg(default_value = "status")]
-        action: String,
-        /// Primary argument: URL (for `open`), snapshot ref such as `@e1` or a CSS selector (for `click` / `fill` / `html`), key name (for `press` / `hold` / `key_down` / `key_up`), JavaScript (for `eval`), or output path (for `screenshot`).
-        target: Option<String>,
-        /// Secondary argument: text to enter when `action` is `fill` / `type`.
-        value: Option<String>,
-        /// Persistent browser profile name (e.g. `default`, `reviewer`, `github`).
-        #[arg(short = 'p', long)]
-        profile: Option<String>,
-        /// Explicit URL override.
-        #[arg(long)]
-        url: Option<String>,
-        /// Explicit element override: a snapshot ref (`@e1` or `@<snapshot_id>:e1`) or a CSS selector.
-        #[arg(long)]
-        selector: Option<String>,
-        /// Explicit text override for `fill` / `type`.
-        #[arg(long)]
-        text: Option<String>,
-        /// Secret reference (`op://vault/item/field`, `op-otp://vault/item`, or `secret://key`) resolved in memory for `fill` / `type`.
-        #[arg(long = "secret-ref")]
-        secret_ref: Option<String>,
-        /// Explicit JavaScript override for `eval`.
-        #[arg(long)]
-        script: Option<String>,
-        /// Explicit output path for `screenshot`.
-        #[arg(long)]
-        path: Option<String>,
-        /// Press Enter in the field after `fill` / `type`.
-        #[arg(long)]
-        submit: bool,
-        /// Capture the full scrollable page on `screenshot` (the page only, without browser chrome).
-        #[arg(long = "full-page")]
-        full_page: bool,
-        /// Wait duration in milliseconds after `open` or `click`.
-        #[arg(long = "wait-ms")]
-        wait_ms: Option<u64>,
-        /// Hold duration in milliseconds for `press` / `hold` (at most 10 s).
-        #[arg(long = "hold-ms", alias = "duration-ms")]
-        hold_ms: Option<u64>,
-        /// Key or chord override for `press` / `hold` / `key_down` / `key_up` (e.g. `Enter`, `ctrl+a`).
-        #[arg(long)]
-        key: Option<String>,
-    },
+    Browser(Box<BrowserArgs>),
     /// List, create, or cancel scheduled wakes.
     #[command(name = "schedules", aliases = ["schedule", "cron"], display_order = 6)]
-    Schedule {
-        /// List visible schedules across all agents (read-only).
-        #[arg(long, conflicts_with_all = ["agent", "at", "every", "watch", "prompt", "cancel"])]
-        all: bool,
-        /// Optional target agent name or `agt_...` id (defaults to this agent when run inside an agent).
-        agent: Option<String>,
-        /// One-off wake time (`1m`, `30s`, `2026-10-29T16:30:00Z`).
-        #[arg(long)]
-        at: Option<String>,
-        /// Recurring wake interval (`1m`, `5m`, `15m`, `1h`).
-        #[arg(long)]
-        every: Option<String>,
-        /// Event watch (`github:pr:<owner>/<repo>#<num>`, `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name_or_id>`).
-        #[arg(long)]
-        watch: Option<String>,
-        /// Prompt delivered when the schedule or event watch fires.
-        #[arg(long)]
-        prompt: Option<String>,
-        /// Cancel schedule by `sch_...` ID or `all`.
-        #[arg(long)]
-        cancel: Option<String>,
-        /// Output machine-readable JSON.
-        #[arg(long)]
-        json: bool,
-    },
+    Schedule(Box<ScheduleArgs>),
     /// List visible fleet automations (event watches and timed wakes).
     Automations {
         /// Output machine-readable JSON.
@@ -694,8 +536,175 @@ enum Command {
     /// Database maintenance and PostgreSQL migration commands.
     Db {
         #[command(subcommand)]
-        action: DbCommand,
+        action: Box<DbCommand>,
     },
+}
+
+#[derive(Args)]
+struct SendArgs {
+    /// Target(s): `agent:<name>`, bare name, comma-separated names (`planner,builder`), `parent`, `children`, `group:<name>`, `all`, `operator`, or `telegram:chat:<id>[:<topic>]`.
+    to: String,
+    /// Message text or caption (optional when sending media, location, or poll).
+    #[arg(default_value = "")]
+    text: String,
+    #[arg(long)]
+    source_key: Option<String>,
+    #[arg(long)]
+    source_time_ms: Option<i64>,
+    #[arg(long)]
+    reply_to: Option<String>,
+    /// The agent or operator this message is from.
+    #[arg(long)]
+    from: Option<String>,
+    /// Optional quoted excerpt from the message being replied to.
+    #[arg(long)]
+    quote: Option<String>,
+    /// Attach a photo by local file path, URL, or file_id.
+    #[arg(long)]
+    photo: Option<String>,
+    /// Attach a video by local file path, URL, or file_id.
+    #[arg(long)]
+    video: Option<String>,
+    /// Attach an audio file by local file path, URL, or file_id.
+    #[arg(long)]
+    audio: Option<String>,
+    /// Attach a music track by local file path, URL, or file_id.
+    #[arg(long)]
+    music: Option<String>,
+    /// Optional music/audio track title.
+    #[arg(long = "music-title")]
+    music_title: Option<String>,
+    /// Optional music/audio artist or performer name.
+    #[arg(long = "music-performer")]
+    music_performer: Option<String>,
+    /// Attach a voice note by local file path, URL, or file_id.
+    #[arg(long)]
+    voice: Option<String>,
+    /// Attach a document by local file path, URL, or file_id.
+    #[arg(long)]
+    document: Option<String>,
+    /// Explicit media kind (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`).
+    #[arg(long = "media-kind")]
+    media_kind: Option<String>,
+    /// Explicit media source path, URL, or file_id.
+    #[arg(long)]
+    media: Option<String>,
+    /// GPS latitude in degrees.
+    #[arg(long)]
+    lat: Option<f64>,
+    /// GPS longitude in degrees.
+    #[arg(long)]
+    lon: Option<f64>,
+    /// Optional venue title for GPS location.
+    #[arg(long = "venue-title")]
+    venue_title: Option<String>,
+    /// Optional venue address for GPS location.
+    #[arg(long = "venue-address")]
+    venue_address: Option<String>,
+    /// Interactive poll question.
+    #[arg(long = "poll-question")]
+    poll_question: Option<String>,
+    /// Interactive poll option (specify 2 to 10 times).
+    #[arg(long = "poll-option")]
+    poll_options: Vec<String>,
+    /// Whether the poll is anonymous.
+    #[arg(long = "poll-anonymous")]
+    poll_anonymous: Option<bool>,
+    /// Whether the poll allows multiple answers.
+    #[arg(long = "poll-multiple")]
+    poll_multiple: Option<bool>,
+    /// Interactive checklist title.
+    #[arg(long = "checklist-title")]
+    checklist_title: Option<String>,
+    /// Interactive checklist task item (specify 1 to 30 times).
+    #[arg(long = "checklist-task")]
+    checklist_tasks: Vec<String>,
+    /// Article title (published as a Telegraph Instant View article when `--article-content` is given).
+    #[arg(long = "article-title")]
+    article_title: Option<String>,
+    /// Article Markdown/text content.
+    #[arg(long = "article-content")]
+    article_content: Option<String>,
+    /// Optional existing article URL.
+    #[arg(long = "article-url")]
+    article_url: Option<String>,
+    /// Optional article author name.
+    #[arg(long = "article-author")]
+    article_author: Option<String>,
+}
+
+#[derive(Args)]
+struct BrowserArgs {
+    /// Action: `open` / `goto`, `back`, `forward`, `reload`, `snapshot`, `read`, `html`, `click`, `fill` / `type`, `press`, `hold`, `key_down`, `key_up`, `release_keys`, `eval`, `cookies`, `screenshot`, `tabs`, `takeover`, `wait_for_user`, `release_takeover`, `status`, `profiles`, or `close` / `stop`. Runs in the server's desktop session for the profile, held by the operator while the operator uses it.
+    #[arg(default_value = "status")]
+    action: String,
+    /// Primary argument: URL (for `open`), snapshot ref such as `@e1` or a CSS selector (for `click` / `fill` / `html`), key name (for `press` / `hold` / `key_down` / `key_up`), JavaScript (for `eval`), or output path (for `screenshot`).
+    target: Option<String>,
+    /// Secondary argument: text to enter when `action` is `fill` / `type`.
+    value: Option<String>,
+    /// Persistent browser profile name (e.g. `default`, `reviewer`, `github`).
+    #[arg(short = 'p', long)]
+    profile: Option<String>,
+    /// Explicit URL override.
+    #[arg(long)]
+    url: Option<String>,
+    /// Explicit element override: a snapshot ref (`@e1` or `@<snapshot_id>:e1`) or a CSS selector.
+    #[arg(long)]
+    selector: Option<String>,
+    /// Explicit text override for `fill` / `type`.
+    #[arg(long)]
+    text: Option<String>,
+    /// Secret reference (`op://vault/item/field`, `op-otp://vault/item`, or `secret://key`) resolved in memory for `fill` / `type`.
+    #[arg(long = "secret-ref")]
+    secret_ref: Option<String>,
+    /// Explicit JavaScript override for `eval`.
+    #[arg(long)]
+    script: Option<String>,
+    /// Explicit output path for `screenshot`.
+    #[arg(long)]
+    path: Option<String>,
+    /// Press Enter in the field after `fill` / `type`.
+    #[arg(long)]
+    submit: bool,
+    /// Capture the full scrollable page on `screenshot` (the page only, without browser chrome).
+    #[arg(long = "full-page")]
+    full_page: bool,
+    /// Wait duration in milliseconds after `open` or `click`.
+    #[arg(long = "wait-ms")]
+    wait_ms: Option<u64>,
+    /// Hold duration in milliseconds for `press` / `hold` (at most 10 s).
+    #[arg(long = "hold-ms", alias = "duration-ms")]
+    hold_ms: Option<u64>,
+    /// Key or chord override for `press` / `hold` / `key_down` / `key_up` (e.g. `Enter`, `ctrl+a`).
+    #[arg(long)]
+    key: Option<String>,
+}
+
+#[derive(Args)]
+struct ScheduleArgs {
+    /// List visible schedules across all agents (read-only).
+    #[arg(long, conflicts_with_all = ["agent", "at", "every", "watch", "prompt", "cancel"])]
+    all: bool,
+    /// Optional target agent name or `agt_...` id (defaults to this agent when run inside an agent).
+    agent: Option<String>,
+    /// One-off wake time (`1m`, `30s`, `2026-10-29T16:30:00Z`).
+    #[arg(long)]
+    at: Option<String>,
+    /// Recurring wake interval (`1m`, `5m`, `15m`, `1h`).
+    #[arg(long)]
+    every: Option<String>,
+    /// Event watch (`github:pr:<owner>/<repo>#<num>`, `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name_or_id>`).
+    #[arg(long)]
+    watch: Option<String>,
+    /// Prompt delivered when the schedule or event watch fires.
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Cancel schedule by `sch_...` ID or `all`.
+    #[arg(long)]
+    cancel: Option<String>,
+    /// Output machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -1457,39 +1466,40 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 profile.as_deref(),
             )
         }
-        Command::Send {
-            to,
-            text,
-            source_key,
-            source_time_ms,
-            reply_to,
-            from,
-            quote,
-            photo,
-            video,
-            audio,
-            music,
-            music_title,
-            music_performer,
-            voice,
-            document,
-            media_kind,
-            media,
-            lat,
-            lon,
-            venue_title,
-            venue_address,
-            poll_question,
-            poll_options,
-            poll_anonymous,
-            poll_multiple,
-            checklist_title,
-            checklist_tasks,
-            article_title,
-            article_content,
-            article_url,
-            article_author,
-        } => {
+        Command::Send(send_args) => {
+            let SendArgs {
+                to,
+                text,
+                source_key,
+                source_time_ms,
+                reply_to,
+                from,
+                quote,
+                photo,
+                video,
+                audio,
+                music,
+                music_title,
+                music_performer,
+                voice,
+                document,
+                media_kind,
+                media,
+                lat,
+                lon,
+                venue_title,
+                venue_address,
+                poll_question,
+                poll_options,
+                poll_anonymous,
+                poll_multiple,
+                checklist_title,
+                checklist_tasks,
+                article_title,
+                article_content,
+                article_url,
+                article_author,
+            } = *send_args;
             let resolved_media = if let (Some(kind), Some(source)) = (media_kind, media) {
                 Some(api::SendMedia {
                     kind,
@@ -1705,53 +1715,59 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Role { agent, role, clear } => {
             agent::role_cmd(&data, &agent, role.as_deref(), clear)
         }
-        Command::Browser {
-            action,
-            target,
-            value,
-            profile,
-            url,
-            selector,
-            text,
-            secret_ref,
-            script,
-            path,
-            submit,
-            full_page,
-            wait_ms,
-            hold_ms,
-            key,
-        } => browser_cmd(
-            &data,
-            action,
-            target,
-            value,
-            workstation::BrowserRequest {
+        Command::Browser(browser_args) => {
+            let BrowserArgs {
+                action,
+                target,
+                value,
                 profile,
                 url,
                 selector,
                 text,
                 secret_ref,
                 script,
-                key,
                 path,
-                submit: submit.then_some(true),
-                full_page: full_page.then_some(true),
+                submit,
+                full_page,
                 wait_ms,
                 hold_ms,
-                ..Default::default()
-            },
-        ),
-        Command::Schedule {
-            all,
-            agent,
-            at,
-            every,
-            watch,
-            prompt,
-            cancel,
-            json,
-        } => schedule_cmd(&data, agent, at, every, watch, prompt, cancel, json, all),
+                key,
+            } = *browser_args;
+            browser_cmd(
+                &data,
+                action,
+                target,
+                value,
+                workstation::BrowserRequest {
+                    profile,
+                    url,
+                    selector,
+                    text,
+                    secret_ref,
+                    script,
+                    key,
+                    path,
+                    submit: submit.then_some(true),
+                    full_page: full_page.then_some(true),
+                    wait_ms,
+                    hold_ms,
+                    ..Default::default()
+                },
+            )
+        }
+        Command::Schedule(schedule_args) => {
+            let ScheduleArgs {
+                all,
+                agent,
+                at,
+                every,
+                watch,
+                prompt,
+                cancel,
+                json,
+            } = *schedule_args;
+            schedule_cmd(&data, agent, at, every, watch, prompt, cancel, json, all)
+        }
         Command::Automations { json } => {
             schedule_cmd(&data, None, None, None, None, None, None, json, true)
         }
@@ -1764,7 +1780,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::CloudHarness(args) => cloud_harness::run(args),
         Command::SandboxExec(args) => sandbox_exec::run(args),
         Command::MemoryService(args) => memory_service::run(&data, args),
-        Command::Db { action } => db_cmd(&data, action),
+        Command::Db { action } => db_cmd(&data, *action),
     }
 }
 

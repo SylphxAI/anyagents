@@ -658,7 +658,7 @@ mod tests {
             host_index::{HostIndex, IndexMetadata, MemoryScope},
             raw_segment::retained_jsonl_records,
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let file = dir.path().join("history.jsonl");
         let lines: String = (0..5)
             .map(|i| format!("{{\"content\":\"doc line {i}\"}}\n"))
@@ -701,7 +701,7 @@ mod tests {
         // When `database-url` configures PostgreSQL and no SQLite file exists on disk,
         // `host_index_available` reports true and `HostCatalog::open` routes to PG
         // rather than failing with SQLite CANTOPEN or creating an empty file.
-        let pg_dir = tempfile::tempdir().unwrap();
+        let pg_dir = crate::test_tempdir();
         let missing_host = pg_dir.path().join("host-history-index-v1.db");
         assert!(!host_index_available(&missing_host));
         std::fs::write(

@@ -4254,7 +4254,7 @@ mod tests {
         assert!(dockerfile.contains("FROM sandbox-base AS sandbox-dev"));
         assert!(dockerfile.contains("https://sh.rustup.rs"));
         assert!(dockerfile.contains("COPY --from=bun-bin /usr/local/bin/bun /usr/local/bin/bun"));
-        assert!(dockerfile.contains("FROM sandbox-base AS sandbox-full"));
+        assert!(dockerfile.contains("FROM sandbox-dev AS sandbox-full"));
 
         let workflow =
             std::fs::read_to_string(root.join(".github/workflows/docker-publish.yml")).unwrap();

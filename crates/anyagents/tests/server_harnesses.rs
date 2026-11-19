@@ -1111,6 +1111,11 @@ while True:
 #[cfg(target_os = "linux")]
 fn native_spiron(data: &Path, name: &str) -> (String, std::path::PathBuf, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(
+        data.join("anyagents.toml"),
+        "[spiron]\nexecution_mode = \"local\"\n",
+    )
+    .unwrap();
     let out = bin()
         .env("PATH", machine_path(data))
         .arg("--data")
@@ -1289,6 +1294,11 @@ fn a_v2_spiron_needs_no_keeper_and_is_reattached_after_a_server_crash() {
     std::fs::create_dir_all(&data).unwrap();
     support::operator_for_contract(&data);
     create_asker(&data);
+    std::fs::write(
+        data.join("anyagents.toml"),
+        "[spiron]\nexecution_mode = \"local\"\n",
+    )
+    .unwrap();
     let name = "native";
     let out = bin()
         .env("PATH", machine_path(&data))
