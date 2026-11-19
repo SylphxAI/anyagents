@@ -397,7 +397,10 @@ async fn wrong_snippets_name_their_fix() {
     )
     .await
     .unwrap_err();
-    assert!(node.contains("require is not defined"), "{node}");
+    assert!(
+        node.contains("require is not defined") || node.contains("require is not a function"),
+        "{node}"
+    );
     assert!(
         node.contains("fix: `require` and Node modules are unavailable"),
         "{node}"
@@ -458,18 +461,33 @@ async fn the_names_agents_reach_for_exist() {
 
 #[test]
 fn every_listed_sandbox_name_is_bound_and_described() {
+    let dir = tempfile::tempdir().unwrap();
+    let mcp = agent_with_limits(dir.path(), None);
+    let registry = mcp.code_mode_registry_for_inspection();
+    let specs = registry.specs();
+    let dts = mcp.code_mode_ts_declarations();
     for (namespace, names) in code_contract::SANDBOX_API {
+        if *namespace == "tools" {
+            for ns_name in *names {
+                assert!(
+                    specs.iter().any(|s| s.namespace == *ns_name),
+                    "`tools.{ns_name}` is listed but not mounted in ToolRegistry"
+                );
+            }
+            continue;
+        }
+        let spec = specs
+            .iter()
+            .find(|s| s.namespace == *namespace)
+            .unwrap_or_else(|| panic!("namespace `{namespace}` not mounted in ToolRegistry"));
         for name in *names {
-            let bound = match *namespace {
-                "workspace" => format!("          {name}: "),
-                "anyagents" => format!("          {name}: "),
-                "memory" => format!("memoryFn.{name} = "),
-                "web" => format!("webFn.{name} = "),
-                _ => name.to_string(),
-            };
             assert!(
-                CODE_SANDBOX_WORKER_JS.contains(&bound) || *namespace == "tools",
-                "`{namespace}.{name}` is listed but not bound in the sandbox"
+                spec.methods.iter().any(|m| m == name),
+                "`{namespace}.{name}` is listed in SANDBOX_API but not mounted in ToolRegistry"
+            );
+            assert!(
+                dts.contains(&format!("function {name}(")),
+                "`{namespace}.{name}` missing from generated TypeScript declarations"
             );
         }
     }

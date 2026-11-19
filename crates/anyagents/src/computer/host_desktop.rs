@@ -1,7 +1,8 @@
-//! Host desktop control: the machine this process runs on. macOS (JXA),
-//! Windows (PowerShell), ChromeOS (Crostini and ARC), and a real Linux X11 or
-//! Wayland display named by `display` / `wayland_display`. The per-session
-//! virtual desktop lives in `session_desktop`; this module never touches it.
+//! Host desktop control: the machine this process runs on, backed by
+//! `agent_workstation::PlatformAdapter` (Linux AT-SPI2/Wayland, macOS AX,
+//! Windows UIA) plus ChromeOS (Crostini and ARC) and explicit Linux X11/Wayland
+//! display overrides. The per-session virtual desktop lives in `workstation`;
+//! this module never touches it.
 
 use super::*;
 
@@ -58,6 +59,12 @@ fn skip_host_desktop_queries(req: &Value) -> bool {
 }
 
 async fn list_local_windows(envs: &[(&str, &str)]) -> Result<Vec<Value>, String> {
+    if envs.is_empty()
+        && let Ok(windows) = native::list_windows(DesktopPlatform::Linux).await
+        && !windows.is_empty()
+    {
+        return Ok(windows);
+    }
     // 1. Try `wmctrl -l -G -p`
     if let Ok(out) = run_cmd("wmctrl", &["-l", "-G", "-p"], envs, 5_000).await
         && out.status.success()
@@ -153,6 +160,20 @@ async fn collect_local_a11y_nodes(
     app_filter: Option<&str>,
     window_filter: Option<&str>,
 ) -> Vec<RawA11yNode> {
+    if envs.is_empty() {
+        let mut req = json!({ "action": "snapshot" });
+        if let Some(app) = app_filter {
+            req["app"] = json!(app);
+        }
+        if let Some(win) = window_filter {
+            req["window_id"] = json!(win);
+        }
+        if let Ok(nodes) = native::collect_nodes(DesktopPlatform::Linux, &req).await
+            && !nodes.is_empty()
+        {
+            return nodes;
+        }
+    }
     let windows = list_local_windows(envs).await.unwrap_or_default();
     a11y_nodes_from_windows(windows, app_filter, window_filter)
 }

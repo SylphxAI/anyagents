@@ -802,9 +802,12 @@ async fn start(
 ) -> Result<Live, ToolError> {
     reap_stale_runtime_dirs_once();
     let (parsed, proxy_argument) = super::proxy::configure(proxy.as_deref())?;
-    super::legacy::retire(dir)
-        .await
-        .map_err(|e| ToolError::invalid(format!("cannot retire legacy browser: {e}")))?;
+    let stale_runtime = dir.join("runtime.json");
+    if let Ok(meta) = std::fs::symlink_metadata(&stale_runtime)
+        && meta.file_type().is_file()
+    {
+        let _ = std::fs::remove_file(&stale_runtime);
+    }
     let runtime_dir = new_runtime_dir().map_err(|e| ToolError::invalid(e.to_string()))?;
     let runtime_lock = lock_runtime_dir(&runtime_dir).ok();
     let runtime_guard = RuntimeDirGuard::new(runtime_dir.clone(), runtime_lock);

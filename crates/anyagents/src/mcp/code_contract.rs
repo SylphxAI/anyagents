@@ -196,12 +196,55 @@ pub(super) const SANDBOX_API: &[(&str, &[&str])] = &[
     ),
     ("web", &["search", "fetch"]),
     (
+        "coordination",
+        &[
+            "send",
+            "inbox",
+            "agents",
+            "schedule",
+            "schedules",
+            "conversation",
+            "search",
+            "groups",
+            "skills",
+            "subagents",
+            "spawn",
+            "describe",
+            "archive",
+            "wake",
+            "interact",
+        ],
+    ),
+    (
+        "workstation",
+        &[
+            "open",
+            "snapshot",
+            "click",
+            "fill",
+            "fill_secret",
+            "eval",
+            "screenshot",
+            "tabs",
+            "status",
+            "close",
+            "desktop_snapshot",
+            "desktop_click",
+            "desktop_type",
+            "desktop_key",
+            "desktop_scroll",
+            "desktop_list_windows",
+        ],
+    ),
+    (
         "tools",
         &[
             "anyagents",
+            "coordination",
             "workspace",
             "memory",
             "web",
+            "workstation",
             "computer",
             "device",
             "media",
@@ -361,13 +404,29 @@ fn has_module_syntax(code: &str) -> bool {
         })
 }
 
-/// `X is not defined` names an identifier the sandbox does not have.
+/// `X is not defined` (or `X is not a function` for a scrubbed host global)
+/// names an identifier the sandbox does not expose.
 fn undefined_global(error: &str) -> Option<&str> {
-    let (head, _) = error.split_once(" is not defined")?;
-    let name = head
-        .rsplit(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
-        .next()?;
-    (!name.is_empty()).then_some(name)
+    if let Some((head, _)) = error.split_once(" is not defined") {
+        let name = head
+            .rsplit(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .next()?;
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    if let Some((head, _)) = error.split_once(" is not a function") {
+        let name = head
+            .rsplit(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .next()?;
+        if matches!(
+            name,
+            "require" | "fetch" | "Buffer" | "WebSocket" | "XMLHttpRequest"
+        ) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// `a.b.c is not a function` names a call into a namespace that has no such

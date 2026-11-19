@@ -52,13 +52,18 @@ dependencies = [
 [[package]]
 name = "agent-workstation"
 version = "0.2.0"
-source = "git+https://github.com/SylphxAI/agent-workstation?rev=9587cbc7d0850afa315111b764cc9cde9d62e646#9587cbc7d0850afa315111b764cc9cde9d62e646"
+source = "git+https://github.com/SylphxAI/agent-workstation?rev=c4470c9a095f46f6bdb6af2f1fc39359104f2fe4#c4470c9a095f46f6bdb6af2f1fc39359104f2fe4"
 dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
+ "clap",
  "futures",
+ "getrandom 0.4.3",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "png",
  "rustix",
  "serde",
@@ -72,6 +77,7 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-misc",
  "wayland-protocols-wlr",
+ "windows",
 ]
 
 [[package]]

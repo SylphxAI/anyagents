@@ -15531,10 +15531,11 @@ exec '{}' "$@"
                 .map(|s| (*s).to_string())
                 .collect();
             assert_eq!(remote_tools, expected_remote);
-            assert!(!remote_tools.contains(&"code".to_string()));
+            assert!(remote_tools.contains(&"code".to_string()));
 
-            // Calling `code` under `Remote` profile is refused with JSON-RPC error.
-            let (status, code_err_json) = post_mcp(
+            // Calling host-free `code` under `Remote` profile succeeds for `coordination.*` + `memory.*`,
+            // while `workspace.*` fails closed with zero coordinator-host filesystem exposure.
+            let (status, code_ok_json) = post_mcp(
                 &cloud_cap,
                 None,
                 serde_json::json!({
@@ -15543,18 +15544,47 @@ exec '{}' "$@"
                     "method": "tools/call",
                     "params": {
                         "name": "code",
-                        "arguments": { "code": "return 1;" }
+                        "arguments": {
+                            "code": "const [agentsRes, memRes] = await Promise.all([coordination.agents({ action: 'list' }), memory.list()]); return { agentCount: agentsRes.agents.length, memOk: Boolean(memRes) };"
+                        }
+                    }
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(
+                code_ok_json["result"]["isError"],
+                serde_json::json!(true),
+                "unexpected remote code error: {code_ok_json}"
+            );
+            assert_eq!(
+                code_ok_json["result"]["structuredContent"]["result"]["memOk"],
+                serde_json::json!(true),
+                "{code_ok_json}"
+            );
+
+            // Direct host-bound `files` tool remains refused under `Remote` profile.
+            let (status, files_err_json) = post_mcp(
+                &cloud_cap,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 30,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "files",
+                        "arguments": { "action": "list" }
                     }
                 }),
             )
             .await;
             assert_eq!(status, StatusCode::OK);
             assert!(
-                code_err_json["error"]["message"]
+                files_err_json["error"]["message"]
                     .as_str()
                     .unwrap()
                     .contains("disabled by active MCP profile `remote`"),
-                "unexpected error response: {code_err_json}"
+                "unexpected error response: {files_err_json}"
             );
 
             // Calling `send`, `inbox`, `agents`, `memory`, `skills` succeeds under `Remote` profile.
@@ -16779,7 +16809,7 @@ exec '{}' "$@"
             .unwrap_err();
             assert_eq!(refused.status, StatusCode::FORBIDDEN);
 
-            // Nothing that executes or reads on the host is callable.
+            // Direct host-bound tools remain disabled under `Remote` profile.
             let exec = serde_json::json!({
                 "action": "exec",
                 "command": format!("touch {}", marker.display()),
@@ -16787,7 +16817,6 @@ exec '{}' "$@"
             for (tool, args) in [
                 ("files", exec.clone()),
                 ("mcp__anyagents__files", exec.clone()),
-                ("code", serde_json::json!({ "code": "return 1" })),
                 ("browser", serde_json::json!({ "action": "status" })),
                 ("computer", serde_json::json!({ "action": "screenshot" })),
                 ("device", serde_json::json!({ "action": "screenshot" })),
@@ -16810,6 +16839,25 @@ exec '{}' "$@"
                     "{tool}: {refused}"
                 );
             }
+            // Host-free `code` under `Remote` profile cannot execute commands or read on the coordinator host.
+            let (_, code_refused) = post_mcp_as(
+                &state,
+                &cap,
+                None,
+                tool_call(
+                    "code",
+                    serde_json::json!({
+                        "code": format!("return await workspace.exec('touch {}');", marker.display())
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                code_refused["result"]["isError"],
+                serde_json::json!(true),
+                "{code_refused}"
+            );
             assert!(!marker.exists(), "an HTTP call ran a host command");
         });
     }
