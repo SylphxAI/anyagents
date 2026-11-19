@@ -44,17 +44,20 @@ FROM ${RUST_IMAGE} AS guest-builder
 WORKDIR /src
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pkg-config \
+    && apt-get install -y --no-install-recommends pkg-config jq \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY tests ./tests
 
-RUN cargo build --release --locked \
-        -p anyagents-guest --bin anyagents-guest \
-        -p agent-tools --bin agent-code-mode \
-        -p agent-workstation --bin agent-workstation \
+RUN cargo build --release --locked -p anyagents-guest --bin anyagents-guest \
+    && AGENT_TOOLS_MANIFEST="$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "agent-tools") | .manifest_path' | head -n 1)" \
+    && AGENT_WS_MANIFEST="$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "agent-workstation") | .manifest_path' | head -n 1)" \
+    && test -n "$AGENT_TOOLS_MANIFEST" \
+    && test -n "$AGENT_WS_MANIFEST" \
+    && cargo build --release --manifest-path "$AGENT_TOOLS_MANIFEST" --target-dir /src/target --bin agent-code-mode \
+    && cargo build --release --manifest-path "$AGENT_WS_MANIFEST" --target-dir /src/target --bin agent-workstation \
     && (strip \
         /src/target/release/anyagents-guest \
         /src/target/release/agent-code-mode \

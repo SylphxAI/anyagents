@@ -486,7 +486,7 @@ fn create_with_seat_and_sandbox_mode(
                 request.base.as_deref(),
             )?;
             if sandbox_mode.is_remote_required() {
-                PathBuf::from(crate::sandbox_providers::providers::DEFAULT_SANDBOX_WORKDIR)
+                PathBuf::from(crate::sandbox_providers::sylphx::DEFAULT_SANDBOX_WORKDIR)
             } else {
                 let launcher = root.join("launcher");
                 create_dir_all_recorded(&launcher, &made)?;

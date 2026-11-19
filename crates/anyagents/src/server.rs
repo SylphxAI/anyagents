@@ -5298,7 +5298,7 @@ fn installed_on_disk(files: &file_cache::FileCache, root: &Path, harness: &str) 
 async fn media_file_route(
     _principal: Principal,
     State(state): State<AppState>,
-    Path(file_name): Path<String>,
+    axum::extract::Path(file_name): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let trimmed = file_name.trim();
     if trimmed.is_empty()
