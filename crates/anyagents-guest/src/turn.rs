@@ -10,6 +10,7 @@
 //!   `turn_complete` or `turn_failed` JSON payload with `Authorization: Bearer <callback-token>`
 //!   and bounded exponential-backoff retry (5 retries).
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -39,6 +40,21 @@ const DEFAULT_MAX_RETRIES: usize = 5;
 const DEFAULT_INITIAL_BACKOFF_MS: u64 = 200;
 const CALLBACK_TIMEOUT_SECS: u64 = 15;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 5;
+
+/// Allowlisted native-harness OAuth credential files relative to `state_dir`.
+///
+/// When a native vendor CLI refreshes its own OAuth token inside a sandbox turn,
+/// `anyagents-guest` detects modified files from this allowlist after `adapter.stop()`
+/// and attaches them (base64-encoded) to the authenticated terminal callback so the
+/// stateless coordinator can persist them back to durable storage under single-writer
+/// custody without ever scraping binaries or spoofing vendor refresh protocols.
+const SYNCABLE_AUTH_FILES: &[&str] = &[
+    ".gemini/antigravity-cli/antigravity-oauth-token",
+    ".claude/.credentials.json",
+    ".credentials.json",
+    ".codex/auth.json",
+];
+const MAX_SYNCABLE_AUTH_FILE_BYTES: usize = 64 * 1024;
 
 /// CLI arguments for `anyagents-guest turn`.
 #[derive(Args, Clone, Debug)]
@@ -307,6 +323,7 @@ fn execute_turn_foreground(
             &err,
             &TurnUsage::default(),
             turns_dir,
+            &BTreeMap::new(),
         );
         return Err(err);
     }
@@ -347,6 +364,7 @@ fn execute_turn_foreground(
     let env = build_guest_env(state_dir, &work_dir, file_cfg.as_ref());
     let guest_exe =
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/anyagents-guest"));
+    let pre_turn_auth = snapshot_syncable_auth_files(state_dir);
 
     let mut adapter = match launch_guest_harness(
         &harness_name,
@@ -363,6 +381,7 @@ fn execute_turn_foreground(
         Ok(a) => a,
         Err(err) => {
             let msg = format!("failed to start guest harness `{harness_name}`: {err}");
+            let synced_auth = collect_changed_syncable_auth_files(state_dir, &pre_turn_auth);
             let _ = send_turn_failed(
                 callback_url,
                 callback_token,
@@ -373,6 +392,7 @@ fn execute_turn_foreground(
                 &msg,
                 &TurnUsage::default(),
                 turns_dir,
+                &synced_auth,
             );
             return Err(msg);
         }
@@ -462,6 +482,7 @@ fn execute_turn_foreground(
             .unwrap_or_else(|| adapter.served_usage().difference(base_usage));
         clear_activity_snapshot(state_dir);
         adapter.stop();
+        let synced_auth = collect_changed_syncable_auth_files(state_dir, &pre_turn_auth);
         send_turn_failed(
             callback_url,
             callback_token,
@@ -472,6 +493,7 @@ fn execute_turn_foreground(
             &err_msg,
             &usage,
             turns_dir,
+            &synced_auth,
         )?;
         return Err(err_msg);
     }
@@ -579,6 +601,7 @@ fn execute_turn_foreground(
         GuestActivitySnapshot::capture_current(&harness_name, Some(sid.clone()), "idle", 0, 0);
     clear_activity_snapshot(state_dir);
     adapter.stop();
+    let synced_auth = collect_changed_syncable_auth_files(state_dir, &pre_turn_auth);
 
     if let Some(err_msg) = err_override {
         send_turn_failed(
@@ -591,6 +614,7 @@ fn execute_turn_foreground(
             &err_msg,
             &usage,
             turns_dir,
+            &synced_auth,
         )?;
         return Ok(());
     }
@@ -621,7 +645,7 @@ fn execute_turn_foreground(
         }
     }
 
-    let payload = json!({
+    let audit_payload = json!({
         "event_type": "turn_complete",
         "turn_id": args.turn_id,
         "agent_id": args.agent_id,
@@ -632,11 +656,17 @@ fn execute_turn_foreground(
         "inflight_children": final_snap.inflight_children,
         "timestamp_ms": now_unix_ms(),
     });
-    persist_turn_result_audit(turns_dir, &args.turn_id, &payload);
+    persist_turn_result_audit(turns_dir, &args.turn_id, &audit_payload);
+    let mut callback_payload = audit_payload;
+    if !synced_auth.is_empty()
+        && let Some(obj) = callback_payload.as_object_mut()
+    {
+        obj.insert("synced_auth_files".to_string(), json!(synced_auth));
+    }
     post_callback_with_retry(
         callback_url,
         callback_token,
-        &payload,
+        &callback_payload,
         DEFAULT_MAX_RETRIES,
         CALLBACK_TIMEOUT_SECS,
     )
@@ -697,8 +727,9 @@ fn send_turn_failed(
     error_text: &str,
     usage: &TurnUsage,
     turns_dir: &Path,
+    synced_auth: &BTreeMap<String, String>,
 ) -> Result<(), String> {
-    let payload = json!({
+    let audit_payload = json!({
         "event_type": "turn_failed",
         "turn_id": turn_id,
         "agent_id": agent_id,
@@ -708,14 +739,89 @@ fn send_turn_failed(
         "usage": usage_json(usage),
         "timestamp_ms": now_unix_ms(),
     });
-    persist_turn_result_audit(turns_dir, turn_id, &payload);
+    persist_turn_result_audit(turns_dir, turn_id, &audit_payload);
+    let mut callback_payload = audit_payload;
+    if !synced_auth.is_empty()
+        && let Some(obj) = callback_payload.as_object_mut()
+    {
+        obj.insert("synced_auth_files".to_string(), json!(synced_auth));
+    }
     post_callback_with_retry(
         callback_url,
         callback_token,
-        &payload,
+        &callback_payload,
         DEFAULT_MAX_RETRIES,
         CALLBACK_TIMEOUT_SECS,
     )
+}
+
+fn snapshot_syncable_auth_files(state_dir: &Path) -> BTreeMap<&'static str, Vec<u8>> {
+    let mut snap = BTreeMap::new();
+    for &rel in SYNCABLE_AUTH_FILES {
+        let path = state_dir.join(rel);
+        if let Ok(meta) = std::fs::metadata(&path)
+            && meta.is_file()
+            && meta.len() <= MAX_SYNCABLE_AUTH_FILE_BYTES as u64
+            && let Ok(bytes) = std::fs::read(&path)
+        {
+            snap.insert(rel, bytes);
+        }
+    }
+    snap
+}
+
+fn collect_changed_syncable_auth_files(
+    state_dir: &Path,
+    before: &BTreeMap<&'static str, Vec<u8>>,
+) -> BTreeMap<String, String> {
+    let mut changed = BTreeMap::new();
+    for &rel in SYNCABLE_AUTH_FILES {
+        let path = state_dir.join(rel);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_SYNCABLE_AUTH_FILE_BYTES as u64 {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.is_empty() || bytes.len() > MAX_SYNCABLE_AUTH_FILE_BYTES {
+            continue;
+        }
+        if before.get(rel).is_some_and(|prev| prev == &bytes) {
+            continue;
+        }
+        if !serde_json::from_slice::<Value>(&bytes).is_ok_and(|v| v.is_object()) {
+            continue;
+        }
+        changed.insert(rel.to_string(), encode_base64_standard(&bytes));
+    }
+    changed
+}
+
+fn encode_base64_standard(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn persist_turn_result_audit(turns_dir: &Path, turn_id: &str, payload: &Value) {
@@ -985,5 +1091,36 @@ mod tests {
         server.join().unwrap();
         assert!(err.contains("401"), "unexpected error: {err}");
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn syncable_auth_files_detect_only_changed_valid_json_and_base64_encode() {
+        assert_eq!(encode_base64_standard(b""), "");
+        assert_eq!(encode_base64_standard(b"f"), "Zg==");
+        assert_eq!(encode_base64_standard(b"fo"), "Zm8=");
+        assert_eq!(encode_base64_standard(b"foo"), "Zm9v");
+        assert_eq!(encode_base64_standard(b"foobar"), "Zm9vYmFy");
+
+        let dir = tempfile::tempdir().unwrap();
+        let agy_rel = ".gemini/antigravity-cli/antigravity-oauth-token";
+        let agy_path = dir.path().join(agy_rel);
+        std::fs::create_dir_all(agy_path.parent().unwrap()).unwrap();
+        let old_tok = br#"{"token":{"access_token":"old","expiry":"2026-11-19T10:00:00Z"}}"#;
+        std::fs::write(&agy_path, old_tok).unwrap();
+
+        let before = snapshot_syncable_auth_files(dir.path());
+        assert!(collect_changed_syncable_auth_files(dir.path(), &before).is_empty());
+
+        let new_tok = br#"{"token":{"access_token":"fresh","expiry":"2026-11-19T22:00:00Z"}}"#;
+        std::fs::write(&agy_path, new_tok).unwrap();
+        // Non-JSON garbage in another allowlisted path must be ignored.
+        std::fs::write(dir.path().join(".credentials.json"), b"not-json").unwrap();
+
+        let changed = collect_changed_syncable_auth_files(dir.path(), &before);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(
+            changed.get(agy_rel).map(String::as_str),
+            Some(encode_base64_standard(new_tok).as_str())
+        );
     }
 }

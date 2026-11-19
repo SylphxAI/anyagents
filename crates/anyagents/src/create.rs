@@ -6416,12 +6416,74 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
     sync_and_list_provider_profiles_inner(store, data, probe_usage, probe_usage)
 }
 
+/// Re-hydrate any newly created or updated profile blobs from PostgreSQL
+/// `deployment_blobs(namespace = 'profiles')` into `<data>/profiles` so stateless
+/// replicas observe fresh native-refreshed OAuth tokens persisted by any other
+/// replica or sandbox turn.
+fn hydrate_profiles_from_store_if_postgres(store: &Store, data: &Path) {
+    if !store.is_postgres() {
+        return;
+    }
+    let blobs = store.blob_store();
+    let Ok(metas) = blobs.list_deployment_blobs("profiles") else {
+        return;
+    };
+    let profiles_root = data.join("profiles");
+    for meta in metas {
+        if anyagents_core::stateless::validate_blob_path(&meta.path).is_err() {
+            continue;
+        }
+        let dest = profiles_root.join(&meta.path);
+        let local_mtime_ms = std::fs::metadata(&dest)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        let needs_refresh = local_mtime_ms.is_none_or(|local_ms| meta.updated_at_ms > local_ms);
+        if !needs_refresh {
+            continue;
+        }
+        let Ok(Some(entry)) = blobs.get_deployment_blob("profiles", &meta.path) else {
+            continue;
+        };
+        let unchanged = std::fs::read(&dest)
+            .ok()
+            .is_some_and(|existing| existing == entry.content);
+        if unchanged {
+            continue;
+        }
+        let mode = if entry.encrypted { 0o600 } else { 0o644 };
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let wrote = if entry.content.is_empty() {
+            std::fs::write(&dest, []).is_ok()
+        } else {
+            anyagents_harness::atomic_write_nonempty_file(&dest, &entry.content, mode).is_ok()
+        };
+        if wrote
+            && (meta.path.ends_with("/antigravity-oauth-token")
+                || meta.path.ends_with("/.credentials.json")
+                || meta.path.ends_with("/.codex/auth.json"))
+        {
+            // Clear local stale error/backoff cache so the next probe immediately uses the fresh token.
+            let mut parts = meta.path.splitn(3, '/');
+            if let (Some(prov), Some(prof)) = (parts.next(), parts.next()) {
+                let prof_dir = profiles_root.join(prov).join(prof);
+                let _ = std::fs::remove_file(prof_dir.join(".anyagents-oauth-refresh-attempt-ms"));
+                let _ = std::fs::remove_file(prof_dir.join(".anyagents-last-usage.txt"));
+            }
+        }
+    }
+}
+
 fn sync_and_list_provider_profiles_inner(
     store: &Store,
     data: &Path,
     probe_usage: bool,
     rebalance: bool,
 ) -> Vec<ProviderProfileEntry> {
+    hydrate_profiles_from_store_if_postgres(store, data);
     let agents = store.list_agents().unwrap_or_default();
     let profiles_root = data.join("profiles");
     let _ = std::fs::create_dir_all(&profiles_root);
@@ -6648,6 +6710,7 @@ fn sync_and_list_provider_profiles_inner(
 
     if rebalance
         && !crate::sandbox::is_isolated_test_env()
+        && !crate::server::serverless::is_serverless_mode()
         && let Ok(store) = Store::open(data.join("state.db"))
     {
         rebalance_provider_profiles(&store, data, &agents, &entries);
@@ -6660,7 +6723,19 @@ fn sync_and_list_provider_profiles_inner(
         let is_root = agent.parent_id.is_none();
         let cfg = agent_config_dir(data, &agent.id);
         let expected_provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-        let bound = bound_profile_name(&cfg);
+        let bound = bound_profile_name(&cfg).or_else(|| {
+            if !store.is_postgres() {
+                return None;
+            }
+            store
+                .blob_store()
+                .get_agent_file(&agent.id, "markers", ".anyagents-profile")
+                .ok()
+                .flatten()
+                .and_then(|e| String::from_utf8(e.content).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
         let (bound_prov, bound_prof) = match bound.as_deref() {
             Some(s) if s.contains('/') => {
                 let (p, n) = s.split_once('/').unwrap_or((&expected_provider, "default"));
@@ -7821,9 +7896,21 @@ pub(crate) fn probe_one_profile_usage(
     }
     let last_usage_path = prof_dir.join(".anyagents-last-usage.txt");
     let now_ms = anyagents_core::now_ms();
+    let cred_newer_than_usage_cache = |cache_mtime: std::time::SystemTime| -> bool {
+        let rel = match provider {
+            "google-antigravity" => ".gemini/antigravity-cli/antigravity-oauth-token",
+            "openai" => ".codex/auth.json",
+            _ => return false,
+        };
+        std::fs::metadata(prof_dir.join(rel))
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .is_some_and(|tok_mtime| tok_mtime > cache_mtime)
+    };
     if provider != "anthropic"
         && let Ok(meta) = std::fs::metadata(&last_usage_path)
         && let Ok(mtime) = meta.modified()
+        && !cred_newer_than_usage_cache(mtime)
         && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH)
         && now_ms.saturating_sub(dur.as_millis() as i64) < 120_000
         && let Ok(cached) = std::fs::read_to_string(&last_usage_path)
@@ -8278,7 +8365,15 @@ pub(crate) fn probe_one_profile_usage(
                         .ok()
                         .and_then(|s| s.trim().parse::<i64>().ok())
                         .unwrap_or(0);
-                    if now_ms.saturating_sub(last_attempt_ms) < 300_000 {
+                    let tok_mtime_ms = std::fs::metadata(&tok_path)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    if tok_mtime_ms <= last_attempt_ms
+                        && now_ms.saturating_sub(last_attempt_ms) < 300_000
+                    {
                         let cached_expired = std::fs::read_to_string(&last_usage_path)
                             .ok()
                             .is_some_and(|s| s.trim().starts_with("oauth expired"));
@@ -8299,6 +8394,14 @@ pub(crate) fn probe_one_profile_usage(
                         write_seat_shared_file(&last_usage_path, b"oauth expired\n", 0o600);
                         return Some("oauth expired".to_string());
                     }
+                    let oauth_clients = extract_agy_oauth_clients();
+                    if oauth_clients.is_empty() {
+                        // Stateless/thin coordinators without a host `agy` binary rely on
+                        // native harness refreshes inside sandboxes synced back to storage.
+                        // Do not record a bogus local refresh attempt backoff marker.
+                        write_seat_shared_file(&last_usage_path, b"oauth expired\n", 0o600);
+                        return Some("oauth expired".to_string());
+                    }
                     let reservation = match OAuthRefreshDiskReservation::acquire(
                         &prof_dir,
                         &[tok_rel],
@@ -8315,7 +8418,7 @@ pub(crate) fn probe_one_profile_usage(
                         }
                     };
                     let mut refreshed_tokens = None;
-                    for (cid, csec) in extract_agy_oauth_clients() {
+                    for (cid, csec) in oauth_clients {
                         let form_body = format!(
                             "client_id={cid}&client_secret={csec}&refresh_token={rtok}&grant_type=refresh_token"
                         );
