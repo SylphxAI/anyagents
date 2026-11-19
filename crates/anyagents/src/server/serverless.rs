@@ -2123,7 +2123,7 @@ async fn run_serverless_sandbox_sign_in_with_handle(
          export TERM=dumb\n\
          export NO_COLOR=1\n\
          : > /tmp/anyagents-signin.log\n\
-         ( if command -v stdbuf >/dev/null 2>&1; then stdbuf -oL -eL {cmd}; else {cmd}; fi > /tmp/anyagents-signin.log 2>&1; printf '%s\\n' \"$?\" > /tmp/anyagents-signin.exit ) </dev/null >/dev/null 2>&1 &\n\
+         ( if [ -x /usr/bin/stdbuf ]; then /usr/bin/stdbuf -oL -eL {cmd}; else {cmd}; fi > /tmp/anyagents-signin.log 2>&1; printf '%s\\n' \"$?\" > /tmp/anyagents-signin.exit ) </dev/null >/dev/null 2>&1 &\n\
          printf '%s\\n' \"$!\" > /tmp/anyagents-signin.pid\n",
         cmd = spec.native_command,
     );
