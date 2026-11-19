@@ -1435,7 +1435,9 @@ pub(crate) fn ensure_seat_environment(target_config: &Path, workdir: &Path) -> R
         #[cfg(unix)]
         crate::seat_tree::set_runtime_dir_mode(&dir, 0o1777)?;
     }
-    crate::repo::configure_seat_git(target_config, workdir)?;
+    if !crate::sandbox_providers::SandboxMode::from_env().is_remote_required() {
+        crate::repo::configure_seat_git(target_config, workdir)?;
+    }
     #[cfg(unix)]
     {
         let shared: Vec<String> = std::env::var("ANYAGENTS_SHARED_HOME_DIRS")
@@ -4311,7 +4313,8 @@ fn propagate_credentials(
             )));
         }
         // Success markers must describe credentials that the seat can read.
-        if let Some(s) = store_opt.as_ref()
+        if !crate::sandbox_providers::SandboxMode::from_env().is_remote_required()
+            && let Some(s) = store_opt.as_ref()
             && let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec)
         {
             crate::sandbox::share_config_with_seat_uid_checked(&cfg, uid, gid)?;
