@@ -22,6 +22,15 @@ const BUILTIN_HARNESSES: [&str; 4] = [
     "cursor-cloud",
 ];
 
+fn canonical_install_id(harness: &str) -> &str {
+    let trimmed = harness.trim();
+    if trimmed.eq_ignore_ascii_case("spiron-local") {
+        "spiron"
+    } else {
+        normalize_harness_name(trimmed)
+    }
+}
+
 /// What one harness install ended as.
 #[derive(Clone, Debug)]
 pub struct Install {
@@ -101,7 +110,7 @@ impl Installer {
     /// `harnesses.toml` changes; a failure is never reused, so the next caller
     /// tries again. Only callers of the same harness wait on each other.
     pub fn ensure(&self, harness: &str) -> Result<Install, String> {
-        let harness = normalize_harness_name(harness);
+        let harness = canonical_install_id(harness);
         let slot = self.slot(harness);
         let _installing = slot
             .installing
@@ -153,7 +162,7 @@ impl Installer {
 
 /// Verify that `harness` names a known catalog entry.
 pub fn adapter(harness: &str) -> Result<(), anyagents_core::Error> {
-    let harness = normalize_harness_name(harness);
+    let harness = canonical_install_id(harness);
     let catalog = Catalog::builtin();
     if catalog.get(harness).is_some() {
         Ok(())
@@ -213,7 +222,7 @@ pub fn record(root: &Path, harness: &str) -> Result<Install, String> {
 /// this server has not needed it. It never installs anything and never waits
 /// on an install in progress.
 pub fn recorded(harness: &str) -> Option<Result<(), String>> {
-    let harness = normalize_harness_name(harness);
+    let harness = canonical_install_id(harness);
     INSTALLER
         .get()?
         .last(harness)
@@ -245,14 +254,14 @@ fn verified_launcher(root: &Path, harness: &str) -> Option<(String, PathBuf)> {
 /// Whether `harness` has a healthy verified installation on disk (or runs
 /// built-in inside this binary).
 pub fn is_healthy(root: &Path, harness: &str) -> bool {
-    let harness = normalize_harness_name(harness);
+    let harness = canonical_install_id(harness);
     BUILTIN_HARNESSES.contains(&harness) || verified_launcher(root, harness).is_some()
 }
 
 /// Version recorded by the current healthy managed receipt, `"builtin"` for
 /// built-in cloud harnesses, or `"-"` when nothing is installed.
 pub fn recorded_version(root: &Path, harness: &str) -> String {
-    let harness = normalize_harness_name(harness);
+    let harness = canonical_install_id(harness);
     if BUILTIN_HARNESSES.contains(&harness) {
         return "builtin".to_string();
     }
@@ -274,7 +283,7 @@ pub fn detect_version(root: &Path, harness: &str) -> String {
 /// 4. Uninstalled sentinel path under `<root>/harnesses/<id>/current/<id>` so
 ///    callers never silently fall back to `PATH`.
 pub fn program(root: &Path, harness: &str) -> PathBuf {
-    let harness = normalize_harness_name(harness);
+    let harness = canonical_install_id(harness);
     let var = env_override_var(harness);
     if let Some(named) = std::env::var_os(&var) {
         eprintln!("anyagents-install: {var} is declared-by-env (deprecated; removed in W2)");
@@ -306,7 +315,7 @@ pub fn update_harness_with_store(
     harness: &str,
     leases: Arc<dyn LeaseView>,
 ) -> Result<(String, String, bool), String> {
-    let harness = normalize_harness_name(harness);
+    let harness = canonical_install_id(harness);
     let lifecycle = Lifecycle::production(root, leases).map_err(|err| err.to_string())?;
     match lifecycle.tick(harness) {
         Ok(Tick::Promoted { from, to }) => Ok((from.unwrap_or_else(|| "-".to_string()), to, true)),

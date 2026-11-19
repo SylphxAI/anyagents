@@ -18,7 +18,7 @@ fn assert_fault(error: Error, needle: &str) {
 
 /// The store's search index connection (`memory_index.rs`).
 fn ix(store: &Store) -> std::sync::MutexGuard<'_, Connection> {
-    store.shared.memory_index.writer()
+    store.memory_index().sqlite_writer().unwrap()
 }
 
 fn reject_chunks(store: &Store) {
@@ -131,7 +131,7 @@ fn upgrading_moves_search_out_of_state_keeping_tool_summaries_and_outbound_order
     // Opening only renamed the old tables (their pages are not visited before
     // the server answers); they are dismantled afterwards, and the outbound
     // turn's position is read from its retired chunk until it is moved.
-    super::retired_search::finish(&mut store.shared.writer()).unwrap();
+    super::retired_search::finish(&mut store.sqlite_shared().writer()).unwrap();
     for table in [
         "retired_rag_chunks",
         "retired_rag_chunks_fts",
@@ -949,7 +949,7 @@ fn reindexing_a_chunk_replaces_only_its_own_search_row() {
             [&longer],
         )
         .unwrap();
-        memory_index::remove_chunk(&conn, &id).unwrap();
+        memory_index::remove_chunk(&*conn, &id).unwrap();
         let gone: i64 = conn
             .query_row(
                 "SELECT count(*) FROM rag_chunks_fts WHERE chunk_id MATCH ?2 AND chunk_id = ?1",
@@ -1180,7 +1180,7 @@ fn deleting_the_newest_agent_keeps_the_index_and_projects_reused_rowids_even_whe
             .unwrap();
         }
         memory_index::upsert_chunk(
-            &conn,
+            &*conn,
             &memory_index::Chunk {
                 id: &tool_row.0,
                 agent_id: &tool_row.1,
@@ -1228,7 +1228,7 @@ fn a_forced_rebuild_keeps_pending_changes_and_drops_orphaned_summaries() {
     let state = store.read_conn();
     let conn = ix(&store);
     memory_index::upsert_chunk(
-        &conn,
+        &*conn,
         &memory_index::Chunk {
             id: "tool_orphan",
             agent_id: "agt_gone",
@@ -1340,7 +1340,7 @@ fn fts_chunk_lookup_intersects_composite_tokens_and_handles_shared_prefix_upsert
         let id = format!("msg_01sharedprefix_{idx}");
         let body = format!("alpha token_{idx}");
         upsert_chunk(
-            &conn,
+            &*conn,
             &Chunk {
                 id: &id,
                 agent_id: agent.id.as_str(),
@@ -1358,7 +1358,7 @@ fn fts_chunk_lookup_intersects_composite_tokens_and_handles_shared_prefix_upsert
         .unwrap();
     }
     upsert_chunk(
-        &conn,
+        &*conn,
         &Chunk {
             id: "msg_01sharedprefix_7",
             agent_id: agent.id.as_str(),
@@ -1395,7 +1395,7 @@ fn fts_chunk_lookup_intersects_composite_tokens_and_handles_shared_prefix_upsert
         .unwrap();
     assert_eq!(fts_hits, 1);
 
-    remove_chunk(&conn, "msg_01sharedprefix_7").unwrap();
+    remove_chunk(&*conn, "msg_01sharedprefix_7").unwrap();
     let after_remove: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM rag_chunks_fts WHERE rag_chunks_fts MATCH '\"01sharedprefix\" AND \"7\"'",

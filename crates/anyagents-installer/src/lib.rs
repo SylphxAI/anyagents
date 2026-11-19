@@ -22,8 +22,28 @@ use anyagents_harness::normalize_harness_name;
 
 pub use catalog::{
     Catalog, CatalogEntry, DoctorSpec, EntryOverride, OVERRIDES, SubscriptionTerms,
-    builtin_catalog, builtin_runtimes, config_dir_variable,
+    builtin_runtimes,
 };
+
+/// The variable that points this harness at its private config directory.
+pub fn config_dir_variable(harness: &str) -> Option<&'static str> {
+    match normalize_harness_name(harness) {
+        "spiron-cloud" => Some("HOME"),
+        _ => catalog::config_dir_variable(harness),
+    }
+}
+
+/// All built-in harness catalog entries, ensuring cloud harnesses expose their
+/// private config directory variable consistently.
+pub fn builtin_catalog() -> Vec<CatalogEntry> {
+    let mut entries = catalog::builtin_catalog();
+    for entry in &mut entries {
+        if entry.id == "spiron-cloud" && entry.config_var.is_none() {
+            entry.config_var = config_dir_variable(&entry.id).map(str::to_string);
+        }
+    }
+    entries
+}
 pub use lifecycle::{HarnessStatus, Installed, Invocation, LeaseView, Lifecycle, NoLeases, Tick};
 
 /// Whether a (harness, model, auth) triple may be offered.
@@ -504,5 +524,16 @@ mod tests {
         .unwrap();
         assert!(sink.done);
         assert_eq!(sink.prompts_before_done, 1);
+    }
+
+    #[test]
+    fn spiron_cloud_uses_home_as_config_dir_variable() {
+        assert_eq!(config_dir_variable("spiron-cloud"), Some("HOME"));
+        let cat = builtin_catalog();
+        let entry = cat
+            .iter()
+            .find(|e| e.id == "spiron-cloud")
+            .expect("spiron-cloud catalog entry must exist");
+        assert_eq!(entry.config_var.as_deref(), Some("HOME"));
     }
 }

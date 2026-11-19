@@ -117,9 +117,9 @@ fn archive_then_create_refuses_all_kinds_before_deduplication() {
     // Simulate a pre-upgrade active row: deduplication must not bypass owner admission.
     store
         .write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agent_schedules SET state = 'active' WHERE id = ?1",
-                [&old.id],
+                &crate::db_params![old.id],
             )?;
             Ok(())
         })
@@ -167,7 +167,7 @@ fn archive_cancellation_failure_rolls_back_the_owner_transition() {
         let agent = store.create_agent(NewAgent::new("worker", "test")).unwrap();
         let timer = store.create_schedule(schedule(&agent, "every")).unwrap();
         store.write_tx(|tx| {
-            tx.execute_batch("CREATE TRIGGER reject_cancel BEFORE UPDATE OF state ON agent_schedules
+            tx.db_execute_batch("CREATE TRIGGER reject_cancel BEFORE UPDATE OF state ON agent_schedules
                 WHEN NEW.state = 'cancelled' BEGIN SELECT RAISE(ABORT, 'injected cancellation failure'); END")?;
             Ok(())
         }).unwrap();
@@ -229,15 +229,15 @@ fn archived_watch_history_is_not_rearmed_by_startup_repair() {
     let agent = store.create_agent(NewAgent::new("worker", "test")).unwrap();
     let watch = store.create_schedule(schedule(&agent, "watch")).unwrap();
     store.write_tx(|tx| {
-        tx.execute("UPDATE agent_schedules SET state = 'fired', last_observed = 'checks_completed' WHERE id = ?1", [&watch.id])?;
+        tx.db_execute("UPDATE agent_schedules SET state = 'fired', last_observed = 'checks_completed' WHERE id = ?1", &crate::db_params![watch.id])?;
         Ok(())
     }).unwrap();
     assert_eq!(store.restore_checks_completed_pr_watches().unwrap(), 1);
     store
         .write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agent_schedules SET state = 'fired' WHERE id = ?1",
-                [&watch.id],
+                &crate::db_params![watch.id],
             )?;
             Ok(())
         })

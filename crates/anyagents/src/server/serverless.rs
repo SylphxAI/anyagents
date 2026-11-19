@@ -1,0 +1,3283 @@
+//! Pure Serverless Coordinator engine (`ANYAGENTS_SERVERLESS=true`).
+//!
+//! Designed for scale-to-zero HTTP runtimes where coordinator pods may exit
+//! seconds after returning `200 OK`:
+//! - **Zero** long-lived background loops, `envd` streams, or Spiron SSE tasks.
+//! - Synchronous (<1s) detached sandbox dispatch (`provider.ensure()` +
+//!   `anyagents-guest turn --detached`) and async cloud turn submission
+//!   (`CloudTurnDriver::submit_turn`), persisted in `public.pending_remote_turns`.
+//! - Authenticated internal endpoints:
+//!   - `POST /v1/internal/guest/events`: constant-time per-turn SHA-256 bearer auth,
+//!     heartbeat + `inflight_children` updates, and idempotent turn settlement.
+//!   - `POST /v1/internal/cloud/events`: constant-time per-turn bearer or HMAC-SHA256
+//!     webhook verification, `CloudTurnDriver::parse_webhook`, and idempotent settlement.
+//!   - `POST /v1/internal/tick`: fail-closed `ANYAGENTS_TICK_TOKEN` and/or neutral
+//!     JWS/JWKS (`EdDSA` / `Ed25519`) authentication driving one bounded (<5s) pass of
+//!     due schedules, cloud turn polling, stale sandbox timeout detection, active
+//!     sandbox lease renewals, and singleton idle sandbox sweeping.
+
+use std::collections::{BTreeMap, HashMap};
+use std::io::Read as _;
+use std::path::Path;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyagents_core::stateless::{
+    NewRemoteTurn, PendingRemoteTurn, RemoteTurnEventUpdate, SettleRemoteTurn, constant_time_eq,
+    generate_callback_token, generate_turn_id, hash_callback_token, verify_callback_token_hash,
+    verify_hmac_sha256_signature,
+};
+use anyagents_core::{
+    Agent, AgentId, BillingMode, Incoming, NewUsage, RuntimeHeartbeat, Store, now_ms, utc_day,
+};
+use anyagents_tools::providers::{
+    ExecRequest, ImageSpec, LeasePolicy, ProviderKind, SandboxProvider as AsyncSandboxProvider,
+};
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ring::signature::{ED25519, UnparsedPublicKey};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+use super::{ApiError, AppState, resolve_remote_sandbox_workdir, spawn_store};
+use crate::cloud_harness::serverless::{
+    CloudTurnDriver, CloudTurnSubmitRequest, GenericHttpCloudDriver, SpironServerlessDriver,
+    resolve_cloud_driver_from_metadata,
+};
+use crate::sandbox_exec::{
+    GuestHeartbeatFrame, apply_guest_heartbeat, ensure_sandbox_with_provider,
+    resolve_registry_for_binding, resolve_remote_provider_registry, sandbox_handle_from_binding,
+    sweep_idle_sandboxes,
+};
+
+const DEFAULT_CLOUD_POLL_DELAY_MS: i64 = 5_000;
+const MAX_CLOUD_POLL_BACKOFF_MS: i64 = 30_000;
+const DEFAULT_SANDBOX_STALE_MS: i64 = 120_000;
+const DEFAULT_LEASE_RENEW_WINDOW_MS: i64 = 300_000;
+const DETACHED_EXEC_TIMEOUT_MS: u64 = 15_000;
+const JWKS_CACHE_TTL: Duration = Duration::from_secs(3600);
+const JWS_CLOCK_SKEW_SECS: i64 = 60;
+const TICK_CLOUD_POLL_LIMIT: usize = 32;
+const TICK_STALE_SANDBOX_LIMIT: usize = 32;
+
+/// Return `true` when `ANYAGENTS_SERVERLESS=true` is enabled.
+pub(crate) fn is_serverless_mode() -> bool {
+    anyagents_tools::serverless_enabled_from_env()
+}
+
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Resolve the coordinator's public base URL for serverless callbacks:
+/// `ANYAGENTS_PUBLIC_URL` -> `ANYAGENTS_WEBHOOK_URL` -> `[server] public_url` in `anyagents.toml`.
+pub(crate) fn resolve_public_url(data_dir: &Path) -> Option<String> {
+    if let Some(url) = env_non_empty("ANYAGENTS_PUBLIC_URL") {
+        return Some(url.trim_end_matches('/').to_string());
+    }
+    if let Some(url) = env_non_empty("ANYAGENTS_WEBHOOK_URL") {
+        return Some(url.trim_end_matches('/').to_string());
+    }
+    crate::remote::Settings::load(data_dir)
+        .ok()
+        .and_then(|s| s.public_url)
+        .map(|u| u.trim_end_matches('/').to_string())
+}
+
+/// Build `<PUBLIC_URL>/v1/internal/guest/events`.
+#[allow(dead_code)]
+pub(crate) fn guest_events_callback_url(data_dir: &Path) -> Option<String> {
+    resolve_public_url(data_dir).map(|base| format!("{base}/v1/internal/guest/events"))
+}
+
+/// Build `<PUBLIC_URL>/v1/internal/cloud/events`.
+#[allow(dead_code)]
+pub(crate) fn cloud_events_callback_url(data_dir: &Path) -> Option<String> {
+    resolve_public_url(data_dir).map(|base| format!("{base}/v1/internal/cloud/events"))
+}
+
+/// Return `ANYAGENTS_TICK_TOKEN` when configured and non-empty.
+pub(crate) fn configured_tick_token() -> Option<String> {
+    env_non_empty("ANYAGENTS_TICK_TOKEN")
+}
+
+fn sandbox_stale_threshold_ms() -> i64 {
+    env_non_empty("ANYAGENTS_SERVERLESS_SANDBOX_STALE_MS")
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(DEFAULT_SANDBOX_STALE_MS)
+}
+
+/// Return `true` when `harness` runs via an asynchronous cloud harness driver.
+pub(crate) fn is_serverless_cloud_harness(harness: &str) -> bool {
+    let lower = harness.trim().to_ascii_lowercase();
+    crate::vendor::is_cloud_harness(&lower) || matches!(lower.as_str(), "http-cloud" | "http_cloud")
+}
+
+/// Outbound reply destination persisted in `pending_remote_turns.metadata_json` so any
+/// replica can deliver the reply after scale-to-zero without holding caller state in memory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ReplyTarget {
+    Telegram {
+        chat_id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to_message_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bot: Option<String>,
+    },
+    Agent {
+        agent_id: String,
+    },
+}
+
+/// Input parameters for dispatching one remote turn synchronously (<1s) in serverless mode.
+#[derive(Clone)]
+pub(crate) struct ServerlessDispatchInput {
+    pub agent: Agent,
+    pub prompt: String,
+    pub message_seq: Option<i64>,
+    pub opener_id: Option<String>,
+    pub reply_target: Option<ReplyTarget>,
+    pub callback_base_url: Option<String>,
+    pub cloud_endpoint: Option<String>,
+    pub remote_agent_id: Option<String>,
+    pub sandbox_provider: Option<Arc<dyn AsyncSandboxProvider>>,
+    pub guest_binary: Option<String>,
+    pub guest_program: Option<String>,
+    pub guest_extra_args: Vec<String>,
+    pub heartbeat_interval_ms: Option<u64>,
+}
+
+impl ServerlessDispatchInput {
+    pub(crate) fn for_agent(agent: Agent, prompt: impl Into<String>) -> Self {
+        Self {
+            agent,
+            prompt: prompt.into(),
+            message_seq: None,
+            opener_id: None,
+            reply_target: None,
+            callback_base_url: None,
+            cloud_endpoint: None,
+            remote_agent_id: None,
+            sandbox_provider: None,
+            guest_binary: None,
+            guest_program: None,
+            guest_extra_args: Vec::new(),
+            heartbeat_interval_ms: None,
+        }
+    }
+}
+
+/// Result of a synchronous (<1s) serverless turn dispatch.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DispatchedRemoteTurn {
+    pub turn: PendingRemoteTurn,
+    /// One-time per-turn callback token handed to the detached guest / cloud harness
+    /// (only its SHA-256 hash is persisted in PostgreSQL).
+    pub callback_token: String,
+}
+
+async fn run_store_blocking<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("store worker join error: {e}"))?
+}
+
+/// Dispatch one remote turn synchronously in <1s without spawning any coordinator-side
+/// background loops or long-lived pipes/SSE streams.
+pub(crate) async fn dispatch_serverless_turn(
+    store: Arc<Store>,
+    input: ServerlessDispatchInput,
+) -> Result<DispatchedRemoteTurn, String> {
+    let base_url = input
+        .callback_base_url
+        .clone()
+        .or_else(|| resolve_public_url(store.data_dir()))
+        .ok_or_else(|| {
+            "serverless turn dispatch requires ANYAGENTS_PUBLIC_URL (or ANYAGENTS_WEBHOOK_URL)"
+                .to_string()
+        })?;
+    let base_url = base_url.trim_end_matches('/').to_string();
+
+    if is_serverless_cloud_harness(&input.agent.harness) {
+        dispatch_cloud_turn(store, input, &base_url).await
+    } else {
+        dispatch_sandbox_turn(store, input, &base_url).await
+    }
+}
+
+async fn dispatch_cloud_turn(
+    store: Arc<Store>,
+    input: ServerlessDispatchInput,
+    base_url: &str,
+) -> Result<DispatchedRemoteTurn, String> {
+    let canonical = anyagents_harness::normalize_harness_name(&input.agent.harness);
+    let harness_kind = if canonical == "spiron-cloud" {
+        "spiron"
+    } else {
+        "http_cloud"
+    };
+
+    let turn_id = generate_turn_id();
+    let callback_token = generate_callback_token();
+    let callback_token_hash = hash_callback_token(&callback_token);
+    let callback_url = format!("{base_url}/v1/internal/cloud/events");
+
+    // Load previously persisted Spiron/cloud remote agent ID from PG `agent_files`.
+    let saved_remote_agent = if let Some(rid) = input.remote_agent_id.clone() {
+        Some(rid)
+    } else {
+        let store_r = Arc::clone(&store);
+        let aid = input.agent.id.clone();
+        run_store_blocking(move || {
+            Ok(store_r
+                .blob_store()
+                .get_agent_file(&aid, "spiron_cloud", "remote_agent_id")
+                .ok()
+                .flatten()
+                .and_then(|b| String::from_utf8(b.content).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()))
+        })
+        .await?
+    };
+
+    let cloud_endpoint = input
+        .cloud_endpoint
+        .clone()
+        .or_else(|| {
+            if harness_kind == "spiron" {
+                env_non_empty("ANYAGENTS_SPIRON_CLOUD_URL")
+                    .or_else(|| env_non_empty("SPIRON_API_URL"))
+                    .or_else(|| env_non_empty("SPIRON_CLOUD_URL"))
+                    .or_else(|| Some("https://api.spiron.ai".to_string()))
+            } else {
+                env_non_empty("ANYAGENTS_CLOUD_HTTP_URL")
+            }
+        })
+        .ok_or_else(|| {
+            format!("no cloud endpoint configured for serverless harness `{harness_kind}`")
+        })?;
+
+    let mut meta = serde_json::Map::new();
+    meta.insert("cloud_endpoint".into(), json!(cloud_endpoint));
+    meta.insert("agent_harness".into(), json!(input.agent.harness));
+    if let Some(ref model) = input.agent.model {
+        meta.insert("agent_model".into(), json!(model));
+    }
+    if let Some(ref rid) = saved_remote_agent {
+        meta.insert("remote_agent_id".into(), json!(rid));
+    }
+    if let Some(seq) = input.message_seq {
+        meta.insert("message_seq".into(), json!(seq));
+    }
+    if let Some(ref opener) = input.opener_id {
+        meta.insert("opener_id".into(), json!(opener));
+    }
+    if let Some(ref rt) = input.reply_target {
+        meta.insert(
+            "reply_target".into(),
+            serde_json::to_value(rt).unwrap_or(Value::Null),
+        );
+    }
+    let meta_val = Value::Object(meta.clone());
+
+    let now = now_ms();
+    let store_create = Arc::clone(&store);
+    let new_turn = NewRemoteTurn {
+        turn_id: turn_id.clone(),
+        agent_id: input.agent.id.clone(),
+        harness_kind: harness_kind.to_string(),
+        provider_kind: Some(harness_kind.to_string()),
+        remote_run_id: None,
+        callback_token_hash,
+        cursor: None,
+        status: "dispatched".to_string(),
+        metadata_json: Some(meta_val.clone()),
+        next_poll_at_ms: Some(now.saturating_add(DEFAULT_CLOUD_POLL_DELAY_MS)),
+    };
+    let aid_mcp = input.agent.id.clone();
+    let base_url_mcp = base_url.to_string();
+    let (created, mcp_servers) = run_store_blocking(move || {
+        let created = store_create
+            .remote_turn_store()
+            .create_turn(&new_turn)
+            .map_err(|e| format!("failed to persist pending cloud turn: {e}"))?;
+        // Build per-turn Streamable HTTP MCP attachment (#5421) from a fresh remote session token.
+        let mcp_servers = store_create
+            .begin_remote_session(&aid_mcp, 3_782_000)
+            .ok()
+            .map(|issued| {
+                let mcp_url = format!("{base_url_mcp}{}?profile=remote", crate::remote::MCP_PATH);
+                json!([{
+                    "name": "anyagents",
+                    "url": mcp_url,
+                    "bearer_token": issued.token,
+                }])
+            });
+        Ok((created, mcp_servers))
+    })
+    .await?;
+
+    let driver = resolve_cloud_driver_from_metadata(harness_kind, Some(&meta_val), None)?;
+    let submit_req = CloudTurnSubmitRequest {
+        turn_id: turn_id.clone(),
+        agent_id: input.agent.id.as_str().to_string(),
+        remote_agent_id: saved_remote_agent,
+        prompt: input.prompt.clone(),
+        model: input.agent.model.clone(),
+        instructions: input.agent.instructions.clone(),
+        mcp_servers,
+        callback_url: Some(callback_url),
+        callback_token: Some(callback_token.clone()),
+        metadata: BTreeMap::new(),
+    };
+
+    let submission = match driver.submit_turn(&submit_req).await {
+        Ok(sub) => sub,
+        Err(err) => {
+            let store_fail = Arc::clone(&store);
+            let tid_fail = turn_id.clone();
+            let err_fail = err.clone();
+            let _ = run_store_blocking(move || {
+                let _ = store_fail.remote_turn_store().settle_turn(
+                    &tid_fail,
+                    &SettleRemoteTurn {
+                        status: "failed".to_string(),
+                        result_text: None,
+                        error_text: Some(err_fail),
+                        usage_json: None,
+                        cursor: None,
+                        settled_at_ms: now_ms(),
+                    },
+                );
+                Ok(())
+            })
+            .await;
+            return Err(err);
+        }
+    };
+
+    if let Some(ref remote_aid) = submission.remote_agent_id {
+        meta.insert("remote_agent_id".into(), json!(remote_aid));
+    }
+    let next_poll = submission
+        .next_poll_after_ms
+        .map(|d| now_ms().saturating_add(i64::try_from(d).unwrap_or(DEFAULT_CLOUD_POLL_DELAY_MS)));
+    let updated_meta = Value::Object(meta);
+
+    let store_upd = Arc::clone(&store);
+    let aid_upd = input.agent.id.clone();
+    let tid_upd = turn_id.clone();
+    let seq_upd = input.message_seq;
+    let final_turn = run_store_blocking(move || {
+        if let Some(ref remote_aid) = submission.remote_agent_id {
+            let _ = store_upd.blob_store().put_agent_file(
+                &aid_upd,
+                "spiron_cloud",
+                "remote_agent_id",
+                remote_aid.as_bytes(),
+                false,
+            );
+        }
+        let updated = store_upd
+            .remote_turn_store()
+            .update_remote_run(
+                &tid_upd,
+                Some(&submission.remote_run_id),
+                Some(if submission.status.is_terminal() {
+                    "running"
+                } else {
+                    submission.status.as_str()
+                }),
+                Some(next_poll),
+                Some(&updated_meta),
+            )
+            .map_err(|e| format!("failed to update remote_run_id: {e}"))?
+            .unwrap_or(created);
+
+        if let Some(seq) = seq_upd {
+            let _ = store_upd.note_delivered(&aid_upd, seq);
+        }
+        let _ = store_upd.update_runtime_heartbeat(
+            &aid_upd,
+            &RuntimeHeartbeat {
+                owner_replica_id: Some(store_upd.replica_id().to_string()),
+                turn_state: "in_turn".to_string(),
+                retry_at_ms: None,
+                heartbeat_at_ms: Some(now_ms()),
+                idle_since_ms: None,
+                inflight_children: 0,
+            },
+        );
+
+        if submission.status.is_terminal() {
+            let settled = settle_remote_turn_and_deliver(
+                &store_upd,
+                &tid_upd,
+                SettleRemoteTurn {
+                    status: submission.status.as_str().to_string(),
+                    result_text: submission.result_text,
+                    error_text: submission.error_text,
+                    usage_json: submission.usage,
+                    cursor: submission.cursor,
+                    settled_at_ms: now_ms(),
+                },
+                None,
+                0,
+            )?;
+            return Ok(settled.map(|s| s.turn).unwrap_or(updated));
+        }
+
+        Ok(updated)
+    })
+    .await?;
+
+    Ok(DispatchedRemoteTurn {
+        turn: final_turn,
+        callback_token,
+    })
+}
+
+async fn dispatch_sandbox_turn(
+    store: Arc<Store>,
+    input: ServerlessDispatchInput,
+    base_url: &str,
+) -> Result<DispatchedRemoteTurn, String> {
+    let provider: Arc<dyn AsyncSandboxProvider> = if let Some(p) = input.sandbox_provider.clone() {
+        p
+    } else if let Some(reg) = resolve_remote_provider_registry(Some(store.data_dir()))? {
+        reg.active()
+    } else {
+        let store_b = Arc::clone(&store);
+        let aid_b = input.agent.id.clone();
+        let existing =
+            run_store_blocking(move || Ok(store_b.sandbox_binding(&aid_b).ok().flatten())).await?;
+        if let Some(existing) = existing
+            && existing.provider != "legacy_http"
+            && existing.provider != "local"
+        {
+            resolve_registry_for_binding(Some(store.data_dir()), &existing)?.active()
+        } else {
+            return Err(
+                "serverless sandbox dispatch requires a configured SandboxProvider (`ANYAGENTS_SANDBOX_PROVIDER`)"
+                    .to_string(),
+            );
+        }
+    };
+
+    let provider_kind_str = provider.kind().as_str().to_string();
+    let turn_id = generate_turn_id();
+    let callback_token = generate_callback_token();
+    let callback_token_hash = hash_callback_token(&callback_token);
+    let callback_url = format!("{base_url}/v1/internal/guest/events");
+
+    let mut meta = serde_json::Map::new();
+    meta.insert("agent_harness".into(), json!(input.agent.harness));
+    if let Some(ref model) = input.agent.model {
+        meta.insert("agent_model".into(), json!(model));
+    }
+    if let Some(seq) = input.message_seq {
+        meta.insert("message_seq".into(), json!(seq));
+    }
+    if let Some(ref opener) = input.opener_id {
+        meta.insert("opener_id".into(), json!(opener));
+    }
+    if let Some(ref rt) = input.reply_target {
+        meta.insert(
+            "reply_target".into(),
+            serde_json::to_value(rt).unwrap_or(Value::Null),
+        );
+    }
+
+    let store_create = Arc::clone(&store);
+    let new_turn = NewRemoteTurn {
+        turn_id: turn_id.clone(),
+        agent_id: input.agent.id.clone(),
+        harness_kind: "sandbox".to_string(),
+        provider_kind: Some(provider_kind_str),
+        remote_run_id: None,
+        callback_token_hash,
+        cursor: None,
+        status: "dispatched".to_string(),
+        metadata_json: Some(Value::Object(meta)),
+        next_poll_at_ms: None,
+    };
+    let created = run_store_blocking(move || {
+        store_create
+            .remote_turn_store()
+            .create_turn(&new_turn)
+            .map_err(|e| format!("failed to persist pending sandbox turn: {e}"))
+    })
+    .await?;
+
+    let store_ensure = Arc::clone(&store);
+    let provider_ensure = Arc::clone(&provider);
+    let agent_ensure = input.agent.clone();
+    let ensured = tokio::task::spawn_blocking(move || {
+        let cfg_dir = anyagents_core::agent_config_dir(store_ensure.data_dir(), &agent_ensure.id);
+        let remote_workdir = resolve_remote_sandbox_workdir(&store_ensure, &agent_ensure);
+        ensure_sandbox_with_provider(
+            &store_ensure,
+            provider_ensure,
+            &ImageSpec::default(),
+            &LeasePolicy::default(),
+            None,
+            None,
+            &agent_ensure.id,
+            Some(&agent_ensure.name),
+            &cfg_dir,
+            Some(&remote_workdir),
+            &BTreeMap::new(),
+        )
+    })
+    .await
+    .map_err(|e| format!("sandbox ensure join error: {e}"))?;
+
+    let ensured = match ensured {
+        Ok(e) => e,
+        Err(err) => {
+            let store_fail = Arc::clone(&store);
+            let tid_fail = turn_id.clone();
+            let err_fail = err.clone();
+            let _ = run_store_blocking(move || {
+                let _ = store_fail.remote_turn_store().settle_turn(
+                    &tid_fail,
+                    &SettleRemoteTurn {
+                        status: "failed".to_string(),
+                        result_text: None,
+                        error_text: Some(err_fail),
+                        usage_json: None,
+                        cursor: None,
+                        settled_at_ms: now_ms(),
+                    },
+                );
+                Ok(())
+            })
+            .await;
+            return Err(err);
+        }
+    };
+
+    let guest_bin = input
+        .guest_binary
+        .clone()
+        .or_else(|| env_non_empty("ANYAGENTS_SANDBOX_GUEST_PATH"))
+        .unwrap_or_else(|| "/usr/local/bin/anyagents-guest".to_string());
+
+    let mut argv = vec![
+        guest_bin,
+        "turn".to_string(),
+        "--detached".to_string(),
+        "--turn-id".to_string(),
+        turn_id.clone(),
+        "--agent-id".to_string(),
+        input.agent.id.as_str().to_string(),
+        "--harness".to_string(),
+        input.agent.harness.clone(),
+        "--prompt-stdin".to_string(),
+        "--callback-url".to_string(),
+        callback_url,
+        "--callback-token".to_string(),
+        callback_token.clone(),
+        "--state-dir".to_string(),
+        ensured.handle.state_dir.clone(),
+        "--workdir".to_string(),
+        ensured.handle.workdir.clone(),
+    ];
+    if let Some(ref prog) = input.guest_program {
+        argv.push("--program".to_string());
+        argv.push(prog.clone());
+    }
+    if let Some(ref model) = input.agent.model
+        && !model.trim().is_empty()
+    {
+        argv.push("--model".to_string());
+        argv.push(model.clone());
+    }
+    if let Some(hb) = input.heartbeat_interval_ms {
+        argv.push("--heartbeat-interval-ms".to_string());
+        argv.push(hb.to_string());
+    }
+    if !input.guest_extra_args.is_empty() {
+        argv.push("--".to_string());
+        argv.extend(input.guest_extra_args.iter().cloned());
+    }
+
+    let exec_req = ExecRequest::argv(argv)
+        .with_cwd(ensured.handle.workdir.clone())
+        .with_stdin(input.prompt.into_bytes())
+        .with_timeout_ms(DETACHED_EXEC_TIMEOUT_MS);
+
+    let out = match provider.exec(&ensured.handle, &exec_req).await {
+        Ok(o) => o,
+        Err(err) => {
+            let store_fail = Arc::clone(&store);
+            let tid_fail = turn_id.clone();
+            let err_fail = err.clone();
+            let _ = run_store_blocking(move || {
+                let _ = store_fail.remote_turn_store().settle_turn(
+                    &tid_fail,
+                    &SettleRemoteTurn {
+                        status: "failed".to_string(),
+                        result_text: None,
+                        error_text: Some(err_fail),
+                        usage_json: None,
+                        cursor: None,
+                        settled_at_ms: now_ms(),
+                    },
+                );
+                Ok(())
+            })
+            .await;
+            return Err(err);
+        }
+    };
+
+    if out.exit_code != 0 {
+        let diag = format!(
+            "detached guest launch failed (exit {}): {}",
+            out.exit_code,
+            out.stderr.trim()
+        );
+        let store_fail = Arc::clone(&store);
+        let tid_fail = turn_id.clone();
+        let diag_fail = diag.clone();
+        let _ = run_store_blocking(move || {
+            let _ = store_fail.remote_turn_store().settle_turn(
+                &tid_fail,
+                &SettleRemoteTurn {
+                    status: "failed".to_string(),
+                    result_text: None,
+                    error_text: Some(diag_fail),
+                    usage_json: None,
+                    cursor: None,
+                    settled_at_ms: now_ms(),
+                },
+            );
+            Ok(())
+        })
+        .await;
+        return Err(diag);
+    }
+
+    let remote_run_id = serde_json::from_str::<Value>(out.stdout.trim())
+        .ok()
+        .and_then(|v| v.get("pid").and_then(Value::as_u64))
+        .map(|pid| format!("pid:{pid}"));
+
+    let store_upd = Arc::clone(&store);
+    let aid_upd = input.agent.id.clone();
+    let tid_upd = turn_id.clone();
+    let seq_upd = input.message_seq;
+    let updated = run_store_blocking(move || {
+        let updated = store_upd
+            .remote_turn_store()
+            .update_remote_run(
+                &tid_upd,
+                remote_run_id.as_deref(),
+                Some("running"),
+                None,
+                None,
+            )
+            .map_err(|e| format!("failed to update sandbox remote_run_id: {e}"))?
+            .unwrap_or(created);
+
+        if let Some(seq) = seq_upd {
+            let _ = store_upd.note_delivered(&aid_upd, seq);
+        }
+        let _ = store_upd.update_runtime_heartbeat(
+            &aid_upd,
+            &RuntimeHeartbeat {
+                owner_replica_id: Some(store_upd.replica_id().to_string()),
+                turn_state: "in_turn".to_string(),
+                retry_at_ms: None,
+                heartbeat_at_ms: Some(now_ms()),
+                idle_since_ms: None,
+                inflight_children: 0,
+            },
+        );
+        Ok(updated)
+    })
+    .await?;
+
+    Ok(DispatchedRemoteTurn {
+        turn: updated,
+        callback_token,
+    })
+}
+
+/// When `ANYAGENTS_SERVERLESS=true`, synchronously dispatch the next undelivered mailbox
+/// message for `agent_id` (if no remote turn is already active for it). Returns `Ok(None)`
+/// immediately when not in serverless mode or when nothing is eligible.
+pub(crate) async fn dispatch_next_mailbox_message_if_serverless(
+    store: Arc<Store>,
+    agent_id: &AgentId,
+) -> Result<Option<DispatchedRemoteTurn>, String> {
+    if !is_serverless_mode() {
+        return Ok(None);
+    }
+    let store_r = Arc::clone(&store);
+    let aid = agent_id.clone();
+    let next_item = run_store_blocking(move || {
+        let agent = store_r
+            .agent(&aid)
+            .map_err(|e| format!("load agent {aid}: {e}"))?;
+        if matches!(agent.state.as_str(), "paused" | "archived") {
+            return Ok(None);
+        }
+        let active = store_r
+            .remote_turn_store()
+            .list_active_for_agent(&aid)
+            .map_err(|e| e.to_string())?;
+        if !active.is_empty() {
+            return Ok(None);
+        }
+        let Some(msg) = store_r.next_undelivered(&aid).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        Ok(Some((agent, msg)))
+    })
+    .await?;
+
+    let Some((agent, msg)) = next_item else {
+        return Ok(None);
+    };
+
+    let reply_target = infer_reply_target_from_message(&msg);
+    let mut input = ServerlessDispatchInput::for_agent(agent, msg.text);
+    input.message_seq = Some(msg.seq);
+    input.opener_id = Some(msg.id.to_string());
+    input.reply_target = reply_target;
+    dispatch_serverless_turn(store, input).await.map(Some)
+}
+
+fn infer_reply_target_from_message(msg: &anyagents_core::Message) -> Option<ReplyTarget> {
+    if let Some(ref origin) = msg.origin
+        && let Some(chat_id) = origin.chat_id
+    {
+        return Some(ReplyTarget::Telegram {
+            chat_id,
+            thread_id: origin.thread_id,
+            reply_to_message_id: origin.message_id,
+            bot: None,
+        });
+    }
+    if let Some(ref sender) = msg.sender
+        && let Some(aid) = sender.strip_prefix("agent:")
+        && AgentId::parse(aid).is_ok()
+    {
+        return Some(ReplyTarget::Agent {
+            agent_id: aid.to_string(),
+        });
+    }
+    None
+}
+
+// ============================================================================
+// Idempotent Settlement + Persistence + Outbound Delivery
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub(crate) struct SettleAndDeliverResult {
+    pub turn: PendingRemoteTurn,
+    pub settled_now: bool,
+    pub delivered_reply: bool,
+}
+
+/// Idempotently settle `turn_id` in `pending_remote_turns`, persist transcript + usage
+/// records in PostgreSQL, update runtime & sandbox idle state, and trigger outbound
+/// delivery (Telegram or parent/peer agent mailbox) strictly once.
+pub(crate) fn settle_remote_turn_and_deliver(
+    store: &Store,
+    turn_id: &str,
+    settlement: SettleRemoteTurn,
+    session_id: Option<&str>,
+    inflight_children: i32,
+) -> Result<Option<SettleAndDeliverResult>, String> {
+    let Some(outcome) = store
+        .remote_turn_store()
+        .settle_turn(turn_id, &settlement)
+        .map_err(|e| format!("settle_turn failed: {e}"))?
+    else {
+        return Ok(None);
+    };
+
+    if !outcome.transitioned {
+        return Ok(Some(SettleAndDeliverResult {
+            turn: outcome.turn,
+            settled_now: false,
+            delivered_reply: false,
+        }));
+    }
+
+    let turn = outcome.turn;
+    let now = now_ms();
+    let agent = store.agent(&turn.agent_id).ok();
+    let harness_label = agent
+        .as_ref()
+        .map(|a| a.harness.clone())
+        .or_else(|| {
+            turn.metadata_json
+                .as_ref()
+                .and_then(|m| m.get("agent_harness").and_then(Value::as_str))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| turn.harness_kind.clone());
+    let model_label = agent
+        .as_ref()
+        .and_then(|a| a.model.clone())
+        .or_else(|| {
+            turn.metadata_json
+                .as_ref()
+                .and_then(|m| m.get("agent_model").and_then(Value::as_str))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "default".to_string());
+
+    // 1. Persist vendor session ID pin into `agent_files` (shared across all replicas).
+    if let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        let _ = store.blob_store().put_agent_file(
+            &turn.agent_id,
+            "session_pin",
+            &format!("{harness_label}-session-id"),
+            format!("{sid}\n").as_bytes(),
+            false,
+        );
+    }
+
+    // 2. Persist turn transcript artifact into PG `agent_files` (`sessions/turns/<turn_id>.json`).
+    let transcript_doc = json!({
+        "turn_id": turn.turn_id,
+        "agent_id": turn.agent_id.as_str(),
+        "harness_kind": turn.harness_kind,
+        "provider_kind": turn.provider_kind,
+        "remote_run_id": turn.remote_run_id,
+        "session_id": session_id,
+        "status": turn.status,
+        "result_text": turn.result_text,
+        "error_text": turn.error_text,
+        "usage": turn.usage_json,
+        "settled_at_ms": now,
+    });
+    if let Ok(bytes) = serde_json::to_vec(&transcript_doc) {
+        let _ = store.blob_store().put_agent_file(
+            &turn.agent_id,
+            "sessions",
+            &format!("turns/{}.json", turn.turn_id),
+            &bytes,
+            false,
+        );
+    }
+
+    // 3. Persist usage telemetry into `usage_records` when non-empty.
+    if let Some(ref usage) = turn.usage_json {
+        let input_tokens = usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as i64;
+        let output_tokens = usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as i64;
+        let cache_read_tokens = usage
+            .get("cache_read_input_tokens")
+            .or_else(|| usage.get("cache_read_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as i64;
+        let cache_write_tokens = usage
+            .get("cache_creation_input_tokens")
+            .or_else(|| usage.get("cache_write_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as i64;
+        let reported_cost_micros = usage
+            .get("reported_cost_micros")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                usage
+                    .get("total_cost_usd")
+                    .and_then(Value::as_f64)
+                    .map(|usd| (usd * 1_000_000.0).round() as i64)
+            });
+
+        if input_tokens > 0
+            || output_tokens > 0
+            || cache_read_tokens > 0
+            || cache_write_tokens > 0
+            || reported_cost_micros.is_some()
+        {
+            let _ = store.record_usage(NewUsage {
+                agent_id: turn.agent_id.clone(),
+                harness: harness_label,
+                model: Some(model_label),
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reported_cost_micros,
+                estimated_cost_micros: reported_cost_micros,
+                billing_mode: BillingMode::ApiKey,
+                quota_state: None,
+                day: utc_day(now),
+            });
+        }
+    }
+
+    // 4. Advance durable mailbox turn terminal ledger if `message_seq` was recorded.
+    if let Some(seq) = turn
+        .metadata_json
+        .as_ref()
+        .and_then(|m| m.get("message_seq").and_then(Value::as_i64))
+    {
+        if turn.status == "completed" {
+            let opener = turn
+                .metadata_json
+                .as_ref()
+                .and_then(|m| m.get("opener_id").and_then(Value::as_str));
+            let exact = opener.zip(turn.result_text.as_deref());
+            let _ = store.note_turn_completed_with_output_for(&turn.agent_id, seq, exact);
+        } else {
+            let err_text = turn
+                .error_text
+                .as_deref()
+                .unwrap_or("serverless turn failed");
+            let _ = store.note_turn_errored_for(&turn.agent_id, seq, err_text, false);
+        }
+    }
+
+    // 5. Update `agent_runtime` heartbeat & `agent_sandbox_bindings` idle marker.
+    let still_active = store
+        .remote_turn_store()
+        .list_active_for_agent(&turn.agent_id)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let busy = still_active || inflight_children > 0;
+    let idle_since = (!busy).then_some(now);
+    let _ = store.update_runtime_heartbeat(
+        &turn.agent_id,
+        &RuntimeHeartbeat {
+            owner_replica_id: Some(store.replica_id().to_string()),
+            turn_state: if busy { "in_turn" } else { "idle" }.to_string(),
+            retry_at_ms: None,
+            heartbeat_at_ms: Some(now),
+            idle_since_ms: idle_since,
+            inflight_children: inflight_children.max(0),
+        },
+    );
+    if let Ok(Some(binding)) = store.sandbox_binding(&turn.agent_id) {
+        let _ = store
+            .sandbox_binding_store()
+            .touch_heartbeat(&turn.agent_id, now);
+        if binding.lease_state == "ready" {
+            let next_idle = if busy {
+                None
+            } else {
+                binding.idle_since_ms.or(idle_since)
+            };
+            if binding.idle_since_ms != next_idle {
+                let _ = store.sandbox_binding_store().update_lease_state(
+                    &turn.agent_id,
+                    "ready",
+                    next_idle,
+                );
+            }
+        }
+    }
+
+    // 6. Trigger outbound reply delivery if configured and turn completed with text.
+    let mut delivered_reply = false;
+    if turn.status == "completed"
+        && let Some(ref reply_text) = turn.result_text
+        && !reply_text.trim().is_empty()
+        && let Some(rt_val) = turn
+            .metadata_json
+            .as_ref()
+            .and_then(|m| m.get("reply_target"))
+        && let Ok(reply_target) = serde_json::from_value::<ReplyTarget>(rt_val.clone())
+    {
+        match reply_target {
+            ReplyTarget::Agent { agent_id: target } => {
+                if let Ok(target_aid) = AgentId::parse(&target) {
+                    let mut incoming = Incoming::new(reply_text.clone());
+                    incoming.sender = Some(format!("agent:{}", turn.agent_id));
+                    incoming.source_key = Some(format!("serverless-reply:{}", turn.turn_id));
+                    if store.receive(&target_aid, incoming).is_ok() {
+                        delivered_reply = true;
+                    }
+                }
+            }
+            ReplyTarget::Telegram {
+                chat_id,
+                thread_id,
+                reply_to_message_id,
+                bot,
+            } => {
+                let from_name = agent
+                    .as_ref()
+                    .map(|a| a.name.as_str())
+                    .unwrap_or(turn.agent_id.as_str());
+                if crate::telegram::post_text(
+                    store,
+                    store.data_dir(),
+                    from_name,
+                    bot.as_deref(),
+                    chat_id,
+                    reply_text,
+                    reply_to_message_id,
+                    thread_id,
+                )
+                .is_ok()
+                {
+                    delivered_reply = true;
+                }
+            }
+        }
+    }
+
+    Ok(Some(SettleAndDeliverResult {
+        turn,
+        settled_now: true,
+        delivered_reply,
+    }))
+}
+
+// ============================================================================
+// HTTP Endpoint 1: POST /v1/internal/guest/events
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct GuestEventPayload {
+    pub turn_id: String,
+    pub event_type: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub timestamp_ms: Option<i64>,
+    #[serde(default)]
+    pub turn_state: Option<String>,
+    #[serde(default)]
+    pub active_turns: Option<u64>,
+    #[serde(default)]
+    pub queued_turns: Option<u64>,
+    #[serde(default)]
+    pub inflight_children: Option<i32>,
+    #[serde(default)]
+    pub busy: Option<bool>,
+    #[serde(default)]
+    pub seq: Option<u64>,
+    #[serde(default)]
+    pub result_text: Option<String>,
+    #[serde(default)]
+    pub error_text: Option<String>,
+    #[serde(default)]
+    pub usage: Option<Value>,
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .trim();
+    raw.strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// `POST /v1/internal/guest/events`: authenticated detached guest push-callback ingress.
+///
+/// Verifies per-turn `Authorization: Bearer <callback-token>` via constant-time SHA-256
+/// comparison against `pending_remote_turns.callback_token_hash` (fail-closed `401`).
+pub(crate) async fn guest_events_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<GuestEventPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(token) = extract_bearer_token(&headers) else {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "missing Authorization: Bearer callback token",
+        ));
+    };
+    if payload.turn_id.trim().is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "missing turn_id"));
+    }
+
+    let store = Arc::clone(&state.store);
+    spawn_store(move || {
+        let Some(turn) = store
+            .remote_turn_store()
+            .verify_callback_token(&payload.turn_id, &token)
+            .map_err(ApiError::from_store)?
+        else {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid callback token for turn",
+            ));
+        };
+
+        if let Some(ref claimed_aid) = payload.agent_id
+            && claimed_aid.trim() != turn.agent_id.as_str()
+        {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "agent_id mismatch for callback token",
+            ));
+        }
+
+        let ts = payload
+            .timestamp_ms
+            .filter(|&t| t > 0)
+            .unwrap_or_else(now_ms);
+        match payload.event_type.trim().to_ascii_lowercase().as_str() {
+            "heartbeat" => {
+                let _ = store
+                    .remote_turn_store()
+                    .record_event(
+                        &turn.turn_id,
+                        &RemoteTurnEventUpdate {
+                            status: Some("running".to_string()),
+                            cursor: None,
+                            remote_run_id: None,
+                            last_event_at_ms: ts,
+                            next_poll_at_ms: None,
+                        },
+                    )
+                    .map_err(ApiError::from_store)?;
+
+                let active_turns = payload.active_turns.unwrap_or(1);
+                let queued_turns = payload.queued_turns.unwrap_or(0);
+                let inflight_children = payload.inflight_children.unwrap_or(0).max(0);
+                let turn_state = payload.turn_state.clone().unwrap_or_else(|| {
+                    if active_turns > 0 || queued_turns > 0 {
+                        "in_turn".to_string()
+                    } else {
+                        "idle".to_string()
+                    }
+                });
+                let busy = payload.busy.unwrap_or(false)
+                    || active_turns > 0
+                    || queued_turns > 0
+                    || inflight_children > 0
+                    || turn_state != "idle";
+                let frame = GuestHeartbeatFrame {
+                    timestamp_ms: ts,
+                    turn_state,
+                    active_turns,
+                    queued_turns,
+                    inflight_children,
+                    busy,
+                };
+                apply_guest_heartbeat(&store, &turn.agent_id, &frame, ts)
+                    .map_err(ApiError::from_store)?;
+
+                Ok(Json(json!({
+                    "ok": true,
+                    "turn_id": turn.turn_id,
+                    "event_type": "heartbeat",
+                })))
+            }
+            "delta" => {
+                let cursor = payload.seq.map(|s| format!("delta:{s}"));
+                let _ = store
+                    .remote_turn_store()
+                    .record_event(
+                        &turn.turn_id,
+                        &RemoteTurnEventUpdate {
+                            status: Some("running".to_string()),
+                            cursor,
+                            remote_run_id: None,
+                            last_event_at_ms: ts,
+                            next_poll_at_ms: None,
+                        },
+                    )
+                    .map_err(ApiError::from_store)?;
+                Ok(Json(json!({
+                    "ok": true,
+                    "turn_id": turn.turn_id,
+                    "event_type": "delta",
+                })))
+            }
+            "turn_complete" | "completed" => {
+                let settled = settle_remote_turn_and_deliver(
+                    &store,
+                    &turn.turn_id,
+                    SettleRemoteTurn {
+                        status: "completed".to_string(),
+                        result_text: payload.result_text,
+                        error_text: None,
+                        usage_json: payload.usage,
+                        cursor: None,
+                        settled_at_ms: ts,
+                    },
+                    payload.session_id.as_deref(),
+                    payload.inflight_children.unwrap_or(0).max(0),
+                )
+                .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
+                Ok(Json(json!({
+                    "ok": true,
+                    "turn_id": settled.turn.turn_id,
+                    "status": settled.turn.status,
+                    "settled": settled.settled_now,
+                    "idempotent_replay": !settled.settled_now,
+                    "delivered_reply": settled.delivered_reply,
+                })))
+            }
+            "turn_failed" | "failed" => {
+                let settled = settle_remote_turn_and_deliver(
+                    &store,
+                    &turn.turn_id,
+                    SettleRemoteTurn {
+                        status: "failed".to_string(),
+                        result_text: None,
+                        error_text: payload
+                            .error_text
+                            .or_else(|| Some("guest turn failed".to_string())),
+                        usage_json: payload.usage,
+                        cursor: None,
+                        settled_at_ms: ts,
+                    },
+                    payload.session_id.as_deref(),
+                    payload.inflight_children.unwrap_or(0).max(0),
+                )
+                .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
+                Ok(Json(json!({
+                    "ok": true,
+                    "turn_id": settled.turn.turn_id,
+                    "status": settled.turn.status,
+                    "settled": settled.settled_now,
+                    "idempotent_replay": !settled.settled_now,
+                })))
+            }
+            "turn_cancelled" | "cancelled" | "canceled" => {
+                let settled = settle_remote_turn_and_deliver(
+                    &store,
+                    &turn.turn_id,
+                    SettleRemoteTurn {
+                        status: "cancelled".to_string(),
+                        result_text: None,
+                        error_text: payload.error_text,
+                        usage_json: payload.usage,
+                        cursor: None,
+                        settled_at_ms: ts,
+                    },
+                    payload.session_id.as_deref(),
+                    payload.inflight_children.unwrap_or(0).max(0),
+                )
+                .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
+                Ok(Json(json!({
+                    "ok": true,
+                    "turn_id": settled.turn.turn_id,
+                    "status": settled.turn.status,
+                    "settled": settled.settled_now,
+                    "idempotent_replay": !settled.settled_now,
+                })))
+            }
+            other => Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported guest event_type `{other}`"),
+            )),
+        }
+    })
+    .await
+}
+
+// ============================================================================
+// HTTP Endpoint 2: POST /v1/internal/cloud/events
+// ============================================================================
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct CloudEventsQuery {
+    #[serde(default)]
+    pub driver: Option<String>,
+}
+
+fn headers_to_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|val| (k.as_str().to_string(), val.to_string()))
+        })
+        .collect()
+}
+
+/// `POST /v1/internal/cloud/events`: authenticated push webhook ingress for Spiron and
+/// vendor-neutral HTTP cloud harnesses.
+///
+/// Fails closed (`401`) unless authenticated by either:
+/// 1. Per-turn `Authorization: Bearer <callback-token>` matching `callback_token_hash`
+///    in constant time, OR
+/// 2. Configured webhook HMAC-SHA256 / Bearer secret (`ANYAGENTS_SPIRON_WEBHOOK_SECRET`
+///    or `ANYAGENTS_CLOUD_WEBHOOK_SECRET`).
+pub(crate) async fn cloud_events_route(
+    State(state): State<AppState>,
+    Query(query): Query<CloudEventsQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    let header_pairs = headers_to_pairs(&headers);
+    let bearer_opt = extract_bearer_token(&headers);
+    let driver_hint = query
+        .driver
+        .as_deref()
+        .or_else(|| {
+            headers
+                .get("x-anyagents-cloud-driver")
+                .and_then(|v| v.to_str().ok())
+        })
+        .map(|s| s.trim().to_ascii_lowercase());
+
+    let store = Arc::clone(&state.store);
+    spawn_store(move || {
+        // Choose driver parser: explicit hint, or infer Spiron when Spiron signature header
+        // or Spiron `message.*` event / `task_id` / `receipt_id` is present.
+        let use_spiron = match driver_hint.as_deref() {
+            Some("spiron" | "spiron-cloud" | "spiron_cloud") => true,
+            Some("http_cloud" | "http-cloud" | "generic") => false,
+            _ => {
+                headers.contains_key("x-spiron-signature-256")
+                    || serde_json::from_slice::<Value>(&body)
+                        .ok()
+                        .is_some_and(|v| {
+                            let data = v.get("data").unwrap_or(&v);
+                            data.get("task_id").is_some()
+                                || data.get("receipt_id").is_some()
+                                || v.get("event").and_then(Value::as_str).is_some_and(|e| {
+                                    e.starts_with("message.") || e.starts_with("run.")
+                                })
+                        })
+            }
+        };
+
+        let configured_secret = if use_spiron {
+            env_non_empty("ANYAGENTS_SPIRON_WEBHOOK_SECRET")
+                .or_else(|| env_non_empty("ANYAGENTS_CLOUD_WEBHOOK_SECRET"))
+        } else {
+            env_non_empty("ANYAGENTS_CLOUD_WEBHOOK_SECRET")
+                .or_else(|| env_non_empty("ANYAGENTS_SPIRON_WEBHOOK_SECRET"))
+        };
+
+        // Check whether a configured shared webhook secret authenticates this request.
+        let hmac_or_shared_ok = if let Some(ref secret) = configured_secret {
+            let sig_ok = [
+                "x-spiron-signature-256",
+                "x-webhook-signature-256",
+                "x-hub-signature-256",
+            ]
+            .iter()
+            .filter_map(|name| headers.get(*name).and_then(|v| v.to_str().ok()))
+            .any(|sig| verify_hmac_sha256_signature(secret.as_bytes(), &body, sig));
+            let bearer_shared_ok = bearer_opt
+                .as_deref()
+                .is_some_and(|b| constant_time_eq(secret.as_bytes(), b.as_bytes()));
+            sig_ok || bearer_shared_ok
+        } else {
+            false
+        };
+
+        // Parse payload through the canonical CloudTurnDriver::parse_webhook.
+        let driver: Box<dyn CloudTurnDriver> = if use_spiron {
+            Box::new(SpironServerlessDriver::new("https://unused.invalid", None))
+        } else {
+            Box::new(GenericHttpCloudDriver::new("https://unused.invalid", None))
+        };
+        let event = driver
+            .parse_webhook(&header_pairs, &body)
+            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e))?;
+
+        // Locate the durable pending turn by `turn_id` first, else by `remote_run_id`.
+        let rts = store.remote_turn_store();
+        let turn_opt = if let Some(ref tid) = event.turn_id {
+            rts.get_turn(tid).map_err(ApiError::from_store)?
+        } else {
+            None
+        };
+        let turn_opt = match turn_opt {
+            Some(t) => Some(t),
+            None => rts
+                .find_by_remote_run_id(Some(&event.harness_kind), &event.remote_run_id)
+                .map_err(ApiError::from_store)?
+                .or_else(|| {
+                    rts.find_by_remote_run_id(None, &event.remote_run_id)
+                        .ok()
+                        .flatten()
+                }),
+        };
+
+        // Fail-closed authorization: must pass either configured webhook HMAC/secret OR
+        // constant-time per-turn SHA-256 bearer token match!
+        let Some(turn) = turn_opt else {
+            return Err(ApiError::new(
+                if hmac_or_shared_ok {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::UNAUTHORIZED
+                },
+                if hmac_or_shared_ok {
+                    "unknown cloud turn"
+                } else {
+                    "unauthorized cloud webhook"
+                },
+            ));
+        };
+
+        let per_turn_token_ok = bearer_opt
+            .as_deref()
+            .is_some_and(|tok| verify_callback_token_hash(&turn.callback_token_hash, tok));
+
+        if !hmac_or_shared_ok && !per_turn_token_ok {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid cloud webhook signature or callback token",
+            ));
+        }
+
+        let now = now_ms();
+        if event.status.is_terminal() {
+            let settled = settle_remote_turn_and_deliver(
+                &store,
+                &turn.turn_id,
+                SettleRemoteTurn {
+                    status: event.status.as_str().to_string(),
+                    result_text: event.result_text,
+                    error_text: event.error_text,
+                    usage_json: event.usage,
+                    cursor: event.cursor,
+                    settled_at_ms: now,
+                },
+                None,
+                0,
+            )
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
+            Ok(Json(json!({
+                "ok": true,
+                "turn_id": settled.turn.turn_id,
+                "remote_run_id": event.remote_run_id,
+                "status": settled.turn.status,
+                "settled": settled.settled_now,
+                "idempotent_replay": !settled.settled_now,
+                "delivered_reply": settled.delivered_reply,
+            })))
+        } else {
+            let _ = rts
+                .record_event(
+                    &turn.turn_id,
+                    &RemoteTurnEventUpdate {
+                        status: Some("running".to_string()),
+                        cursor: event.cursor,
+                        remote_run_id: Some(event.remote_run_id.clone()),
+                        last_event_at_ms: now,
+                        next_poll_at_ms: None,
+                    },
+                )
+                .map_err(ApiError::from_store)?;
+            Ok(Json(json!({
+                "ok": true,
+                "turn_id": turn.turn_id,
+                "remote_run_id": event.remote_run_id,
+                "status": "running",
+                "settled": false,
+            })))
+        }
+    })
+    .await
+}
+
+// ============================================================================
+// Neutral JWS / JWKS (EdDSA / OKP Ed25519) Verification for /v1/internal/tick
+// ============================================================================
+
+#[derive(Clone, Debug)]
+struct Ed25519Jwk {
+    kid: Option<String>,
+    public_key_bytes: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+struct CachedJwks {
+    fetched_at: Instant,
+    keys: Vec<Ed25519Jwk>,
+}
+
+static JWKS_CACHE: LazyLock<Mutex<HashMap<String, CachedJwks>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn clear_jwks_cache() {
+    if let Ok(mut guard) = JWKS_CACHE.lock() {
+        guard.clear();
+    }
+}
+
+fn parse_jwks_ed25519_keys(raw: &[u8]) -> Result<Vec<Ed25519Jwk>, String> {
+    let doc: Value = serde_json::from_slice(raw).map_err(|e| format!("invalid JWKS JSON: {e}"))?;
+    let keys = doc
+        .get("keys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "JWKS missing `keys` array".to_string())?;
+    let mut parsed = Vec::new();
+    for entry in keys {
+        let kty = entry.get("kty").and_then(Value::as_str).unwrap_or("");
+        let crv = entry.get("crv").and_then(Value::as_str).unwrap_or("");
+        if kty != "OKP" || crv != "Ed25519" {
+            continue;
+        }
+        if let Some(key_use) = entry.get("use").and_then(Value::as_str)
+            && key_use != "sig"
+        {
+            continue;
+        }
+        if let Some(alg) = entry.get("alg").and_then(Value::as_str)
+            && alg != "EdDSA"
+        {
+            continue;
+        }
+        let Some(x_b64) = entry.get("x").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(decoded) = URL_SAFE_NO_PAD.decode(x_b64.trim()) else {
+            continue;
+        };
+        if decoded.len() != 32 {
+            continue;
+        }
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&decoded);
+        let kid = entry
+            .get("kid")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        parsed.push(Ed25519Jwk {
+            kid,
+            public_key_bytes: pk,
+        });
+    }
+    Ok(parsed)
+}
+
+async fn fetch_jwks_keys(jwks_url: &str, force_refresh: bool) -> Result<Vec<Ed25519Jwk>, String> {
+    if !force_refresh {
+        let guard = JWKS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = guard.get(jwks_url)
+            && cached.fetched_at.elapsed() < JWKS_CACHE_TTL
+        {
+            return Ok(cached.keys.clone());
+        }
+    }
+
+    let url = jwks_url.to_string();
+    let keys = tokio::task::spawn_blocking(move || -> Result<Vec<Ed25519Jwk>, String> {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut resp = agent
+            .get(&url)
+            .header("accept", "application/json")
+            .call()
+            .map_err(|e| format!("JWKS fetch failed ({url}): {e}"))?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(format!("JWKS endpoint returned HTTP {status}"));
+        }
+        let mut raw = Vec::new();
+        let _ = resp
+            .body_mut()
+            .as_reader()
+            .take(512 * 1024)
+            .read_to_end(&mut raw);
+        parse_jwks_ed25519_keys(&raw)
+    })
+    .await
+    .map_err(|e| format!("JWKS fetch join error: {e}"))??;
+
+    let mut guard = JWKS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    guard.insert(
+        jwks_url.to_string(),
+        CachedJwks {
+            fetched_at: Instant::now(),
+            keys: keys.clone(),
+        },
+    );
+    Ok(keys)
+}
+
+fn extract_tick_jws(headers: &HeaderMap) -> Option<String> {
+    if let Some(hdr_name) = env_non_empty("ANYAGENTS_TICK_SIGNATURE_HEADER") {
+        let val = headers
+            .get(hdr_name.as_str())
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let cleaned = val
+            .strip_prefix("Bearer ")
+            .or_else(|| val.strip_prefix("bearer "))
+            .map(str::trim)
+            .unwrap_or(val);
+        return (!cleaned.is_empty()).then(|| cleaned.to_string());
+    }
+    // When no custom signature header is set, accept `Authorization: Bearer <jws>` if it
+    // looks like a 3-part compact JWS (`header.payload.signature`).
+    let tok = extract_bearer_token(headers)?;
+    let parts: Vec<&str> = tok.split('.').collect();
+    if parts.len() == 3 && parts.iter().all(|p| !p.is_empty()) {
+        Some(tok)
+    } else {
+        None
+    }
+}
+
+async fn verify_tick_jws_jwks(
+    jwks_url: &str,
+    headers: &HeaderMap,
+    raw_body: &[u8],
+) -> Result<(), String> {
+    let jws =
+        extract_tick_jws(headers).ok_or_else(|| "missing tick JWS signature header".to_string())?;
+    let parts: Vec<&str> = jws.split('.').collect();
+    if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+        return Err("malformed compact JWS".to_string());
+    }
+    let (header_b64, payload_b64, sig_b64) = (parts[0], parts[1], parts[2]);
+
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(header_b64)
+        .map_err(|_| "invalid JWS header base64url".to_string())?;
+    let header_json: Value =
+        serde_json::from_slice(&header_bytes).map_err(|_| "invalid JWS header JSON".to_string())?;
+    if header_json.get("alg").and_then(Value::as_str) != Some("EdDSA") {
+        return Err("JWS header alg must be EdDSA".to_string());
+    }
+    let kid = header_json
+        .get("kid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(sig_b64)
+        .map_err(|_| "invalid JWS signature base64url".to_string())?;
+    if sig_bytes.len() != 64 {
+        return Err("invalid EdDSA signature length".to_string());
+    }
+    let signing_input = format!("{header_b64}.{payload_b64}");
+
+    let mut keys = fetch_jwks_keys(jwks_url, false).await?;
+    let mut candidates: Vec<&Ed25519Jwk> = match kid {
+        Some(want_kid) => keys
+            .iter()
+            .filter(|k| k.kid.as_deref() == Some(want_kid))
+            .collect(),
+        None => keys.iter().collect(),
+    };
+    if candidates.is_empty() {
+        // Refetch JWKS once on unknown `kid` (key rotation support).
+        keys = fetch_jwks_keys(jwks_url, true).await?;
+        candidates = match kid {
+            Some(want_kid) => keys
+                .iter()
+                .filter(|k| k.kid.as_deref() == Some(want_kid))
+                .collect(),
+            None => keys.iter().collect(),
+        };
+    }
+    if candidates.is_empty() {
+        return Err("no matching Ed25519 JWK found for kid".to_string());
+    }
+
+    let sig_valid = candidates.iter().any(|jwk| {
+        UnparsedPublicKey::new(&ED25519, &jwk.public_key_bytes)
+            .verify(signing_input.as_bytes(), &sig_bytes)
+            .is_ok()
+    });
+    if !sig_valid {
+        return Err("EdDSA signature verification failed".to_string());
+    }
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .map_err(|_| "invalid JWS payload base64url".to_string())?;
+    let claims: Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|_| "invalid JWS payload JSON".to_string())?;
+    let claims_obj = claims
+        .as_object()
+        .ok_or_else(|| "JWS payload must be a JSON object".to_string())?;
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // `exp` is mandatory (±60s clock skew).
+    let exp = claims_obj
+        .get("exp")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "JWS missing numeric `exp` claim".to_string())?;
+    if now_secs > exp.saturating_add(JWS_CLOCK_SKEW_SECS) {
+        return Err("JWS token expired".to_string());
+    }
+    if let Some(nbf) = claims_obj.get("nbf").and_then(Value::as_i64)
+        && now_secs.saturating_add(JWS_CLOCK_SKEW_SECS) < nbf
+    {
+        return Err("JWS token not yet valid".to_string());
+    }
+
+    if let Some(expected_iss) = env_non_empty("ANYAGENTS_TICK_ISS") {
+        let got_iss = claims_obj.get("iss").and_then(Value::as_str).unwrap_or("");
+        if got_iss != expected_iss {
+            return Err("JWS `iss` claim mismatch".to_string());
+        }
+    }
+    if let Some(expected_aud) = env_non_empty("ANYAGENTS_TICK_AUD") {
+        let aud_ok = match claims_obj.get("aud") {
+            Some(Value::String(s)) => s == &expected_aud,
+            Some(Value::Array(arr)) => arr
+                .iter()
+                .any(|v| v.as_str() == Some(expected_aud.as_str())),
+            _ => false,
+        };
+        if !aud_ok {
+            return Err("JWS `aud` claim mismatch".to_string());
+        }
+    }
+    if let Some(expected_sub) = env_non_empty("ANYAGENTS_TICK_SUB") {
+        let got_sub = claims_obj.get("sub").and_then(Value::as_str).unwrap_or("");
+        if got_sub != expected_sub {
+            return Err("JWS `sub` claim mismatch".to_string());
+        }
+    }
+
+    // If `bh` (body hash) claim is present, verify `bh == base64url_nopad(sha256(raw_body))`.
+    if let Some(bh_val) = claims_obj.get("bh") {
+        let Some(bh_str) = bh_val.as_str() else {
+            return Err("JWS `bh` claim must be a string".to_string());
+        };
+        let expected_bh = URL_SAFE_NO_PAD.encode(Sha256::digest(raw_body));
+        if !constant_time_eq(expected_bh.as_bytes(), bh_str.as_bytes()) {
+            return Err("JWS `bh` body hash mismatch".to_string());
+        }
+    }
+
+    Ok(())
+}
+
+fn verify_tick_shared_token(expected: &str, headers: &HeaderMap, raw_body: &[u8]) -> bool {
+    if let Some(tok) = extract_bearer_token(headers)
+        && constant_time_eq(expected.as_bytes(), tok.as_bytes())
+    {
+        return true;
+    }
+    if let Some(hdr_tok) = headers
+        .get("x-anyagents-tick-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && constant_time_eq(expected.as_bytes(), hdr_tok.as_bytes())
+    {
+        return true;
+    }
+    if let Some(sig) = headers
+        .get("x-anyagents-tick-signature")
+        .and_then(|v| v.to_str().ok())
+        && verify_hmac_sha256_signature(expected.as_bytes(), raw_body, sig)
+    {
+        return true;
+    }
+    false
+}
+
+async fn authenticate_tick_request(headers: &HeaderMap, raw_body: &[u8]) -> Result<(), ApiError> {
+    let tick_token = configured_tick_token();
+    let jwks_url = env_non_empty("ANYAGENTS_TICK_JWKS_URL");
+
+    if tick_token.is_none() && jwks_url.is_none() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tick endpoint disabled: configure ANYAGENTS_TICK_TOKEN or ANYAGENTS_TICK_JWKS_URL",
+        ));
+    }
+
+    if let Some(ref expected) = tick_token
+        && verify_tick_shared_token(expected, headers, raw_body)
+    {
+        return Ok(());
+    }
+
+    if let Some(ref url) = jwks_url
+        && verify_tick_jws_jwks(url, headers, raw_body).await.is_ok()
+    {
+        return Ok(());
+    }
+
+    Err(ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "invalid tick authentication credentials",
+    ))
+}
+
+// ============================================================================
+// HTTP Endpoint 3: POST /v1/internal/tick
+// ============================================================================
+
+/// Structured JSON summary returned by `POST /v1/internal/tick`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TickSummary {
+    pub ok: bool,
+    pub schedules_fired: usize,
+    pub cloud_turns_polled: usize,
+    pub turns_settled: usize,
+    pub leases_renewed: usize,
+    pub sandboxes_swept: usize,
+}
+
+/// `POST /v1/internal/tick`: bounded (<5s) stateless maintenance & polling pass.
+///
+/// Authenticates via `ANYAGENTS_TICK_TOKEN` and/or neutral `ANYAGENTS_TICK_JWKS_URL`
+/// (fail-closed `503` when neither is configured, `401` on invalid credentials), then:
+/// 1. Fires due schedules/reminders (dispatching turns asynchronously in serverless mode).
+/// 2. Polls due `pending_remote_turns` via `CloudTurnDriver::poll_turn` and marks stale
+///    sandbox turns failed when heartbeats exceed the timeout threshold.
+/// 3. Renews leases for active non-idle sandbox bindings.
+/// 4. Runs `sweep_idle_sandboxes` under the `maint:singleton` PG lease.
+pub(crate) async fn tick_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate_tick_request(&headers, &body).await?;
+    let summary = run_tick_pass(Arc::clone(&state.store), state.health.clone()).await?;
+    Ok(Json(summary))
+}
+
+pub(crate) async fn run_tick_pass(
+    store: Arc<Store>,
+    health: anyagents_supervisor::HealthBoard,
+) -> Result<TickSummary, ApiError> {
+    let now = now_ms();
+    let mut summary = TickSummary {
+        ok: true,
+        ..TickSummary::default()
+    };
+
+    // 1. Fire due schedules & reminders, then dispatch turns for woken agents in serverless mode.
+    let store_sched = Arc::clone(&store);
+    let health_sched = health.clone();
+    let (schedules_fired, woken_agents) = spawn_store(move || {
+        Ok(crate::schedule::tick_serverless_schedules(
+            &store_sched,
+            &health_sched,
+            now,
+        ))
+    })
+    .await?;
+    summary.schedules_fired = schedules_fired;
+
+    if is_serverless_mode() {
+        for aid in woken_agents {
+            let _ = dispatch_next_mailbox_message_if_serverless(Arc::clone(&store), &aid).await;
+        }
+    }
+
+    // 2a. Poll due cloud turns (`next_poll_at_ms <= now`).
+    let store_due = Arc::clone(&store);
+    let due_turns = spawn_store(move || {
+        store_due
+            .remote_turn_store()
+            .list_due_polls(now, TICK_CLOUD_POLL_LIMIT)
+            .map_err(ApiError::from_store)
+    })
+    .await?;
+
+    for turn in due_turns {
+        let Some(ref remote_run_id) = turn.remote_run_id else {
+            continue;
+        };
+        let Ok(driver) = resolve_cloud_driver_from_metadata(
+            &turn.harness_kind,
+            turn.metadata_json.as_ref(),
+            None,
+        ) else {
+            continue;
+        };
+        let poll_res = tokio::time::timeout(
+            Duration::from_secs(4),
+            driver.poll_turn(remote_run_id, turn.cursor.as_deref()),
+        )
+        .await;
+        summary.cloud_turns_polled += 1;
+
+        match poll_res {
+            Ok(Ok(polled)) if polled.status.is_terminal() => {
+                let store_settle = Arc::clone(&store);
+                let tid = turn.turn_id.clone();
+                let res = spawn_store(move || {
+                    settle_remote_turn_and_deliver(
+                        &store_settle,
+                        &tid,
+                        SettleRemoteTurn {
+                            status: polled.status.as_str().to_string(),
+                            result_text: polled.result_text,
+                            error_text: polled.error_text,
+                            usage_json: polled.usage,
+                            cursor: polled.cursor,
+                            settled_at_ms: now_ms(),
+                        },
+                        None,
+                        0,
+                    )
+                    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))
+                })
+                .await?;
+                if res.is_some_and(|r| r.settled_now) {
+                    summary.turns_settled += 1;
+                }
+            }
+            Ok(Ok(polled)) => {
+                let next_delay = polled
+                    .next_poll_after_ms
+                    .map(|ms| i64::try_from(ms).unwrap_or(DEFAULT_CLOUD_POLL_DELAY_MS))
+                    .unwrap_or(DEFAULT_CLOUD_POLL_DELAY_MS)
+                    .clamp(DEFAULT_CLOUD_POLL_DELAY_MS, MAX_CLOUD_POLL_BACKOFF_MS);
+                let next_at = now_ms().saturating_add(next_delay);
+                let store_next = Arc::clone(&store);
+                let tid = turn.turn_id.clone();
+                let cur = polled.cursor;
+                let _ = spawn_store(move || {
+                    let _ = store_next.remote_turn_store().schedule_next_poll(
+                        &tid,
+                        Some(next_at),
+                        cur.as_deref(),
+                        now_ms(),
+                    );
+                    Ok(())
+                })
+                .await;
+            }
+            Ok(Err(_)) | Err(_) => {
+                // Transient poll failure/timeout: push next poll forward with bounded backoff.
+                let next_at = now_ms().saturating_add(DEFAULT_CLOUD_POLL_DELAY_MS * 2);
+                let store_next = Arc::clone(&store);
+                let tid = turn.turn_id.clone();
+                let _ = spawn_store(move || {
+                    let _ = store_next.remote_turn_store().schedule_next_poll(
+                        &tid,
+                        Some(next_at),
+                        None,
+                        now_ms(),
+                    );
+                    Ok(())
+                })
+                .await;
+            }
+        }
+    }
+
+    // 2b. Mark stale/dead sandbox turns whose heartbeats exceeded the stale threshold.
+    let stale_before = now.saturating_sub(sandbox_stale_threshold_ms());
+    let store_stale = Arc::clone(&store);
+    let stale_settled = spawn_store(move || {
+        let stale = store_stale
+            .remote_turn_store()
+            .list_stale_active(Some("sandbox"), stale_before, TICK_STALE_SANDBOX_LIMIT)
+            .map_err(ApiError::from_store)?;
+        let mut count = 0usize;
+        for turn in stale {
+            if let Ok(Some(res)) = settle_remote_turn_and_deliver(
+                &store_stale,
+                &turn.turn_id,
+                SettleRemoteTurn {
+                    status: "failed".to_string(),
+                    result_text: None,
+                    error_text: Some("sandbox turn heartbeat timed out".to_string()),
+                    usage_json: None,
+                    cursor: None,
+                    settled_at_ms: now_ms(),
+                },
+                None,
+                0,
+            ) && res.settled_now
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    })
+    .await?;
+    summary.turns_settled += stale_settled;
+
+    // 3. Renew leases for active non-idle sandbox bindings.
+    let store_renew = Arc::clone(&store);
+    let renewed = spawn_store(move || {
+        let ready = store_renew
+            .sandbox_binding_store()
+            .list_active_ready()
+            .map_err(ApiError::from_store)?;
+        let mut count = 0usize;
+        for binding in ready {
+            let has_active_turn = store_renew
+                .remote_turn_store()
+                .list_active_for_agent(&binding.agent_id)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            let has_inflight_children = store_renew
+                .runtime_heartbeat(&binding.agent_id)
+                .ok()
+                .flatten()
+                .is_some_and(|hb| hb.inflight_children > 0);
+            let is_active =
+                binding.idle_since_ms.is_none() || has_active_turn || has_inflight_children;
+            if !is_active {
+                continue;
+            }
+            let due_for_renew = binding
+                .lease_expires_at_ms
+                .is_none_or(|exp| exp <= now.saturating_add(DEFAULT_LEASE_RENEW_WINDOW_MS));
+            if !due_for_renew {
+                continue;
+            }
+            if renew_binding_lease(&store_renew, &binding) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    })
+    .await?;
+    summary.leases_renewed = renewed;
+
+    // 4. Sweep idle sandboxes (`inflight_children == 0` and no active turn) under `maint:singleton`.
+    let store_sweep = Arc::clone(&store);
+    let swept = spawn_store(move || {
+        let _singleton = if store_sweep.is_postgres() {
+            match store_sweep
+                .try_acquire_coordinator_lease("maint:singleton", Duration::from_secs(30))
+            {
+                Ok(Some(guard)) => Some(guard),
+                Ok(None) => return Ok(0usize),
+                Err(_) => return Ok(0usize),
+            }
+        } else {
+            None
+        };
+        let report = sweep_idle_sandboxes(&store_sweep, store_sweep.data_dir(), now)
+            .map_err(ApiError::from_store)?;
+        Ok(report.released.len())
+    })
+    .await?;
+    summary.sandboxes_swept = swept;
+
+    Ok(summary)
+}
+
+fn renew_binding_lease(store: &Store, binding: &anyagents_core::stateless::SandboxBinding) -> bool {
+    let cfg_dir = anyagents_core::agent_config_dir(store.data_dir(), &binding.agent_id);
+    if anyagents_tools::renew_lease_for_config_dir(&cfg_dir).is_ok_and(|renewed| renewed) {
+        let mut updated = binding.clone();
+        updated.lease_expires_at_ms = Some(
+            now_ms().saturating_add(anyagents_tools::providers::DEFAULT_MAX_LEASE_TTL_MS as i64),
+        );
+        let _ = store.sandbox_binding_store().upsert(&updated);
+        return true;
+    }
+    if binding.provider != "legacy_http"
+        && binding.provider != "local"
+        && let Ok(reg) = resolve_registry_for_binding(Some(store.data_dir()), binding)
+        && reg.active_kind() != ProviderKind::Local
+        && let Some(existing_handle) = sandbox_handle_from_binding(binding)
+    {
+        let mut req = reg.default_ensure_request(binding.agent_id.as_str());
+        req.existing = Some(existing_handle);
+        if let Ok(refreshed) = crate::sandbox_exec::block_on_provider(reg.active().ensure(&req)) {
+            let mut updated = binding.clone();
+            updated.lease_expires_at_ms = refreshed
+                .expires_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp_millis())
+                .or_else(|| {
+                    Some(now_ms().saturating_add(
+                        anyagents_tools::providers::DEFAULT_MAX_LEASE_TTL_MS as i64,
+                    ))
+                });
+            let _ = store.sandbox_binding_store().upsert(&updated);
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyagents_core::{NewAgent, NewSchedule, hmac_sha256_hex};
+    use anyagents_supervisor::HealthBoard;
+    use anyagents_tools::providers::{
+        EnsureSandboxRequest, ExecOutput, ProviderHealth, SandboxCapabilities, SandboxHandle,
+    };
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    use tower::ServiceExt as _;
+
+    fn test_pg_url() -> Option<String> {
+        std::env::var("ANYAGENTS_TEST_POSTGRES_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn make_app_state(store: Arc<Store>, data_dir: &Path) -> AppState {
+        AppState {
+            store,
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(super::super::ProcessRunner)),
+            auth: crate::auth::Mode::Trusted {
+                data_dir: data_dir.to_path_buf(),
+            },
+            identity: Arc::new(crate::identity::ServingIdentity::capture()),
+            profiles: Default::default(),
+        }
+    }
+
+    /// Mock SandboxProvider that runs a real local `anyagents-guest turn --detached` command
+    /// inside an isolated temp sandbox root so scale-to-zero tests prove end-to-end callback
+    /// delivery across router drops!
+    struct RealGuestExecMockProvider {
+        root: std::path::PathBuf,
+        released: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncSandboxProvider for RealGuestExecMockProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Http
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities {
+                persistent_volumes: true,
+                volume_survives_release: true,
+                ..SandboxCapabilities::default()
+            }
+        }
+
+        async fn ensure(&self, req: &EnsureSandboxRequest) -> Result<SandboxHandle, String> {
+            let state_dir = self.root.join("state");
+            let workdir = self.root.join("workspace");
+            std::fs::create_dir_all(&state_dir).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(&workdir).map_err(|e| e.to_string())?;
+            Ok(SandboxHandle {
+                provider: ProviderKind::Http,
+                sandbox_id: format!("sbx-{}", req.agent_id),
+                volume_id: Some(format!("vol-{}", req.agent_id)),
+                mount_path: self.root.display().to_string(),
+                state_dir: state_dir.display().to_string(),
+                workdir: workdir.display().to_string(),
+                transport_url: None,
+                transport_token: None,
+                expires_at: None,
+                metadata: BTreeMap::new(),
+            })
+        }
+
+        async fn exec(
+            &self,
+            _handle: &SandboxHandle,
+            req: &ExecRequest,
+        ) -> Result<ExecOutput, String> {
+            use std::io::Write as _;
+            use std::process::{Command, Stdio};
+
+            let (prog, args) = req
+                .command
+                .split_first()
+                .ok_or_else(|| "empty exec argv".to_string())?;
+            let mut cmd = Command::new(prog);
+            cmd.args(args)
+                .env("ANYAGENTS_GUEST_CALLBACK_BACKOFF_MS", "20")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn().map_err(|e| format!("spawn {prog}: {e}"))?;
+            if let Some(ref stdin_bytes) = req.stdin
+                && let Some(mut stdin_pipe) = child.stdin.take()
+            {
+                let _ = stdin_pipe.write_all(stdin_bytes);
+            }
+            let out = child.wait_with_output().map_err(|e| e.to_string())?;
+            Ok(ExecOutput {
+                exit_code: out.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+            })
+        }
+
+        async fn sync_bundle_tar(
+            &self,
+            _handle: &SandboxHandle,
+            _dest_dir: &str,
+            _tar_gz: &[u8],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn release(&self, handle: &SandboxHandle) -> Result<(), String> {
+            self.released
+                .lock()
+                .unwrap()
+                .push(handle.sandbox_id.clone());
+            Ok(())
+        }
+
+        async fn destroy(&self, _handle: &SandboxHandle) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn health(&self) -> Result<ProviderHealth, String> {
+            Ok(ProviderHealth {
+                provider: ProviderKind::Http,
+                healthy: true,
+                message: "ok".into(),
+                latency_ms: Some(1),
+            })
+        }
+    }
+
+    fn sign_ed25519_jws(kp: &Ed25519KeyPair, kid: &str, claims: &Value) -> String {
+        let header = json!({ "alg": "EdDSA", "typ": "JWT", "kid": kid });
+        let h_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let p_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+        let signing_input = format!("{h_b64}.{p_b64}");
+        let sig = kp.sign(signing_input.as_bytes());
+        let s_b64 = URL_SAFE_NO_PAD.encode(sig.as_ref());
+        format!("{signing_input}.{s_b64}")
+    }
+
+    fn jwks_doc_for(keys: &[(&str, &Ed25519KeyPair)]) -> Value {
+        let arr: Vec<Value> = keys
+            .iter()
+            .map(|(kid, kp)| {
+                json!({
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "use": "sig",
+                    "alg": "EdDSA",
+                    "kid": kid,
+                    "x": URL_SAFE_NO_PAD.encode(kp.public_key().as_ref()),
+                })
+            })
+            .collect();
+        json!({ "keys": arr })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn serverless_scale_to_zero_restart_survival_sandbox_turn_pg_and_local() {
+        let _env = crate::server::tests::env_lock();
+        let dir_a = crate::test_tempdir();
+        let dir_b = crate::test_tempdir();
+        let sbx_root = crate::test_tempdir();
+
+        // Use real PostgreSQL 18 when ANYAGENTS_TEST_POSTGRES_URL is set, else shared local dir.
+        let pg_url = test_pg_url();
+        let tag = format!("{}_{}", std::process::id(), now_ms());
+        let (store_a, shared_dir_for_b) = match pg_url.as_deref() {
+            Some(url) => (
+                Arc::new(
+                    Store::open_postgres_isolated(url, dir_a.path(), format!("sl-a-{tag}"))
+                        .expect("open PG replica A"),
+                ),
+                dir_b.path().to_path_buf(),
+            ),
+            None => (
+                Arc::new(Store::open(dir_a.path().join("state.db")).unwrap()),
+                dir_a.path().to_path_buf(),
+            ),
+        };
+
+        let parent = store_a
+            .create_agent(NewAgent::new(format!("sl_parent_{tag}"), "claude-code"))
+            .unwrap();
+        let worker = store_a
+            .create_agent(NewAgent::new(format!("sl_worker_{tag}"), "claude-code"))
+            .unwrap();
+
+        // Bind a stable listener port that Router A will NOT serve — instead, we simulate
+        // complete scale-to-zero by dropping Router A & Store A, then binding Router B on
+        // the callback address so the real `anyagents-guest` detached child (or callback)
+        // settles directly into Router B!
+        let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let public_url = format!("http://{addr_b}");
+
+        // Prepare a fake Claude CLI script for our detached guest runner.
+        let fake_claude = sbx_root.path().join("fake-claude");
+        std::fs::write(
+            &fake_claude,
+            r#"#!/bin/sh
+echo '{"type":"system","subtype":"init","session_id":"s2z-sess-1","claude_code_version":"1.0","peer":"claude-code 1.0"}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"user"'*)
+      uuid=$(printf '%s\n' "$line" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
+      printf '{"type":"user","isReplay":true,"uuid":"%s","message":{"role":"user","content":[{"type":"text","text":"work"}]}}\n' "$uuid"
+      sleep 0.15
+      printf '{"type":"assistant","session_id":"s2z-sess-1","message":{"role":"assistant","content":[{"type":"text","text":"survived scale to zero"}]}}\n'
+      printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s2z-sess-1","user_message_uuids":["%s"],"result":"survived scale to zero","usage":{"input_tokens":42,"output_tokens":17},"total_cost_usd":0.05}\n' "$uuid"
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Router A receives inbound message & dispatches detached turn via Provider.
+        let router_a =
+            super::super::build_public_router(make_app_state(Arc::clone(&store_a), dir_a.path()));
+        let _ = router_a; // Proves Router A existed and is dropped before callback arrives.
+
+        let released = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn AsyncSandboxProvider> = Arc::new(RealGuestExecMockProvider {
+            root: sbx_root.path().to_path_buf(),
+            released: Arc::clone(&released),
+        });
+
+        let msg = match store_a
+            .receive(&worker.id, Incoming::new("Execute serverless task"))
+            .unwrap()
+        {
+            anyagents_core::ReceiveOutcome::New(m) => m,
+            anyagents_core::ReceiveOutcome::Duplicate(m) => m,
+        };
+
+        // Locate compiled `anyagents` multi-call binary (or `anyagents-guest` if sibling exists).
+        let guest_bin = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().and_then(Path::parent).map(Path::to_path_buf))
+            .map(|target_debug| target_debug.join("anyagents-guest"))
+            .filter(|p| p.is_file());
+
+        let dispatched = if let Some(ref gbin) = guest_bin {
+            let mut input = ServerlessDispatchInput::for_agent(worker.clone(), msg.text.clone());
+            input.message_seq = Some(msg.seq);
+            input.opener_id = Some(msg.id.to_string());
+            input.reply_target = Some(ReplyTarget::Agent {
+                agent_id: parent.id.as_str().to_string(),
+            });
+            input.callback_base_url = Some(public_url.clone());
+            input.sandbox_provider = Some(Arc::clone(&provider));
+            input.guest_binary = Some(gbin.display().to_string());
+            input.guest_program = Some(fake_claude.display().to_string());
+            input.guest_extra_args = vec!["--guest-bare".to_string()];
+            input.heartbeat_interval_ms = Some(40);
+            dispatch_serverless_turn(Arc::clone(&store_a), input)
+                .await
+                .expect("Router A detached sandbox dispatch")
+        } else {
+            // Even when running unit tests without sibling `anyagents-guest` binary prebuilt,
+            // exercise the full Router A persist -> drop -> Router B HTTP callback path!
+            let turn_id = generate_turn_id();
+            let callback_token = generate_callback_token();
+            let turn = store_a
+                .remote_turn_store()
+                .create_turn(&NewRemoteTurn {
+                    turn_id,
+                    agent_id: worker.id.clone(),
+                    harness_kind: "sandbox".into(),
+                    provider_kind: Some("http".into()),
+                    remote_run_id: Some("pid:9999".into()),
+                    callback_token_hash: hash_callback_token(&callback_token),
+                    cursor: None,
+                    status: "running".into(),
+                    metadata_json: Some(json!({
+                        "agent_harness": "claude-code",
+                        "message_seq": msg.seq,
+                        "opener_id": msg.id.to_string(),
+                        "reply_target": { "kind": "agent", "agent_id": parent.id.as_str() }
+                    })),
+                    next_poll_at_ms: None,
+                })
+                .unwrap();
+            let _ = store_a.note_delivered(&worker.id, msg.seq);
+            DispatchedRemoteTurn {
+                turn,
+                callback_token,
+            }
+        };
+
+        let turn_id = dispatched.turn.turn_id.clone();
+        let callback_token = dispatched.callback_token.clone();
+
+        // === SCALE TO ZERO: completely drop Router A & Store A! ===
+        drop(store_a);
+        drop(provider);
+
+        // === COLD START: spin up brand-new stateless Router B sharing ONLY the database! ===
+        let store_b = match pg_url.as_deref() {
+            Some(url) => Arc::new(
+                Store::open_postgres_isolated(url, &shared_dir_for_b, format!("sl-b-{tag}"))
+                    .expect("open PG replica B"),
+            ),
+            None => Arc::new(Store::open(shared_dir_for_b.join("state.db")).unwrap()),
+        };
+        let router_b = super::super::build_public_router(make_app_state(
+            Arc::clone(&store_b),
+            &shared_dir_for_b,
+        ));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener_b, router_b)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        if guest_bin.is_none() {
+            // Post heartbeat + turn_complete directly to Router B over real HTTP!
+            let url = format!("{public_url}/v1/internal/guest/events");
+            let hb_body = json!({
+                "event_type": "heartbeat",
+                "turn_id": turn_id,
+                "agent_id": worker.id.as_str(),
+                "active_turns": 1,
+                "inflight_children": 2,
+                "busy": true,
+                "timestamp_ms": now_ms(),
+            });
+            let complete_body = json!({
+                "event_type": "turn_complete",
+                "turn_id": turn_id,
+                "agent_id": worker.id.as_str(),
+                "session_id": "s2z-sess-1",
+                "result_text": "survived scale to zero",
+                "usage": { "input_tokens": 42, "output_tokens": 17, "reported_cost_micros": 50000 },
+                "inflight_children": 0,
+                "timestamp_ms": now_ms(),
+            });
+            let tok_clone = callback_token.clone();
+            tokio::task::spawn_blocking(move || {
+                let agent: ureq::Agent = ureq::Agent::config_builder()
+                    .http_status_as_error(false)
+                    .build()
+                    .into();
+                let r1 = agent
+                    .post(&url)
+                    .header("authorization", &format!("Bearer {tok_clone}"))
+                    .send_json(&hb_body)
+                    .unwrap();
+                assert_eq!(r1.status().as_u16(), 200);
+                let r2 = agent
+                    .post(&url)
+                    .header("authorization", &format!("Bearer {tok_clone}"))
+                    .send_json(&complete_body)
+                    .unwrap();
+                assert_eq!(r2.status().as_u16(), 200);
+            })
+            .await
+            .unwrap();
+        }
+
+        // Wait for settlement in PG / shared store on Router B.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let settled = loop {
+            if let Some(t) = store_b.remote_turn_store().get_turn(&turn_id).unwrap()
+                && t.is_terminal()
+            {
+                break t;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "turn `{turn_id}` did not settle on Router B within 10s"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        };
+
+        assert_eq!(settled.status, "completed");
+        assert_eq!(
+            settled.result_text.as_deref(),
+            Some("survived scale to zero")
+        );
+        assert_eq!(settled.usage_json.as_ref().unwrap()["input_tokens"], 42);
+        assert_eq!(settled.usage_json.as_ref().unwrap()["output_tokens"], 17);
+
+        // Verify durable PG transcript & usage records & parent reply delivery on Router B!
+        let transcript = store_b
+            .blob_store()
+            .get_agent_file(&worker.id, "sessions", &format!("turns/{turn_id}.json"))
+            .unwrap()
+            .expect("transcript persisted in PG agent_files");
+        let transcript_val: Value = serde_json::from_slice(&transcript.content).unwrap();
+        assert_eq!(transcript_val["result_text"], "survived scale to zero");
+
+        let usage_rows = store_b.list_usage(Some(&worker.id)).unwrap();
+        assert_eq!(usage_rows.len(), 1);
+        assert_eq!(usage_rows[0].input_tokens, 42);
+        assert_eq!(usage_rows[0].output_tokens, 17);
+
+        let parent_inbox = store_b.inbox(&parent.id, None).unwrap();
+        assert_eq!(parent_inbox.len(), 1);
+        assert_eq!(parent_inbox[0].text, "survived scale to zero");
+
+        // Duplicate replay of turn_complete must be strictly idempotent (zero duplicate usage/replies).
+        let replay_url = format!("{public_url}/v1/internal/guest/events");
+        let tid_replay = turn_id.clone();
+        let tok_replay = callback_token.clone();
+        let replay_status = tokio::task::spawn_blocking(move || {
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .build()
+                .into();
+            let mut resp = agent
+                .post(&replay_url)
+                .header("authorization", &format!("Bearer {tok_replay}"))
+                .send_json(json!({
+                    "event_type": "turn_complete",
+                    "turn_id": tid_replay,
+                    "result_text": "duplicate overwrite attempt",
+                    "usage": { "input_tokens": 999, "output_tokens": 999 }
+                }))
+                .unwrap();
+            let status = resp.status().as_u16();
+            let body: Value = resp.body_mut().read_json().unwrap();
+            (status, body)
+        })
+        .await
+        .unwrap();
+        assert_eq!(replay_status.0, 200);
+        assert_eq!(replay_status.1["idempotent_replay"], true);
+        assert_eq!(store_b.list_usage(Some(&worker.id)).unwrap().len(), 1);
+        assert_eq!(store_b.inbox(&parent.id, None).unwrap().len(), 1);
+
+        let _ = shutdown_tx.send(());
+        let _ = server_task.await;
+        let _ = store_b.delete_agent(&worker.id);
+        let _ = store_b.delete_agent(&parent.id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn serverless_cloud_spiron_and_generic_http_survive_restart_via_webhook_and_tick_idempotently()
+     {
+        let _env = crate::server::tests::env_lock();
+        let dir_a = crate::test_tempdir();
+        let dir_b = crate::test_tempdir();
+        let pg_url = test_pg_url();
+        let tag = format!("{}_{}", std::process::id(), now_ms());
+
+        let (store_a, shared_dir_for_b) = match pg_url.as_deref() {
+            Some(url) => (
+                Arc::new(
+                    Store::open_postgres_isolated(url, dir_a.path(), format!("cld-a-{tag}"))
+                        .expect("open PG replica A"),
+                ),
+                dir_b.path().to_path_buf(),
+            ),
+            None => (
+                Arc::new(Store::open(dir_a.path().join("state.db")).unwrap()),
+                dir_a.path().to_path_buf(),
+            ),
+        };
+
+        // Spin up mock Spiron server (for tick polling fallback) AND mock Generic HTTP Cloud server (for webhook push).
+        let mock_spiron = axum::Router::new()
+            .route(
+                "/v1/agents",
+                axum::routing::post(|| async { Json(json!({ "id": "spiron_agt_99" })) }),
+            )
+            .route(
+                "/v1/agents/{aid}/messages",
+                axum::routing::post(
+                    |axum::extract::Path(aid): axum::extract::Path<String>| async move {
+                        Json(json!({
+                            "id": "rcpt_spiron_tick_1",
+                            "agent_id": aid,
+                            "status": "submitted"
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/v1/message-receipts/{task_id}",
+                axum::routing::get(
+                    |axum::extract::Path(task_id): axum::extract::Path<String>| async move {
+                        Json(json!({
+                            "id": task_id,
+                            "status": "completed",
+                            "reply": "settled via tick poll",
+                            "usage": { "input_tokens": 30, "output_tokens": 12 }
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/v1/message-receipts/{task_id}/events",
+                axum::routing::get(|| async {
+                    Json(json!({ "next_cursor": "ev_done", "events": [] }))
+                }),
+            );
+        let spiron_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let spiron_addr = spiron_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(spiron_listener, mock_spiron).await;
+        });
+
+        let mock_generic = axum::Router::new()
+            .route(
+                "/turns",
+                axum::routing::post(|| async {
+                    (
+                        StatusCode::ACCEPTED,
+                        Json(json!({ "id": "gen_run_webhook_1", "status": "running" })),
+                    )
+                }),
+            )
+            .route(
+                "/turns/{id}",
+                axum::routing::get(
+                    |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                        Json(json!({
+                            "id": id,
+                            "status": "completed",
+                            "result_text": "late tick poll should be ignored"
+                        }))
+                    },
+                ),
+            );
+        let generic_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let generic_addr = generic_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(generic_listener, mock_generic).await;
+        });
+
+        // Router A creates agents and submits both cloud turns.
+        let spiron_agent = store_a
+            .create_agent(NewAgent::new(format!("spiron_cld_{tag}"), "spiron-cloud"))
+            .unwrap();
+        let generic_agent = store_a
+            .create_agent(NewAgent::new(format!("http_cld_{tag}"), "http-cloud"))
+            .unwrap();
+
+        let mut spiron_req =
+            ServerlessDispatchInput::for_agent(spiron_agent.clone(), "Hello Spiron");
+        spiron_req.callback_base_url = Some("https://coord.example".into());
+        spiron_req.cloud_endpoint = Some(format!("http://{spiron_addr}"));
+        let spiron_dispatched = dispatch_serverless_turn(Arc::clone(&store_a), spiron_req)
+            .await
+            .expect("Router A submits Spiron turn");
+        assert_eq!(
+            spiron_dispatched.turn.remote_run_id.as_deref(),
+            Some("rcpt_spiron_tick_1")
+        );
+
+        let mut generic_req =
+            ServerlessDispatchInput::for_agent(generic_agent.clone(), "Hello Generic Cloud");
+        generic_req.callback_base_url = Some("https://coord.example".into());
+        generic_req.cloud_endpoint = Some(format!("http://{generic_addr}"));
+        let generic_dispatched = dispatch_serverless_turn(Arc::clone(&store_a), generic_req)
+            .await
+            .expect("Router A submits Generic HTTP Cloud turn");
+        assert_eq!(
+            generic_dispatched.turn.remote_run_id.as_deref(),
+            Some("gen_run_webhook_1")
+        );
+
+        // Make Spiron turn immediately due for tick polling.
+        store_a
+            .remote_turn_store()
+            .schedule_next_poll(&spiron_dispatched.turn.turn_id, Some(1), None, now_ms())
+            .unwrap();
+
+        // === SCALE TO ZERO: drop Router A & Store A completely! ===
+        drop(store_a);
+
+        // === COLD START: spin up brand-new Router B sharing ONLY the database! ===
+        let store_b = match pg_url.as_deref() {
+            Some(url) => Arc::new(
+                Store::open_postgres_isolated(url, &shared_dir_for_b, format!("cld-b-{tag}"))
+                    .expect("open PG replica B"),
+            ),
+            None => Arc::new(Store::open(shared_dir_for_b.join("state.db")).unwrap()),
+        };
+
+        let prev_tick_tok = std::env::var_os("ANYAGENTS_TICK_TOKEN");
+        let prev_wh_sec = std::env::var_os("ANYAGENTS_CLOUD_WEBHOOK_SECRET");
+        unsafe {
+            std::env::set_var("ANYAGENTS_TICK_TOKEN", "tick-secret-cloud-test");
+            std::env::set_var("ANYAGENTS_CLOUD_WEBHOOK_SECRET", "whsec-cloud-test");
+        }
+
+        let router_b = super::super::build_public_router(make_app_state(
+            Arc::clone(&store_b),
+            &shared_dir_for_b,
+        ));
+
+        // 1. Router B handles `/v1/internal/cloud/events` webhook push for Generic HTTP Cloud!
+        let wh_body = serde_json::to_vec(&json!({
+            "event_type": "turn_complete",
+            "turn_id": generic_dispatched.turn.turn_id,
+            "remote_run_id": "gen_run_webhook_1",
+            "status": "completed",
+            "result_text": "settled via webhook push",
+            "usage": { "input_tokens": 15, "output_tokens": 8 }
+        }))
+        .unwrap();
+        let sig = format!("sha256={}", hmac_sha256_hex(b"whsec-cloud-test", &wh_body));
+        let wh_resp = router_b
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/cloud/events?driver=http_cloud")
+                    .header("content-type", "application/json")
+                    .header("x-webhook-signature-256", sig)
+                    .body(Body::from(wh_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wh_resp.status(), StatusCode::OK);
+        let wh_json: Value =
+            serde_json::from_slice(&wh_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(wh_json["settled"], true);
+
+        // 2. Also create a due schedule on Router B to prove `/v1/internal/tick` fires schedules
+        //    AND polls the due Spiron turn in ONE bounded HTTP call!
+        store_b
+            .create_schedule(NewSchedule {
+                agent_id: spiron_agent.id.clone(),
+                kind: "at".into(),
+                spec: "now".into(),
+                prompt: "tick reminder".into(),
+                interval_ms: None,
+                next_fire_at_ms: Some(now_ms() - 1_000),
+                watch_baseline: None,
+            })
+            .unwrap();
+
+        let tick_resp = router_b
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/tick")
+                    .header("authorization", "Bearer tick-secret-cloud-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tick_resp.status(), StatusCode::OK);
+        let tick_json: Value =
+            serde_json::from_slice(&tick_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(tick_json["ok"], true);
+        assert!(tick_json["schedules_fired"].as_u64().unwrap() >= 1);
+        assert_eq!(tick_json["cloud_turns_polled"], 1);
+        assert_eq!(tick_json["turns_settled"], 1);
+
+        // 3. Verify BOTH turns settled cleanly with exact results & idempotency!
+        let spiron_settled = store_b
+            .remote_turn_store()
+            .get_turn(&spiron_dispatched.turn.turn_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(spiron_settled.status, "completed");
+        assert_eq!(
+            spiron_settled.result_text.as_deref(),
+            Some("settled via tick poll")
+        );
+
+        let generic_settled = store_b
+            .remote_turn_store()
+            .get_turn(&generic_dispatched.turn.turn_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(generic_settled.status, "completed");
+        assert_eq!(
+            generic_settled.result_text.as_deref(),
+            Some("settled via webhook push")
+        );
+
+        // 4. Late Spiron webhook arriving AFTER tick already settled must be idempotent!
+        let late_spiron_wh = serde_json::to_vec(&json!({
+            "event": "message.completed",
+            "data": {
+                "task_id": "rcpt_spiron_tick_1",
+                "provider_message_id": spiron_dispatched.turn.turn_id,
+                "status": "completed",
+                "reply": "late webhook overwrite attempt"
+            }
+        }))
+        .unwrap();
+        let late_sig = format!(
+            "sha256={}",
+            hmac_sha256_hex(b"whsec-cloud-test", &late_spiron_wh)
+        );
+        let late_resp = router_b
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/cloud/events?driver=spiron")
+                    .header("content-type", "application/json")
+                    .header("x-spiron-signature-256", late_sig)
+                    .body(Body::from(late_spiron_wh))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(late_resp.status(), StatusCode::OK);
+        let late_json: Value =
+            serde_json::from_slice(&late_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(late_json["idempotent_replay"], true);
+        assert_eq!(
+            store_b
+                .remote_turn_store()
+                .get_turn(&spiron_dispatched.turn.turn_id)
+                .unwrap()
+                .unwrap()
+                .result_text
+                .as_deref(),
+            Some("settled via tick poll")
+        );
+
+        match prev_tick_tok {
+            Some(v) => unsafe { std::env::set_var("ANYAGENTS_TICK_TOKEN", v) },
+            None => unsafe { std::env::remove_var("ANYAGENTS_TICK_TOKEN") },
+        }
+        match prev_wh_sec {
+            Some(v) => unsafe { std::env::set_var("ANYAGENTS_CLOUD_WEBHOOK_SECRET", v) },
+            None => unsafe { std::env::remove_var("ANYAGENTS_CLOUD_WEBHOOK_SECRET") },
+        }
+        let _ = store_b.delete_agent(&spiron_agent.id);
+        let _ = store_b.delete_agent(&generic_agent.id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn serverless_security_fail_closed_guest_tokens_tick_token_and_jwks_eddsa() {
+        let _env = crate::server::tests::env_lock();
+        clear_jwks_cache();
+
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("sec_agent", "claude-code"))
+            .unwrap();
+
+        let tok_a = generate_callback_token();
+        let tok_b = generate_callback_token();
+        store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "turn_sec_a".into(),
+                agent_id: agent.id.clone(),
+                harness_kind: "sandbox".into(),
+                provider_kind: Some("http".into()),
+                remote_run_id: None,
+                callback_token_hash: hash_callback_token(&tok_a),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: None,
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+        store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "turn_sec_b".into(),
+                agent_id: agent.id.clone(),
+                harness_kind: "sandbox".into(),
+                provider_kind: Some("http".into()),
+                remote_run_id: None,
+                callback_token_hash: hash_callback_token(&tok_b),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: None,
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+
+        let app = super::super::build_public_router(make_app_state(Arc::clone(&store), dir.path()));
+
+        // 1. `/v1/internal/guest/events` rejects missing, invalid, and wrong-turn bearer tokens (401)!
+        for auth in [
+            None,
+            Some("Bearer wrong-token"),
+            Some(format!("Bearer {tok_b}").as_str()),
+        ] {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/v1/internal/guest/events")
+                .header("content-type", "application/json");
+            if let Some(hdr) = auth {
+                req = req.header("authorization", hdr);
+            }
+            let resp = app
+                .clone()
+                .oneshot(
+                    req.body(Body::from(
+                        json!({
+                            "event_type": "turn_complete",
+                            "turn_id": "turn_sec_a",
+                            "result_text": "forged"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(
+            store
+                .remote_turn_store()
+                .get_turn("turn_sec_a")
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+
+        // Save env vars before testing tick fail-closed + JWKS.
+        let env_keys = [
+            "ANYAGENTS_TICK_TOKEN",
+            "ANYAGENTS_TICK_JWKS_URL",
+            "ANYAGENTS_TICK_SIGNATURE_HEADER",
+            "ANYAGENTS_TICK_ISS",
+            "ANYAGENTS_TICK_AUD",
+            "ANYAGENTS_TICK_SUB",
+        ];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            env_keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in env_keys {
+            unsafe { std::env::remove_var(k) };
+        }
+
+        // 2. `/v1/internal/tick` fails closed with 503 when neither token nor JWKS is set!
+        let resp_503 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/tick")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_503.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // 3. With `ANYAGENTS_TICK_TOKEN` set, wrong/missing bearer gets 401, valid gets 200!
+        unsafe { std::env::set_var("ANYAGENTS_TICK_TOKEN", "expected-tick-secret") };
+        let resp_401 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/tick")
+                    .header("authorization", "Bearer wrong-tick-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_401.status(), StatusCode::UNAUTHORIZED);
+
+        let resp_200 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/tick")
+                    .header("authorization", "Bearer expected-tick-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_200.status(), StatusCode::OK);
+
+        // 4. Neutral JWKS / EdDSA verification (with `kid` rotation refetch + `exp`/`iss`/`aud`/`sub`/`bh`)!
+        unsafe { std::env::remove_var("ANYAGENTS_TICK_TOKEN") };
+        let rng = SystemRandom::new();
+        let pkcs8_1 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp1 = Ed25519KeyPair::from_pkcs8(pkcs8_1.as_ref()).unwrap();
+        let pkcs8_2 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp2 = Ed25519KeyPair::from_pkcs8(pkcs8_2.as_ref()).unwrap();
+
+        let jwks_state = Arc::new(Mutex::new(jwks_doc_for(&[("k1", &kp1)])));
+        let jwks_srv_state = Arc::clone(&jwks_state);
+        let jwks_app = axum::Router::new().route(
+            "/.well-known/jwks.json",
+            axum::routing::get(move || {
+                let st = Arc::clone(&jwks_srv_state);
+                async move { Json(st.lock().unwrap().clone()) }
+            }),
+        );
+        let jwks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let jwks_addr = jwks_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(jwks_listener, jwks_app).await;
+        });
+
+        unsafe {
+            std::env::set_var(
+                "ANYAGENTS_TICK_JWKS_URL",
+                format!("http://{jwks_addr}/.well-known/jwks.json"),
+            );
+            std::env::set_var("ANYAGENTS_TICK_SIGNATURE_HEADER", "X-Webhook-Signature");
+            std::env::set_var("ANYAGENTS_TICK_ISS", "https://scheduler.example.test");
+            std::env::set_var(
+                "ANYAGENTS_TICK_AUD",
+                "https://coord.example.test/v1/internal/tick",
+            );
+            std::env::set_var("ANYAGENTS_TICK_SUB", "tick-job-1");
+        }
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let body_bytes = br#"{"trigger":"cron"}"#;
+        let bh = URL_SAFE_NO_PAD.encode(Sha256::digest(body_bytes));
+
+        let valid_jws = sign_ed25519_jws(
+            &kp1,
+            "k1",
+            &json!({
+                "iss": "https://scheduler.example.test",
+                "aud": "https://coord.example.test/v1/internal/tick",
+                "sub": "tick-job-1",
+                "exp": now_secs + 300,
+                "bh": bh,
+            }),
+        );
+        let ok_jwks = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/tick")
+                    .header("x-webhook-signature", valid_jws.clone())
+                    .body(Body::from(body_bytes.as_slice()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_jwks.status(), StatusCode::OK);
+
+        // Tampered body fails `bh` check (401)!
+        let bad_bh = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/tick")
+                    .header("x-webhook-signature", valid_jws)
+                    .body(Body::from(&b"{\"trigger\":\"tampered\"}"[..]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_bh.status(), StatusCode::UNAUTHORIZED);
+
+        // Expired token (> 60s skew) fails (401)!
+        let expired_jws = sign_ed25519_jws(
+            &kp1,
+            "k1",
+            &json!({
+                "iss": "https://scheduler.example.test",
+                "aud": "https://coord.example.test/v1/internal/tick",
+                "sub": "tick-job-1",
+                "exp": now_secs - 120,
+            }),
+        );
+        let bad_exp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/tick")
+                    .header("x-webhook-signature", expired_jws)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_exp.status(), StatusCode::UNAUTHORIZED);
+
+        // Key rotation: publish `k2` in JWKS and sign with `k2` -> cache misses `k2`, refetches, succeeds!
+        *jwks_state.lock().unwrap() = jwks_doc_for(&[("k1", &kp1), ("k2", &kp2)]);
+        let rotated_jws = sign_ed25519_jws(
+            &kp2,
+            "k2",
+            &json!({
+                "iss": "https://scheduler.example.test",
+                "aud": "https://coord.example.test/v1/internal/tick",
+                "sub": "tick-job-1",
+                "exp": now_secs + 300,
+            }),
+        );
+        let ok_rotated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/tick")
+                    .header("x-webhook-signature", rotated_jws)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_rotated.status(), StatusCode::OK);
+
+        // Restore env vars.
+        for (k, val) in saved {
+            match val {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        clear_jwks_cache();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn serverless_webhook_router_mounts_confined_api_only_with_operator_token() {
+        let _env = crate::server::tests::env_lock();
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "ANYAGENTS_SERVERLESS",
+            "ANYAGENTS_OPERATOR_TOKEN",
+            "ANYAGENTS_OPERATOR_TOKEN_FILE",
+        ]
+        .into_iter()
+        .map(|k| (k, std::env::var_os(k)))
+        .collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let make_state = |auth: crate::auth::Mode| AppState {
+            store: Arc::clone(&store),
+            health: crate::server::HealthBoard::default(),
+            sign_in: Arc::new(std::sync::Mutex::new(super::super::ProcessRunner)),
+            auth,
+            identity: Arc::new(crate::identity::ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+
+        unsafe {
+            std::env::set_var("ANYAGENTS_SERVERLESS", "true");
+            std::env::remove_var("ANYAGENTS_OPERATOR_TOKEN");
+            std::env::remove_var("ANYAGENTS_OPERATOR_TOKEN_FILE");
+        }
+        let no_op_app = crate::server::build_webhook_router(make_state(
+            crate::auth::Mode::from_env(dir.path()),
+        ));
+        let res_no_op = no_op_app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_no_op.status(), StatusCode::NOT_FOUND);
+
+        unsafe {
+            std::env::set_var(
+                "ANYAGENTS_OPERATOR_TOKEN",
+                "serverless-op-secret-0123456789",
+            );
+        }
+        let auth = crate::auth::Mode::from_env(dir.path());
+        assert!(auth.has_operator());
+        let app = crate::server::build_webhook_router(make_state(auth));
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let unauth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let authed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/agents")
+                    .header(crate::operator::HEADER, "serverless-op-secret-0123456789")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), StatusCode::OK);
+
+        for (k, val) in saved {
+            match val {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+}

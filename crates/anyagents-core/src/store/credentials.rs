@@ -7,9 +7,8 @@
 use std::fmt;
 use std::str::FromStr;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
-
 use super::{AgentId, Error, Store, now_ms};
+use crate::db::{DbExec, DbExecExt as _, DbRow, db_params};
 
 fn invalid(what: &str, text: &str) -> Error {
     Error::InvalidCredential(format!("invalid credential {what} `{text}`"))
@@ -218,44 +217,13 @@ pub struct CredentialObservation {
     pub at_ms: i64,
 }
 
-fn column<T: FromStr<Err = Error>>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T> {
-    let text: String = row.get(index)?;
-    text.parse().map_err(|err: Error| {
-        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(err))
-    })
-}
-
-fn optional_column<T: FromStr<Err = Error>>(
-    row: &rusqlite::Row<'_>,
-    index: usize,
-) -> rusqlite::Result<Option<T>> {
-    let text: Option<String> = row.get(index)?;
-    text.map(|text| {
-        text.parse().map_err(|err: Error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                index,
-                rusqlite::types::Type::Text,
-                Box::new(err),
-            )
-        })
-    })
-    .transpose()
-}
-
-fn agent_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<AgentId> {
-    let text: String = row.get(index)?;
-    AgentId::parse(&text).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(err))
-    })
-}
-
 const BINDING_COLS: &str = "agent_id, slot, target, set_by, set_at_ms, reason";
 
-fn binding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CredentialBinding> {
+fn binding_from_row(row: &DbRow<'_>) -> Result<CredentialBinding, Error> {
     Ok(CredentialBinding {
-        agent_id: agent_column(row, 0)?,
-        slot: column(row, 1)?,
-        target: column(row, 2)?,
+        agent_id: row.get(0)?,
+        slot: row.parse_str(1)?,
+        target: row.parse_str(2)?,
         set_by: row.get(3)?,
         set_at_ms: row.get(4)?,
         reason: row.get(5)?,
@@ -263,23 +231,21 @@ fn binding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CredentialBindi
 }
 
 fn binding_of(
-    conn: &Connection,
+    conn: &(impl DbExec + ?Sized),
     agent_id: &AgentId,
     slot: &CredentialSlot,
 ) -> Result<Option<CredentialBinding>, Error> {
-    Ok(conn
-        .query_row(
-            &format!(
-                "SELECT {BINDING_COLS} FROM credential_bindings WHERE agent_id = ?1 AND slot = ?2"
-            ),
-            params![agent_id.as_str(), slot.to_string()],
-            binding_from_row,
-        )
-        .optional()?)
+    conn.db_query_opt(
+        &format!(
+            "SELECT {BINDING_COLS} FROM credential_bindings WHERE agent_id = ?1 AND slot = ?2"
+        ),
+        &db_params![agent_id, slot.to_string()],
+        binding_from_row,
+    )
 }
 
 fn audit(
-    tx: &Transaction<'_>,
+    tx: &(impl DbExec + ?Sized),
     agent_id: &AgentId,
     slot: &str,
     before: Option<&str>,
@@ -287,10 +253,10 @@ fn audit(
     actor: &str,
     reason: &str,
 ) -> Result<(), Error> {
-    tx.execute(
+    tx.db_execute(
         "INSERT INTO credential_binding_audit (agent_id, slot, before_target, after_target, actor, reason, at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![agent_id.as_str(), slot, before, after, actor, reason, now_ms()],
+        &db_params![agent_id, slot, before, after, actor, reason, now_ms()],
     )?;
     Ok(())
 }
@@ -307,17 +273,15 @@ fn require_actor(actor: &str, reason: &str) -> Result<(), Error> {
 /// Remove every binding of a deleted agent, one audit row each, inside the
 /// deleting transaction.
 pub(super) fn delete_bindings_for_deleted_agent(
-    tx: &Transaction<'_>,
+    tx: &(impl DbExec + ?Sized),
     agent_id: &AgentId,
     actor: &str,
 ) -> Result<(), Error> {
-    let rows: Vec<(String, String)> = {
-        let mut stmt = tx.prepare(
-            "SELECT slot, target FROM credential_bindings WHERE agent_id = ?1 ORDER BY slot",
-        )?;
-        let rows = stmt.query_map([agent_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        rows.collect::<Result<_, _>>()?
-    };
+    let rows = tx.db_query_vec(
+        "SELECT slot, target FROM credential_bindings WHERE agent_id = ?1 ORDER BY slot",
+        &db_params![agent_id],
+        |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
+    )?;
     for (slot, target) in rows {
         audit(
             tx,
@@ -329,25 +293,18 @@ pub(super) fn delete_bindings_for_deleted_agent(
             "agent deleted",
         )?;
     }
-    tx.execute(
+    tx.db_execute(
         "DELETE FROM credential_bindings WHERE agent_id = ?1",
-        [agent_id.as_str()],
+        &db_params![agent_id],
     )?;
-    tx.execute(
+    tx.db_execute(
         "DELETE FROM credential_observations WHERE agent_id = ?1",
-        [agent_id.as_str()],
+        &db_params![agent_id],
     )?;
     Ok(())
 }
 
 impl Store {
-    fn credential_write<T>(
-        &self,
-        op: impl FnOnce(&Transaction<'_>) -> Result<T, Error>,
-    ) -> Result<T, Error> {
-        self.write_tx(op)
-    }
-
     /// Bind `slot` to `target`. Writes the row and one audit line in one
     /// commit; binding the target already bound returns the row unchanged and
     /// writes no audit line. Authorization is the caller's.
@@ -360,7 +317,7 @@ impl Store {
         reason: &str,
     ) -> Result<CredentialBinding, Error> {
         require_actor(actor, reason)?;
-        self.credential_write(|tx| {
+        self.write_tx(|tx| {
             super::agent_by_id(tx, agent_id)?;
             let before = binding_of(tx, agent_id, slot)?;
             if let Some(existing) = before.as_ref().filter(|b| &b.target == target) {
@@ -368,11 +325,11 @@ impl Store {
             }
             let slot_text = slot.to_string();
             let target_text = target.to_string();
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO credential_bindings (agent_id, slot, target, set_by, set_at_ms, reason)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(agent_id, slot) DO UPDATE SET target = ?3, set_by = ?4, set_at_ms = ?5, reason = ?6",
-                params![agent_id.as_str(), slot_text, target_text, actor, now_ms(), reason],
+                &db_params![agent_id, slot_text, target_text, actor, now_ms(), reason],
             )?;
             let before_text = before.map(|b| b.target.to_string());
             audit(tx, agent_id, &slot_text, before_text.as_deref(), Some(&target_text), actor, reason)?;
@@ -390,14 +347,14 @@ impl Store {
         reason: &str,
     ) -> Result<Option<CredentialBinding>, Error> {
         require_actor(actor, reason)?;
-        self.credential_write(|tx| {
+        self.write_tx(|tx| {
             let Some(before) = binding_of(tx, agent_id, slot)? else {
                 return Ok(None);
             };
             let slot_text = slot.to_string();
-            tx.execute(
+            tx.db_execute(
                 "DELETE FROM credential_bindings WHERE agent_id = ?1 AND slot = ?2",
-                params![agent_id.as_str(), slot_text],
+                &db_params![agent_id, slot_text],
             )?;
             audit(
                 tx,
@@ -426,21 +383,23 @@ impl Store {
         agent_id: &AgentId,
     ) -> Result<Vec<CredentialBinding>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {BINDING_COLS} FROM credential_bindings WHERE agent_id = ?1 ORDER BY slot"
-        ))?;
-        let rows = stmt.query_map([agent_id.as_str()], binding_from_row)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        conn.db_query_vec(
+            &format!(
+                "SELECT {BINDING_COLS} FROM credential_bindings WHERE agent_id = ?1 ORDER BY slot"
+            ),
+            &db_params![agent_id],
+            binding_from_row,
+        )
     }
 
     /// Every binding, ordered by agent and slot.
     pub fn list_credential_bindings(&self) -> Result<Vec<CredentialBinding>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {BINDING_COLS} FROM credential_bindings ORDER BY agent_id, slot"
-        ))?;
-        let rows = stmt.query_map([], binding_from_row)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        conn.db_query_vec(
+            &format!("SELECT {BINDING_COLS} FROM credential_bindings ORDER BY agent_id, slot"),
+            &[],
+            binding_from_row,
+        )
     }
 
     /// The agent's binding audit trail, oldest first.
@@ -449,23 +408,23 @@ impl Store {
         agent_id: &AgentId,
     ) -> Result<Vec<CredentialBindingAudit>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(
+        conn.db_query_vec(
             "SELECT id, agent_id, slot, before_target, after_target, actor, reason, at_ms
              FROM credential_binding_audit WHERE agent_id = ?1 ORDER BY id",
-        )?;
-        let rows = stmt.query_map([agent_id.as_str()], |row| {
-            Ok(CredentialBindingAudit {
-                id: row.get(0)?,
-                agent_id: agent_column(row, 1)?,
-                slot: column(row, 2)?,
-                before_target: optional_column(row, 3)?,
-                after_target: optional_column(row, 4)?,
-                actor: row.get(5)?,
-                reason: row.get(6)?,
-                at_ms: row.get(7)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+            &db_params![agent_id],
+            |row| {
+                Ok(CredentialBindingAudit {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    slot: row.parse_str(2)?,
+                    before_target: row.opt_parse_str(3)?,
+                    after_target: row.opt_parse_str(4)?,
+                    actor: row.get(5)?,
+                    reason: row.get(6)?,
+                    at_ms: row.get(7)?,
+                })
+            },
+        )
     }
 
     /// Record which record served a pool-bound slot at launch.
@@ -482,13 +441,13 @@ impl Store {
                 "an observation names a record, not `{record}`"
             )));
         }
-        self.credential_write(|tx| {
+        self.write_tx(|tx| {
             super::agent_by_id(tx, agent_id)?;
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO credential_observations (agent_id, slot, record, generation, reason, at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(agent_id, slot) DO UPDATE SET record = ?3, generation = ?4, reason = ?5, at_ms = ?6",
-                params![agent_id.as_str(), slot.to_string(), record.to_string(), generation, reason, now_ms()],
+                &db_params![agent_id, slot.to_string(), record.to_string(), generation, reason, now_ms()],
             )?;
             Ok(())
         })
@@ -499,23 +458,20 @@ impl Store {
         agent_id: &AgentId,
         slot: &CredentialSlot,
     ) -> Result<Option<CredentialObservation>, Error> {
-        Ok(self
-            .read_conn()
-            .query_row(
-                "SELECT agent_id, slot, record, generation, reason, at_ms
-                 FROM credential_observations WHERE agent_id = ?1 AND slot = ?2",
-                params![agent_id.as_str(), slot.to_string()],
-                |row| {
-                    Ok(CredentialObservation {
-                        agent_id: agent_column(row, 0)?,
-                        slot: column(row, 1)?,
-                        record: column(row, 2)?,
-                        generation: row.get(3)?,
-                        reason: row.get(4)?,
-                        at_ms: row.get(5)?,
-                    })
-                },
-            )
-            .optional()?)
+        self.read_conn().db_query_opt(
+            "SELECT agent_id, slot, record, generation, reason, at_ms
+             FROM credential_observations WHERE agent_id = ?1 AND slot = ?2",
+            &db_params![agent_id, slot.to_string()],
+            |row| {
+                Ok(CredentialObservation {
+                    agent_id: row.get(0)?,
+                    slot: row.parse_str(1)?,
+                    record: row.parse_str(2)?,
+                    generation: row.get(3)?,
+                    reason: row.get(4)?,
+                    at_ms: row.get(5)?,
+                })
+            },
+        )
     }
 }

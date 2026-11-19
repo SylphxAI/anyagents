@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::registry::Shared;
+use crate::db::{DbBackend, DbExec, DbExecExt};
+use crate::db_params;
 use crate::error::Error;
 
 /// The retired chunk table.
@@ -54,21 +56,32 @@ const DELETE_BATCH: i64 = 256;
 const MIN_PAUSE: Duration = Duration::from_millis(20);
 
 /// Whether state still has its retired chunk table.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn present(conn: &Connection) -> Result<bool, Error> {
-    Ok(conn.query_row(
+    present_db(conn)
+}
+
+pub(super) fn present_db(conn: &(impl DbExec + ?Sized)) -> Result<bool, Error> {
+    if conn.backend() == DbBackend::Postgres {
+        return Ok(false);
+    }
+    conn.db_query_one(
         "SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?1)",
-        [CHUNKS],
+        &db_params![CHUNKS],
         |r| r.get(0),
-    )?)
+    )
 }
 
 /// Whether anything retired is left to dismantle.
-pub(super) fn pending(conn: &Connection) -> Result<bool, Error> {
-    Ok(conn.query_row(
+pub(super) fn pending(conn: &(impl DbExec + ?Sized)) -> Result<bool, Error> {
+    if conn.backend() == DbBackend::Postgres {
+        return Ok(false);
+    }
+    conn.db_query_one(
         "SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name IN (?1, ?2))",
-        [CHUNKS, FTS],
+        &db_params![CHUNKS, FTS],
         |r| r.get(0),
-    )?)
+    )
 }
 
 fn table_exists(conn: &Connection, name: &str) -> Result<bool, Error> {
@@ -173,7 +186,7 @@ impl Retirement {
 pub(super) fn start(shared: &Arc<Shared>, in_memory: bool) -> Result<(), Error> {
     {
         let mut conn = shared.writer();
-        if !pending(&conn)? {
+        if !pending(&*conn)? {
             return Ok(());
         }
         let holds_documents = has_rows(&conn, CHUNKS)?
@@ -357,9 +370,14 @@ mod tests {
         // Until it is moved, the projection reads the position from the
         // retired chunk; a turn without one keeps none.
         let read = |conn: &Connection, id: &str| {
-            super::super::memory_index::read_source_rows(conn, "out", "WHERE o.id = ?1", &[&id])
-                .unwrap()
-                .remove(0)
+            super::super::memory_index::read_source_rows(
+                conn,
+                "out",
+                "WHERE o.id = ?1",
+                &crate::db_params![id],
+            )
+            .unwrap()
+            .remove(0)
         };
         assert_eq!(read(&conn, "out_old1").seq, 7);
         assert_eq!(read(&conn, "out_old2").seq, 0);

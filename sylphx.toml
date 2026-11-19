@@ -1,0 +1,17 @@
+# Portable serverless deployment blueprint (schema v2).
+version = "2"
+
+[[services]]
+name = "coordinator"
+public_networking = true
+port = 8788
+instance_type = "standard"
+min_instances = 0
+
+[services.build]
+dockerfile = "Dockerfile"
+context = "."
+
+[services.health]
+mode = "http"
+path = "/healthz"

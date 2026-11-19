@@ -3,11 +3,60 @@ use crate::HarnessError;
 use std::path::Path;
 use std::process::Command;
 
+const MAX_REGISTRY_BYTES: u64 = 64 * 1024 * 1024;
+
 fn current_uid() -> u32 {
     unsafe extern "C" {
         fn geteuid() -> u32;
     }
     unsafe { geteuid() }
+}
+
+/// Restore execute/traverse-only bits on `config.parent()` (`<data>/agents/<id>`)
+/// when owned by the server user and blocking seat traversal (e.g. `0o700`/`0o2700`),
+/// preserving setgid (`0o2000`) and never adding group/world read or write bits.
+#[cfg(unix)]
+fn ensure_agent_root_traversable(config: &Path, gid: u32) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let Some(root) = config.parent() else {
+        return Ok(());
+    };
+    let link_meta = match std::fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if !link_meta.is_dir() || link_meta.file_type().is_symlink() || link_meta.uid() != current_uid()
+    {
+        return Ok(());
+    }
+    let dir = std::fs::File::open(root)?;
+    let opened_meta = dir.metadata()?;
+    if !opened_meta.is_dir()
+        || (opened_meta.dev(), opened_meta.ino()) != (link_meta.dev(), link_meta.ino())
+        || opened_meta.uid() != current_uid()
+    {
+        return Ok(());
+    }
+    let opened_mode = opened_meta.mode() & 0o7777;
+    let group_traverse = opened_meta.gid() == gid && (opened_mode & 0o010) != 0;
+    let other_traverse = (opened_mode & 0o001) != 0;
+    if group_traverse || other_traverse {
+        return Ok(());
+    }
+    let add_bits = if opened_meta.gid() == gid {
+        0o710
+    } else {
+        0o711
+    };
+    dir.set_permissions(std::fs::Permissions::from_mode(
+        (opened_mode | add_bits) & 0o7777,
+    ))
+}
+
+#[cfg(not(unix))]
+fn ensure_agent_root_traversable(_config: &Path, _gid: u32) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 pub(super) fn admitted_command(
@@ -65,6 +114,10 @@ pub(super) fn admitted_command(
         .transpose()
         .map_err(|e| refuse(format!("invalid trusted peer principals: {e}")))?
         .unwrap_or_default();
+    if let Some(config_path) = config {
+        ensure_agent_root_traversable(config_path, gid)
+            .map_err(|e| refuse(format!("cannot prepare agent root traversal: {e}")))?;
+    }
     let checks = checks_with_principals(config, data, uid, gid, &principals)
         .map_err(|e| refuse(format!("cannot inventory peer boundaries: {e}")))?;
     let prefix = || {
@@ -190,12 +243,17 @@ fn live_registry_same_seat_roots(data: &Path, uid: u32, gid: u32) -> Vec<std::pa
             || meta.uid() != current_uid()
             || (meta.mode() & 0o022) != 0
             || meta.nlink() != 1
-            || meta.len() > 1_048_576
+            || meta.len() > MAX_REGISTRY_BYTES
         {
             return Vec::new();
         }
         let mut raw = String::new();
-        if file.take(1_048_577).read_to_string(&mut raw).is_err() || raw.len() > 1_048_576 {
+        if file
+            .take(MAX_REGISTRY_BYTES + 1)
+            .read_to_string(&mut raw)
+            .is_err()
+            || raw.len() as u64 > MAX_REGISTRY_BYTES
+        {
             return Vec::new();
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -1216,5 +1274,77 @@ mod peer_search_regressions {
             run().status.success(),
             "same-seat peer in server-owned execution-principals.json must be admitted even when absent from frozen env snapshot"
         );
+    }
+
+    #[test]
+    fn live_registry_same_seat_roots_reads_registries_over_one_mib() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("execution-principals.json");
+        let mut map = serde_json::Map::new();
+        for i in 0..16_000u32 {
+            let gid = if i == 15_999 { 24032 } else { 25000 };
+            map.insert(
+                format!("agt_peer_{i:05}"),
+                serde_json::json!({
+                    "user": format!("seat-{i:05}"),
+                    "uid": 24031,
+                    "gid": gid,
+                    "socket_gid": 24033
+                }),
+            );
+        }
+        let raw = serde_json::Value::Object(map).to_string();
+        assert!(raw.len() > 1_048_576, "fixture must exceed 1 MiB");
+        std::fs::write(&registry, raw).unwrap();
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let roots = live_registry_same_seat_roots(dir.path(), 24031, 24032);
+        assert_eq!(roots, vec![dir.path().join("agents/agt_peer_15999")]);
+    }
+
+    #[test]
+    fn ensure_agent_root_traversable_repairs_0o2700_without_granting_read_bits_or_breaking_peer_isolation()
+     {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("agents/own");
+        let config = root.join("config");
+        let peer = dir.path().join("agents/peer");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(peer.join("config")).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o2700)).unwrap();
+        std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o2700)).unwrap();
+
+        let my_gid = root.metadata().unwrap().gid();
+        // Matching seat gid: 0o2700 -> 0o2710 (group traverse only, preserving setgid & cross-seat isolation).
+        ensure_agent_root_traversable(&config, my_gid).unwrap();
+        let mode_same_gid = root.metadata().unwrap().mode() & 0o7777;
+        assert_eq!(mode_same_gid, 0o2710);
+        assert_eq!(
+            mode_same_gid & 0o066,
+            0,
+            "must never add read or write bits"
+        );
+
+        // Distinct seat gid: 0o2700 -> 0o2711 (traverse-only, preserving setgid & blocking peer readdir).
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o2700)).unwrap();
+        ensure_agent_root_traversable(&config, my_gid.wrapping_add(1)).unwrap();
+        let mode_other_gid = root.metadata().unwrap().mode() & 0o7777;
+        assert_eq!(mode_other_gid, 0o2711);
+        assert_eq!(
+            mode_other_gid & 0o066,
+            0,
+            "must never add read or write bits"
+        );
+
+        // Symlinked root must never mutate target.
+        let real_target = dir.path().join("private-target");
+        std::fs::create_dir_all(real_target.join("config")).unwrap();
+        std::fs::set_permissions(&real_target, std::fs::Permissions::from_mode(0o2700)).unwrap();
+        let sym = dir.path().join("agents/sym");
+        std::os::unix::fs::symlink(&real_target, &sym).unwrap();
+        ensure_agent_root_traversable(&sym.join("config"), my_gid.wrapping_add(1)).unwrap();
+        assert_eq!(real_target.metadata().unwrap().mode() & 0o7777, 0o2700);
+        assert_eq!(peer.metadata().unwrap().mode() & 0o7777, 0o2700);
     }
 }

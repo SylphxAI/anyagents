@@ -20,10 +20,17 @@ pub const AGENT_HEADER: &str = "x-anyagents-agent";
 /// config directory.
 pub const CAPABILITY_FILE: &str = "mcp-capability";
 
-/// The operator token, when this deployment has one: the environment names
-/// the file (`ANYAGENTS_OPERATOR_TOKEN_FILE`), else the data directory holds
-/// the one file a start script wrote before the server started.
+/// The operator token, when this deployment has one: `ANYAGENTS_OPERATOR_TOKEN`
+/// env var (12-factor / serverless deployments), else the file named by
+/// `ANYAGENTS_OPERATOR_TOKEN_FILE`, else the data directory file written before
+/// the server started.
 pub fn operator_token(data: &std::path::Path) -> Option<String> {
+    if let Ok(raw) = std::env::var("ANYAGENTS_OPERATOR_TOKEN") {
+        let token = raw.trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+    }
     let path = match std::env::var_os("ANYAGENTS_OPERATOR_TOKEN_FILE") {
         Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
         _ => {

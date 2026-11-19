@@ -5,19 +5,23 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 
 const INITIAL_POLL: Duration = Duration::from_millis(250);
-const MAX_POLL: Duration = Duration::from_secs(10);
+const MAX_POLL: Duration = Duration::from_secs(5);
+const MAX_TRANSIENT_POLL_ERRORS: u32 = 5;
 
 pub(super) struct Input {
     pub(super) request: Pending,
     path: PathBuf,
+    config_dir: PathBuf,
     event: Value,
     proof: Option<Value>,
     echoed: bool,
     pub(super) failure: Option<String>,
+    pub(super) error_detail: Option<CloudErrorDetail>,
     durable: bool,
     deadline: Instant,
     next_poll: Instant,
     interval: Duration,
+    transient_poll_errors: u32,
 }
 
 impl Input {
@@ -100,88 +104,164 @@ impl Input {
         Ok(Self {
             request,
             path,
+            config_dir: config.to_path_buf(),
             event: Value::Null,
             proof,
             echoed: false,
             failure: None,
+            error_detail: None,
             durable: key.is_some(),
             deadline: Instant::now() + TURN_BUDGET,
             next_poll: Instant::now(),
             interval: INITIAL_POLL,
+            transient_poll_errors: 0,
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn advance(
         &mut self,
         session: &Session,
         strict: bool,
     ) -> Result<Option<CloudTurnOutcome>, String> {
+        self.advance_detailed(session, strict, &TurnCancel::default())
+            .map_err(|d| d.message)
+    }
+
+    pub(super) fn advance_detailed(
+        &mut self,
+        session: &Session,
+        strict: bool,
+        cancel: &TurnCancel,
+    ) -> Result<Option<CloudTurnOutcome>, CloudErrorDetail> {
         let cached = self.request.completed.is_some();
         let receipt = if let Some(receipt) = &self.request.completed {
             receipt.clone()
         } else if let Some(task) = &self.request.receipt {
-            session.api.get(&format!("/v1/message-receipts/{task}"))?
+            match session
+                .api
+                .get_detailed(&format!("/v1/message-receipts/{task}"))
+            {
+                Ok(v) => {
+                    self.transient_poll_errors = 0;
+                    v
+                }
+                Err(d) if d.status.is_some_and(|s| (500..=599).contains(&s)) => {
+                    self.transient_poll_errors += 1;
+                    if self.transient_poll_errors <= MAX_TRANSIENT_POLL_ERRORS {
+                        return Ok(None);
+                    }
+                    return Err(d);
+                }
+                Err(d) => return Err(d),
+            }
         } else {
-            let receipt = session.api.post(
+            match session.api.post_message_stream_or_json(
                 &format!("/v1/agents/{}/messages", session.agent_id),
                 &self.request,
-            )?;
-            if receipt.get("agent_id").and_then(Value::as_str) != Some(&session.agent_id) {
-                return Err("Spiron receipt Agent mismatch; request retained".into());
+                &session.agent_id,
+                cancel,
+            )? {
+                PostMessageResponse::Stream(outcome) => {
+                    clear_active_run(&self.config_dir);
+                    if !self.durable {
+                        let _ = std::fs::remove_file(&self.path);
+                    }
+                    return Ok(Some(outcome));
+                }
+                PostMessageResponse::Json(receipt) => {
+                    if receipt.get("agent_id").and_then(Value::as_str) != Some(&session.agent_id) {
+                        return Err(CloudErrorDetail::generic(
+                            "Spiron receipt Agent mismatch; request retained",
+                        ));
+                    }
+                    let receipt_id =
+                        identifier(&receipt, "id").map_err(CloudErrorDetail::generic)?;
+                    let run_id = receipt
+                        .get("run_id")
+                        .and_then(Value::as_str)
+                        .and_then(|s| validate_id(s, "run_id").ok());
+                    self.request.receipt = Some(receipt_id.clone());
+                    self.request.run_id = run_id.clone();
+                    self.save().map_err(CloudErrorDetail::generic)?;
+                    let _ = persist_active_run(
+                        &self.config_dir,
+                        &ActiveRunState {
+                            agent_id: session.agent_id.clone(),
+                            run_id,
+                            receipt_id: Some(receipt_id),
+                            idempotency_key: Some(self.request.key.clone()),
+                            content: self
+                                .request
+                                .body
+                                .get("content")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            started_at_ms: now_epoch_ms(),
+                        },
+                    );
+                    receipt
+                }
             }
-            self.request.receipt = Some(identifier(&receipt, "id")?);
-            self.save()?;
-            receipt
         };
         let task = self
             .request
             .receipt
             .as_deref()
-            .ok_or("Spiron receipt missing")?;
-        if identifier(&receipt, "id")? != task
+            .ok_or_else(|| CloudErrorDetail::generic("Spiron receipt missing"))?;
+        if identifier(&receipt, "id").map_err(CloudErrorDetail::generic)? != task
             || receipt.get("agent_id").and_then(Value::as_str) != Some(&session.agent_id)
         {
-            return Err("Spiron receipt identity mismatch; request retained".into());
+            return Err(CloudErrorDetail::generic(
+                "Spiron receipt identity mismatch; request retained",
+            ));
         }
         if strict {
             if receipt.get("provider_message_id").and_then(Value::as_str) != Some(&self.request.key)
             {
-                return Err("Spiron receipt request key mismatch; request retained".into());
+                return Err(CloudErrorDetail::generic(
+                    "Spiron receipt request key mismatch; request retained",
+                ));
             }
             if let Some(proof) = receipt.get("input_delivery").filter(|p| !p.is_null()) {
                 for field in ["session_id", "entry_id", "turn_entry_id"] {
-                    identifier(proof, field)?;
+                    identifier(proof, field).map_err(CloudErrorDetail::generic)?;
                 }
                 if proof
                     .get("recorded_at")
                     .and_then(Value::as_str)
                     .is_none_or(str::is_empty)
                 {
-                    return Err("Spiron input proof missing recorded_at".into());
+                    return Err(CloudErrorDetail::generic(
+                        "Spiron input proof missing recorded_at",
+                    ));
                 }
                 if self
                     .proof
                     .as_ref()
                     .is_some_and(|previous| previous != proof)
                 {
-                    return Err("Spiron input proof changed; request retained".into());
+                    return Err(CloudErrorDetail::generic(
+                        "Spiron input proof changed; request retained",
+                    ));
                 }
                 if self.proof.is_none() {
                     self.proof = Some(proof.clone());
                     self.request.input_delivery = Some(proof.clone());
-                    self.save()?;
+                    self.save().map_err(CloudErrorDetail::generic)?;
                 }
             } else if self.proof.is_some() {
-                return Err("Spiron input proof disappeared; request retained".into());
+                return Err(CloudErrorDetail::generic(
+                    "Spiron input proof disappeared; request retained",
+                ));
             }
         }
         match receipt.get("status").and_then(Value::as_str) {
             Some("completed") => {
                 if strict && self.proof.is_none() {
-                    return Err(
-                        "completed Spiron receipt lacks durable input proof; request retained"
-                            .into(),
-                    );
+                    return Err(CloudErrorDetail::generic(
+                        "completed Spiron receipt lacks durable input proof; request retained",
+                    ));
                 }
                 let reply = receipt
                     .get("reply")
@@ -200,9 +280,12 @@ impl Input {
                 };
                 let reply = match reply {
                     Some(reply) => reply.to_string(),
-                    None => projection?
+                    None => projection
+                        .map_err(CloudErrorDetail::generic)?
                         .filter(|s| !s.is_empty())
-                        .ok_or("completed Spiron receipt has no reply")?,
+                        .ok_or_else(|| {
+                            CloudErrorDetail::generic("completed Spiron receipt has no reply")
+                        })?,
                 };
                 if self.durable {
                     self.request.completed = Some(receipt);
@@ -212,11 +295,13 @@ impl Input {
                         .unwrap()
                         .remove("mcp_servers");
                     if !cached {
-                        self.save()?;
+                        self.save().map_err(CloudErrorDetail::generic)?;
                     }
                 } else {
-                    std::fs::remove_file(&self.path).map_err(|e| e.to_string())?;
+                    std::fs::remove_file(&self.path)
+                        .map_err(|e| CloudErrorDetail::generic(e.to_string()))?;
                 }
+                clear_active_run(&self.config_dir);
                 Ok(Some(CloudTurnOutcome {
                     session_id: session.agent_id.clone(),
                     reply_text: reply,
@@ -225,10 +310,26 @@ impl Input {
                 }))
             }
             Some("failed" | "canceled") => {
-                self.failure = Some(format!(
-                    "Spiron turn {}",
-                    receipt["status"].as_str().unwrap()
-                ));
+                let st = receipt["status"].as_str().unwrap_or("failed");
+                let msg = format!("Spiron turn {st}");
+                self.failure = Some(msg.clone());
+                if let Some(err_obj) = receipt.get("error") {
+                    let err_raw = err_obj.to_string();
+                    if let Some(code_status) = err_obj
+                        .get("status")
+                        .or_else(|| err_obj.get("apiErrorStatus"))
+                        .and_then(Value::as_u64)
+                        .and_then(|n| u16::try_from(n).ok())
+                    {
+                        self.error_detail = Some(classify_http_error(
+                            code_status,
+                            None,
+                            &err_raw,
+                            HARNESS,
+                            "spiron",
+                        ));
+                    }
+                }
                 if self.durable {
                     self.request.completed = Some(receipt);
                     self.request
@@ -237,15 +338,19 @@ impl Input {
                         .unwrap()
                         .remove("mcp_servers");
                     if !cached {
-                        self.save()?;
+                        self.save().map_err(CloudErrorDetail::generic)?;
                     }
                 } else {
-                    std::fs::remove_file(&self.path).map_err(|e| e.to_string())?;
+                    std::fs::remove_file(&self.path)
+                        .map_err(|e| CloudErrorDetail::generic(e.to_string()))?;
                 }
+                clear_active_run(&self.config_dir);
                 Ok(None)
             }
             Some("submitted" | "working" | "input_required") => Ok(None),
-            _ => Err("Spiron receipt has missing or unknown status; request retained".into()),
+            _ => Err(CloudErrorDetail::generic(
+                "Spiron receipt has missing or unknown status; request retained",
+            )),
         }
     }
 
@@ -335,12 +440,27 @@ pub(crate) fn serve<R: BufRead + Send + 'static, W: Write + Send + 'static>(
                     {
                         for input in &pending {
                             if let Some(task) = &input.request.receipt {
-                                cancel_cloud_turn(
-                                    &session.api.base,
-                                    HARNESS,
-                                    session.api.token.as_deref(),
-                                    task,
-                                )?;
+                                if let Some(run_id) = input
+                                    .request
+                                    .run_id
+                                    .as_deref()
+                                    .filter(|r| *r != task.as_str())
+                                {
+                                    cancel_spiron_run(
+                                        &session.api.base,
+                                        session.api.token.as_deref(),
+                                        &session.agent_id,
+                                        run_id,
+                                        Some(task),
+                                    )?;
+                                } else {
+                                    cancel_cloud_turn(
+                                        &session.api.base,
+                                        HARNESS,
+                                        session.api.token.as_deref(),
+                                        task,
+                                    )?;
+                                }
                             }
                         }
                         return Err(
@@ -393,7 +513,21 @@ pub(crate) fn serve<R: BufRead + Send + 'static, W: Write + Send + 'static>(
                 pending.push_back(input);
                 continue;
             }
-            let outcome = input.advance(&session, strict)?;
+            let outcome = match input.advance_detailed(&session, strict, &TurnCancel::default()) {
+                Ok(outcome) => outcome,
+                Err(detail) => {
+                    if matches!(detail.status, Some(401 | 429 | 503)) {
+                        let uuid = input.event["uuid"].clone();
+                        emit_structured_cloud_error(
+                            &mut writer,
+                            &session.agent_id,
+                            &detail,
+                            Some(&[uuid]),
+                        );
+                    }
+                    return Err(detail.message);
+                }
+            };
             if !input.echoed && (input.proof.is_some() || (!strict && outcome.is_some())) {
                 let mut echo = input.event.clone();
                 echo["isReplay"] = json!(true);
@@ -405,11 +539,20 @@ pub(crate) fn serve<R: BufRead + Send + 'static, W: Write + Send + 'static>(
             }
             if let Some(reason) = input.failure.take() {
                 let uuid = input.event["uuid"].clone();
-                emit(
-                    &mut writer,
-                    &json!({"type":"result", "subtype":"error", "is_error":true,
-                    "session_id":session.agent_id, "result":reason,"completed_message_uuids":[uuid]}),
-                )?;
+                if let Some(detail) = input.error_detail.take() {
+                    emit_structured_cloud_error(
+                        &mut writer,
+                        &session.agent_id,
+                        &detail,
+                        Some(&[uuid]),
+                    );
+                } else {
+                    emit(
+                        &mut writer,
+                        &json!({"type":"result", "subtype":"error", "is_error":true,
+                        "session_id":session.agent_id, "result":reason,"completed_message_uuids":[uuid]}),
+                    )?;
+                }
             } else if let Some(outcome) = outcome {
                 let uuid = input.event["uuid"].clone();
                 emit(
@@ -423,7 +566,12 @@ pub(crate) fn serve<R: BufRead + Send + 'static, W: Write + Send + 'static>(
                     "result":outcome.reply_text,"user_message_uuids":[uuid],"completed_message_uuids":[uuid]}),
                 )?;
             } else {
-                input.next_poll = Instant::now() + input.interval;
+                let next_wait = if input.interval > INITIAL_POLL {
+                    apply_poll_jitter(input.interval)
+                } else {
+                    input.interval
+                };
+                input.next_poll = Instant::now() + next_wait;
                 input.interval = (input.interval * 2).min(MAX_POLL);
                 pending.push_back(input);
             }

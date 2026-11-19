@@ -1,0 +1,321 @@
+name: docker-publish
+
+# Open-source, vendor-neutral multi-target OCI image publishing pipeline.
+#
+# Builds and publishes:
+#   1. Coordinator image (`Dockerfile`)             -> <registry>/<owner>/anyagents
+#   2. Sandbox images (`Dockerfile.sandbox`):
+#      - target `sandbox-base`                      -> <registry>/<owner>/anyagents-sandbox:base*
+#      - target `sandbox-dev`  (rustup + bun)       -> <registry>/<owner>/anyagents-sandbox:dev*
+#      - target `sandbox-full` (public harnesses)   -> <registry>/<owner>/anyagents-sandbox:full*
+#
+# Emits exact immutable `@sha256:...` digests in job outputs and `$GITHUB_STEP_SUMMARY`
+# ready to pin in `ANYAGENTS_SANDBOX_IMAGE` across any OCI-capable sandbox provider.
+#
+# Hosted runners are free only on public repositories: every job carries the
+# `github.event.repository.private == false` guard and uses GitHub-hosted labels only.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: Target OCI container registry (default ghcr.io)
+        required: false
+        default: ghcr.io
+        type: string
+      image_namespace:
+        description: Target OCI namespace/owner (defaults to lowercased repository owner)
+        required: false
+        default: ''
+        type: string
+      tag:
+        description: Optional extra mutable tag to attach (e.g. edge or rc1)
+        required: false
+        default: ''
+        type: string
+      platforms:
+        description: Comma-separated OCI target platforms
+        required: false
+        default: linux/amd64,linux/arm64
+        type: string
+      install_harnesses:
+        description: Space-separated public CLI harnesses for sandbox-full
+        required: false
+        default: claude-code codex opencode
+        type: string
+      push:
+        description: Push built images to registry (set false for build-only verification)
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      registry: ${{ steps.vars.outputs.registry }}
+      namespace: ${{ steps.vars.outputs.namespace }}
+      coordinator_image: ${{ steps.vars.outputs.coordinator_image }}
+      sandbox_image: ${{ steps.vars.outputs.sandbox_image }}
+      platforms: ${{ steps.vars.outputs.platforms }}
+      install_harnesses: ${{ steps.vars.outputs.install_harnesses }}
+      extra_tag: ${{ steps.vars.outputs.extra_tag }}
+      push: ${{ steps.vars.outputs.push }}
+    steps:
+      - name: Resolve target registry and image repositories
+        id: vars
+        env:
+          INPUT_REGISTRY: ${{ inputs.registry }}
+          INPUT_NAMESPACE: ${{ inputs.image_namespace }}
+          INPUT_PLATFORMS: ${{ inputs.platforms }}
+          INPUT_HARNESSES: ${{ inputs.install_harnesses }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PUSH: ${{ inputs.push }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          registry="${INPUT_REGISTRY:-ghcr.io}"
+          registry="${registry%/}"
+          raw_ns="${INPUT_NAMESPACE:-$REPO_OWNER}"
+          namespace="$(printf '%s' "$raw_ns" | tr '[:upper:]' '[:lower:]')"
+          platforms="${INPUT_PLATFORMS:-linux/amd64,linux/arm64}"
+          harnesses="${INPUT_HARNESSES:-claude-code codex opencode}"
+          push_flag="true"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_PUSH" = "false" ]; then
+            push_flag="false"
+          fi
+          {
+            echo "registry=${registry}"
+            echo "namespace=${namespace}"
+            echo "coordinator_image=${registry}/${namespace}/anyagents"
+            echo "sandbox_image=${registry}/${namespace}/anyagents-sandbox"
+            echo "platforms=${platforms}"
+            echo "install_harnesses=${harnesses}"
+            echo "extra_tag=${INPUT_TAG:-}"
+            echo "push=${push_flag}"
+          } >> "$GITHUB_OUTPUT"
+
+  coordinator:
+    needs: resolve
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image_ref: ${{ steps.record.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to OCI registry
+        if: needs.resolve.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ needs.resolve.outputs.registry }}
+          username: ${{ secrets.REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.REGISTRY_PASSWORD || github.token }}
+
+      - name: Extract OCI metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.resolve.outputs.coordinator_image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ needs.resolve.outputs.extra_tag }},enable=${{ needs.resolve.outputs.extra_tag != '' }}
+
+      - name: Build and push Coordinator OCI image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ needs.resolve.outputs.platforms }}
+          push: ${{ needs.resolve.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=coordinator
+          cache-to: type=gha,mode=max,scope=coordinator
+
+      - name: Record immutable Coordinator digest
+        id: record
+        env:
+          IMAGE: ${{ needs.resolve.outputs.coordinator_image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DIGEST" ]; then
+            ref="${IMAGE}@${DIGEST}"
+          else
+            ref="${IMAGE} (unpushed build-only verification)"
+          fi
+          echo "image_ref=${ref}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$ref" > "$RUNNER_TEMP/digests/coordinator.txt"
+          echo "Coordinator OCI digest: ${ref}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Coordinator digest receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-digest-coordinator
+          path: ${{ runner.temp }}/digests/coordinator.txt
+          retention-days: 7
+
+  sandbox:
+    needs: resolve
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: sandbox-base
+            tag_prefix: base
+          - target: sandbox-dev
+            tag_prefix: dev
+          - target: sandbox-full
+            tag_prefix: full
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to OCI registry
+        if: needs.resolve.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ needs.resolve.outputs.registry }}
+          username: ${{ secrets.REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.REGISTRY_PASSWORD || github.token }}
+
+      - name: Extract OCI metadata (${{ matrix.target }})
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.resolve.outputs.sandbox_image }}
+          tags: |
+            type=semver,pattern=${{ matrix.tag_prefix }}-{{version}}
+            type=semver,pattern=${{ matrix.tag_prefix }}-{{major}}.{{minor}}
+            type=ref,event=tag,prefix=${{ matrix.tag_prefix }}-
+            type=sha,prefix=${{ matrix.tag_prefix }}-sha-
+            type=raw,value=${{ matrix.tag_prefix }},enable=${{ github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v') || needs.resolve.outputs.extra_tag == '' }}
+            type=raw,value=${{ matrix.tag_prefix }}-${{ needs.resolve.outputs.extra_tag }},enable=${{ needs.resolve.outputs.extra_tag != '' }}
+
+      - name: Build and push ${{ matrix.target }} OCI image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.sandbox
+          target: ${{ matrix.target }}
+          platforms: ${{ needs.resolve.outputs.platforms }}
+          push: ${{ needs.resolve.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            INSTALL_HARNESSES=${{ needs.resolve.outputs.install_harnesses }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+
+      - name: Record immutable ${{ matrix.target }} digest
+        id: record
+        env:
+          IMAGE: ${{ needs.resolve.outputs.sandbox_image }}
+          TARGET: ${{ matrix.target }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DIGEST" ]; then
+            ref="${IMAGE}@${DIGEST}"
+          else
+            ref="${IMAGE} (unpushed build-only verification)"
+          fi
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$ref" > "$RUNNER_TEMP/digests/${TARGET}.txt"
+          echo "${TARGET} OCI digest: ${ref}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ${{ matrix.target }} digest receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-digest-${{ matrix.target }}
+          path: ${{ runner.temp }}/digests/${{ matrix.target }}.txt
+          retention-days: 7
+
+  summary:
+    needs: [resolve, coordinator, sandbox]
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download digest receipts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: oci-digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Emit immutable OCI digest summary
+        run: |
+          set -euo pipefail
+          coord="$(cat "$RUNNER_TEMP/digests/coordinator.txt")"
+          base="$(cat "$RUNNER_TEMP/digests/sandbox-base.txt")"
+          dev="$(cat "$RUNNER_TEMP/digests/sandbox-dev.txt")"
+          full="$(cat "$RUNNER_TEMP/digests/sandbox-full.txt")"
+          {
+            echo "## Published OCI Images (Immutable Digests)"
+            echo ""
+            echo "| Target | Dockerfile | Immutable Image Reference |"
+            echo "| --- | --- | --- |"
+            echo "| \`coordinator\` | \`Dockerfile\` | \`${coord}\` |"
+            echo "| \`sandbox-base\` | \`Dockerfile.sandbox\` | \`${base}\` |"
+            echo "| \`sandbox-dev\` | \`Dockerfile.sandbox\` | \`${dev}\` |"
+            echo "| \`sandbox-full\` | \`Dockerfile.sandbox\` | \`${full}\` |"
+            echo ""
+            echo "### Pinning Example"
+            echo '```bash'
+            echo "export ANYAGENTS_SANDBOX_IMAGE=\"${full}\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

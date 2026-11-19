@@ -13,9 +13,8 @@
 //! The decision and the write share one write transaction, so concurrent
 //! sends cannot both take the last slot.
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
-
 use super::{Error, MessageId, Store};
+use crate::db::{DbExec, DbExecExt as _, DbRow, db_params};
 use crate::migrate::now_ms;
 
 const MINUTE_MS: i64 = 60_000;
@@ -81,9 +80,9 @@ pub enum OperatorReceipt {
 const COLS: &str =
     "id, seq, sender, sender_name, body, received_at_ms, repeats, last_repeated_at_ms";
 
-fn from_row(row: &Row<'_>) -> Result<OperatorMessage, Error> {
+fn from_row(row: &DbRow<'_>) -> Result<OperatorMessage, Error> {
     Ok(OperatorMessage {
-        id: MessageId::parse(&row.get::<_, String>(0)?)?,
+        id: row.get(0)?,
         seq: row.get(1)?,
         sender: row.get(2)?,
         sender_name: row.get(3)?,
@@ -99,23 +98,29 @@ fn digest(body: &str) -> String {
 }
 
 /// The report this body repeats, if one arrived within the window.
-fn original(conn: &Connection, body: &str, now: i64) -> Result<Option<OperatorMessage>, Error> {
-    conn.prepare_cached(&format!(
-        "SELECT {COLS} FROM operator_messages
-         WHERE body_sha256 = ?1 AND received_at_ms > ?2 AND body = ?3
-         ORDER BY seq DESC LIMIT 1"
-    ))?
-    .query_row(
-        params![digest(body), now - OPERATOR_DEDUPE_WINDOW_MS, body],
-        |row| Ok(from_row(row)),
+fn original(
+    conn: &(impl DbExec + ?Sized),
+    body: &str,
+    now: i64,
+) -> Result<Option<OperatorMessage>, Error> {
+    conn.db_query_opt(
+        &format!(
+            "SELECT {COLS} FROM operator_messages
+             WHERE body_sha256 = ?1 AND received_at_ms > ?2 AND body = ?3
+             ORDER BY seq DESC LIMIT 1"
+        ),
+        &db_params![digest(body), now - OPERATOR_DEDUPE_WINDOW_MS, body],
+        from_row,
     )
-    .optional()?
-    .transpose()
 }
 
 /// When `sender` (every sender, for `None`) may store another report, if it
 /// is over a limit now.
-fn limited_until(conn: &Connection, sender: Option<&str>, now: i64) -> Result<Option<i64>, Error> {
+fn limited_until(
+    conn: &(impl DbExec + ?Sized),
+    sender: Option<&str>,
+    now: i64,
+) -> Result<Option<i64>, Error> {
     let limits = match sender {
         Some(_) => [(MINUTE_MS, OPERATOR_BURST), (HOUR_MS, OPERATOR_HOURLY_CAP)],
         None => [
@@ -127,14 +132,13 @@ fn limited_until(conn: &Connection, sender: Option<&str>, now: i64) -> Result<Op
     for (window, cap) in limits {
         // The cap-th newest report in the window: once it leaves the window,
         // fewer than `cap` remain and a report may be stored again.
-        let pivot: Option<i64> = conn
-            .prepare_cached(
-                "SELECT received_at_ms FROM operator_messages
-                 WHERE (?1 IS NULL OR sender = ?1) AND received_at_ms > ?2
-                 ORDER BY received_at_ms DESC LIMIT 1 OFFSET ?3",
-            )?
-            .query_row(params![sender, now - window, cap - 1], |row| row.get(0))
-            .optional()?;
+        let pivot: Option<i64> = conn.db_query_opt(
+            "SELECT received_at_ms FROM operator_messages
+             WHERE (?1 IS NULL OR sender = ?1) AND received_at_ms > ?2
+             ORDER BY received_at_ms DESC LIMIT 1 OFFSET ?3",
+            &db_params![sender, now - window, cap - 1],
+            |row| row.get(0),
+        )?;
         if let Some(pivot) = pivot {
             open_at = open_at.max(Some(pivot + window));
         }
@@ -146,7 +150,7 @@ fn limited_until(conn: &Connection, sender: Option<&str>, now: i64) -> Result<Op
 /// stored. A repeat is answered first, even while a limit holds, so a loop
 /// keeps getting its receipt instead of an error.
 fn decide(
-    conn: &Connection,
+    conn: &(impl DbExec + ?Sized),
     sender: &str,
     body: &str,
     now: i64,
@@ -201,10 +205,10 @@ impl Store {
         self.write_tx(|tx| {
             match decide(tx, &report.sender, &report.body, now)? {
                 Some(OperatorReceipt::Duplicate(existing)) => {
-                    tx.execute(
+                    tx.db_execute(
                         "UPDATE operator_messages
                          SET repeats = repeats + 1, last_repeated_at_ms = ?2 WHERE seq = ?1",
-                        params![existing.seq, now],
+                        &db_params![existing.seq, now],
                     )?;
                     return Ok(OperatorReceipt::Duplicate(OperatorMessage {
                         repeats: existing.repeats + 1,
@@ -215,27 +219,29 @@ impl Store {
                 Some(answer) => return Ok(answer),
                 None => {}
             }
-            tx.execute(
+            tx.db_execute(
                 "DELETE FROM operator_messages WHERE received_at_ms < ?1",
-                [now - OPERATOR_RETENTION_MS],
+                &db_params![now - OPERATOR_RETENTION_MS],
             )?;
             let id = MessageId::generate();
-            tx.execute(
+            let seq: i64 = tx.db_query_one(
                 "INSERT INTO operator_messages
                      (id, sender, sender_name, body, body_sha256, received_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    id.as_str(),
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 RETURNING seq",
+                &db_params![
+                    id,
                     report.sender,
                     report.sender_name,
                     report.body,
                     digest(&report.body),
                     now
                 ],
+                |row| row.get(0),
             )?;
             Ok(OperatorReceipt::New(OperatorMessage {
                 id,
-                seq: tx.last_insert_rowid(),
+                seq,
                 sender: report.sender,
                 sender_name: report.sender_name,
                 body: report.body,
@@ -254,19 +260,18 @@ impl Store {
         limit: Option<usize>,
     ) -> Result<Vec<OperatorMessage>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {COLS} FROM operator_messages WHERE seq > ?1 ORDER BY seq DESC LIMIT ?2"
-        ))?;
-        let mut rows = stmt.query(params![
-            since.unwrap_or(i64::MIN),
-            limit
-                .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
-                .unwrap_or(-1)
-        ])?;
-        let mut messages = Vec::new();
-        while let Some(row) = rows.next()? {
-            messages.push(from_row(row)?);
-        }
+        let mut messages = conn.db_query_vec(
+            &format!(
+                "SELECT {COLS} FROM operator_messages WHERE seq > ?1 ORDER BY seq DESC LIMIT ?2"
+            ),
+            &db_params![
+                since.unwrap_or(i64::MIN),
+                limit
+                    .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+                    .unwrap_or(i64::MAX)
+            ],
+            from_row,
+        )?;
         messages.reverse();
         Ok(messages)
     }

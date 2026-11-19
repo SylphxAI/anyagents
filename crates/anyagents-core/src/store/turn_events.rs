@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::{DbExec, db_params};
 
 /// One coherent observation for a causal terminal-state watch. The recovery
 /// cursor can close implicitly; only terminal callbacks advance `turn_seq`.
@@ -13,13 +14,13 @@ pub struct AgentTurnSnapshot {
 }
 
 pub(super) fn record_terminal(
-    conn: &Connection,
+    conn: &(impl DbExec + ?Sized),
     agent_id: &AgentId,
     outcome: &str,
 ) -> Result<(), Error> {
-    let seq = conn.query_row(
+    let seq = conn.db_query_one(
         "SELECT COALESCE((SELECT delivered_seq FROM mailbox_cursors WHERE agent_id = ?1), 0)",
-        [agent_id.as_str()],
+        &db_params![agent_id],
         |row| row.get(0),
     )?;
     if record_terminal_for(conn, agent_id, seq, outcome)? {
@@ -31,12 +32,12 @@ pub(super) fn record_terminal(
 /// Accept only the delivery owned by the caller, never infer callback custody
 /// from the cursor that a newer delivery may already have advanced.
 fn record_terminal_for(
-    conn: &Connection,
+    conn: &(impl DbExec + ?Sized),
     agent_id: &AgentId,
     delivered_seq: i64,
     outcome: &str,
 ) -> Result<bool, Error> {
-    let changed = conn.execute(
+    let changed = conn.db_execute(
         "INSERT INTO agent_turn_events(agent_id, turn_seq, delivered_seq, outcome)
          SELECT agent_id, 1, delivered_seq, ?3 FROM mailbox_cursors
          WHERE agent_id = ?1 AND delivered_seq = ?2 AND delivered_seq > 0
@@ -47,25 +48,25 @@ fn record_terminal_for(
          WHERE excluded.delivered_seq > agent_turn_events.delivered_seq
             OR (excluded.delivered_seq = agent_turn_events.delivered_seq
                 AND agent_turn_events.outcome = 'errored' AND excluded.outcome = 'completed')",
-        params![agent_id.as_str(), delivered_seq, outcome],
+        &db_params![agent_id, delivered_seq, outcome],
     )?;
     Ok(changed != 0)
 }
 
 fn revoke_task_contexts_through(
-    conn: &Connection,
+    conn: &(impl DbExec + ?Sized),
     child_id: &AgentId,
     seq: i64,
 ) -> Result<(), Error> {
-    conn.execute(
+    conn.db_execute(
         "DELETE FROM task_turn_contexts WHERE child_id = ?1 AND opener_seq <= ?2 AND closed_delivery_seq IS NULL",
-        params![child_id.as_str(), seq],
+        &db_params![child_id, seq],
     )?;
     Ok(())
 }
 
 fn task_return_on(
-    tx: &Connection,
+    tx: &dyn DbExec,
     child_id: &AgentId,
     delivered_seq: i64,
     opener_id: &str,
@@ -73,23 +74,21 @@ fn task_return_on(
 ) -> Result<Option<ReceiveTx>, Error> {
     // Persist the authority of the exact result even when schedules or an
     // explicit send suppress the return; legacy idle notices must not run.
-    let sent_to_parent = tx
-        .query_row(
-            "UPDATE task_turn_contexts SET closed_delivery_seq = ?4
+    let sent_to_parent = tx.db_query_opt(
+        "UPDATE task_turn_contexts SET closed_delivery_seq = ?4
          WHERE child_id = ?1 AND opener_id = ?2 AND opener_seq <= ?3
            AND closed_delivery_seq IS NULL RETURNING sent_to_parent_id",
-            params![child_id.as_str(), opener_id, delivered_seq, delivered_seq],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?;
+        &db_params![child_id, opener_id, delivered_seq, delivered_seq],
+        |row| row.get::<Option<String>>(0),
+    )?;
     let Some(sent_to_parent) = sent_to_parent else {
         return Ok(None);
     };
     // Only the latest authoritative completion is needed by idle release;
     // a stale result cannot move the terminal event backwards.
-    tx.execute(
+    tx.db_execute(
         "DELETE FROM task_turn_contexts WHERE child_id = ?1 AND opener_id != ?2 AND opener_seq <= ?3",
-        params![child_id.as_str(), opener_id, delivered_seq],
+        &db_params![child_id, opener_id, delivered_seq],
     )?;
     let child = agent_by_id(tx, child_id)?;
     if !child.is_task_subagent() || child.state == "archived" {
@@ -98,9 +97,9 @@ fn task_return_on(
     let Some(parent_id) = child.parent_id else {
         return Ok(None);
     };
-    let scheduled: bool = tx.query_row(
+    let scheduled: bool = tx.db_query_one(
         "SELECT EXISTS(SELECT 1 FROM agent_schedules WHERE agent_id = ?1 AND state = 'active')",
-        [child_id.as_str()],
+        &db_params![child_id],
         |row| row.get(0),
     )?;
     if scheduled || sent_to_parent.as_deref() == Some(parent_id.as_str()) {
@@ -134,15 +133,14 @@ impl Store {
         seq: i64,
     ) -> Result<Vec<String>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached(
+        conn.db_query_vec(
             "SELECT id FROM messages WHERE agent_id = ?1 AND seq = ?2
              UNION ALL SELECT opener_id FROM task_turn_contexts
              WHERE child_id = ?1 AND opener_seq = ?2 AND synthetic_recovery = 1
                AND closed_delivery_seq IS NULL",
-        )?;
-        Ok(stmt
-            .query_map(params![agent_id.as_str(), seq], |row| row.get(0))?
-            .collect::<Result<_, _>>()?)
+            &db_params![agent_id, seq],
+            |row| row.get(0),
+        )
     }
 
     /// Allocate transport-only context for a task mailbox opener before the
@@ -158,19 +156,19 @@ impl Store {
             if !child.is_task_subagent() || child.state != "running" {
                 return Ok(None);
             }
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO task_turn_contexts(child_id, opener_id, opener_seq, token)
                  SELECT agent_id, id, seq, ?3 FROM messages
                  WHERE agent_id = ?1 AND id = ?2 AND seq > COALESCE(
                      (SELECT delivered_seq FROM mailbox_cursors WHERE agent_id = ?1), 0)
                  ON CONFLICT(child_id, opener_id) DO NOTHING",
-                params![child_id.as_str(), opener_id, uuid::Uuid::new_v4().simple().to_string()],
+                &db_params![child_id, opener_id, uuid::Uuid::new_v4().simple().to_string()],
             )?;
-            Ok(tx.query_row(
+            tx.db_query_opt(
                 "SELECT token FROM task_turn_contexts WHERE child_id = ?1 AND opener_id = ?2 AND closed_delivery_seq IS NULL",
-                params![child_id.as_str(), opener_id],
+                &db_params![child_id, opener_id],
                 |row| row.get(0),
-            ).optional()?)
+            )
         })
     }
 
@@ -188,19 +186,19 @@ impl Store {
             if !child.is_task_subagent() || child.state != "running" {
                 return Ok(None);
             }
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO task_turn_contexts(child_id, opener_id, opener_seq, token, synthetic_recovery)
                  SELECT agent_id, ?2, opened_seq, ?5, 1 FROM turn_recovery
                  WHERE agent_id = ?1 AND opened_seq = ?3 AND recovery_count = ?4 AND opened_seq > completed_seq
                  ON CONFLICT(child_id, opener_id) DO NOTHING",
-                params![child_id.as_str(), opener_id, opened_seq, recovery_count, uuid::Uuid::new_v4().simple().to_string()],
+                &db_params![child_id, opener_id, opened_seq, recovery_count, uuid::Uuid::new_v4().simple().to_string()],
             )?;
-            Ok(tx.query_row(
+            tx.db_query_opt(
                 "SELECT token FROM task_turn_contexts WHERE child_id = ?1 AND opener_id = ?2
                  AND opener_seq = ?3 AND synthetic_recovery = 1 AND closed_delivery_seq IS NULL",
-                params![child_id.as_str(), opener_id, opened_seq],
+                &db_params![child_id, opener_id, opened_seq],
                 |row| row.get(0),
-            ).optional()?)
+            )
         })
     }
 
@@ -237,10 +235,10 @@ impl Store {
             if !record_terminal_for(tx, agent_id, delivered_seq, "completed")? {
                 return Ok((false, None));
             }
-            tx.execute(
+            tx.db_execute(
                 "UPDATE turn_recovery SET completed_seq = opened_seq, recovery_count = 0
                  WHERE agent_id = ?1 AND completed_seq < opened_seq AND opened_seq <= ?2",
-                params![agent_id.as_str(), delivered_seq],
+                &db_params![agent_id, delivered_seq],
             )?;
             super::turn_errors::end_run(tx, agent_id)?;
             let notice = exact_output
@@ -290,10 +288,10 @@ impl Store {
     ) -> Result<bool, Error> {
         self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
-            let owned: bool = tx.query_row(
+            let owned: bool = tx.db_query_one(
                 "SELECT EXISTS(SELECT 1 FROM mailbox_cursors
                  WHERE agent_id = ?1 AND delivered_seq = ?2 AND delivered_seq > 0)",
-                params![agent_id.as_str(), delivered_seq],
+                &db_params![agent_id, delivered_seq],
                 |row| row.get(0),
             )?;
             if !owned {
@@ -307,26 +305,34 @@ impl Store {
 
     pub fn agent_turn_snapshot(&self, agent_id: &AgentId) -> Result<AgentTurnSnapshot, Error> {
         let conn = self.read_conn();
-        let tx = conn.unchecked_transaction()?;
+        let tx = conn.snapshot()?;
         agent_exists(&tx, agent_id)?;
-        let snapshot = tx.query_row(
-            "SELECT COALESCE(e.turn_seq, 0), COALESCE(e.delivered_seq, 0), e.outcome,
-                    COALESCE(c.delivered_seq, 0),
-                    EXISTS(SELECT 1 FROM messages m WHERE m.agent_id = a.id
-                           AND m.seq > COALESCE(c.delivered_seq, 0)
-                           AND (CASE WHEN json_valid(m.context) THEN json_extract(m.context, '$.event') END)
-                               IS NOT 'reaction_passive'),
-                    COALESCE(r.opened_seq > r.completed_seq, 0)
-             FROM agents a
-             LEFT JOIN agent_turn_events e ON e.agent_id = a.id
-             LEFT JOIN mailbox_cursors c ON c.agent_id = a.id
-             LEFT JOIN turn_recovery r ON r.agent_id = a.id
-             WHERE a.id = ?1",
-            [agent_id.as_str()],
-            |row| Ok(AgentTurnSnapshot {
-                turn_seq: row.get(0)?, terminal_delivered_seq: row.get(1)?, outcome: row.get(2)?,
-                delivered_seq: row.get(3)?, pending_mail: row.get(4)?, open_turn: row.get(5)?,
-            }),
+        let not_passive = tx.backend().sql_not_passive_reaction("m.context");
+        let snapshot = tx.db_query_one(
+            &format!(
+                "SELECT COALESCE(e.turn_seq, 0), COALESCE(e.delivered_seq, 0), e.outcome,
+                        COALESCE(c.delivered_seq, 0),
+                        EXISTS(SELECT 1 FROM messages m WHERE m.agent_id = a.id
+                               AND m.seq > COALESCE(c.delivered_seq, 0)
+                               AND {not_passive}),
+                        CASE WHEN r.opened_seq > r.completed_seq THEN 1 ELSE 0 END
+                 FROM agents a
+                 LEFT JOIN agent_turn_events e ON e.agent_id = a.id
+                 LEFT JOIN mailbox_cursors c ON c.agent_id = a.id
+                 LEFT JOIN turn_recovery r ON r.agent_id = a.id
+                 WHERE a.id = ?1"
+            ),
+            &db_params![agent_id],
+            |row| {
+                Ok(AgentTurnSnapshot {
+                    turn_seq: row.get(0)?,
+                    terminal_delivered_seq: row.get(1)?,
+                    outcome: row.get(2)?,
+                    delivered_seq: row.get(3)?,
+                    pending_mail: row.get(4)?,
+                    open_turn: row.get(5)?,
+                })
+            },
         )?;
         tx.commit()?;
         Ok(snapshot)

@@ -14,6 +14,36 @@ pub const DEFAULT_SPIRON_MODEL: &str = "sylphx/openai/gpt-6.1-sol#medium";
 /// Compatibility value used by the managed-worktree marker consumed by Spiron.
 pub const CLOUD_WORKSPACE_DIR: &str = "/home/user";
 
+/// Returns `true` when `token` is a Sylphx gateway key (`sylphx_sk_...`),
+/// which authenticates local/gateway model calls rather than Spiron Cloud.
+pub fn is_sylphx_gateway_key(token: &str) -> bool {
+    token.trim().starts_with("sylphx_sk_")
+}
+
+/// Returns `true` when `token` is a Spiron Cloud API key (`spiron_sk_...`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_spiron_cloud_api_key(token: &str) -> bool {
+    token.trim().starts_with("spiron_sk_")
+}
+
+/// Returns `true` when `token` looks like a three-segment compact JWT.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_jwt_token(token: &str) -> bool {
+    let mut parts = token.trim().split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(h), Some(p), Some(s), None) => {
+            !h.is_empty()
+                && !p.is_empty()
+                && !s.is_empty()
+                && [h, p, s].into_iter().all(|seg| {
+                    seg.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Write the narrow JSON mount passed to Spiron with `--mcp-config` and the
 /// seat's `config.toml` (`always_approve = true`) for headless tool execution.
 ///
@@ -557,5 +587,16 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(cfg.join(".spiron/auth.json")).unwrap())
                 .unwrap();
         assert_eq!(auth["access_token"], "sk-or-v1-test-key");
+    }
+
+    #[test]
+    fn classifies_spiron_cloud_credentials_versus_sylphx_gateway_keys() {
+        assert!(is_sylphx_gateway_key("sylphx_sk_live_abc123"));
+        assert!(!is_sylphx_gateway_key("spiron_sk_live_abc123"));
+        assert!(is_spiron_cloud_api_key("spiron_sk_live_abc123"));
+        assert!(is_jwt_token(
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbg"
+        ));
+        assert!(!is_jwt_token("sylphx_sk_live_abc123"));
     }
 }

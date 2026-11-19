@@ -10,13 +10,18 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyagents_harness::normalize_harness_name;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 
+use crate::db::{
+    DbBackend, DbExec, DbExecExt, DbParam, DbRow, DbTx, PgTx, SnapshotGuard, ToDbParam,
+    build_pg_tsquery,
+};
+use crate::db_params;
 use crate::error::Error;
 use crate::id::{AgentId, ChannelId, MessageId, UsageId};
 use crate::quote::Quote;
@@ -71,23 +76,23 @@ pub use remote_sessions::{
 };
 pub use runtime::{
     AgentRuntime, BackfillReport, Fault, FaultKind, ProcessIdentity, QUOTA_ESTIMATE_MS, QuotaBlock,
-    QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeState, SessionLease, Turn,
-    TurnOutcome, TurnState,
+    QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeHeartbeat, RuntimeState,
+    SessionLease, Turn, TurnOutcome, TurnState,
 };
 pub use turn_errors::{ErroredTurn, MAX_ERRORED_TURNS, TurnErrors, is_session_turn_error};
 pub use turn_events::AgentTurnSnapshot;
 
 /// Run in the owner's archive transaction, never in a second Store write.
 /// Cancelled history and coalesced counts remain available for inspection.
-fn cancel_archived_schedules(conn: &Connection, id: &AgentId) -> Result<(), Error> {
-    conn.execute(
+fn cancel_archived_schedules(conn: &(impl DbExec + ?Sized), id: &AgentId) -> Result<(), Error> {
+    conn.db_execute(
         "UPDATE agent_schedules SET state = 'cancelled', next_fire_at_ms = NULL
          WHERE agent_id = ?1 AND state = 'active'",
-        [id.as_str()],
+        &db_params![id.as_str()],
     )?;
-    conn.execute(
+    conn.db_execute(
         "DELETE FROM task_turn_contexts WHERE child_id = ?1 AND closed_delivery_seq IS NULL",
-        [id.as_str()],
+        &db_params![id.as_str()],
     )?;
     Ok(())
 }
@@ -851,8 +856,19 @@ pub struct OpenTurn {
 /// (or adopted it from a keeper) unlocks on drop, and not once
 /// [`AgentLock::retain`] said the keeper keeps holding it after this process.
 #[derive(Debug)]
+enum AgentLockInner {
+    Flock(File),
+    PgLease {
+        guard: Arc<crate::stateless::CoordinatorLeaseGuard>,
+        /// Read-only descriptor supporting `AsFd` / `share()` compatibility for
+        /// callers that expect an OS fd handle.
+        fd: File,
+    },
+}
+
+#[derive(Debug)]
 pub struct AgentLock {
-    file: File,
+    inner: AgentLockInner,
     /// This descriptor took the lock (or adopted it), so its drop releases it.
     owner: bool,
     /// Cleared by [`AgentLock::retain`] on any copy: no copy in this process
@@ -863,17 +879,36 @@ pub struct AgentLock {
 impl AgentLock {
     fn taken(file: File) -> Self {
         Self {
-            file,
+            inner: AgentLockInner::Flock(file),
             owner: true,
             release: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
+    fn from_pg_lease(guard: crate::stateless::CoordinatorLeaseGuard) -> std::io::Result<Self> {
+        let fd = OpenOptions::new().read(true).open("/dev/null")?;
+        Ok(Self {
+            inner: AgentLockInner::PgLease {
+                guard: Arc::new(guard),
+                fd,
+            },
+            owner: true,
+            release: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        })
+    }
+
     /// Another descriptor of this lock, for a keeper process to inherit or
     /// for a later launch to hand on. The copy never unlocks on drop.
     pub fn share(&self) -> std::io::Result<AgentLock> {
+        let inner = match &self.inner {
+            AgentLockInner::Flock(file) => AgentLockInner::Flock(file.try_clone()?),
+            AgentLockInner::PgLease { guard, fd } => AgentLockInner::PgLease {
+                guard: Arc::clone(guard),
+                fd: fd.try_clone()?,
+            },
+        };
         Ok(Self {
-            file: self.file.try_clone()?,
+            inner,
             owner: false,
             release: Arc::clone(&self.release),
         })
@@ -891,23 +926,57 @@ impl AgentLock {
     pub fn retain(&self) {
         self.release.store(false, Ordering::SeqCst);
     }
+
+    /// Fencing token when backed by a distributed PostgreSQL coordinator lease.
+    pub fn fencing_token(&self) -> Option<i64> {
+        match &self.inner {
+            AgentLockInner::Flock(_) => None,
+            AgentLockInner::PgLease { guard, .. } => Some(guard.lease().fencing_token),
+        }
+    }
+
+    #[cfg(test)]
+    fn flock_file(&self) -> &File {
+        match &self.inner {
+            AgentLockInner::Flock(file) => file,
+            AgentLockInner::PgLease { fd, .. } => fd,
+        }
+    }
 }
 
 impl std::os::fd::AsFd for AgentLock {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        self.file.as_fd()
+        match &self.inner {
+            AgentLockInner::Flock(file) => file.as_fd(),
+            AgentLockInner::PgLease { fd, .. } => fd.as_fd(),
+        }
     }
 }
 
 impl Drop for AgentLock {
     fn drop(&mut self) {
-        if !self.owner || !self.release.load(Ordering::SeqCst) {
+        if !self.owner {
             return;
         }
-        // Closing only our descriptor leaves flock held by a concurrent fork's
-        // inherited copy until exec. Release the open-file-description lock
-        // explicitly so the next turn and busy probe see the intended lifetime.
-        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        let should_release = self.release.load(Ordering::SeqCst);
+        match &self.inner {
+            AgentLockInner::Flock(file) => {
+                if !should_release {
+                    return;
+                }
+                // Closing only our descriptor leaves flock held by a concurrent fork's
+                // inherited copy until exec. Release the open-file-description lock
+                // explicitly so the next turn and busy probe see the intended lifetime.
+                let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            }
+            AgentLockInner::PgLease { guard, .. } => {
+                if should_release {
+                    guard.release_now();
+                } else {
+                    guard.detach_without_release();
+                }
+            }
+        }
     }
 }
 
@@ -922,15 +991,36 @@ pub enum Wake {
 
 /// A handle on an open database. Every handle a process opens on one file
 /// shares that file's single read-write connection, read pool, and in-process
-/// wake subscribers (see `registry`). Writes serialize on the writer's mutex.
-/// File-backed reads use independent read-only connections; when a reader
+/// wake subscribers (see `registry`). SQLite writes serialize on the writer's mutex,
+/// while PostgreSQL writes execute concurrently via `sqlx::PgPool`.
+/// SQLite file-backed reads use independent read-only connections; when a reader
 /// cannot open, or for an in-memory database, reads use the authoritative writer
 /// and may wait for its mutex. The capability key belongs to the handle.
 pub struct Store {
-    shared: Arc<registry::Shared>,
+    backend: registry::Backend,
     db_path: PathBuf,
     data_dir: PathBuf,
     capabilities: Mutex<Option<String>>,
+    replica_id: String,
+}
+
+fn default_replica_id() -> String {
+    static REPLICA_ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        if let Ok(explicit) = std::env::var("ANYAGENTS_REPLICA_ID") {
+            let trimmed = explicit.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        let host = std::env::var("HOSTNAME")
+            .ok()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "replica".to_string());
+        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        format!("{host}-{}-{suffix}", std::process::id())
+    });
+    REPLICA_ID.clone()
 }
 
 /// Default per-statement wait for the writer lock.
@@ -1039,15 +1129,95 @@ pub(crate) enum ReadConn<'a> {
     /// The writer, when no reader opens; `true` while it has the search
     /// index attached for this borrow (detached on drop).
     Guard(registry::WriterGuard<'a>, bool),
+    /// A shared PostgreSQL connection pool handle.
+    Postgres(sqlx::PgPool),
 }
 
-impl std::ops::Deref for ReadConn<'_> {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
+impl ReadConn<'_> {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn as_sqlite(&self) -> &Connection {
         match self {
             Self::Pooled { conn, .. } => conn.as_ref().expect("pooled reader present until drop"),
             Self::Owned(conn) => conn.as_ref().expect("owned reader present until drop"),
             Self::Guard(g, _) => g,
+            Self::Postgres(_) => panic!("expected SQLite ReadConn, found Postgres"),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<SnapshotGuard<'_>, Error> {
+        match self {
+            Self::Pooled { conn, .. } => Ok(SnapshotGuard::Sqlite(
+                conn.as_ref()
+                    .expect("pooled reader present until drop")
+                    .unchecked_transaction()?,
+            )),
+            Self::Owned(conn) => Ok(SnapshotGuard::Sqlite(
+                conn.as_ref()
+                    .expect("owned reader present until drop")
+                    .unchecked_transaction()?,
+            )),
+            Self::Guard(g, _) => Ok(SnapshotGuard::Sqlite(g.unchecked_transaction()?)),
+            Self::Postgres(pool) => Ok(SnapshotGuard::Postgres(PgTx::begin_read_only(pool)?)),
+        }
+    }
+}
+
+impl DbExec for ReadConn<'_> {
+    fn backend(&self) -> DbBackend {
+        match self {
+            Self::Pooled { .. } | Self::Owned(_) | Self::Guard(_, _) => DbBackend::Sqlite,
+            Self::Postgres(_) => DbBackend::Postgres,
+        }
+    }
+
+    fn execute_raw(&self, sql: &str, params: &[DbParam]) -> Result<usize, Error> {
+        match self {
+            Self::Pooled { conn, .. } => conn
+                .as_ref()
+                .expect("pooled reader present until drop")
+                .execute_raw(sql, params),
+            Self::Owned(conn) => conn
+                .as_ref()
+                .expect("owned reader present until drop")
+                .execute_raw(sql, params),
+            Self::Guard(g, _) => g.execute_raw(sql, params),
+            Self::Postgres(pool) => pool.execute_raw(sql, params),
+        }
+    }
+
+    fn execute_batch_raw(&self, sql: &str) -> Result<(), Error> {
+        match self {
+            Self::Pooled { conn, .. } => conn
+                .as_ref()
+                .expect("pooled reader present until drop")
+                .execute_batch_raw(sql),
+            Self::Owned(conn) => conn
+                .as_ref()
+                .expect("owned reader present until drop")
+                .execute_batch_raw(sql),
+            Self::Guard(g, _) => g.execute_batch_raw(sql),
+            Self::Postgres(pool) => pool.execute_batch_raw(sql),
+        }
+    }
+
+    fn for_each_row_raw(
+        &self,
+        sql: &str,
+        params: &[DbParam],
+        f: &mut dyn FnMut(&DbRow<'_>) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        match self {
+            Self::Pooled { conn, .. } => conn
+                .as_ref()
+                .expect("pooled reader present until drop")
+                .for_each_row_raw(sql, params, f),
+            Self::Owned(conn) => conn
+                .as_ref()
+                .expect("owned reader present until drop")
+                .for_each_row_raw(sql, params, f),
+            Self::Guard(g, _) => g.for_each_row_raw(sql, params, f),
+            Self::Postgres(pool) => pool.for_each_row_raw(sql, params, f),
         }
     }
 }
@@ -1119,18 +1289,266 @@ fn preserve_legacy_scopes(conn: &mut Connection) -> Result<(), Error> {
 }
 
 impl Store {
-    /// A handle on the database at `path`. The first open of a file in this
-    /// process creates it if needed, turns on WAL, applies pending migrations
-    /// and repairs legacy rows; later opens, while any handle on the file is
-    /// alive, reuse that connection without touching the database.
+    /// A handle on the store: SQLite at `path` by default, or PostgreSQL when
+    /// `ANYAGENTS_DATABASE_URL` / `--database-url` / `<data_dir>/database-url`
+    /// is configured.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
+        let data_dir = data_dir_for(path);
+        if let Some(url) = crate::db::configured_database_url_for_data_dir(&data_dir) {
+            return Self::open_postgres_with_paths(&url, path, &data_dir);
+        }
         Ok(Self {
-            shared: registry::shared(path)?,
+            backend: registry::Backend::Sqlite(registry::shared(path)?),
             db_path: path.to_path_buf(),
-            data_dir: data_dir_for(path),
+            data_dir,
             capabilities: Mutex::new(None),
+            replica_id: default_replica_id(),
         })
+    }
+
+    /// Explicitly open the store backed by PostgreSQL at `url`, keeping local
+    /// workspace/config artifacts anchored under `data_dir`.
+    pub fn open_postgres(url: &str, data_dir: impl AsRef<Path>) -> Result<Self, Error> {
+        let data_dir = data_dir.as_ref();
+        Self::open_postgres_with_paths(url, &data_dir.join("state.db"), data_dir)
+    }
+
+    /// Open a PostgreSQL-backed store with its own isolated in-process wake
+    /// bus, `LISTEN` connection, and explicit `replica_id`.
+    ///
+    /// Useful for multi-replica coordinator integration tests simulating
+    /// independent pods sharing one PostgreSQL database.
+    pub fn open_postgres_isolated(
+        url: &str,
+        data_dir: impl AsRef<Path>,
+        replica_id: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let data_dir = data_dir.as_ref();
+        let replica_id = replica_id.into();
+        let pg = registry::isolated_postgres(url, data_dir, &replica_id)?;
+        Ok(Self {
+            backend: registry::Backend::Postgres(pg),
+            db_path: data_dir.join("state.db"),
+            data_dir: data_dir.to_path_buf(),
+            capabilities: Mutex::new(None),
+            replica_id,
+        })
+    }
+
+    fn open_postgres_with_paths(url: &str, db_path: &Path, data_dir: &Path) -> Result<Self, Error> {
+        let replica_id = default_replica_id();
+        let pg = registry::shared_postgres(url, data_dir, &replica_id)?;
+        Ok(Self {
+            backend: registry::Backend::Postgres(pg),
+            db_path: db_path.to_path_buf(),
+            data_dir: data_dir.to_path_buf(),
+            capabilities: Mutex::new(None),
+            replica_id,
+        })
+    }
+
+    pub fn replica_id(&self) -> &str {
+        &self.replica_id
+    }
+
+    pub fn pg_pool(&self) -> Option<sqlx::PgPool> {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => Some(pg.handle.pool.clone()),
+            registry::Backend::Sqlite(_) => None,
+        }
+    }
+
+    /// Wait up to `timeout` for the background PostgreSQL `LISTEN anyagents_wakes`
+    /// subscriber to become active. Returns `true` immediately on SQLite.
+    pub fn wait_pg_wake_listener_ready(&self, timeout: Duration) -> bool {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => pg.wait_wake_listener_ready(timeout),
+            registry::Backend::Sqlite(_) => true,
+        }
+    }
+
+    /// State blob store (`agent_files` + `deployment_blobs` on PostgreSQL;
+    /// local `<data_dir>` filesystem on SQLite).
+    pub fn blob_store(&self) -> Box<dyn crate::stateless::StateBlobStore> {
+        self.blob_store_with_key(None)
+    }
+
+    pub fn blob_store_with_key(
+        &self,
+        master_key: Option<crate::stateless::MasterKey>,
+    ) -> Box<dyn crate::stateless::StateBlobStore> {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => Box::new(crate::stateless::PgStateBlobStore::new(
+                pg.handle.pool.clone(),
+                master_key,
+            )),
+            registry::Backend::Sqlite(_) => {
+                Box::new(crate::stateless::FsStateBlobStore::new(&self.data_dir))
+            }
+        }
+    }
+
+    /// Distributed coordinator lock backend (`public.coordinator_leases` on
+    /// PostgreSQL; local `flock` files on SQLite).
+    pub fn lock_backend(&self) -> Box<dyn crate::stateless::CoordinatorLockBackend> {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => {
+                Box::new(crate::stateless::PgCoordinatorLockBackend::new(
+                    pg.handle.pool.clone(),
+                    self.replica_id.clone(),
+                ))
+            }
+            registry::Backend::Sqlite(_) => Box::new(crate::stateless::LocalFlockLockBackend::new(
+                &self.data_dir,
+                self.replica_id.clone(),
+            )),
+        }
+    }
+
+    /// Try to acquire a distributed PostgreSQL coordinator lease with automatic
+    /// background heartbeat renewal. Returns `Ok(None)` when another replica
+    /// currently holds an unexpired lease (or when backed by SQLite).
+    pub fn try_acquire_coordinator_lease(
+        &self,
+        lease_key: &str,
+        ttl: Duration,
+    ) -> Result<Option<crate::stateless::CoordinatorLeaseGuard>, Error> {
+        let Some(pool) = self.pg_pool() else {
+            return Ok(None);
+        };
+        let backend =
+            crate::stateless::PgCoordinatorLockBackend::new(pool, self.replica_id.clone());
+        backend.try_acquire_guard(lease_key, ttl)
+    }
+
+    /// PostgreSQL protocol gateway route store (`None` on SQLite).
+    pub fn gateway_route_store(&self) -> Option<crate::stateless::PgGatewayRouteStore> {
+        self.gateway_route_store_with_key(None)
+    }
+
+    pub fn gateway_route_store_with_key(
+        &self,
+        master_key: Option<crate::stateless::MasterKey>,
+    ) -> Option<crate::stateless::PgGatewayRouteStore> {
+        self.pg_pool()
+            .map(|pool| crate::stateless::PgGatewayRouteStore::new(pool, master_key))
+    }
+
+    /// Durable sandbox binding store (`public.agent_sandbox_bindings` on
+    /// PostgreSQL; local config JSON on SQLite).
+    pub fn sandbox_binding_store(&self) -> Box<dyn crate::stateless::SandboxBindingStore> {
+        self.sandbox_binding_store_with_key(None)
+    }
+
+    pub fn sandbox_binding_store_with_key(
+        &self,
+        master_key: Option<crate::stateless::MasterKey>,
+    ) -> Box<dyn crate::stateless::SandboxBindingStore> {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => Box::new(
+                crate::stateless::PgSandboxBindingStore::new(pg.handle.pool.clone(), master_key),
+            ),
+            registry::Backend::Sqlite(_) => {
+                Box::new(crate::stateless::FsSandboxBindingStore::new(&self.data_dir))
+            }
+        }
+    }
+
+    /// Convenience lookup for one agent's persisted sandbox binding.
+    pub fn sandbox_binding(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<crate::stateless::SandboxBinding>, Error> {
+        self.sandbox_binding_store().get(agent_id)
+    }
+
+    /// Durable obligation store (`public.durable_obligations` on PostgreSQL;
+    /// local `<data_dir>/obligations/` on SQLite).
+    pub fn durable_obligation_store(&self) -> Box<dyn crate::stateless::DurableObligationStore> {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => Box::new(
+                crate::stateless::PgDurableObligationStore::new(pg.handle.pool.clone()),
+            ),
+            registry::Backend::Sqlite(_) => Box::new(
+                crate::stateless::FsDurableObligationStore::new(&self.data_dir),
+            ),
+        }
+    }
+
+    /// Durable serverless remote turn ledger (`public.pending_remote_turns` on PostgreSQL;
+    /// local `<data_dir>/remote-turns/` on SQLite).
+    pub fn remote_turn_store(&self) -> Box<dyn crate::stateless::RemoteTurnStore> {
+        match &self.backend {
+            registry::Backend::Postgres(pg) => Box::new(crate::stateless::PgRemoteTurnStore::new(
+                pg.handle.pool.clone(),
+            )),
+            registry::Backend::Sqlite(_) => {
+                Box::new(crate::stateless::FsRemoteTurnStore::new(&self.data_dir))
+            }
+        }
+    }
+
+    pub fn backend_kind(&self) -> DbBackend {
+        match &self.backend {
+            registry::Backend::Sqlite(_) => DbBackend::Sqlite,
+            registry::Backend::Postgres(_) => DbBackend::Postgres,
+        }
+    }
+
+    pub fn is_postgres(&self) -> bool {
+        matches!(self.backend, registry::Backend::Postgres(_))
+    }
+
+    fn sqlite_shared(&self) -> &Arc<registry::Shared> {
+        match &self.backend {
+            registry::Backend::Sqlite(s) => s,
+            registry::Backend::Postgres(_) => panic!("expected SQLite Store backend"),
+        }
+    }
+
+    fn memory_index(&self) -> &Arc<memory_index::MemoryIndex> {
+        match &self.backend {
+            registry::Backend::Sqlite(s) => &s.memory_index,
+            registry::Backend::Postgres(p) => &p.memory_index,
+        }
+    }
+
+    fn wakes(&self) -> &Mutex<Vec<Sender<Wake>>> {
+        match &self.backend {
+            registry::Backend::Sqlite(s) => s.wakes(),
+            registry::Backend::Postgres(p) => p.wakes(),
+        }
+    }
+
+    fn changes_sender(&self) -> &tokio::sync::watch::Sender<u64> {
+        match &self.backend {
+            registry::Backend::Sqlite(s) => &s.changes,
+            registry::Backend::Postgres(p) => &p.changes,
+        }
+    }
+
+    /// Run a SQLite `wal_checkpoint(TRUNCATE)` on `state.db`, or return `None`
+    /// when backed by PostgreSQL (no local SQLite WAL exists).
+    pub(crate) fn sqlite_wal_checkpoint_truncate(&self) -> Option<Result<(i64, i64, i64), Error>> {
+        match &self.backend {
+            registry::Backend::Sqlite(shared) => {
+                let conn = shared.writer();
+                let _ = conn.busy_timeout(Duration::ZERO);
+                let res = conn
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })
+                    .map_err(Error::from);
+                let _ = conn.busy_timeout(self.busy_timeout());
+                Some(res)
+            }
+            registry::Backend::Postgres(_) => None,
+        }
     }
 
     /// Set the writer's per-statement lock wait and the total budget that
@@ -1141,13 +1559,21 @@ impl Store {
         busy_timeout: Duration,
         retry_budget: Duration,
     ) -> Result<(), Error> {
-        self.conn().busy_timeout(busy_timeout)?;
-        self.shared
-            .busy_timeout_ms
-            .store(busy_timeout.as_millis() as u64, Ordering::Relaxed);
-        self.shared
-            .write_retry_budget_ms
-            .store(retry_budget.as_millis() as u64, Ordering::Relaxed);
+        match &self.backend {
+            registry::Backend::Sqlite(shared) => {
+                shared.writer().busy_timeout(busy_timeout)?;
+                shared
+                    .busy_timeout_ms
+                    .store(busy_timeout.as_millis() as u64, Ordering::Relaxed);
+                shared
+                    .write_retry_budget_ms
+                    .store(retry_budget.as_millis() as u64, Ordering::Relaxed);
+            }
+            registry::Backend::Postgres(pg) => {
+                pg.write_retry_budget_ms
+                    .store(retry_budget.as_millis() as u64, Ordering::Relaxed);
+            }
+        }
         Ok(())
     }
 
@@ -1157,7 +1583,15 @@ impl Store {
     /// attempted, with no busy wait, so a concurrent reader or writer makes it
     /// a cheap no-op instead of a stall. Call it periodically from one place.
     pub fn checkpoint_wal(&self) -> Result<WalCheckpoint, Error> {
-        let conn = self.conn();
+        let registry::Backend::Sqlite(shared) = &self.backend else {
+            return Ok(WalCheckpoint {
+                log_frames: 0,
+                checkpointed_frames: 0,
+                passive_busy: false,
+                truncated: true,
+            });
+        };
+        let conn = shared.writer();
         let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
             conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -1174,7 +1608,7 @@ impl Store {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
             });
             let restored = conn.busy_timeout(Duration::from_millis(
-                self.shared.busy_timeout_ms.load(Ordering::Relaxed),
+                shared.busy_timeout_ms.load(Ordering::Relaxed),
             ));
             match truncated.map_err(Error::from) {
                 Ok((0, 0)) => outcome.truncated = true,
@@ -1188,48 +1622,78 @@ impl Store {
     }
 
     pub(crate) fn busy_timeout(&self) -> Duration {
-        Duration::from_millis(self.shared.busy_timeout_ms.load(Ordering::Relaxed))
+        match &self.backend {
+            registry::Backend::Sqlite(shared) => {
+                Duration::from_millis(shared.busy_timeout_ms.load(Ordering::Relaxed))
+            }
+            registry::Backend::Postgres(_) => BUSY_TIMEOUT,
+        }
     }
 
-    /// Run one `BEGIN IMMEDIATE` transaction, retrying transient lock errors at
-    /// transaction start within the retry budget and releasing the writer mutex
-    /// between attempts.
+    /// Run one transaction (`BEGIN IMMEDIATE` on SQLite, pooled PostgreSQL tx
+    /// on Postgres), retrying transient lock/serialization errors within budget.
     pub(crate) fn write_tx<T>(
         &self,
-        op: impl FnOnce(&Transaction<'_>) -> Result<T, Error>,
+        op: impl FnOnce(&DbTx<'_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let budget =
-            Duration::from_millis(self.shared.write_retry_budget_ms.load(Ordering::Relaxed));
+        let budget = Duration::from_millis(match &self.backend {
+            registry::Backend::Sqlite(shared) => {
+                shared.write_retry_budget_ms.load(Ordering::Relaxed)
+            }
+            registry::Backend::Postgres(pg) => pg.write_retry_budget_ms.load(Ordering::Relaxed),
+        });
         let started = std::time::Instant::now();
         let mut backoff = Duration::from_millis(10);
         let mut op = Some(op);
-        loop {
-            // End the transaction-start temporary and writer guard's scope
-            // before backing off. Never replay a closure with external effects.
-            let error = {
-                let mut conn = self.conn();
-                let before = conn.total_changes();
-                let attempt = conn.transaction_with_behavior(TransactionBehavior::Immediate);
-                match attempt {
-                    Ok(tx) => {
-                        let result = (op.take().expect("write_tx closure called once"))(&tx)?;
-                        let changed = tx.total_changes() != before;
-                        tx.commit()?;
-                        if changed {
-                            self.poke_changes();
-                            self.notify_changes();
+        match &self.backend {
+            registry::Backend::Sqlite(shared) => loop {
+                // End the transaction-start temporary and writer guard's scope
+                // before backing off. Never replay a closure with external effects.
+                let error = {
+                    let mut conn = shared.writer();
+                    let before = conn.total_changes();
+                    let attempt = conn.transaction_with_behavior(TransactionBehavior::Immediate);
+                    match attempt {
+                        Ok(tx) => {
+                            let wrapped = DbTx::Sqlite(&tx);
+                            let result =
+                                (op.take().expect("write_tx closure called once"))(&wrapped)?;
+                            let changed = tx.total_changes() != before;
+                            tx.commit()?;
+                            if changed {
+                                self.poke_changes();
+                                self.notify_changes();
+                            }
+                            return Ok(result);
                         }
-                        return Ok(result);
+                        Err(err) => Error::from(err),
                     }
-                    Err(err) => Error::from(err),
+                };
+                let elapsed = started.elapsed();
+                if !is_transient_lock_error(&error) || elapsed >= budget {
+                    return Err(error);
                 }
-            };
-            let elapsed = started.elapsed();
-            if !is_transient_lock_error(&error) || elapsed >= budget {
-                return Err(error);
+                std::thread::sleep(backoff.min(budget - elapsed));
+                backoff = (backoff * 2).min(Duration::from_secs(1));
+            },
+            registry::Backend::Postgres(pg) => {
+                let pg_tx = PgTx::begin(&pg.handle.pool)?;
+                let wrapped = DbTx::Postgres(pg_tx);
+                let result = (op.take().expect("write_tx closure called once"))(&wrapped)?;
+                let changed = match wrapped {
+                    DbTx::Postgres(tx) => {
+                        let wrote = tx.wrote();
+                        tx.commit()?;
+                        wrote
+                    }
+                    DbTx::Sqlite(_) => false,
+                };
+                if changed {
+                    self.poke_changes();
+                    self.notify_changes();
+                }
+                Ok(result)
             }
-            std::thread::sleep(backoff.min(budget - elapsed));
-            backoff = (backoff * 2).min(Duration::from_secs(1));
         }
     }
 
@@ -1279,20 +1743,20 @@ impl Store {
             agent_exists(tx, agent_id)?;
             // A new instance replaces the old one: the generation moves, and
             // every capability minted before it stops authenticating.
-            let generation: i64 = tx.query_row(
+            let generation: i64 = tx.db_query_one(
                 "SELECT COALESCE(MAX(generation), 0) + 1 FROM agent_capabilities WHERE agent_id = ?1",
-                [agent_id.as_str()],
+                &db_params![agent_id.as_str()],
                 |row| row.get(0),
             )?;
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO agent_capabilities (token_hash, agent_id, generation, created_at_ms, revoked_at_ms)
                  VALUES (?1, ?2, ?3, ?4, NULL)",
-                params![hash(&key, &token), agent_id.as_str(), generation, now],
+                &db_params![hash(&key, &token), agent_id.as_str(), generation, now],
             )?;
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agent_capabilities SET revoked_at_ms = ?1
                  WHERE agent_id = ?2 AND generation < ?3 AND revoked_at_ms IS NULL",
-                params![now, agent_id.as_str(), generation],
+                &db_params![now, agent_id.as_str(), generation],
             )?;
             Ok(())
         })?;
@@ -1305,14 +1769,12 @@ impl Store {
         let key = self.capability_key()?;
         let digest = hash(&key, token);
         let conn = self.read_conn();
-        let found = conn
-            .query_row(
-                "SELECT agent_id FROM agent_capabilities
-                 WHERE token_hash = ?1 AND revoked_at_ms IS NULL",
-                [digest.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        let found = conn.db_query_opt(
+            "SELECT agent_id FROM agent_capabilities
+             WHERE token_hash = ?1 AND revoked_at_ms IS NULL",
+            &db_params![digest],
+            |row| row.get::<String>(0),
+        )?;
         match found {
             Some(id) => AgentId::parse(&id),
             None => Err(Error::Message("the session is not authenticated".into())),
@@ -1328,11 +1790,11 @@ impl Store {
     /// A receipt one named send already produced, or `None`.
     pub fn send_receipt(&self, id: &str) -> Result<Option<String>, Error> {
         let conn = self.read_conn();
-        Ok(conn
-            .query_row("SELECT receipt FROM sends WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })
-            .optional()?)
+        conn.db_query_opt(
+            "SELECT receipt FROM sends WHERE id = ?1",
+            &db_params![id],
+            |row| row.get(0),
+        )
     }
 
     /// A committed mailbox receipt for this source, including when the server
@@ -1349,10 +1811,10 @@ impl Store {
     /// Keep one named send's receipt after it was delivered.
     pub fn record_send_receipt(&self, id: &str, receipt: &str) -> Result<(), Error> {
         self.write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO sends (id, receipt, created_at_ms) VALUES (?1, ?2, ?3)
                  ON CONFLICT (id) DO NOTHING",
-                params![id, receipt, now_ms()],
+                &db_params![id, receipt, now_ms()],
             )?;
             Ok(())
         })
@@ -1379,12 +1841,23 @@ impl Store {
     /// been, the deployment has an identity boundary.
     pub fn ever_authenticated(&self) -> bool {
         self.read_conn()
-            .query_row(
+            .db_query_one(
                 "SELECT EXISTS(SELECT 1 FROM agent_capabilities)",
-                [],
+                &[],
                 |row| row.get(0),
             )
             .unwrap_or(false)
+    }
+
+    /// Whether this agent already has an unrevoked capability row in the store.
+    pub fn has_active_capability(&self, agent_id: &AgentId) -> Result<bool, Error> {
+        let count: i64 = self.read_conn().db_query_one(
+            "SELECT COUNT(*) FROM agent_capabilities
+             WHERE agent_id = ?1 AND revoked_at_ms IS NULL",
+            &db_params![agent_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Replace an agent's instance: its generation moves, so every capability
@@ -1392,10 +1865,10 @@ impl Store {
     pub fn retire_capabilities(&self, agent_id: &AgentId) -> Result<(), Error> {
         self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agent_capabilities SET revoked_at_ms = ?1
                  WHERE agent_id = ?2 AND revoked_at_ms IS NULL",
-                params![now_ms(), agent_id.as_str()],
+                &db_params![now_ms(), agent_id.as_str()],
             )?;
             Ok(())
         })
@@ -1406,17 +1879,24 @@ impl Store {
     /// Subscribe before scanning durable state. Generations are coalesced hints,
     /// never proof that any particular predicate became true.
     pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.shared.changes.subscribe()
+        if let registry::Backend::Postgres(pg) = &self.backend {
+            pg.ensure_wake_listener();
+        }
+        self.changes_sender().subscribe()
     }
 
     /// Import a cross-process state invalidation without starting any worker.
     pub fn poke_changes(&self) {
-        self.shared
-            .changes
+        self.changes_sender()
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     fn notify_changes(&self) {
+        if let registry::Backend::Postgres(pg) = &self.backend {
+            let _ =
+                crate::stateless::publish_pg_wake(&pg.handle.pool, Some(&self.replica_id), None);
+            return;
+        }
         let path = self.data_dir().join("wake.sock");
         if path.as_os_str().len() > 107 {
             return;
@@ -1429,9 +1909,11 @@ impl Store {
 
     /// Subscribe to mailbox/agent hints; committed events are not replayed.
     pub fn subscribe(&self) -> Receiver<Wake> {
+        if let registry::Backend::Postgres(pg) = &self.backend {
+            pg.ensure_wake_listener();
+        }
         let (sender, receiver) = mpsc::channel();
-        self.shared
-            .wakes()
+        self.wakes()
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .push(sender);
@@ -1440,8 +1922,7 @@ impl Store {
 
     /// Drop every subscriber so a blocked `recv` returns.
     pub fn close_wakes(&self) {
-        self.shared
-            .wakes()
+        self.wakes()
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clear();
@@ -1453,16 +1934,20 @@ impl Store {
     }
 
     fn notify(&self, wake: Wake) {
-        self.send_datagram(&wake);
+        if let registry::Backend::Postgres(pg) = &self.backend {
+            let _ = crate::stateless::publish_pg_wake(
+                &pg.handle.pool,
+                Some(&self.replica_id),
+                Some(&wake),
+            );
+        } else {
+            self.send_datagram(&wake);
+        }
         self.fanout(&wake);
     }
 
     fn fanout(&self, wake: &Wake) {
-        let mut wakes = self
-            .shared
-            .wakes()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
+        let mut wakes = self.wakes().lock().unwrap_or_else(|err| err.into_inner());
         wakes.retain(|sender| sender.send(wake.clone()).is_ok());
     }
 
@@ -1485,6 +1970,19 @@ impl Store {
 
     /// Exclusive lock for this agent's vendor process. A second caller gets [`Error::AgentBusy`].
     pub fn try_lock_agent(&self, agent_id: &AgentId) -> Result<AgentLock, Error> {
+        if let registry::Backend::Postgres(pg) = &self.backend {
+            let backend = crate::stateless::PgCoordinatorLockBackend::new(
+                pg.handle.pool.clone(),
+                self.replica_id.clone(),
+            );
+            let key = format!("agent:proc:{}", agent_id.as_str());
+            let Some(guard) =
+                backend.try_acquire_guard(&key, crate::stateless::DEFAULT_LEASE_TTL)?
+            else {
+                return Err(Error::AgentBusy);
+            };
+            return AgentLock::from_pg_lease(guard).map_err(Error::Io);
+        }
         let path = agent_lock_path(&self.data_dir, agent_id);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -1526,6 +2024,30 @@ impl Store {
         agent_id: &AgentId,
         nonblocking: bool,
     ) -> Result<AgentLock, Error> {
+        if let registry::Backend::Postgres(pg) = &self.backend {
+            debug_assert!(
+                nonblocking || !registry::holds_store_writer(),
+                "a lifecycle lock is waited for while this thread holds the Store writer"
+            );
+            let backend = crate::stateless::PgCoordinatorLockBackend::new(
+                pg.handle.pool.clone(),
+                self.replica_id.clone(),
+            );
+            let key = format!("agent:life:{}", agent_id.as_str());
+            let guard = if nonblocking {
+                match backend.try_acquire_guard(&key, crate::stateless::DEFAULT_LEASE_TTL)? {
+                    Some(g) => g,
+                    None => return Err(Error::AgentBusy),
+                }
+            } else {
+                backend.acquire_guard_blocking(
+                    &key,
+                    crate::stateless::DEFAULT_LEASE_TTL,
+                    WRITE_RETRY_BUDGET,
+                )?
+            };
+            return AgentLock::from_pg_lease(guard).map_err(Error::Io);
+        }
         let dir = self.data_dir.join("locks");
         std::fs::create_dir_all(&dir)?;
         let file = OpenOptions::new()
@@ -1604,9 +2126,9 @@ impl Store {
         };
         agent.launch_env = scope_env(&agent, agent.default_scope());
         self.write_tx(|tx| {
-            let taken: i64 = tx.query_row(
+            let taken: i64 = tx.db_query_one(
                 "SELECT COUNT(*) FROM agents WHERE name = ?1",
-                [&agent.name],
+                &db_params![agent.name],
                 |row| row.get(0),
             )?;
             if taken != 0 {
@@ -1615,11 +2137,11 @@ impl Store {
             if lifecycle::spawn_reservation(tx, &agent.name)?.is_some() {
                 return Err(Error::NameReserved(agent.name.clone()));
             }
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO agents (
                     id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role, description, launch_env
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8, ?9, ?10, ?11)",
-                params![
+                &db_params![
                     agent.id.as_str(),
                     agent.name,
                     agent.harness,
@@ -1633,9 +2155,9 @@ impl Store {
                     encode_env(&agent.launch_env),
                 ],
             )?;
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO mailbox_cursors (agent_id, delivered_seq) VALUES (?1, 0)",
-                [agent.id.as_str()],
+                &db_params![agent.id.as_str()],
             )?;
             runtime::seed_runtime(tx, &agent.id)?;
             Ok(())
@@ -1655,9 +2177,9 @@ impl Store {
                     "a subagent cannot hold administrative authority".into(),
                 ));
             }
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agents SET is_admin = ?2 WHERE id = ?1",
-                params![agent_id.as_str(), is_admin],
+                &db_params![agent_id.as_str(), is_admin],
             )?;
             Ok(())
         })
@@ -1666,9 +2188,9 @@ impl Store {
     pub fn set_agent_model(&self, agent_id: &AgentId, model: &str) -> Result<(), Error> {
         self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agents SET model = ?2 WHERE id = ?1",
-                params![agent_id.as_str(), model],
+                &db_params![agent_id.as_str(), model],
             )?;
             Ok(())
         })?;
@@ -1685,9 +2207,9 @@ impl Store {
         }
         let updated = self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agents SET harness = ?2 WHERE id = ?1",
-                params![agent_id.as_str(), clean],
+                &db_params![agent_id.as_str(), clean],
             )?;
             agent_by_id(tx, agent_id)
         })?;
@@ -1707,30 +2229,33 @@ impl Store {
         validate_token(clean, "agent name")?;
         refuse_reserved_agent_name(clean)?;
         // The agent's search rows are refiled from the committed name.
-        let (updated, changed) = self.reindex_around(&[], &[agent_id.as_str()], || self.write_tx(|tx| {
-            let current = agent_by_id(tx, agent_id)?;
-            if current.name == clean {
-                return Ok((current, false));
-            }
-            let taken: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM agents WHERE name = ?1 AND id != ?2",
-                params![clean, agent_id.as_str()],
-                |row| row.get(0),
-            )?;
-            if taken != 0 {
-                return Err(Error::AgentExists(clean.to_string()));
-            }
-            tx.execute(
-                "UPDATE agents SET name = ?2 WHERE id = ?1",
-                params![agent_id.as_str(), clean],
-            )?;
-            tx.execute(
-                "INSERT OR REPLACE INTO agent_aliases (alias, agent_id, created_at_ms) VALUES (?1, ?2, ?3)",
-                params![current.name, agent_id.as_str(), now_ms()],
-            )?;
-            tx.execute("DELETE FROM agent_aliases WHERE alias = ?1", [clean])?;
-            Ok((agent_by_id(tx, agent_id)?, true))
-        }))?;
+        let (updated, changed) = self.reindex_around(&[], &[agent_id.as_str()], || {
+            self.write_tx(|tx| {
+                let current = agent_by_id(tx, agent_id)?;
+                if current.name == clean {
+                    return Ok((current, false));
+                }
+                let taken: i64 = tx.db_query_one(
+                    "SELECT COUNT(*) FROM agents WHERE name = ?1 AND id != ?2",
+                    &db_params![clean, agent_id.as_str()],
+                    |row| row.get(0),
+                )?;
+                if taken != 0 {
+                    return Err(Error::AgentExists(clean.to_string()));
+                }
+                tx.db_execute(
+                    "UPDATE agents SET name = ?2 WHERE id = ?1",
+                    &db_params![agent_id.as_str(), clean],
+                )?;
+                tx.db_execute(
+                    "INSERT INTO agent_aliases (alias, agent_id, created_at_ms) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (alias) DO UPDATE SET agent_id = excluded.agent_id, created_at_ms = excluded.created_at_ms",
+                    &db_params![current.name, agent_id.as_str(), now_ms()],
+                )?;
+                tx.db_execute("DELETE FROM agent_aliases WHERE alias = ?1", &db_params![clean])?;
+                Ok((agent_by_id(tx, agent_id)?, true))
+            })
+        })?;
         if changed {
             self.notify(Wake::Agent {
                 agent_id: agent_id.clone(),
@@ -1744,9 +2269,9 @@ impl Store {
         let clean = role.map(str::trim).filter(|s| !s.is_empty());
         self.write_tx(|tx| {
             agent_exists(tx, id)?;
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agents SET role = ?1 WHERE id = ?2",
-                params![clean, id.as_str()],
+                &db_params![clean, id.as_str()],
             )?;
             agent_by_id(tx, id)
         })
@@ -1785,9 +2310,9 @@ impl Store {
                 }
             }
             let parent_str = new_parent_id.map(AgentId::as_str);
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agents SET parent_id = ?1 WHERE id = ?2",
-                params![parent_str, current.id.as_str()],
+                &db_params![parent_str, current.id.as_str()],
             )?;
             agent_by_id(tx, agent_id)
         })?;
@@ -1799,24 +2324,19 @@ impl Store {
 
     /// Former names recorded for this agent via `rename_agent`.
     pub fn agent_aliases(&self, id: &AgentId) -> Result<Vec<String>, Error> {
-        let conn = self.read_conn();
-        let mut stmt = conn.prepare(
+        self.read_conn().db_query_vec(
             "SELECT alias FROM agent_aliases WHERE agent_id = ?1 ORDER BY created_at_ms DESC",
-        )?;
-        let mut rows = stmt.query([id.as_str()])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(row.get(0)?);
-        }
-        Ok(out)
+            &db_params![id.as_str()],
+            |row| row.get(0),
+        )
     }
 
     /// Administrative metadata only; callers must never pass credentials here.
     pub fn record_admin_audit(&self, actor: &str, action: &str, target: &str) -> Result<(), Error> {
         self.write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO admin_audit (created_at, actor, action, target) VALUES (?1, ?2, ?3, ?4)",
-                params![now_ms(), actor, action, target],
+                &db_params![now_ms(), actor, action, target],
             )?;
             Ok(())
         })
@@ -1831,9 +2351,9 @@ impl Store {
         let clean = description.map(str::trim).filter(|s| !s.is_empty());
         self.write_tx(|tx| {
             agent_exists(tx, id)?;
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agents SET description = ?1 WHERE id = ?2",
-                params![clean, id.as_str()],
+                &db_params![clean, id.as_str()],
             )?;
             agent_by_id(tx, id)
         })
@@ -1856,9 +2376,9 @@ impl Store {
             } else {
                 current.description
             };
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agents SET instructions = ?1, description = ?2 WHERE id = ?3",
-                params![clean, derived_desc, id.as_str()],
+                &db_params![clean, derived_desc, id.as_str()],
             )?;
             agent_by_id(tx, id)
         })
@@ -1867,62 +2387,50 @@ impl Store {
     pub fn agent_by_name(&self, name: &str) -> Result<Agent, Error> {
         let lookup = name.strip_prefix("agent:").unwrap_or(name);
         let conn = self.read_conn();
-        let found = conn
-            .prepare_cached(concat!(
+        if let Some(agent) = conn.db_query_opt(
+            concat!(
                 "SELECT ",
                 agent_cols!(),
                 " FROM agents WHERE name = ?1 OR id = ?1"
-            ))?
-            .query_row([lookup], agent_from_row)
-            .optional()?;
-        if let Some(agent) = found {
+            ),
+            &db_params![lookup],
+            agent_from_row_db,
+        )? {
             return Ok(agent);
         }
-        let aliased = conn
-            .query_row(
-                "SELECT a.id, a.name, a.harness, a.model, a.workdir, a.instructions, a.state, \
-                        a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role, a.description \
-                 FROM agent_aliases al \
-                 JOIN agents a ON a.id = al.agent_id \
-                 WHERE al.alias = ?1",
-                [lookup],
-                agent_from_row,
-            )
-            .optional()?;
+        let aliased = conn.db_query_opt(
+            "SELECT a.id, a.name, a.harness, a.model, a.workdir, a.instructions, a.state, \
+                    a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role, a.description \
+             FROM agent_aliases al \
+             JOIN agents a ON a.id = al.agent_id \
+             WHERE al.alias = ?1",
+            &db_params![lookup],
+            agent_from_row_db,
+        )?;
         aliased.ok_or_else(|| Error::AgentNotFound(name.to_string()))
     }
 
     pub fn list_agents(&self) -> Result<Vec<Agent>, Error> {
-        let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached(concat!(
-            "SELECT ",
-            agent_cols!(),
-            " FROM agents ORDER BY name"
-        ))?;
-        let mut rows = stmt.query([])?;
-        let mut agents = Vec::new();
-        while let Some(row) = rows.next()? {
-            agents.push(agent_from_row(row)?);
-        }
-        Ok(agents)
+        self.read_conn().db_query_vec(
+            concat!("SELECT ", agent_cols!(), " FROM agents ORDER BY name"),
+            &[],
+            agent_from_row_db,
+        )
     }
 
     /// Every agent that is not archived, ordered by name. Hot paths use this
     /// instead of [`Store::list_agents`] so their cost follows the live fleet,
     /// not the ever-growing archive (served by `idx_agents_state`).
     pub fn list_live_agents(&self) -> Result<Vec<Agent>, Error> {
-        let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached(concat!(
-            "SELECT ",
-            agent_cols!(),
-            " FROM agents WHERE state IN ('created', 'running', 'idle', 'paused') ORDER BY name"
-        ))?;
-        let mut rows = stmt.query([])?;
-        let mut agents = Vec::new();
-        while let Some(row) = rows.next()? {
-            agents.push(agent_from_row(row)?);
-        }
-        Ok(agents)
+        self.read_conn().db_query_vec(
+            concat!(
+                "SELECT ",
+                agent_cols!(),
+                " FROM agents WHERE state IN ('created', 'running', 'idle', 'paused') ORDER BY name"
+            ),
+            &[],
+            agent_from_row_db,
+        )
     }
 
     /// Agents a roster needs, without reading the archive: the agents whose
@@ -1931,46 +2439,41 @@ impl Store {
     /// The second value is the number of archived agents. Ordered by name.
     pub fn roster_agents(&self, state: Option<&str>) -> Result<(Vec<Agent>, usize), Error> {
         let conn = self.read_conn();
-        let archived: i64 = conn.query_row(
+        let archived: i64 = conn.db_query_one(
             "SELECT count(*) FROM agents WHERE state = 'archived'",
-            [],
+            &[],
             |r| r.get(0),
         )?;
-        let mut agents = Vec::new();
-        let mut push = |mut rows: rusqlite::Rows<'_>| -> Result<(), Error> {
-            while let Some(row) = rows.next()? {
-                agents.push(agent_from_row(row)?);
-            }
-            Ok(())
-        };
-        match state {
-            Some("all") => {
-                let mut stmt =
-                    conn.prepare(&format!("SELECT {AGENT_COLS} FROM agents ORDER BY name"))?;
-                push(stmt.query([])?)?;
-            }
-            Some("archived") => {
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT {AGENT_COLS} FROM agents WHERE state = 'archived' ORDER BY name"
-                ))?;
-                push(stmt.query([])?)?;
-            }
+        let agents = match state {
+            Some("all") => conn.db_query_vec(
+                &format!("SELECT {AGENT_COLS} FROM agents ORDER BY name"),
+                &[],
+                agent_from_row_db,
+            )?,
+            Some("archived") => conn.db_query_vec(
+                &format!("SELECT {AGENT_COLS} FROM agents WHERE state = 'archived' ORDER BY name"),
+                &[],
+                agent_from_row_db,
+            )?,
             _ => {
                 // UNION (not UNION ALL) deduplicates, so a parent cycle ends.
-                let mut stmt = conn.prepare(&format!(
-                    "WITH RECURSIVE wanted(id) AS (
-                         SELECT id FROM agents
-                          WHERE state != 'archived' AND (?1 IS NULL OR state = ?1)
-                         UNION
-                         SELECT a.parent_id FROM agents a JOIN wanted w ON a.id = w.id
-                          WHERE a.parent_id IS NOT NULL
-                     )
-                     SELECT {AGENT_COLS} FROM agents WHERE id IN (SELECT id FROM wanted)
-                     ORDER BY name"
-                ))?;
-                push(stmt.query([state])?)?;
+                conn.db_query_vec(
+                    &format!(
+                        "WITH RECURSIVE wanted(id) AS (
+                             SELECT id FROM agents
+                              WHERE state != 'archived' AND (?1 IS NULL OR state = ?1)
+                             UNION
+                             SELECT a.parent_id FROM agents a JOIN wanted w ON a.id = w.id
+                              WHERE a.parent_id IS NOT NULL
+                         )
+                         SELECT {AGENT_COLS} FROM agents WHERE id IN (SELECT id FROM wanted)
+                         ORDER BY name"
+                    ),
+                    &db_params![state],
+                    agent_from_row_db,
+                )?
             }
-        }
+        };
         Ok((agents, archived as usize))
     }
 
@@ -1980,39 +2483,38 @@ impl Store {
         let mut metadata = AgentQueryMetadata::default();
         {
             let conn = self.read_conn();
-            let mut stmt =
-                conn.prepare("SELECT agent_id, alias FROM agent_aliases ORDER BY alias")?;
-            for row in
-                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            {
-                let (id, alias) = row?;
+            for (id, alias) in conn.db_query_vec(
+                "SELECT agent_id, alias FROM agent_aliases ORDER BY alias",
+                &[],
+                |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)),
+            )? {
                 metadata.aliases.entry(id).or_default().push(alias);
             }
-            let mut stmt = conn.prepare(
+            let not_passive = conn.backend().sql_not_passive_reaction("m.context");
+            let oldest_sql = format!(
                 "SELECT a.id, (SELECT m.received_at_ms FROM messages m
                    WHERE m.agent_id = a.id AND m.seq > COALESCE(d.delivered_seq, 0)
-                     AND (CASE WHEN json_valid(m.context) THEN json_extract(m.context, '$.event') END) IS NOT 'reaction_passive'
+                     AND {not_passive}
                    ORDER BY m.seq LIMIT 1)
                  FROM agents a LEFT JOIN mailbox_cursors d ON d.agent_id = a.id
-                 WHERE a.state != 'archived'",
-            )?;
-            for row in stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+                 WHERE a.state != 'archived'"
+            );
+            for (id, timestamp) in conn.db_query_vec(&oldest_sql, &[], |r| {
+                Ok((r.get::<String>(0)?, r.get::<Option<i64>>(1)?))
             })? {
-                let (id, timestamp) = row?;
                 if let Some(timestamp) = timestamp {
                     metadata.oldest_undelivered.insert(id, timestamp);
                 }
             }
-            let mut stmt = conn.prepare(
+            for (id, timestamp) in conn.db_query_vec(
                 "SELECT t.agent_id, COALESCE((SELECT m.received_at_ms FROM messages m
                     WHERE m.agent_id = t.agent_id AND m.seq > t.completed_seq AND m.seq <= t.opened_seq
                     ORDER BY m.seq LIMIT 1), t.opened_at_ms)
                  FROM turn_recovery t JOIN agents a ON a.id = t.agent_id
                  WHERE t.opened_seq > t.completed_seq AND a.state != 'archived'",
-            )?;
-            for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
-                let (id, timestamp) = row?;
+                &[],
+                |r| Ok((r.get::<String>(0)?, r.get::<i64>(1)?)),
+            )? {
                 metadata.open_turns.insert(id, timestamp);
             }
         }
@@ -2032,69 +2534,62 @@ impl Store {
     }
 
     pub fn children_of(&self, parent_id: &AgentId) -> Result<Vec<Agent>, Error> {
-        let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached(concat!(
-            "SELECT ",
-            agent_cols!(),
-            " FROM agents WHERE parent_id = ?1 ORDER BY created_at_ms, name"
-        ))?;
-        let mut rows = stmt.query([parent_id.as_str()])?;
-        let mut agents = Vec::new();
-        while let Some(row) = rows.next()? {
-            agents.push(agent_from_row(row)?);
-        }
-        Ok(agents)
+        self.read_conn().db_query_vec(
+            concat!(
+                "SELECT ",
+                agent_cols!(),
+                " FROM agents WHERE parent_id = ?1 ORDER BY created_at_ms, name"
+            ),
+            &db_params![parent_id.as_str()],
+            agent_from_row_db,
+        )
     }
 
     /// A parent's children that are not archived, oldest first. Served by a
     /// partial index, so a parent's archived history is never read.
     pub fn live_children_of(&self, parent_id: &AgentId) -> Result<Vec<Agent>, Error> {
-        let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached(concat!(
-            "SELECT ",
-            agent_cols!(),
-            " FROM agents WHERE parent_id = ?1 AND state != 'archived'
-             ORDER BY created_at_ms, name"
-        ))?;
-        let agents = stmt
-            .query_map([parent_id.as_str()], agent_from_row)?
-            .collect::<Result<_, _>>()?;
-        Ok(agents)
+        self.read_conn().db_query_vec(
+            concat!(
+                "SELECT ",
+                agent_cols!(),
+                " FROM agents WHERE parent_id = ?1 AND state != 'archived'
+                 ORDER BY created_at_ms, name"
+            ),
+            &db_params![parent_id.as_str()],
+            agent_from_row_db,
+        )
     }
 
     /// Ids of the agents in one lifecycle state, by name, from the state index.
     pub fn agent_ids_in_state(&self, state: &str) -> Result<Vec<AgentId>, Error> {
-        let conn = self.read_conn();
-        let mut stmt =
-            conn.prepare_cached("SELECT id FROM agents WHERE state = ?1 ORDER BY name")?;
-        let ids = stmt
-            .query_map([state], |row| row.get::<_, String>(0))?
-            .map(|id| AgentId::parse(&id?))
-            .collect::<Result<_, Error>>()?;
-        Ok(ids)
+        let ids = self.read_conn().db_query_vec(
+            "SELECT id FROM agents WHERE state = ?1 ORDER BY name",
+            &db_params![state],
+            |row| row.get::<String>(0),
+        )?;
+        ids.into_iter()
+            .map(|id| AgentId::parse(&id))
+            .collect::<Result<_, Error>>()
     }
 
     /// Every agent (or every non-archived one) by name, without reading
     /// instructions or decoding launch environments.
     pub fn agent_summaries(&self, include_archived: bool) -> Result<Vec<AgentSummary>, Error> {
-        let conn = self.read_conn();
-        let mut stmt = if include_archived {
-            conn.prepare_cached(concat!(
+        let sql = if include_archived {
+            concat!(
                 "SELECT ",
                 agent_summary_cols!(),
                 " FROM agents ORDER BY name"
-            ))?
+            )
         } else {
-            conn.prepare_cached(concat!(
+            concat!(
                 "SELECT ",
                 agent_summary_cols!(),
                 " FROM agents WHERE state != 'archived' ORDER BY name"
-            ))?
+            )
         };
-        let agents = stmt
-            .query_map([], agent_summary_from_row)?
-            .collect::<Result<_, _>>()?;
-        Ok(agents)
+        self.read_conn()
+            .db_query_vec(sql, &[], agent_summary_from_row_db)
     }
 
     /// Append one message to every agent in a room: all of them except the
@@ -2259,13 +2754,13 @@ impl Store {
         }
         self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO groups (name, created_at_ms) VALUES (?1, ?2)",
-                params![name, now_ms()],
+            tx.db_execute(
+                "INSERT INTO groups (name, created_at_ms) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                &db_params![name, now_ms()],
             )?;
-            tx.execute(
-                "INSERT OR IGNORE INTO group_agents (group_name, agent_id) VALUES (?1, ?2)",
-                params![name, agent_id.as_str()],
+            tx.db_execute(
+                "INSERT INTO group_agents (group_name, agent_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                &db_params![name, agent_id.as_str()],
             )?;
             Ok(())
         })
@@ -2274,9 +2769,9 @@ impl Store {
     /// Take one agent out of a named group.
     pub fn leave_group(&self, name: &str, agent_id: &AgentId) -> Result<(), Error> {
         self.write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "DELETE FROM group_agents WHERE group_name = ?1 AND agent_id = ?2",
-                params![name, agent_id.as_str()],
+                &db_params![name, agent_id.as_str()],
             )?;
             Ok(())
         })
@@ -2285,9 +2780,9 @@ impl Store {
     /// Remove every group membership for an agent. Group names have no lifecycle privilege.
     pub fn leave_all_groups(&self, agent_id: &AgentId) -> Result<(), Error> {
         self.write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "DELETE FROM group_agents WHERE agent_id = ?1",
-                [agent_id.as_str()],
+                &db_params![agent_id.as_str()],
             )?;
             Ok(())
         })
@@ -2300,10 +2795,10 @@ impl Store {
             return Err(Error::Message(format!("invalid group name: {name}")));
         }
         self.write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO groups (name, created_at_ms, public) VALUES (?1, ?2, ?3)
                  ON CONFLICT(name) DO UPDATE SET public = excluded.public",
-                params![name, now_ms(), i32::from(public)],
+                &db_params![name, now_ms(), i64::from(public)],
             )?;
             Ok(())
         })
@@ -2312,9 +2807,11 @@ impl Store {
     /// Whether a named virtual group is `public` (`true`) or `private` (`false`, default).
     pub fn is_group_public(&self, name: &str) -> bool {
         let conn = self.read_conn();
-        conn.query_row("SELECT public FROM groups WHERE name = ?1", [name], |r| {
-            Ok(r.get::<_, i64>(0)? != 0)
-        })
+        conn.db_query_one(
+            "SELECT public FROM groups WHERE name = ?1",
+            &db_params![name],
+            |r| Ok(r.get::<i64>(0)? != 0),
+        )
         .unwrap_or(false)
     }
 
@@ -2326,11 +2823,10 @@ impl Store {
     /// Every named group and its current members, ordered by group name.
     pub fn list_groups(&self) -> Result<Vec<(String, Vec<String>)>, Error> {
         let conn = self.read_conn();
-        let names: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT name FROM groups ORDER BY name")?;
-            stmt.query_map([], |row| row.get(0))?
-                .collect::<Result<_, _>>()?
-        };
+        let names: Vec<String> =
+            conn.db_query_vec("SELECT name FROM groups ORDER BY name", &[], |row| {
+                row.get(0)
+            })?;
         let mut groups = Vec::with_capacity(names.len());
         for name in names {
             let members = group_members_on(&conn, &name)?;
@@ -2358,10 +2854,10 @@ impl Store {
             agents: Vec::new(),
         };
         self.write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO channels (id, kind, identity, config, credential_ref, state, created_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
+                &db_params![
                     channel.id.as_str(),
                     channel.kind,
                     channel.identity,
@@ -2379,16 +2875,14 @@ impl Store {
     /// Every channel, with the agents attached to it. No secret is in the rows.
     pub fn list_channels(&self) -> Result<Vec<Channel>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(
+        let mut channels = conn.db_query_vec(
             "SELECT id, kind, identity, config, credential_ref, created_at_ms, state FROM channels
              ORDER BY created_at_ms",
+            &[],
+            channel_from_row_db,
         )?;
-        let mut rows = stmt.query([])?;
-        let mut channels = Vec::new();
-        while let Some(row) = rows.next()? {
-            let mut channel = channel_from_row(row)?;
+        for channel in &mut channels {
             channel.agents = agents_of(&conn, &channel.id)?;
-            channels.push(channel);
         }
         Ok(channels)
     }
@@ -2403,9 +2897,9 @@ impl Store {
             return Err(Error::Message("credential ref is empty".into()));
         }
         self.write_tx(|tx| {
-            let changed = tx.execute(
+            let changed = tx.db_execute(
                 "UPDATE channels SET credential_ref = ?2 WHERE id = ?1",
-                params![channel_id.as_str(), credential_ref],
+                &db_params![channel_id.as_str(), credential_ref],
             )?;
             if changed == 0 {
                 return Err(Error::ChannelNotFound(channel_id.to_string()));
@@ -2419,9 +2913,9 @@ impl Store {
         serde_json::from_str::<serde_json::Value>(state)
             .map_err(|_| Error::Message("channel state is not json".into()))?;
         self.write_tx(|tx| {
-            let changed = tx.execute(
+            let changed = tx.db_execute(
                 "UPDATE channels SET state = ?2 WHERE id = ?1",
-                params![channel_id.as_str(), state],
+                &db_params![channel_id.as_str(), state],
             )?;
             if changed == 0 {
                 return Err(Error::ChannelNotFound(channel_id.to_string()));
@@ -2456,9 +2950,9 @@ impl Store {
             {
                 return Ok(false);
             }
-            tx.execute(
+            tx.db_execute(
                 "UPDATE channels SET state = ?2 WHERE id = ?1",
-                params![expected.id.as_str(), state],
+                &db_params![expected.id.as_str(), state],
             )?;
             Ok(true)
         })
@@ -2468,9 +2962,9 @@ impl Store {
         self.write_tx(|tx| {
             channel_with(tx, channel_id)?;
             agent_exists(tx, agent_id)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO channel_agents (channel_id, agent_id) VALUES (?1, ?2)",
-                params![channel_id.as_str(), agent_id.as_str()],
+            tx.db_execute(
+                "INSERT INTO channel_agents (channel_id, agent_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                &db_params![channel_id.as_str(), agent_id.as_str()],
             )?;
             Ok(())
         })
@@ -2484,9 +2978,9 @@ impl Store {
     ) -> Result<(), Error> {
         let clean = identity.map(str::trim).filter(|s| !s.is_empty());
         self.write_tx(|tx| {
-            let changed = tx.execute(
+            let changed = tx.db_execute(
                 "UPDATE channels SET identity = ?2 WHERE id = ?1",
-                params![channel_id.as_str(), clean],
+                &db_params![channel_id.as_str(), clean],
             )?;
             if changed == 0 {
                 return Err(Error::ChannelNotFound(channel_id.to_string()));
@@ -2499,9 +2993,9 @@ impl Store {
     pub fn detach_channel_agents(&self, channel_id: &ChannelId) -> Result<(), Error> {
         self.write_tx(|tx| {
             channel_with(tx, channel_id)?;
-            tx.execute(
+            tx.db_execute(
                 "DELETE FROM channel_agents WHERE channel_id = ?1",
-                params![channel_id.as_str()],
+                &db_params![channel_id.as_str()],
             )?;
             Ok(())
         })
@@ -2514,9 +3008,9 @@ impl Store {
         agent_id: &AgentId,
     ) -> Result<(), Error> {
         self.write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "DELETE FROM channel_agents WHERE channel_id = ?1 AND agent_id = ?2",
-                params![channel_id.as_str(), agent_id.as_str()],
+                &db_params![channel_id.as_str(), agent_id.as_str()],
             )?;
             Ok(())
         })
@@ -2611,7 +3105,7 @@ impl Store {
         agent_id: &AgentId,
         incoming: Incoming,
         wake_archived: bool,
-        admit: impl FnOnce(&Connection) -> Result<bool, Error>,
+        admit: impl FnOnce(&dyn DbExec) -> Result<bool, Error>,
     ) -> Result<Option<ReceiveOutcome>, Error> {
         self.receive_with_turn_admission(agent_id, incoming, wake_archived, admit, None)
     }
@@ -2642,7 +3136,7 @@ impl Store {
         agent_id: &AgentId,
         incoming: Incoming,
         wake_archived: bool,
-        admit: impl FnOnce(&Connection) -> Result<bool, Error>,
+        admit: impl FnOnce(&dyn DbExec) -> Result<bool, Error>,
         turn: Option<(&AgentId, &str)>,
     ) -> Result<Option<ReceiveOutcome>, Error> {
         let mut incoming = incoming;
@@ -2657,15 +3151,18 @@ impl Store {
             }
             if let Some((sender, token)) = turn {
                 let sender_agent = agent_by_id(tx, sender)?;
-                let active = sender_agent.is_task_subagent() && sender_agent.state != "archived"
-                    && tx.query_row(
+                let active = sender_agent.is_task_subagent()
+                    && sender_agent.state != "archived"
+                    && tx.db_query_one(
                         "SELECT EXISTS(SELECT 1 FROM task_turn_contexts
                          WHERE child_id = ?1 AND token = ?2 AND closed_delivery_seq IS NULL)",
-                        params![sender.as_str(), token],
-                        |row| row.get::<_, bool>(0),
+                        &db_params![sender.as_str(), token],
+                        |row| row.get::<bool>(0),
                     )?;
                 if !active {
-                    return Err(Error::PermissionDenied("invalid or closed task turn context".into()));
+                    return Err(Error::PermissionDenied(
+                        "invalid or closed task turn context".into(),
+                    ));
                 }
             }
             let outcome = Self::receive_on(
@@ -2679,11 +3176,13 @@ impl Store {
                 None,
                 &mut merged,
             )?;
-            if let Some((sender, token)) = turn && matches!(outcome, ReceiveTx::Inserted { .. }) {
-                tx.execute(
+            if let Some((sender, token)) = turn
+                && matches!(outcome, ReceiveTx::Inserted { .. })
+            {
+                tx.db_execute(
                     "UPDATE task_turn_contexts SET sent_to_parent_id = ?3
                      WHERE child_id = ?1 AND token = ?2 AND ?3 = (SELECT parent_id FROM agents WHERE id = ?1)",
-                    params![sender.as_str(), token, agent_id.as_str()],
+                    &db_params![sender.as_str(), token, agent_id.as_str()],
                 )?;
             }
             Ok(outcome)
@@ -2694,7 +3193,7 @@ impl Store {
     /// Append under an existing writer. Call finish_receive only after commit.
     #[allow(clippy::too_many_arguments)]
     fn receive_on(
-        tx: &Connection,
+        tx: &dyn DbExec,
         agent_id: &AgentId,
         incoming: Incoming,
         source_key: Option<String>,
@@ -2798,14 +3297,14 @@ impl Store {
                 let prev_text =
                     stored_message_version(tx, agent_id, chat_id, msg_id, source_key.as_deref())
                         .or(history.edited_from);
-                let _ = tx.execute(
+                let _ = tx.db_execute(
                     "INSERT INTO message_versions (agent_id, chat_id, message_id, body, updated_at_ms, origin_namespace)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT (agent_id, chat_id, message_id) DO UPDATE SET
                          body = excluded.body,
                          updated_at_ms = excluded.updated_at_ms
                      WHERE message_versions.origin_namespace = excluded.origin_namespace",
-                    params![
+                    &db_params![
                         agent_id.as_str(),
                         chat_id,
                         msg_id,
@@ -2848,11 +3347,11 @@ impl Store {
             && !incoming.text.starts_with("[pinned message")
             && !incoming.text.starts_with("[Member ")
         {
-            let _ = tx.execute(
+            let _ = tx.db_execute(
                 "INSERT INTO message_versions (agent_id, chat_id, message_id, body, updated_at_ms, origin_namespace)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (agent_id, chat_id, message_id) DO NOTHING",
-                params![
+                &db_params![
                     agent_id.as_str(),
                     chat_id,
                     message_id,
@@ -2989,11 +3488,11 @@ impl Store {
             origin: incoming.origin,
             context,
         };
-        tx.execute(
+        tx.db_execute(
             "INSERT INTO messages (
                 id, agent_id, seq, source_time_ms, source_key, sender, body, reply_to, received_at_ms, origin, context
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
+            &db_params![
                 message.id.as_str(),
                 message.agent_id.as_str(),
                 message.seq,
@@ -3010,25 +3509,25 @@ impl Store {
             ],
         )?;
         if let Some(identity_id) = redelivery_identity {
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO message_identities (agent_id, target_id, identity_id) VALUES (?1, ?2, ?3)",
-                params![agent_id.as_str(), message.id.as_str(), identity_id],
+                &db_params![agent_id.as_str(), message.id.as_str(), identity_id],
             )?;
         }
         retain_message_aliases(tx, &message, ingress_origin, message.source_key.as_deref())?;
         let is_passive_reaction = message.context.event.as_deref() == Some("reaction_passive");
         let woke_agent = if wake_archived {
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agents SET state = 'running'
                  WHERE id = ?1 AND state IN ('idle', 'created', 'archived')",
-                [agent_id.as_str()],
+                &db_params![agent_id.as_str()],
             )? > 0
         } else if is_passive_reaction {
             false
         } else {
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agents SET state = 'running' WHERE id = ?1 AND state = 'idle'",
-                [agent_id.as_str()],
+                &db_params![agent_id.as_str()],
             )? > 0
         };
         let agent = agent_by_id(tx, agent_id)?;
@@ -3107,29 +3606,28 @@ impl Store {
             // A database written before this column existed still reads: the
             // harness then keeps whatever sign-in it already has.
             let updated = tx
-                .execute(
+                .db_execute(
                     "UPDATE agents SET launch_env = ?1 WHERE id = ?2",
-                    params![json, id.as_str()],
+                    &db_params![json, id.as_str()],
                 )
-                .map_err(|err| match err {
-                    rusqlite::Error::SqliteFailure(_, Some(ref text))
-                        if text.contains("no column named launch_env") =>
-                    {
+                .map_err(|err| {
+                    if err.is_missing_schema_object() {
                         Error::Message(
                             "this database has no launch environment column yet".to_string(),
                         )
+                    } else {
+                        err
                     }
-                    other => other.into(),
                 })?;
             if updated == 0 {
                 return Err(Error::AgentNotFound(id.to_string()));
             }
             let changed = agent_by_id(tx, id)?;
             if let Some((actor, source)) = audit {
-                tx.execute(
+                tx.db_execute(
                     "INSERT INTO admin_audit (created_at, actor, action, target, before_scope, after_scope, source)
                      VALUES (?1, ?2, 'agents.scope', ?3, ?4, ?5, ?6)",
-                    params![now_ms(), actor, changed.name, current.scope(), changed.scope(), source],
+                    &db_params![now_ms(), actor, changed.name, current.scope(), changed.scope(), source],
                 )?;
             }
             Ok(changed)
@@ -3148,9 +3646,9 @@ impl Store {
         workdir: &str,
     ) -> Result<Agent, Error> {
         self.write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agents SET workdir = ?1 WHERE id = ?2 AND workdir IS NULL",
-                params![workdir, id.as_str()],
+                &db_params![workdir, id.as_str()],
             )?;
             agent_by_id(tx, id)
         })
@@ -3159,9 +3657,9 @@ impl Store {
     /// Store the work directory and mark the agent running.
     pub fn set_agent_running(&self, id: &AgentId, workdir: &str) -> Result<Agent, Error> {
         let changed = self.write_tx(|tx| {
-            let updated = tx.execute(
+            let updated = tx.db_execute(
                 "UPDATE agents SET workdir = ?1, state = 'running' WHERE id = ?2",
-                params![workdir, id.as_str()],
+                &db_params![workdir, id.as_str()],
             )?;
             if updated == 0 {
                 return Err(Error::AgentNotFound(id.to_string()));
@@ -3178,9 +3676,9 @@ impl Store {
     /// notify the supervisor so it starts or stops the worker slot.
     pub fn set_agent_state(&self, id: &AgentId, state: &str) -> Result<Agent, Error> {
         let changed = self.write_tx(|tx| {
-            let updated = tx.execute(
+            let updated = tx.db_execute(
                 "UPDATE agents SET state = ?1 WHERE id = ?2",
-                params![state, id.as_str()],
+                &db_params![state, id.as_str()],
             )?;
             if updated == 0 {
                 return Err(Error::AgentNotFound(id.to_string()));
@@ -3223,71 +3721,56 @@ impl Store {
         // child, mail past its cursor, no completed turn) is reviewed on every
         // idle pass and must not take the writer lock each time. The UPDATE
         // below re-checks the same predicate under the lock.
-        let eligible: bool = self
-            .read_conn()
-            .prepare_cached(concat!(
+        let eligible: bool = self.read_conn().db_query_one(
+            concat!(
                 "SELECT EXISTS(SELECT 1 FROM agents WHERE ",
                 idle_release_predicate!(),
                 ")"
-            ))?
-            .query_row([id.as_str()], |row| row.get(0))?;
+            ),
+            &db_params![id.as_str()],
+            |row| row.get(0),
+        )?;
         if !eligible {
             return Ok(false);
         }
         let (transitioned, parent_to_wake, silent_completion) = self.write_tx(|tx| {
-            let parent_id_opt: Option<AgentId> = tx
-                .query_row(
-                    "SELECT parent_id FROM agents WHERE id = ?1 AND parent_id IS NOT NULL",
-                    [id.as_str()],
-                    |r| {
-                        let pid: String = r.get(0)?;
-                        AgentId::parse(&pid)
-                            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
-                    },
-                )
-                .optional()?;
-            let silent_info: Option<(AgentId, String, i64)> = tx
-                .query_row(
-                    "SELECT a.parent_id, a.name, tr.completed_seq
-                     FROM agents a
-                     JOIN agents p ON p.id = a.parent_id
-                     JOIN turn_recovery tr ON tr.agent_id = a.id
-                     WHERE a.id = ?1
-                       AND a.parent_id IS NOT NULL
-                       AND a.state = 'running'
-                       AND NOT EXISTS (
-                           SELECT 1 FROM task_turn_contexts t
-                           WHERE t.child_id = a.id AND t.closed_delivery_seq = tr.completed_seq
-                       )
-                       AND EXISTS (
-                           SELECT 1 FROM messages m
-                           WHERE m.agent_id = ?1
-                             AND m.seq >= tr.opened_seq
-                             AND m.sender = 'agent:' || p.name
-                       )
-                       AND NOT EXISTS (
-                           SELECT 1 FROM outbound_messages om
-                           WHERE om.agent_id = ?1
-                             AND om.sent_at_ms >= tr.opened_at_ms
-                       )",
-                    [id.as_str()],
-                    |r| {
-                        let pid: String = r.get(0)?;
-                        let parsed = AgentId::parse(&pid).map_err(|err| {
-                            rusqlite::Error::ToSqlConversionFailure(Box::new(err))
-                        })?;
-                        let name: String = r.get(1)?;
-                        let cseq: i64 = r.get(2)?;
-                        Ok((parsed, name, cseq))
-                    },
-                )
-                .optional()?;
-            let updated = tx.execute(
+            let parent_id_opt: Option<AgentId> = tx.db_query_opt(
+                "SELECT parent_id FROM agents WHERE id = ?1 AND parent_id IS NOT NULL",
+                &db_params![id.as_str()],
+                |r| r.parse_str(0),
+            )?;
+            let silent_info: Option<(AgentId, String, i64)> = tx.db_query_opt(
+                "SELECT a.parent_id, a.name, tr.completed_seq
+                 FROM agents a
+                 JOIN agents p ON p.id = a.parent_id
+                 JOIN turn_recovery tr ON tr.agent_id = a.id
+                 WHERE a.id = ?1
+                   AND a.parent_id IS NOT NULL
+                   AND a.state = 'running'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_turn_contexts t
+                       WHERE t.child_id = a.id AND t.closed_delivery_seq = tr.completed_seq
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM messages m
+                       WHERE m.agent_id = ?1
+                         AND m.seq >= tr.opened_seq
+                         AND m.sender = 'agent:' || p.name
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM outbound_messages om
+                       WHERE om.agent_id = ?1
+                         AND om.sent_at_ms >= tr.opened_at_ms
+                   )",
+                &db_params![id.as_str()],
+                |r| Ok((r.parse_str(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            let updated = tx.db_execute(
                 concat!(
                     "UPDATE agents SET state = 'idle' WHERE ",
                     idle_release_predicate!()
                 ),
-                [id.as_str()],
+                &db_params![id.as_str()],
             )?;
             Ok((
                 updated > 0,
@@ -3336,10 +3819,10 @@ impl Store {
     /// and journal are untouched. Admitted agents are refused.
     pub fn release_unadmitted_agent(&self, id: &AgentId) -> Result<Agent, Error> {
         let released = self.write_tx(|tx| {
-            let changed = tx.execute(
+            let changed = tx.db_execute(
                 "UPDATE agents SET name = id, state = 'archived', workdir = NULL
                  WHERE id = ?1 AND (workdir IS NULL OR state = 'created') AND is_admin = 0",
-                [id.as_str()],
+                &db_params![id.as_str()],
             )?;
             if changed == 0 {
                 agent_exists(tx, id)?;
@@ -3360,15 +3843,49 @@ impl Store {
     /// every row that never reached admission is a failed or interrupted
     /// creation. Release each one's name. Returns the released `(id, name)`s.
     pub fn release_unadmitted_names(&self) -> Result<Vec<(AgentId, String)>, Error> {
-        let rows: Vec<(String, String)> = {
-            let conn = self.read_conn();
-            let mut stmt = conn.prepare(
+        self.release_unadmitted_names_older_than(0)
+    }
+
+    /// Release unadmitted agent name reservations created at least `min_age_ms`
+    /// ago (and, on PostgreSQL, without a fresh runtime heartbeat), so peer
+    /// coordinator replicas booting in multi-replica mode never clobber an
+    /// in-flight `create_agent` on another pod.
+    pub fn release_unadmitted_names_older_than(
+        &self,
+        min_age_ms: i64,
+    ) -> Result<Vec<(AgentId, String)>, Error> {
+        let cutoff = now_ms().saturating_sub(min_age_ms.max(0));
+        let rows: Vec<(String, String)> = if min_age_ms > 0 && self.is_postgres() {
+            self.read_conn().db_query_vec(
+                "SELECT a.id, a.name
+                 FROM agents a
+                 LEFT JOIN agent_runtime r ON r.agent_id = a.id
+                 WHERE (a.workdir IS NULL OR a.state = 'created')
+                   AND a.is_admin = 0
+                   AND a.name != a.id
+                   AND a.state IN ('created', 'archived')
+                   AND a.created_at_ms <= ?1
+                   AND COALESCE(r.heartbeat_at_ms, 0) <= ?1",
+                &db_params![cutoff],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        } else if min_age_ms > 0 {
+            self.read_conn().db_query_vec(
+                "SELECT id, name FROM agents
+                 WHERE (workdir IS NULL OR state = 'created') AND is_admin = 0 AND name != id
+                   AND state IN ('created', 'archived')
+                   AND created_at_ms <= ?1",
+                &db_params![cutoff],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        } else {
+            self.read_conn().db_query_vec(
                 "SELECT id, name FROM agents
                  WHERE (workdir IS NULL OR state = 'created') AND is_admin = 0 AND name != id
                    AND state IN ('created', 'archived')",
-            )?;
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<Result<_, _>>()?
+                &[],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
         };
         let mut released = Vec::new();
         for (id, name) in rows {
@@ -3420,25 +3937,23 @@ impl Store {
                 "group_agents",
                 "channel_agents",
             ] {
-                tx.execute(
+                tx.db_execute(
                     &format!("DELETE FROM {table} WHERE agent_id = ?1"),
-                    [id.as_str()],
+                    &db_params![id.as_str()],
                 )?;
             }
-            tx.execute("DELETE FROM agents WHERE id = ?1", [id.as_str()])?;
+            tx.db_execute("DELETE FROM agents WHERE id = ?1", &db_params![id.as_str()])?;
             // Every row inserted after this commit lies above these, even
             // one that reuses a rowid the deleted rows held.
-            let max_rowids = tx.query_row(
+            let max_rowids = tx.db_query_one(
                 "SELECT (SELECT COALESCE(MAX(rowid), 0) FROM messages),
                         (SELECT COALESCE(MAX(rowid), 0) FROM outbound_messages)",
-                [],
+                &[],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             Ok((agent, max_rowids))
         })?;
-        self.shared
-            .memory_index
-            .agent_deleted(id.as_str(), max_rowids)?;
+        self.memory_index().agent_deleted(id.as_str(), max_rowids)?;
         self.notify(Wake::Agent {
             agent_id: id.clone(),
         });
@@ -3450,19 +3965,17 @@ impl Store {
         let conn = self.read_conn();
         agent_exists(&conn, agent_id)?;
         let delivered = cursor(&conn, agent_id)?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {MESSAGE_COLS}
-             FROM messages WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq"
-        ))?;
-        let mut rows = stmt.query(params![agent_id.as_str(), since.unwrap_or(i64::MIN)])?;
-        let mut messages = Vec::new();
-        while let Some(row) = rows.next()? {
-            messages.push(message_from_row_with_cursor(row, delivered)?);
-        }
-        Ok(messages)
+        conn.db_query_vec(
+            &format!(
+                "SELECT {MESSAGE_COLS}
+                 FROM messages WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq"
+            ),
+            &db_params![agent_id.as_str(), since.unwrap_or(i64::MIN)],
+            |row| message_from_row_with_cursor_db(row, delivered),
+        )
     }
 
-    /// Latest matching messages, limited in SQLite and returned in sequence order.
+    /// Latest matching messages, limited in SQL and returned in sequence order.
     pub fn inbox_query(
         &self,
         agent_id: &AgentId,
@@ -3484,27 +3997,26 @@ impl Store {
         let conn = self.read_conn();
         agent_exists(&conn, agent_id)?;
         let delivered = cursor(&conn, agent_id)?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {MESSAGE_COLS} FROM messages
-             WHERE agent_id = ?1 AND seq > ?2
-               AND (?3 IS NULL OR sender = ?3)
-             ORDER BY seq DESC LIMIT ?4"
-        ))?;
         let lower = since
             .unwrap_or(i64::MIN)
             .max(if unread_only { delivered } else { i64::MIN });
-        let mut rows = stmt.query(params![
-            agent_id.as_str(),
-            lower,
-            sender,
-            limit
-                .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
-                .unwrap_or(-1)
-        ])?;
-        let mut messages = Vec::new();
-        while let Some(row) = rows.next()? {
-            messages.push(message_from_row_with_cursor(row, delivered)?);
-        }
+        let mut messages = conn.db_query_vec(
+            &format!(
+                "SELECT {MESSAGE_COLS} FROM messages
+                 WHERE agent_id = ?1 AND seq > ?2
+                   AND (?3 IS NULL OR sender = ?3)
+                 ORDER BY seq DESC LIMIT ?4"
+            ),
+            &db_params![
+                agent_id.as_str(),
+                lower,
+                sender,
+                limit
+                    .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+                    .unwrap_or(i64::MAX)
+            ],
+            |row| message_from_row_with_cursor_db(row, delivered),
+        )?;
         messages.reverse();
         Ok(messages)
     }
@@ -3562,17 +4074,24 @@ impl Store {
             let ts_ms = now_ms();
             // `seq` places the turn in the mailbox: after the last message
             // the agent had received when it sent.
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO outbound_messages (id, agent_id, destination, reply_to, body, sent_at_ms, seq)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6,
                          (SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?2))
                  ON CONFLICT(id) DO NOTHING",
-                params![id, agent_id.as_str(), destination, reply_to, body, ts_ms,],
+                &db_params![id, agent_id.as_str(), destination, reply_to, body, ts_ms],
             )?;
-            let matches: bool = tx.query_row(
-                "SELECT agent_id=?2 AND destination=?3 AND reply_to IS ?4 AND body=?5
-                 FROM outbound_messages WHERE id=?1",
-                params![id, agent_id.as_str(), destination, reply_to, body],
+            let is_eq = if tx.backend() == DbBackend::Postgres {
+                "IS NOT DISTINCT FROM"
+            } else {
+                "IS"
+            };
+            let matches: bool = tx.db_query_one(
+                &format!(
+                    "SELECT agent_id=?2 AND destination=?3 AND reply_to {is_eq} ?4 AND body=?5
+                     FROM outbound_messages WHERE id=?1"
+                ),
+                &db_params![id, agent_id.as_str(), destination, reply_to, body],
                 |r| r.get(0),
             )?;
             if !matches {
@@ -3600,9 +4119,9 @@ impl Store {
         let (agent, cur_seq) = {
             let conn = self.read_conn();
             let agent = agent_by_id(&conn, agent_id)?;
-            let seq: i64 = conn.query_row(
+            let seq: i64 = conn.db_query_one(
                 "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?1",
-                [agent_id.as_str()],
+                &db_params![agent_id.as_str()],
                 |r| r.get(0),
             )?;
             (agent, seq)
@@ -3615,8 +4134,7 @@ impl Store {
         } else {
             format!("[tool:{clean_tool}] {}", summary.trim())
         };
-        self.shared
-            .memory_index
+        self.memory_index()
             .record_standalone(&memory_index::Chunk {
                 id: &id,
                 agent_id: agent_id.as_str(),
@@ -3642,8 +4160,7 @@ impl Store {
             return;
         };
         if let Err(error) = self
-            .shared
-            .memory_index
+            .memory_index()
             .sync(&state, false, memory_index::READ_BUDGET)
         {
             eprintln!("anyagents memory index: projection deferred: {error}");
@@ -3656,17 +4173,15 @@ impl Store {
     pub(crate) fn sync_memory_index(&self) -> Result<(), Error> {
         match self.index_state_reader() {
             Some(state) => {
-                self.shared
-                    .memory_index
+                self.memory_index()
                     .sync(&state, true, memory_index::READ_BUDGET)?;
             }
             // Only the state writer can read state: never wait on the index
             // while holding it.
             None => {
-                let state = self.conn();
-                self.shared
-                    .memory_index
-                    .sync(&state, false, memory_index::READ_BUDGET)?;
+                let state = self.sqlite_shared().writer();
+                self.memory_index()
+                    .sync(&*state, false, memory_index::READ_BUDGET)?;
             }
         }
         Ok(())
@@ -3681,10 +4196,10 @@ impl Store {
             return;
         }
         let Some(state) = self.index_state_reader() else {
-            self.shared.memory_index.defer(merged);
+            self.memory_index().defer(merged);
             return;
         };
-        if let Err(error) = self.shared.memory_index.try_reproject(&state, merged) {
+        if let Err(error) = self.memory_index().try_reproject(&state, merged) {
             eprintln!("anyagents memory index: re-projection deferred: {error}");
         }
     }
@@ -3692,7 +4207,10 @@ impl Store {
     /// A pooled state reader for index maintenance, never the state writer:
     /// index work must not hold the state writer while it waits.
     fn index_state_reader(&self) -> Option<ReadConn<'static>> {
-        self.shared.reader()
+        match &self.backend {
+            registry::Backend::Sqlite(shared) => shared.reader(),
+            registry::Backend::Postgres(pg) => Some(ReadConn::Postgres(pg.handle.pool.clone())),
+        }
     }
 
     /// Re-project `chunks` and refile `agents`' rows around a state change:
@@ -3720,15 +4238,11 @@ impl Store {
     /// busy index fails the change before it starts.
     fn invalidate_index(&self, chunks: &[&str], agents: &[&str]) -> Result<(), Error> {
         match self.index_state_reader() {
-            Some(state) => self
-                .shared
-                .memory_index
-                .invalidate(&state, chunks, agents, true),
+            Some(state) => self.memory_index().invalidate(&state, chunks, agents, true),
             None => {
-                let state = self.conn();
-                self.shared
-                    .memory_index
-                    .invalidate(&state, chunks, agents, false)
+                let state = self.sqlite_shared().writer();
+                self.memory_index()
+                    .invalidate(&*state, chunks, agents, false)
             }
         }
     }
@@ -3737,18 +4251,18 @@ impl Store {
     /// (`memory_index::Staged`). Never call it with the state writer held.
     pub(crate) fn begin_staged_index(&self) -> Result<memory_index::Staged<'_>, Error> {
         debug_assert!(!registry::holds_store_writer());
-        self.shared.memory_index.begin_staged()
+        self.memory_index().begin_staged()
     }
 
     /// Forget a standalone redaction's staged receipt once its audit is in
     /// state.
     pub(crate) fn clear_staged_index_redaction(&self, chunk_id: &str) -> Result<(), Error> {
-        self.shared.memory_index.clear_staged_redaction(chunk_id)
+        self.memory_index().clear_staged_redaction(chunk_id)
     }
 
     /// The search index's file.
     pub fn memory_index_path(&self) -> &Path {
-        self.shared.memory_index.path()
+        self.memory_index().path()
     }
 
     /// Whether state still has pre-split search tables left to dismantle
@@ -3763,24 +4277,25 @@ impl Store {
         agent_id: &AgentId,
         chunk_id: &str,
     ) -> Result<Option<String>, Error> {
-        let in_mailbox: bool = self.read_conn().query_row(
+        let in_mailbox: bool = self.read_conn().db_query_one(
             "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)
                  OR EXISTS(SELECT 1 FROM outbound_messages WHERE id = ?1)",
-            [chunk_id],
+            &db_params![chunk_id],
             |r| r.get(0),
         )?;
         if in_mailbox {
             return Ok(None);
         }
-        self.shared
-            .memory_index
+        self.memory_index()
             .standalone_text(agent_id.as_str(), chunk_id)
     }
 
     /// Checkpoint the index's log back into its file and truncate it, without
     /// waiting. `false` when a reader still needs the log.
     pub(crate) fn truncate_index_wal(&self) -> Result<bool, Error> {
-        let conn = self.shared.memory_index.writer();
+        let Some(conn) = self.memory_index().sqlite_writer() else {
+            return Ok(true);
+        };
         conn.busy_timeout(Duration::ZERO)?;
         let result = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
             Ok((
@@ -3798,20 +4313,19 @@ impl Store {
         agent_id: &AgentId,
     ) -> Result<TurnOwnershipSnapshot, Error> {
         let conn = self.read_conn();
-        let last_in: Option<(i64, i64, Option<String>, Option<String>)> = conn
-            .prepare_cached(
-                "SELECT seq, delivered_at_ms, sender, source_key
-                 FROM messages
-                 WHERE agent_id = ?1 AND delivered_at_ms IS NOT NULL
-                 ORDER BY seq DESC LIMIT 1",
-            )?
-            .query_row([agent_id.as_str()], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .optional()?;
-        let last_outbound_at_ms: Option<i64> = conn
-            .prepare_cached("SELECT MAX(sent_at_ms) FROM outbound_messages WHERE agent_id = ?1")?
-            .query_row([agent_id.as_str()], |row| row.get(0))?;
+        let last_in: Option<(i64, i64, Option<String>, Option<String>)> = conn.db_query_opt(
+            "SELECT seq, delivered_at_ms, sender, source_key
+             FROM messages
+             WHERE agent_id = ?1 AND delivered_at_ms IS NOT NULL
+             ORDER BY seq DESC LIMIT 1",
+            &db_params![agent_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let last_outbound_at_ms: Option<i64> = conn.db_query_one(
+            "SELECT MAX(sent_at_ms) FROM outbound_messages WHERE agent_id = ?1",
+            &db_params![agent_id.as_str()],
+            |row| row.get(0),
+        )?;
         Ok(match last_in {
             Some((seq, delivered_at_ms, sender, source_key)) => TurnOwnershipSnapshot {
                 last_delivered_seq: Some(seq),
@@ -3835,13 +4349,12 @@ impl Store {
         agent_id: &AgentId,
         source_key: &str,
     ) -> Result<bool, Error> {
-        let conn = self.read_conn();
-        let exists: i64 = conn
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM messages WHERE agent_id = ?1 AND source_key = ?2)",
-            )?
-            .query_row(params![agent_id.as_str(), source_key], |row| row.get(0))?;
-        Ok(exists != 0)
+        let exists: bool = self.read_conn().db_query_one(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE agent_id = ?1 AND source_key = ?2)",
+            &db_params![agent_id.as_str(), source_key],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
     }
 
     /// Read the complete two-way (`in` + `out`) conversation of `agent_id` across
@@ -3889,6 +4402,11 @@ impl Store {
             None
         };
 
+        let mut query_params = db_params![agent_id.as_str(), since];
+        if let Some(lim) = sql_limit {
+            query_params.push(lim.to_db_param());
+        }
+
         // 1. Inbound messages received by this agent.
         let in_sql = match (sql_limit, since_ms.is_none()) {
             (Some(_), true) => format!(
@@ -3907,14 +4425,10 @@ impl Store {
                  ORDER BY received_at_ms, seq"
             ),
         };
-        let mut in_stmt = conn.prepare(&in_sql)?;
-        let mut in_rows = if let Some(lim) = sql_limit {
-            in_stmt.query(params![agent_id.as_str(), since, lim])?
-        } else {
-            in_stmt.query(params![agent_id.as_str(), since])?
-        };
-        while let Some(row) = in_rows.next()? {
-            let msg = message_from_row_with_cursor(row, delivered)?;
+        let inbound_msgs = conn.db_query_vec(&in_sql, &query_params, |row| {
+            message_from_row_with_cursor_db(row, delivered)
+        })?;
+        for msg in inbound_msgs {
             let from = msg.sender.unwrap_or_else(|| "unknown".to_string());
             let to = msg
                 .reply_to
@@ -3951,14 +4465,8 @@ impl Store {
                  ORDER BY sent_at_ms, id"
             }
         };
-        let mut out_stmt = conn.prepare(out_sql)?;
-        let mut out_rows = if let Some(lim) = sql_limit {
-            out_stmt.query(params![agent_id.as_str(), since, lim])?
-        } else {
-            out_stmt.query(params![agent_id.as_str(), since])?
-        };
-        while let Some(row) = out_rows.next()? {
-            turns.push(ConversationTurn {
+        let out_turns = conn.db_query_vec(out_sql, &query_params, |row| {
+            Ok(ConversationTurn {
                 seq: row.get(5)?,
                 id: row.get(0)?,
                 direction: "out".to_string(),
@@ -3967,8 +4475,9 @@ impl Store {
                 reply_to: row.get(2)?,
                 text: row.get(3)?,
                 timestamp_ms: row.get(4)?,
-            });
-        }
+            })
+        })?;
+        turns.extend(out_turns);
 
         if let Some(peer) = peer_filter {
             let peers = self.conversation_peer_forms(peer);
@@ -4042,14 +4551,9 @@ impl Store {
                  LIMIT ?2"
             )
         };
-        let mut turns = Vec::new();
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(scoped_params(
-            params![since, fetch_limit],
-            visible_agent_ids,
-        )))?;
-        while let Some(row) = rows.next()? {
-            turns.push(ConversationTurn {
+        let all_params = scoped_params(db_params![since, fetch_limit], visible_agent_ids);
+        let mut turns = conn.db_query_vec(&sql, &all_params, |row| {
+            Ok(ConversationTurn {
                 seq: row.get(6)?,
                 id: row.get(0)?,
                 direction: row.get(1)?,
@@ -4058,8 +4562,8 @@ impl Store {
                 reply_to: None,
                 text: row.get(4)?,
                 timestamp_ms: row.get(5)?,
-            });
-        }
+            })
+        })?;
         if let Some(peer) = peer_filter {
             let peers = self.conversation_peer_forms(peer);
             turns.retain(|turn| peers.iter().any(|p| matches_conversation_peer(turn, p)));
@@ -4246,62 +4750,161 @@ impl Store {
             std::collections::HashMap::new();
 
         if !all_queries.is_empty() {
-            // 1. Lexical FTS5 BM25 Leg with inverted-index filter pushdown (`agent_name`, `kind`, `tool_name`).
-            let fts_query = build_fts5_query_with_filters(
-                &all_queries,
-                agent_name_filter.as_deref(),
-                kind_sql_filter,
-                tool_filter.as_deref(),
+            // 1. Lexical FTS5 / PostgreSQL GIN tsvector leg with filter pushdown.
+            let fts_limit = i64::try_from((limit * 8).max(120)).unwrap_or(120);
+            type FtsChunkRow = (
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                String,
+                String,
+                String,
+                i64,
+                f64,
             );
-            let visibility_sql = visible_agent_ids_sql("agent_id", visible_agent_ids, 5);
-            if !fts_query.is_empty()
-                && let Ok(mut fstmt) = conn.prepare(&format!(
-                    "SELECT c.chunk_id, c.direction, c.sender, c.destination,
-                            COALESCE(
-                                (SELECT m.body FROM messages m WHERE m.agent_id = c.agent_id AND m.id = c.chunk_id),
-                                (SELECT o.body FROM outbound_messages o WHERE o.agent_id = c.agent_id AND o.id = c.chunk_id),
-                                c.text
-                            ),
-                            c.timestamp_ms, c.agent_name, c.kind, c.tool_name, c.seq, f.score
-                     FROM (
-                         SELECT chunk_id, bm25(rag_chunks_fts, 0.5, 1.0, 1.0, 1.0, 0.5, 2.0, 3.0, 2.5) as score
-                         FROM rag_chunks_fts
-                         WHERE rag_chunks_fts MATCH ?1
-                           AND chunk_id IN (
-                               SELECT chunk_id FROM rag_chunks WHERE 1=1{visibility_sql}
-                           )
-                         ORDER BY score ASC
-                         LIMIT ?4
-                     ) f
-                     JOIN rag_chunks c ON c.chunk_id = f.chunk_id
-                     WHERE c.timestamp_ms > ?2 AND c.timestamp_ms <= ?3
-                     ORDER BY f.score ASC",
-                ))
-                && let Ok(mut frows) = fstmt.query(rusqlite::params_from_iter(scoped_params(
-                    params![fts_query, since, until, i64::try_from((limit * 8).max(120)).unwrap_or(120)],
-                    visible_agent_ids,
-                )))
-            {
-                let mut rank = 0usize;
-                while let Ok(Some(row)) = frows.next() {
-                    let cid: String = row.get(0)?;
-                    let aname: String = row.get(6)?;
-                    let kind: String = row.get(7)?;
-                    let tool_name: String = row.get(8)?;
-                    let seq: i64 = row.get(9)?;
-                    let bm25_raw: f64 = row.get(10).unwrap_or(0.0);
+            let fts_rows: Option<Vec<FtsChunkRow>> = match conn.backend() {
+                DbBackend::Sqlite => {
+                    let fts_query = build_fts5_query_with_filters(
+                        &all_queries,
+                        agent_name_filter.as_deref(),
+                        kind_sql_filter,
+                        tool_filter.as_deref(),
+                    );
+                    let visibility_sql = visible_agent_ids_sql("agent_id", visible_agent_ids, 5);
+                    if fts_query.is_empty() {
+                        None
+                    } else {
+                        let sql = format!(
+                                "SELECT c.chunk_id, c.direction, c.sender, c.destination,
+                                        COALESCE(
+                                            (SELECT m.body FROM messages m WHERE m.agent_id = c.agent_id AND m.id = c.chunk_id),
+                                            (SELECT o.body FROM outbound_messages o WHERE o.agent_id = c.agent_id AND o.id = c.chunk_id),
+                                            c.text
+                                        ),
+                                        c.timestamp_ms, c.agent_name, c.kind, c.tool_name, c.seq, f.score
+                                 FROM (
+                                     SELECT chunk_id, bm25(rag_chunks_fts, 0.5, 1.0, 1.0, 1.0, 0.5, 2.0, 3.0, 2.5) as score
+                                     FROM rag_chunks_fts
+                                     WHERE rag_chunks_fts MATCH ?1
+                                       AND chunk_id IN (
+                                           SELECT chunk_id FROM rag_chunks WHERE 1=1{visibility_sql}
+                                       )
+                                     ORDER BY score ASC
+                                     LIMIT ?4
+                                 ) f
+                                 JOIN rag_chunks c ON c.chunk_id = f.chunk_id
+                                 WHERE c.timestamp_ms > ?2 AND c.timestamp_ms <= ?3
+                                 ORDER BY f.score ASC"
+                            );
+                        let p = scoped_params(
+                            db_params![fts_query, since, until, fts_limit],
+                            visible_agent_ids,
+                        );
+                        conn.db_query_vec(&sql, &p, |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                r.get(3)?,
+                                r.get(4)?,
+                                r.get(5)?,
+                                r.get(6)?,
+                                r.get(7)?,
+                                r.get(8)?,
+                                r.get(9)?,
+                                r.get::<Option<f64>>(10)?.unwrap_or(0.0),
+                            ))
+                        })
+                        .ok()
+                    }
+                }
+                DbBackend::Postgres => {
+                    let pg_query = build_pg_tsquery(&all_queries);
+                    let visibility_sql = visible_agent_ids_sql("c.agent_id", visible_agent_ids, 8);
+                    pg_query.and_then(|fts_query| {
+                            let sql = format!(
+                                "SELECT c.chunk_id, c.direction, c.sender, c.destination,
+                                        COALESCE(
+                                            (SELECT m.body FROM messages m WHERE m.agent_id = c.agent_id AND m.id = c.chunk_id),
+                                            (SELECT o.body FROM outbound_messages o WHERE o.agent_id = c.agent_id AND o.id = c.chunk_id),
+                                            c.text
+                                        ),
+                                        c.timestamp_ms, c.agent_name, c.kind, c.tool_name, c.seq,
+                                        -ts_rank_cd(c.search_tsv, to_tsquery('simple', ?1))::float8 AS score
+                                 FROM memory_index.rag_chunks c
+                                 WHERE c.search_tsv @@ to_tsquery('simple', ?1)
+                                   AND c.timestamp_ms > ?2 AND c.timestamp_ms <= ?3
+                                   AND (?5 IS NULL OR LOWER(c.agent_name) = ?5)
+                                   AND (?6 IS NULL OR c.kind = ?6)
+                                   AND (?7 IS NULL OR LOWER(c.tool_name) = ?7)
+                                   {visibility_sql}
+                                 ORDER BY score ASC
+                                 LIMIT ?4"
+                            );
+                            let p = scoped_params(
+                                db_params![
+                                    fts_query,
+                                    since,
+                                    until,
+                                    fts_limit,
+                                    agent_name_filter.as_deref(),
+                                    kind_sql_filter,
+                                    tool_filter.as_deref(),
+                                ],
+                                visible_agent_ids,
+                            );
+                            conn.db_query_vec(&sql, &p, |r| {
+                                Ok((
+                                    r.get(0)?,
+                                    r.get(1)?,
+                                    r.get(2)?,
+                                    r.get(3)?,
+                                    r.get(4)?,
+                                    r.get(5)?,
+                                    r.get(6)?,
+                                    r.get(7)?,
+                                    r.get(8)?,
+                                    r.get(9)?,
+                                    r.get::<Option<f64>>(10)?.unwrap_or(0.0),
+                                ))
+                            })
+                            .ok()
+                        })
+                }
+            };
+            if let Some(rows) = fts_rows {
+                for (
+                    rank,
+                    (
+                        cid,
+                        direction,
+                        from,
+                        to,
+                        text,
+                        timestamp_ms,
+                        aname,
+                        kind,
+                        tool_name,
+                        seq,
+                        bm25_raw,
+                    ),
+                ) in rows.into_iter().enumerate()
+                {
                     let turn = ConversationTurn {
                         seq,
                         id: cid.clone(),
-                        direction: row.get(1)?,
-                        from: row.get(2)?,
-                        to: row.get(3)?,
+                        direction,
+                        from,
+                        to,
                         reply_to: Some(format!(
                             "bm25_rank={}:agent={aname}:kind={kind}:seq={seq}",
                             rank + 1
                         )),
-                        text: row.get(4)?,
-                        timestamp_ms: row.get(5)?,
+                        text,
+                        timestamp_ms,
                     };
                     if !passes_filters(&turn, &aname, &kind, &tool_name, seq) {
                         continue;
@@ -4328,20 +4931,20 @@ impl Store {
                         + token_hits * 0.8;
                     *scores.entry(cid.clone()).or_insert(0.0) += rrf;
                     chunk_meta.entry(cid).or_insert((turn, aname, seq));
-                    rank += 1;
                 }
             }
 
             // 2. Bounded index-pushed substring fallback (only when FTS5 returned fewer than `limit` hits
             //    or for symbol/punctuation queries that produce no FTS tokens).
             if scores.len() < limit {
+                let like_kw = conn.backend().sql_like_ci();
                 for q_raw in &all_queries {
                     let q_trim = q_raw.trim();
                     if q_trim.is_empty() {
                         continue;
                     }
                     let like_pat = format!("%{}%", q_trim.replace('%', "\\%").replace('_', "\\_"));
-                    let mut lstmt = conn.prepare(&format!(
+                    let sql = format!(
                         "SELECT chunk_id, direction, sender, destination, text, timestamp_ms,
                                 agent_name, kind, tool_name, seq
                          FROM (
@@ -4355,14 +4958,14 @@ impl Store {
                                AND (?8 IS NULL OR seq <= ?8){}
                              ORDER BY timestamp_ms DESC
                              LIMIT 2000
-                         )
-                         WHERE text LIKE ?3 ESCAPE '\\'
+                         ) AS _recent
+                         WHERE text {like_kw} ?3 ESCAPE '\\'
                          ORDER BY timestamp_ms DESC
                          LIMIT ?4",
                         visible_agent_ids_sql("agent_id", visible_agent_ids, 9)
-                    ))?;
-                    let mut lrows = lstmt.query(rusqlite::params_from_iter(scoped_params(
-                        params![
+                    );
+                    let p = scoped_params(
+                        db_params![
                             since,
                             until,
                             like_pat,
@@ -4373,23 +4976,44 @@ impl Store {
                             req.to_seq,
                         ],
                         visible_agent_ids,
-                    )))?;
+                    );
+                    let lrows = conn.db_query_vec(&sql, &p, |row| {
+                        Ok((
+                            row.get::<String>(0)?,
+                            row.get::<String>(1)?,
+                            row.get::<String>(2)?,
+                            row.get::<String>(3)?,
+                            row.get::<String>(4)?,
+                            row.get::<i64>(5)?,
+                            row.get::<String>(6)?,
+                            row.get::<String>(7)?,
+                            row.get::<String>(8)?,
+                            row.get::<i64>(9)?,
+                        ))
+                    })?;
                     let mut rank = 0usize;
-                    while let Some(row) = lrows.next()? {
-                        let cid: String = row.get(0)?;
-                        let aname: String = row.get(6)?;
-                        let kind: String = row.get(7)?;
-                        let tool_name: String = row.get(8)?;
-                        let seq: i64 = row.get(9)?;
+                    for (
+                        cid,
+                        direction,
+                        from,
+                        to,
+                        text,
+                        timestamp_ms,
+                        aname,
+                        kind,
+                        tool_name,
+                        seq,
+                    ) in lrows
+                    {
                         let turn = ConversationTurn {
                             seq,
                             id: cid.clone(),
-                            direction: row.get(1)?,
-                            from: row.get(2)?,
-                            to: row.get(3)?,
+                            direction,
+                            from,
+                            to,
                             reply_to: Some(format!("exact:agent={aname}:kind={kind}:seq={seq}")),
-                            text: row.get(4)?,
-                            timestamp_ms: row.get(5)?,
+                            text,
+                            timestamp_ms,
                         };
                         if !passes_filters(&turn, &aname, &kind, &tool_name, seq) {
                             continue;
@@ -4423,9 +5047,8 @@ impl Store {
                  LIMIT ?3",
                 visible_agent_ids_sql("agent_id", visible_agent_ids, 9)
             );
-            let mut bstmt = conn.prepare(&sql)?;
-            let mut brows = bstmt.query(rusqlite::params_from_iter(scoped_params(
-                params![
+            let p = scoped_params(
+                db_params![
                     since,
                     until,
                     i64::try_from((limit * 8).max(200)).unwrap_or(200),
@@ -4436,23 +5059,33 @@ impl Store {
                     req.to_seq,
                 ],
                 visible_agent_ids,
-            )))?;
+            );
+            let brows = conn.db_query_vec(&sql, &p, |row| {
+                Ok((
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                    row.get::<String>(4)?,
+                    row.get::<i64>(5)?,
+                    row.get::<String>(6)?,
+                    row.get::<String>(7)?,
+                    row.get::<String>(8)?,
+                    row.get::<i64>(9)?,
+                ))
+            })?;
             let mut rank = 0usize;
-            while let Some(row) = brows.next()? {
-                let cid: String = row.get(0)?;
-                let aname: String = row.get(6)?;
-                let kind: String = row.get(7)?;
-                let tool_name: String = row.get(8)?;
-                let seq: i64 = row.get(9)?;
+            for (cid, direction, from, to, text, timestamp_ms, aname, kind, tool_name, seq) in brows
+            {
                 let turn = ConversationTurn {
                     seq,
                     id: cid.clone(),
-                    direction: row.get(1)?,
-                    from: row.get(2)?,
-                    to: row.get(3)?,
+                    direction,
+                    from,
+                    to,
                     reply_to: Some(format!("filter:agent={aname}:kind={kind}:seq={seq}")),
-                    text: row.get(4)?,
-                    timestamp_ms: row.get(5)?,
+                    text,
+                    timestamp_ms,
                 };
                 if !passes_filters(&turn, &aname, &kind, &tool_name, seq) {
                     continue;
@@ -4524,7 +5157,7 @@ impl Store {
         for (hit_turn, aname, _) in matched_hits {
             let hit_ts = hit_turn.timestamp_ms;
             let mut before: Vec<ConversationTurn> = Vec::new();
-            if let Ok(mut bstmt) = conn.prepare(&format!(
+            let bsql = format!(
                 "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, kind, seq, tool_name
                  FROM rag_chunks
                  WHERE LOWER(agent_name) = LOWER(?1)
@@ -4533,33 +5166,44 @@ impl Store {
                  ORDER BY timestamp_ms DESC, seq DESC
                  LIMIT ?4",
                 visible_agent_ids_sql("agent_id", visible_agent_ids, 7),
-            )) && let Ok(mut brows) =
-                bstmt.query(rusqlite::params_from_iter(scoped_params(
-                    params![aname, hit_ts, hit_turn.id, rad_i64 * 2, since, until], visible_agent_ids)))
-            {
-                while let Ok(Some(r)) = brows.next() {
-                    let kind: String = r.get(6)?;
+            );
+            let bp = scoped_params(
+                db_params![aname, hit_ts, hit_turn.id, rad_i64 * 2, since, until],
+                visible_agent_ids,
+            );
+            if let Ok(brows) = conn.db_query_vec(&bsql, &bp, |r| {
+                Ok((
+                    r.get::<String>(0)?,
+                    r.get::<String>(1)?,
+                    r.get::<String>(2)?,
+                    r.get::<String>(3)?,
+                    r.get::<String>(4)?,
+                    r.get::<i64>(5)?,
+                    r.get::<String>(6)?,
+                    r.get::<i64>(7)?,
+                    r.get::<String>(8)?,
+                ))
+            }) {
+                for (cid, direction, from, to, text, timestamp_ms, kind, seq, tool_name) in brows {
                     if only_tools && kind != "tool" {
                         continue;
                     }
                     if !include_tools && kind == "tool" {
                         continue;
                     }
-                    let seq: i64 = r.get(7)?;
                     let turn = ConversationTurn {
                         seq,
-                        id: r.get(0)?,
-                        direction: r.get(1)?,
-                        from: r.get(2)?,
-                        to: r.get(3)?,
+                        id: cid,
+                        direction,
+                        from,
+                        to,
                         reply_to: Some(format!(
                             "context:before={}:agent={aname}:seq={seq}",
                             hit_turn.id
                         )),
-                        text: r.get(4)?,
-                        timestamp_ms: r.get(5)?,
+                        text,
+                        timestamp_ms,
                     };
-                    let tool_name: String = r.get(8)?;
                     if !passes_filters(&turn, &aname, &kind, &tool_name, seq) {
                         continue;
                     }
@@ -4579,7 +5223,7 @@ impl Store {
             if seen_ids.insert(hit_id.clone()) {
                 out.push(hit_turn);
             }
-            if let Ok(mut astmt) = conn.prepare(&format!(
+            let asql = format!(
                 "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, kind, seq, tool_name
                  FROM rag_chunks
                  WHERE LOWER(agent_name) = LOWER(?1)
@@ -4589,30 +5233,42 @@ impl Store {
                  ORDER BY timestamp_ms ASC, seq ASC
                  LIMIT ?4",
                 visible_agent_ids_sql("agent_id", visible_agent_ids, 7),
-            )) && let Ok(mut arows) = astmt.query(rusqlite::params_from_iter(scoped_params(
-                params![aname, hit_ts, hit_id, rad_i64 * 2, since, until], visible_agent_ids)))
-            {
+            );
+            let ap = scoped_params(
+                db_params![aname, hit_ts, hit_id, rad_i64 * 2, since, until],
+                visible_agent_ids,
+            );
+            if let Ok(arows) = conn.db_query_vec(&asql, &ap, |r| {
+                Ok((
+                    r.get::<String>(0)?,
+                    r.get::<String>(1)?,
+                    r.get::<String>(2)?,
+                    r.get::<String>(3)?,
+                    r.get::<String>(4)?,
+                    r.get::<i64>(5)?,
+                    r.get::<String>(6)?,
+                    r.get::<i64>(7)?,
+                    r.get::<String>(8)?,
+                ))
+            }) {
                 let mut added_after = 0usize;
-                while let Ok(Some(r)) = arows.next() {
-                    let kind: String = r.get(6)?;
+                for (cid, direction, from, to, text, timestamp_ms, kind, seq, tool_name) in arows {
                     if only_tools && kind != "tool" {
                         continue;
                     }
                     if !include_tools && kind == "tool" {
                         continue;
                     }
-                    let seq: i64 = r.get(7)?;
                     let turn = ConversationTurn {
                         seq,
-                        id: r.get(0)?,
-                        direction: r.get(1)?,
-                        from: r.get(2)?,
-                        to: r.get(3)?,
+                        id: cid,
+                        direction,
+                        from,
+                        to,
                         reply_to: Some(format!("context:after={hit_id}:agent={aname}:seq={seq}")),
-                        text: r.get(4)?,
-                        timestamp_ms: r.get(5)?,
+                        text,
+                        timestamp_ms,
                     };
-                    let tool_name: String = r.get(8)?;
                     if !passes_filters(&turn, &aname, &kind, &tool_name, seq) {
                         continue;
                     }
@@ -4717,17 +5373,17 @@ impl Store {
         let (max_in_seq, latest_in_ms, max_out_ms, substantive_turns) = {
             let conn = self.read_conn();
             let (max_in_seq, latest_in_ms): (i64, i64) = conn
-                .query_row(
+                .db_query_one(
                     "SELECT COALESCE(MAX(seq), 0), COALESCE(MAX(received_at_ms), 0)
                      FROM messages WHERE agent_id = ?1",
-                    params![agent.id.as_str()],
+                    &db_params![agent.id.as_str()],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .unwrap_or((0, 0));
             let max_out_ms: i64 = conn
-                .query_row(
+                .db_query_one(
                     "SELECT COALESCE(MAX(sent_at_ms), 0) FROM outbound_messages WHERE agent_id = ?1",
-                    params![agent.id.as_str()],
+                    &db_params![agent.id.as_str()],
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
@@ -4739,22 +5395,25 @@ impl Store {
             } else {
                 let mut raw_turns: Vec<crate::learned_memory::SleepTurnDelta> = Vec::new();
                 if max_in_seq > sleep.last_inbound_seq
-                    && let Ok(mut stmt) = conn.prepare(
+                    && let Ok(rows) = conn.db_query_vec(
                         "SELECT received_at_ms, COALESCE(sender, 'unknown'), body, id, seq
                          FROM messages
                          WHERE agent_id = ?1 AND seq > ?2
                          ORDER BY seq DESC
                          LIMIT 30",
+                        &db_params![agent.id.as_str(), sleep.last_inbound_seq],
+                        |row| {
+                            Ok((
+                                row.get::<i64>(0).unwrap_or(0),
+                                row.get::<String>(1).unwrap_or_default(),
+                                row.get::<String>(2).unwrap_or_default(),
+                                row.get::<String>(3).unwrap_or_default(),
+                                row.get::<i64>(4).unwrap_or_default(),
+                            ))
+                        },
                     )
-                    && let Ok(mut rows) =
-                        stmt.query(params![agent.id.as_str(), sleep.last_inbound_seq])
                 {
-                    while let Ok(Some(row)) = rows.next() {
-                        let ts: i64 = row.get(0).unwrap_or(0);
-                        let peer: String = row.get(1).unwrap_or_default();
-                        let body: String = row.get(2).unwrap_or_default();
-                        let id: String = row.get(3).unwrap_or_default();
-                        let seq: i64 = row.get(4).unwrap_or_default();
+                    for (ts, peer, body, id, seq) in rows {
                         if let Some(clean) = crate::learned_memory::clean_sleep_turn_text(&body) {
                             raw_turns.push(crate::learned_memory::SleepTurnDelta {
                                 timestamp_ms: ts,
@@ -4769,22 +5428,25 @@ impl Store {
                     }
                 }
                 if max_out_ms > sleep.last_outbound_ms
-                    && let Ok(mut stmt) = conn.prepare(
+                    && let Ok(rows) = conn.db_query_vec(
                         "SELECT sent_at_ms, destination, body, id, seq
                          FROM outbound_messages
                          WHERE agent_id = ?1 AND sent_at_ms > ?2
                          ORDER BY sent_at_ms DESC
                          LIMIT 30",
+                        &db_params![agent.id.as_str(), sleep.last_outbound_ms],
+                        |row| {
+                            Ok((
+                                row.get::<i64>(0).unwrap_or(0),
+                                row.get::<String>(1).unwrap_or_default(),
+                                row.get::<String>(2).unwrap_or_default(),
+                                row.get::<String>(3).unwrap_or_default(),
+                                row.get::<i64>(4).unwrap_or_default(),
+                            ))
+                        },
                     )
-                    && let Ok(mut rows) =
-                        stmt.query(params![agent.id.as_str(), sleep.last_outbound_ms])
                 {
-                    while let Ok(Some(row)) = rows.next() {
-                        let ts: i64 = row.get(0).unwrap_or(0);
-                        let peer: String = row.get(1).unwrap_or_default();
-                        let body: String = row.get(2).unwrap_or_default();
-                        let id: String = row.get(3).unwrap_or_default();
-                        let seq: i64 = row.get(4).unwrap_or_default();
+                    for (ts, peer, body, id, seq) in rows {
                         if let Some(clean) = crate::learned_memory::clean_sleep_turn_text(&body) {
                             raw_turns.push(crate::learned_memory::SleepTurnDelta {
                                 timestamp_ms: ts,
@@ -4964,7 +5626,7 @@ impl Store {
         let conn = self.read_conn();
         // One snapshot: a line committed between reading the cursor and the
         // last sequence must not look like a hole in the mailbox.
-        let snapshot = conn.unchecked_transaction()?;
+        let snapshot = conn.snapshot()?;
         agent_exists(&snapshot, agent_id)?;
         let delivered = cursor(&snapshot, agent_id)?;
         let next = delivered + 1;
@@ -4991,15 +5653,18 @@ impl Store {
         // per-row Rust JSON parse would scan and deserialize every
         // undelivered line on each idle poll, pinning one core per agent
         // (80 agents x 4 polls/s against a multi-GB mailbox).
-        let found: bool = conn
-            .prepare_cached(
+        let not_passive = conn.backend().sql_not_passive_reaction("context");
+        let found: bool = conn.db_query_one(
+            &format!(
                 "SELECT EXISTS(
                    SELECT 1 FROM messages
                    WHERE agent_id = ?1 AND seq > ?2
-                     AND (CASE WHEN json_valid(context) THEN json_extract(context, '$.event') END) IS NOT 'reaction_passive'
-                 )",
-            )?
-            .query_row(params![agent_id.as_str(), delivered], |row| row.get(0))?;
+                     AND {not_passive}
+                 )"
+            ),
+            &db_params![agent_id.as_str(), delivered],
+            |row| row.get(0),
+        )?;
         Ok(found)
     }
 
@@ -5031,9 +5696,9 @@ impl Store {
     #[doc(hidden)]
     pub fn rewind_for_test(&self, agent_id: &AgentId, seq: i64) {
         self.write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "UPDATE mailbox_cursors SET delivered_seq = ?1 WHERE agent_id = ?2",
-                params![seq, agent_id.as_str()],
+                &db_params![seq, agent_id.as_str()],
             )?;
             Ok(())
         })
@@ -5047,11 +5712,11 @@ impl Store {
             bump_delivered(tx, agent_id, seq)?;
             let now = now_ms();
             let prev_seq = (seq - 1).max(0);
-            tx.execute(
+            tx.db_execute(
                 "UPDATE messages SET delivered_at_ms = ?1 WHERE agent_id = ?2 AND seq = ?3",
-                params![now, agent_id.as_str(), seq],
+                &db_params![now, agent_id.as_str(), seq],
             )?;
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO turn_recovery (agent_id, opened_seq, completed_seq, recovery_count, opened_at_ms)
                  VALUES (?1, ?2, ?3, 0, ?4)
                  ON CONFLICT(agent_id) DO UPDATE SET
@@ -5075,7 +5740,7 @@ impl Store {
                      END,
                      opened_seq = excluded.opened_seq,
                      recovery_count = 0",
-                params![agent_id.as_str(), seq, prev_seq, now],
+                &db_params![agent_id.as_str(), seq, prev_seq, now],
             )?;
             Ok(())
         })
@@ -5145,14 +5810,14 @@ impl Store {
     pub fn share_any_group_or_chat(&self, agent_a: &AgentId, agent_b: &AgentId) -> bool {
         let shares_group = {
             let conn = self.read_conn();
-            conn.query_row(
+            conn.db_query_one(
                 "SELECT EXISTS(
                      SELECT 1 FROM group_agents g1
                      JOIN group_agents g2 ON g1.group_name = g2.group_name
                      WHERE g1.agent_id = ?1 AND g2.agent_id = ?2
                  )",
-                params![agent_a.as_str(), agent_b.as_str()],
-                |r| r.get::<_, bool>(0),
+                &db_params![agent_a.as_str(), agent_b.as_str()],
+                |r| r.get::<bool>(0),
             )
             .unwrap_or(false)
         };
@@ -5186,16 +5851,16 @@ impl Store {
     /// message to `to_agent`, allowing `to_agent` to reply back even if `from_agent` is `public: false`.
     pub fn has_messaged(&self, from_agent: &Agent, to_agent: &Agent) -> bool {
         let dest_name = format!("agent:{}", to_agent.name);
-        let conn = self.read_conn();
-        conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM outbound_messages
-                 WHERE agent_id = ?1 AND (destination = ?2 OR destination = ?3)
-             )",
-            params![from_agent.id.as_str(), dest_name, to_agent.id.as_str()],
-            |r| r.get::<_, bool>(0),
-        )
-        .unwrap_or(false)
+        self.read_conn()
+            .db_query_one(
+                "SELECT EXISTS(
+                     SELECT 1 FROM outbound_messages
+                     WHERE agent_id = ?1 AND (destination = ?2 OR destination = ?3)
+                 )",
+                &db_params![from_agent.id.as_str(), dest_name, to_agent.id.as_str()],
+                |r| r.get::<bool>(0),
+            )
+            .unwrap_or(false)
     }
 
     /// Mark the agent's current open turn as completed (`completed_seq = opened_seq`).
@@ -5205,12 +5870,12 @@ impl Store {
             // BEGIN IMMEDIATE: a SELECT-then-UPDATE under BEGIN DEFERRED raises
             // SQLITE_BUSY without honouring busy_timeout when a peer is writing.
             agent_exists(tx, agent_id)?;
-            tx.execute(
+            tx.db_execute(
                 "UPDATE turn_recovery
                  SET completed_seq = opened_seq,
                      recovery_count = 0
                  WHERE agent_id = ?1 AND completed_seq < opened_seq",
-                [agent_id.as_str()],
+                &db_params![agent_id.as_str()],
             )?;
             turn_events::record_terminal(tx, agent_id, "completed")?;
             turn_errors::end_run(tx, agent_id)?;
@@ -5230,18 +5895,18 @@ impl Store {
     ) -> Result<RejectedMessage, Error> {
         let rejected = self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
-            let (message_id, sender): (String, Option<String>) = tx.query_row(
+            let (message_id, sender): (String, Option<String>) = tx.db_query_one(
                 "SELECT id, sender FROM messages WHERE agent_id = ?1 AND seq = ?2",
-                params![agent_id.as_str(), seq],
+                &db_params![agent_id.as_str(), seq],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             bump_delivered(tx, agent_id, seq)?;
             let now = now_ms();
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO rejected_messages (message_id, agent_id, seq, reason, rejected_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(message_id) DO NOTHING",
-                params![message_id, agent_id.as_str(), seq, reason, now],
+                &db_params![message_id, agent_id.as_str(), seq, reason, now],
             )?;
             Ok(RejectedMessage {
                 message_id,
@@ -5287,9 +5952,9 @@ impl Store {
             self.receive(&sender.id, note)?;
         }
         self.write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "UPDATE rejected_messages SET notified_at_ms = ?1 WHERE message_id = ?2",
-                params![now_ms(), rejected.message_id],
+                &db_params![now_ms(), rejected.message_id],
             )?;
             Ok(())
         })
@@ -5313,15 +5978,12 @@ impl Store {
     /// origin, as a new message at the end, and the parked record removed.
     /// Re-queueing the same parking twice adds it once.
     pub fn requeue_rejected(&self, agent_id: &AgentId, message_id: &str) -> Result<Message, Error> {
-        let rejected_at_ms: Option<i64> = self
-            .read_conn()
-            .query_row(
-                "SELECT rejected_at_ms FROM rejected_messages
-                 WHERE agent_id = ?1 AND message_id = ?2",
-                params![agent_id.as_str(), message_id],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let rejected_at_ms: Option<i64> = self.read_conn().db_query_opt(
+            "SELECT rejected_at_ms FROM rejected_messages
+             WHERE agent_id = ?1 AND message_id = ?2",
+            &db_params![agent_id.as_str(), message_id],
+            |row| row.get(0),
+        )?;
         let Some(rejected_at_ms) = rejected_at_ms else {
             return Err(Error::Message(format!(
                 "{message_id} is not a parked message of this agent"
@@ -5344,9 +6006,9 @@ impl Store {
             ReceiveOutcome::New(message) | ReceiveOutcome::Duplicate(message) => message,
         };
         self.write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "DELETE FROM rejected_messages WHERE agent_id = ?1 AND message_id = ?2",
-                params![agent_id.as_str(), message_id],
+                &db_params![agent_id.as_str(), message_id],
             )?;
             Ok(())
         })?;
@@ -5355,14 +6017,12 @@ impl Store {
 
     /// Messages the harness refused for good, oldest first.
     pub fn rejected_messages(&self, agent_id: &AgentId) -> Result<Vec<RejectedMessage>, Error> {
-        let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached(
+        self.read_conn().db_query_vec(
             "SELECT r.message_id, r.seq, m.sender, r.reason, r.rejected_at_ms, r.notified_at_ms
              FROM rejected_messages r LEFT JOIN messages m ON m.id = r.message_id
              WHERE r.agent_id = ?1 ORDER BY r.seq",
-        )?;
-        let rows = stmt
-            .query_map([agent_id.as_str()], |row| {
+            &db_params![agent_id.as_str()],
+            |row| {
                 Ok(RejectedMessage {
                     message_id: row.get(0)?,
                     agent_id: agent_id.clone(),
@@ -5372,19 +6032,18 @@ impl Store {
                     rejected_at_ms: row.get(4)?,
                     notified_at_ms: row.get(5)?,
                 })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+            },
+        )
     }
 
     pub fn note_turn_recovered(&self, agent_id: &AgentId, opened_seq: i64) -> Result<(), Error> {
         self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
-            tx.execute(
+            tx.db_execute(
                 "UPDATE turn_recovery
                  SET recovery_count = recovery_count + 1
                  WHERE agent_id = ?1 AND opened_seq = ?2",
-                params![agent_id.as_str(), opened_seq],
+                &db_params![agent_id.as_str(), opened_seq],
             )?;
             Ok(())
         })
@@ -5393,12 +6052,11 @@ impl Store {
     /// Return `true` when the agent currently has an open turn (`opened_seq > completed_seq`).
     pub fn has_open_turn(&self, agent_id: &AgentId) -> Result<bool, Error> {
         let conn = self.read_conn();
-        let row: Option<(i64, i64)> = conn
-            .prepare_cached(
-                "SELECT opened_seq, completed_seq FROM turn_recovery WHERE agent_id = ?1",
-            )?
-            .query_row([agent_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()?;
+        let row: Option<(i64, i64)> = conn.db_query_opt(
+            "SELECT opened_seq, completed_seq FROM turn_recovery WHERE agent_id = ?1",
+            &db_params![agent_id.as_str()],
+            |r| Ok((r.get::<i64>(0)?, r.get::<i64>(1)?)),
+        )?;
         Ok(row.is_some_and(|(opened_seq, completed_seq)| opened_seq > completed_seq))
     }
 
@@ -5407,15 +6065,19 @@ impl Store {
     pub fn open_turn(&self, agent_id: &AgentId) -> Result<Option<OpenTurn>, Error> {
         let conn = self.read_conn();
         agent_exists(&conn, agent_id)?;
-        let row: Option<(i64, i64, i64, i64)> = conn
-            .prepare_cached(
-                "SELECT opened_seq, completed_seq, recovery_count, opened_at_ms
-                 FROM turn_recovery WHERE agent_id = ?1",
-            )?
-            .query_row([agent_id.as_str()], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
-            .optional()?;
+        let row: Option<(i64, i64, i64, i64)> = conn.db_query_opt(
+            "SELECT opened_seq, completed_seq, recovery_count, opened_at_ms
+             FROM turn_recovery WHERE agent_id = ?1",
+            &db_params![agent_id.as_str()],
+            |r| {
+                Ok((
+                    r.get::<i64>(0)?,
+                    r.get::<i64>(1)?,
+                    r.get::<i64>(2)?,
+                    r.get::<i64>(3)?,
+                ))
+            },
+        )?;
         let Some((opened_seq, completed_seq, recovery_count, opened_at_ms)) = row else {
             return Ok(None);
         };
@@ -5423,40 +6085,38 @@ impl Store {
             return Ok(None);
         }
         let delivered = cursor(&conn, agent_id)?;
-        let mut msg_stmt = conn.prepare_cached(concat!(
-            "SELECT ",
-            message_cols!(),
-            " FROM messages
-             WHERE agent_id = ?1 AND seq > ?2 AND seq <= ?3
-               AND id NOT IN (SELECT message_id FROM rejected_messages WHERE agent_id = ?1)
-             ORDER BY seq ASC"
-        ))?;
         // A message the harness refused for good was never in any turn.
-        let mut msg_rows = msg_stmt.query(params![agent_id.as_str(), completed_seq, opened_seq])?;
-        let mut messages = Vec::new();
-        while let Some(r) = msg_rows.next()? {
-            messages.push(message_from_row_with_cursor(r, delivered)?);
-        }
+        let messages = conn.db_query_vec(
+            concat!(
+                "SELECT ",
+                message_cols!(),
+                " FROM messages
+                 WHERE agent_id = ?1 AND seq > ?2 AND seq <= ?3
+                   AND id NOT IN (SELECT message_id FROM rejected_messages WHERE agent_id = ?1)
+                 ORDER BY seq ASC"
+            ),
+            &db_params![agent_id.as_str(), completed_seq, opened_seq],
+            |r| message_from_row_with_cursor_db(r, delivered),
+        )?;
         if messages.is_empty() {
             return Ok(None);
         }
-        let mut out_stmt = conn.prepare_cached(
+        let completed_outbounds = conn.db_query_vec(
             "SELECT id, destination, reply_to, body, sent_at_ms
              FROM outbound_messages
              WHERE agent_id = ?1 AND sent_at_ms >= ?2
              ORDER BY sent_at_ms ASC, id ASC",
+            &db_params![agent_id.as_str(), opened_at_ms],
+            |r| {
+                Ok(OutboundEffect {
+                    id: r.get(0)?,
+                    destination: r.get(1)?,
+                    reply_to: r.get(2)?,
+                    body: r.get(3)?,
+                    sent_at_ms: r.get(4)?,
+                })
+            },
         )?;
-        let mut out_rows = out_stmt.query(params![agent_id.as_str(), opened_at_ms])?;
-        let mut completed_outbounds = Vec::new();
-        while let Some(r) = out_rows.next()? {
-            completed_outbounds.push(OutboundEffect {
-                id: r.get(0)?,
-                destination: r.get(1)?,
-                reply_to: r.get(2)?,
-                body: r.get(3)?,
-                sent_at_ms: r.get(4)?,
-            });
-        }
         Ok(Some(OpenTurn {
             agent_id: agent_id.clone(),
             opened_seq,
@@ -5471,20 +6131,18 @@ impl Store {
     pub fn message(&self, agent_id: &AgentId, id: &str) -> Result<Option<Message>, Error> {
         let conn = self.read_conn();
         agent_exists(&conn, agent_id)?;
-        let found = conn
-            .prepare_cached(concat!(
+        let delivered = cursor(&conn, agent_id)?;
+        conn.db_query_opt(
+            concat!(
                 "SELECT ",
                 message_cols!(),
                 " FROM messages WHERE agent_id = ?1 AND id = ?2"
-            ))?
-            .query_row(params![agent_id.as_str(), id], |row| {
-                Ok(message_from_row(&conn, row))
-            })
-            .optional()?;
-        found.transpose()
+            ),
+            &db_params![agent_id.as_str(), id],
+            |row| message_from_row_with_cursor_db(row, delivered),
+        )
     }
 
-    /// Age of the oldest message the harness has not taken.
     /// Age of the oldest message the harness has not taken.
     pub fn lag(&self, agent_id: &AgentId, now_ms: i64) -> Result<Lag, Error> {
         let delivered = self.delivered_cursor(agent_id)?;
@@ -5514,13 +6172,13 @@ impl Store {
         // second row for the same usage.
         self.write_tx(|tx| {
             agent_exists(tx, &record.agent_id)?;
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO usage_records (
                     id, agent_id, harness, model, input_tokens, output_tokens,
                     cache_read_tokens, cache_write_tokens, reported_cost_micros,
                     estimated_cost_micros, billing_mode, quota_state, day, recorded_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                params![
+                &db_params![
                     record.id.as_str(),
                     record.agent_id.as_str(),
                     record.harness,
@@ -5544,70 +6202,70 @@ impl Store {
 
     pub fn list_usage(&self, agent_id: Option<&AgentId>) -> Result<Vec<UsageRecord>, Error> {
         let conn = self.read_conn();
-        let sql = match agent_id {
+        let (sql, params) = match agent_id {
             Some(id) => {
                 agent_exists(&conn, id)?;
+                (
+                    "SELECT id, agent_id, harness, model, input_tokens, output_tokens,
+                            cache_read_tokens, cache_write_tokens, reported_cost_micros,
+                            estimated_cost_micros, billing_mode, quota_state, day, recorded_at_ms
+                     FROM usage_records WHERE agent_id = ?1 ORDER BY recorded_at_ms, id",
+                    db_params![id.as_str()],
+                )
+            }
+            None => (
                 "SELECT id, agent_id, harness, model, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, reported_cost_micros,
                         estimated_cost_micros, billing_mode, quota_state, day, recorded_at_ms
-                 FROM usage_records WHERE agent_id = ?1 ORDER BY recorded_at_ms, id"
-            }
-            None => {
-                "SELECT id, agent_id, harness, model, input_tokens, output_tokens,
-                        cache_read_tokens, cache_write_tokens, reported_cost_micros,
-                        estimated_cost_micros, billing_mode, quota_state, day, recorded_at_ms
-                 FROM usage_records ORDER BY recorded_at_ms, id"
-            }
+                 FROM usage_records ORDER BY recorded_at_ms, id",
+                Vec::new(),
+            ),
         };
-        let mut stmt = conn.prepare(sql)?;
-        let mut rows = match agent_id {
-            Some(id) => stmt.query(params![id.as_str()])?,
-            None => stmt.query([])?,
-        };
-        let mut records = Vec::new();
-        while let Some(row) = rows.next()? {
-            records.push(usage_from_row(row)?);
-        }
-        Ok(records)
+        conn.db_query_vec(sql, &params, usage_from_row_db)
     }
 
     fn age_at(&self, agent_id: &AgentId, seq: i64, now_ms: i64) -> Result<Option<i64>, Error> {
         let conn = self.read_conn();
         // Server-side filter: per-row JSON parse here pins a core per agent
         // on every health publish; see `has_actionable_undelivered`.
-        let received_at: Option<i64> = conn
-            .prepare_cached(
-                "SELECT received_at_ms FROM messages
-                 WHERE agent_id = ?1 AND seq >= ?2
-                   AND (CASE WHEN json_valid(context) THEN json_extract(context, '$.event') END) IS NOT 'reaction_passive'
-                 ORDER BY seq ASC LIMIT 1",
-            )?
-            .query_row(params![agent_id.as_str(), seq], |row| row.get(0))
-            .optional()?;
+        let not_passive = conn.backend().sql_not_passive_reaction("context");
+        let sql = format!(
+            "SELECT received_at_ms FROM messages
+             WHERE agent_id = ?1 AND seq >= ?2 AND {not_passive}
+             ORDER BY seq ASC LIMIT 1"
+        );
+        let received_at: Option<i64> =
+            conn.db_query_opt(&sql, &db_params![agent_id.as_str(), seq], |row| row.get(0))?;
         Ok(received_at.map(|at| (now_ms - at).max(0)))
     }
 
     /// The process's one read-write connection to this database. Use it only
     /// to write: reads go through [`Store::read_conn`] and never wait here.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn conn(&self) -> registry::WriterGuard<'_> {
-        self.shared.writer()
+        self.sqlite_shared().writer()
     }
 
     /// A read-only connection from the shared pool. Each statement outside an
     /// explicit transaction reads the latest commit, including this process's
     /// own writes. Falls back to the writer only when no reader can be opened.
     pub(crate) fn read_conn(&self) -> ReadConn<'_> {
-        if let Some(reader) = self.shared.reader() {
-            return reader;
+        match &self.backend {
+            registry::Backend::Sqlite(shared) => {
+                if let Some(reader) = shared.reader() {
+                    return reader;
+                }
+                // Empty-path databases cannot share a reader. If a file-backed reader
+                // cannot open, use the authoritative connection rather than fabricate
+                // an empty database that could turn a failed read into missing state.
+                // The writer never keeps the index attached (a write transaction
+                // would lock both files); it has it only for this read.
+                let writer = shared.writer();
+                let attached = attach_memory_index(&writer, self.database_path()).is_ok();
+                ReadConn::Guard(writer, attached)
+            }
+            registry::Backend::Postgres(pg) => ReadConn::Postgres(pg.handle.pool.clone()),
         }
-        // Empty-path databases cannot share a reader. If a file-backed reader
-        // cannot open, use the authoritative connection rather than fabricate
-        // an empty database that could turn a failed read into missing state.
-        // The writer never keeps the index attached (a write transaction
-        // would lock both files); it has it only for this read.
-        let writer = self.conn();
-        let attached = attach_memory_index(&writer, self.database_path()).is_ok();
-        ReadConn::Guard(writer, attached)
     }
 
     pub fn create_schedule(&self, input: NewSchedule) -> Result<AgentSchedule, Error> {
@@ -5627,21 +6285,19 @@ impl Store {
             }
             // Deduplicate identical active recurring/watch schedules for the same agent.
             if (input.kind == "every" || input.kind == "watch")
-                && let Some(existing_id) = tx
-                    .query_row(
-                        "SELECT id FROM agent_schedules
-                         WHERE agent_id = ?1 AND kind = ?2 AND spec = ?3 AND prompt = ?4 AND state = 'active'
-                         LIMIT 1",
-                        params![input.agent_id.as_str(), input.kind, input.spec, input.prompt],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?
+                && let Some(existing_id) = tx.db_query_opt(
+                    "SELECT id FROM agent_schedules
+                     WHERE agent_id = ?1 AND kind = ?2 AND spec = ?3 AND prompt = ?4 AND state = 'active'
+                     LIMIT 1",
+                    &db_params![input.agent_id.as_str(), input.kind, input.spec, input.prompt],
+                    |row| row.get::<String>(0),
+                )?
             {
-                tx.execute(
+                tx.db_execute(
                     "UPDATE agent_schedules
                      SET interval_ms = ?2, next_fire_at_ms = ?3, watch_baseline = COALESCE(?4, watch_baseline)
                      WHERE id = ?1",
-                    params![
+                    &db_params![
                         existing_id,
                         input.interval_ms,
                         input.next_fire_at_ms,
@@ -5650,12 +6306,12 @@ impl Store {
                 )?;
                 return schedule_by_id(tx, &existing_id);
             }
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO agent_schedules (
                     id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
                     last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, 'active', ?9)",
-                params![
+                &db_params![
                     id,
                     input.agent_id.as_str(),
                     input.kind,
@@ -5677,69 +6333,57 @@ impl Store {
         active_only: bool,
     ) -> Result<Vec<AgentSchedule>, Error> {
         let conn = self.read_conn();
-        let mut out = Vec::new();
-        match (agent_id, active_only) {
-            (Some(aid), true) => {
-                let mut stmt = conn.prepare_cached(concat!(
+        let (sql, params) = match (agent_id, active_only) {
+            (Some(aid), true) => (
+                concat!(
                     "SELECT ",
                     schedule_cols!(),
                     " FROM agent_schedules WHERE agent_id = ?1 AND state = 'active'
                      ORDER BY created_at_ms ASC, id ASC"
-                ))?;
-                let rows = stmt.query_map([aid.as_str()], schedule_from_row)?;
-                for row in rows {
-                    out.push(row?);
-                }
-            }
-            (Some(aid), false) => {
-                let mut stmt = conn.prepare_cached(concat!(
+                ),
+                db_params![aid.as_str()],
+            ),
+            (Some(aid), false) => (
+                concat!(
                     "SELECT ",
                     schedule_cols!(),
                     " FROM agent_schedules WHERE agent_id = ?1
                      ORDER BY created_at_ms ASC, id ASC"
-                ))?;
-                let rows = stmt.query_map([aid.as_str()], schedule_from_row)?;
-                for row in rows {
-                    out.push(row?);
-                }
-            }
-            (None, true) => {
-                let mut stmt = conn.prepare_cached(concat!(
+                ),
+                db_params![aid.as_str()],
+            ),
+            (None, true) => (
+                concat!(
                     "SELECT ",
                     schedule_cols!(),
                     " FROM agent_schedules WHERE state = 'active'
                      ORDER BY created_at_ms ASC, id ASC"
-                ))?;
-                let rows = stmt.query_map([], schedule_from_row)?;
-                for row in rows {
-                    out.push(row?);
-                }
-            }
-            (None, false) => {
-                let mut stmt = conn.prepare_cached(concat!(
+                ),
+                Vec::new(),
+            ),
+            (None, false) => (
+                concat!(
                     "SELECT ",
                     schedule_cols!(),
                     " FROM agent_schedules ORDER BY created_at_ms ASC, id ASC"
-                ))?;
-                let rows = stmt.query_map([], schedule_from_row)?;
-                for row in rows {
-                    out.push(row?);
-                }
-            }
-        }
-        Ok(out)
+                ),
+                Vec::new(),
+            ),
+        };
+        conn.db_query_vec(sql, &params, schedule_from_row_db)
     }
 
     pub fn get_schedule(&self, id: &str) -> Result<Option<AgentSchedule>, Error> {
         let conn = self.read_conn();
-        conn.prepare_cached(concat!(
-            "SELECT ",
-            schedule_cols!(),
-            " FROM agent_schedules WHERE id = ?1"
-        ))?
-        .query_row([id.trim()], schedule_from_row)
-        .optional()
-        .map_err(Error::from)
+        conn.db_query_opt(
+            concat!(
+                "SELECT ",
+                schedule_cols!(),
+                " FROM agent_schedules WHERE id = ?1"
+            ),
+            &db_params![id.trim()],
+            schedule_from_row_db,
+        )
     }
 
     pub fn cancel_schedule(
@@ -5751,32 +6395,32 @@ impl Store {
         self.write_tx(|tx| {
             let count = if target.eq_ignore_ascii_case("all") || target == "*" {
                 match agent_id {
-                    Some(aid) => tx.execute(
+                    Some(aid) => tx.db_execute(
                         "UPDATE agent_schedules
                          SET state = 'cancelled', next_fire_at_ms = NULL
                          WHERE agent_id = ?1 AND state = 'active'",
-                        [aid.as_str()],
+                        &db_params![aid.as_str()],
                     )?,
-                    None => tx.execute(
+                    None => tx.db_execute(
                         "UPDATE agent_schedules
                          SET state = 'cancelled', next_fire_at_ms = NULL
                          WHERE state = 'active'",
-                        [],
+                        &[],
                     )?,
                 }
             } else {
                 match agent_id {
-                    Some(aid) => tx.execute(
+                    Some(aid) => tx.db_execute(
                         "UPDATE agent_schedules
                          SET state = 'cancelled', next_fire_at_ms = NULL
                          WHERE id = ?1 AND agent_id = ?2 AND state = 'active'",
-                        params![target, aid.as_str()],
+                        &db_params![target, aid.as_str()],
                     )?,
-                    None => tx.execute(
+                    None => tx.db_execute(
                         "UPDATE agent_schedules
                          SET state = 'cancelled', next_fire_at_ms = NULL
                          WHERE id = ?1 AND state = 'active'",
-                        [target],
+                        &db_params![target],
                     )?,
                 }
             };
@@ -5828,10 +6472,10 @@ impl Store {
         incoming: Incoming,
     ) -> Result<bool, Error> {
         let outcome = self.receive_with_admission(agent_id, incoming, true, |conn| {
-            let eligible: bool = conn.query_row(
+            let eligible: bool = conn.db_query_one(
                 "SELECT EXISTS(SELECT 1 FROM agent_schedules s JOIN agents a ON a.id=s.agent_id
                  WHERE s.id=?1 AND s.agent_id=?2 AND a.state <> 'archived')",
-                params![id, agent_id.as_str()],
+                &db_params![id, agent_id.as_str()],
                 |r| r.get(0),
             )?;
             if !eligible {
@@ -5860,22 +6504,21 @@ impl Store {
     ) -> Result<bool, Error> {
         let conn = self.read_conn();
         let delivered = cursor(&conn, agent_id)?;
-        let found: bool = conn.query_row(
+        conn.db_query_one(
             "SELECT EXISTS(
                SELECT 1 FROM messages
                WHERE agent_id = ?1 AND seq > ?2 AND sender = ?3
              )",
-            params![agent_id.as_str(), delivered, sender],
+            &db_params![agent_id.as_str(), delivered, sender],
             |row| row.get(0),
-        )?;
-        Ok(found)
+        )
     }
 
     /// Reopen GitHub PR watches that an earlier release retired when checks
     /// completed, so they keep watching until the PR is merged or closed.
     pub fn restore_checks_completed_pr_watches(&self) -> Result<usize, Error> {
         self.write_tx(|tx| {
-            let updated = tx.execute(
+            let updated = tx.db_execute(
                 "UPDATE agent_schedules
                  SET state = 'active',
                      watch_baseline = 'checks_completed'
@@ -5897,7 +6540,7 @@ impl Store {
                          AND active_s.spec = agent_schedules.spec
                          AND active_s.state = 'active'
                    )",
-                [],
+                &[],
             )?;
             Ok(updated)
         })
@@ -5912,14 +6555,11 @@ impl Store {
         // Coalesce unchanged observations: a schedule pass would otherwise
         // write a WAL frame per watch even when both fields already hold
         // those values. The reader decides; only a change takes the writer.
-        let cur: Option<(Option<String>, Option<String>)> = self
-            .read_conn()
-            .query_row(
-                "SELECT watch_baseline, last_observed FROM agent_schedules WHERE id = ?1 AND state = 'active'",
-                [id],
-                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
-            )
-            .optional()?;
+        let cur: Option<(Option<String>, Option<String>)> = self.read_conn().db_query_opt(
+            "SELECT watch_baseline, last_observed FROM agent_schedules WHERE id = ?1 AND state = 'active'",
+            &db_params![id],
+            |r| Ok((r.get::<Option<String>>(0)?, r.get::<Option<String>>(1)?)),
+        )?;
         let (cur_baseline, cur_observed) = match cur {
             Some(v) => v,
             None => return Ok(()),
@@ -5936,41 +6576,33 @@ impl Store {
             return Ok(());
         }
         self.write_tx(|tx| {
-            tx.execute(
+            tx.db_execute(
                 "UPDATE agent_schedules
                  SET watch_baseline = COALESCE(?2, watch_baseline),
                      last_observed = COALESCE(?3, last_observed)
                  WHERE id = ?1 AND state = 'active'",
-                params![id, watch_baseline, last_observed],
+                &db_params![id, watch_baseline, last_observed],
             )?;
             Ok(())
         })
     }
 }
 
-fn schedule_by_id(conn: &Connection, id: &str) -> Result<AgentSchedule, Error> {
-    conn.prepare_cached(concat!(
-        "SELECT ",
-        schedule_cols!(),
-        " FROM agent_schedules WHERE id = ?1"
-    ))?
-    .query_row([id], schedule_from_row)
-    .optional()?
-    .ok_or_else(|| Error::Message(format!("schedule not found: {id}")))
+fn schedule_by_id(conn: &dyn DbExec, id: &str) -> Result<AgentSchedule, Error> {
+    let found = conn.db_query_opt(
+        concat!(
+            "SELECT ",
+            schedule_cols!(),
+            " FROM agent_schedules WHERE id = ?1"
+        ),
+        &db_params![id],
+        schedule_from_row_db,
+    )?;
+    found.ok_or_else(|| Error::Message(format!("schedule not found: {id}")))
 }
 
-fn schedule_from_row(row: &rusqlite::Row<'_>) -> Result<AgentSchedule, rusqlite::Error> {
-    let raw_aid: String = row.get(1)?;
-    let agent_id = AgentId::parse(&raw_aid).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(
-            1,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                err.to_string(),
-            )),
-        )
-    })?;
+fn schedule_from_row_db(row: &DbRow<'_>) -> Result<AgentSchedule, Error> {
+    let agent_id = row.parse_str(1)?;
     Ok(AgentSchedule {
         id: row.get(0)?,
         agent_id,
@@ -6013,6 +6645,11 @@ pub fn agent_lock_path(data_dir: &Path, id: &AgentId) -> PathBuf {
 }
 
 fn open_roster_conn(data_dir: &Path) -> Option<ReadConn<'static>> {
+    if let Some(url) = crate::db::configured_database_url_for_data_dir(data_dir) {
+        return crate::db::shared_pg_handle(&url)
+            .ok()
+            .map(|h| ReadConn::Postgres(h.pool));
+    }
     let db_path = data_dir.join("state.db");
     if !db_path.is_file() {
         return None;
@@ -6053,7 +6690,7 @@ fn roster_entry(
 }
 
 /// Reads the active root agent roster `(name, role, public_description)` from
-/// `{data}/state.db` read-only when present, without creating or locking the database.
+/// `{data}/state.db` or PostgreSQL read-only when present, without creating or locking the database.
 pub fn read_root_roster(data_dir: &Path) -> Vec<(String, Option<String>, Option<String>)> {
     let Some(conn) = open_roster_conn(data_dir) else {
         return Vec::new();
@@ -6063,24 +6700,34 @@ pub fn read_root_roster(data_dir: &Path) -> Vec<(String, Option<String>, Option<
          WHERE parent_id IS NULL AND state = 'running'
          ORDER BY name ASC";
     let mut roster = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(query_with_desc)
-        && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })
-    {
-        for (name, role, description, instructions) in rows.flatten() {
+    if let Ok(rows) = conn.db_query_vec(query_with_desc, &[], |row| {
+        Ok((
+            row.get::<String>(0)?,
+            row.get::<Option<String>>(1)?,
+            row.get::<Option<String>>(2)?,
+            row.get::<Option<String>>(3)?,
+        ))
+    }) {
+        for (name, role, description, instructions) in rows {
             roster.push(roster_entry(name, role, description, instructions));
         }
         return roster;
     }
-    if let Ok(mut stmt) = conn.prepare(
+    if let Ok(rows) = conn.db_query_vec(
         "SELECT name, role, instructions
          FROM agents
          WHERE parent_id IS NULL AND state = 'running'
          ORDER BY name ASC",
-    ) && let Ok(rows) = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-    {
-        for (name, role, instructions) in rows.flatten() {
+        &[],
+        |row| {
+            Ok((
+                row.get::<String>(0)?,
+                row.get::<Option<String>>(1)?,
+                row.get::<Option<String>>(2)?,
+            ))
+        },
+    ) {
+        for (name, role, instructions) in rows {
             roster.push(roster_entry(name, role, None, instructions));
         }
     }
@@ -6088,7 +6735,7 @@ pub fn read_root_roster(data_dir: &Path) -> Vec<(String, Option<String>, Option<
 }
 
 /// Reads the active direct child sub-agents `(name, role, public_description)` for `parent_id`
-/// from `{data}/state.db` read-only, regardless of role label.
+/// from `{data}/state.db` or PostgreSQL read-only, regardless of role label.
 pub fn read_children_roster(
     data_dir: &Path,
     parent_id: &str,
@@ -6101,12 +6748,15 @@ pub fn read_children_roster(
          WHERE parent_id = ?1 AND state != 'archived'
          ORDER BY name ASC";
     let mut roster = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(query)
-        && let Ok(rows) = stmt.query_map([parent_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })
-    {
-        for (name, role, description, instructions) in rows.flatten() {
+    if let Ok(rows) = conn.db_query_vec(query, &db_params![parent_id], |row| {
+        Ok((
+            row.get::<String>(0)?,
+            row.get::<Option<String>>(1)?,
+            row.get::<Option<String>>(2)?,
+            row.get::<Option<String>>(3)?,
+        ))
+    }) {
+        for (name, role, description, instructions) in rows {
             roster.push(roster_entry(name, role, description, instructions));
         }
     }
@@ -6569,14 +7219,12 @@ fn validate_token(value: &str, what: &str) -> Result<(), Error> {
     }
 }
 
-fn channel_with(conn: &Connection, id: &ChannelId) -> Result<Channel, Error> {
-    let found = conn
-        .query_row(
-            "SELECT id, kind, identity, config, credential_ref, created_at_ms, state FROM channels WHERE id = ?1",
-            [id.as_str()],
-            channel_from_row,
-        )
-        .optional()?;
+pub(super) fn channel_with(conn: &dyn DbExec, id: &ChannelId) -> Result<Channel, Error> {
+    let found = conn.db_query_opt(
+        "SELECT id, kind, identity, config, credential_ref, created_at_ms, state FROM channels WHERE id = ?1",
+        &db_params![id.as_str()],
+        channel_from_row_db,
+    )?;
     found.ok_or_else(|| Error::ChannelNotFound(id.to_string()))
 }
 
@@ -6594,25 +7242,23 @@ fn legacy_last_error(data_dir: &Path, id: &AgentId) -> Option<String> {
         .map(str::to_string)
 }
 
-fn agent_by_id(conn: &Connection, id: &AgentId) -> Result<Agent, Error> {
-    let found = conn
-        .prepare_cached(concat!(
-            "SELECT ",
-            agent_cols!(),
-            " FROM agents WHERE id = ?1"
-        ))?
-        .query_row([id.as_str()], agent_from_row)
-        .optional()?;
+pub(super) fn agent_by_id(conn: &dyn DbExec, id: &AgentId) -> Result<Agent, Error> {
+    let found = conn.db_query_opt(
+        concat!("SELECT ", agent_cols!(), " FROM agents WHERE id = ?1"),
+        &db_params![id.as_str()],
+        agent_from_row_db,
+    )?;
     found.ok_or_else(|| Error::AgentNotFound(id.to_string()))
 }
 
 /// `Ok` when the agent exists, else [`Error::AgentNotFound`]: the guard most
 /// mailbox and turn operations need, without reading or decoding the row.
-fn agent_exists(conn: &Connection, id: &AgentId) -> Result<(), Error> {
-    let found = conn
-        .prepare_cached("SELECT 1 FROM agents WHERE id = ?1")?
-        .query_row([id.as_str()], |_| Ok(()))
-        .optional()?;
+pub(super) fn agent_exists(conn: &dyn DbExec, id: &AgentId) -> Result<(), Error> {
+    let found = conn.db_query_opt(
+        "SELECT 1 FROM agents WHERE id = ?1",
+        &db_params![id.as_str()],
+        |_| Ok(()),
+    )?;
     found.ok_or_else(|| Error::AgentNotFound(id.to_string()))
 }
 
@@ -6742,15 +7388,10 @@ fn read_string(bytes: &[u8], at: usize) -> Option<(String, usize)> {
     None
 }
 
-fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
-    let id: String = row.get(0)?;
-    let agent_id = AgentId::parse(&id)
-        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
-    let parent_id = match row.get::<_, Option<String>>(9)? {
-        Some(raw) if !raw.is_empty() => Some(
-            AgentId::parse(&raw)
-                .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
-        ),
+pub(super) fn agent_from_row_db(row: &DbRow<'_>) -> Result<Agent, Error> {
+    let agent_id = row.parse_str(0)?;
+    let parent_id = match row.get::<Option<String>>(9)? {
+        Some(raw) if !raw.is_empty() => Some(AgentId::parse(&raw)?),
         _ => None,
     };
     Ok(Agent {
@@ -6766,31 +7407,22 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
         state: row.get(6)?,
         created_at_ms: row.get(7)?,
         launch_env: row
-            .get::<_, Option<String>>(8)?
+            .get::<Option<String>>(8)?
             .map(|json| decode_env(&json))
             .unwrap_or_default(),
         parent_id,
     })
 }
 
-fn agent_summary_from_row(row: &rusqlite::Row<'_>) -> Result<AgentSummary, rusqlite::Error> {
-    let parse = |index: usize, raw: &str| {
-        AgentId::parse(raw).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                index,
-                rusqlite::types::Type::Text,
-                Box::new(err),
-            )
-        })
-    };
+pub(super) fn agent_summary_from_row_db(row: &DbRow<'_>) -> Result<AgentSummary, Error> {
     Ok(AgentSummary {
-        id: parse(0, &row.get::<_, String>(0)?)?,
+        id: row.parse_str(0)?,
         name: row.get(1)?,
         harness: row.get(2)?,
         model: row.get(3)?,
         state: row.get(4)?,
-        parent_id: match row.get::<_, Option<String>>(5)? {
-            Some(raw) if !raw.is_empty() => Some(parse(5, &raw)?),
+        parent_id: match row.get::<Option<String>>(5)? {
+            Some(raw) if !raw.is_empty() => Some(AgentId::parse(&raw)?),
             _ => None,
         },
         role: row.get(6)?,
@@ -6799,11 +7431,9 @@ fn agent_summary_from_row(row: &rusqlite::Row<'_>) -> Result<AgentSummary, rusql
     })
 }
 
-fn channel_from_row(row: &rusqlite::Row<'_>) -> Result<Channel, rusqlite::Error> {
-    let id: String = row.get(0)?;
+pub(super) fn channel_from_row_db(row: &DbRow<'_>) -> Result<Channel, Error> {
     Ok(Channel {
-        id: ChannelId::parse(&id)
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+        id: row.parse_str(0)?,
         kind: row.get(1)?,
         identity: row.get(2)?,
         config: row.get(3)?,
@@ -6814,27 +7444,20 @@ fn channel_from_row(row: &rusqlite::Row<'_>) -> Result<Channel, rusqlite::Error>
     })
 }
 
-fn agents_of(conn: &Connection, channel: &ChannelId) -> Result<Vec<AgentId>, Error> {
-    let mut stmt = conn
-        .prepare("SELECT agent_id FROM channel_agents WHERE channel_id = ?1 ORDER BY agent_id")?;
-    let ids = stmt.query_map([channel.as_str()], |row| {
-        let raw: String = row.get(0)?;
-        Ok(raw)
-    })?;
-    let mut agents = Vec::new();
-    for id in ids {
-        agents.push(AgentId::parse(&id?)?);
-    }
-    Ok(agents)
+pub(super) fn agents_of(conn: &dyn DbExec, channel: &ChannelId) -> Result<Vec<AgentId>, Error> {
+    let raw_ids = conn.db_query_vec(
+        "SELECT agent_id FROM channel_agents WHERE channel_id = ?1 ORDER BY agent_id",
+        &db_params![channel.as_str()],
+        |row| row.get::<String>(0),
+    )?;
+    raw_ids.iter().map(|id| AgentId::parse(id)).collect()
 }
 
-fn usage_from_row(row: &rusqlite::Row<'_>) -> Result<UsageRecord, Error> {
-    let id: String = row.get(0)?;
-    let agent_id: String = row.get(1)?;
+fn usage_from_row_db(row: &DbRow<'_>) -> Result<UsageRecord, Error> {
     let billing: String = row.get(10)?;
     Ok(UsageRecord {
-        id: UsageId::parse(&id)?,
-        agent_id: AgentId::parse(&agent_id)?,
+        id: row.parse_str(0)?,
+        agent_id: row.parse_str(1)?,
         harness: row.get(2)?,
         model: row.get(3)?,
         input_tokens: row.get(4)?,
@@ -6850,18 +7473,14 @@ fn usage_from_row(row: &rusqlite::Row<'_>) -> Result<UsageRecord, Error> {
     })
 }
 
-fn message_from_row(conn: &Connection, row: &rusqlite::Row<'_>) -> Result<Message, Error> {
-    let agent_id = AgentId::parse(&row.get::<_, String>(1)?)?;
-    let delivered = cursor(conn, &agent_id)?;
-    message_from_row_with_cursor(row, delivered)
-}
-
-fn message_from_row_with_cursor(row: &rusqlite::Row<'_>, delivered: i64) -> Result<Message, Error> {
-    let id: String = row.get(0)?;
-    let agent_id = AgentId::parse(&row.get::<_, String>(1)?)?;
+pub(super) fn message_from_row_with_cursor_db(
+    row: &DbRow<'_>,
+    delivered: i64,
+) -> Result<Message, Error> {
+    let agent_id = row.parse_str(1)?;
     let seq: i64 = row.get(2)?;
     Ok(Message {
-        id: MessageId::parse(&id)?,
+        id: row.parse_str(0)?,
         agent_id,
         seq,
         source_time_ms: row.get(3)?,
@@ -6877,10 +7496,10 @@ fn message_from_row_with_cursor(row: &rusqlite::Row<'_>, delivered: i64) -> Resu
         },
         delivered_at_ms: row.get(9)?,
         origin: row
-            .get::<_, Option<String>>(10)?
+            .get::<Option<String>>(10)?
             .and_then(|text| serde_json::from_str(&text).ok()),
         context: row
-            .get::<_, Option<String>>(11)?
+            .get::<Option<String>>(11)?
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default(),
     })
@@ -7025,7 +7644,7 @@ fn classify_chunk_kind_and_tool(
 
 #[allow(clippy::too_many_arguments)]
 fn claim_schedule_tick_on(
-    conn: &Connection,
+    conn: &dyn DbExec,
     id: &str,
     expected_next_fire_at_ms: Option<i64>,
     new_state: &str,
@@ -7035,7 +7654,7 @@ fn claim_schedule_tick_on(
     last_observed: Option<&str>,
 ) -> Result<bool, Error> {
     let updated = match expected_next_fire_at_ms {
-        Some(expected) => conn.execute(
+        Some(expected) => conn.db_execute(
             "UPDATE agent_schedules
                  SET state = ?3,
                      next_fire_at_ms = ?4,
@@ -7043,7 +7662,7 @@ fn claim_schedule_tick_on(
                      watch_baseline = COALESCE(?6, watch_baseline),
                      last_observed = COALESCE(?7, last_observed)
                  WHERE id = ?1 AND state = 'active' AND next_fire_at_ms = ?2",
-            params![
+            &db_params![
                 id,
                 expected,
                 new_state,
@@ -7053,7 +7672,7 @@ fn claim_schedule_tick_on(
                 last_observed
             ],
         )?,
-        None => conn.execute(
+        None => conn.db_execute(
             "UPDATE agent_schedules
                  SET state = ?2,
                      next_fire_at_ms = ?3,
@@ -7061,7 +7680,7 @@ fn claim_schedule_tick_on(
                      watch_baseline = COALESCE(?5, watch_baseline),
                      last_observed = COALESCE(?6, last_observed)
                  WHERE id = ?1 AND state = 'active'",
-            params![
+            &db_params![
                 id,
                 new_state,
                 new_next_fire_at_ms,
@@ -7074,6 +7693,7 @@ fn claim_schedule_tick_on(
     Ok(updated == 1)
 }
 
+#[allow(dead_code)]
 fn build_fts5_query_with_filters(
     queries: &[String],
     agent_name: Option<&str>,
@@ -7131,7 +7751,7 @@ fn visible_agent_ids_sql(
         return String::new();
     };
     if agents.is_empty() {
-        return " AND 0".to_string();
+        return " AND 1 = 0".to_string();
     }
     let placeholders = (0..agents.len())
         .map(|offset| format!("?{}", first_param + offset))
@@ -7140,33 +7760,37 @@ fn visible_agent_ids_sql(
     format!(" AND {column} IN ({placeholders})")
 }
 
-fn scoped_params<'a>(
-    bind: &[&'a dyn rusqlite::ToSql],
-    visible_agent_ids: Option<&'a [String]>,
-) -> Vec<&'a dyn rusqlite::ToSql> {
-    let mut bind = bind.to_vec();
+fn scoped_params(mut bind: Vec<DbParam>, visible_agent_ids: Option<&[String]>) -> Vec<DbParam> {
     if let Some(agents) = visible_agent_ids {
-        bind.extend(agents.iter().map(|agent| agent as &dyn rusqlite::ToSql));
+        bind.extend(agents.iter().map(ToDbParam::to_db_param));
     }
     bind
 }
 
 fn message_by_source(
-    conn: &Connection,
+    conn: &dyn DbExec,
     agent_id: &AgentId,
     source_key: &str,
 ) -> Result<Option<Message>, Error> {
-    let found = conn
-        .prepare_cached(concat!(
+    let found = conn.db_query_opt(
+        concat!(
             "SELECT ",
             message_cols!(),
             " FROM messages WHERE agent_id = ?1 AND source_key = ?2"
-        ))?
-        .query_row(params![agent_id.as_str(), source_key], |row| {
-            Ok(message_from_row(conn, row))
-        })
-        .optional()?;
-    found.transpose()
+        ),
+        &db_params![agent_id.as_str(), source_key],
+        |row| message_from_row_with_cursor_db(row, 0),
+    )?;
+    let Some(mut msg) = found else {
+        return Ok(None);
+    };
+    let delivered = cursor(conn, &msg.agent_id)?;
+    msg.ack = if msg.seq <= delivered {
+        Ack::Delivered
+    } else {
+        Ack::Received
+    };
+    Ok(Some(msg))
 }
 
 /// Namespace of the ordinary numeric-origin matcher. Telegram basic-group
@@ -7203,7 +7827,7 @@ pub(crate) fn origin_namespace(chat_id: i64, source_key: Option<&str>) -> String
 }
 
 fn message_origin_namespace_matches(
-    conn: &Connection,
+    conn: &dyn DbExec,
     message: &Message,
     chat: i64,
     incoming_key: Option<&str>,
@@ -7212,18 +7836,19 @@ fn message_origin_namespace_matches(
     if namespace == "unscoped" {
         return Ok(false);
     }
-    let (retained, matched): (i64, bool) = conn.query_row(
-        "SELECT count(*), coalesce(max(a.namespace=?3), 0) FROM message_origin_aliases a
-         JOIN message_identities i ON i.agent_id=a.agent_id AND i.identity_id=a.identity_id
-         WHERE i.agent_id=?1 AND i.target_id=?2 AND a.chat_id=?4 AND a.message_id=?5",
-        params![
+    let (retained, matched): (i64, bool) = conn.db_query_one(
+        "SELECT COUNT(*), COALESCE(MAX(CASE WHEN a.namespace = ?3 THEN 1 ELSE 0 END), 0)
+         FROM message_origin_aliases a
+         JOIN message_identities i ON i.agent_id = a.agent_id AND i.identity_id = a.identity_id
+         WHERE i.agent_id = ?1 AND i.target_id = ?2 AND a.chat_id = ?4 AND a.message_id = ?5",
+        &db_params![
             message.agent_id.as_str(),
             message.id.as_str(),
             namespace,
             chat,
             message.origin.and_then(|o| o.message_id)
         ],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get::<i64>(0)?, r.get::<i64>(1)? != 0)),
     )?;
     Ok(if retained != 0 {
         matched
@@ -7236,18 +7861,18 @@ fn message_origin_namespace_matches(
 /// This also lazily seeds a pre-upgrade row's still-available canonical identity.
 /// Callers share ingress/redaction's IMMEDIATE transaction; errors roll it back.
 fn retain_message_aliases(
-    conn: &Connection,
+    conn: &dyn DbExec,
     message: &Message,
     incoming_origin: Option<Origin>,
     incoming_source_key: Option<&str>,
 ) -> Result<String, Error> {
-    let seeded = conn.execute(
+    let seeded = conn.db_execute(
         "INSERT INTO message_identities (agent_id, target_id, identity_id) VALUES (?1, ?2, ?2) ON CONFLICT DO NOTHING",
-        params![message.agent_id.as_str(), message.id.as_str()],
+        &db_params![message.agent_id.as_str(), message.id.as_str()],
     )?;
-    let identity_id: String = conn.query_row(
+    let identity_id: String = conn.db_query_one(
         "SELECT identity_id FROM message_identities WHERE agent_id = ?1 AND target_id = ?2",
-        params![message.agent_id.as_str(), message.id.as_str()],
+        &db_params![message.agent_id.as_str(), message.id.as_str()],
         |r| r.get(0),
     )?;
     // Only seed the visible route once. After promotion source_key may be
@@ -7265,10 +7890,10 @@ fn retain_message_aliases(
             ..
         }) = origin
         {
-            conn.execute(
+            conn.db_execute(
                 "INSERT INTO message_origin_aliases (agent_id, identity_id, namespace, chat_id, message_id)
                  VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING",
-                params![message.agent_id.as_str(), identity_id, origin_namespace(chat_id, key), chat_id, message_id],
+                &db_params![message.agent_id.as_str(), identity_id, origin_namespace(chat_id, key), chat_id, message_id],
             )?;
         }
     }
@@ -7277,10 +7902,10 @@ fn retain_message_aliases(
         .flatten()
         .filter(|key| !key.is_empty())
     {
-        conn.execute(
+        conn.db_execute(
             "INSERT INTO message_source_aliases (agent_id, identity_id, source_key)
              VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
-            params![message.agent_id.as_str(), identity_id, key],
+            &db_params![message.agent_id.as_str(), identity_id, key],
         )?;
     }
     Ok(identity_id)
@@ -7290,14 +7915,13 @@ fn retain_message_aliases(
 /// before any ordinary writer. No bounded history scan or body matching. A
 /// missing canonical row is a storage error, not permission to append plaintext.
 fn redacted_message_by_ingress(
-    conn: &Connection,
+    conn: &dyn DbExec,
     agent_id: &AgentId,
     origin: Option<Origin>,
     source_key: Option<&str>,
 ) -> Result<Option<Message>, Error> {
-    let target_id: Option<String> = conn
-        .query_row(
-            "SELECT r.target_id FROM message_origin_aliases a
+    let target_id: Option<String> = conn.db_query_opt(
+        "SELECT r.target_id FROM message_origin_aliases a
          JOIN message_identities i ON i.agent_id = a.agent_id AND i.identity_id = a.identity_id
          JOIN conversation_redactions r ON r.agent_id = i.agent_id AND r.target_id = i.target_id
          WHERE a.agent_id = ?1 AND a.chat_id = ?2 AND a.message_id = ?3 AND a.namespace = ?5 AND a.namespace != 'unscoped'
@@ -7307,32 +7931,32 @@ fn redacted_message_by_ingress(
          JOIN conversation_redactions r ON r.agent_id = i.agent_id AND r.target_id = i.target_id
          WHERE a.agent_id = ?1 AND a.source_key = ?4
          LIMIT 1",
-            params![
-                agent_id.as_str(),
-                origin.and_then(|o| o.chat_id),
-                origin.and_then(|o| o.message_id),
-                source_key,
-                origin
-                    .and_then(|o| o.chat_id)
-                    .map(|chat| origin_namespace(chat, source_key))
-            ],
-            |r| r.get(0),
-        )
-        .optional()?;
+        &db_params![
+            agent_id.as_str(),
+            origin.and_then(|o| o.chat_id),
+            origin.and_then(|o| o.message_id),
+            source_key,
+            origin
+                .and_then(|o| o.chat_id)
+                .map(|chat| origin_namespace(chat, source_key))
+        ],
+        |r| r.get(0),
+    )?;
     let Some(target_id) = target_id else {
         return Ok(None);
     };
-    let row = conn.query_row(
+    let delivered = cursor(conn, agent_id)?;
+    let row = conn.db_query_one(
         &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id = ?1 AND id = ?2"),
-        params![agent_id.as_str(), target_id],
-        |r| Ok(message_from_row(conn, r)),
-    )??;
+        &db_params![agent_id.as_str(), target_id],
+        |r| message_from_row_with_cursor_db(r, delivered),
+    )?;
     Ok(Some(row))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn message_by_origin(
-    conn: &Connection,
+    conn: &dyn DbExec,
     agent_id: &AgentId,
     chat_id: i64,
     message_id: i64,
@@ -7344,17 +7968,28 @@ fn message_by_origin(
     redelivery_identity: &mut Option<String>,
     merged: &mut Vec<String>,
 ) -> Result<Option<Message>, Error> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {MESSAGE_COLS} FROM messages
-         WHERE agent_id = ?1 AND origin IS NOT NULL ORDER BY seq DESC LIMIT 64"
-    ))?;
-    let mut rows = stmt.query([agent_id.as_str()])?;
+    let rows = conn.db_query_vec(
+        &format!(
+            "SELECT {MESSAGE_COLS} FROM messages
+             WHERE agent_id = ?1 AND origin IS NOT NULL ORDER BY seq DESC LIMIT 64"
+        ),
+        &db_params![agent_id.as_str()],
+        |row| message_from_row_with_cursor_db(row, 0),
+    )?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let delivered = cursor(conn, agent_id)?;
     let in_user = telegram_sender_user_key(incoming_sender);
     let in_is_relay =
         incoming_source_key.is_some_and(|k| k.starts_with("tg-in:") || k.starts_with("room:"));
     let is_basic_group = chat_id < 0 && chat_id > -1_000_000_000_000;
-    while let Some(row) = rows.next()? {
-        let mut msg = message_from_row(conn, row)?;
+    for mut msg in rows {
+        msg.ack = if msg.seq <= delivered {
+            Ack::Delivered
+        } else {
+            Ack::Received
+        };
         let Some(origin) = msg.origin else {
             continue;
         };
@@ -7410,21 +8045,19 @@ fn message_by_origin(
             // redeliveries) may have been redacted. Re-resolve after retaining
             // the new alias and return the actual frozen row before either
             // body UPDATE. This shares ingress/redaction's IMMEDIATE transaction.
-            let redacted_target: Option<String> = conn
-                .query_row(
-                    "SELECT r.target_id FROM conversation_redactions r
+            let redacted_target: Option<String> = conn.db_query_opt(
+                "SELECT r.target_id FROM conversation_redactions r
                  JOIN message_identities i ON i.agent_id=r.agent_id AND i.target_id=r.target_id
                  WHERE i.agent_id=?1 AND i.identity_id=?2 LIMIT 1",
-                    params![agent_id.as_str(), identity_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
+                &db_params![agent_id.as_str(), identity_id],
+                |r| r.get(0),
+            )?;
             if let Some(target) = redacted_target {
-                let redacted = conn.query_row(
+                let redacted = conn.db_query_one(
                     &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id=?1 AND id=?2"),
-                    params![agent_id.as_str(), target],
-                    |r| Ok(message_from_row(conn, r)),
-                )??;
+                    &db_params![agent_id.as_str(), target],
+                    |r| message_from_row_with_cursor_db(r, delivered),
+                )?;
                 return Ok(Some(redacted));
             }
             let was_unquoted = !has_quoted_block(&msg.text) && has_quoted_block(incoming_body);
@@ -7444,9 +8077,9 @@ fn message_by_origin(
                     updated_context.reply_to_author = Some(rta.to_string());
                 }
                 let new_body = best_body.as_deref().unwrap_or(&msg.text);
-                conn.execute(
+                conn.db_execute(
                     "UPDATE messages SET origin = ?1, context = ?2, source_key = NULL, body = ?3 WHERE id = ?4",
-                    params![
+                    &db_params![
                         serde_json::to_string(&updated_origin).unwrap_or_default(),
                         serde_json::to_string(&updated_context).ok(),
                         new_body,
@@ -7472,9 +8105,9 @@ fn message_by_origin(
                     updated_context.reply_to_author = Some(rta.to_string());
                 }
                 let new_body = best_body.as_deref().unwrap_or(&msg.text);
-                conn.execute(
+                conn.db_execute(
                     "UPDATE messages SET body = ?1, context = ?2 WHERE id = ?3",
-                    params![
+                    &db_params![
                         new_body,
                         serde_json::to_string(&updated_context).ok(),
                         msg.id.as_str(),
@@ -7488,7 +8121,7 @@ fn message_by_origin(
                     msg.text = b;
                 }
             }
-            if was_unquoted && cursor(conn, agent_id).unwrap_or(0) >= msg.seq {
+            if was_unquoted && delivered >= msg.seq {
                 *redelivery_identity = Some(identity_id);
                 return Ok(None);
             }
@@ -7522,7 +8155,7 @@ fn normalize_telegram_body_for_dedup(s: &str) -> String {
     lines.join("\n")
 }
 
-fn resolve_quote_author(conn: &Connection, quote: &crate::Quote) -> Option<String> {
+fn resolve_quote_author(conn: &dyn DbExec, quote: &crate::Quote) -> Option<String> {
     let author = quote.author.trim();
     if author.is_empty() {
         return None;
@@ -7541,13 +8174,11 @@ fn resolve_quote_author(conn: &Connection, quote: &crate::Quote) -> Option<Strin
             .next()
             .unwrap_or("");
         if !first_word.is_empty()
-            && let Ok(Some(agent)) = conn
-                .query_row(
-                    "SELECT name FROM agents WHERE LOWER(name) = LOWER(?1)",
-                    [first_word],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
+            && let Ok(Some(agent)) = conn.db_query_opt(
+                "SELECT name FROM agents WHERE LOWER(name) = LOWER(?1)",
+                &db_params![first_word],
+                |row| row.get::<String>(0),
+            )
         {
             return Some(format!("{author} [agent:{agent}]"));
         }
@@ -7556,7 +8187,7 @@ fn resolve_quote_author(conn: &Connection, quote: &crate::Quote) -> Option<Strin
 }
 
 fn enrich_quote_from_store(
-    conn: &Connection,
+    conn: &dyn DbExec,
     quote: &mut crate::Quote,
     incoming_origin: Option<Origin>,
 ) {
@@ -7588,21 +8219,18 @@ fn enrich_quote_from_store(
             .to_string();
         if !base_quote_text.is_empty() {
             let dest_pattern = format!("telegram:chat:{chat_id}%");
-            if let Ok(mut stmt) = conn.prepare(
+            if let Ok(bodies) = conn.db_query_vec(
                 "SELECT body FROM outbound_messages
                  WHERE destination LIKE ?1
                  ORDER BY sent_at_ms DESC LIMIT 32",
-            ) && let Ok(mut rows) = stmt.query([dest_pattern])
-            {
-                while let Ok(Some(row)) = rows.next() {
-                    if let Ok(body) = row.get::<_, String>(0) {
-                        let clean = strip_quoted_block(&body).trim().to_string();
-                        if clean.starts_with(&base_quote_text)
-                            && clean.len() > base_quote_text.len()
-                        {
-                            stored_excerpt = Some(clean);
-                            break;
-                        }
+                &db_params![dest_pattern],
+                |row| row.get::<String>(0),
+            ) {
+                for body in bodies {
+                    let clean = strip_quoted_block(&body).trim().to_string();
+                    if clean.starts_with(&base_quote_text) && clean.len() > base_quote_text.len() {
+                        stored_excerpt = Some(clean);
+                        break;
                     }
                 }
             }
@@ -7630,26 +8258,30 @@ fn enrich_quote_from_store(
 }
 
 fn resolve_origin_message_author_and_excerpt(
-    conn: &Connection,
+    conn: &dyn DbExec,
     chat_id: i64,
     message_id: i64,
 ) -> Option<(String, String)> {
     history_read_probe();
     let pattern = format!("%\"message_id\":{message_id}%");
-    let mut stmt = conn
-        .prepare(
+    let rows = conn
+        .db_query_vec(
             "SELECT sender, body, origin FROM messages
              WHERE origin LIKE ?1
                AND body NOT LIKE '[Reaction %'
                AND body NOT LIKE '[Deleted message #%'
              ORDER BY rowid DESC LIMIT 32",
+            &db_params![pattern],
+            |row| {
+                Ok((
+                    row.get::<Option<String>>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<Option<String>>(2)?,
+                ))
+            },
         )
         .ok()?;
-    let mut rows = stmt.query([pattern]).ok()?;
-    while let Some(row) = rows.next().ok()? {
-        let sender: Option<String> = row.get(0).ok()?;
-        let body: String = row.get(1).ok()?;
-        let origin_raw: Option<String> = row.get(2).ok()?;
+    for (sender, body, origin_raw) in rows {
         let Some(origin_str) = origin_raw else {
             continue;
         };
@@ -7676,24 +8308,23 @@ fn parse_edited_message_text(text: &str) -> Option<(i64, &str)> {
 /// The last version of an edited message this agent recorded: one indexed
 /// lookup, made inside the ingress transaction.
 fn stored_message_version(
-    conn: &Connection,
+    conn: &dyn DbExec,
     agent_id: &AgentId,
     chat_id: i64,
     message_id: i64,
     source_key: Option<&str>,
 ) -> Option<String> {
-    conn.query_row(
+    conn.db_query_opt(
         "SELECT body FROM message_versions
          WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = ?3 AND origin_namespace = ?4",
-        params![
+        &db_params![
             agent_id.as_str(),
             chat_id,
             message_id,
             origin_namespace(chat_id, source_key)
         ],
-        |row| row.get::<_, String>(0),
+        |row| row.get::<String>(0),
     )
-    .optional()
     .ok()
     .flatten()
 }
@@ -7702,7 +8333,7 @@ fn stored_message_version(
 /// history when no version was recorded. This reads across the whole mailbox
 /// history, so ingress runs it on a read snapshot before taking the writer.
 fn original_message_text(
-    conn: &Connection,
+    conn: &dyn DbExec,
     agent_id: &AgentId,
     chat_id: i64,
     message_id: i64,
@@ -7710,18 +8341,20 @@ fn original_message_text(
 ) -> Option<String> {
     history_read_probe();
     let pattern = format!("%\"message_id\":{message_id}%");
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT {MESSAGE_COLS} FROM messages WHERE origin LIKE ?1
-           AND body NOT LIKE '[Edited message #%'
-           AND body NOT LIKE '[Reaction %'
-           AND body NOT LIKE '[Deleted message #%'
-         ORDER BY CASE WHEN agent_id=?2 THEN 0 ELSE 1 END, rowid DESC LIMIT 32"
-        ))
+    let rows = conn
+        .db_query_vec(
+            &format!(
+                "SELECT {MESSAGE_COLS} FROM messages WHERE origin LIKE ?1
+               AND body NOT LIKE '[Edited message #%'
+               AND body NOT LIKE '[Reaction %'
+               AND body NOT LIKE '[Deleted message #%'
+             ORDER BY CASE WHEN agent_id=?2 THEN 0 ELSE 1 END, rowid DESC LIMIT 32"
+            ),
+            &db_params![pattern, agent_id.as_str()],
+            |row| message_from_row_with_cursor_db(row, 0),
+        )
         .ok()?;
-    let mut rows = stmt.query(params![pattern, agent_id.as_str()]).ok()?;
-    while let Some(row) = rows.next().ok()? {
-        let message = message_from_row(conn, row).ok()?;
+    for message in rows {
         if let Some(origin) = message.origin
             && origin.chat_id == Some(chat_id)
             && origin.message_id == Some(message_id)
@@ -7734,26 +8367,34 @@ fn original_message_text(
 }
 
 fn latest_message_for_origin(
-    conn: &Connection,
+    conn: &dyn DbExec,
     agent_id: &AgentId,
     chat_id: i64,
     message_id: i64,
     source_key: Option<&str>,
 ) -> Result<Option<Message>, Error> {
     let pattern = format!("%\"message_id\":{message_id}%");
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {MESSAGE_COLS} FROM messages
-         WHERE agent_id = ?1 AND origin LIKE ?2
-         ORDER BY seq DESC LIMIT 16"
-    ))?;
-    let mut rows = stmt.query(params![agent_id.as_str(), pattern])?;
-    while let Some(row) = rows.next()? {
-        let msg = message_from_row(conn, row)?;
+    let rows = conn.db_query_vec(
+        &format!(
+            "SELECT {MESSAGE_COLS} FROM messages
+             WHERE agent_id = ?1 AND origin LIKE ?2
+             ORDER BY seq DESC LIMIT 16"
+        ),
+        &db_params![agent_id.as_str(), pattern],
+        |row| message_from_row_with_cursor_db(row, 0),
+    )?;
+    for mut msg in rows {
         if let Some(origin) = msg.origin
             && origin.chat_id == Some(chat_id)
             && origin.message_id == Some(message_id)
             && message_origin_namespace_matches(conn, &msg, chat_id, source_key)?
         {
+            let delivered = cursor(conn, agent_id)?;
+            msg.ack = if msg.seq <= delivered {
+                Ack::Delivered
+            } else {
+                Ack::Received
+            };
             return Ok(Some(msg));
         }
     }
@@ -7843,27 +8484,17 @@ pub fn format_edited_message_diff(old: &str, new: &str) -> String {
     out.join("\n")
 }
 
-/// Agents attached to a Telegram chat: those its channel links name, and
-/// up to 16 that received a line from it. The second part matches origins by
-/// text pattern and can read every stored message, so ingress counts on a
-/// read snapshot before it takes the writer.
-fn chat_attached_agent_count(conn: &Connection, chat_id: i64) -> usize {
-    history_read_probe();
-    let mut distinct_agents = std::collections::HashSet::new();
-    if let Ok(mut stmt) = conn.prepare(
+fn telegram_chat_agent_ids(conn: &dyn DbExec, chat_id: i64) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Ok(rows) = conn.db_query_vec(
         "SELECT c.state, ca.agent_id
          FROM channels c
          JOIN channel_agents ca ON ca.channel_id = c.id
          WHERE c.kind = 'telegram'",
-    ) && let Ok(mut rows) = stmt.query([])
-    {
-        while let Ok(Some(row)) = rows.next() {
-            let Ok(state) = row.get::<_, String>(0) else {
-                continue;
-            };
-            let Ok(aid) = row.get::<_, String>(1) else {
-                continue;
-            };
+        &[],
+        |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
+    ) {
+        for (state, aid) in rows {
             let Ok(val) = serde_json::from_str::<serde_json::Value>(&state) else {
                 continue;
             };
@@ -7873,26 +8504,34 @@ fn chat_attached_agent_count(conn: &Connection, chat_id: i64) -> usize {
             if chats.iter().any(|link| {
                 link.get("chat_id").and_then(serde_json::Value::as_i64) == Some(chat_id)
             }) {
-                distinct_agents.insert(aid);
+                ids.push(aid);
             }
         }
     }
+    ids
+}
+
+/// Agents attached to a Telegram chat: those its channel links name, and
+/// up to 16 that received a line from it. The second part matches origins by
+/// text pattern and can read every stored message, so ingress counts on a
+/// read snapshot before it takes the writer.
+fn chat_attached_agent_count(conn: &dyn DbExec, chat_id: i64) -> usize {
+    history_read_probe();
+    let mut distinct_agents: std::collections::HashSet<String> =
+        telegram_chat_agent_ids(conn, chat_id).into_iter().collect();
     let pattern = format!("%\"chat_id\":{chat_id}%");
-    if let Ok(mut stmt) =
-        conn.prepare("SELECT DISTINCT agent_id FROM messages WHERE origin LIKE ?1 LIMIT 16")
-        && let Ok(mut rows) = stmt.query([pattern])
-    {
-        while let Ok(Some(row)) = rows.next() {
-            if let Ok(aid) = row.get::<_, String>(0) {
-                distinct_agents.insert(aid);
-            }
-        }
+    if let Ok(aids) = conn.db_query_vec(
+        "SELECT DISTINCT agent_id FROM messages WHERE origin LIKE ?1 LIMIT 16",
+        &db_params![pattern],
+        |row| row.get::<String>(0),
+    ) {
+        distinct_agents.extend(aids);
     }
     distinct_agents.len()
 }
 
 fn resolve_conversation_participants(
-    conn: &Connection,
+    conn: &dyn DbExec,
     chat_id: Option<i64>,
     destination: Option<&str>,
 ) -> Vec<String> {
@@ -7900,54 +8539,22 @@ fn resolve_conversation_participants(
     if let Some(cid) = chat_id
         && cid < 0
     {
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT c.state, ca.agent_id
-             FROM channels c
-             JOIN channel_agents ca ON ca.channel_id = c.id
-             WHERE c.kind = 'telegram'",
-        ) && let Ok(mut rows) = stmt.query([])
-        {
-            while let Ok(Some(row)) = rows.next() {
-                let Ok(state) = row.get::<_, String>(0) else {
-                    continue;
-                };
-                let Ok(aid) = row.get::<_, String>(1) else {
-                    continue;
-                };
-                let Ok(val) = serde_json::from_str::<serde_json::Value>(&state) else {
-                    continue;
-                };
-                let Some(chats) = val.get("chats").and_then(serde_json::Value::as_array) else {
-                    continue;
-                };
-                if chats.iter().any(|link| {
-                    link.get("chat_id").and_then(serde_json::Value::as_i64) == Some(cid)
-                }) {
-                    agent_ids.insert(aid);
-                }
-            }
-        }
+        agent_ids.extend(telegram_chat_agent_ids(conn, cid));
     } else if let Some(group_name) = destination.and_then(|d| d.strip_prefix("group:")) {
         if group_name == "all" {
-            if let Ok(mut stmt) = conn.prepare(
+            if let Ok(aids) = conn.db_query_vec(
                 "SELECT id FROM agents WHERE parent_id IS NULL AND state IN ('running', 'idle')",
-            ) && let Ok(mut rows) = stmt.query([])
-            {
-                while let Ok(Some(row)) = rows.next() {
-                    if let Ok(aid) = row.get::<_, String>(0) {
-                        agent_ids.insert(aid);
-                    }
-                }
+                &[],
+                |row| row.get::<String>(0),
+            ) {
+                agent_ids.extend(aids);
             }
-        } else if let Ok(mut stmt) =
-            conn.prepare("SELECT agent_id FROM group_agents WHERE group_name = ?1")
-            && let Ok(mut rows) = stmt.query([group_name])
-        {
-            while let Ok(Some(row)) = rows.next() {
-                if let Ok(aid) = row.get::<_, String>(0) {
-                    agent_ids.insert(aid);
-                }
-            }
+        } else if let Ok(aids) = conn.db_query_vec(
+            "SELECT agent_id FROM group_agents WHERE group_name = ?1",
+            &db_params![group_name],
+            |row| row.get::<String>(0),
+        ) {
+            agent_ids.extend(aids);
         }
     }
     if agent_ids.len() <= 1 {
@@ -7955,14 +8562,14 @@ fn resolve_conversation_participants(
     }
     let mut participants = Vec::new();
     for aid in agent_ids {
-        if let Ok((name, role, state)) = conn.query_row(
+        if let Ok(Some((name, role, state))) = conn.db_query_opt(
             "SELECT name, role, state FROM agents WHERE id = ?1",
-            [&aid],
+            &db_params![aid],
             |r| {
                 Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, String>(2)?,
+                    r.get::<String>(0)?,
+                    r.get::<Option<String>>(1)?,
+                    r.get::<String>(2)?,
                 ))
             },
         ) {
@@ -7994,7 +8601,7 @@ fn xml_escape_attr_local(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn is_ancestor_in_conn(conn: &Connection, ancestor_id: &AgentId, target: &Agent) -> bool {
+fn is_ancestor_in_conn(conn: &dyn DbExec, ancestor_id: &AgentId, target: &Agent) -> bool {
     let mut cursor = target.parent_id.clone();
     let mut depth = 0usize;
     while let Some(pid) = cursor {
@@ -8011,7 +8618,7 @@ fn is_ancestor_in_conn(conn: &Connection, ancestor_id: &AgentId, target: &Agent)
 }
 
 fn resolve_sender_relationship_and_role(
-    conn: &Connection,
+    conn: &dyn DbExec,
     recipient: Option<&Agent>,
     sender: Option<&str>,
 ) -> (Option<String>, Option<String>) {
@@ -8034,12 +8641,13 @@ fn resolve_sender_relationship_and_role(
         Ok(id) => id,
         Err(_) => {
             let Some(id) = conn
-                .query_row(
+                .db_query_opt(
                     "SELECT id FROM agents WHERE name = ?1",
-                    [sender_reference],
-                    |r| r.get::<_, String>(0),
+                    &db_params![sender_reference],
+                    |r| r.get::<String>(0),
                 )
                 .ok()
+                .flatten()
                 .and_then(|id| AgentId::parse(&id).ok())
             else {
                 return (None, None);
@@ -8087,7 +8695,7 @@ struct PersistedTopologyState {
 }
 
 fn compute_and_diff_topology_event(
-    conn: &Connection,
+    conn: &dyn DbExec,
     recipient: Option<&Agent>,
     now_ms: i64,
 ) -> Option<String> {
@@ -8101,11 +8709,12 @@ fn compute_and_diff_topology_event(
 
     let mut peers = Vec::new();
     if rec.parent_id.is_none() {
-        if let Ok(mut stmt) = conn.prepare(
+        if let Ok(ids) = conn.db_query_vec(
             "SELECT id FROM agents WHERE parent_id IS NULL AND state != 'archived' AND id != ?1 ORDER BY name ASC",
-        ) && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
-        {
-            for id_str in rows.flatten() {
+            &db_params![rec.id.as_str()],
+            |r| r.get::<String>(0),
+        ) {
+            for id_str in ids {
                 if let Ok(aid) = AgentId::parse(&id_str)
                     && let Ok(peer) = agent_by_id(conn, &aid)
                 {
@@ -8115,14 +8724,13 @@ fn compute_and_diff_topology_event(
         }
     } else if rec.allows_sibling_messages()
         && let Some(ref pid) = rec.parent_id
-        && let Ok(mut stmt) = conn.prepare(
+        && let Ok(ids) = conn.db_query_vec(
             "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND id != ?2 ORDER BY name ASC",
+            &db_params![pid.as_str(), rec.id.as_str()],
+            |r| r.get::<String>(0),
         )
-        && let Ok(rows) = stmt.query_map(params![pid.as_str(), rec.id.as_str()], |r| {
-            r.get::<_, String>(0)
-        })
     {
-        for id_str in rows.flatten() {
+        for id_str in ids {
             if let Ok(aid) = AgentId::parse(&id_str)
                 && let Ok(sib) = agent_by_id(conn, &aid)
                 && sib.allows_sibling_messages()
@@ -8133,11 +8741,12 @@ fn compute_and_diff_topology_event(
     }
 
     let mut children = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(
+    if let Ok(ids) = conn.db_query_vec(
         "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' ORDER BY name ASC",
-    ) && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
-    {
-        for id_str in rows.flatten() {
+        &db_params![rec.id.as_str()],
+        |r| r.get::<String>(0),
+    ) {
+        for id_str in ids {
             if let Ok(aid) = AgentId::parse(&id_str)
                 && let Ok(child) = agent_by_id(conn, &aid)
             {
@@ -8150,11 +8759,12 @@ fn compute_and_diff_topology_event(
     }
 
     let mut groups = Vec::new();
-    if let Ok(mut stmt) = conn
-        .prepare("SELECT group_name FROM group_agents WHERE agent_id = ?1 ORDER BY group_name ASC")
-        && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
-    {
-        for g in rows.flatten() {
+    if let Ok(group_names) = conn.db_query_vec(
+        "SELECT group_name FROM group_agents WHERE agent_id = ?1 ORDER BY group_name ASC",
+        &db_params![rec.id.as_str()],
+        |r| r.get::<String>(0),
+    ) {
+        for g in group_names {
             groups.push(format!("group:{g}"));
         }
     }
@@ -8169,22 +8779,21 @@ fn compute_and_diff_topology_event(
     let current_json = serde_json::to_string(&current).ok()?;
 
     let prev_json: Option<String> = conn
-        .query_row(
+        .db_query_opt(
             "SELECT state_json FROM agent_topology_state WHERE agent_id = ?1",
-            [rec.id.as_str()],
+            &db_params![rec.id.as_str()],
             |r| r.get(0),
         )
-        .optional()
         .ok()
         .flatten();
 
     match prev_json.and_then(|s| serde_json::from_str::<PersistedTopologyState>(&s).ok()) {
         None => {
-            let _ = conn.execute(
+            let _ = conn.db_execute(
                 "INSERT INTO agent_topology_state (agent_id, state_json, updated_at_ms)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT (agent_id) DO UPDATE SET state_json = excluded.state_json, updated_at_ms = excluded.updated_at_ms",
-                params![rec.id.as_str(), current_json, now_ms],
+                &db_params![rec.id.as_str(), current_json, now_ms],
             );
             let self_tag = format_agent_topology_tag(&rec.name, rec.role.as_deref());
             let mut tag = format!(
@@ -8223,9 +8832,9 @@ fn compute_and_diff_topology_event(
         }
         Some(prev) if prev == current => None,
         Some(prev) => {
-            let _ = conn.execute(
+            let _ = conn.db_execute(
                 "UPDATE agent_topology_state SET state_json = ?1, updated_at_ms = ?2 WHERE agent_id = ?3",
-                params![current_json, now_ms, rec.id.as_str()],
+                &db_params![current_json, now_ms, rec.id.as_str()],
             );
             let mut changes = Vec::new();
             if prev.scope != current.scope {
@@ -8349,16 +8958,15 @@ fn matches_conversation_peer(turn: &ConversationTurn, peer: &str) -> bool {
     })
 }
 
-fn resolve_chat_metadata(conn: &Connection, chat_id: i64) -> (Option<String>, Option<String>) {
+fn resolve_chat_metadata(conn: &dyn DbExec, chat_id: i64) -> (Option<String>, Option<String>) {
     let mut found_title: Option<String> = None;
     let mut found_type: Option<String> = None;
-    if let Ok(mut stmt) = conn.prepare("SELECT state FROM channels WHERE kind = 'telegram'")
-        && let Ok(mut rows) = stmt.query([])
-    {
-        while let Ok(Some(row)) = rows.next() {
-            let Ok(state) = row.get::<_, String>(0) else {
-                continue;
-            };
+    if let Ok(states) = conn.db_query_vec(
+        "SELECT state FROM channels WHERE kind = 'telegram'",
+        &[],
+        |row| row.get::<String>(0),
+    ) {
+        for state in states {
             let Ok(val) = serde_json::from_str::<serde_json::Value>(&state) else {
                 continue;
             };
@@ -8395,7 +9003,7 @@ fn resolve_chat_metadata(conn: &Connection, chat_id: i64) -> (Option<String>, Op
     (found_title, found_type)
 }
 
-fn resolve_mentions(conn: &Connection, text: &str) -> Vec<String> {
+fn resolve_mentions(conn: &dyn DbExec, text: &str) -> Vec<String> {
     if !text.contains('@') {
         return Vec::new();
     }
@@ -8404,21 +9012,16 @@ fn resolve_mentions(conn: &Connection, text: &str) -> Vec<String> {
         return Vec::new();
     }
     let mut bot_to_agent: Vec<(String, String)> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(
+    if let Ok(rows) = conn.db_query_vec(
         "SELECT c.state, a.name
          FROM channels c
          JOIN channel_agents ca ON ca.channel_id = c.id
          JOIN agents a ON a.id = ca.agent_id
          WHERE c.kind = 'telegram'",
-    ) && let Ok(mut rows) = stmt.query([])
-    {
-        while let Ok(Some(row)) = rows.next() {
-            let Ok(state) = row.get::<_, String>(0) else {
-                continue;
-            };
-            let Ok(agent_name) = row.get::<_, String>(1) else {
-                continue;
-            };
+        &[],
+        |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
+    ) {
+        for (state, agent_name) in rows {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&state)
                 && let Some(bot) = val.get("bot").and_then(serde_json::Value::as_str)
                 && let Some((_, username)) = bot.split_once(':')
@@ -8431,12 +9034,11 @@ fn resolve_mentions(conn: &Connection, text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for handle in handles {
         let agent_match: Option<String> = conn
-            .query_row(
+            .db_query_opt(
                 "SELECT name FROM agents WHERE LOWER(name) = LOWER(?1)",
-                [&handle],
-                |row| row.get(0),
+                &db_params![handle],
+                |row| row.get::<String>(0),
             )
-            .optional()
             .ok()
             .flatten()
             .or_else(|| {
@@ -8503,62 +9105,57 @@ fn extract_at_handles(text: &str) -> Vec<String> {
     handles
 }
 
-fn next_seq(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
-    let seq = conn
-        .prepare_cached(
-            "SELECT MAX(0, COALESCE(MAX(seq), 0)) + 1 FROM messages WHERE agent_id = ?1",
-        )?
-        .query_row([agent_id.as_str()], |row| row.get(0))?;
-    Ok(seq)
+fn next_seq(conn: &dyn DbExec, agent_id: &AgentId) -> Result<i64, Error> {
+    conn.lock_agent_for_seq(agent_id.as_str())?;
+    let greatest = conn.backend().sql_greatest("0", "COALESCE(MAX(seq), 0)");
+    let sql = format!("SELECT {greatest} + 1 FROM messages WHERE agent_id = ?1");
+    conn.db_query_one(&sql, &db_params![agent_id.as_str()], |row| row.get(0))
 }
 
 /// The highest sequence in the agent's mailbox, or 0 when it is empty.
-fn last_seq(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
-    Ok(conn
-        .prepare_cached("SELECT MAX(0, COALESCE(MAX(seq), 0)) FROM messages WHERE agent_id = ?1")?
-        .query_row([agent_id.as_str()], |row| row.get(0))?)
+pub(super) fn last_seq(conn: &dyn DbExec, agent_id: &AgentId) -> Result<i64, Error> {
+    let greatest = conn.backend().sql_greatest("0", "COALESCE(MAX(seq), 0)");
+    let sql = format!("SELECT {greatest} FROM messages WHERE agent_id = ?1");
+    conn.db_query_one(&sql, &db_params![agent_id.as_str()], |row| row.get(0))
 }
 
 /// The mailbox line at `seq`, acknowledged against the `delivered` cursor.
-fn message_at_on(
-    conn: &Connection,
+pub(super) fn message_at_on(
+    conn: &dyn DbExec,
     agent_id: &AgentId,
     seq: i64,
     delivered: i64,
 ) -> Result<Option<Message>, Error> {
-    let found = conn
-        .prepare_cached(concat!(
+    conn.db_query_opt(
+        concat!(
             "SELECT ",
             message_cols!(),
             " FROM messages WHERE agent_id = ?1 AND seq = ?2"
-        ))?
-        .query_row(params![agent_id.as_str(), seq], |row| {
-            Ok(message_from_row_with_cursor(row, delivered))
-        })
-        .optional()?;
-    found.transpose()
+        ),
+        &db_params![agent_id.as_str(), seq],
+        |row| message_from_row_with_cursor_db(row, delivered),
+    )
 }
 
-fn group_members_on(conn: &Connection, name: &str) -> Result<Vec<String>, Error> {
-    let mut stmt = conn.prepare(
+fn group_members_on(conn: &dyn DbExec, name: &str) -> Result<Vec<String>, Error> {
+    conn.db_query_vec(
         "SELECT a.name FROM group_agents AS g JOIN agents AS a ON a.id = g.agent_id
          WHERE g.group_name = ?1 ORDER BY a.name",
-    )?;
-    let members = stmt
-        .query_map([name], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    Ok(members)
+        &db_params![name],
+        |row| row.get(0),
+    )
 }
 
-fn cursor(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
-    let found = conn
-        .prepare_cached("SELECT delivered_seq FROM mailbox_cursors WHERE agent_id = ?1")?
-        .query_row([agent_id.as_str()], |row| row.get(0))
-        .optional()?;
+pub(super) fn cursor(conn: &dyn DbExec, agent_id: &AgentId) -> Result<i64, Error> {
+    let found = conn.db_query_opt(
+        "SELECT delivered_seq FROM mailbox_cursors WHERE agent_id = ?1",
+        &db_params![agent_id.as_str()],
+        |row| row.get(0),
+    )?;
     found.ok_or_else(|| Error::Message(format!("mailbox cursor missing for {agent_id}")))
 }
 
-fn bump_delivered(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<(), Error> {
+fn bump_delivered(conn: &dyn DbExec, agent_id: &AgentId, seq: i64) -> Result<(), Error> {
     let delivered = cursor(conn, agent_id)?;
     if seq != delivered + 1 || !message_exists(conn, agent_id, seq)? {
         return Err(Error::CursorGap {
@@ -8567,17 +9164,19 @@ fn bump_delivered(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<(),
             attempted: seq,
         });
     }
-    conn.execute(
+    conn.db_execute(
         "UPDATE mailbox_cursors SET delivered_seq = ?1 WHERE agent_id = ?2",
-        params![seq, agent_id.as_str()],
+        &db_params![seq, agent_id.as_str()],
     )?;
     Ok(())
 }
 
-fn message_exists(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<bool, Error> {
-    let count: i64 = conn
-        .prepare_cached("SELECT COUNT(*) FROM messages WHERE agent_id = ?1 AND seq = ?2")?
-        .query_row(params![agent_id.as_str(), seq], |row| row.get(0))?;
+fn message_exists(conn: &dyn DbExec, agent_id: &AgentId, seq: i64) -> Result<bool, Error> {
+    let count: i64 = conn.db_query_one(
+        "SELECT COUNT(*) FROM messages WHERE agent_id = ?1 AND seq = ?2",
+        &db_params![agent_id.as_str(), seq],
+        |row| row.get(0),
+    )?;
     Ok(count == 1)
 }
 
@@ -8613,8 +9212,17 @@ mod tests {
             assert_eq!(temporary, 1, "large sorts must be able to spill to disk");
         }
         let reader = store.read_conn();
-        check(&reader, None);
-        check(&reader, Some(memory_index::ATTACHED));
+        match &reader {
+            ReadConn::Pooled { conn: Some(c), .. } | ReadConn::Owned(Some(c)) => {
+                check(c, None);
+                check(c, Some(memory_index::ATTACHED));
+            }
+            ReadConn::Guard(c, _) => {
+                check(c, None);
+                check(c, Some(memory_index::ATTACHED));
+            }
+            _ => panic!("expected SQLite reader"),
+        }
     }
 
     #[test]
@@ -9717,7 +10325,7 @@ mod tests {
         let lock = store.try_lock_agent(&owner.id).unwrap();
         // A concurrent fork can inherit this open file description until exec.
         // A clone deterministically models that lifetime without timing a fork.
-        let inherited = lock.file.try_clone().unwrap();
+        let inherited = lock.flock_file().try_clone().unwrap();
         drop(lock);
         let _next_turn = store.try_lock_agent(&owner.id).unwrap();
         drop(inherited);
@@ -9758,8 +10366,9 @@ mod tests {
             Err(Error::AgentBusy)
         ));
         // The next kernel adopts the keeper's descriptor and owns release.
-        let adopted =
-            AgentLock::adopt(std::os::fd::OwnedFd::from(keeper.file.try_clone().unwrap()));
+        let adopted = AgentLock::adopt(std::os::fd::OwnedFd::from(
+            keeper.flock_file().try_clone().unwrap(),
+        ));
         drop(keeper);
         assert!(matches!(
             store.try_lock_agent(&owner.id),
@@ -9781,7 +10390,7 @@ mod tests {
             };
             // A duplicate shares the open file description inherited by fork,
             // even when the descriptor is close-on-exec. No fork timing needed.
-            let inherited = lock.file.try_clone().unwrap();
+            let inherited = lock.flock_file().try_clone().unwrap();
             assert!(matches!(
                 store.try_lock_agent_lifecycle(&owner.id),
                 Err(Error::AgentBusy)
@@ -10321,9 +10930,9 @@ mod tests {
             .unwrap();
         // Historical names are not a permission boundary (e.g. after rename).
         store
-            .shared
-            .memory_index
-            .writer()
+            .memory_index()
+            .sqlite_writer()
+            .unwrap()
             .execute(
                 "UPDATE rag_chunks SET agent_name = 'own' WHERE agent_id = ?1",
                 [hidden.id.as_str()],
@@ -10501,7 +11110,7 @@ mod tests {
             .record_tool_event(&own.id, "browser", "legacy tool summary")
             .unwrap();
         {
-            let index = store.shared.memory_index.writer();
+            let index = store.memory_index().sqlite_writer().unwrap();
             index
                 .execute(
                     "UPDATE rag_chunks SET text='clipped' WHERE kind='message'",
@@ -10527,7 +11136,7 @@ mod tests {
         for _ in 0..100 {
             store.sync_memory_index().unwrap();
         }
-        let index = store.shared.memory_index.writer();
+        let index = store.memory_index().sqlite_writer().unwrap();
         let (messages, tools, stale): (i64, i64, i64) = index
             .query_row(
                 "SELECT count(*) FILTER (WHERE kind='message'), count(*) FILTER (WHERE kind='tool'),
@@ -10568,7 +11177,7 @@ mod tests {
         assert!(state_search.is_empty(), "{state_search:?}");
         let indexed: i64 = store
             .read_conn()
-            .query_row("SELECT count(*) FROM rag_chunks", [], |r| r.get(0))
+            .db_query_one("SELECT count(*) FROM rag_chunks", &[], |r| r.get(0))
             .unwrap();
         assert_eq!(indexed, 200);
 
@@ -10602,9 +11211,9 @@ mod tests {
             let started = std::time::Instant::now();
             store
                 .write_tx(|tx| {
-                    tx.execute(
+                    tx.db_execute(
                         "UPDATE agents SET description = 'x' WHERE id = ?1",
-                        [own.id.as_str()],
+                        &db_params![own.id.as_str()],
                     )?;
                     Ok(())
                 })
@@ -10632,7 +11241,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         let indexed: i64 = store
             .read_conn()
-            .query_row("SELECT count(*) FROM rag_chunks", [], |r| r.get(0))
+            .db_query_one("SELECT count(*) FROM rag_chunks", &[], |r| r.get(0))
             .unwrap();
         assert_eq!(indexed, 300);
         let state_bytes = std::fs::metadata(dir.path().join("state.db"))
@@ -10696,7 +11305,7 @@ mod tests {
                 "{term}"
             );
         }
-        let hashes: i64 = store.shared.memory_index.writer().query_row("SELECT count(DISTINCT content_hash) FROM rag_chunks WHERE agent_id=?1 AND direction='in'", [own.id.as_str()], |r| r.get(0)).unwrap();
+        let hashes: i64 = store.memory_index().sqlite_writer().unwrap().query_row("SELECT count(DISTINCT content_hash) FROM rag_chunks WHERE agent_id=?1 AND direction='in'", [own.id.as_str()], |r| r.get(0)).unwrap();
         assert_eq!(
             hashes, 2,
             "identical prefixes must not merge distinct tails"
@@ -10727,9 +11336,9 @@ mod tests {
         // A rebuild reads the redacted authoritative body, never an earlier
         // derivative snapshot.
         store
-            .shared
-            .memory_index
-            .writer()
+            .memory_index()
+            .sqlite_writer()
+            .unwrap()
             .execute("UPDATE index_meta SET value = 0 WHERE key = 'layout'", [])
             .unwrap();
         drop(store);
@@ -12530,12 +13139,11 @@ mod tests {
         let (_dir, store) = setup();
         let conn = store.conn();
         let plan = |sql: &str| -> String {
-            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            stmt.query_map([], |r| r.get::<_, String>(3))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect::<Vec<_>>()
-                .join("\n")
+            conn.db_query_vec(&format!("EXPLAIN QUERY PLAN {sql}"), &[], |r| {
+                r.get::<String>(3)
+            })
+            .unwrap()
+            .join("\n")
         };
         let count = plan("SELECT count(*) FROM agents WHERE state = 'archived'");
         assert!(count.contains("COVERING INDEX idx_agents_state"), "{count}");
@@ -12550,12 +13158,11 @@ mod tests {
         let (_dir, store) = setup();
         let conn = store.read_conn();
         let plan = |sql: &str| -> String {
-            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            stmt.query_map([], |r| r.get::<_, String>(3))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect::<Vec<_>>()
-                .join("\n")
+            conn.db_query_vec(&format!("EXPLAIN QUERY PLAN {sql}"), &[], |r| {
+                r.get::<String>(3)
+            })
+            .unwrap()
+            .join("\n")
         };
         let active = plan(concat!(
             "SELECT ",

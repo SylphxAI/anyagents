@@ -1,5 +1,5 @@
 //! Durable, immutable-ID principal grants, with a bounded legacy import.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -11,6 +11,8 @@ use anyagents_core::{Agent, AgentId, Error, Store};
 use serde_json::{Map, Value};
 
 const REGISTRY: &str = "execution-principals.json";
+const MAX_REGISTRY_BYTES: u64 = 64 * 1024 * 1024;
+const LAZY_PRUNE_THRESHOLD: usize = 256;
 
 type PrincipalTuple = (String, u32, u32, u32);
 type ParsedRegistry = (String, HashMap<String, PrincipalTuple>);
@@ -122,10 +124,10 @@ fn read_principal_registry_from_file(
     stamp: FileStamp,
 ) -> Result<Option<ParsedRegistry>, Error> {
     let mut raw = String::new();
-    file.take(1_048_577).read_to_string(&mut raw)?;
-    if raw.len() > 1_048_576 {
+    file.take(MAX_REGISTRY_BYTES + 1).read_to_string(&mut raw)?;
+    if raw.len() as u64 > MAX_REGISTRY_BYTES {
         return Err(Error::Message(
-            "execution principal registry exceeds 1 MiB".into(),
+            "execution principal registry exceeds 64 MiB".into(),
         ));
     }
     let me = super::current_uid();
@@ -181,11 +183,22 @@ fn trusted_file(file: &File) -> Result<FileStamp, Error> {
 
 /// Only the first daemon startup can import exact legacy OS account names.
 /// Thereafter the persisted registry, not a mutable name, is authoritative.
+/// Archived agent grants are pruned so the registry stays bounded by live seats.
 pub(crate) fn reconcile_principals(store: &Store) -> Result<(), Error> {
     if std::env::var_os("ANYAGENTS_PRINCIPALS").is_some() {
         return Ok(());
     }
-    update(store.data_dir(), &store.list_agents()?, true)
+    let all_agents = store.list_agents()?;
+    let archived_ids: HashSet<String> = all_agents
+        .iter()
+        .filter(|a| a.state == "archived")
+        .map(|a| a.id.to_string())
+        .collect();
+    let live_agents: Vec<Agent> = all_agents
+        .into_iter()
+        .filter(|a| a.state != "archived")
+        .collect();
+    update_with_prune(store.data_dir(), &live_agents, &archived_ids, true)
 }
 
 /// Optional account selection and UID assertion from an authenticated operator.
@@ -228,25 +241,46 @@ pub(crate) fn bind_principal(
     };
     let prefix = seat_prefix();
     let mut claimed = false;
+    let archived_for_prune = if read_admitted_principals(data)
+        .map(|m| m.len() >= LAZY_PRUNE_THRESHOLD)
+        .unwrap_or(false)
+    {
+        store
+            .list_agents()
+            .ok()
+            .map(|list| {
+                list.into_iter()
+                    .filter(|a| a.state == "archived" && a.id != agent.id)
+                    .map(|a| a.id.to_string())
+                    .collect::<HashSet<String>>()
+            })
+            .unwrap_or_default()
+    } else {
+        HashSet::new()
+    };
     edit_registry(data, |grants, _| {
         let socket_gid = registry_socket_gid(grants);
         claimed = claim_root_seat(grants, agent, root, &prefix, socket_gid, |user| {
             lookup_root_account(data, user)
         })?;
-        if claimed || grants.contains_key(agent.id.as_str()) {
-            return Ok(claimed);
+        let mut changed = claimed;
+        if !claimed && !grants.contains_key(agent.id.as_str()) {
+            // No named seat was requested or found; keep ordinary per-ID behavior.
+            changed = socket_gid.is_some_and(|gid| {
+                extend(
+                    grants,
+                    std::slice::from_ref(agent),
+                    &prefix,
+                    gid,
+                    false,
+                    lookup_account,
+                )
+            });
         }
-        // No named seat was requested or found; keep ordinary per-ID behavior.
-        Ok(socket_gid.is_some_and(|gid| {
-            extend(
-                grants,
-                std::slice::from_ref(agent),
-                &prefix,
-                gid,
-                false,
-                lookup_account,
-            )
-        }))
+        if prune_archived_grants(grants, &archived_for_prune) {
+            changed = true;
+        }
+        Ok(changed)
     })?;
     Ok(claimed)
 }
@@ -282,8 +316,17 @@ fn registry_socket_gid(grants: &Map<String, Value>) -> Option<u32> {
 }
 
 fn update(data: &Path, agents: &[Agent], import_legacy: bool) -> Result<(), Error> {
+    update_with_prune(data, agents, &HashSet::new(), import_legacy)
+}
+
+fn update_with_prune(
+    data: &Path,
+    agents: &[Agent],
+    archived_ids: &HashSet<String>,
+    import_legacy: bool,
+) -> Result<(), Error> {
     edit_registry(data, |grants, new| {
-        Ok(registry_socket_gid(grants).is_some_and(|gid| {
+        let extended = registry_socket_gid(grants).is_some_and(|gid| {
             extend(
                 grants,
                 agents,
@@ -292,8 +335,19 @@ fn update(data: &Path, agents: &[Agent], import_legacy: bool) -> Result<(), Erro
                 import_legacy && new,
                 lookup_account,
             )
-        }))
+        });
+        let pruned = prune_archived_grants(grants, archived_ids);
+        Ok(extended || pruned)
     })
+}
+
+fn prune_archived_grants(grants: &mut Map<String, Value>, archived_ids: &HashSet<String>) -> bool {
+    if archived_ids.is_empty() {
+        return false;
+    }
+    let before = grants.len();
+    grants.retain(|id, _| !archived_ids.contains(id.as_str()));
+    grants.len() != before
 }
 
 fn edit_registry(
@@ -731,5 +785,87 @@ mod tests {
             |user| (user == format!("seat-{}", agent.id)).then_some((42001, 42002))
         ));
         assert_eq!(grants[agent.id.as_str()]["uid"], 42001);
+    }
+
+    #[test]
+    fn reconcile_principals_prunes_archived_entries_and_reads_over_one_mib_registry() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::server::tests::env_lock();
+        let previous = std::env::var_os("ANYAGENTS_PRINCIPALS");
+        unsafe {
+            std::env::remove_var("ANYAGENTS_PRINCIPALS");
+        }
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let live_agent = store
+            .create_agent(NewAgent::new("live-worker", "codex"))
+            .unwrap();
+        let archived_parent = store
+            .create_agent(NewAgent::new("old-parent", "codex"))
+            .unwrap();
+        let mut child_req = NewAgent::new("live-child", "codex");
+        child_req.parent_id = Some(archived_parent.id.clone());
+        let live_child = store.create_agent(child_req).unwrap();
+        store
+            .set_agent_state(&archived_parent.id, "archived")
+            .unwrap();
+
+        let uid = if super::super::current_uid() == 42001 {
+            42002
+        } else {
+            42001
+        };
+        let mut seed = Map::new();
+        seed.insert(
+            live_agent.id.to_string(),
+            serde_json::json!({"user":"seat-live","uid":uid,"gid":42003,"socket_gid":42004}),
+        );
+        seed.insert(
+            archived_parent.id.to_string(),
+            serde_json::json!({"user":"seat-parent","uid":uid + 1,"gid":42005,"socket_gid":42004}),
+        );
+        let path = dir.path().join(REGISTRY);
+        std::fs::write(&path, Value::Object(seed).to_string()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        reconcile_principals(&store).unwrap();
+        let after = read_admitted_principals(dir.path()).unwrap();
+        assert!(after.contains_key(live_agent.id.as_str()));
+        assert!(
+            after.contains_key(live_child.id.as_str()),
+            "live child must inherit archived parent seat before pruning"
+        );
+        assert!(
+            !after.contains_key(archived_parent.id.as_str()),
+            "archived agent entry must be pruned from registry"
+        );
+
+        // Verify registries larger than 1 MiB no longer fail.
+        let mut huge = Map::new();
+        for n in 0..16_000 {
+            let id = AgentId::generate();
+            huge.insert(
+                id.to_string(),
+                serde_json::json!({
+                    "user": format!("seat-{n:05}"),
+                    "uid": uid + 10 + (n as u32),
+                    "gid": 42005,
+                    "socket_gid": 42004
+                }),
+            );
+        }
+        let huge_raw = Value::Object(huge).to_string();
+        assert!(huge_raw.len() > 1_048_576, "fixture must exceed 1 MiB");
+        std::fs::write(&path, huge_raw).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let parsed = read_admitted_principals(dir.path()).unwrap();
+        assert_eq!(parsed.len(), 16_000);
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ANYAGENTS_PRINCIPALS", value),
+                None => std::env::remove_var("ANYAGENTS_PRINCIPALS"),
+            }
+        }
     }
 }

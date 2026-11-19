@@ -938,6 +938,9 @@ pub(crate) struct Client {
     /// calls go straight through it instead of dialing the external socket,
     /// which closes at the start of a stop while admitted calls still drain.
     in_process: Option<axum::Router>,
+    /// Verified principal injected directly into `in_process` router calls so
+    /// HTTP MCP never reads pod-local `mcp-capability` or calls `operator::ensure()`.
+    in_process_principal: Option<crate::auth::Principal>,
     /// What every clone of this client shares: idle connections to the
     /// server and the capability file as last read.
     link: Arc<ServerLink>,
@@ -993,6 +996,7 @@ impl Client {
             via_http: false,
             turn_context: None,
             in_process: None,
+            in_process_principal: None,
             link: Arc::default(),
         }
     }
@@ -1005,10 +1009,11 @@ impl Client {
     }
 
     /// The client of an HTTP MCP tool server running inside `router`'s own
-    /// server process.
-    fn over_http_router(mut self, router: axum::Router) -> Self {
+    /// server process with a directly injected authenticated principal.
+    fn over_http_router(mut self, router: axum::Router, principal: crate::auth::Principal) -> Self {
         self.via_http = true;
         self.in_process = Some(router);
+        self.in_process_principal = Some(principal);
         self
     }
 
@@ -1050,16 +1055,26 @@ impl Client {
         agent_id: Option<&str>,
     ) -> Result<(hyper::StatusCode, Vec<u8>), String> {
         let payload = body.unwrap_or_default();
+        let cap_header = if self.in_process_principal.is_some() {
+            None
+        } else {
+            Some(capability)
+        };
         let fresh = || {
             let mut request = build_request(
                 method,
                 path,
                 Some(payload.clone()),
-                Some(capability),
+                cap_header,
                 None,
                 agent_id,
                 self.via_http,
             )?;
+            if let Some(principal) = &self.in_process_principal {
+                request
+                    .extensions_mut()
+                    .insert(crate::auth::InjectedPrincipal(principal.clone()));
+            }
             if path == "/v1/send"
                 && let Some(context) = self.turn_context.as_deref()
             {
@@ -3967,10 +3982,12 @@ impl AgentMcp {
         let scope = current_call().scope();
         let (val, media) = tokio::task::spawn_blocking(move || {
             let _scope = code_children::enter(scope);
-            let backend = <dyn anyagents_tools::WorkspaceBackend>::resolve(
+            let mode = anyagents_tools::SandboxMode::from_env();
+            let backend = anyagents_tools::resolve_workspace_backend_for_mode(
                 Some(&config_dir),
                 base_dir.clone(),
-            );
+                mode,
+            )?;
             execute_files_tool_with_media_backend(backend.as_ref(), &base_dir, args, limits)
         })
         .await
@@ -4687,9 +4704,16 @@ impl AgentMcp {
         let mut tools =
             tool_definitions_with_roles(self.profile, Some(&wd), self.client.socket.parent());
         if tools.iter().any(|t| t.name == "code") {
-            let backend =
-                <dyn anyagents_tools::WorkspaceBackend>::resolve(Some(&self.client.config), wd);
-            let description = code_tool_description(CodeLimits::current(), backend.kind());
+            let mode = anyagents_tools::SandboxMode::from_env();
+            let kind = match anyagents_tools::resolve_workspace_backend_for_mode(
+                Some(&self.client.config),
+                wd,
+                mode,
+            ) {
+                Ok(backend) => backend.kind(),
+                Err(_) => "remote-sandbox",
+            };
+            let description = code_tool_description(CodeLimits::current(), kind);
             for tool in tools.iter_mut().filter(|t| t.name == "code") {
                 tool.description = Some(description.clone().into());
             }
@@ -5209,13 +5233,13 @@ impl AgentMcp {
         agent: AgentRef,
         socket: PathBuf,
         config: PathBuf,
-        capability: String,
+        principal: crate::auth::Principal,
         profile: McpProfile,
         router: axum::Router,
     ) -> Self {
         Self {
             agent,
-            client: Client::new(socket, config, capability).over_http_router(router),
+            client: Client::new(socket, config, String::new()).over_http_router(router, principal),
             profile,
         }
     }
@@ -7097,10 +7121,406 @@ fn execute_remote_files_tool_with_media(
             }
             Ok((result, Vec::new()))
         }
+        "patch" | "apply_patch" => {
+            let patch_text = args
+                .patch
+                .or(args.content)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "`files` patch requires non-empty `patch`".to_string())?;
+            let val = apply_workspace_patch_with(&RemotePatchFs { backend }, &patch_text)?;
+            Ok((val, Vec::new()))
+        }
+        "glob" => {
+            let val = execute_remote_glob(backend, args)?;
+            Ok((val, Vec::new()))
+        }
+        "grep" | "search" => {
+            let val = execute_remote_grep(backend, args)?;
+            Ok((val, Vec::new()))
+        }
         other => Err(format!(
-            "remote sandbox `files` action `{other}` is not supported directly; use `read`, `write`, `edit`, `multi_edit`, `list`, or `exec`"
+            "remote sandbox `files` action `{other}` is not supported directly; use `read`, `write`, `edit`, `multi_edit`, `patch`, `list`, `glob`, `grep`, or `exec`"
         )),
     }
+}
+
+fn execute_remote_glob(
+    backend: &dyn anyagents_tools::WorkspaceBackend,
+    args: FilesArgs,
+) -> Result<serde_json::Value, String> {
+    let mut raw_pattern = args
+        .pattern
+        .or(args.glob)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut raw_path = args
+        .path
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if raw_pattern.is_none()
+        && let Some(ref p) = raw_path
+        && (p.contains('*') || p.contains('?') || p.contains('[') || p.contains('{'))
+    {
+        raw_pattern = Some(p.clone());
+        raw_path = None;
+    }
+    let search_root = backend.resolve_path(raw_path.as_deref(), false)?;
+    let pattern = raw_pattern.unwrap_or_else(|| "**/*".to_string());
+    let clean_pat = pattern.strip_prefix("./").unwrap_or(&pattern);
+    let max_results = args
+        .max_results
+        .unwrap_or(DEFAULT_GLOB_MAX_RESULTS)
+        .clamp(1, HARD_GLOB_MAX_RESULTS);
+    let include_hidden = args
+        .include_hidden
+        .unwrap_or_else(|| clean_pat.starts_with('.') || clean_pat.contains("/."));
+    let include_ignored = args.include_ignored.unwrap_or(false)
+        || DEFAULT_IGNORED_DIRS.iter().any(|d| clean_pat.contains(d));
+
+    let candidate_files =
+        remote_collect_workspace_files(backend, &search_root, include_hidden, include_ignored)?;
+    let mut matched = Vec::new();
+    let mut truncated = false;
+    let pat_has_slash = clean_pat.contains('/');
+    for rel in candidate_files {
+        let file_name = Path::new(&rel)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&rel);
+        let is_match =
+            glob_matches(clean_pat, &rel) || (!pat_has_slash && glob_matches(clean_pat, file_name));
+        if is_match {
+            if matched.len() >= max_results {
+                truncated = true;
+                break;
+            }
+            matched.push(rel);
+        }
+    }
+    let count = matched.len();
+    Ok(serde_json::json!({
+        "action": "glob",
+        "base_dir": search_root,
+        "pattern": pattern,
+        "files": matched,
+        "matches": matched,
+        "count": count,
+        "truncated": truncated,
+    }))
+}
+
+fn execute_remote_grep(
+    backend: &dyn anyagents_tools::WorkspaceBackend,
+    args: FilesArgs,
+) -> Result<serde_json::Value, String> {
+    let query = args
+        .query
+        .or(args.pattern)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "`files` grep requires a non-empty `query`".to_string())?;
+    let target_path = backend.resolve_path(args.path.as_deref(), false)?;
+    let max_results = args
+        .max_results
+        .unwrap_or(DEFAULT_GREP_MAX_RESULTS)
+        .clamp(1, HARD_GREP_MAX_RESULTS);
+    let context_lines = args.context_lines.unwrap_or(0).min(10);
+    let matcher = GrepMatcher::compile(
+        &query,
+        args.case_insensitive.unwrap_or(false),
+        args.literal.unwrap_or(false),
+    );
+    let file_glob = args
+        .glob
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.strip_prefix("./").unwrap_or(s));
+
+    let base_root = backend.root_display();
+    let files_to_search: Vec<(String, String)> = match backend.list_dir(Some(&target_path), true, 1)
+    {
+        Err(_) if backend.read_file_bytes(Some(&target_path)).is_ok() => {
+            let disp = remote_rel_display(&base_root, &target_path);
+            vec![(target_path, disp)]
+        }
+        Err(err) => {
+            if backend.read_file_bytes(Some(&target_path)).is_ok() {
+                let disp = remote_rel_display(&base_root, &target_path);
+                vec![(target_path, disp)]
+            } else {
+                return Err(format!(
+                    "grep target path `{target_path}` does not exist: {err}"
+                ));
+            }
+        }
+        Ok(_) => {
+            let include_hidden = args.include_hidden.unwrap_or(false);
+            let include_ignored = args.include_ignored.unwrap_or(false);
+            let rels = remote_collect_workspace_files(
+                backend,
+                &target_path,
+                include_hidden,
+                include_ignored,
+            )?;
+            rels.into_iter()
+                .filter(|rel| {
+                    if let Some(g) = file_glob {
+                        let fname = Path::new(rel)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(rel);
+                        glob_matches(g, rel) || (!g.contains('/') && glob_matches(g, fname))
+                    } else {
+                        true
+                    }
+                })
+                .map(|rel| {
+                    let abs = remote_join_path(&target_path, &rel);
+                    let disp = remote_rel_display(&base_root, &abs);
+                    (abs, disp)
+                })
+                .collect()
+        }
+    };
+
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    for (abs_path, disp_path) in files_to_search {
+        let Ok((_, bytes)) = backend.read_file_bytes(Some(&abs_path)) else {
+            continue;
+        };
+        if collect_grep_hits_from_bytes(
+            &bytes,
+            &disp_path,
+            &matcher,
+            context_lines,
+            max_results,
+            &mut matches,
+        ) {
+            truncated = true;
+            break;
+        }
+    }
+    let count = matches.len();
+    Ok(serde_json::json!({
+        "action": "grep",
+        "query": query,
+        "matches": matches,
+        "count": count,
+        "truncated": truncated,
+    }))
+}
+
+fn collect_grep_hits_from_bytes(
+    bytes: &[u8],
+    disp_path: &str,
+    matcher: &GrepMatcher,
+    context_lines: usize,
+    max_results: usize,
+    matches: &mut Vec<serde_json::Value>,
+) -> bool {
+    let probe_len = bytes.len().min(8192);
+    if bytes[..probe_len].contains(&0) {
+        return false;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    for (idx, line) in lines.iter().enumerate() {
+        if matcher.is_match(line) {
+            if matches.len() >= max_results {
+                return true;
+            }
+            let mut hit = serde_json::json!({
+                "path": disp_path,
+                "line": idx + 1,
+                "text": line,
+            });
+            if context_lines > 0
+                && let Some(obj) = hit.as_object_mut()
+            {
+                let before_start = idx.saturating_sub(context_lines);
+                let after_end = (idx + 1 + context_lines).min(lines.len());
+                let before: Vec<&str> = lines[before_start..idx].to_vec();
+                let after: Vec<&str> = lines[idx + 1..after_end].to_vec();
+                obj.insert("context_before".to_string(), serde_json::json!(before));
+                obj.insert("context_after".to_string(), serde_json::json!(after));
+            }
+            matches.push(hit);
+        }
+    }
+    false
+}
+
+fn remote_collect_workspace_files(
+    backend: &dyn anyagents_tools::WorkspaceBackend,
+    search_root: &str,
+    include_hidden: bool,
+    include_ignored: bool,
+) -> Result<Vec<String>, String> {
+    let gitignore_patterns = if include_ignored {
+        Vec::new()
+    } else {
+        let gi_path = remote_join_path(search_root, ".gitignore");
+        backend
+            .read_file_bytes(Some(&gi_path))
+            .ok()
+            .map(|(_, bytes)| parse_gitignore_patterns(&String::from_utf8_lossy(&bytes)))
+            .unwrap_or_default()
+    };
+
+    // Fast path: run `find . -type f` inside the remote sandbox to collect all files
+    // in one round-trip, falling back to recursive `list_dir` walk when `exec` does not
+    // return valid `find` output (e.g., restricted mock backends).
+    let find_cmd = "find . -maxdepth 16 -type f";
+    let mut candidates = if let Ok(out) = backend.exec(find_cmd, Some(search_root), Some(20_000))
+        && out.exit_code == 0
+        && out
+            .stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .any(|l| l.trim().starts_with("./"))
+        && out
+            .stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .all(|l| l.trim().starts_with("./"))
+    {
+        out.stdout
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("./"))
+            .filter(|rel| !rel.is_empty())
+            .filter(|rel| {
+                let parts: Vec<&str> = rel.split('/').collect();
+                if !include_hidden && parts.iter().any(|p| p.starts_with('.')) {
+                    return false;
+                }
+                if !include_ignored
+                    && parts
+                        .iter()
+                        .take(parts.len().saturating_sub(1))
+                        .any(|d| DEFAULT_IGNORED_DIRS.contains(d))
+                {
+                    return false;
+                }
+                let fname = parts.last().copied().unwrap_or("");
+                include_ignored || !is_gitignored(rel, fname, &gitignore_patterns)
+            })
+            .map(str::to_string)
+            .collect()
+    } else {
+        let mut collected = Vec::new();
+        remote_walk_dir_recursive(
+            backend,
+            search_root,
+            "",
+            include_hidden,
+            include_ignored,
+            &gitignore_patterns,
+            &mut collected,
+            0,
+        )?;
+        collected
+    };
+
+    candidates.sort();
+    Ok(candidates)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remote_walk_dir_recursive(
+    backend: &dyn anyagents_tools::WorkspaceBackend,
+    abs_dir: &str,
+    rel_prefix: &str,
+    include_hidden: bool,
+    include_ignored: bool,
+    gitignore_patterns: &[String],
+    out: &mut Vec<String>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 16 {
+        return Ok(());
+    }
+    let val = backend.list_dir(Some(abs_dir), include_hidden, HARD_GLOB_MAX_RESULTS)?;
+    let Some(entries) = val.get("entries").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let Some(name) = entry.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if name == "." || name == ".." || name.is_empty() {
+            continue;
+        }
+        if !include_hidden && name.starts_with('.') {
+            continue;
+        }
+        let kind = entry
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("file");
+        let rel = if rel_prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{rel_prefix}/{name}")
+        };
+        if kind == "dir" {
+            if !include_ignored && DEFAULT_IGNORED_DIRS.contains(&name) {
+                continue;
+            }
+            if !include_ignored && is_gitignored(&rel, name, gitignore_patterns) {
+                continue;
+            }
+            let child_abs = remote_join_path(abs_dir, name);
+            remote_walk_dir_recursive(
+                backend,
+                &child_abs,
+                &rel,
+                include_hidden,
+                include_ignored,
+                gitignore_patterns,
+                out,
+                depth + 1,
+            )?;
+        } else {
+            if !include_ignored && is_gitignored(&rel, name, gitignore_patterns) {
+                continue;
+            }
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
+fn remote_join_path(base: &str, rel: &str) -> String {
+    let base_clean = base.trim_end_matches('/');
+    let rel_clean = rel.trim_start_matches('/');
+    if base_clean.is_empty() {
+        format!("/{rel_clean}")
+    } else if rel_clean.is_empty() {
+        base_clean.to_string()
+    } else {
+        format!("{base_clean}/{rel_clean}")
+    }
+}
+
+fn remote_rel_display(base_root: &str, abs_path: &str) -> String {
+    let root_clean = base_root.trim_end_matches('/');
+    if root_clean.is_empty() {
+        abs_path.to_string()
+    } else if let Some(stripped) = abs_path
+        .strip_prefix(root_clean)
+        .and_then(|s| s.strip_prefix('/'))
+        .filter(|s| !s.is_empty())
+    {
+        stripped.to_string()
+    } else {
+        abs_path.to_string()
+    }
+}
+
+fn shell_quote_remote(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "'\"'\"'"))
 }
 
 fn execute_files_tool_with_media(
@@ -7599,39 +8019,20 @@ fn execute_files_tool(
 
             let mut matches = Vec::new();
             let mut truncated = false;
-            'file_loop: for (abs_path, disp_path) in files_to_search {
+            for (abs_path, disp_path) in files_to_search {
                 let Ok(bytes) = std::fs::read(&abs_path) else {
                     continue;
                 };
-                let probe_len = bytes.len().min(8192);
-                if bytes[..probe_len].contains(&0) {
-                    continue;
-                }
-                let text = String::from_utf8_lossy(&bytes);
-                let lines: Vec<&str> = text.lines().collect();
-                for (idx, line) in lines.iter().enumerate() {
-                    if matcher.is_match(line) {
-                        if matches.len() >= max_results {
-                            truncated = true;
-                            break 'file_loop;
-                        }
-                        let mut hit = serde_json::json!({
-                            "path": disp_path,
-                            "line": idx + 1,
-                            "text": line,
-                        });
-                        if context_lines > 0
-                            && let Some(obj) = hit.as_object_mut()
-                        {
-                            let before_start = idx.saturating_sub(context_lines);
-                            let after_end = (idx + 1 + context_lines).min(lines.len());
-                            let before: Vec<&str> = lines[before_start..idx].to_vec();
-                            let after: Vec<&str> = lines[idx + 1..after_end].to_vec();
-                            obj.insert("context_before".to_string(), serde_json::json!(before));
-                            obj.insert("context_after".to_string(), serde_json::json!(after));
-                        }
-                        matches.push(hit);
-                    }
+                if collect_grep_hits_from_bytes(
+                    &bytes,
+                    &disp_path,
+                    &matcher,
+                    context_lines,
+                    max_results,
+                    &mut matches,
+                ) {
+                    truncated = true;
+                    break;
                 }
             }
             let count = matches.len();
@@ -8044,16 +8445,111 @@ fn is_v4a_patch(text: &str) -> bool {
     })
 }
 
+fn clean_patch_rel(raw: &str) -> &str {
+    let t = raw.trim();
+    t.strip_prefix("a/")
+        .or_else(|| t.strip_prefix("b/"))
+        .unwrap_or(t)
+}
+
 fn resolve_patch_rel_path(base_dir: &Path, raw: &str) -> Result<PathBuf, String> {
-    let clean = raw
-        .trim()
-        .strip_prefix("a/")
-        .or_else(|| raw.trim().strip_prefix("b/"))
-        .unwrap_or(raw.trim());
-    resolve_workspace_path(base_dir, Some(clean), true)
+    resolve_workspace_path(base_dir, Some(clean_patch_rel(raw)), true)
+}
+
+trait PatchFs {
+    fn resolve(&self, raw: &str) -> Result<String, String>;
+    fn read_text(&self, resolved: &str, rel_label: &str) -> Result<String, String>;
+    fn write_text(&self, resolved: &str, rel_label: &str, content: &str) -> Result<String, String>;
+    fn delete_if_exists(&self, resolved: &str, rel_label: &str) -> Result<(), String>;
+}
+
+struct LocalPatchFs<'a> {
+    base_dir: &'a Path,
+}
+
+impl PatchFs for LocalPatchFs<'_> {
+    fn resolve(&self, raw: &str) -> Result<String, String> {
+        Ok(resolve_patch_rel_path(self.base_dir, raw)?
+            .display()
+            .to_string())
+    }
+
+    fn read_text(&self, resolved: &str, rel_label: &str) -> Result<String, String> {
+        std::fs::read_to_string(resolved).map_err(|e| format!("failed reading `{rel_label}`: {e}"))
+    }
+
+    fn write_text(&self, resolved: &str, rel_label: &str, content: &str) -> Result<String, String> {
+        let p = Path::new(resolved);
+        if let Some(parent) = p.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!("failed creating parent directory {}: {e}", parent.display())
+            })?;
+        }
+        std::fs::write(p, content.as_bytes())
+            .map_err(|e| format!("failed writing `{rel_label}`: {e}"))?;
+        Ok(sha256_hex(content.as_bytes()))
+    }
+
+    fn delete_if_exists(&self, resolved: &str, rel_label: &str) -> Result<(), String> {
+        let p = Path::new(resolved);
+        if p.exists() {
+            std::fs::remove_file(p).map_err(|e| format!("failed deleting `{rel_label}`: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+struct RemotePatchFs<'a> {
+    backend: &'a dyn anyagents_tools::WorkspaceBackend,
+}
+
+impl PatchFs for RemotePatchFs<'_> {
+    fn resolve(&self, raw: &str) -> Result<String, String> {
+        self.backend.resolve_path(Some(clean_patch_rel(raw)), true)
+    }
+
+    fn read_text(&self, resolved: &str, rel_label: &str) -> Result<String, String> {
+        let (_, bytes) = self
+            .backend
+            .read_file_bytes(Some(resolved))
+            .map_err(|e| format!("failed reading `{rel_label}`: {e}"))?;
+        String::from_utf8(bytes).map_err(|e| format!("`{rel_label}` is not valid UTF-8: {e}"))
+    }
+
+    fn write_text(&self, resolved: &str, rel_label: &str, content: &str) -> Result<String, String> {
+        let (_, _, sha256) = self
+            .backend
+            .write_file_bytes(Some(resolved), content.as_bytes(), false, true)
+            .map_err(|e| format!("failed writing `{rel_label}`: {e}"))?;
+        Ok(sha256)
+    }
+
+    fn delete_if_exists(&self, resolved: &str, rel_label: &str) -> Result<(), String> {
+        let cmd = format!("rm -f -- {}", shell_quote_remote(resolved));
+        let out = self
+            .backend
+            .exec(&cmd, None, Some(15_000))
+            .map_err(|e| format!("failed deleting `{rel_label}`: {e}"))?;
+        if out.exit_code != 0 {
+            return Err(format!(
+                "failed deleting `{rel_label}`: {}",
+                out.stderr.trim()
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn apply_workspace_patch(base_dir: &Path, patch_text: &str) -> Result<serde_json::Value, String> {
+    apply_workspace_patch_with(&LocalPatchFs { base_dir }, patch_text)
+}
+
+fn apply_workspace_patch_with(
+    fs: &dyn PatchFs,
+    patch_text: &str,
+) -> Result<serde_json::Value, String> {
     let normalized = patch_text.replace("\r\n", "\n");
     let lines: Vec<&str> = normalized.lines().collect();
     let mut operations = Vec::new();
@@ -8083,26 +8579,17 @@ fn apply_workspace_patch(base_dir: &Path, patch_text: &str) -> Result<serde_json
                     }
                     i += 1;
                 }
-                let target = resolve_patch_rel_path(base_dir, rel)?;
-                if let Some(p) = target.parent()
-                    && !p.as_os_str().is_empty()
-                {
-                    std::fs::create_dir_all(p).map_err(|e| {
-                        format!("failed creating parent directory {}: {e}", p.display())
-                    })?;
-                }
+                let target = fs.resolve(rel)?;
                 let mut content = body_lines.join("\n");
                 if !content.is_empty() && !content.ends_with('\n') {
                     content.push('\n');
                 }
-                std::fs::write(&target, content.as_bytes())
-                    .map_err(|e| format!("failed writing `{rel}`: {e}"))?;
-                let sha256 = sha256_hex(content.as_bytes());
+                let sha256 = fs.write_text(&target, rel, &content)?;
                 files.push(rel.to_string());
                 operations.push(serde_json::json!({
                     "op": "add",
                     "path": rel,
-                    "resolved_path": target.display().to_string(),
+                    "resolved_path": target,
                     "sha256": sha256,
                 }));
                 continue;
@@ -8112,16 +8599,13 @@ fn apply_workspace_patch(base_dir: &Path, patch_text: &str) -> Result<serde_json
                 while i < lines.len() && !lines[i].trim().starts_with("*** ") {
                     i += 1;
                 }
-                let target = resolve_patch_rel_path(base_dir, rel)?;
-                if target.exists() {
-                    std::fs::remove_file(&target)
-                        .map_err(|e| format!("failed deleting `{rel}`: {e}"))?;
-                }
+                let target = fs.resolve(rel)?;
+                fs.delete_if_exists(&target, rel)?;
                 files.push(rel.to_string());
                 operations.push(serde_json::json!({
                     "op": "delete",
                     "path": rel,
-                    "resolved_path": target.display().to_string(),
+                    "resolved_path": target,
                 }));
                 continue;
             }
@@ -8141,42 +8625,31 @@ fn apply_workspace_patch(base_dir: &Path, patch_text: &str) -> Result<serde_json
                     }
                     i += 1;
                 }
-                let target = resolve_patch_rel_path(base_dir, rel)?;
-                let existing = std::fs::read_to_string(&target)
-                    .map_err(|e| format!("failed reading `{rel}`: {e}"))?;
+                let target = fs.resolve(rel)?;
+                let existing = fs.read_text(&target, rel)?;
                 let updated = apply_patch_context_hunks(&existing, &hunk_lines)
                     .map_err(|e| format!("failed patching `{rel}`: {e}"))?;
-                let sha256 = sha256_hex(updated.as_bytes());
                 if let Some(dest_rel) = move_to {
-                    let dest = resolve_patch_rel_path(base_dir, &dest_rel)?;
-                    if let Some(p) = dest.parent()
-                        && !p.as_os_str().is_empty()
-                    {
-                        std::fs::create_dir_all(p).map_err(|e| {
-                            format!("failed creating parent directory {}: {e}", p.display())
-                        })?;
-                    }
-                    std::fs::write(&dest, updated.as_bytes())
-                        .map_err(|e| format!("failed writing `{dest_rel}`: {e}"))?;
-                    if dest != target && target.exists() {
-                        let _ = std::fs::remove_file(&target);
+                    let dest = fs.resolve(&dest_rel)?;
+                    let sha256 = fs.write_text(&dest, &dest_rel, &updated)?;
+                    if dest != target {
+                        let _ = fs.delete_if_exists(&target, rel);
                     }
                     files.push(dest_rel.clone());
                     operations.push(serde_json::json!({
                         "op": "update",
                         "path": rel,
                         "moved_to": dest_rel,
-                        "resolved_path": dest.display().to_string(),
+                        "resolved_path": dest,
                         "sha256": sha256,
                     }));
                 } else {
-                    std::fs::write(&target, updated.as_bytes())
-                        .map_err(|e| format!("failed writing `{rel}`: {e}"))?;
+                    let sha256 = fs.write_text(&target, rel, &updated)?;
                     files.push(rel.to_string());
                     operations.push(serde_json::json!({
                         "op": "update",
                         "path": rel,
-                        "resolved_path": target.display().to_string(),
+                        "resolved_path": target,
                         "sha256": sha256,
                     }));
                 }
@@ -8215,27 +8688,17 @@ fn apply_workspace_patch(base_dir: &Path, patch_text: &str) -> Result<serde_json
                     i += 1;
                 }
                 if new_header == "/dev/null" {
-                    let target = resolve_patch_rel_path(base_dir, old_header)?;
-                    if target.exists() {
-                        std::fs::remove_file(&target)
-                            .map_err(|e| format!("failed deleting `{old_header}`: {e}"))?;
-                    }
+                    let target = fs.resolve(old_header)?;
+                    fs.delete_if_exists(&target, old_header)?;
                     let clean_rel = old_header.strip_prefix("a/").unwrap_or(old_header);
                     files.push(clean_rel.to_string());
                     operations.push(serde_json::json!({
                         "op": "delete",
                         "path": clean_rel,
-                        "resolved_path": target.display().to_string(),
+                        "resolved_path": target,
                     }));
                 } else if old_header == "/dev/null" {
-                    let target = resolve_patch_rel_path(base_dir, new_header)?;
-                    if let Some(p) = target.parent()
-                        && !p.as_os_str().is_empty()
-                    {
-                        std::fs::create_dir_all(p).map_err(|e| {
-                            format!("failed creating parent directory {}: {e}", p.display())
-                        })?;
-                    }
+                    let target = fs.resolve(new_header)?;
                     let mut added = Vec::new();
                     for hl in &hunk_lines {
                         if hl.starts_with("@@") || hl.starts_with("\\ No newline") {
@@ -8251,15 +8714,13 @@ fn apply_workspace_patch(base_dir: &Path, patch_text: &str) -> Result<serde_json
                     if !content.is_empty() {
                         content.push('\n');
                     }
-                    std::fs::write(&target, content.as_bytes())
-                        .map_err(|e| format!("failed writing `{new_header}`: {e}"))?;
-                    let sha256 = sha256_hex(content.as_bytes());
+                    let sha256 = fs.write_text(&target, new_header, &content)?;
                     let clean_rel = new_header.strip_prefix("b/").unwrap_or(new_header);
                     files.push(clean_rel.to_string());
                     operations.push(serde_json::json!({
                         "op": "add",
                         "path": clean_rel,
-                        "resolved_path": target.display().to_string(),
+                        "resolved_path": target,
                         "sha256": sha256,
                     }));
                 } else {
@@ -8268,14 +8729,11 @@ fn apply_workspace_patch(base_dir: &Path, patch_text: &str) -> Result<serde_json
                     } else {
                         old_header
                     };
-                    let target = resolve_patch_rel_path(base_dir, rel)?;
-                    let existing = std::fs::read_to_string(&target)
-                        .map_err(|e| format!("failed reading `{rel}`: {e}"))?;
+                    let target = fs.resolve(rel)?;
+                    let existing = fs.read_text(&target, rel)?;
                     let updated = apply_patch_context_hunks(&existing, &hunk_lines)
                         .map_err(|e| format!("failed applying hunk to `{rel}`: {e}"))?;
-                    std::fs::write(&target, updated.as_bytes())
-                        .map_err(|e| format!("failed writing `{rel}`: {e}"))?;
-                    let sha256 = sha256_hex(updated.as_bytes());
+                    let sha256 = fs.write_text(&target, rel, &updated)?;
                     let clean_rel = rel
                         .strip_prefix("b/")
                         .or_else(|| rel.strip_prefix("a/"))
@@ -8284,7 +8742,7 @@ fn apply_workspace_patch(base_dir: &Path, patch_text: &str) -> Result<serde_json
                     operations.push(serde_json::json!({
                         "op": "update",
                         "path": clean_rel,
-                        "resolved_path": target.display().to_string(),
+                        "resolved_path": target,
                         "sha256": sha256,
                     }));
                 }
@@ -8452,6 +8910,10 @@ fn read_gitignore_patterns(root: &Path) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
+    parse_gitignore_patterns(&text)
+}
+
+fn parse_gitignore_patterns(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('!'))
@@ -12914,5 +13376,232 @@ mod client_link_tests {
             ["first", "first", "second", "third-and-longer", "at-start"]
         );
         server.abort();
+    }
+
+    #[test]
+    fn remote_sandbox_files_supports_glob_grep_and_patch() {
+        use anyagents_tools::{ExecOutput, WorkspaceBackend, resolve_workspace_path};
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+
+        struct MockRemoteFs {
+            root: PathBuf,
+            files: Mutex<BTreeMap<String, Vec<u8>>>,
+        }
+
+        impl WorkspaceBackend for MockRemoteFs {
+            fn kind(&self) -> &'static str {
+                "cloud-sandbox"
+            }
+            fn base_path(&self) -> &Path {
+                self.root.as_path()
+            }
+            fn exec(
+                &self,
+                command: &str,
+                _cwd: Option<&str>,
+                _timeout_ms: Option<u64>,
+            ) -> Result<ExecOutput, String> {
+                if let Some(target) = command.strip_prefix("rm -f -- '")
+                    && let Some(clean) = target.strip_suffix('\'')
+                {
+                    let clean = clean.replace("'\"'\"'", "'");
+                    self.files.lock().unwrap().remove(&clean);
+                    return Ok(ExecOutput {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        exit_code: 0,
+                    });
+                }
+                Ok(ExecOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 1,
+                })
+            }
+            fn read_file_bytes(&self, path: Option<&str>) -> Result<(String, Vec<u8>), String> {
+                let resolved = resolve_workspace_path(&self.root, path, true)?;
+                let guard = self.files.lock().unwrap();
+                let bytes = guard
+                    .get(&resolved)
+                    .cloned()
+                    .ok_or_else(|| format!("ENOENT: {resolved}"))?;
+                Ok((resolved, bytes))
+            }
+            fn write_file_bytes(
+                &self,
+                path: Option<&str>,
+                content: &[u8],
+                append: bool,
+                overwrite: bool,
+            ) -> Result<(String, usize, String), String> {
+                let resolved = resolve_workspace_path(&self.root, path, true)?;
+                let mut guard = self.files.lock().unwrap();
+                let final_bytes = if append {
+                    let mut v = guard.get(&resolved).cloned().unwrap_or_default();
+                    v.extend_from_slice(content);
+                    v
+                } else {
+                    if !overwrite && guard.contains_key(&resolved) {
+                        return Err("exists".into());
+                    }
+                    content.to_vec()
+                };
+                let sha = sha256_hex(&final_bytes);
+                let len = final_bytes.len();
+                guard.insert(resolved.clone(), final_bytes);
+                Ok((resolved, len, sha))
+            }
+            fn list_dir(
+                &self,
+                path: Option<&str>,
+                include_hidden: bool,
+                max_results: usize,
+            ) -> Result<serde_json::Value, String> {
+                let resolved = resolve_workspace_path(&self.root, path, false)?;
+                let guard = self.files.lock().unwrap();
+                if guard.contains_key(&resolved) {
+                    return Err("not a directory".into());
+                }
+                let prefix = format!("{}/", resolved.trim_end_matches('/'));
+                let mut seen: BTreeMap<String, (&'static str, usize)> = BTreeMap::new();
+                for (k, v) in guard.iter() {
+                    if let Some(rest) = k.strip_prefix(&prefix)
+                        && !rest.is_empty()
+                    {
+                        if let Some((dir, _)) = rest.split_once('/') {
+                            if include_hidden || !dir.starts_with('.') {
+                                seen.insert(dir.to_string(), ("dir", 0));
+                            }
+                        } else if include_hidden || !rest.starts_with('.') {
+                            seen.insert(rest.to_string(), ("file", v.len()));
+                        }
+                    }
+                }
+                let mut entries: Vec<serde_json::Value> = seen
+                    .into_iter()
+                    .take(max_results)
+                    .map(|(name, (kind, bytes))| {
+                        serde_json::json!({
+                            "name": name,
+                            "path": format!("{prefix}{name}"),
+                            "kind": kind,
+                            "bytes": bytes,
+                        })
+                    })
+                    .collect();
+                let count = entries.len();
+                Ok(serde_json::json!({
+                    "action": "list",
+                    "path": resolved,
+                    "entries": std::mem::take(&mut entries),
+                    "count": count,
+                    "truncated": false,
+                }))
+            }
+        }
+
+        let mut initial = BTreeMap::new();
+        initial.insert("/ws/.gitignore".into(), b"ignored.rs\n".to_vec());
+        initial.insert(
+            "/ws/src/main.rs".into(),
+            b"fn main() {\n    println!(\"hello\");\n}\n".to_vec(),
+        );
+        initial.insert(
+            "/ws/src/ignored.rs".into(),
+            b"// should skip\nfn hidden_match() {}\n".to_vec(),
+        );
+        initial.insert("/ws/README.md".into(), b"# Project\n".to_vec());
+        let backend = MockRemoteFs {
+            root: PathBuf::from("/ws"),
+            files: Mutex::new(initial),
+        };
+
+        // 1. Remote `glob` skips .gitignore and matches pattern.
+        let glob_res = execute_remote_files_tool_with_media(
+            &backend,
+            FilesArgs {
+                action: Some("glob".into()),
+                pattern: Some("**/*.rs".into()),
+                ..Default::default()
+            },
+            CodeLimits::current(),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(glob_res["files"], serde_json::json!(["src/main.rs"]));
+
+        // 2. Remote `grep` searches file contents + context lines.
+        let grep_res = execute_remote_files_tool_with_media(
+            &backend,
+            FilesArgs {
+                action: Some("grep".into()),
+                query: Some("hello".into()),
+                glob: Some("*.rs".into()),
+                context_lines: Some(1),
+                ..Default::default()
+            },
+            CodeLimits::current(),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(grep_res["count"], 1);
+        assert_eq!(grep_res["matches"][0]["path"], "src/main.rs");
+        assert_eq!(grep_res["matches"][0]["line"], 2);
+        assert_eq!(grep_res["matches"][0]["context_before"][0], "fn main() {");
+
+        // 3. Remote `patch` supports V4A add/update/delete.
+        let v4a = concat!(
+            "*** Begin Patch\n",
+            "*** Add File: src/lib.rs\n",
+            "+pub fn greet() {}\n",
+            "*** Update File: src/main.rs\n",
+            "@@\n",
+            " fn main() {\n",
+            "-    println!(\"hello\");\n",
+            "+    println!(\"patched\");\n",
+            " }\n",
+            "*** Delete File: README.md\n",
+            "*** End Patch\n",
+        );
+        let patch_res = execute_remote_files_tool_with_media(
+            &backend,
+            FilesArgs {
+                action: Some("patch".into()),
+                patch: Some(v4a.into()),
+                ..Default::default()
+            },
+            CodeLimits::current(),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(patch_res["count"], 3);
+        let main_bytes = backend.read_file_bytes(Some("src/main.rs")).unwrap().1;
+        assert!(String::from_utf8_lossy(&main_bytes).contains("patched"));
+        assert!(backend.read_file_bytes(Some("src/lib.rs")).is_ok());
+        assert!(backend.read_file_bytes(Some("README.md")).is_err());
+
+        // 4. Unified diff also works remotely.
+        let udiff = concat!(
+            "--- a/src/lib.rs\n",
+            "+++ b/src/lib.rs\n",
+            "@@ -1,1 +1,2 @@\n",
+            " pub fn greet() {}\n",
+            "+pub fn extra() {}\n",
+        );
+        let udiff_res = execute_remote_files_tool_with_media(
+            &backend,
+            FilesArgs {
+                action: Some("patch".into()),
+                patch: Some(udiff.into()),
+                ..Default::default()
+            },
+            CodeLimits::current(),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(udiff_res["count"], 1);
+        let lib_bytes = backend.read_file_bytes(Some("src/lib.rs")).unwrap().1;
+        assert!(String::from_utf8_lossy(&lib_bytes).contains("extra"));
     }
 }

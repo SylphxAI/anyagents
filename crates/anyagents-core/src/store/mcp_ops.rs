@@ -2,9 +2,8 @@
 //! Telegram bot reading its own channel. Each is one indexed lookup on a read
 //! connection, with no agent row decoded and no other channel read.
 
-use rusqlite::OptionalExtension;
-
-use super::{AgentId, Channel, ChannelId, Error, Store, agents_of, channel_from_row, hash};
+use super::{AgentId, Channel, ChannelId, Error, Store, agents_of, channel_from_row_db, hash};
+use crate::db::{DbExecExt as _, db_params};
 
 impl Store {
     /// The agent a presented capability authenticates, when the server minted
@@ -18,16 +17,13 @@ impl Store {
     ) -> Result<Option<(AgentId, Option<String>)>, Error> {
         let digest = hash(&self.capability_key()?, token);
         let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached(
+        let found = conn.db_query_opt(
             "SELECT c.agent_id, a.name FROM agent_capabilities c
              LEFT JOIN agents a ON a.id = c.agent_id
              WHERE c.token_hash = ?1 AND c.revoked_at_ms IS NULL",
+            &db_params![digest],
+            |row| Ok((row.get::<String>(0)?, row.get::<Option<String>>(1)?)),
         )?;
-        let found = stmt
-            .query_row([digest.as_str()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })
-            .optional()?;
         found
             .map(|(id, name)| Ok((AgentId::parse(&id)?, name)))
             .transpose()
@@ -36,13 +32,12 @@ impl Store {
     /// One channel, with the agents attached to it, or `None` when it is gone.
     pub fn channel(&self, id: &ChannelId) -> Result<Option<Channel>, Error> {
         let conn = self.read_conn();
-        let found = conn
-            .prepare_cached(
-                "SELECT id, kind, identity, config, credential_ref, created_at_ms, state
-                 FROM channels WHERE id = ?1",
-            )?
-            .query_row([id.as_str()], channel_from_row)
-            .optional()?;
+        let found = conn.db_query_opt(
+            "SELECT id, kind, identity, config, credential_ref, created_at_ms, state
+             FROM channels WHERE id = ?1",
+            &db_params![id],
+            channel_from_row_db,
+        )?;
         let Some(mut channel) = found else {
             return Ok(None);
         };

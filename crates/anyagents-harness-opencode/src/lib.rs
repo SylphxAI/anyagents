@@ -233,6 +233,13 @@ struct State {
     /// unproven prompts settle atomically.
     settling: usize,
     turns_completed: u32,
+    /// Set when OpenCode emits an SSE error or quota event during an active
+    /// prompt/turn so `watch_turn` never counts an errored turn as completed.
+    turn_errored: bool,
+    /// Quota reset instant (epoch ms) observed from an OpenCode SSE quota/rate-limit event.
+    quota_reset_at_ms: Option<i64>,
+    /// Upstream AI/auth/session error reported on OpenCode's SSE event stream.
+    sign_in_fault: Option<String>,
     /// `turns_completed` when the session's totals were last read.
     usage_read_at: Option<u32>,
     /// What this process served, as last read: the host records differences
@@ -801,6 +808,255 @@ fn follow_events(vendor: &Arc<Vendor>, launch: u64) {
     vendor.changed.notify_all();
 }
 
+fn event_str<'a>(event: &'a Value, pointers: &[&str]) -> Option<&'a str> {
+    pointers
+        .iter()
+        .find_map(|ptr| event.pointer(ptr).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn event_i64(event: &Value, pointers: &[&str]) -> Option<i64> {
+    pointers
+        .iter()
+        .find_map(|ptr| event.pointer(ptr).and_then(Value::as_i64))
+}
+
+fn event_f64(event: &Value, pointers: &[&str]) -> Option<f64> {
+    pointers.iter().find_map(|ptr| {
+        let v = event.pointer(ptr)?;
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+    })
+}
+
+fn find_quota_reset_in_event(event: &Value, message: &str, observed_ms: i64) -> Option<i64> {
+    if let Some(ms) = event_i64(
+        event,
+        &[
+            "/data/quota_reset_at_ms",
+            "/data/resets_at_ms",
+            "/data/reset_at_ms",
+            "/data/error/data/quota_reset_at_ms",
+            "/data/error/data/resets_at_ms",
+            "/data/error/data/reset_at_ms",
+            "/properties/quota_reset_at_ms",
+            "/properties/resets_at_ms",
+            "/properties/error/data/resets_at_ms",
+            "/quota_reset_at_ms",
+            "/resets_at_ms",
+            "/reset_at_ms",
+        ],
+    ) {
+        return Some(ms);
+    }
+    if let Some(n) = event_i64(
+        event,
+        &[
+            "/data/resetsAt",
+            "/data/resetAt",
+            "/data/next",
+            "/data/status/next",
+            "/properties/status/next",
+            "/resetsAt",
+            "/resetAt",
+        ],
+    ) {
+        return Some(if n >= 1_000_000_000_000 {
+            n
+        } else {
+            n.saturating_mul(1_000)
+        });
+    }
+    if let Some(s) = event_str(
+        event,
+        &[
+            "/data/resetsAt",
+            "/data/resetAt",
+            "/data/resets_at",
+            "/data/error/data/resets_at",
+            "/properties/resetsAt",
+            "/resets_at",
+        ],
+    ) && let Some(ms) = anyagents_harness::quota::parse_rfc3339_utc_ms(s)
+    {
+        return Some(ms);
+    }
+    if let Some(delay_ms) = event_i64(
+        event,
+        &[
+            "/data/retry_after_ms",
+            "/data/retryAfterMs",
+            "/data/error/data/retry_after_ms",
+            "/properties/retry_after_ms",
+            "/retry_after_ms",
+        ],
+    ) && delay_ms >= 0
+    {
+        return Some(observed_ms.saturating_add(delay_ms));
+    }
+    if let Some(secs) = event_f64(
+        event,
+        &[
+            "/data/retry_after",
+            "/data/retryAfter",
+            "/data/error/data/retry_after",
+            "/data/error/data/responseHeaders/retry-after",
+            "/properties/error/data/responseHeaders/retry-after",
+            "/retry_after",
+        ],
+    ) && secs.is_finite()
+        && secs >= 0.0
+    {
+        return Some(observed_ms.saturating_add((secs * 1_000.0).round() as i64));
+    }
+    anyagents_harness::quota::reset_at_ms(message, observed_ms)
+}
+
+fn is_quota_or_rate_limit(
+    kind: Option<&str>,
+    name: Option<&str>,
+    status: Option<i64>,
+    msg: &str,
+) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    matches!(
+        kind,
+        Some("QuotaExceeded" | "quota.exceeded" | "rate_limit" | "rate_limit_exceeded")
+    ) || matches!(name, Some("QuotaExceeded" | "RateLimitError"))
+        || status == Some(429)
+        || lower.contains("quota")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests")
+        || lower.contains("usage limit")
+}
+
+struct ParsedSseError {
+    message: String,
+    quota_reset_at_ms: Option<i64>,
+    is_quota: bool,
+}
+
+fn parse_sse_error(event: &Value, state_session: Option<&str>) -> Option<ParsedSseError> {
+    let kind = event.get("type").and_then(Value::as_str);
+    let event_session = event_str(
+        event,
+        &[
+            "/data/sessionID",
+            "/data/session_id",
+            "/properties/sessionID",
+            "/properties/session_id",
+            "/sessionID",
+            "/session_id",
+        ],
+    );
+    if let (Some(ev_sid), Some(cur_sid)) = (event_session, state_session)
+        && ev_sid != cur_sid
+    {
+        return None;
+    }
+
+    let err_name = event_str(
+        event,
+        &[
+            "/data/error/name",
+            "/data/name",
+            "/properties/error/name",
+            "/properties/name",
+            "/error/name",
+            "/name",
+        ],
+    );
+    let status_type = event_str(event, &["/data/status/type", "/properties/status/type"]);
+    let has_message_updated_error = kind == Some("message.updated")
+        && (event
+            .pointer("/data/info/error")
+            .is_some_and(|v| !v.is_null())
+            || event
+                .pointer("/properties/info/error")
+                .is_some_and(|v| !v.is_null()));
+
+    let is_retry_quota = kind == Some("session.status")
+        && status_type == Some("retry")
+        && event_str(
+            event,
+            &["/data/status/message", "/properties/status/message"],
+        )
+        .is_some_and(|m| is_quota_or_rate_limit(kind, err_name, None, m));
+
+    let is_error_event = matches!(
+        kind,
+        Some(
+            "session.error"
+                | "AI.Error"
+                | "ai.error"
+                | "QuotaExceeded"
+                | "quota.exceeded"
+                | "rate_limit"
+                | "error"
+                | "message.error"
+        )
+    ) || matches!(err_name, Some("AI.Error" | "QuotaExceeded"))
+        || (kind == Some("session.status") && status_type == Some("error"))
+        || is_retry_quota
+        || has_message_updated_error;
+
+    if !is_error_event {
+        return None;
+    }
+
+    let message = event_str(
+        event,
+        &[
+            "/data/error/data/message",
+            "/data/error/message",
+            "/data/error",
+            "/data/info/error/data/message",
+            "/data/info/error/message",
+            "/data/status/message",
+            "/data/message",
+            "/properties/error/data/message",
+            "/properties/error/message",
+            "/properties/info/error/data/message",
+            "/properties/info/error/message",
+            "/properties/status/message",
+            "/properties/message",
+            "/error/message",
+            "/error",
+            "/message",
+        ],
+    )
+    .map(str::to_string)
+    .unwrap_or_else(|| {
+        err_name
+            .or(kind)
+            .unwrap_or("opencode SSE error")
+            .to_string()
+    });
+
+    let status_code = event_i64(
+        event,
+        &[
+            "/data/error/data/statusCode",
+            "/data/statusCode",
+            "/data/status",
+            "/data/info/error/data/statusCode",
+            "/properties/error/data/statusCode",
+            "/properties/statusCode",
+            "/statusCode",
+        ],
+    );
+    let quota_reset_at_ms = find_quota_reset_in_event(event, &message, now_ms());
+    let is_quota = is_quota_or_rate_limit(kind, err_name, status_code, &message);
+
+    Some(ParsedSseError {
+        message,
+        quota_reset_at_ms,
+        is_quota,
+    })
+}
+
 /// Record one event of the service started as `launch`. Answers whether it
 /// was `server.connected`.
 fn on_event(vendor: &Vendor, launch: u64, event: &Value, connected_before: bool) -> bool {
@@ -834,7 +1090,18 @@ fn on_event(vendor: &Vendor, launch: u64, event: &Value, connected_before: bool)
                 state.cancelled.insert(inbox);
             }
         }
-        _ => return false,
+        _ => {
+            let Some(err) = parse_sse_error(event, state.session.as_deref()) else {
+                return false;
+            };
+            state.turn_errored = true;
+            if let Some(reset_at_ms) = err.quota_reset_at_ms {
+                state.quota_reset_at_ms = Some(reset_at_ms);
+            }
+            if !err.is_quota || err.quota_reset_at_ms.is_none() {
+                state.sign_in_fault = Some(err.message);
+            }
+        }
     }
     state.epoch += 1;
     drop(state);
@@ -1592,7 +1859,9 @@ fn watch_turn(vendor: &Arc<Vendor>) {
         downgrade_unconsumed_admitted(&mut state);
         state.watching = false;
         state.turn_open = false;
-        state.turns_completed = state.turns_completed.saturating_add(1);
+        if !state.turn_errored {
+            state.turns_completed = state.turns_completed.saturating_add(1);
+        }
         state.epoch += 1;
         drop(state);
         vendor.changed.notify_all();
@@ -1667,6 +1936,11 @@ impl Harness for OpenCodeHarness {
         // settling — keeps the inbox in mailbox order.
         if state.settling > 0 || state.sending.is_some() {
             return Ok(DeliverOutcome::Deferred);
+        }
+        if !state.turn_open {
+            state.turn_errored = false;
+            state.quota_reset_at_ms = None;
+            state.sign_in_fault = None;
         }
         state.sending = Some(message.id.clone());
         state.prompts.insert(message.id.clone(), Prompt::Sending);
@@ -1771,8 +2045,8 @@ impl Harness for OpenCodeHarness {
                 TurnState::Idle
             },
             delivery: DELIVERY.with_peer(state.peer.clone()),
-            quota_reset_at_ms: None,
-            sign_in_fault: None,
+            quota_reset_at_ms: state.quota_reset_at_ms,
+            sign_in_fault: state.sign_in_fault.clone(),
         }
     }
 
@@ -2322,4 +2596,125 @@ fn text_of(message: &Value) -> String {
         }
     }
     text.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vendor_with_session(session: &str) -> Arc<Vendor> {
+        let dir = std::env::temp_dir().join("opencode-test");
+        Arc::new(Vendor {
+            program: PathBuf::from("opencode"),
+            config_dir: Some(dir.clone()),
+            work_dir: Some(dir),
+            environment: Vec::new(),
+            state: Mutex::new(State {
+                session: Some(session.to_string()),
+                alive: true,
+                launch: 1,
+                turn_open: true,
+                admissions: 1,
+                ..State::default()
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn health_of(vendor: &Vendor) -> HarnessHealth {
+        let state = vendor.lock();
+        HarnessHealth {
+            process_alive: state.alive,
+            turn_state: if state.turn_open || state.sending.is_some() {
+                TurnState::InTurn
+            } else {
+                TurnState::Idle
+            },
+            delivery: DELIVERY.with_peer(state.peer.clone()),
+            quota_reset_at_ms: state.quota_reset_at_ms,
+            sign_in_fault: state.sign_in_fault.clone(),
+        }
+    }
+
+    #[test]
+    fn on_event_captures_ai_error_and_prevents_turn_completion_count() {
+        let vendor = vendor_with_session("ses_1");
+        let event = json!({
+            "type": "session.error",
+            "data": {
+                "sessionID": "ses_1",
+                "error": {
+                    "name": "AI.Error",
+                    "data": {
+                        "message": "API Error: 401 unauthorized key",
+                        "statusCode": 401
+                    }
+                }
+            }
+        });
+        on_event(&vendor, 1, &event, true);
+
+        let health = health_of(&vendor);
+        assert_eq!(
+            health.sign_in_fault.as_deref(),
+            Some("API Error: 401 unauthorized key")
+        );
+        assert_eq!(health.quota_reset_at_ms, None);
+
+        {
+            let mut state = vendor.lock();
+            assert!(state.turn_errored);
+            state.watching = false;
+            state.turn_open = false;
+            if !state.turn_errored {
+                state.turns_completed = state.turns_completed.saturating_add(1);
+            }
+            assert_eq!(state.turns_completed, 0);
+        }
+    }
+
+    #[test]
+    fn on_event_captures_quota_exceeded_reset_time_and_ignores_other_sessions() {
+        let vendor = vendor_with_session("ses_target");
+        // Other session's error must be ignored.
+        let other = json!({
+            "type": "QuotaExceeded",
+            "data": {
+                "sessionID": "ses_other",
+                "resets_at_ms": 1_800_000_000_000i64,
+                "message": "quota exceeded"
+            }
+        });
+        assert!(!on_event(&vendor, 1, &other, true));
+        assert!(health_of(&vendor).quota_reset_at_ms.is_none());
+
+        let mine = json!({
+            "type": "QuotaExceeded",
+            "data": {
+                "sessionID": "ses_target",
+                "resets_at_ms": 1_850_000_000_000i64,
+                "message": "Quota exceeded. Resets in 2h."
+            }
+        });
+        on_event(&vendor, 1, &mine, true);
+        let health = health_of(&vendor);
+        assert_eq!(health.quota_reset_at_ms, Some(1_850_000_000_000i64));
+        assert!(vendor.lock().turn_errored);
+
+        // Fallback AI.Error event with top-level type + retry-after header in error data.
+        let vendor2 = vendor_with_session("ses_2");
+        let retry_ev = json!({
+            "type": "AI.Error",
+            "data": {
+                "sessionID": "ses_2",
+                "message": "429 rate limit exceeded",
+                "statusCode": 429,
+                "retry_after": 30
+            }
+        });
+        on_event(&vendor2, 1, &retry_ev, true);
+        let health2 = health_of(&vendor2);
+        assert!(health2.quota_reset_at_ms.is_some());
+        assert!(vendor2.lock().turn_errored);
+    }
 }

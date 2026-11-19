@@ -4,6 +4,7 @@
 //! the process at another home.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyagents_harness::{
@@ -20,6 +21,9 @@ use anyagents_harness_stream::{Launch, StreamHarness, StreamSpec};
 use anyagents_keeper::{Hosted, RemoteHarness};
 use anyagents_supervisor::LaunchRequest;
 use serde::{Deserialize, Serialize};
+
+mod in_process;
+pub use in_process::InProcessRemoteHarness;
 
 use crate::dsh::DshHarness;
 use crate::grok::GrokHarness;
@@ -38,6 +42,8 @@ pub enum LocalAdapter {
     /// The external Spiron CLI.
     Spiron(Box<SpironHarness>),
     Contract(Box<ContractHarness>),
+    /// In-process cloud or remote-sandbox harness (zero local OS shim processes).
+    InProcessRemote(Box<InProcessRemoteHarness>),
 }
 
 /// Where vendor adapters run.
@@ -133,6 +139,7 @@ impl VendorHarness {
         planned: Planned,
         request: &LaunchRequest,
         host: &HarnessHost,
+        shared_store: Option<Arc<anyagents_core::Store>>,
     ) -> Result<Self, String> {
         let Planned {
             launch,
@@ -167,55 +174,66 @@ impl VendorHarness {
                 }
             }
         }
-        let host = match host {
-            HarnessHost::InProcess => Host::Local(launch.start()?),
-            HarnessHost::Keeper(program) => {
-                use std::os::fd::AsFd as _;
-                let seat = launch
-                    .environment()
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == anyagents_harness::SEAT_LAUNCH_ENV)
-                    .map(|(_, spec)| spec.clone());
-                let mut labels = std::collections::BTreeMap::new();
-                labels.insert(LABEL_SELECTOR.to_string(), selector.clone());
-                if let Some(pointer) = &pointer {
-                    labels.insert(LABEL_POINTER.to_string(), pointer.display().to_string());
+        let host = if matches!(
+            launch,
+            AdapterLaunch::InProcessCloud { .. } | AdapterLaunch::InProcessSandbox { .. }
+        ) {
+            Host::Local(
+                launch.start_with_store(shared_store.map(|s| (s, request.agent.id.clone())))?,
+            )
+        } else {
+            match host {
+                HarnessHost::InProcess => Host::Local(
+                    launch.start_with_store(shared_store.map(|s| (s, request.agent.id.clone())))?,
+                ),
+                HarnessHost::Keeper(program) => {
+                    use std::os::fd::AsFd as _;
+                    let seat = launch
+                        .environment()
+                        .iter()
+                        .rev()
+                        .find(|(key, _)| key == anyagents_harness::SEAT_LAUNCH_ENV)
+                        .map(|(_, spec)| spec.clone());
+                    let mut labels = std::collections::BTreeMap::new();
+                    labels.insert(LABEL_SELECTOR.to_string(), selector.clone());
+                    if let Some(pointer) = &pointer {
+                        labels.insert(LABEL_POINTER.to_string(), pointer.display().to_string());
+                    }
+                    let spec = anyagents_keeper::Spec {
+                        agent: request.agent.id.as_str().to_string(),
+                        harness: request.agent.harness.clone(),
+                        model: request.agent.model.clone(),
+                        seat,
+                        labels,
+                        lock_path: Some(anyagents_core::agent_lock_path(
+                            &request.data_dir,
+                            &request.agent.id,
+                        )),
+                        launch: serde_json::to_value(&launch).map_err(|error| error.to_string())?,
+                    };
+                    let lock = request.lock.as_deref().map(|lock| lock.as_fd());
+                    let program = anyagents_keeper::Program {
+                        ready: launch.keeper_ready(program.ready),
+                        ..program.clone()
+                    };
+                    Host::Kept(Box::new(
+                        anyagents_keeper::spawn(
+                            &program,
+                            &anyagents_keeper::root(&request.data_dir),
+                            &spec,
+                            lock,
+                        )
+                        .map_err(|error| {
+                            // The keeper holds the agent's lock on: the
+                            // supervisor must not unlock its own copy.
+                            if error == anyagents_keeper::ABANDONED_START {
+                                anyagents_supervisor::LAUNCH_ABANDONED.to_string()
+                            } else {
+                                error
+                            }
+                        })?,
+                    ))
                 }
-                let spec = anyagents_keeper::Spec {
-                    agent: request.agent.id.as_str().to_string(),
-                    harness: request.agent.harness.clone(),
-                    model: request.agent.model.clone(),
-                    seat,
-                    labels,
-                    lock_path: Some(anyagents_core::agent_lock_path(
-                        &request.data_dir,
-                        &request.agent.id,
-                    )),
-                    launch: serde_json::to_value(&launch).map_err(|error| error.to_string())?,
-                };
-                let lock = request.lock.as_deref().map(|lock| lock.as_fd());
-                let program = anyagents_keeper::Program {
-                    ready: launch.keeper_ready(program.ready),
-                    ..program.clone()
-                };
-                Host::Kept(Box::new(
-                    anyagents_keeper::spawn(
-                        &program,
-                        &anyagents_keeper::root(&request.data_dir),
-                        &spec,
-                        lock,
-                    )
-                    .map_err(|error| {
-                        // The keeper holds the agent's lock on: the
-                        // supervisor must not unlock its own copy.
-                        if error == anyagents_keeper::ABANDONED_START {
-                            anyagents_supervisor::LAUNCH_ABANDONED.to_string()
-                        } else {
-                            error
-                        }
-                    })?,
-                ))
             }
         };
         Ok(Self {
@@ -467,6 +485,22 @@ pub enum AdapterLaunch {
         env: Vec<(String, String)>,
         work_dir: PathBuf,
     },
+    /// In-process cloud harness (`HarnessHost::InProcess` under `remote_required`).
+    InProcessCloud {
+        config_dir: PathBuf,
+        harness: String,
+        model: Option<String>,
+        session: Option<String>,
+        env: Vec<(String, String)>,
+    },
+    /// In-process remote-sandbox harness (`HarnessHost::InProcess` under `remote_required`).
+    InProcessSandbox {
+        config_dir: PathBuf,
+        harness: String,
+        program: Option<String>,
+        session: Option<String>,
+        env: Vec<(String, String)>,
+    },
 }
 
 /// What a keeper adds to its adapter's own start: its own start and the
@@ -477,7 +511,10 @@ impl AdapterLaunch {
     /// Whether this launch runs the harness off this host: the cloud adapter
     /// or a remote-sandbox spawn. Such a launch begins a remote session.
     fn runs_off_host(&self) -> bool {
-        matches!(self, Self::Claude { args, .. }
+        matches!(
+            self,
+            Self::InProcessCloud { .. } | Self::InProcessSandbox { .. }
+        ) || matches!(self, Self::Claude { args, .. }
             if args.iter().any(|arg| arg == "cloud-harness" || arg == "sandbox-exec"))
     }
 
@@ -509,7 +546,9 @@ impl AdapterLaunch {
             | Self::Grok { env, .. }
             | Self::Spiron { env, .. }
             | Self::OpenCode { env, .. }
-            | Self::Codex { env, .. } => env,
+            | Self::Codex { env, .. }
+            | Self::InProcessCloud { env, .. }
+            | Self::InProcessSandbox { env, .. } => env,
         }
     }
 
@@ -556,6 +595,13 @@ impl AdapterLaunch {
 
     /// Start the vendor process and its adapter.
     pub fn start(self) -> Result<LocalAdapter, String> {
+        self.start_with_store(None)
+    }
+
+    pub(crate) fn start_with_store(
+        self,
+        store_target: Option<(Arc<anyagents_core::Store>, anyagents_core::AgentId)>,
+    ) -> Result<LocalAdapter, String> {
         Ok(match self {
             Self::Contract {
                 program,
@@ -746,6 +792,39 @@ impl AdapterLaunch {
                 &env,
                 &work_dir,
             )?)),
+            Self::InProcessCloud {
+                config_dir,
+                harness,
+                model,
+                session,
+                ..
+            } => LocalAdapter::InProcessRemote(Box::new(InProcessRemoteHarness::start_cloud(
+                crate::cloud_harness::CloudHarnessArgs {
+                    config: Some(config_dir),
+                    harness: Some(harness),
+                    model,
+                    resume: session,
+                },
+            )?)),
+            Self::InProcessSandbox {
+                config_dir,
+                harness,
+                program,
+                session,
+                ..
+            } => LocalAdapter::InProcessRemote(Box::new(
+                InProcessRemoteHarness::start_sandbox_with_store(
+                    crate::sandbox_exec::SandboxExecArgs {
+                        config: Some(config_dir),
+                        harness: Some(harness),
+                        program,
+                        resume: session,
+                        oneshot: false,
+                        args: Vec::new(),
+                    },
+                    store_target,
+                )?,
+            )),
         })
     }
 }
@@ -991,7 +1070,7 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
 
 #[cfg(test)]
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
-    vendor_launch_authorized(request, None, &HarnessHost::InProcess)
+    vendor_launch_authorized(request, None, None, &HarnessHost::InProcess)
 }
 
 /// Reuse the daemon's admitted in-memory authority; reopening SQLite alone does
@@ -1000,21 +1079,22 @@ pub fn vendor_launch_with_store(
     request: LaunchRequest,
     store: &anyagents_core::Store,
 ) -> Result<VendorHarness, String> {
-    vendor_launch_authorized(request, Some(store), &HarnessHost::InProcess)
+    vendor_launch_authorized(request, Some(store), None, &HarnessHost::InProcess)
 }
 
 /// Launch with the daemon's authority, hosting the adapter where `host` says.
 pub fn vendor_launch_hosted(
     request: LaunchRequest,
-    store: &anyagents_core::Store,
+    store: &Arc<anyagents_core::Store>,
     host: &HarnessHost,
 ) -> Result<VendorHarness, String> {
-    vendor_launch_authorized(request, Some(store), host)
+    vendor_launch_authorized(request, Some(store.as_ref()), Some(Arc::clone(store)), host)
 }
 
 fn vendor_launch_authorized(
     request: LaunchRequest,
     store: Option<&anyagents_core::Store>,
+    shared_store: Option<Arc<anyagents_core::Store>>,
     host: &HarnessHost,
 ) -> Result<VendorHarness, String> {
     // The supervisor owns the agent process lock. Allocate the host generation
@@ -1030,13 +1110,17 @@ fn vendor_launch_authorized(
         }
     })?;
     prepare_host_session(&request)?;
-    // A Spiron hold means something only to a Spiron session; any other
-    // harness starts its own, so the hold is settled before it launches.
-    if !is_spiron_harness(&request.agent.harness) {
+    // A Spiron hold means something only to a local Spiron session; any other
+    // harness (including Cloud-routed Spiron) starts its own, so settle first.
+    if !spiron_uses_local_execution(
+        &request.agent.harness,
+        Some(&request.data_dir),
+        Some(&request.config_dir),
+    ) {
         settle_legacy_spiron_hold(&request.config_dir)?;
     }
     let config_dir = request.config_dir.clone();
-    let res = vendor_launch_inner(request, store, host);
+    let res = vendor_launch_inner(request, store, shared_store, host);
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
         match &res {
             Ok(vh) => {
@@ -1218,6 +1302,7 @@ fn read_opencode_exit_error(config_dir: &Path) -> Option<String> {
 fn vendor_launch_inner(
     mut request: LaunchRequest,
     authority: Option<&anyagents_core::Store>,
+    shared_store: Option<Arc<anyagents_core::Store>>,
     host: &HarnessHost,
 ) -> Result<VendorHarness, String> {
     // Strip any untrusted launch or authority variables from caller/stored env.
@@ -1235,8 +1320,13 @@ fn vendor_launch_inner(
                     | anyagents_core::GIT_POOL_DIR_ENV
                     | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
+                    | "ANYAGENTS_OPERATOR_TOKEN"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
                     | "ANYAGENTS_CAPABILITY_KEY"
+                    | "ANYAGENTS_MASTER_KEY"
+                    | "ANYAGENTS_TICK_TOKEN"
+                    | "ANYAGENTS_DATABASE_URL"
+                    | "ANYAGENTS_DIRECT_DATABASE_URL"
                     | "LD_PRELOAD"
                     | "LD_LIBRARY_PATH"
             )
@@ -1326,8 +1416,13 @@ fn vendor_launch_inner(
                     | anyagents_core::GIT_POOL_DIR_ENV
                     | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
+                    | "ANYAGENTS_OPERATOR_TOKEN"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
                     | "ANYAGENTS_CAPABILITY_KEY"
+                    | "ANYAGENTS_MASTER_KEY"
+                    | "ANYAGENTS_TICK_TOKEN"
+                    | "ANYAGENTS_DATABASE_URL"
+                    | "ANYAGENTS_DIRECT_DATABASE_URL"
                     | "LD_PRELOAD"
                     | "LD_LIBRARY_PATH"
             )
@@ -1369,13 +1464,41 @@ fn vendor_launch_inner(
                 seat_hint.as_deref(),
             )
         });
-    if crate::sandbox::seats_configured() && seat_spec.is_none() {
+    let sandbox_mode = anyagents_tools::SandboxMode::from_env();
+    let effective_cloud = is_effective_cloud_harness(
+        &request.agent.harness,
+        Some(&request.data_dir),
+        Some(&request.config_dir),
+    );
+    let pg_sandbox_backed = store_opt
+        .and_then(|s| s.sandbox_binding(&request.agent.id).ok().flatten())
+        .is_some();
+    let sylphx_backed = pg_sandbox_backed
+        || crate::sandbox_exec::has_remote_sandbox_provider(Some(&request.data_dir))
+        || anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&request.config_dir)
+            .is_some()
+        || anyagents_tools::SylphxProviderConfig::resolve(Some(&request.data_dir))
+            .ok()
+            .flatten()
+            .is_some();
+    let remote_sandbox_backed = sylphx_backed
+        || anyagents_tools::SandboxConfig::resolve(Some(&request.config_dir))
+            .is_some_and(|cfg| cfg.remote_spawn);
+
+    if crate::sandbox::seats_configured()
+        && seat_spec.is_none()
+        && !sandbox_mode.is_remote_required()
+        && !effective_cloud
+        && !remote_sandbox_backed
+    {
         return Err(format!(
             "no admitted execution principal for {}",
             request.agent.id
         ));
     }
-    if let Some((_, uid, gid, _)) = resolved_seat.as_ref() {
+    if let Some((_, uid, gid, _)) = resolved_seat.as_ref()
+        && !sandbox_mode.is_remote_required()
+    {
         crate::sandbox::prepare_config_with_seat_uid(&request.config_dir, *uid, *gid)
             .map_err(|error| error.to_string())?;
     }
@@ -1394,7 +1517,14 @@ fn vendor_launch_inner(
         ));
     }
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
-        let _ = crate::install::record(&root, &request.agent.harness);
+        if !sandbox_mode.is_remote_required() && !remote_sandbox_backed {
+            let install_target = if effective_cloud && is_spiron_harness(&request.agent.harness) {
+                "spiron-cloud"
+            } else {
+                &request.agent.harness
+            };
+            let _ = crate::install::record(&root, install_target);
+        }
         if let Some(store) = store_opt {
             crate::create::reconcile_agent_runtime_config_for_launch(
                 store,
@@ -1456,7 +1586,9 @@ fn vendor_launch_inner(
             if request.work_dir == managed_work && !managed_work.exists() {
                 let _ = crate::sandbox::ensure_seat_dir_as_owner(&managed_work, uid, gid, 0o2770);
             }
-            if request.work_dir == managed_work
+            if !sandbox_mode.is_remote_required()
+                && !remote_sandbox_backed
+                && request.work_dir == managed_work
                 && managed_work.is_dir()
                 && !managed_work.join(".git").exists()
             {
@@ -1567,11 +1699,11 @@ fn vendor_launch_inner(
         }
     }
     enforce_host_memory_env(&request.agent.harness, &mut env);
-    let planned = plan_adapter(&request, &root, env)?;
+    let planned = plan_adapter(&request, &root, env, pg_sandbox_backed)?;
     if planned.launch.runs_off_host() {
         begin_remote_session(store_opt, &request.agent)?;
     }
-    let vh = VendorHarness::start(planned, &request, host)?;
+    let vh = VendorHarness::start(planned, &request, host, shared_store)?;
     vh.sync_session()?;
     Ok(vh)
 }
@@ -1582,6 +1714,7 @@ fn plan_adapter(
     request: &LaunchRequest,
     root: &Path,
     mut env: Vec<(String, String)>,
+    pg_sandbox_backed: bool,
 ) -> Result<Planned, String> {
     let scripted = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some();
     let model = request
@@ -1610,12 +1743,29 @@ fn plan_adapter(
             &request.agent.harness,
         ));
     }
-    if !scripted
-        && !is_cloud_harness(&request.agent.harness)
-        && anyagents_tools::SandboxConfig::resolve(Some(&request.config_dir))
-            .is_some_and(|cfg| cfg.remote_spawn)
-    {
-        let canonical = anyagents_harness::normalize_harness_name(&request.agent.harness);
+    let sandbox_mode = anyagents_tools::SandboxMode::from_env();
+    let effective_cloud = is_effective_cloud_harness(
+        &request.agent.harness,
+        Some(&request.data_dir),
+        Some(&request.config_dir),
+    );
+    let sylphx_backed = pg_sandbox_backed
+        || crate::sandbox_exec::has_remote_sandbox_provider(Some(&request.data_dir))
+        || anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&request.config_dir)
+            .is_some()
+        || anyagents_tools::SylphxProviderConfig::resolve(Some(&request.data_dir))
+            .ok()
+            .flatten()
+            .is_some();
+    let legacy_remote_spawn = anyagents_tools::SandboxConfig::resolve(Some(&request.config_dir))
+        .is_some_and(|cfg| cfg.remote_spawn);
+
+    if !scripted && !effective_cloud && (sylphx_backed || legacy_remote_spawn) {
+        let canonical = if request.agent.harness.eq_ignore_ascii_case("spiron-local") {
+            "spiron"
+        } else {
+            anyagents_harness::normalize_harness_name(&request.agent.harness)
+        };
         let session_file = format!("{canonical}-session-id");
         let session = session_from_file(&request.config_dir, &session_file)?.or(
             match crate::create::harness_session_filename(canonical) {
@@ -1623,19 +1773,34 @@ fn plan_adapter(
                 _ => None,
             },
         );
-        let target_program = crate::install::program(root, canonical);
+        if sandbox_mode.is_remote_required() {
+            return Ok(planned(
+                AdapterLaunch::InProcessSandbox {
+                    config_dir: request.config_dir.clone(),
+                    harness: canonical.to_string(),
+                    program: None,
+                    session,
+                    env,
+                },
+                Some(&session_file),
+                canonical,
+            ));
+        }
         let exe = std::env::current_exe()
             .or_else(|_| crate::data::current_exe_clean())
             .unwrap_or_else(|_| PathBuf::from("anyagents"));
-        let args = vec![
+        let mut args = vec![
             "sandbox-exec".to_string(),
             "--config".to_string(),
             request.config_dir.display().to_string(),
             "--harness".to_string(),
             canonical.to_string(),
-            "--program".to_string(),
-            target_program.display().to_string(),
         ];
+        if !sylphx_backed && !sandbox_mode.is_remote_required() {
+            let target_program = crate::install::program(root, canonical);
+            args.push("--program".to_string());
+            args.push(target_program.display().to_string());
+        }
         return Ok(planned(
             AdapterLaunch::Claude {
                 program: exe.display().to_string(),
@@ -1647,6 +1812,12 @@ fn plan_adapter(
             },
             Some(&session_file),
             canonical,
+        ));
+    }
+    if !scripted && !effective_cloud && sandbox_mode.is_remote_required() {
+        return Err(format!(
+            "ANYAGENTS_SANDBOX_MODE=remote_required forbids launching local harness `{}` on the coordinator host; configure a Sylphx or remote sandbox provider",
+            request.agent.harness
         ));
     }
     if request.agent.harness == "agy" {
@@ -1795,10 +1966,34 @@ fn plan_adapter(
             Some("grok-session-id"),
             "grok",
         ))
-    } else if is_cloud_harness(&request.agent.harness) {
-        let canonical = anyagents_harness::normalize_harness_name(&request.agent.harness);
+    } else if effective_cloud {
+        let canonical = if is_spiron_harness(&request.agent.harness) {
+            "spiron-cloud"
+        } else {
+            anyagents_harness::normalize_harness_name(&request.agent.harness)
+        };
         let session_file = format!("{canonical}-session-id");
         let session = session_from_file(&request.config_dir, &session_file)?;
+        let bin_override_var = format!(
+            "ANYAGENTS_{}_BIN",
+            canonical.to_uppercase().replace('-', "_")
+        );
+        if sandbox_mode.is_remote_required()
+            && !scripted
+            && std::env::var_os(&bin_override_var).is_none()
+        {
+            return Ok(planned(
+                AdapterLaunch::InProcessCloud {
+                    config_dir: request.config_dir.clone(),
+                    harness: canonical.to_string(),
+                    model,
+                    session,
+                    env,
+                },
+                Some(&session_file),
+                canonical,
+            ));
+        }
         let program = crate::install::program(root, canonical);
         let mut args = vec![
             "cloud-harness".to_string(),
@@ -1823,7 +2018,11 @@ fn plan_adapter(
             Some(&session_file),
             canonical,
         ))
-    } else if is_spiron_harness(&request.agent.harness) {
+    } else if spiron_uses_local_execution(
+        &request.agent.harness,
+        Some(&request.data_dir),
+        Some(&request.config_dir),
+    ) {
         let session = session_from_file(&request.config_dir, "spiron-session-id")?;
         let program = std::env::var("ANYAGENTS_SPIRON_BIN")
             .map(PathBuf::from)
@@ -2263,11 +2462,106 @@ fn start_claude(
         .map_err(|err| err.to_string())
 }
 
-/// Legacy AnyAgents records named `sylphx` are deliberately only a selector
-/// alias.  They launch the external `spiron` process and never enter a local
-/// model/tool loop.
+/// Legacy AnyAgents records named `sylphx` and explicit `spiron-local`
+/// target the external `spiron` headless process; by default `spiron` routes
+/// to `spiron-cloud` unless opted into local execution via `spiron-local`
+/// or `execution_mode = "local"`.
 pub(crate) fn is_spiron_harness(harness: &str) -> bool {
-    anyagents_harness::normalize_harness_name(harness) == "spiron"
+    let trimmed = harness.trim();
+    trimmed.eq_ignore_ascii_case("spiron-local")
+        || anyagents_harness::normalize_harness_name(trimmed) == "spiron"
+}
+
+fn spiron_execution_mode_local_in_toml(data: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(data.join(crate::remote::CONFIG_FILE)) else {
+        return false;
+    };
+    let Ok(val) = toml::from_str::<toml::Value>(&raw) else {
+        return false;
+    };
+    let check_eq = |v: Option<&toml::Value>| {
+        v.and_then(toml::Value::as_str)
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("local"))
+    };
+    check_eq(val.get("execution_mode"))
+        || check_eq(val.get("spiron").and_then(|v| v.get("execution_mode")))
+        || check_eq(
+            val.get("harness")
+                .and_then(|v| v.get("spiron"))
+                .and_then(|v| v.get("execution_mode")),
+        )
+        || check_eq(val.get("server").and_then(|v| v.get("execution_mode")))
+        || check_eq(
+            val.get("server")
+                .and_then(|v| v.get("spiron_execution_mode")),
+        )
+}
+
+/// Whether `harness` should execute the local external `spiron` binary
+/// instead of routing to Cloud (`spiron-cloud`).
+pub(crate) fn spiron_uses_local_execution(
+    harness: &str,
+    data_dir: Option<&Path>,
+    config_dir: Option<&Path>,
+) -> bool {
+    let trimmed = harness.trim();
+    if trimmed.eq_ignore_ascii_case("spiron-local") {
+        return true;
+    }
+    if !is_spiron_harness(trimmed) {
+        return false;
+    }
+    if anyagents_tools::SandboxMode::from_env().is_remote_required() {
+        return false;
+    }
+    if let Ok(mode) = std::env::var("ANYAGENTS_SPIRON_EXECUTION_MODE")
+        .or_else(|_| std::env::var("ANYAGENTS_EXECUTION_MODE"))
+    {
+        if mode.trim().eq_ignore_ascii_case("local") {
+            return true;
+        }
+        if mode.trim().eq_ignore_ascii_case("cloud") {
+            return false;
+        }
+    }
+    if std::env::var("ANYAGENTS_SPIRON_LOCAL")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+    {
+        return true;
+    }
+    if let Some(cfg) = config_dir {
+        if adapter_config(cfg, trimmed).is_some() {
+            return true;
+        }
+        if let Ok(raw) = std::fs::read_to_string(cfg.join("spiron-execution-mode")) {
+            let t = raw.trim().to_ascii_lowercase();
+            if t == "local" {
+                return true;
+            }
+            if t == "cloud" {
+                return false;
+            }
+        }
+    }
+    if let Some(data) = data_dir
+        && spiron_execution_mode_local_in_toml(data)
+    {
+        return true;
+    }
+    // Preserve unit-test doubles (`ANYAGENTS_FAKE_MODE=1`) testing local Spiron.
+    cfg!(test) && std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+}
+
+/// Whether `harness` routes through Cloud (`*-cloud` or default `"spiron"`).
+pub(crate) fn is_effective_cloud_harness(
+    harness: &str,
+    data_dir: Option<&Path>,
+    config_dir: Option<&Path>,
+) -> bool {
+    is_cloud_harness(harness)
+        || (is_spiron_harness(harness)
+            && !spiron_uses_local_execution(harness, data_dir, config_dir))
 }
 
 /// A harness that runs off this host starts with a fresh remote session: its
@@ -2620,6 +2914,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.deliver(message),
             Self::Spiron(harness) => harness.deliver(message),
             Self::Contract(harness) => harness.deliver(message),
+            Self::InProcessRemote(harness) => harness.deliver(message),
         }
     }
 
@@ -2635,6 +2930,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.proven(message_id),
             Self::Spiron(harness) => harness.proven(message_id),
             Self::Contract(harness) => harness.proven(message_id),
+            Self::InProcessRemote(harness) => harness.proven(message_id),
         }
     }
 
@@ -2650,6 +2946,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.stop(),
             Self::Spiron(harness) => harness.stop(),
             Self::Contract(harness) => harness.stop(),
+            Self::InProcessRemote(harness) => harness.stop(),
         }
     }
 
@@ -2665,6 +2962,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.stop_verified(),
             Self::Spiron(harness) => harness.stop_verified(),
             Self::Contract(harness) => harness.stop_verified(),
+            Self::InProcessRemote(harness) => harness.stop_verified(),
         }
     }
 
@@ -2680,6 +2978,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.background(),
             Self::Spiron(harness) => harness.background(),
             Self::Contract(harness) => harness.background(),
+            Self::InProcessRemote(harness) => harness.background(),
         }
     }
 
@@ -2695,6 +2994,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.resume(session),
             Self::Spiron(harness) => harness.resume(session),
             Self::Contract(harness) => harness.resume(session),
+            Self::InProcessRemote(harness) => harness.resume(session),
         }
     }
 
@@ -2710,12 +3010,14 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.cancel(),
             Self::Spiron(harness) => harness.cancel(),
             Self::Contract(harness) => harness.cancel(),
+            Self::InProcessRemote(harness) => harness.cancel(),
         }
     }
 
     fn exit_diagnostic(&self) -> Option<String> {
         match self {
             Self::Claude(harness) => harness.exit_diagnostic(),
+            Self::InProcessRemote(harness) => harness.exit_diagnostic(),
             _ => None,
         }
     }
@@ -2732,6 +3034,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.health(),
             Self::Spiron(harness) => harness.health(),
             Self::Contract(harness) => harness.health(),
+            Self::InProcessRemote(harness) => harness.health(),
         }
     }
 
@@ -2747,6 +3050,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.pending_input_owner(),
             Self::Spiron(harness) => harness.pending_input_owner(),
             Self::Contract(harness) => harness.pending_input_owner(),
+            Self::InProcessRemote(harness) => harness.pending_input_owner(),
         }
     }
 
@@ -2762,6 +3066,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.input_ready(),
             Self::Spiron(harness) => harness.input_ready(),
             Self::Contract(harness) => harness.input_ready(),
+            Self::InProcessRemote(harness) => harness.input_ready(),
         }
     }
 
@@ -2777,6 +3082,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.last_usage(),
             Self::Spiron(harness) => harness.served_usage(),
             Self::Contract(harness) => harness.last_usage(),
+            Self::InProcessRemote(harness) => harness.served_usage(),
         }
     }
 
@@ -2796,6 +3102,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.turns_served(),
             Self::Spiron(harness) => harness.turns_served(),
             Self::Contract(harness) => harness.turns_served(),
+            Self::InProcessRemote(harness) => harness.turns_served(),
         }
     }
 
@@ -2811,6 +3118,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.quiet_for(id, quiet, patience),
             Self::Spiron(_) => false,
             Self::Contract(harness) => harness.quiet_for(id, quiet, patience),
+            Self::InProcessRemote(harness) => harness.quiet_for(id, quiet, patience),
         }
     }
 
@@ -2826,6 +3134,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.ends_on_quiet(),
             Self::Spiron(_) => None,
             Self::Contract(harness) => harness.ends_on_quiet(),
+            Self::InProcessRemote(harness) => harness.ends_on_quiet(),
         }
     }
 
@@ -2841,6 +3150,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.clear_quota(),
             Self::Spiron(harness) => harness.clear_quota(),
             Self::Contract(harness) => harness.clear_quota(),
+            Self::InProcessRemote(harness) => harness.clear_quota(),
         }
     }
 
@@ -2856,6 +3166,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.process_id(),
             Self::Spiron(harness) => harness.process_id(),
             Self::Contract(harness) => harness.process_id(),
+            Self::InProcessRemote(harness) => harness.process_id(),
         }
     }
 
@@ -2871,6 +3182,7 @@ impl Harness for LocalAdapter {
             Self::Grok(harness) => harness.watch_activity(notify),
             Self::Spiron(harness) => harness.watch_activity(notify),
             Self::Contract(harness) => harness.watch_activity(notify),
+            Self::InProcessRemote(harness) => harness.watch_activity(notify),
         }
     }
 }
@@ -2888,6 +3200,7 @@ impl Hosted for LocalAdapter {
             Self::Grok(harness) => harness.session_id(),
             Self::Spiron(harness) => harness.session_id(),
             Self::Contract(_) => None,
+            Self::InProcessRemote(harness) => harness.session_id(),
         }
     }
 
@@ -4178,7 +4491,7 @@ for raw in reader:
             extra_env: vec![],
             lock: None,
         };
-        let planned = plan_adapter(&request, dir.path(), Vec::new()).unwrap();
+        let planned = plan_adapter(&request, dir.path(), Vec::new(), false).unwrap();
         let wire = serde_json::to_value(&planned.launch).unwrap();
         assert!(
             matches!(
@@ -4234,6 +4547,7 @@ for raw in reader:
                 &request,
                 data,
                 vec![("ANTHROPIC_API_KEY".into(), "leaked".into())],
+                false,
             )
             .unwrap()
             .launch

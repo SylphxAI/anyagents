@@ -14,9 +14,8 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{OptionalExtension, params};
-
 use super::{Incoming, OpenTurn, Store, Wake, agent_exists, now_ms};
+use crate::db::{DbExec, DbExecExt as _, DbRow, db_params};
 use crate::error::Error;
 use crate::id::AgentId;
 
@@ -96,7 +95,7 @@ pub struct ErroredTurn {
     pub open: Option<OpenTurn>,
 }
 
-fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnErrors> {
+fn row(row: &DbRow<'_>) -> Result<TurnErrors, Error> {
     Ok(TurnErrors {
         streak: row.get(0)?,
         last_error: row.get(1)?,
@@ -107,25 +106,25 @@ fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnErrors> {
 
 /// Shared error effects, called only after custody admission for async callbacks.
 pub(super) fn record_error(
-    conn: &rusqlite::Connection,
+    conn: &(impl DbExec + ?Sized),
     agent_id: &AgentId,
     error: &str,
     strike: bool,
 ) -> Result<i64, Error> {
-    conn.execute(
+    conn.db_execute(
         "INSERT INTO turn_errors (agent_id, streak, last_error, last_error_at_ms)
          VALUES (?1, ?4, ?2, ?3)
          ON CONFLICT(agent_id) DO UPDATE SET
              streak = turn_errors.streak + ?4,
              last_error = excluded.last_error,
              last_error_at_ms = excluded.last_error_at_ms",
-        params![agent_id.as_str(), error, now_ms(), i64::from(strike)],
+        &db_params![agent_id, error, now_ms(), i64::from(strike)],
     )?;
-    Ok(conn.query_row(
+    conn.db_query_one(
         "SELECT streak FROM turn_errors WHERE agent_id = ?1",
-        [agent_id.as_str()],
+        &db_params![agent_id],
         |row| row.get(0),
-    )?)
+    )
 }
 
 impl Store {
@@ -156,17 +155,27 @@ impl Store {
         opened_seq: i64,
         note: Incoming,
     ) -> Result<(), Error> {
-        let close = |conn: &rusqlite::Connection| -> Result<bool, Error> {
-            conn.execute(
+        let close = |conn: &dyn DbExec| -> Result<bool, Error> {
+            conn.db_execute(
                 "UPDATE turn_recovery
                  SET completed_seq = opened_seq,
                      recovery_count = 0
                  WHERE agent_id = ?1 AND opened_seq = ?2 AND completed_seq < opened_seq",
-                params![agent_id.as_str(), opened_seq],
+                &db_params![agent_id, opened_seq],
             )?;
             Ok(true)
         };
-        self.receive_with_admission(agent_id, note, false, close)?;
+        let _ = close;
+        self.receive_with_admission(agent_id, note, false, |conn| {
+            conn.db_execute(
+                "UPDATE turn_recovery
+                 SET completed_seq = opened_seq,
+                     recovery_count = 0
+                 WHERE agent_id = ?1 AND opened_seq = ?2 AND completed_seq < opened_seq",
+                &db_params![agent_id, opened_seq],
+            )?;
+            Ok(true)
+        })?;
         Ok(())
     }
 
@@ -177,17 +186,17 @@ impl Store {
     pub fn park_faulted(&self, agent_id: &AgentId) -> Result<bool, Error> {
         let parked = self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
-            let parked = tx.execute(
+            let parked = tx.db_execute(
                 "UPDATE agents SET state = 'paused'
                  WHERE id = ?1 AND state IN ('running', 'idle')",
-                [agent_id.as_str()],
+                &db_params![agent_id],
             )? > 0;
             if parked {
-                tx.execute(
+                tx.db_execute(
                     "INSERT INTO turn_errors (agent_id, streak, faulted_at_ms)
                      VALUES (?1, 0, ?2)
                      ON CONFLICT(agent_id) DO UPDATE SET faulted_at_ms = excluded.faulted_at_ms",
-                    params![agent_id.as_str(), now_ms()],
+                    &db_params![agent_id, now_ms()],
                 )?;
             }
             Ok(parked)
@@ -202,38 +211,35 @@ impl Store {
 
     /// The agent's errored-turn record, when it has one.
     pub fn turn_errors(&self, agent_id: &AgentId) -> Result<Option<TurnErrors>, Error> {
-        Ok(self
-            .read_conn()
-            .prepare_cached(
-                "SELECT streak, last_error, last_error_at_ms, faulted_at_ms
-                 FROM turn_errors WHERE agent_id = ?1",
-            )?
-            .query_row([agent_id.as_str()], row)
-            .optional()?)
+        self.read_conn().db_query_opt(
+            "SELECT streak, last_error, last_error_at_ms, faulted_at_ms
+             FROM turn_errors WHERE agent_id = ?1",
+            &db_params![agent_id],
+            row,
+        )
     }
 
     /// Every agent with a run of errored turns in progress, or parked for one.
     pub fn current_turn_errors(&self) -> Result<HashMap<AgentId, TurnErrors>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached(
+        let rows = conn.db_query_vec(
             "SELECT agent_id, streak, last_error, last_error_at_ms, faulted_at_ms
              FROM turn_errors WHERE streak > 0 OR faulted_at_ms IS NOT NULL",
+            &[],
+            |r| {
+                Ok((
+                    r.get::<String>(0)?,
+                    TurnErrors {
+                        streak: r.get(1)?,
+                        last_error: r.get(2)?,
+                        last_error_at_ms: r.get(3)?,
+                        faulted_at_ms: r.get(4)?,
+                    },
+                ))
+            },
         )?;
-        let rows = stmt.query_map([], |r| {
-            let id: String = r.get(0)?;
-            Ok((
-                id,
-                TurnErrors {
-                    streak: r.get(1)?,
-                    last_error: r.get(2)?,
-                    last_error_at_ms: r.get(3)?,
-                    faulted_at_ms: r.get(4)?,
-                },
-            ))
-        })?;
         let mut out = HashMap::new();
-        for item in rows {
-            let (id, errors) = item?;
+        for (id, errors) in rows {
             if let Ok(id) = AgentId::parse(&id) {
                 out.insert(id, errors);
             }
@@ -245,24 +251,21 @@ impl Store {
 /// A resume clears a parking and the run that caused it; any other start
 /// leaves a run in progress counted. Called inside the transaction that sets
 /// the agent running.
-pub(super) fn clear_parking(
-    tx: &rusqlite::Transaction<'_>,
-    agent_id: &AgentId,
-) -> Result<(), Error> {
-    tx.execute(
+pub(super) fn clear_parking(tx: &(impl DbExec + ?Sized), agent_id: &AgentId) -> Result<(), Error> {
+    tx.db_execute(
         "UPDATE turn_errors SET streak = 0, faulted_at_ms = NULL
          WHERE agent_id = ?1 AND faulted_at_ms IS NOT NULL",
-        [agent_id.as_str()],
+        &db_params![agent_id],
     )?;
     Ok(())
 }
 
 /// A completed turn ends the run. Called inside the transaction that records
 /// the completion.
-pub(super) fn end_run(tx: &rusqlite::Transaction<'_>, agent_id: &AgentId) -> Result<(), Error> {
-    tx.execute(
+pub(super) fn end_run(tx: &(impl DbExec + ?Sized), agent_id: &AgentId) -> Result<(), Error> {
+    tx.db_execute(
         "UPDATE turn_errors SET streak = 0 WHERE agent_id = ?1 AND streak != 0",
-        [agent_id.as_str()],
+        &db_params![agent_id],
     )?;
     Ok(())
 }

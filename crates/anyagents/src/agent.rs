@@ -1059,7 +1059,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         parsed.model,
         parsed.profile,
     );
-    if crate::vendor::is_cloud_harness(&harness) {
+    if crate::vendor::is_effective_cloud_harness(&harness, Some(data), None) {
         crate::remote::require_public_url(data)?;
     }
     let mut agent = crate::create::create(

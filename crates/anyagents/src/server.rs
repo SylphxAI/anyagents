@@ -46,6 +46,7 @@ pub(crate) mod outbound_history;
 mod profiles;
 mod quota_rotation;
 mod reap_queue;
+pub(crate) mod serverless;
 
 pub(crate) use profiles::ServedProfile;
 
@@ -63,14 +64,21 @@ pub fn socket_path(data: &Path) -> PathBuf {
 /// Run the server. Every harness runs in a keeper started from this binary,
 /// so stopping, crashing or upgrading the server ends no agent's work.
 pub fn run(data: &Path) -> Result<(), Error> {
+    run_with_port(data, None)
+}
+
+/// Run the server with an optional explicit `--port` override for the HTTP
+/// webhook/public TCP listener.
+pub fn run_with_port(data: &Path, port: Option<u16>) -> Result<(), Error> {
     let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let host = crate::keeper::host().map_err(Error::Message)?;
-    run_with_identity(
+    run_with_identity_and_port(
         data,
         Arc::new(Mutex::new(ProcessRunner)),
         stop_rx,
         Arc::new(ServingIdentity::capture()),
         host,
+        port,
     )
 }
 
@@ -92,17 +100,29 @@ pub fn run_with(
     )
 }
 
+#[cfg(test)]
 fn run_with_identity(
+    data: &Path,
+    runner: Arc<Mutex<dyn CommandRunner + Send>>,
+    stop: tokio::sync::oneshot::Receiver<()>,
+    identity: Arc<ServingIdentity>,
+    host: HarnessHost,
+) -> Result<(), Error> {
+    run_with_identity_and_port(data, runner, stop, identity, host, None)
+}
+
+fn run_with_identity_and_port(
     data: &Path,
     runner: Arc<Mutex<dyn CommandRunner + Send>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
     identity: Arc<ServingIdentity>,
     host: HarnessHost,
+    port_override: Option<u16>,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async {
         tokio::select! {
-            result = serve(data, runner, identity, host) => result,
+            result = serve(data, runner, identity, host, port_override) => result,
             _ = &mut stop => Ok(()),
         }
     });
@@ -151,6 +171,69 @@ pub(crate) struct AppState {
     pub(crate) identity: Arc<ServingIdentity>,
     /// The last provider-profile listing, refreshed in the background.
     pub(crate) profiles: Arc<profiles::ProfileSnapshots>,
+}
+
+/// Materialize deployment-level config, secret, and profile blobs from
+/// PostgreSQL (`public.deployment_blobs`) into a stateless/serverless replica's
+/// local ephemeral data directory so `FileCredentialStore`, `Settings::load`,
+/// and profile lookups work identically across cold starts.
+fn hydrate_deployment_blobs_on_start(store: &Store, data: &Path) -> Result<usize, Error> {
+    let master_key = anyagents_core::MasterKey::from_env()?;
+    let blobs = store.blob_store_with_key(master_key);
+    let mut hydrated = 0usize;
+    let secrets_dir = data.join("secrets");
+    std::fs::create_dir_all(&secrets_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    for ns in ["config", "secrets", "profiles"] {
+        let metas = blobs.list_deployment_blobs(ns)?;
+        for meta in metas {
+            if anyagents_core::stateless::validate_blob_path(&meta.path).is_err() {
+                continue;
+            }
+            let dest = match ns {
+                "config" => data.join(&meta.path),
+                "secrets" => data.join("secrets").join(&meta.path),
+                "profiles" => data.join("profiles").join(&meta.path),
+                _ => continue,
+            };
+            let Some(entry) = blobs.get_deployment_blob(ns, &meta.path)? else {
+                continue;
+            };
+            let mode = if entry.encrypted || ns == "secrets" {
+                0o600
+            } else {
+                0o644
+            };
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+                #[cfg(unix)]
+                if ns == "secrets" {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ =
+                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+            if entry.content.is_empty() {
+                std::fs::write(&dest, [])?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode));
+                }
+            } else {
+                anyagents_harness::atomic_write_nonempty_file(&dest, &entry.content, mode)?;
+            }
+            hydrated += 1;
+        }
+    }
+    if hydrated > 0 {
+        eprintln!("anyagents-blobs: hydrated {hydrated} deployment blob(s) from postgres");
+    }
+    Ok(hydrated)
 }
 
 /// This process's capability key. Tests name one so a server and the fixture
@@ -236,42 +319,157 @@ fn active_seat_ids(store: &Store) -> Result<Vec<String>, Error> {
         .collect())
 }
 
+/// Minimum age (5 minutes) before a PostgreSQL replica's startup repair
+/// releases an unadmitted agent name reservation, preventing a booting peer
+/// pod from clobbering another replica's in-flight `create_agent`.
+const UNADMITTED_STALE_AGE_MS: i64 = 5 * 60 * 1000;
+
+/// Startup repair of failed agent creation reservations.
+///
+/// On single-host SQLite, `server.lock` excludes concurrent creation so every
+/// unadmitted row is a failed creation. On multi-replica PostgreSQL, gate
+/// behind a distributed `coordinator_leases` lock and only release rows older
+/// than `stale_age_ms` without a fresh runtime heartbeat.
+pub(crate) fn release_stale_unadmitted_names_on_start(
+    store: &Store,
+    stale_age_ms: i64,
+) -> Result<Vec<(anyagents_core::AgentId, String)>, Error> {
+    if store.is_postgres() {
+        let Some(_lease) = store.try_acquire_coordinator_lease(
+            "maint:unadmitted_names",
+            std::time::Duration::from_secs(60),
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        return store.release_unadmitted_names_older_than(stale_age_ms);
+    }
+    store.release_unadmitted_names()
+}
+
+/// Resolve the logical workspace directory inside a remote sandbox VM.
+///
+/// NEVER returns a coordinator-host path (such as `<data>/agents/<id>/launcher`
+/// or `<data>/agents/<id>/work`). Prefers:
+/// 1. Persisted `agent_sandbox_bindings.remote_workdir`
+/// 2. Explicit `ANYAGENTS_SANDBOX_WORKDIR` / `ANYAGENTS_REMOTE_WORKDIR` in `agent.launch_env`
+/// 3. Process env `ANYAGENTS_SANDBOX_WORKDIR` (when host storage env is active)
+/// 4. Default `/home/user/agent-data/workspace`.
+pub(crate) fn resolve_remote_sandbox_workdir(store: &Store, agent: &Agent) -> String {
+    let is_host_local = |raw: &str| -> bool {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || !trimmed.starts_with('/') {
+            return true;
+        }
+        let path = Path::new(trimmed);
+        if trimmed.ends_with("/launcher")
+            || trimmed.contains("/agents/")
+            || trimmed.starts_with("/var/lib/anyagents")
+            || trimmed.starts_with("/tmp/")
+            || trimmed == "/tmp"
+        {
+            return true;
+        }
+        let data_dir = store.data_dir();
+        if !data_dir.as_os_str().is_empty() && path.starts_with(data_dir) {
+            return true;
+        }
+        if let Some(ws) = anyagents_core::configured_workspaces_dir()
+            && path.starts_with(ws)
+        {
+            return true;
+        }
+        let temp_dir = std::env::temp_dir();
+        !temp_dir.as_os_str().is_empty() && path.starts_with(&temp_dir)
+    };
+
+    if let Ok(Some(binding)) = store.sandbox_binding(&agent.id)
+        && !is_host_local(&binding.remote_workdir)
+    {
+        return binding.remote_workdir;
+    }
+    for key in ["ANYAGENTS_SANDBOX_WORKDIR", "ANYAGENTS_REMOTE_WORKDIR"] {
+        if let Some((_, val)) = agent.launch_env.iter().rev().find(|(k, _)| k == key)
+            && !is_host_local(val)
+        {
+            return val.trim().to_string();
+        }
+    }
+    if anyagents_core::storage_env_enabled()
+        && let Ok(val) = std::env::var("ANYAGENTS_SANDBOX_WORKDIR")
+        && !is_host_local(&val)
+    {
+        return val.trim().to_string();
+    }
+    anyagents_core::DEFAULT_REMOTE_SANDBOX_WORKDIR.to_string()
+}
+
 async fn serve(
     data: &Path,
     sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
     identity: Arc<ServingIdentity>,
     host: HarnessHost,
+    port_override: Option<u16>,
 ) -> Result<(), Error> {
-    let _server_lock = acquire_server_lock(data)?;
+    let serverless = serverless::is_serverless_mode();
+    std::fs::create_dir_all(data)?;
+    let _server_lock = if serverless {
+        None
+    } else {
+        Some(acquire_server_lock(data)?)
+    };
     anyagents_toolchain::init_server(data, crate::sandbox::host_home_dir());
     let store = Arc::new(Store::open(data.join("state.db"))?);
-    // The server lock excludes concurrent creation: no unadmitted row is in
-    // flight, so each is a failed creation still holding its name.
-    for (id, name) in store.release_unadmitted_names()? {
+    let remote_required = anyagents_tools::SandboxMode::from_env().is_remote_required();
+    let stateless_pg = store.is_postgres() && remote_required;
+    if store.is_postgres()
+        && (serverless || remote_required)
+        && let Err(err) = hydrate_deployment_blobs_on_start(&store, data)
+    {
+        eprintln!("anyagents-blobs: startup hydration warning: {err}");
+    }
+    for (id, name) in release_stale_unadmitted_names_on_start(&store, UNADMITTED_STALE_AGE_MS)? {
         eprintln!("released name `{name}` held by failed creation {id}");
     }
-    crate::sandbox::reconcile_principals(&store)?;
-    crate::host_memory::on_start(&store);
+    if !stateless_pg {
+        crate::sandbox::reconcile_principals(&store)?;
+        crate::host_memory::on_start(&store);
+    }
     let key = capability_key()?;
     store.hold_capability_key(&key)?;
-    let agents = store.list_agents()?;
-    // Keep small legacy deployments compatible without walking every archived
-    // seat tree in a large registry. Wake/admission mints a capability on demand.
-    let skip_archived_mint = agents.len() > 32;
-    let mut mint_failures = Vec::new();
-    for agent in &agents {
-        if skip_archived_mint && agent.state == "archived" {
-            continue;
+    // In stateless multi-replica PG mode, HTTP MCP injects `Principal::Agent`
+    // directly after authenticating `remote_session_tokens`, so booting pods
+    // must NEVER blindly call `operator::ensure()` when pod-local
+    // `mcp-capability` is absent (which would revoke peer pods' live
+    // `agent_capabilities` rows in PostgreSQL).
+    if !stateless_pg {
+        let agents = store.list_agents()?;
+        // Keep small legacy deployments compatible without walking every archived
+        // seat tree in a large registry. Wake/admission mints a capability on demand.
+        let skip_archived_mint = agents.len() > 32;
+        let mut mint_failures = Vec::new();
+        for agent in &agents {
+            if skip_archived_mint && agent.state == "archived" {
+                continue;
+            }
+            if store.is_postgres()
+                && store.has_active_capability(&agent.id).unwrap_or(false)
+                && !anyagents_core::agent_config_dir(store.data_dir(), &agent.id)
+                    .join(crate::operator::CAPABILITY_FILE)
+                    .is_file()
+            {
+                continue;
+            }
+            if let Err(err) = crate::operator::ensure(&store, &agent.id) {
+                mint_failures.push(format!("{}: {err}", agent.name));
+            }
         }
-        if let Err(err) = crate::operator::ensure(&store, &agent.id) {
-            mint_failures.push(format!("{}: {err}", agent.name));
+        if !mint_failures.is_empty() {
+            eprintln!(
+                "warning: a capability was not minted for {}",
+                mint_failures.join(", ")
+            );
         }
-    }
-    if !mint_failures.is_empty() {
-        eprintln!(
-            "warning: a capability was not minted for {}",
-            mint_failures.join(", ")
-        );
     }
     if crate::sandbox::seat_named() && crate::sandbox::configured_seat().is_none() {
         return Err(Error::Message(
@@ -284,7 +482,10 @@ async fn serve(
     // harness it starts is in its own OS seat. Otherwise the boundary contract
     // says so, and no run claims it.
     let seats = active_seat_ids(&store)?;
-    if operator::operator_token(data).is_some() && !crate::sandbox::launch_boundary(&seats) {
+    if !anyagents_tools::SandboxMode::from_env().is_remote_required()
+        && operator::operator_token(data).is_some()
+        && !crate::sandbox::launch_boundary(&seats)
+    {
         return Err(Error::Message(
             "this server has an operator token, so it is the identity boundary, but no OS seat is \
              in place for its agents: configure ANYAGENTS_AGENT_UID, ANYAGENTS_AGENT_GID and \
@@ -310,6 +511,9 @@ async fn serve(
     // started: a client that sees the socket must find a live origin, not the
     // port of the server that just stopped.
     let gateway = crate::gateway::start(data)?;
+    if let Err(err) = crate::gateway::ensure_routes_loaded(data) {
+        eprintln!("anyagents-gateway: deferred route hydration: {err}");
+    }
     // The API is bound before any vendor starts: an agent that is slow, silent
     // or wedged must never stop the server from answering.
     prepare_socket(&path)?;
@@ -319,37 +523,43 @@ async fn serve(
     if auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&path);
     }
-    let launch_store = Arc::clone(&store);
-    // A harness kept from the last server on a gateway origin that moved
-    // would send its token wherever that port now leads: it is replaced.
-    let refused = if gateway.moved {
-        gateway.agents
+    let kept = !serverless && matches!(host, HarnessHost::Keeper(_));
+    let (supervisor, health) = if serverless {
+        // Pure serverless mode (`ANYAGENTS_SERVERLESS=true`): zero long-running
+        // keeper/supervisor loops, zero coordinator-side `envd` pipes or SSE
+        // streams across HTTP requests.
+        (None, HealthBoard::default())
     } else {
-        Vec::new()
+        let launch_store = Arc::clone(&store);
+        // A harness kept from the last server on a gateway origin that moved
+        // would send its token wherever that port now leads: it is replaced.
+        let refused = if gateway.moved {
+            gateway.agents
+        } else {
+            Vec::new()
+        };
+        let custody = crate::keeper::custody(data, &host, refused);
+        let sup = Supervisor::<VendorHarness>::start_with_custody(
+            Arc::clone(&store),
+            Arc::new(SystemClock::new()),
+            Arc::new(move |request| vendor::vendor_launch_hosted(request, &launch_store, &host)),
+            vendor::child_env(),
+            custody,
+        )
+        .map_err(Error::Message)?;
+        let idle_release_store = Arc::clone(&store);
+        sup.set_on_idle_released(Arc::new(move |agent_id, cfg| {
+            crate::sandbox_exec::handle_agent_idle_release(&idle_release_store, agent_id, cfg);
+        }));
+        let board = sup.board();
+        (Some(Retaining(Some(sup), kept)), board)
     };
-    let custody = crate::keeper::custody(data, &host, refused);
-    let kept = matches!(host, HarnessHost::Keeper(_));
-    let supervisor = Retaining(
-        Some(
-            Supervisor::<VendorHarness>::start_with_custody(
-                Arc::clone(&store),
-                Arc::new(SystemClock::new()),
-                Arc::new(move |request| {
-                    vendor::vendor_launch_hosted(request, &launch_store, &host)
-                }),
-                vendor::child_env(),
-                custody,
-            )
-            .map_err(Error::Message)?,
-        ),
-        kept,
-    );
-    if auth.is_confined() {
+    if !serverless && auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&data.join("wake.sock"));
     }
     let state = AppState {
         store: Arc::clone(&store),
-        health: supervisor.board(),
+        health,
         sign_in,
         auth,
         identity,
@@ -357,13 +567,21 @@ async fn serve(
     };
     let _ = boundary;
     let listener = api_listener;
-    let poller = crate::telegram::Poller::start(Arc::clone(&store), data.to_path_buf())
-        .map_err(Error::Message)?;
+    let poller = if serverless {
+        None
+    } else {
+        Some(
+            crate::telegram::Poller::start(Arc::clone(&store), data.to_path_buf())
+                .map_err(Error::Message)?,
+        )
+    };
     // Set once a stop is requested: every listener (the socket and both TCP
     // listeners) stops taking connections at once, calls running on any of
     // them drain together, and every background loop ends at once.
     let (stopping, _) = tokio::sync::watch::channel(false);
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
+    if !serverless
+        && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+        && !crate::sandbox::is_isolated_test_env()
     {
         quota_rotation::start(Arc::clone(&store));
         start_host_history_indexer(Arc::clone(&store));
@@ -389,18 +607,42 @@ async fn serve(
                 let health = reaper_health.clone();
                 let memory_backlog = Arc::clone(&memory_backlog);
                 let _ = tokio::task::spawn_blocking(move || {
+                    // In multi-replica PostgreSQL mode, elect one singleton
+                    // maintenance leader per tick via `public.coordinator_leases`
+                    // so N replicas never race on reaping, rotation, or renewals.
+                    let _singleton_lease = if store.is_postgres() {
+                        match store.try_acquire_coordinator_lease(
+                            "maint:singleton",
+                            std::time::Duration::from_secs(90),
+                        ) {
+                            Ok(Some(guard)) => Some(guard),
+                            Ok(None) => return,
+                            Err(err) => {
+                                eprintln!(
+                                    "anyagents-maint: deferred singleton lease acquisition: {err}"
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     // The daemon is the long-lived writer: keep the WAL bounded
                     // from here so it never grows while readers overlap.
-                    match store.checkpoint_wal() {
-                        Ok(c)
-                            if c.passive_busy
-                                || c.checkpointed_frames < c.log_frames
-                                || c.log_frames > WAL_REPORT_FRAMES => eprintln!(
-                            "anyagents-store: wal checkpoint log={} checkpointed={} busy={} truncated={}",
-                            c.log_frames, c.checkpointed_frames, c.passive_busy, c.truncated
-                        ),
-                        Ok(_) => {}
-                        Err(error) => eprintln!("anyagents-store: wal checkpoint failed: {error}"),
+                    if !store.is_postgres() {
+                        match store.checkpoint_wal() {
+                            Ok(c)
+                                if c.passive_busy
+                                    || c.checkpointed_frames < c.log_frames
+                                    || c.log_frames > WAL_REPORT_FRAMES => eprintln!(
+                                "anyagents-store: wal checkpoint log={} checkpointed={} busy={} truncated={}",
+                                c.log_frames, c.checkpointed_frames, c.passive_busy, c.truncated
+                            ),
+                            Ok(_) => {}
+                            Err(error) => {
+                                eprintln!("anyagents-store: wal checkpoint failed: {error}")
+                            }
+                        }
                     }
                     if let Err(error) = outbound_history::reconcile(&store) {
                         eprintln!("outbound history settlement remains pending: {error}");
@@ -425,60 +667,25 @@ async fn serve(
                     crate::create::sync_fresher_bound_agent_credentials_in(&store, &root);
                     #[cfg(unix)]
                     crate::create::sync_canonical_skills(&root);
-                })
-                .await;
-            }
-        });
-        let updater_root = data.to_path_buf();
-        let updater_store = Arc::clone(&store);
-        let mut updater_stop = stopping.subscribe();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
-                std::time::Duration::from_secs(6 * 3600),
-            );
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = updater_stop.wait_for(|stop| *stop) => break,
-                    _ = interval.tick() => {}
-                }
-                let root = updater_root.clone();
-                let store_for_update = Arc::clone(&updater_store);
-                let _ = tokio::task::spawn_blocking(move || {
-                    let catalog = match anyagents_installer::Catalog::load(&root) {
-                        Ok(catalog) => catalog,
-                        Err(err) => {
-                            eprintln!("anyagents-updater: failed to load catalog overrides: {err}");
-                            return;
-                        }
-                    };
-                    for entry in catalog.harnesses().iter().chain(catalog.runtimes()) {
-                        if !entry.source.is_managed()
-                            || matches!(
-                                entry.source,
-                                anyagents_installer::source::Source::Unconfigured
-                            )
-                        {
-                            continue;
-                        }
-                        match crate::install::update_harness_with_store(
-                            &root,
-                            &entry.id,
-                            Arc::clone(&store_for_update)
-                                as Arc<dyn anyagents_installer::LeaseView>,
-                        ) {
-                            Ok((before, after, true)) => {
+                    // 2-tier idle-TTL sandbox sweeper under singleton maintenance lease:
+                    // releases compute ONLY when idle_since_ms + idle_ttl_ms <= now AND
+                    // inflight_children == 0 AND no active turn (preserving persistent volumes).
+                    if let Err(err) = crate::sandbox_exec::sweep_idle_sandboxes(
+                        &store,
+                        &root,
+                        anyagents_core::now_ms(),
+                    ) {
+                        eprintln!("anyagents-sandbox: idle sweep deferred: {err}");
+                    }
+                    if tick_count.is_multiple_of(5)
+                        && let Ok(live) = store.list_live_agents()
+                    {
+                        for a in live {
+                            let cfg = anyagents_core::agent_config_dir(&root, &a.id);
+                            if let Err(err) = anyagents_tools::renew_lease_for_config_dir(&cfg) {
                                 eprintln!(
-                                    "anyagents-updater: upgraded harness `{}` {} -> {}",
-                                    entry.id, before, after
-                                );
-                            }
-                            Ok((_, _, false)) => {}
-                            Err(err) => {
-                                eprintln!(
-                                    "anyagents-updater: failed to update `{}`: {err}",
-                                    entry.id
+                                    "anyagents-sandbox: lease renew failed for `{}`: {err}",
+                                    a.name
                                 );
                             }
                         }
@@ -487,6 +694,68 @@ async fn serve(
                 .await;
             }
         });
+        if !anyagents_tools::SandboxMode::from_env().is_remote_required() {
+            let updater_root = data.to_path_buf();
+            let updater_store = Arc::clone(&store);
+            let mut updater_stop = stopping.subscribe();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval_at(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(6 * 3600),
+                );
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = updater_stop.wait_for(|stop| *stop) => break,
+                        _ = interval.tick() => {}
+                    }
+                    let root = updater_root.clone();
+                    let store_for_update = Arc::clone(&updater_store);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let catalog = match anyagents_installer::Catalog::load(&root) {
+                            Ok(catalog) => catalog,
+                            Err(err) => {
+                                eprintln!(
+                                    "anyagents-updater: failed to load catalog overrides: {err}"
+                                );
+                                return;
+                            }
+                        };
+                        for entry in catalog.harnesses().iter().chain(catalog.runtimes()) {
+                            if !entry.source.is_managed()
+                                || matches!(
+                                    entry.source,
+                                    anyagents_installer::source::Source::Unconfigured
+                                )
+                            {
+                                continue;
+                            }
+                            match crate::install::update_harness_with_store(
+                                &root,
+                                &entry.id,
+                                Arc::clone(&store_for_update)
+                                    as Arc<dyn anyagents_installer::LeaseView>,
+                            ) {
+                                Ok((before, after, true)) => {
+                                    eprintln!(
+                                        "anyagents-updater: upgraded harness `{}` {} -> {}",
+                                        entry.id, before, after
+                                    );
+                                }
+                                Ok((_, _, false)) => {}
+                                Err(err) => {
+                                    eprintln!(
+                                        "anyagents-updater: failed to update `{}`: {err}",
+                                        entry.id
+                                    );
+                                }
+                            }
+                        }
+                    })
+                    .await;
+                }
+            });
+        }
         crate::schedule::start_loops(
             Arc::clone(&store),
             state.health.clone(),
@@ -530,8 +799,8 @@ async fn serve(
         }
     }
     let mut webhook_listener = None;
-    if let Some(addr) = webhook_listen_addr(public_configured) {
-        if public_configured && !binds_loopback(&addr) {
+    if let Some(addr) = webhook_listen_addr(public_configured, port_override) {
+        if public_configured && !serverless && !binds_loopback(&addr) {
             eprintln!(
                 "warning: the local TCP listener ({addr}) is not loopback while `public_listen` is set; \
                  it accepts every local credential, so bind it to 127.0.0.1"
@@ -556,7 +825,7 @@ async fn serve(
             }
         }
     }
-    {
+    if !serverless {
         // A spawn the last server stopped part way gets the rest of it (most
         // often its prompt) before any call is answered on any listener: a call
         // to list, inspect or delete that agent then sees it whole. Every
@@ -624,19 +893,22 @@ async fn serve(
                 exit_after(STOP_WITHIN);
             }
 
-            // A long poll ends at Telegram, not here: signal the poller to
-            // stop so released long polls exit instead of re-entering a 30s
-            // wait, and release every bot while the calls drain, so each
-            // bot's last offset is written before shutdown.
-            poller.signal_stop();
-            let release_store = Arc::clone(&store);
-            releasing = Some(tokio::task::spawn_blocking(move || {
-                crate::telegram::poller::release_every_bot(
-                    &release_store,
-                    release_store.data_dir(),
-                    TELEGRAM_RELEASE_WITHIN,
-                )
-            }));
+            let preserve_webhook = preserve_webhooks_on_shutdown(data);
+            if !preserve_webhook && let Some(ref poller) = poller {
+                // A long poll ends at Telegram, not here: signal the poller to
+                // stop so released long polls exit instead of re-entering a 30s
+                // wait, and release every bot while the calls drain, so each
+                // bot's last offset is written before shutdown.
+                poller.signal_stop();
+                let release_store = Arc::clone(&store);
+                releasing = Some(tokio::task::spawn_blocking(move || {
+                    crate::telegram::poller::release_every_bot(
+                        &release_store,
+                        release_store.data_dir(),
+                        TELEGRAM_RELEASE_WITHIN,
+                    )
+                }));
+            }
             let _ = stopping.send(true);
             // `serving` is polled first so the Unix listener closes at once,
             // while `settling` keeps waiting even after `serving` has no open
@@ -688,24 +960,51 @@ async fn serve(
     };
     #[cfg(target_os = "linux")]
     crate::workstation::session::stop_all().await;
-    let released = match releasing {
-        Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
-        None => {
-            poller.signal_stop();
-            crate::telegram::poller::release_every_bot(
-                &store,
-                store.data_dir(),
-                TELEGRAM_RELEASE_WITHIN,
-            )
+    let preserve_webhook = preserve_webhooks_on_shutdown(data);
+    let released = if preserve_webhook {
+        Ok(())
+    } else {
+        match releasing {
+            Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
+            None => {
+                if let Some(ref poller) = poller {
+                    poller.signal_stop();
+                    crate::telegram::poller::release_every_bot(
+                        &store,
+                        store.data_dir(),
+                        TELEGRAM_RELEASE_WITHIN,
+                    )
+                } else {
+                    Ok(())
+                }
+            }
         }
     };
     if let Err(reason) = released {
         eprintln!("anyagents-telegram: shutdown did not release every bot: {reason}");
     }
-    poller.stop();
+    if let Some(poller) = poller {
+        if preserve_webhook {
+            // Stateless webhook pods keep Telegram webhooks active on pod
+            // SIGTERM so rolling replacements never drop incoming updates.
+            std::mem::forget(poller);
+        } else {
+            poller.stop();
+        }
+    }
     drop(supervisor);
     let _ = std::fs::remove_file(&path);
     result.map_err(Error::from)
+}
+
+fn preserve_webhooks_on_shutdown(data: &Path) -> bool {
+    serverless::is_serverless_mode()
+        || anyagents_tools::SandboxMode::from_env().is_remote_required()
+        || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
+        || std::env::var("ANYAGENTS_PUBLIC_URL")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+        || crate::remote::require_public_url(data).is_ok()
 }
 
 /// How long a stopping server waits for the mutating calls it is running
@@ -1165,6 +1464,31 @@ async fn github_webhook(
         Ok(changed) => {
             if changed {
                 crate::schedule::schedules_changed(state.store.data_dir());
+                if serverless::is_serverless_mode() {
+                    let store = Arc::clone(&state.store);
+                    let health = state.health.clone();
+                    let (_, fired_agents) = spawn_store(move || {
+                        Ok::<_, ApiError>(crate::schedule::tick_serverless_schedules(
+                            &store,
+                            &health,
+                            anyagents_core::now_ms(),
+                        ))
+                    })
+                    .await
+                    .unwrap_or_default();
+                    for agent_id in fired_agents {
+                        if let Err(err) = serverless::dispatch_next_mailbox_message_if_serverless(
+                            Arc::clone(&state.store),
+                            &agent_id,
+                        )
+                        .await
+                        {
+                            eprintln!(
+                                "anyagents-serverless: github schedule dispatch failed for {agent_id}: {err}"
+                            );
+                        }
+                    }
+                }
             }
             StatusCode::ACCEPTED
         }
@@ -1184,7 +1508,8 @@ async fn telegram_webhook(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let store = Arc::clone(&state.store);
-    spawn_store(move || {
+    let channel_for_dispatch = channel_id.clone();
+    let target_agents = spawn_store(move || {
         crate::telegram::receive_webhook(
             &store,
             store.data_dir(),
@@ -1206,9 +1531,38 @@ async fn telegram_webhook(
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, why)
             }
         })?;
-        Ok(Json(serde_json::json!({ "ok": true })))
+        let agents = if serverless::is_serverless_mode() {
+            store
+                .list_channels()
+                .ok()
+                .and_then(|channels| {
+                    channels
+                        .into_iter()
+                        .find(|c| c.id.as_str() == channel_for_dispatch)
+                        .map(|c| c.agents)
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Ok(agents)
     })
-    .await
+    .await?;
+    if serverless::is_serverless_mode() {
+        for agent_id in target_agents {
+            if let Err(err) = serverless::dispatch_next_mailbox_message_if_serverless(
+                Arc::clone(&state.store),
+                &agent_id,
+            )
+            .await
+            {
+                eprintln!(
+                    "anyagents-serverless: telegram webhook dispatch failed for {agent_id}: {err}"
+                );
+            }
+        }
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// The TCP listener for the local API surface: readiness, Telegram webhooks
@@ -1219,22 +1573,56 @@ async fn telegram_webhook(
 pub(crate) fn public_entry_listening(data: &Path) -> bool {
     match crate::remote::Settings::load(data) {
         Ok(settings) if settings.public_listen.is_some() => true,
-        Ok(_) => webhook_listen_addr(false).is_some(),
+        Ok(_) => webhook_listen_addr(false, None).is_some(),
         Err(_) => false,
     }
 }
 
-fn webhook_listen_addr(public_configured: bool) -> Option<String> {
-    local_listen_addr(
+fn parse_port_env(name: &str) -> Option<u16> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|&p| p > 0)
+}
+
+fn webhook_listen_addr(public_configured: bool, port_override: Option<u16>) -> Option<String> {
+    local_listen_addr_with_port(
         std::env::var("ANYAGENTS_WEBHOOK_LISTEN").ok().as_deref(),
+        port_override,
+        parse_port_env("ANYAGENTS_PORT"),
+        parse_port_env("PORT"),
+        serverless::is_serverless_mode(),
         std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
             || std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some(),
         public_configured,
     )
 }
 
+#[cfg(test)]
 fn local_listen_addr(
     explicit: Option<&str>,
+    test_double: bool,
+    public_configured: bool,
+) -> Option<String> {
+    local_listen_addr_with_port(
+        explicit,
+        None,
+        None,
+        None,
+        false,
+        test_double,
+        public_configured,
+    )
+}
+
+fn local_listen_addr_with_port(
+    explicit: Option<&str>,
+    cli_port: Option<u16>,
+    anyagents_port: Option<u16>,
+    std_port: Option<u16>,
+    serverless: bool,
     test_double: bool,
     public_configured: bool,
 ) -> Option<String> {
@@ -1245,10 +1633,18 @@ fn local_listen_addr(
         }
         return Some(trimmed.to_string());
     }
-    if test_double {
+    if test_double && cli_port.is_none() {
         return None;
     }
-    Some(if public_configured {
+    if let Some(port) = cli_port.or(anyagents_port).or(std_port) {
+        let host = if serverless || std_port.is_some() || !public_configured {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
+        return Some(format!("{host}:{port}"));
+    }
+    Some(if public_configured && !serverless {
         "127.0.0.1:8788".to_string()
     } else {
         "0.0.0.0:8788".to_string()
@@ -1282,11 +1678,23 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .route("/v1/webhooks/github", post(github_webhook))
         .route(
+            "/v1/internal/guest/events",
+            post(serverless::guest_events_route),
+        )
+        .route(
+            "/v1/internal/cloud/events",
+            post(serverless::cloud_events_route),
+        )
+        .route("/v1/internal/tick", post(serverless::tick_route))
+        .route(
             "/v1/webhooks/mcp",
             get(public_mcp_get_route).post(public_mcp_post_route),
         )
         .fallback(public_not_found)
-        .with_state(state)
+        .with_state(state.clone())
+        .merge(crate::gateway::http_router_for_store(Arc::clone(
+            &state.store,
+        )))
         .layer(axum::middleware::from_fn(in_flight::track))
 }
 
@@ -1338,7 +1746,7 @@ pub(crate) async fn takeover_page_route(req: axum::extract::Request) -> Response
 }
 
 fn build_webhook_router(state: AppState) -> Router {
-    Router::new()
+    let base = Router::new()
         .route("/v1/webhooks/takeover/{key}", any(takeover_page_route))
         .route("/v1/webhooks/takeover/{key}/", any(takeover_page_route))
         .route(
@@ -1350,15 +1758,36 @@ fn build_webhook_router(state: AppState) -> Router {
         .route("/v1/webhooks/healthz", get(public_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .route("/v1/webhooks/github", post(github_webhook))
+        .route(
+            "/v1/internal/guest/events",
+            post(serverless::guest_events_route),
+        )
+        .route(
+            "/v1/internal/cloud/events",
+            post(serverless::cloud_events_route),
+        )
+        .route("/v1/internal/tick", post(serverless::tick_route))
         .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
-        .route("/mcp", get(mcp_get_route).post(mcp_post_route))
-        .with_state(state)
+        .route("/mcp", get(mcp_get_route).post(mcp_post_route));
+    // In Pure Serverless mode there is no reachable host Unix socket, so expose
+    // the full authenticated control/agent API on the HTTP listener strictly
+    // when fail-closed operator auth (`ANYAGENTS_OPERATOR_TOKEN`) is active.
+    let router = if serverless::is_serverless_mode() && state.auth.has_operator() {
+        mount_authenticated_api_routes(base)
+    } else {
+        base
+    };
+    router
+        .with_state(state.clone())
+        .merge(crate::gateway::http_router_for_store(Arc::clone(
+            &state.store,
+        )))
         .layer(axum::middleware::from_fn(in_flight::track))
 }
 
-pub(crate) fn build_router(state: AppState) -> Router {
-    Router::new()
+fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> {
+    router
         .route("/v1/agents", get(list_agents).post(create_agent_route))
         .route("/v1/agents/{name}", get(get_agent))
         .route("/v1/agents/{name}/admin", post(set_admin_route))
@@ -1432,13 +1861,29 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/outbound", get(outbound_list_route))
         .route("/v1/outbound/{key}/retry", post(outbound_retry_route))
         .route("/v1/outbound/{key}/discard", post(outbound_discard_route))
+}
+
+pub(crate) fn build_router(state: AppState) -> Router {
+    mount_authenticated_api_routes(Router::new())
         .route("/v1/webhooks/healthz", get(webhook_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .route("/v1/webhooks/github", post(github_webhook))
+        .route(
+            "/v1/internal/guest/events",
+            post(serverless::guest_events_route),
+        )
+        .route(
+            "/v1/internal/cloud/events",
+            post(serverless::cloud_events_route),
+        )
+        .route("/v1/internal/tick", post(serverless::tick_route))
         .route("/v1/webhooks/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/v1/mcp", get(mcp_get_route).post(mcp_post_route))
         .route("/mcp", get(mcp_get_route).post(mcp_post_route))
-        .with_state(state)
+        .with_state(state.clone())
+        .merge(crate::gateway::http_router_for_store(Arc::clone(
+            &state.store,
+        )))
         .layer(axum::middleware::from_fn(in_flight::track))
 }
 
@@ -1460,21 +1905,22 @@ enum McpListener {
 /// Who made one MCP call, and with which kind of credential.
 struct McpCaller {
     agent: Agent,
-    /// What the call's tools present on the internal socket: the agent's own
-    /// local capability, which the server reads and which never leaves this
-    /// host.
-    internal_token: String,
     /// The remote session the presented token belongs to.
     remote: Option<anyagents_core::RemoteSessionGrant>,
+    /// True when the agent runs inside an isolated remote sandbox (`agent_sandbox_bindings`
+    /// in PostgreSQL, `SandboxConfig` with `remote_spawn`, or Sylphx sandbox lease),
+    /// admitting `?profile=full`.
+    sandbox_backed: bool,
 }
 
 impl McpCaller {
     /// The tool profile this call gets: `remote`, or `coordination` when it
-    /// asks, for every credential kind. Over HTTP the tools run inside the
-    /// server process as the server's own user, so `full` is never served
-    /// here (403); it exists only over stdio, where the tool server runs as
-    /// the agent.
+    /// asks, or `full` strictly when authenticated as an isolated remote-sandbox
+    /// agent (never cloud harnesses or unisolated local processes).
     fn profile(&self, requested: Option<&str>) -> Result<crate::mcp::McpProfile, ApiError> {
+        if self.sandbox_backed && self.remote.is_some() && requested == Some("full") {
+            return Ok(crate::mcp::McpProfile::Full);
+        }
         crate::mcp::McpProfile::resolve_http(requested).map_err(|msg| {
             let known = requested.and_then(crate::mcp::McpProfile::from_str_opt);
             let status = if known.is_some() {
@@ -1532,22 +1978,27 @@ fn authenticate_mcp_request(
         let agent = store
             .agent(&grant.agent_id)
             .map_err(|_| unauthenticated())?;
-        // A remote token is for an agent that runs off this host. One whose
-        // harness was moved back onto the host no longer has a remote session.
+        // A remote token is for an agent that runs off this host. Consult
+        // PostgreSQL `agent_sandbox_bindings` (plus local config fallback) so
+        // peer replicas without pod-local `sandbox*.json` admit requests cleanly
+        // and never call `operator::ensure()` (which revokes peer capabilities!).
         let config_dir = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-        if !crate::remote::runs_off_host(&agent, &config_dir) {
+        if !crate::remote::runs_off_host_in(store, &agent, &config_dir) {
             return Err(unauthenticated());
         }
-        operator::ensure(store, &agent.id).map_err(ApiError::from_store)?;
-        let internal_token = crate::mcp::capability_of(&anyagents_core::agent_config_dir(
-            store.data_dir(),
-            &agent.id,
-        ))
-        .map_err(ApiError::from_store)?;
+        let has_pg_binding = store.sandbox_binding(&agent.id).ok().flatten().is_some();
+        let sandbox_backed = !crate::vendor::is_effective_cloud_harness(
+            &agent.harness,
+            Some(store.data_dir()),
+            Some(&config_dir),
+        ) && (has_pg_binding
+            || anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir).is_some()
+            || anyagents_tools::SandboxConfig::from_config_dir(&config_dir)
+                .is_some_and(|sbx| sbx.remote_spawn));
         return Ok(McpCaller {
             agent,
-            internal_token,
             remote: Some(grant),
+            sandbox_backed,
         });
     }
     // The public listener never tells a network peer whether a token is a
@@ -1677,15 +2128,15 @@ async fn mcp_post(
     let mcp = spawn_store(move || {
         let caller = authenticate_mcp_request(&state.store, &headers, listener)?;
         let profile = caller.profile(query.profile.as_deref())?;
-        let McpCaller {
-            agent,
-            internal_token: token,
-            ..
-        } = caller;
+        let McpCaller { agent, .. } = caller;
         let data_dir = state.store.data_dir();
         let config_dir = anyagents_core::agent_config_dir(data_dir, &agent.id);
         let sock = socket_path(data_dir);
         let router = build_router(state.clone());
+        let principal = Principal::Agent {
+            agent_id: agent.id.clone(),
+            name: agent.name.clone(),
+        };
         let _ = std::fs::create_dir_all(&config_dir);
         Ok(crate::mcp::AgentMcp::new_for_http(
             crate::mcp::AgentRef {
@@ -1695,7 +2146,7 @@ async fn mcp_post(
             },
             sock,
             config_dir,
-            token,
+            principal,
             profile,
             router,
         ))
@@ -2213,7 +2664,7 @@ async fn harness_route(
             }
         };
         require_remote_callback(state.store.data_dir(), &body.harness)?;
-        refuse_host_placement_over_http(via_http, &body.harness)?;
+        refuse_host_placement_over_http(via_http, state.store.data_dir(), &body.harness)?;
         let out = create::set_agent_harness(
             &state.store,
             state.store.data_dir(),
@@ -2238,18 +2689,25 @@ fn via_http_mcp(headers: &axum::http::HeaderMap) -> bool {
     headers.contains_key(crate::mcp::HTTP_MCP_HEADER)
 }
 
-/// Whether an agent's harness runs off this host.
-fn runs_off_host(data_dir: &Path, agent: &Agent) -> bool {
-    crate::remote::runs_off_host(
+/// Whether an agent's harness runs off this host (including PostgreSQL sandbox bindings).
+fn runs_off_host(store: &Store, agent: &Agent) -> bool {
+    crate::remote::runs_off_host_in(
+        store,
         agent,
-        &anyagents_core::agent_config_dir(data_dir, &agent.id),
+        &anyagents_core::agent_config_dir(store.data_dir(), &agent.id),
     )
 }
 
 /// Over HTTP MCP an agent is created on, or moved to, a cloud harness only:
 /// any other harness would run on this host on the call's behalf.
-fn refuse_host_placement_over_http(via_http: bool, harness: &str) -> Result<(), ApiError> {
-    if via_http && !vendor::is_cloud_harness(harness) {
+fn refuse_host_placement_over_http(
+    via_http: bool,
+    data_dir: &Path,
+    harness: &str,
+) -> Result<(), ApiError> {
+    let remote_capable = vendor::is_effective_cloud_harness(harness, Some(data_dir), None)
+        || anyagents_tools::SandboxMode::from_env().is_remote_required();
+    if via_http && !remote_capable {
         return Err(ApiError::forbidden(format!(
             "a call over HTTP MCP places agents only on a cloud harness (`claude-cloud`, \
              `openai-cloud`, `cursor-cloud`, `spiron-cloud`); `{harness}` would run on this host"
@@ -3696,7 +4154,7 @@ pub fn serve_gateway(
     routes: MemoryRoutes,
     usage: anyagents_gateway::MemoryUsage,
 ) -> Result<(), Error> {
-    let app = anyagents_gateway::router(routes, usage);
+    let app = crate::gateway::http_router_with(routes, usage);
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -4914,7 +5372,7 @@ async fn create_agent_route(
             body.profile,
         );
         require_remote_callback(state.store.data_dir(), &harness)?;
-        refuse_host_placement_over_http(via_http, &harness)?;
+        refuse_host_placement_over_http(via_http, state.store.data_dir(), &harness)?;
         let request = CreateRequest {
             name: body.name,
             role: Some(
@@ -5230,10 +5688,10 @@ fn finish_agent_archive_locked(
 ) -> Result<(), ApiError> {
     mark_explicitly_archived_locked(&state.store, state.store.data_dir(), agent)
         .map_err(ApiError::from_store)?;
-    if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(
-        &anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id),
-    ) {
-        let _ = anyagents_tools::SandboxProvider::pause(&sbx);
+    let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+    if let Err(err) = crate::sandbox_exec::release_sandbox_for_agent(&state.store, &agent.id, &cfg)
+    {
+        eprintln!("anyagents-sandbox: archive release failed: {err}");
     }
     let mut process_guard = None;
     if !is_self {
@@ -5344,9 +5802,14 @@ fn reap_subagent_ephemeral_dirs_in(
         );
     }
     let mut shared_workdirs = std::collections::HashSet::new();
-    #[cfg(target_os = "linux")]
     if let Some(agent) = agent {
+        #[cfg(target_os = "linux")]
         crate::workstation::session::stop_agent_in_background(data_dir, &agent.name);
+        complete &= remove_path_with_seat_under(
+            data_dir,
+            &data_dir.join("browser-profiles").join(&agent.name),
+            seat_ids,
+        );
     }
     // Every other agent that is not archived, and the parent even when it is,
     // keeps its workdir.
@@ -5756,10 +6219,11 @@ async fn pause_agent_route(
             .store
             .set_agent_state(&found.id, "paused")
             .map_err(ApiError::from_store)?;
-        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(
-            &anyagents_core::agent_config_dir(state.store.data_dir(), &found.id),
-        ) {
-            let _ = anyagents_tools::SandboxProvider::pause(&sbx);
+        let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &found.id);
+        if let Err(err) =
+            crate::sandbox_exec::release_sandbox_for_agent(&state.store, &found.id, &cfg)
+        {
+            eprintln!("anyagents-sandbox: pause release failed: {err}");
         }
         drop(lifecycle);
         let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
@@ -5849,8 +6313,8 @@ async fn delete_agent_route(
         let data_dir = state.store.data_dir();
         let config = agent_dir.join("config");
         let seat_ids = detect_seat_ids(&config);
-        if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&config) {
-            let _ = anyagents_tools::SandboxProvider::destroy(&sbx);
+        if let Err(err) = anyagents_tools::destroy_sandbox_for_config_dir(&config) {
+            eprintln!("anyagents-sandbox: delete destroy failed: {err}");
         }
 
         reap_subagent_ephemeral_dirs_in(&state.store, data_dir, &found.id);
@@ -5927,7 +6391,7 @@ async fn wake_agent_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
-        if via_http && !runs_off_host(state.store.data_dir(), &found) {
+        if via_http && !runs_off_host(&state.store, &found) {
             return Err(ApiError::forbidden(format!(
                 "`{}` runs on this host; a call over HTTP MCP cannot wake it",
                 found.name
@@ -6103,8 +6567,33 @@ fn prepare_agent_wake_with_options(
     rotate_profile: bool,
 ) -> Result<(), ApiError> {
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &found.id);
-    if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&cfg) {
-        let _ = anyagents_tools::SandboxProvider::resume(&sbx);
+    if !crate::vendor::is_effective_cloud_harness(
+        &found.harness,
+        Some(store.data_dir()),
+        Some(&cfg),
+    ) {
+        let remote_workdir = resolve_remote_sandbox_workdir(store, found);
+        match crate::sandbox_exec::ensure_sandbox_for_agent(
+            store,
+            found,
+            &cfg,
+            Some(remote_workdir.as_str()),
+            &std::collections::BTreeMap::new(),
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                // Only dispatch legacy HTTP resume when no leased/registry provider handled wake.
+                if let Some(sbx) = anyagents_tools::SandboxConfig::from_config_dir(&cfg) {
+                    let _ = anyagents_tools::SandboxProvider::resume(&sbx);
+                }
+            }
+            Err(err) => {
+                if anyagents_tools::SandboxMode::from_env().is_remote_required() {
+                    return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
+                }
+                eprintln!("anyagents-sandbox: wake lease ensure failed: {err}");
+            }
+        }
     }
     let work_dir = found
         .workdir
@@ -7174,7 +7663,8 @@ async fn send(
     // On a machine without the boundary, its own agent route names the sender;
     // that is the one place a body chooses the author, and an inbox is still
     // only ever its own.
-    spawn_store(move || {
+    let dispatch_store = Arc::clone(&state.store);
+    let response = spawn_store(move || {
         let route_named = match &principal {
             Principal::Agent { name, .. } if state.auth.is_trusted() => body
                 .sender
@@ -7247,7 +7737,32 @@ async fn send(
         let key = send_key(&key_body);
         send_sync(&state.store, &actor, body, plan, key)
     })
-    .await
+    .await?;
+    if serverless::is_serverless_mode() {
+        let mut dispatched_agents = HashSet::new();
+        for delivery in &response.0.deliveries {
+            if delivery.duplicate {
+                continue;
+            }
+            let Some(agent_name) = delivery.to.strip_prefix("agent:") else {
+                continue;
+            };
+            if let Ok(agent) = dispatch_store.agent_by_name(agent_name)
+                && dispatched_agents.insert(agent.id.clone())
+                && let Err(err) = serverless::dispatch_next_mailbox_message_if_serverless(
+                    Arc::clone(&dispatch_store),
+                    &agent.id,
+                )
+                .await
+            {
+                eprintln!(
+                    "anyagents-serverless: /v1/send dispatch failed for {}: {err}",
+                    agent.name
+                );
+            }
+        }
+    }
+    Ok(response)
 }
 
 async fn interact_route(
@@ -8378,7 +8893,7 @@ fn send_sync(
                     && (plan.revive_host_agents
                         || store
                             .agent_by_name(name)
-                            .is_ok_and(|agent| runs_off_host(store.data_dir(), &agent)));
+                            .is_ok_and(|agent| runs_off_host(store, &agent)));
                 // An archived recipient this send cannot wake would never read
                 // it: refused with the reason, never stored unread.
                 if !wake_archived && let Some(refusal) = archived_refusal(store, name) {
@@ -8858,6 +9373,29 @@ fn deliver_agent_with_media(
         && !is_explicitly_archived(store.data_dir(), &agent)
         && !(agent.parent_id.is_none() && is_auto_subagent_lifecycle)
     {
+        let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+        if !crate::vendor::is_effective_cloud_harness(
+            &agent.harness,
+            Some(store.data_dir()),
+            Some(&cfg),
+        ) {
+            let remote_workdir = resolve_remote_sandbox_workdir(store, &agent);
+            match crate::sandbox_exec::ensure_sandbox_for_agent(
+                store,
+                &agent,
+                &cfg,
+                Some(remote_workdir.as_str()),
+                &std::collections::BTreeMap::new(),
+            ) {
+                Ok(Some(_)) | Ok(None) => {}
+                Err(err) if anyagents_tools::SandboxMode::from_env().is_remote_required() => {
+                    return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
+                }
+                Err(err) => {
+                    eprintln!("anyagents-sandbox: delivery lease ensure failed: {err}");
+                }
+            }
+        }
         let _ = store.set_agent_state(&agent.id, "running");
     }
     let incoming = Incoming {
@@ -16055,6 +16593,59 @@ exec '{}' "$@"
     }
 
     #[test]
+    fn serverless_listen_addr_honors_port_precedence_and_binds_all_interfaces() {
+        // Explicit `ANYAGENTS_WEBHOOK_LISTEN` always takes priority.
+        assert_eq!(
+            local_listen_addr_with_port(
+                Some("127.0.0.1:9999"),
+                Some(9090),
+                Some(8081),
+                Some(8080),
+                true,
+                false,
+                true,
+            )
+            .as_deref(),
+            Some("127.0.0.1:9999")
+        );
+        // CLI `--port` beats `ANYAGENTS_PORT` and `PORT`.
+        assert_eq!(
+            local_listen_addr_with_port(
+                None,
+                Some(9090),
+                Some(8081),
+                Some(8080),
+                false,
+                false,
+                false
+            )
+            .as_deref(),
+            Some("0.0.0.0:9090")
+        );
+        // `ANYAGENTS_PORT` beats `PORT`.
+        assert_eq!(
+            local_listen_addr_with_port(None, None, Some(8081), Some(8080), false, false, false)
+                .as_deref(),
+            Some("0.0.0.0:8081")
+        );
+        // Standard `PORT` fallback binds `0.0.0.0:${PORT}` even if `public_configured`.
+        assert_eq!(
+            local_listen_addr_with_port(None, None, None, Some(8080), false, false, true)
+                .as_deref(),
+            Some("0.0.0.0:8080")
+        );
+        // `ANYAGENTS_SERVERLESS=true` binds `0.0.0.0:${PORT}` even when `public_configured`.
+        assert_eq!(
+            local_listen_addr_with_port(None, Some(8080), None, None, true, false, true).as_deref(),
+            Some("0.0.0.0:8080")
+        );
+        assert_eq!(
+            local_listen_addr_with_port(None, None, None, None, true, false, true).as_deref(),
+            Some("0.0.0.0:8788")
+        );
+    }
+
+    #[test]
     fn a_remote_token_stops_authenticating_once_its_agent_runs_on_the_host() {
         let _env = env_lock();
         let dir = crate::test_tempdir();
@@ -18367,6 +18958,548 @@ exec '{}' "$@"
                 .as_str()
             )
         );
+    }
+
+    #[test]
+    fn webhook_router_serves_mcp_profile_full_for_sandboxed_only_and_gateway_prefix() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        std::fs::write(
+            dir.path().join(crate::remote::CONFIG_FILE),
+            "[server]\npublic_url = \"https://agents.example.test\"\n",
+        )
+        .unwrap();
+
+        let sbx_agent = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("sbx-codex", "codex"))
+            .unwrap();
+        let sbx_cfg = anyagents_core::agent_config_dir(dir.path(), &sbx_agent.id);
+        std::fs::create_dir_all(&sbx_cfg).unwrap();
+        anyagents_tools::sylphx::SylphxLeaseConfig {
+            endpoint: "https://sandbox.example.test".into(),
+            token: None,
+            parent: "orgs/o1/projects/p1/envs/e1".into(),
+            template: "agent".into(),
+            shape: "linux-m".into(),
+            volume_size_gib: Some(10),
+            mount_path: "/home/user/agent-state".into(),
+            workdir: "/home/user/workspace".into(),
+            volume_id: "vol_1".into(),
+            volume_resource: "orgs/o1/projects/p1/envs/e1/volumes/vol_1".into(),
+            lease_id: Some("lease_1".into()),
+            lease_resource: Some("orgs/o1/projects/p1/envs/e1/leases/lease_1".into()),
+            data_plane_resource: Some("orgs/o1/projects/p1/envs/e1/leases/lease_1".into()),
+            envd_url: None,
+            envd_token: None,
+            expires_at: None,
+        }
+        .save_to_config_dir(&sbx_cfg)
+        .unwrap();
+        crate::remote::begin_session(&state.store, &sbx_agent).unwrap();
+        let sbx_remote = crate::remote::session_token(&sbx_cfg).unwrap();
+
+        let cloud_agent = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("cloud-only", "claude-cloud"))
+            .unwrap();
+        let cloud_cfg = anyagents_core::agent_config_dir(dir.path(), &cloud_agent.id);
+        std::fs::create_dir_all(&cloud_cfg).unwrap();
+        crate::remote::begin_session(&state.store, &cloud_agent).unwrap();
+        let cloud_remote = crate::remote::session_token(&cloud_cfg).unwrap();
+
+        // Start a minimal mock upstream responses server and add gateway route.
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in upstream.incoming().take(2) {
+                let mut s = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = std::io::Read::read(&mut s, &mut buf).unwrap();
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(req_str.contains("upstream-secret-token"), "{req_str}");
+                let body = r#"{"id":"resp_1","object":"response","status":"completed"}"#;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = std::io::Write::write_all(&mut s, reply.as_bytes());
+            }
+        });
+        crate::gateway::ProviderImage::store(
+            dir.path(),
+            &sbx_agent,
+            &format!("http://{upstream_addr}/v1"),
+            "gpt-test",
+            "upstream-secret-token",
+        )
+        .unwrap();
+        let gw_token = crate::gateway::add_route(dir.path(), &sbx_agent)
+            .unwrap()
+            .unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = build_webhook_router(state.clone());
+            let served = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let list = tools_list().to_string();
+
+            // 1) Remote-sandboxed agent admits `?profile=full` on `/mcp` and `/v1/webhooks/mcp`.
+            for path in ["/mcp?profile=full", "/v1/webhooks/mcp?profile=full"] {
+                let list_body = list.clone();
+                let tok = sbx_remote.clone();
+                let (status, body) = tokio::task::spawn_blocking(move || {
+                    let hdrs = [("authorization", format!("Bearer {tok}"))];
+                    let refs: Vec<(&str, &str)> =
+                        hdrs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    raw_http(addr, "POST", path, &refs, &list_body)
+                })
+                .await
+                .unwrap();
+                assert_eq!(status, 200, "{path}: {body}");
+                let tools_str = body.to_string();
+                assert!(tools_str.contains("\"code\""), "{path}: {tools_str}");
+                assert!(tools_str.contains("\"web_search\""), "{path}: {tools_str}");
+                assert!(tools_str.contains("\"browser\""), "{path}: {tools_str}");
+            }
+
+            // 2) Cloud-only harness MUST NOT receive `?profile=full`.
+            let list_body = list.clone();
+            let (status, _) = tokio::task::spawn_blocking(move || {
+                let hdrs = [("authorization", format!("Bearer {cloud_remote}"))];
+                let refs: Vec<(&str, &str)> = hdrs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                raw_http(addr, "POST", "/mcp?profile=full", &refs, &list_body)
+            })
+            .await
+            .unwrap();
+            assert_eq!(status, 403);
+
+            // 3) Both `/v1/responses` and `/gateway/v1/responses` work on the webhook router.
+            for path in ["/gateway/v1/responses", "/v1/responses"] {
+                let tok = gw_token.clone();
+                let (status, body) = tokio::task::spawn_blocking(move || {
+                    let hdrs = [("authorization", format!("Bearer {tok}"))];
+                    let refs: Vec<(&str, &str)> =
+                        hdrs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    raw_http(
+                        addr,
+                        "POST",
+                        path,
+                        &refs,
+                        r#"{"model":"gpt-test","input":"hi"}"#,
+                    )
+                })
+                .await
+                .unwrap();
+                assert_eq!(status, 200, "{path}: {body}");
+                assert_eq!(body["id"], "resp_1", "{path}: {body}");
+            }
+
+            served.abort();
+        });
+    }
+
+    #[test]
+    fn reap_subagent_ephemeral_dirs_removes_browser_profiles_for_reaped_agent() {
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new(
+                "ephem-browser",
+                "claude-code",
+            ))
+            .unwrap();
+        let bp = data.join("browser-profiles").join(&agent.name);
+        std::fs::create_dir_all(&bp).unwrap();
+        std::fs::write(bp.join("cookies.sqlite"), b"db").unwrap();
+        store.set_agent_state(&agent.id, "archived").unwrap();
+
+        reap_subagent_ephemeral_dirs_in(&store, data, &agent.id);
+        assert!(
+            !bp.exists(),
+            "browser-profiles/{} must be reaped",
+            agent.name
+        );
+    }
+
+    #[test]
+    fn stateless_remote_sandbox_workdir_rejects_host_launcher_paths() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sbx-wd", "claude-code"))
+            .unwrap();
+
+        // Default logical workspace when nothing is configured (never a coordinator host path).
+        let default_wd = resolve_remote_sandbox_workdir(&store, &agent);
+        assert_eq!(
+            default_wd,
+            anyagents_core::stateless::DEFAULT_REMOTE_SANDBOX_WORKDIR
+        );
+
+        // Host `<data>/agents/<id>/launcher` path in `agent.workdir` or launch_env MUST be rejected!
+        let host_launcher = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("launcher")
+            .display()
+            .to_string();
+        store
+            .set_agent_launch_env(
+                &agent.id,
+                &[("ANYAGENTS_SANDBOX_WORKDIR".into(), host_launcher)],
+            )
+            .unwrap();
+        let agent_host = store.agent(&agent.id).unwrap();
+        assert_eq!(
+            resolve_remote_sandbox_workdir(&store, &agent_host),
+            anyagents_core::stateless::DEFAULT_REMOTE_SANDBOX_WORKDIR
+        );
+
+        // Explicit logical remote workspace in `agent_sandbox_bindings` is honored.
+        let mut binding =
+            anyagents_core::stateless::SandboxBinding::new(agent.id.clone(), "sylphx");
+        binding.remote_workdir = "/home/user/agent-data/workspace/repo".to_string();
+        store.sandbox_binding_store().upsert(&binding).unwrap();
+        assert_eq!(
+            resolve_remote_sandbox_workdir(&store, &agent_host),
+            "/home/user/agent-data/workspace/repo"
+        );
+    }
+
+    #[test]
+    fn stateless_in_process_remote_harness_delivers_turn_without_os_child_and_keeper_host_is_in_process()
+     {
+        use anyagents_harness::{Context, DeliverOutcome, Harness, OutboundMessage, Proof};
+        use anyagents_keeper::Hosted as _;
+        use std::io::{BufRead as _, Write as _};
+
+        let _env = env_lock();
+        let prev_mode = std::env::var_os("ANYAGENTS_SANDBOX_MODE");
+        unsafe {
+            std::env::set_var("ANYAGENTS_SANDBOX_MODE", "remote_required");
+        }
+        assert!(matches!(
+            crate::keeper::host(),
+            Ok(crate::vendor::HarnessHost::InProcess)
+        ));
+        match prev_mode {
+            Some(v) => unsafe { std::env::set_var("ANYAGENTS_SANDBOX_MODE", v) },
+            None => unsafe { std::env::remove_var("ANYAGENTS_SANDBOX_MODE") },
+        }
+
+        // Exercise `InProcessRemoteHarness` end-to-end with an in-memory stream-json worker.
+        let mut harness = crate::vendor::InProcessRemoteHarness::start_with_worker(
+            true,
+            "test",
+            |reader, mut writer| {
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let Ok(ev) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                        continue;
+                    };
+                    if ev.get("type").and_then(|v| v.as_str()) == Some("user") {
+                        writeln!(writer, "{trimmed}")?;
+                        let res = serde_json::json!({
+                            "type": "result",
+                            "subtype": "success",
+                            "is_error": false,
+                            "session_id": "inproc-sess-42",
+                            "result": "ok",
+                            "usage": { "input_tokens": 11, "output_tokens": 7 }
+                        });
+                        writeln!(writer, "{res}")?;
+                        writer.flush()?;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .expect("start InProcessRemoteHarness");
+
+        assert!(
+            harness.process_id().is_none(),
+            "InProcessRemoteHarness must spawn ZERO OS child processes"
+        );
+        let msg = OutboundMessage {
+            id: "msg-inproc-1".to_string(),
+            seq: 1,
+            text: "ping".to_string(),
+            sender: Some("operator".to_string()),
+            reply_to: None,
+            source_time_ms: None,
+            context: Context::default(),
+        };
+        let outcome = harness.deliver(&msg).expect("deliver to in-process worker");
+        assert!(
+            matches!(outcome, DeliverOutcome::Accepted { .. }),
+            "unexpected deliver outcome: {outcome:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while harness.proven("msg-inproc-1")
+            != Some(Proof::Taken {
+                turn_finished: true,
+            })
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            harness.proven("msg-inproc-1"),
+            Some(Proof::Taken {
+                turn_finished: true
+            })
+        );
+        assert_eq!(harness.session_id().as_deref(), Some("inproc-sess-42"));
+        assert_eq!(harness.turns_served(), 1);
+        assert_eq!(harness.served_usage().input_tokens, 11);
+        assert_eq!(harness.served_usage().output_tokens, 7);
+        harness.stop();
+    }
+
+    #[test]
+    fn stateless_dockerfile_sets_anyagents_data_not_data_dir() {
+        let dockerfile = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Dockerfile");
+        let body = std::fs::read_to_string(&dockerfile)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dockerfile.display()));
+        assert!(
+            body.contains("ANYAGENTS_DATA=/var/lib/anyagents"),
+            "Dockerfile must export ANYAGENTS_DATA=/var/lib/anyagents"
+        );
+        assert!(
+            !body.contains("ANYAGENTS_DATA_DIR"),
+            "Dockerfile must not reference dead ANYAGENTS_DATA_DIR env var"
+        );
+    }
+
+    #[test]
+    fn stateless_two_replicas_mcp_and_gateway_never_revoke_capabilities_or_overwrite_launch_env() {
+        use anyagents_gateway::RouteResolver as _;
+        use http_body_util::BodyExt as _;
+
+        let url = match std::env::var("ANYAGENTS_TEST_POSTGRES_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            Some(u) => u,
+            None => {
+                eprintln!(
+                    "skipping stateless_two_replicas_mcp_and_gateway test: ANYAGENTS_TEST_POSTGRES_URL not set"
+                );
+                return;
+            }
+        };
+        let _env = env_lock();
+        let tag = format!("{}_{}", std::process::id(), anyagents_core::now_ms());
+        let dir_a = crate::test_tempdir();
+        let dir_b = crate::test_tempdir();
+        let store_a = Arc::new(
+            Store::open_postgres_isolated(&url, dir_a.path(), format!("srv-a-{tag}"))
+                .expect("open replica A store"),
+        );
+        let store_b = Arc::new(
+            Store::open_postgres_isolated(&url, dir_b.path(), format!("srv-b-{tag}"))
+                .expect("open replica B store"),
+        );
+        let shared_cap_key = "a".repeat(64);
+        store_a.hold_capability_key(&shared_cap_key).unwrap();
+        store_b.hold_capability_key(&shared_cap_key).unwrap();
+
+        let state_a = AppState {
+            store: Arc::clone(&store_a),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir_a.path().into(),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+        let state_b = AppState {
+            store: Arc::clone(&store_b),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir_b.path().into(),
+            },
+            identity: Arc::new(ServingIdentity::capture()),
+            profiles: Default::default(),
+        };
+
+        // 1. Replica A creates a remote-sandbox-backed agent with a live local capability,
+        //    a PG `agent_sandbox_bindings` row, a remote session token, a PG gateway route,
+        //    and a public cloud `launch_env`.
+        let agent = store_a
+            .create_agent(anyagents_core::NewAgent::new(
+                format!("rep_sbx_{tag}"),
+                "claude-code",
+            ))
+            .unwrap();
+        let cap_a = store_a.issue_capability(&agent.id).unwrap();
+        let mut binding =
+            anyagents_core::stateless::SandboxBinding::new(agent.id.clone(), "sylphx");
+        binding.volume_id = format!("vol-srv-{tag}");
+        binding.lease_id = Some(format!("lease-srv-{tag}"));
+        binding.lease_state = "ready".to_string();
+        store_a.sandbox_binding_store().upsert(&binding).unwrap();
+
+        let remote_tok = store_a
+            .begin_remote_session(&agent.id, 3_600_000)
+            .unwrap()
+            .token;
+
+        let key = anyagents_core::stateless::MasterKey::from_bytes(&[0x55u8; 32]).unwrap();
+        let gw_tok = crate::gateway::store_key_in(
+            &store_a,
+            &agent,
+            "https://api.example.test/v1",
+            "gpt-5",
+            "sk-srv-synthetic",
+            Some(key.clone()),
+        )
+        .expect("store gateway route in PG");
+        let cloud_env = vec![
+            (
+                "OPENAI_BASE_URL".to_string(),
+                "https://public-gateway.example.test/v1".to_string(),
+            ),
+            ("OPENAI_API_KEY".to_string(), gw_tok.clone()),
+        ];
+        store_a.set_agent_launch_env(&agent.id, &cloud_env).unwrap();
+        let expected_launch_env = store_a.agent(&agent.id).unwrap().launch_env;
+
+        // 2. Verify replica B has ZERO local sandbox/capability/provider files on disk!
+        let cfg_b = anyagents_core::agent_config_dir(dir_b.path(), &agent.id);
+        assert!(!cfg_b.exists());
+
+        // 3. Replica B serves HTTP MCP (`?profile=full`) using PG `agent_sandbox_bindings`
+        //    and direct `Principal::Agent` injection WITHOUT calling `operator::ensure()`.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {remote_tok}").parse().unwrap(),
+            );
+            let resp = mcp_post_route(
+                State(state_b.clone()),
+                headers.clone(),
+                Query(McpRouteQuery {
+                    profile: Some("full".to_string()),
+                }),
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                })),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "replica B MCP tools/list failed: {}: {}",
+                    e.status, e.message
+                )
+            });
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                text.contains("\"code\""),
+                "replica B must grant ?profile=full from PG agent_sandbox_bindings: {text}"
+            );
+
+            // Also call an MCP tool (`whoami` / `inbox`) to verify the in-process router accepts
+            // `InjectedPrincipal` cleanly with zero local capability file on replica B!
+            let call_resp = mcp_post_route(
+                State(state_b.clone()),
+                headers,
+                Query(McpRouteQuery {
+                    profile: Some("full".to_string()),
+                }),
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "inbox",
+                        "arguments": {}
+                    }
+                })),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "replica B MCP inbox call failed: {}: {}",
+                    e.status, e.message
+                )
+            });
+            assert_eq!(call_resp.status(), StatusCode::OK);
+        });
+
+        // 4. Replica A's original capability token MUST STILL BE VALID in PG (never revoked by replica B!).
+        let authed = store_a
+            .authenticate_agent(&cap_a)
+            .expect("replica A capability MUST NOT be revoked when replica B serves MCP");
+        assert_eq!(authed.id, agent.id);
+        let _ = state_a;
+
+        // 5. Replica B resolves replica A's gateway route directly from PG `gateway_routes`!
+        let resolver_b =
+            crate::gateway::PgGatewayRoutes::with_master_key(Arc::clone(&store_b), Some(key));
+        let route_b = resolver_b
+            .resolve(&gw_tok)
+            .expect("replica B resolves gateway token from PG");
+        assert_eq!(route_b.agent, agent.name);
+        assert_eq!(route_b.api_key, "sk-srv-synthetic");
+
+        // 6. Under `ANYAGENTS_SANDBOX_MODE=remote_required`, `gateway::start` on replica B
+        //    MUST NOT bind a random loopback port and MUST NOT overwrite `agents.launch_env` in PG!
+        std::fs::write(dir_b.path().join("database-url"), format!("{url}\n")).unwrap();
+        let prev_mode = std::env::var_os("ANYAGENTS_SANDBOX_MODE");
+        unsafe {
+            std::env::set_var("ANYAGENTS_SANDBOX_MODE", "remote_required");
+        }
+        let started_b =
+            crate::gateway::start(dir_b.path()).expect("gateway::start in remote_required");
+        match prev_mode {
+            Some(v) => unsafe { std::env::set_var("ANYAGENTS_SANDBOX_MODE", v) },
+            None => unsafe { std::env::remove_var("ANYAGENTS_SANDBOX_MODE") },
+        }
+        assert!(!started_b.moved);
+        assert!(
+            !dir_b.path().join("gateway.port").exists(),
+            "stateless remote_required replica MUST NOT bind pod-local gateway.port"
+        );
+        let reloaded = store_a.agent(&agent.id).unwrap();
+        assert_eq!(
+            reloaded.launch_env, expected_launch_env,
+            "stateless replica gateway::start MUST NOT overwrite agents.launch_env in PG"
+        );
+        assert!(
+            reloaded.launch_env.iter().any(|(k, v)| {
+                k == "OPENAI_BASE_URL" && v == "https://public-gateway.example.test/v1"
+            }),
+            "public gateway URL must remain intact: {:?}",
+            reloaded.launch_env
+        );
+
+        // Clean up test agent in PG.
+        store_a.delete_agent(&agent.id).unwrap();
     }
 }
 

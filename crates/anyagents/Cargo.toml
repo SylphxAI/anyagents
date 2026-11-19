@@ -10,6 +10,7 @@ description = "Server, command line, and MCP entry point for long-lived coding a
 anyagents-channel-telegram = { path = "../anyagents-channel-telegram" }
 anyagents-core = { path = "../anyagents-core" }
 anyagents-gateway = { path = "../anyagents-gateway" }
+anyagents-guest = { path = "../anyagents-guest" }
 anyagents-harness = { path = "../anyagents-harness" }
 anyagents-harness-agy = { path = "../anyagents-harness-agy" }
 anyagents-harness-omp = { path = "../anyagents-harness-omp" }
@@ -25,7 +26,9 @@ anyagents-harness-spiron = { path = "../anyagents-harness-spiron" }
 anyagents-supervisor = { path = "../anyagents-supervisor" }
 anyagents-memory = { path = "../anyagents-memory", features = ["service"] }
 anyagents-tools = { path = "../anyagents-tools" }
+async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
+base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
@@ -34,6 +37,7 @@ hyper = { version = "1", features = ["client", "http1"] }
 futures = "0.3"
 hyper-util = { version = "0.1", features = ["service", "tokio"] }
 libc = "0.2"
+ring = "0.17"
 rmcp = { version = "3.5", features = [
     "client",
     "macros",
@@ -64,8 +68,10 @@ roxmltree = "0.21"
 # until 0.2.0 is published; then this becomes `agent-workstation = "0.2"`.
 [target.'cfg(target_os = "linux")'.dependencies]
 agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "9587cbc7d0850afa315111b764cc9cde9d62e646" }
-async-trait = "0.1"
 tower = { version = "0.5", features = ["util"] }
+
+[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["background_threads_runtime_support"] }
 
 [dev-dependencies]
 anyagents-agent = { path = "../anyagents-agent" }
@@ -78,6 +84,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 rmcp = { version = "3.5", features = ["client", "transport-child-process"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+tower = { version = "0.5", features = ["util"] }
 
 # A scripted `opencode` for the server test: it speaks the CLI's own `serve`
 # and `api` surface. It is not part of the released binary.

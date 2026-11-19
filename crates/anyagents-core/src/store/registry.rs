@@ -21,10 +21,11 @@ use super::{
     memory_index::{self, MemoryIndex},
     open_reader, preserve_legacy_scopes, runtime, tune_connection,
 };
+use crate::db::{PgHandle, shared_pg_handle};
 use crate::error::Error;
 use crate::migrate;
 
-/// What every handle on one database file shares.
+/// What every SQLite handle on one database file shares.
 pub(super) struct Shared {
     /// The file the read pool opens. Empty for SQLite's private temporary
     /// database, which no second connection can reach.
@@ -45,9 +46,159 @@ pub(super) struct Shared {
     repairs_pending: AtomicBool,
 }
 
+/// What every PostgreSQL handle on one database URL shares.
+pub(super) struct PgShared {
+    pub(super) handle: PgHandle,
+    pub(super) memory_index: Arc<MemoryIndex>,
+    pub(super) replica_id: String,
+    wakes: Mutex<Vec<Sender<Wake>>>,
+    pub(super) changes: tokio::sync::watch::Sender<u64>,
+    pub(super) write_retry_budget_ms: AtomicU64,
+    wake_listener: Mutex<Option<crate::stateless::PgWakeListener>>,
+}
+
+impl PgShared {
+    fn open(url: &str, data_dir: &Path, replica_id: String) -> Result<Self, Error> {
+        let handle = shared_pg_handle(url)?;
+        let memory_index = Arc::new(MemoryIndex::open_postgres(
+            &data_dir.join(memory_index::FILE_NAME),
+            handle.pool.clone(),
+        )?);
+        memory_index.check_tail(&handle.pool)?;
+        if memory_index.far_behind(&handle.pool)? {
+            let pool = handle.pool.clone();
+            memory_index::spawn_rebuild(&memory_index, move || Some(pool.clone()));
+        } else {
+            memory_index.sync(&handle.pool, true, memory_index::READ_BUDGET)?;
+        }
+        Ok(Self {
+            handle,
+            memory_index,
+            replica_id,
+            wakes: Mutex::new(Vec::new()),
+            changes: tokio::sync::watch::channel(0).0,
+            write_retry_budget_ms: AtomicU64::new(WRITE_RETRY_BUDGET.as_millis() as u64),
+            wake_listener: Mutex::new(None),
+        })
+    }
+
+    pub(super) fn wakes(&self) -> &Mutex<Vec<Sender<Wake>>> {
+        &self.wakes
+    }
+
+    /// Lazily start the background `LISTEN anyagents_wakes` subscriber for this
+    /// PostgreSQL replica handle. Uses a `Weak<PgShared>` so the listener exits
+    /// automatically when all `Store` handles drop.
+    pub(super) fn ensure_wake_listener(self: &Arc<Self>) {
+        let mut slot = lock(&self.wake_listener);
+        if slot.is_some() {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let direct_url = self.handle.direct_url.clone();
+        let listener = crate::stateless::PgWakeListener::start(direct_url, move |event| {
+            let Some(shared) = weak.upgrade() else {
+                return;
+            };
+            match event {
+                crate::stateless::PgWakeEvent::Wake {
+                    origin_replica_id,
+                    wake,
+                } => {
+                    if origin_replica_id.as_deref() == Some(shared.replica_id.as_str()) {
+                        return;
+                    }
+                    let mut wakes = lock(&shared.wakes);
+                    wakes.retain(|sender| sender.send(wake.clone()).is_ok());
+                    shared.changes.send_modify(|seq| *seq = seq.wrapping_add(1));
+                }
+                crate::stateless::PgWakeEvent::Changes { origin_replica_id } => {
+                    if origin_replica_id.as_deref() == Some(shared.replica_id.as_str()) {
+                        return;
+                    }
+                    shared.changes.send_modify(|seq| *seq = seq.wrapping_add(1));
+                }
+            }
+        });
+        *slot = Some(listener);
+    }
+
+    pub(super) fn wait_wake_listener_ready(self: &Arc<Self>, timeout: std::time::Duration) -> bool {
+        self.ensure_wake_listener();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let connected = lock(&self.wake_listener)
+                .as_ref()
+                .is_some_and(crate::stateless::PgWakeListener::is_connected);
+            if connected {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+/// Backend shared across `Store` clones.
+#[derive(Clone)]
+pub(super) enum Backend {
+    Sqlite(Arc<Shared>),
+    Postgres(Arc<PgShared>),
+}
+
+type OpenPgRegistry = Mutex<HashMap<String, Arc<Mutex<Weak<PgShared>>>>>;
+
+static OPEN_PG: LazyLock<OpenPgRegistry> = LazyLock::new(Mutex::default);
+
+pub(super) fn shared_postgres(
+    url: &str,
+    data_dir: &Path,
+    replica_id: &str,
+) -> Result<Arc<PgShared>, Error> {
+    let trimmed = url.trim();
+    let slot = {
+        let mut open = lock(&OPEN_PG);
+        open.retain(|_, slot| Arc::strong_count(slot) > 1 || lock(slot).strong_count() > 0);
+        Arc::clone(open.entry(trimmed.to_string()).or_default())
+    };
+    let mut current = lock(&slot);
+    if let Some(shared) = current.upgrade() {
+        return Ok(shared);
+    }
+    let shared = Arc::new(PgShared::open(trimmed, data_dir, replica_id.to_string())?);
+    *current = Arc::downgrade(&shared);
+    Ok(shared)
+}
+
+/// Create a standalone PostgreSQL backend handle with its own in-process wake
+/// subscribers, `PgListener`, and `replica_id` (used to simulate distinct
+/// coordinator pods sharing one PostgreSQL database in integration tests).
+pub(super) fn isolated_postgres(
+    url: &str,
+    data_dir: &Path,
+    replica_id: &str,
+) -> Result<Arc<PgShared>, Error> {
+    let shared = Arc::new(PgShared::open(
+        url.trim(),
+        data_dir,
+        replica_id.to_string(),
+    )?);
+    Ok(shared)
+}
+
 /// Borrow a pooled reader for `path` only if this process already holds the
 /// store open; never opens a writer, runs migrations, or creates a file.
 pub(super) fn reader_if_open(path: &Path) -> Option<ReadConn<'static>> {
+    if let Some(url) = crate::db::configured_database_url_for_data_dir(&data_dir_for(path)) {
+        let slot = {
+            let open = lock(&OPEN_PG);
+            open.get(url.trim()).cloned()
+        }?;
+        let shared = { lock(&slot).upgrade() }?;
+        return Some(ReadConn::Postgres(shared.handle.pool.clone()));
+    }
     if path.as_os_str().is_empty() {
         return None;
     }
@@ -457,6 +608,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::db::DbExecExt as _;
     use crate::store::{Incoming, NewAgent, Store};
 
     fn passes() -> usize {
@@ -529,8 +681,8 @@ mod tests {
         // No later open migrated, repaired or probed the schema again.
         assert_eq!(passes(), before + 1);
         for (index, handle) in handles.iter().enumerate() {
-            assert!(Arc::ptr_eq(&first.shared, &handle.shared));
             // Every handle writes and reads through the shared connections.
+            assert!(Arc::ptr_eq(first.sqlite_shared(), handle.sqlite_shared()));
             let agent = handle
                 .create_agent(NewAgent::new(format!("handle-{index}"), "codex"))
                 .unwrap();
@@ -570,7 +722,7 @@ mod tests {
         assert!(
             stores
                 .iter()
-                .all(|s| Arc::ptr_eq(&s.shared, &stores[0].shared))
+                .all(|s| Arc::ptr_eq(s.sqlite_shared(), stores[0].sqlite_shared()))
         );
         if let Some(count) = read_write_descriptors(&db) {
             assert_eq!(
@@ -590,7 +742,7 @@ mod tests {
         let first = Store::open(&db).unwrap();
         let second = Store::open(&db).unwrap();
         let agent = first.create_agent(NewAgent::new("kept", "codex")).unwrap();
-        let weak = Arc::downgrade(&first.shared);
+        let weak = Arc::downgrade(first.sqlite_shared());
         drop(first);
         assert!(weak.upgrade().is_some(), "a live handle keeps the writer");
         drop(second);
@@ -625,7 +777,7 @@ mod tests {
             )
             .unwrap();
         // As if a peer process's write lock had deferred the repairs at open.
-        store.shared.mark_repairs_pending();
+        store.sqlite_shared().mark_repairs_pending();
         let before = passes();
         let _again = Store::open(&db).unwrap();
         assert_eq!(passes(), before + 1);
@@ -642,16 +794,16 @@ mod tests {
         let agent = store
             .create_agent(NewAgent::new("reader-fallback", "test"))
             .unwrap();
-        lock(&store.shared.readers).clear();
+        lock(&store.sqlite_shared().readers).clear();
         let moved = dir.path().join("moved.db");
         std::fs::rename(&path, &moved).unwrap();
-        assert!(store.shared.reader().is_none());
+        assert!(store.sqlite_shared().reader().is_none());
         let reader = store.read_conn();
         assert!(matches!(&reader, ReadConn::Guard(..)));
         let name: String = reader
-            .query_row(
+            .db_query_one(
                 "SELECT name FROM agents WHERE id = ?1",
-                [agent.id.as_str()],
+                &[crate::db::ToDbParam::to_db_param(&agent.id.as_str())],
                 |row| row.get(0),
             )
             .unwrap();
@@ -659,9 +811,7 @@ mod tests {
         // The fallback reads the search index too, attached for the borrow
         // only: the writer never keeps it.
         reader
-            .query_row("SELECT count(*) FROM rag_chunks", [], |r| {
-                r.get::<_, i64>(0)
-            })
+            .db_query_one("SELECT count(*) FROM rag_chunks", &[], |r| r.get::<i64>(0))
             .unwrap();
         drop(reader);
         let attached: i64 = store
@@ -703,9 +853,9 @@ mod tests {
             .create_agent(NewAgent::new("reader", "codex"))
             .unwrap();
         let reader = store.read_conn();
-        reader.execute_batch("BEGIN").unwrap();
-        fn count(conn: &Connection) -> i64 {
-            conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+        reader.db_execute_batch("BEGIN").unwrap();
+        fn count(conn: &ReadConn<'_>) -> i64 {
+            conn.db_query_one("SELECT count(*) FROM messages", &[], |r| r.get(0))
                 .unwrap()
         }
         assert_eq!(count(&reader), 0);
@@ -724,7 +874,7 @@ mod tests {
             let outcome = finished.recv_timeout(Duration::from_secs(10));
             // The open read keeps its snapshot while the writer commits.
             assert_eq!(count(&reader), 0);
-            reader.execute_batch("COMMIT").unwrap();
+            reader.db_execute_batch("COMMIT").unwrap();
             outcome.expect("a writer waited for a long read");
         });
         drop(reader);

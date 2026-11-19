@@ -14,10 +14,26 @@
 //! origin it was started with, and a restarted server listens there again.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
-use anyagents_core::{Agent, AgentId, Error, Store};
-use anyagents_gateway::{MemoryRoutes, Protocol, ProviderRoute};
+use anyagents_core::{
+    Agent, AgentId, Error, MasterKey, Store, StoredGatewayRoute, UpsertGatewayRoute,
+};
+use anyagents_gateway::{
+    MemoryRoutes, MemoryUsage, Protocol, ProviderRoute, RouteResolver, UsageEvent, UsageSink as _,
+    encode_request, encode_response, parse_request, parse_response,
+};
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+
+/// Environment variable specifying the external HTTPS origin of the coordinator's
+/// authenticated protocol gateway (for example `https://agents.example.com` on port 443).
+pub const ENV_PUBLIC_GATEWAY_URL: &str = "ANYAGENTS_PUBLIC_GATEWAY_URL";
 
 /// The running gateway: where it listens, and what it resolves.
 pub struct Gateway {
@@ -27,7 +43,19 @@ pub struct Gateway {
 }
 
 static GATEWAY: OnceLock<Gateway> = OnceLock::new();
+static SHARED_ROUTES: OnceLock<MemoryRoutes> = OnceLock::new();
+static SHARED_USAGE: OnceLock<MemoryUsage> = OnceLock::new();
 static START: Mutex<()> = Mutex::new(());
+
+/// Shared gateway route table mounted on loopback and authenticated public/webhook TCP routers.
+pub fn shared_routes() -> &'static MemoryRoutes {
+    SHARED_ROUTES.get_or_init(MemoryRoutes::new)
+}
+
+/// Shared gateway usage recorder mounted on loopback and authenticated public/webhook TCP routers.
+pub fn shared_usage() -> &'static MemoryUsage {
+    SHARED_USAGE.get_or_init(MemoryUsage::new)
+}
 
 /// The running gateway, if `start` was called.
 pub fn running() -> Option<&'static Gateway> {
@@ -44,10 +72,108 @@ pub struct Started {
     pub agents: Vec<AgentId>,
 }
 
+/// Cross-replica [`RouteResolver`] backed by PostgreSQL `public.gateway_routes`.
+///
+/// Resolves bearer tokens directly by indexed `token_hash` on PostgreSQL so any
+/// coordinator replica answers LLM gateway traffic for agents configured on any
+/// other replica without pod-local `provider.json` or `gateway-token.txt` files.
+/// On SQLite, delegates directly to the in-process [`MemoryRoutes`] table.
+#[derive(Clone)]
+pub struct PgGatewayRoutes {
+    store: Arc<Store>,
+    memory: MemoryRoutes,
+    master_key: Option<MasterKey>,
+}
+
+impl PgGatewayRoutes {
+    pub fn new(store: Arc<Store>) -> Self {
+        Self {
+            store,
+            memory: shared_routes().clone(),
+            master_key: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_master_key(store: Arc<Store>, master_key: Option<MasterKey>) -> Self {
+        Self {
+            store,
+            memory: shared_routes().clone(),
+            master_key,
+        }
+    }
+}
+
+impl RouteResolver for PgGatewayRoutes {
+    fn resolve(&self, token: &str) -> Option<ProviderRoute> {
+        if let Some(pg_store) = self
+            .store
+            .gateway_route_store_with_key(self.master_key.clone())
+        {
+            return pg_store
+                .resolve_by_token(token)
+                .ok()
+                .flatten()
+                .map(stored_route_to_provider_route);
+        }
+        self.memory.resolve(token)
+    }
+}
+
+fn protocol_str(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::AnthropicMessages => "anthropic_messages",
+        Protocol::OpenAiChat => "openai_chat",
+        Protocol::OpenAiResponses => "openai_responses",
+    }
+}
+
+fn protocol_from_stored(stored: &str, harness: &str) -> Protocol {
+    match stored {
+        "anthropic_messages" => Protocol::AnthropicMessages,
+        "openai_chat" => Protocol::OpenAiChat,
+        "openai_responses" => Protocol::OpenAiResponses,
+        _ => protocol_of(harness),
+    }
+}
+
+fn stored_route_to_provider_route(r: StoredGatewayRoute) -> ProviderRoute {
+    ProviderRoute {
+        agent: r.agent_name,
+        provider: provider_of(&r.base_url).to_string(),
+        protocol: protocol_from_stored(&r.protocol, &r.harness),
+        base_url: r.base_url.trim_end_matches('/').to_string(),
+        model: r.model,
+        api_key: r.api_key,
+    }
+}
+
 /// Start the gateway once, as part of the server starting. It is bound to the
 /// server's lifetime: a server that cannot serve harnesses reports why.
+///
+/// Under `ANYAGENTS_SANDBOX_MODE=remote_required` (stateless coordinator mode),
+/// skips binding a pod-local random loopback port and NEVER overwrites
+/// `agents.launch_env` in PostgreSQL across replicas; gateway traffic is served
+/// exclusively on the public/HTTP router via [`http_router_for_store`].
 pub fn start(data: &Path) -> Result<Started, Error> {
     let guard = START.lock().unwrap_or_else(PoisonError::into_inner);
+    if anyagents_tools::SandboxMode::from_env().is_remote_required() {
+        let store = Store::open(data.join("state.db"))?;
+        let agents = if store.is_postgres() {
+            store
+                .gateway_route_store()
+                .and_then(|pg| pg.list_live().ok())
+                .map(|rows| rows.into_iter().map(|r| r.agent_id).collect())
+                .unwrap_or_default()
+        } else {
+            ensure_routes_loaded(data).unwrap_or_default()
+        };
+        drop(guard);
+        return Ok(Started {
+            moved: false,
+            agents,
+        });
+    }
     if GATEWAY.get().is_some() {
         return Ok(Started {
             moved: false,
@@ -55,7 +181,7 @@ pub fn start(data: &Path) -> Result<Started, Error> {
         });
     }
     let (port, listener, moved) = bind(&data.join("gateway.port"))?;
-    let routes = MemoryRoutes::new();
+    let routes = shared_routes().clone();
     let store = Store::open(data.join("state.db"))?;
     let mut provider_agents = Vec::new();
     // An archived agent runs nothing; a wake gives it its route back.
@@ -68,7 +194,7 @@ pub fn start(data: &Path) -> Result<Started, Error> {
             provider_agents.push(agent.id);
         }
     }
-    let usage = anyagents_gateway::MemoryUsage::new();
+    let usage = shared_usage().clone();
     crate::server::serve_gateway(listener, routes.clone(), usage)?;
     let _ = GATEWAY.set(Gateway { port, routes });
     // The port is this process's, so every agent pointed at the gateway is
@@ -127,32 +253,386 @@ pub fn origin() -> Option<String> {
     running().map(|gateway| format!("http://127.0.0.1:{}", gateway.port))
 }
 
+/// External gateway origin advertised to isolated remote sandboxes (via Ingress/443).
+/// Never falls back to `127.0.0.1`.
+pub fn public_origin(data: Option<&Path>) -> Option<String> {
+    if let Ok(raw) = std::env::var(ENV_PUBLIC_GATEWAY_URL) {
+        let trimmed = raw.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    data.and_then(|d| crate::remote::require_public_url(d).ok())
+        .and_then(|s| s.public_url)
+        .map(|u| u.trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Populate `shared_routes()` from stored agent `provider.json` images (or
+/// PostgreSQL `public.gateway_routes`) on startup.
+pub fn ensure_routes_loaded(data: &Path) -> Result<Vec<AgentId>, Error> {
+    let routes = shared_routes();
+    let store = Store::open(data.join("state.db"))?;
+    let mut loaded = Vec::new();
+    if let Some(pg_routes) = store.gateway_route_store()
+        && let Ok(rows) = pg_routes.list_live()
+    {
+        for row in rows {
+            let tok = row.token.clone();
+            let id = row.agent_id.clone();
+            routes.insert(tok, stored_route_to_provider_route(row));
+            loaded.push(id);
+        }
+    }
+    for agent in store.list_live_agents()? {
+        if loaded.contains(&agent.id) {
+            continue;
+        }
+        if let Some(image) = ProviderImage::load(data, &agent.id)? {
+            routes.insert(token(data, &agent.id)?, image.route(&agent.name));
+            loaded.push(agent.id);
+        }
+    }
+    Ok(loaded)
+}
+
+/// Environment variables injecting the coordinator's public gateway URL and
+/// per-agent gateway token (without raw provider API keys) into an isolated sandbox.
+pub fn sandbox_env(data: &Path, id: &AgentId) -> Result<Vec<(String, String)>, String> {
+    let store = Store::open(data.join("state.db")).ok();
+    if let Some(ref store) = store
+        && let Some(pg_routes) = store.gateway_route_store()
+        && let Ok(Some(stored)) = pg_routes.get_for_agent(id)
+    {
+        let origin = public_origin(Some(data)).ok_or_else(|| {
+            format!(
+                "agent `{}` requires a public gateway URL ({ENV_PUBLIC_GATEWAY_URL} or server public_url) so the remote sandbox never dials 127.0.0.1",
+                stored.agent_name
+            )
+        })?;
+        return Ok(env_for_parts(
+            &stored.harness,
+            &stored.model,
+            &stored.token,
+            &origin,
+        ));
+    }
+    let Some(image) = ProviderImage::load(data, id).map_err(|e| e.to_string())? else {
+        return Ok(Vec::new());
+    };
+    let tok = token(data, id).map_err(|e| e.to_string())?;
+    let agent_name = store
+        .and_then(|s| s.agent(id).ok())
+        .map(|a| a.name)
+        .unwrap_or_else(|| id.to_string());
+    shared_routes().insert(tok, image.route(&agent_name));
+    let origin = public_origin(Some(data)).ok_or_else(|| {
+        format!(
+            "agent `{agent_name}` requires a public gateway URL ({ENV_PUBLIC_GATEWAY_URL} or server public_url) so the remote sandbox never dials 127.0.0.1"
+        )
+    })?;
+    Ok(env_for(data, id, &origin))
+}
+
+/// Build the Axum router serving `/v1/messages`, `/v1/responses`, and `/v1/chat/completions`
+/// authenticated exclusively by per-agent gateway bearer tokens.
+pub fn http_router() -> Router {
+    http_router_with(shared_routes().clone(), shared_usage().clone())
+}
+
+/// Build the store-aware protocol gateway Axum router: backed by PostgreSQL
+/// `public.gateway_routes` when `store` uses PostgreSQL, or in-process
+/// `shared_routes()` on SQLite.
+pub fn http_router_for_store(store: Arc<Store>) -> Router {
+    if store.is_postgres() {
+        http_router_with(PgGatewayRoutes::new(store), shared_usage().clone())
+    } else {
+        http_router()
+    }
+}
+
+/// Build the protocol gateway Axum router against explicit route/usage stores.
+/// Serves both `/v1/{messages,responses,chat/completions}` and
+/// `/gateway/v1/{messages,responses,chat/completions}` so ingress routing without
+/// path rewrite works cleanly.
+pub fn http_router_with<R>(routes: R, usage: MemoryUsage) -> Router
+where
+    R: RouteResolver + Clone + Send + Sync + 'static,
+{
+    let responses_state = Arc::new((routes.clone(), usage.clone()));
+    let core = anyagents_gateway::router(routes, usage).merge(
+        Router::new()
+            .route("/v1/responses", post(on_responses::<R>))
+            .with_state(responses_state),
+    );
+    core.clone().nest("/gateway", core)
+}
+
+async fn on_responses<R>(
+    State(state): State<Arc<(R, MemoryUsage)>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    R: RouteResolver + Clone + Send + Sync + 'static,
+{
+    let token = match bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({ "error": { "message": "unauthorized" } })),
+            )
+                .into_response();
+        }
+    };
+    let (routes, usage) = &*state;
+    let Some(route) = routes.resolve(&token) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({ "error": { "message": "unauthorized" } })),
+        )
+            .into_response();
+    };
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({ "error": { "message": "invalid json" } })),
+            )
+                .into_response();
+        }
+    };
+    let stream = payload
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let passthrough = route.protocol == Protocol::OpenAiResponses;
+    let outbound_bytes = if passthrough {
+        let mut obj = payload.clone();
+        if let Some(map) = obj.as_object_mut() {
+            map.insert("model".into(), serde_json::json!(route.model));
+        }
+        serde_json::to_vec(&obj).unwrap_or_default()
+    } else {
+        let req = match parse_request(Protocol::OpenAiResponses, &payload) {
+            Ok(r) => r,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({ "error": { "message": err.to_string() } })),
+                )
+                    .into_response();
+            }
+        };
+        match encode_request(route.protocol, &req, &route.model, false)
+            .and_then(|v| serde_json::to_vec(&v).map_err(|_| anyagents_gateway::Fail::Upstream))
+        {
+            Ok(b) => b,
+            Err(err) => return err.into_response(),
+        }
+    };
+
+    let route_clone = route.clone();
+    let version = headers
+        .get("anthropic-version")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let forwarded = tokio::task::spawn_blocking(move || {
+        forward_upstream_sync(&route_clone, outbound_bytes, version.as_deref())
+    })
+    .await;
+    let (status, content_type, resp_bytes) = match forwarded {
+        Ok(Ok(tuple)) => tuple,
+        Ok(Err(_)) | Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({ "error": { "message": "upstream gateway error" } })),
+            )
+                .into_response();
+        }
+    };
+
+    if !(200..300).contains(&status) {
+        return Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
+            .header(
+                header::CONTENT_TYPE,
+                content_type.unwrap_or_else(|| "application/json".into()),
+            )
+            .body(axum::body::Body::from(resp_bytes))
+            .unwrap();
+    }
+
+    if passthrough
+        && (stream
+            || content_type
+                .as_deref()
+                .is_some_and(|c| c.contains("text/event-stream")))
+    {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                content_type.unwrap_or_else(|| "text/event-stream".into()),
+            )
+            .body(axum::body::Body::from(resp_bytes))
+            .unwrap();
+    }
+
+    let upstream_val: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(axum::body::Body::from(resp_bytes))
+                .unwrap();
+        }
+    };
+    let final_val = if passthrough {
+        upstream_val
+    } else {
+        match parse_response(route.protocol, &upstream_val) {
+            Ok(completion) => {
+                match encode_response(Protocol::OpenAiResponses, &completion, &route.model) {
+                    Ok(v) => v,
+                    Err(err) => return err.into_response(),
+                }
+            }
+            Err(err) => return err.into_response(),
+        }
+    };
+    let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) =
+        extract_usage_counts(&final_val);
+    usage.record(UsageEvent {
+        agent: route.agent.clone(),
+        provider: route.provider.clone(),
+        model: route.model.clone(),
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+    });
+    axum::Json(final_val).into_response()
+}
+
+fn extract_usage_counts(val: &serde_json::Value) -> (u64, u64, u64, u64) {
+    let usage = val.get("usage");
+    let get_u64 = |obj: Option<&serde_json::Value>, key: &str| {
+        obj.and_then(|u| u.get(key))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let input = get_u64(usage, "input_tokens").max(get_u64(usage, "prompt_tokens"));
+    let output = get_u64(usage, "output_tokens").max(get_u64(usage, "completion_tokens"));
+    let cache_read = usage
+        .and_then(|u| u.pointer("/input_tokens_details/cached_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| get_u64(usage, "cache_read_input_tokens"));
+    let cache_write = get_u64(usage, "cache_creation_input_tokens");
+    (input, output, cache_read, cache_write)
+}
+
+fn forward_upstream_sync(
+    route: &ProviderRoute,
+    body: Vec<u8>,
+    anthropic_version: Option<&str>,
+) -> Result<(u16, Option<String>, Vec<u8>), String> {
+    let base = route.base_url.trim_end_matches('/');
+    let suffix = match route.protocol {
+        Protocol::AnthropicMessages => "/v1/messages",
+        Protocol::OpenAiChat => "/v1/chat/completions",
+        Protocol::OpenAiResponses => "/v1/responses",
+    };
+    let url = format!("{base}{suffix}");
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(300)))
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let mut req = agent.post(&url).header("content-type", "application/json");
+    match route.protocol {
+        Protocol::AnthropicMessages => {
+            req = req.header("x-api-key", &route.api_key).header(
+                "anthropic-version",
+                anthropic_version.unwrap_or("2023-06-01"),
+            );
+        }
+        Protocol::OpenAiChat | Protocol::OpenAiResponses => {
+            req = req.header("authorization", &format!("Bearer {}", route.api_key));
+        }
+    }
+    let resp = req.send(body.as_slice()).map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let bytes = resp.into_body().read_to_vec().map_err(|e| e.to_string())?;
+    Ok((status, ctype, bytes))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, tok) = value.split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let trimmed = tok.trim();
+    (!trimmed.is_empty() && !trimmed.contains(char::is_whitespace)).then(|| trimmed.to_string())
+}
+
 /// Point one agent at the gateway. Called when the agent's key is stored, with
 /// the server running or not: the next start rebuilds it from the same file.
 pub fn add_route(data: &Path, agent: &Agent) -> Result<Option<String>, Error> {
+    if let Ok(store) = Store::open(data.join("state.db"))
+        && let Some(pg_routes) = store.gateway_route_store()
+        && let Ok(Some(stored)) = pg_routes.get_for_agent(&agent.id)
+    {
+        let tok = stored.token.clone();
+        shared_routes().insert(tok.clone(), stored_route_to_provider_route(stored));
+        return Ok(Some(tok));
+    }
     let Some(image) = ProviderImage::load(data, &agent.id)? else {
         return Ok(None);
     };
     let token = token(data, &agent.id)?;
-    // The agent is told the origin and its token from the next start on. A
-    // client process reads the origin the running server published; a server
-    // process knows it directly.
-    let origin = origin().or_else(|| published_origin(data));
-    let Some(origin) = origin else {
-        return Ok(Some(token));
+    shared_routes().insert(token.clone(), image.route(&agent.name));
+    if let Some(gateway) = running() {
+        gateway
+            .routes
+            .insert(token.clone(), image.route(&agent.name));
+    }
+    // Local agents keep using the loopback listener; remote-sandbox agents must
+    // use the external public gateway origin so sandboxes never dial 127.0.0.1.
+    let config_dir = anyagents_core::agent_config_dir(data, &agent.id);
+    let remote_required = anyagents_tools::SandboxMode::from_env().is_remote_required();
+    let runs_in_sandbox = anyagents_tools::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir)
+        .is_some()
+        || anyagents_tools::SandboxConfig::resolve(Some(&config_dir))
+            .is_some_and(|s| s.remote_spawn)
+        || remote_required;
+    let origin = if runs_in_sandbox {
+        public_origin(Some(data))
+    } else {
+        origin()
+            .or_else(|| published_origin(data))
+            .or_else(|| public_origin(Some(data)))
     };
-    store_launch_env(data, &agent.id, &origin)?;
-    let Some(gateway) = running() else {
-        return Ok(Some(token));
-    };
-    gateway
-        .routes
-        .insert(token.clone(), image.route(&agent.name));
+    if let Some(origin) = origin
+        && !remote_required
+    {
+        store_launch_env(data, &agent.id, &origin)?;
+    }
     Ok(Some(token))
 }
 
 /// Store the provider key for one agent and point its route at the gateway.
-/// The file is 0600 and nothing prints the key. Called by `anyagents model`.
+/// On PostgreSQL, persists the encrypted route directly into `public.gateway_routes`
+/// so all coordinator replicas resolve it immediately. On SQLite, writes 0600
+/// `provider.json` + `gateway-token.txt` on disk. Never prints the key.
 pub fn store_key(
     data: &Path,
     agent: &Agent,
@@ -160,11 +640,56 @@ pub fn store_key(
     model: &str,
     api_key: &str,
 ) -> Result<(), Error> {
+    let store = Store::open(data.join("state.db"))?;
+    store_key_in(&store, agent, base_url, model, api_key, None)?;
+    Ok(())
+}
+
+/// Store one agent's gateway route against an explicit [`Store`] (and optional
+/// [`MasterKey`] override for tests). Returns the agent's gateway bearer token.
+pub fn store_key_in(
+    store: &Store,
+    agent: &Agent,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    master_key: Option<MasterKey>,
+) -> Result<String, Error> {
+    if let Some(pg_routes) = store.gateway_route_store_with_key(master_key) {
+        let tok = match pg_routes.get_for_agent(&agent.id)? {
+            Some(existing) if !existing.token.is_empty() => existing.token,
+            _ => random_token()?,
+        };
+        let protocol = protocol_str(protocol_of(&agent.harness)).to_string();
+        let stored = pg_routes.upsert(&UpsertGatewayRoute {
+            agent_id: agent.id.clone(),
+            agent_name: agent.name.clone(),
+            harness: agent.harness.clone(),
+            protocol,
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            token: tok.clone(),
+        })?;
+        shared_routes().insert(tok.clone(), stored_route_to_provider_route(stored));
+        if !anyagents_tools::SandboxMode::from_env().is_remote_required()
+            && let Some(origin) = public_origin(Some(store.data_dir())).or_else(origin)
+        {
+            let env = env_for_parts(&agent.harness, model, &tok, &origin);
+            if !env.is_empty() && agent.launch_env != env {
+                store.set_agent_launch_env(&agent.id, &env)?;
+            }
+        }
+        return Ok(tok);
+    }
+    let data = store.data_dir();
     ProviderImage::store(data, agent, base_url, model, api_key)?;
     // With the gateway running the route answers at once; either way the agent
     // is told the gateway origin and its own token from its next start.
-    add_route(data, agent)?;
-    Ok(())
+    let tok = add_route(data, agent)?.ok_or_else(|| {
+        Error::Message("provider image disappeared immediately after write".into())
+    })?;
+    Ok(tok)
 }
 
 /// The origin the running server published on its socket, for a client process
@@ -215,8 +740,13 @@ fn env_for(data: &Path, id: &AgentId, origin: &str) -> Vec<(String, String)> {
     let Ok(token) = token(data, id) else {
         return Vec::new();
     };
+    env_for_parts(&image.harness, &image.model, &token, origin)
+}
+
+fn env_for_parts(harness: &str, model: &str, token: &str, origin: &str) -> Vec<(String, String)> {
     let origin = origin.to_string();
-    let mut env = match protocol_of(&image.harness) {
+    let token = token.to_string();
+    let mut env = match protocol_of(harness) {
         Protocol::AnthropicMessages => vec![
             ("ANTHROPIC_BASE_URL".to_string(), origin),
             ("ANTHROPIC_AUTH_TOKEN".to_string(), token),
@@ -226,8 +756,8 @@ fn env_for(data: &Path, id: &AgentId, origin: &str) -> Vec<(String, String)> {
             ("OPENAI_API_KEY".to_string(), token),
         ],
     };
-    if !image.model.is_empty() && image.harness == "claude-code" {
-        env.push(("ANTHROPIC_MODEL".to_string(), image.model.clone()));
+    if !model.is_empty() && harness == "claude-code" {
+        env.push(("ANTHROPIC_MODEL".to_string(), model.to_string()));
     }
     env
 }
@@ -451,5 +981,246 @@ mod tests {
         }
         std::fs::write(&file, b"{}").unwrap();
         assert!(ProviderImage::load(dir.path(), &id).is_err());
+    }
+
+    #[test]
+    fn responses_route_translates_chat_provider_and_rejects_unauthorized() {
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let upstream_auths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let auth_ref = Arc::clone(&upstream_auths);
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in upstream.incoming().flatten() {
+                let auth_ref = Arc::clone(&auth_ref);
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream);
+                    let mut req_line = String::new();
+                    let _ = reader.read_line(&mut req_line);
+                    let path = req_line.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let mut len = 0usize;
+                    let mut auth = String::new();
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).is_err()
+                            || h == "\r\n"
+                            || h == "\n"
+                            || h.is_empty()
+                        {
+                            break;
+                        }
+                        if let Some((k, v)) = h.split_once(':') {
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                len = v.trim().parse().unwrap_or(0);
+                            } else if k.trim().eq_ignore_ascii_case("authorization") {
+                                auth = v.trim().to_string();
+                            }
+                        }
+                    }
+                    let mut body = vec![0u8; len];
+                    if len > 0 {
+                        let _ = reader.read_exact(&mut body);
+                    }
+                    auth_ref.lock().unwrap().push(auth);
+                    let resp_body = if path == "/v1/responses" {
+                        serde_json::json!({
+                            "id": "resp_1",
+                            "object": "response",
+                            "model": "gpt-test",
+                            "output": [{
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{ "type": "output_text", "text": "passthrough ok" }]
+                            }],
+                            "usage": { "input_tokens": 3, "output_tokens": 2, "total_tokens": 5 }
+                        })
+                    } else {
+                        serde_json::json!({
+                            "id": "chatcmpl_1",
+                            "object": "chat.completion",
+                            "model": "gpt-test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "translated ok" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 4, "completion_tokens": 3 }
+                        })
+                    };
+                    let raw = serde_json::to_vec(&resp_body).unwrap();
+                    let mut stream = reader.into_inner();
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        raw.len()
+                    );
+                    let _ = stream.write_all(hdr.as_bytes());
+                    let _ = stream.write_all(&raw);
+                });
+            }
+        });
+
+        let routes = MemoryRoutes::new();
+        routes.insert(
+            "tok-resp",
+            ProviderRoute {
+                agent: "a1".into(),
+                provider: "openai".into(),
+                base_url: format!("http://{upstream_addr}"),
+                protocol: Protocol::OpenAiResponses,
+                model: "gpt-test".into(),
+                api_key: "secret-upstream-key".into(),
+            },
+        );
+        routes.insert(
+            "tok-chat",
+            ProviderRoute {
+                agent: "a2".into(),
+                provider: "openai".into(),
+                base_url: format!("http://{upstream_addr}"),
+                protocol: Protocol::OpenAiChat,
+                model: "gpt-test".into(),
+                api_key: "secret-upstream-key".into(),
+            },
+        );
+        let usage = MemoryUsage::new();
+        let app = http_router_with(routes, usage.clone());
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let http = ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .build()
+                .new_agent();
+
+            let url = format!("http://{addr}/v1/responses");
+            let unauth = tokio::task::spawn_blocking({
+                let http = http.clone();
+                let url = url.clone();
+                move || {
+                    http.post(&url)
+                        .header("content-type", "application/json")
+                        .send(br#"{"input":"hi"}"#.as_slice())
+                        .unwrap()
+                        .status()
+                        .as_u16()
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(unauth, 401);
+
+            let resp_pass: serde_json::Value = tokio::task::spawn_blocking({
+                let http = http.clone();
+                let url = url.clone();
+                move || {
+                    let r = http
+                        .post(&url)
+                        .header("authorization", "Bearer tok-resp")
+                        .header("content-type", "application/json")
+                        .send(br#"{"input":"hi"}"#.as_slice())
+                        .unwrap();
+                    assert_eq!(r.status().as_u16(), 200);
+                    serde_json::from_str(&r.into_body().read_to_string().unwrap()).unwrap()
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                resp_pass["output"][0]["content"][0]["text"],
+                "passthrough ok"
+            );
+
+            let resp_trans: serde_json::Value = tokio::task::spawn_blocking(move || {
+                let r = http
+                    .post(&url)
+                    .header("authorization", "Bearer tok-chat")
+                    .header("content-type", "application/json")
+                    .send(br#"{"model":"ignored","input":"hi"}"#.as_slice())
+                    .unwrap();
+                assert_eq!(r.status().as_u16(), 200);
+                serde_json::from_str(&r.into_body().read_to_string().unwrap()).unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(resp_trans["object"], "response");
+
+            let gw_url = format!("http://{addr}/gateway/v1/responses");
+            let gw_resp: serde_json::Value = tokio::task::spawn_blocking(move || {
+                let r = ureq::Agent::config_builder()
+                    .http_status_as_error(false)
+                    .build()
+                    .new_agent()
+                    .post(&gw_url)
+                    .header("authorization", "Bearer tok-resp")
+                    .header("content-type", "application/json")
+                    .send(br#"{"input":"via gateway prefix"}"#.as_slice())
+                    .unwrap();
+                assert_eq!(r.status().as_u16(), 200);
+                serde_json::from_str(&r.into_body().read_to_string().unwrap()).unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(gw_resp["output"][0]["content"][0]["text"], "passthrough ok");
+
+            let auths = upstream_auths.lock().unwrap();
+            assert!(
+                auths.iter().all(|a| a == "Bearer secret-upstream-key"),
+                "gateway must rewrite auth with stored upstream key: {auths:?}"
+            );
+            srv.abort();
+        });
+    }
+
+    #[test]
+    fn sandbox_env_requires_public_origin_and_never_exposes_raw_key() {
+        let _env = crate::server::tests::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("gw-sbx", "codex"))
+            .unwrap();
+        ProviderImage::store(
+            dir.path(),
+            &agent,
+            "https://provider.example.test/v1",
+            "gpt-test",
+            "raw-provider-secret",
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var(ENV_PUBLIC_GATEWAY_URL);
+        }
+        assert!(sandbox_env(dir.path(), &agent.id).is_err());
+
+        unsafe {
+            std::env::set_var(ENV_PUBLIC_GATEWAY_URL, "https://agents.example.com/");
+        }
+        let env = sandbox_env(dir.path(), &agent.id).unwrap();
+        unsafe {
+            std::env::remove_var(ENV_PUBLIC_GATEWAY_URL);
+        }
+        let base_url = env
+            .iter()
+            .find(|(k, _)| k == "OPENAI_BASE_URL")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        let api_key = env
+            .iter()
+            .find(|(k, _)| k == "OPENAI_API_KEY")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(base_url, "https://agents.example.com");
+        assert!(!base_url.contains("127.0.0.1"));
+        assert_ne!(api_key, "raw-provider-secret");
     }
 }

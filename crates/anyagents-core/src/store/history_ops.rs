@@ -1,8 +1,8 @@
 //! Narrow reads for host history search, on the read pool: the two columns
 //! of an agent row that indexing needs, and the redaction receipts.
-use rusqlite::OptionalExtension;
 
 use super::Store;
+use crate::db::{DbExecExt as _, db_params};
 use crate::error::Error;
 use crate::id::AgentId;
 
@@ -14,13 +14,13 @@ impl Store {
         ids: impl IntoIterator<Item = &'a str>,
     ) -> Result<Vec<(AgentId, String)>, Error> {
         let conn = self.read_conn();
-        let mut statement = conn.prepare_cached("SELECT name FROM agents WHERE id = ?1")?;
         let mut names = Vec::new();
         for id in ids {
-            if let Some(name) = statement
-                .query_row([id], |row| row.get::<_, String>(0))
-                .optional()?
-            {
+            if let Some(name) = conn.db_query_opt(
+                "SELECT name FROM agents WHERE id = ?1",
+                &db_params![id],
+                |row| row.get::<String>(0),
+            )? {
                 names.push((AgentId::parse(id)?, name));
             }
         }
@@ -33,18 +33,16 @@ impl Store {
         agent: Option<&str>,
     ) -> Result<Vec<(String, String)>, Error> {
         let conn = self.read_conn();
-        let mut statement = match agent {
-            Some(_) => conn.prepare_cached(
+        let (sql, params) = match agent {
+            Some(agent) => (
                 "SELECT agent_id, receipt FROM conversation_redactions WHERE agent_id = ?1",
-            )?,
-            None => conn.prepare_cached("SELECT agent_id, receipt FROM conversation_redactions")?,
+                db_params![agent],
+            ),
+            None => (
+                "SELECT agent_id, receipt FROM conversation_redactions",
+                db_params![],
+            ),
         };
-        let rows = match agent {
-            Some(agent) => statement.query([agent])?,
-            None => statement.query([])?,
-        };
-        Ok(rows
-            .mapped(|row| Ok((row.get(0)?, row.get(1)?)))
-            .collect::<Result<_, _>>()?)
+        conn.db_query_vec(sql, &params, |row| Ok((row.get(0)?, row.get(1)?)))
     }
 }

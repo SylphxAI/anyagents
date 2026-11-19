@@ -185,14 +185,15 @@ fn attaches_exact_mcp_schema_and_refreshes_remote_capability() {
         let token = format!("aars_{}", ch.repeat(64));
         std::fs::write(config.path().join(crate::remote::TOKEN_FILE), &token).unwrap();
         turn(config.path(), "work").unwrap();
-        let req = mock
-            .requests()
-            .into_iter()
+        let reqs = mock.requests();
+        assert!(reqs.iter().all(|r| r.method != Method::PUT));
+        let post = reqs
+            .iter()
             .rev()
             .find(|r| r.method == Method::POST)
             .unwrap();
         assert_eq!(
-            req.body["mcp_servers"],
+            post.body["mcp_servers"],
             json!([{"name":"anyagents","url":"https://callback.example/v1/webhooks/mcp?profile=remote","bearer_token":token}])
         );
     }
@@ -338,6 +339,11 @@ fn paginates_conversation_pages_and_deduplicates_outputs() {
     let result = turn(config.path(), "work").unwrap();
     assert_eq!(result.reply_text, "first\nsecond");
     let requests = mock.requests();
+    assert_eq!(requests[0].method, Method::POST);
+    assert_eq!(
+        requests[0].body["mcp_servers"][0]["url"],
+        json!("http://127.0.0.1:8787/v1/webhooks/mcp?profile=remote")
+    );
     assert_eq!(
         requests[1].uri,
         format!("/v1/agents/{AGENT}/conversation?limit=100")
@@ -405,4 +411,143 @@ fn cancels_in_flight_receipt_and_tolerates_settled_conflict() {
             .contains("invalid job_id")
     );
     conflict_mock.consumed();
+}
+
+#[test]
+fn spiron_cloud_syncs_mcp_servers_streams_sse_and_reattaches_active_run_on_crash() {
+    use std::io::{BufRead as _, Read as _};
+
+    // 1. Verify fresh agent with remote MCP config calls PUT /v1/agents/{id}/mcp-servers
+    // and POST /v1/agents/{id}/messages handles incremental 200 text/event-stream responses.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen_uris = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let seen_clone = Arc::clone(&seen_uris);
+    let server = thread::spawn(move || {
+        for (idx, stream) in listener.incoming().take(3).enumerate() {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            let _ = reader.read_line(&mut req_line);
+            let mut parts = req_line.split_whitespace();
+            let method = parts.next().unwrap_or("").to_string();
+            let uri = parts.next().unwrap_or("").to_string();
+            let mut len = 0usize;
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                    break;
+                }
+                if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            let _ = reader.read_exact(&mut body);
+            seen_clone.lock().unwrap().push((method, uri));
+            match idx {
+                0 => {
+                    let b = json!({"id": AGENT}).to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                        b.len()
+                    );
+                }
+                1 => {
+                    let b = json!({"ok": true}).to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                        b.len()
+                    );
+                }
+                _ => {
+                    let sse = format!(
+                        "event: message.delta\ndata: {{\"type\":\"content.delta\",\"delta\":\"streamed \"}}\n\nevent: message.completed\ndata: {{\"type\":\"message.completed\",\"agent_id\":\"{AGENT}\",\"delta\":\"reply ok\"}}\n\ndata: [DONE]\n\n"
+                    );
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                        sse.len()
+                    );
+                }
+            }
+        }
+    });
+
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("cloud.json"),
+        json!({"base_url": base, "token": "spiron_sk_test_key_123", "sync_mcp_servers": true})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.path().join(crate::remote::MCP_URL_FILE),
+        "https://callback.example/v1/webhooks/mcp",
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.path().join(crate::remote::TOKEN_FILE),
+        format!("aars_{}", "e".repeat(64)),
+    )
+    .unwrap();
+    let out = turn(cfg.path(), "stream prompt").unwrap();
+    assert_eq!(out.session_id, AGENT);
+    assert_eq!(out.reply_text, "streamed reply ok");
+    server.join().unwrap();
+    let recorded = seen_uris.lock().unwrap().clone();
+    assert_eq!(recorded[0], ("POST".into(), "/v1/agents".into()));
+    assert_eq!(
+        recorded[1],
+        ("PUT".into(), format!("/v1/agents/{AGENT}/mcp-servers"))
+    );
+    assert_eq!(
+        recorded[2],
+        ("POST".into(), format!("/v1/agents/{AGENT}/messages"))
+    );
+    assert!(!cfg.path().join("spiron-cloud-active-run.json").exists());
+
+    // 2. Verify crash re-attach persisted in spiron-cloud-active-run.json and run cancel URL.
+    let reattach_mock = Mock::new(vec![
+        (200, receipt("working")),
+        (
+            200,
+            json!({"id": TASK, "agent_id": AGENT, "status": "completed", "reply": "reattached ok"}),
+        ),
+    ]);
+    let rcfg = reattach_mock.config();
+    resumed(rcfg.path());
+    persist_active_run(
+        rcfg.path(),
+        &ActiveRunState {
+            agent_id: AGENT.into(),
+            run_id: Some(TASK.into()),
+            receipt_id: Some(TASK.into()),
+            idempotency_key: Some("idem-1".into()),
+            content: Some("recover me".into()),
+            started_at_ms: 1,
+        },
+    )
+    .unwrap();
+    let recovered = turn(rcfg.path(), "recover me").unwrap();
+    assert_eq!(recovered.reply_text, "reattached ok");
+    assert!(!rcfg.path().join("spiron-cloud-active-run.json").exists());
+    reattach_mock.consumed();
+
+    let run_cancel_mock = Mock::new(vec![(200, json!({"status": "canceled"}))]);
+    cancel_spiron_run(
+        &run_cancel_mock.base,
+        Some("spiron_sk_test"),
+        AGENT,
+        TASK,
+        Some(TASK),
+    )
+    .unwrap();
+    assert_eq!(
+        run_cancel_mock.requests()[0].uri,
+        format!("/v1/agents/{AGENT}/runs/{TASK}/cancel")
+    );
+    run_cancel_mock.consumed();
 }

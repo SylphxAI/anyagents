@@ -8,13 +8,13 @@
 //! policy can change without rewriting history.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 use super::{
     Agent, Incoming, IngressHistory, Store, Wake, agent_by_id, agent_exists,
     cancel_archived_schedules, turn_errors,
 };
+use crate::db::{DbBackend, DbExec, DbExecExt as _, DbRow, db_params};
 use crate::error::Error;
 use crate::id::AgentId;
 use crate::migrate::now_ms;
@@ -216,15 +216,14 @@ const OUTCOME_COLS: &str = "id, agent_id, kind, subject, dedupe_key, actor, harn
 
 /// A row whose kind this binary does not know reads as `None`, so a newer
 /// writer never breaks an older reader.
-fn outcome_from_row(row: &Row<'_>) -> Result<Option<Outcome>, Error> {
+fn outcome_from_row(row: &DbRow<'_>) -> Result<Option<Outcome>, Error> {
     let kind: String = row.get(2)?;
     let Some(kind) = OutcomeKind::parse(&kind) else {
         return Ok(None);
     };
-    let agent: String = row.get(1)?;
     Ok(Some(Outcome {
         id: row.get(0)?,
-        agent_id: AgentId::parse(&agent)?,
+        agent_id: row.get(1)?,
         kind,
         subject: row.get(3)?,
         dedupe_key: row.get(4)?,
@@ -267,7 +266,7 @@ impl Store {
         self.write_tx(|tx| Self::record_outcome_on(tx, new))
     }
 
-    fn record_outcome_on(tx: &Connection, new: NewOutcome) -> Result<(Outcome, bool), Error> {
+    fn record_outcome_on(tx: &dyn DbExec, new: NewOutcome) -> Result<(Outcome, bool), Error> {
         bounded("subject", &new.subject)?;
         bounded("dedupe_key", &new.dedupe_key)?;
         bounded("actor", &new.actor)?;
@@ -289,15 +288,15 @@ impl Store {
             .filter(|profile| !profile.is_empty());
         let id = format!("out_{}", uuid::Uuid::now_v7().simple());
         let agent = agent_by_id(tx, &new.agent_id)?;
-        let inserted = tx.execute(
+        let inserted = tx.db_execute(
             "INSERT INTO outcomes (id, agent_id, kind, source, subject, dedupe_key, actor,
                                        harness, model, role, profile, note, claimed_at_ms,
                                        observed_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT (agent_id, dedupe_key) DO NOTHING",
-            params![
+            &db_params![
                 id,
-                agent.id.as_str(),
+                agent.id,
                 new.kind.as_str(),
                 new.kind.source(),
                 new.subject,
@@ -312,17 +311,16 @@ impl Store {
                 new.observed_at_ms,
             ],
         )? == 1;
-        let stored = {
-            let mut statement = tx.prepare(&format!(
-                "SELECT {OUTCOME_COLS} FROM outcomes WHERE agent_id = ?1 AND dedupe_key = ?2"
-            ))?;
-            let mut rows = statement.query(params![agent.id.as_str(), new.dedupe_key])?;
-            match rows.next()? {
-                Some(row) => outcome_from_row(row)?,
-                None => None,
-            }
-        }
-        .ok_or_else(|| Error::Message("a newer binary recorded this outcome".to_string()))?;
+        let stored = tx
+            .db_query_opt(
+                &format!(
+                    "SELECT {OUTCOME_COLS} FROM outcomes WHERE agent_id = ?1 AND dedupe_key = ?2"
+                ),
+                &db_params![agent.id, new.dedupe_key],
+                outcome_from_row,
+            )?
+            .flatten()
+            .ok_or_else(|| Error::Message("a newer binary recorded this outcome".to_string()))?;
         Ok((stored, inserted))
     }
 
@@ -362,9 +360,9 @@ impl Store {
                     if caller.parent_id.is_some() || !caller.is_admin {
                         return Err(Error::PermissionDenied("administrative authority required".into()));
                     }
-                    tx.execute(
+                    tx.db_execute(
                         "INSERT INTO admin_audit (created_at, actor, action, target) VALUES (?1, ?2, 'agents.verdict', ?3)",
-                        params![now_ms(), actor, target.name],
+                        &db_params![now_ms(), actor, target.name],
                     )?;
                 }
                 (actor, format!("agent:{id}"))
@@ -380,14 +378,14 @@ impl Store {
             let (state, mail) = if kind == OutcomeKind::Rework {
                 let mut incoming = Incoming::new(outcome.note.as_deref().unwrap_or("Please rework the task."));
                 incoming.sender = Some(sender);
-                tx.execute("UPDATE agents SET state = 'running' WHERE id = ?1", [target_id.as_str()])?;
+                tx.db_execute("UPDATE agents SET state = 'running' WHERE id = ?1", &db_params![target_id])?;
                 turn_errors::clear_parking(tx, target_id)?;
                 let mail = Self::receive_on(tx, target_id, incoming,
                     Some(format!("anyagents:verdict:{}", outcome.id)), now_ms(),
                     IngressHistory::default(), false, Some("task_rework"), &mut Vec::new())?;
                 ("running", Some(mail))
             } else {
-                tx.execute("UPDATE agents SET state = 'archived' WHERE id = ?1", [target_id.as_str()])?;
+                tx.db_execute("UPDATE agents SET state = 'archived' WHERE id = ?1", &db_params![target_id])?;
                 cancel_archived_schedules(tx, target_id)?;
                 ("archived", None)
             };
@@ -437,10 +435,10 @@ impl Store {
         let at = now_ms();
         self.write_tx(|tx| {
             agent_exists(tx, agent_id)?;
-            tx.execute(
+            tx.db_execute(
                 "INSERT INTO skill_reads (agent_id, skill, file, sha256, read_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![agent_id.as_str(), skill, file, sha256, at],
+                &db_params![agent_id, skill, file, sha256, at],
             )?;
             Ok(())
         })
@@ -458,7 +456,7 @@ impl Store {
     ) -> Result<OutcomeReport, Error> {
         let conn = self.read_conn();
         // One snapshot: facts, usage and skill reads agree with each other.
-        let snapshot = conn.unchecked_transaction()?;
+        let snapshot = conn.snapshot()?;
         build_report(&snapshot, agent_ids, since_ms, until_ms, group_by)
     }
 }
@@ -522,7 +520,7 @@ impl OutcomeCost {
         self.reported_cost_micros += other.reported_cost_micros;
     }
 
-    fn from_row(row: &Row<'_>, at: usize) -> rusqlite::Result<Self> {
+    fn from_row(row: &DbRow<'_>, at: usize) -> Result<Self, Error> {
         Ok(Self {
             turns: row.get(at)?,
             turns_with_cost: row.get(at + 1)?,
@@ -535,9 +533,9 @@ impl OutcomeCost {
     }
 }
 
-const COST_SUMS: &str = "COUNT(*), COUNT(reported_cost_micros), COALESCE(SUM(input_tokens), 0), \
-     COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0), \
-     COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(reported_cost_micros), 0)";
+const COST_SUMS: &str = "COUNT(*), COUNT(reported_cost_micros), CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT), \
+     CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT), CAST(COALESCE(SUM(cache_read_tokens), 0) AS BIGINT), \
+     CAST(COALESCE(SUM(cache_write_tokens), 0) AS BIGINT), CAST(COALESCE(SUM(reported_cost_micros), 0) AS BIGINT)";
 
 /// One report row. Key fields that are not part of the grouping are null.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -631,7 +629,7 @@ struct Accum {
 }
 
 fn build_report(
-    conn: &Connection,
+    conn: &(impl DbExec + ?Sized),
     agent_ids: &[AgentId],
     since_ms: Option<i64>,
     until_ms: i64,
@@ -639,17 +637,18 @@ fn build_report(
 ) -> Result<OutcomeReport, Error> {
     let since = since_ms.unwrap_or(i64::MIN);
     let allowed: HashSet<&str> = agent_ids.iter().map(AgentId::as_str).collect();
-    let mut facts: Vec<Outcome> = Vec::new();
-    {
-        let mut statement = conn.prepare(&format!(
-            "SELECT {OUTCOME_COLS} FROM outcomes WHERE observed_at_ms <= ?1
-             ORDER BY observed_at_ms, id"
-        ))?;
-        let mut rows = statement.query([until_ms])?;
-        while let Some(row) = rows.next()? {
-            facts.extend(outcome_from_row(row)?);
-        }
-    }
+    let facts: Vec<Outcome> = conn
+        .db_query_vec(
+            &format!(
+                "SELECT {OUTCOME_COLS} FROM outcomes WHERE observed_at_ms <= ?1
+                 ORDER BY observed_at_ms, id"
+            ),
+            &db_params![until_ms],
+            outcome_from_row,
+        )?
+        .into_iter()
+        .flatten()
+        .collect();
     // The claimant of each GitHub fact, chosen over every agent: who may read
     // the report changes what it shows, never whom a fact counts for.
     let mut claimant: HashMap<&str, (i64, &str)> = HashMap::new();
@@ -676,17 +675,16 @@ fn build_report(
     let mut groups: BTreeMap<GroupKey, Accum> = BTreeMap::new();
     let mut unattributed = OutcomeCost::default();
     let mut attributed: HashSet<&str> = HashSet::new();
-    let mut agent_row = conn.prepare("SELECT name, created_at_ms FROM agents WHERE id = ?1")?;
     for (agent, agent_facts) in &by_agent {
         let in_window = |fact: &&&Outcome| fact.observed_at_ms >= since;
         let Some(latest) = agent_facts.iter().rfind(in_window) else {
             continue;
         };
-        let Some((name, created_at)) = agent_row
-            .query_row([agent], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .optional()?
+        let Some((name, created_at)) = conn.db_query_opt(
+            "SELECT name, created_at_ms FROM agents WHERE id = ?1",
+            &db_params![*agent],
+            |row| Ok((row.get::<String>(0)?, row.get::<i64>(1)?)),
+        )?
         else {
             continue;
         };
@@ -761,15 +759,17 @@ fn build_report(
         }
     }
     // Agents with no counted terminal outcome: their whole window is unattributed.
-    let mut window = conn.prepare(&format!(
-        "SELECT agent_id, {COST_SUMS} FROM usage_records
-         WHERE recorded_at_ms >= ?1 AND recorded_at_ms <= ?2 GROUP BY agent_id"
-    ))?;
-    let mut rows = window.query(params![since, until_ms])?;
-    while let Some(row) = rows.next()? {
-        let agent: String = row.get(0)?;
+    let window_rows = conn.db_query_vec(
+        &format!(
+            "SELECT agent_id, {COST_SUMS} FROM usage_records
+             WHERE recorded_at_ms >= ?1 AND recorded_at_ms <= ?2 GROUP BY agent_id"
+        ),
+        &db_params![since, until_ms],
+        |row| Ok((row.get::<String>(0)?, OutcomeCost::from_row(row, 1)?)),
+    )?;
+    for (agent, cost) in window_rows {
         if allowed.contains(agent.as_str()) && !attributed.contains(agent.as_str()) {
-            unattributed.add(&OutcomeCost::from_row(row, 1)?);
+            unattributed.add(&cost);
         }
     }
 
@@ -789,33 +789,39 @@ fn build_report(
 /// Usage of `agent` recorded in `(after, through]`, and how many distinct
 /// harness and model pairs it ran on.
 fn usage_between(
-    conn: &Connection,
+    conn: &(impl DbExec + ?Sized),
     agent: &str,
     after: i64,
     through: i64,
 ) -> Result<(OutcomeCost, i64), Error> {
-    let mut statement = conn.prepare_cached(&format!(
-        "SELECT {COST_SUMS}, COUNT(DISTINCT harness || char(31) || COALESCE(model, ''))
-         FROM usage_records
-         WHERE agent_id = ?1 AND recorded_at_ms > ?2 AND recorded_at_ms <= ?3"
-    ))?;
-    Ok(statement.query_row(params![agent, after, through], |row| {
-        Ok((OutcomeCost::from_row(row, 0)?, row.get(7)?))
-    })?)
+    let sep = match conn.backend() {
+        DbBackend::Sqlite => "char(31)",
+        DbBackend::Postgres => "chr(31)",
+    };
+    conn.db_query_one(
+        &format!(
+            "SELECT {COST_SUMS}, COUNT(DISTINCT harness || {sep} || COALESCE(model, ''))
+             FROM usage_records
+             WHERE agent_id = ?1 AND recorded_at_ms > ?2 AND recorded_at_ms <= ?3"
+        ),
+        &db_params![agent, after, through],
+        |row| Ok((OutcomeCost::from_row(row, 0)?, row.get(7)?)),
+    )
 }
 
 fn skills_read(
-    conn: &Connection,
+    conn: &(impl DbExec + ?Sized),
     agent: &str,
     after: i64,
     through: i64,
 ) -> Result<BTreeSet<String>, Error> {
-    let mut statement = conn.prepare_cached(
+    let rows = conn.db_query_vec(
         "SELECT DISTINCT skill FROM skill_reads
          WHERE agent_id = ?1 AND read_at_ms > ?2 AND read_at_ms <= ?3",
+        &db_params![agent, after, through],
+        |row| row.get::<String>(0),
     )?;
-    let rows = statement.query_map(params![agent, after, through], |row| row.get(0))?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    Ok(rows.into_iter().collect())
 }
 
 fn group_keys(
@@ -915,6 +921,7 @@ mod tests {
     use super::*;
     use crate::id::UsageId;
     use crate::{Agent, NewAgent};
+    use rusqlite::params;
 
     fn open() -> (tempfile::TempDir, Store) {
         let dir = crate::test_tempdir();

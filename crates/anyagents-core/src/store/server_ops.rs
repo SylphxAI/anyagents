@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 
 use super::{AgentId, Error, Store, telegram_chat_links};
+use crate::db::{DbExecExt as _, db_params};
 
 impl Store {
     /// Every agent that shares an internal group or a Telegram chat with
@@ -15,13 +16,14 @@ impl Store {
         let mut shared = HashSet::new();
         {
             let conn = self.read_conn();
-            if let Ok(mut stmt) = conn.prepare_cached(
+            if let Ok(ids) = conn.db_query_vec(
                 "SELECT DISTINCT g2.agent_id FROM group_agents g1
                  JOIN group_agents g2 ON g1.group_name = g2.group_name
                  WHERE g1.agent_id = ?1",
-            ) && let Ok(rows) = stmt.query_map([agent.as_str()], |r| r.get::<_, String>(0))
-            {
-                shared.extend(rows.flatten().filter_map(|id| AgentId::parse(&id).ok()));
+                &db_params![agent],
+                |r| r.get::<String>(0),
+            ) {
+                shared.extend(ids.into_iter().filter_map(|id| AgentId::parse(&id).ok()));
             }
         }
         let Ok(channels) = self.list_channels() else {
@@ -56,46 +58,33 @@ impl Store {
     pub fn descendant_ids(&self, root: &AgentId) -> Result<HashSet<AgentId>, Error> {
         let conn = self.read_conn();
         // UNION (not UNION ALL) deduplicates, so a parent cycle ends.
-        let mut stmt = conn.prepare_cached(
+        let ids = conn.db_query_vec(
             "WITH RECURSIVE below(id) AS (
                  SELECT id FROM agents WHERE parent_id = ?1
                  UNION
                  SELECT a.id FROM agents a JOIN below b ON a.parent_id = b.id
              )
              SELECT id FROM below",
+            &db_params![root],
+            |r| r.get::<AgentId>(0),
         )?;
-        let rows = stmt.query_map([root.as_str()], |r| r.get::<_, String>(0))?;
-        let mut ids = HashSet::new();
-        for id in rows {
-            ids.insert(AgentId::parse(&id?)?);
-        }
-        Ok(ids)
+        Ok(ids.into_iter().collect())
     }
 
     /// The id of every agent, archived ones included, without decoding rows.
     pub fn agent_ids(&self) -> Result<Vec<AgentId>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached("SELECT id FROM agents ORDER BY name")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut ids = Vec::new();
-        for id in rows {
-            ids.push(AgentId::parse(&id?)?);
-        }
-        Ok(ids)
+        conn.db_query_vec("SELECT id FROM agents ORDER BY name", &[], |r| r.get(0))
     }
 
     /// Every archived agent that has a parent, through the state index.
     pub fn archived_subagent_ids(&self) -> Result<Vec<AgentId>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached(
+        conn.db_query_vec(
             "SELECT id FROM agents WHERE state = 'archived' AND parent_id IS NOT NULL",
-        )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut ids = Vec::new();
-        for id in rows {
-            ids.push(AgentId::parse(&id?)?);
-        }
-        Ok(ids)
+            &[],
+            |r| r.get(0),
+        )
     }
 
     /// `(id, workdir)` of every agent that is not archived and names a workdir,
@@ -103,17 +92,12 @@ impl Store {
     /// archive.
     pub fn unarchived_workdirs(&self) -> Result<Vec<(AgentId, String)>, Error> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare_cached(
+        conn.db_query_vec(
             "SELECT id, workdir FROM agents
              WHERE (state < 'archived' OR state > 'archived') AND workdir IS NOT NULL",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        let mut workdirs = Vec::new();
-        for row in rows {
-            let (id, workdir) = row?;
-            workdirs.push((AgentId::parse(&id)?, workdir));
-        }
-        Ok(workdirs)
+            &[],
+            |r| Ok((r.get::<AgentId>(0)?, r.get::<String>(1)?)),
+        )
     }
 
     /// Whether this agent's sleep consolidation has taken in every message it
@@ -122,14 +106,16 @@ impl Store {
         let agent_root = self.data_dir().join("agents").join(agent_id.as_str());
         let sleep = crate::learned_memory::read_sleep_state(&agent_root);
         let conn = self.read_conn();
-        let max_in_seq: i64 = conn
-            .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?1")?
-            .query_row([agent_id.as_str()], |r| r.get(0))?;
-        let max_out_ms: i64 = conn
-            .prepare_cached(
-                "SELECT COALESCE(MAX(sent_at_ms), 0) FROM outbound_messages WHERE agent_id = ?1",
-            )?
-            .query_row([agent_id.as_str()], |r| r.get(0))?;
+        let max_in_seq: i64 = conn.db_query_one(
+            "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?1",
+            &db_params![agent_id],
+            |r| r.get(0),
+        )?;
+        let max_out_ms: i64 = conn.db_query_one(
+            "SELECT COALESCE(MAX(sent_at_ms), 0) FROM outbound_messages WHERE agent_id = ?1",
+            &db_params![agent_id],
+            |r| r.get(0),
+        )?;
         Ok(max_in_seq <= sleep.last_inbound_seq && max_out_ms <= sleep.last_outbound_ms)
     }
 }
