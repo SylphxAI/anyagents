@@ -1,5 +1,6 @@
 //! Server startup, listeners, PostgreSQL blob hydration, lockfile, and shutdown.
 
+use std::future::IntoFuture as _;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -310,6 +311,25 @@ pub(crate) fn release_stale_unadmitted_names_on_start(
     store.release_unadmitted_names()
 }
 
+// Use the eventual TCP listener for liveness while the deployment files are
+// restored. Do not build the application routers (including auth), start
+// workers, or infer the final listener policy from a partially restored tree.
+async fn with_startup_health<T: Send + 'static>(
+    listener: Option<tokio::net::TcpListener>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    let mut work = tokio::task::spawn_blocking(work);
+    if let Some(listener) = listener {
+        let probes =
+            axum::Router::new().route("/healthz", axum::routing::get(super::ops::public_healthz));
+        tokio::select! {
+            result = &mut work => return result,
+            _ = axum::serve(listener, probes).into_future() => {}
+        }
+    }
+    work.await
+}
+
 async fn serve(
     data: &Path,
     sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
@@ -325,15 +345,40 @@ async fn serve(
         Some(acquire_server_lock(data)?)
     };
     anyagents_toolchain::init_server(data, crate::sandbox::host_home_dir());
-    let store = Arc::new(Store::open(data.join("state.db"))?);
     let remote_required = crate::sandbox_providers::SandboxMode::from_env().is_remote_required();
+    let root = data.to_path_buf();
+    let startup_probe = if serverless || remote_required {
+        match webhook_listen_addr(false, port_override) {
+            Some(addr) => tokio::net::TcpListener::bind(&addr)
+                .await
+                .ok()
+                .and_then(|socket| socket.into_std().ok())
+                .map(|socket| (addr, socket)),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let store = if serverless || remote_required {
+        let probe = startup_probe.as_ref().and_then(|(_, socket)| {
+            tokio::net::TcpListener::from_std(socket.try_clone().ok()?).ok()
+        });
+        with_startup_health(probe, move || {
+            let store = Store::open(root.join("state.db"))?;
+            if store.is_postgres()
+                && let Err(err) = hydrate_deployment_blobs_on_start(&store, &root)
+            {
+                eprintln!("anyagents-blobs: startup hydration warning: {err}");
+            }
+            Ok::<_, Error>(store)
+        })
+        .await
+        .map_err(|err| Error::Message(format!("startup store task failed: {err}")))??
+    } else {
+        Store::open(root.join("state.db"))?
+    };
+    let store = Arc::new(store);
     let stateless_pg = store.is_postgres() && remote_required;
-    if store.is_postgres()
-        && (serverless || remote_required)
-        && let Err(err) = hydrate_deployment_blobs_on_start(&store, data)
-    {
-        eprintln!("anyagents-blobs: startup hydration warning: {err}");
-    }
     for (id, name) in release_stale_unadmitted_names_on_start(&store, UNADMITTED_STALE_AGE_MS)? {
         eprintln!("released name `{name}` held by failed creation {id}");
     }
@@ -704,6 +749,22 @@ async fn serve(
     if public_listen.is_none() {
         let _ = std::fs::remove_file(data.join("public.addr"));
     }
+    let webhook_addr = webhook_listen_addr(public_configured, port_override);
+    // Reuse the socket only when it is also the final local listener. Let a
+    // public listener configured by a restored blob bind as usual otherwise.
+    let startup_listener = startup_probe.and_then(|(addr, socket)| {
+        if webhook_addr.as_ref() == Some(&addr)
+            && public_listen.is_none_or(|public| {
+                socket
+                    .local_addr()
+                    .is_ok_and(|local| local.port() != public.port())
+            })
+        {
+            Some(socket)
+        } else {
+            None
+        }
+    });
     let mut public_listener = None;
     if let Some(addr) = public_listen {
         match tokio::net::TcpListener::bind(addr).await {
@@ -726,14 +787,18 @@ async fn serve(
         }
     }
     let mut webhook_listener = None;
-    if let Some(addr) = webhook_listen_addr(public_configured, port_override) {
+    if let Some(addr) = webhook_addr {
         if public_configured && !serverless && !binds_loopback(&addr) {
             eprintln!(
                 "warning: the local TCP listener ({addr}) is not loopback while `public_listen` is set; \
                  it accepts every local credential, so bind it to 127.0.0.1"
             );
         }
-        match tokio::net::TcpListener::bind(&addr).await {
+        let bound = match startup_listener {
+            Some(socket) => tokio::net::TcpListener::from_std(socket),
+            None => tokio::net::TcpListener::bind(&addr).await,
+        };
+        match bound {
             Ok(tcp_listener) => {
                 if let Ok(local) = tcp_listener.local_addr() {
                     let addr_path = data.join("webhook.addr");
@@ -1303,6 +1368,48 @@ async fn run_serverless_startup_backlog_drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_listener_answers_health_before_store_and_hydration_finish() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (ready, listener) = listen_on_loopback(0).unwrap();
+        let (release, finish) = tokio::sync::oneshot::channel();
+        let work = tokio::spawn(with_startup_health(Some(listener), move || {
+            finish.blocking_recv().unwrap();
+        }));
+        for (path, status) in [("/healthz", "200 OK"), ("/v1/agents", "404 Not Found")] {
+            let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut client = tokio::net::TcpStream::connect(("127.0.0.1", ready))
+                    .await
+                    .unwrap();
+                client
+                    .write_all(
+                        format!(
+                            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let mut response = String::new();
+                client.read_to_string(&mut response).await.unwrap();
+                response
+            })
+            .await
+            .expect("startup health must answer without waiting for the store");
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response}"
+            );
+            if path == "/healthz" {
+                assert!(response.contains("cache-control: no-store"));
+            }
+        }
+        assert!(!work.is_finished());
+        release.send(()).unwrap();
+        work.await.unwrap().unwrap();
+    }
 
     #[tokio::test]
     async fn serverless_startup_backlog_drain_cancels_cleanly_on_shutdown() {

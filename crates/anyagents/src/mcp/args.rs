@@ -7,9 +7,9 @@ pub(super) struct SendArgs {
     /// Destinations: agent names or IDs (`planner`, `agent:planner`, `agt_...`, `parent`,
     /// `children`), internal groups (`group:owners`, `group:<name>`, `group:all`, `all`),
     /// or external channel targets (`telegram:chat:<chat_id>[:<topic_id>]`,
-    /// `telegram:user:<user_id>[:<message_id>]`). An authored send addressed to
-    /// exactly one archived agent by name or `agt_...` ID wakes its session.
-    /// Broadcasts, channel updates and system events do not. May be
+    /// `telegram:user:<user_id>[:<message_id>]`). A send never wakes an archived
+    /// agent: one addressed only to archived agents fails with `409`; wake it
+    /// first with `agents(action="wake")`. May be
     /// empty (`[]`) when `reply_to` names a mailbox reference (`anyagents:reply:<msg_id>`)
     /// or when performing a message interaction (`action`: `"react"` | `"vote"` | `"edit"` | `"delete"` | `"pin"` | `"unpin"` | `"stop_poll"`).
     #[serde(default, deserialize_with = "deserialize_send_targets")]
@@ -197,7 +197,7 @@ pub(super) struct AgentsArgs {
     /// - `"secrets"` (read or replace an agent's granted deployment secret bundle names; non-admin ancestors enforce `child ⊆ parent` and self-mutation is denied)
     /// - `"describe"` (read any agent's role & responsibility `description` / `instructions`, defaulting `name` to `"self"`, or update a target's `description` / `instructions` / `role` / `scope` — mutations require the target's Parent/Ancestor agent or an Admin)
     /// - `"verdict"` (judge the work of `name`, a descendant: `verdict` is `accepted`, `rework`, `rejected`, or `abandoned`, with an optional `reason`; never your own work)
-    /// - `"steer"` / `"send"` (send/steer a follow-up `prompt` into an agent or sub-agent, waking it if archived)
+    /// - `"steer"` / `"send"` (send/steer a follow-up `prompt` into an agent or sub-agent; refused while it is archived, so wake it first)
     /// - `"wake"` / `"resume"` (wake an archived or paused agent, with optional `prompt`)
     /// - `"reset_session"` / `"new_session"` (new session for a quiescent managed agent; preserves old pins and raw state)
     /// - `"pause"` (pause an agent)
@@ -482,7 +482,7 @@ pub(super) struct SubagentsArgs {
     /// Action to perform: `"list"` (default: list sub-agents and their live status),
     /// `"inspect"` / `"status"` (inspect a sub-agent's live status + recent conversation turns),
     /// `"spawn"` (create and start a new cross-harness sub-agent),
-    /// `"steer"` / `"send"` (send/steer a follow-up prompt into a sub-agent, waking it if archived),
+    /// `"steer"` / `"send"` (send/steer a follow-up prompt into a sub-agent; refused while it is archived, so wake it first),
     /// `"wake"` / `"resume"` (wake an archived or paused sub-agent, with optional `prompt`),
     /// `"pause"` (pause a sub-agent), `"archive"` (archive a sub-agent to scale to zero),
     /// or `"delete"` / `"kill"` (permanently delete a sub-agent).

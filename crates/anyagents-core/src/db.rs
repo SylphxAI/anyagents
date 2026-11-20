@@ -34,7 +34,10 @@ pub const DATABASE_URL_ENV: &str = "ANYAGENTS_DATABASE_URL";
 pub const DATABASE_URL_FILE_ENV: &str = "ANYAGENTS_DATABASE_URL_FILE";
 pub const DIRECT_DATABASE_URL_ENV: &str = "ANYAGENTS_DIRECT_DATABASE_URL";
 pub const DIRECT_DATABASE_URL_FILE_ENV: &str = "ANYAGENTS_DIRECT_DATABASE_URL_FILE";
+/// Per-pool connection limit; primary pools default to 16 connections per process and URL.
 pub const PG_MAX_CONNECTIONS_ENV: &str = "ANYAGENTS_PG_MAX_CONNECTIONS";
+/// Pool acquisition timeout in whole seconds (default 3, positive values capped at 30).
+pub const PG_ACQUIRE_TIMEOUT_SECS_ENV: &str = "ANYAGENTS_PG_ACQUIRE_TIMEOUT_SECS";
 pub const PG_STATEMENT_CACHE_ENV: &str = "ANYAGENTS_PG_STATEMENT_CACHE";
 pub const TEST_POSTGRES_URL_ENV: &str = "ANYAGENTS_TEST_POSTGRES_URL";
 
@@ -133,25 +136,16 @@ pub fn set_cli_database_url(url: Option<String>) {
 fn non_empty_trimmed_env(name: &str) -> Option<String> {
     let raw = std::env::var(name).ok()?;
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn read_url_file(path: &Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() {
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
         return None;
     }
     let content = std::fs::read_to_string(path).ok()?;
     let trimmed = content.lines().next()?.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 pub fn is_postgres_url(url: &str) -> bool {
@@ -260,7 +254,7 @@ pub(crate) fn block_on_pg<F: std::future::Future>(fut: F) -> F::Output {
 }
 
 fn pg_connect_options(url: &str) -> Result<PgConnectOptions, Error> {
-    let mut opts = PgConnectOptions::from_str(url).map_err(|err| {
+    let opts = PgConnectOptions::from_str(url).map_err(|err| {
         Error::Message(format!(
             "invalid postgres url {}: {err}",
             redact_database_url(url)
@@ -271,29 +265,34 @@ fn pg_connect_options(url: &str) -> Result<PgConnectOptions, Error> {
     let stmt_cache = non_empty_trimmed_env(PG_STATEMENT_CACHE_ENV)
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
-    opts = opts
+    Ok(opts
         .application_name("anyagents")
-        .statement_cache_capacity(stmt_cache);
-    Ok(opts)
+        .statement_cache_capacity(stmt_cache))
+}
+
+fn pg_pool_options(explicit: Option<u32>, env_max: &str, env_timeout: &str) -> PgPoolOptions {
+    // Each replica has its own pool. Leave room for other replicas and direct connections.
+    let max_conns = explicit
+        .or_else(|| env_max.trim().parse().ok())
+        .unwrap_or(16)
+        .max(2);
+    // Bound checkout/connection setup, not statement execution.
+    let timeout_secs = match env_timeout.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => secs.min(30),
+        _ => 3,
+    };
+    PgPoolOptions::new()
+        .max_connections(max_conns)
+        .acquire_timeout(Duration::from_secs(timeout_secs))
+        .idle_timeout(Some(Duration::from_secs(300)))
 }
 
 pub(crate) fn build_pg_pool(url: &str, max_connections: Option<u32>) -> Result<PgPool, Error> {
     let opts = pg_connect_options(url)?;
-    let max_conns = max_connections
-        .or_else(|| {
-            non_empty_trimmed_env(PG_MAX_CONNECTIONS_ENV).and_then(|v| v.parse::<u32>().ok())
-        })
-        .unwrap_or(64)
-        .max(2);
-    block_on_pg(async move {
-        PgPoolOptions::new()
-            .max_connections(max_conns)
-            .acquire_timeout(Duration::from_secs(30))
-            .idle_timeout(Some(Duration::from_secs(300)))
-            .connect_with(opts)
-            .await
-            .map_err(Error::from)
-    })
+    let env_max = std::env::var(PG_MAX_CONNECTIONS_ENV).unwrap_or_default();
+    let env_timeout = std::env::var(PG_ACQUIRE_TIMEOUT_SECS_ENV).unwrap_or_default();
+    let pool = pg_pool_options(max_connections, &env_max, &env_timeout);
+    block_on_pg(pool.connect_with(opts)).map_err(Error::from)
 }
 
 #[derive(Clone)]
@@ -1558,6 +1557,83 @@ pub(crate) fn build_pg_tsquery(queries: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pg_pool_defaults_leave_headroom_and_bound_waiting() {
+        let options = pg_pool_options(None, "", "");
+        assert_eq!(options.get_max_connections(), 16);
+        assert_eq!(options.get_min_connections(), 0);
+        assert_eq!(options.get_acquire_timeout(), Duration::from_secs(3));
+        assert_eq!(options.get_idle_timeout(), Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn pg_pool_connection_limit_preserves_override_precedence_and_floor() {
+        for (explicit, env, expected) in [
+            (None, "  24\n", 24),
+            (Some(2), "24", 2),
+            (Some(4), "24", 4),
+            (Some(0), "24", 2),
+            (None, "0", 2),
+            (None, "1", 2),
+            (None, "1024", 1024),
+            (None, "4294967296", 16),
+            (None, "-5", 16),
+            (None, "invalid", 16),
+        ] {
+            assert_eq!(
+                pg_pool_options(explicit, env, "").get_max_connections(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn pg_pool_acquire_timeout_accepts_only_bounded_positive_seconds() {
+        for (env, expected) in [
+            ("  1\n", 1),
+            ("12", 12),
+            ("30", 30),
+            ("120", 30),
+            (" ", 3),
+            ("0", 3),
+            ("-1", 3),
+            ("1.5", 3),
+            ("18446744073709551616", 3),
+        ] {
+            let options = pg_pool_options(Some(2), "", env);
+            assert_eq!(options.get_acquire_timeout(), Duration::from_secs(expected));
+        }
+    }
+
+    #[test]
+    fn saturated_pg_pool_times_out_and_recovers() {
+        let Some(url) = non_empty_trimmed_env(TEST_POSTGRES_URL_ENV) else {
+            eprintln!("skipping pool saturation test: {TEST_POSTGRES_URL_ENV} not set");
+            return;
+        };
+        block_on_pg(async {
+            let pool = pg_pool_options(Some(2), "", "1")
+                .connect_with(pg_connect_options(&url).unwrap())
+                .await
+                .unwrap();
+            let first = pool.acquire().await.unwrap();
+            let _second = pool.acquire().await.unwrap();
+            let err = tokio::time::timeout(Duration::from_secs(5), pool.acquire())
+                .await
+                .expect("the pool must time out before the test deadline")
+                .unwrap_err();
+            assert!(matches!(err, sqlx::Error::PoolTimedOut));
+            assert!(Error::from(err).is_transient_lock_error());
+
+            drop(first);
+            let result: i32 = sqlx::query_scalar("SELECT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(result, 1);
+        });
+    }
 
     #[test]
     fn placeholder_translator_handles_numbered_and_anonymous_safely() {

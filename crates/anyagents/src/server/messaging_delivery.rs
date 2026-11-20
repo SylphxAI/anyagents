@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use crate::api::{Delivery, InteractRequest, InteractResponse, SendRequest};
 use crate::auth::Principal;
 
-use super::agents_lifecycle::{is_explicitly_archived, prepare_agent_wake};
+use super::agents_lifecycle::is_explicitly_archived;
 use super::messaging::{Actor, SendPlan, can_actor_message_agent, own_message};
 use super::types::{ApiError, AppState, resolve_remote_sandbox_workdir, spawn_store};
 
@@ -468,15 +468,19 @@ pub(super) fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> 
         .collect()
 }
 
-/// Non-running agents in a room that a broadcast or group send skipped, with their state reason.
+/// Archived and otherwise inactive agents a room send skipped. Broadcasts do
+/// not address retired agents; explicit group membership can.
 pub(super) fn room_skipped(
     store: &Store,
     body: &SendRequest,
     room: &str,
-) -> Vec<crate::api::SkippedDelivery> {
+) -> (
+    Vec<crate::api::SkippedDelivery>,
+    Vec<crate::api::SkippedDelivery>,
+) {
     let name = room.strip_prefix("group:").unwrap_or(room);
     if name == "all" || name == "peers" {
-        return store
+        let inactive = store
             .list_live_agents()
             .unwrap_or_default()
             .into_iter()
@@ -490,10 +494,11 @@ pub(super) fn room_skipped(
                 reason: agent.state,
             })
             .collect();
+        return (Vec::new(), inactive);
     }
     let members = match store.room_members(room) {
         Ok(Some(members)) => members,
-        _ => return Vec::new(),
+        _ => return (Vec::new(), Vec::new()),
     };
     // One row per member name, in name order.
     let members: std::collections::BTreeMap<_, _> = members
@@ -502,15 +507,22 @@ pub(super) fn room_skipped(
         .filter(|agent| members.contains(&agent.name))
         .map(|agent| (agent.name.clone(), agent))
         .collect();
-    members
+    let mut archived = Vec::new();
+    let mut inactive = Vec::new();
+    for agent in members
         .into_values()
         .filter(|agent| !body_author_is(body, agent))
-        .filter(|agent| agent.state != "running" && agent.state != "idle")
-        .map(|agent| crate::api::SkippedDelivery {
-            to: format!("agent:{}", agent.name),
-            reason: agent.state,
-        })
-        .collect()
+    {
+        if is_explicitly_archived(store.data_dir(), &agent) {
+            archived.push(archived_skip(store, &agent));
+        } else if agent.state != "running" && agent.state != "idle" {
+            inactive.push(crate::api::SkippedDelivery {
+                to: format!("agent:{}", agent.name),
+                reason: agent.state,
+            });
+        }
+    }
+    (archived, inactive)
 }
 
 /// One room message, one delivery per recipient.
@@ -553,7 +565,7 @@ pub(super) fn deliver_room_with_media(
     upload: Option<&crate::telegram::MediaUpload>,
 ) -> Result<Vec<Delivery>, ApiError> {
     let delivered = store
-        .receive_room_with(
+        .try_receive_room_with(
             room,
             Incoming {
                 text: body.text.clone(),
@@ -566,7 +578,12 @@ pub(super) fn deliver_room_with_media(
                 received_at_ms: None,
             },
             |agent, mut incoming| {
-                let (text, staged) = recipient_media_text(store, body, agent, upload)?;
+                let _lifecycle = store.lock_agent_lifecycle(&agent.id)?;
+                let agent = store.agent(&agent.id)?;
+                if is_explicitly_archived(store.data_dir(), &agent) {
+                    return Ok(None);
+                }
+                let (text, staged) = recipient_media_text(store, body, &agent, upload)?;
                 incoming.text = text;
                 let outcome = store.receive(&agent.id, incoming)?;
                 if matches!(outcome, ReceiveOutcome::New(_))
@@ -574,7 +591,7 @@ pub(super) fn deliver_room_with_media(
                 {
                     staged.retain();
                 }
-                Ok(outcome)
+                Ok(Some(outcome))
             },
         )
         .map_err(ApiError::from_store)?;
@@ -596,31 +613,45 @@ pub(super) fn deliver_room_with_media(
 }
 
 /// The refusal of a send to `name` when that agent is archived: it reads
-/// nothing until it is resumed. Names who answers for it instead.
+/// nothing until it is explicitly woken. Names who answers for it instead.
 pub(super) fn archived_refusal(store: &Store, name: &str) -> Option<crate::api::SkippedDelivery> {
     let recipient = store.agent_by_name(name).ok()?;
     if !is_explicitly_archived(store.data_dir(), &recipient) {
         return None;
     }
-    let answers = match store.live_ancestor(&recipient).ok().flatten() {
+    Some(archived_skip(store, &recipient))
+}
+
+fn archived_skip(store: &Store, recipient: &Agent) -> crate::api::SkippedDelivery {
+    let answers = match store.live_ancestor(recipient).ok().flatten() {
         Some(parent) if recipient.parent_id.as_ref() == Some(&parent.id) => {
             format!("its parent is `{}`", parent.name)
         }
         Some(ancestor) => format!("the nearest running agent above it is `{}`", ancestor.name),
         None => "no running agent is above it".to_string(),
     };
-    Some(crate::api::SkippedDelivery {
+    crate::api::SkippedDelivery {
         to: format!("agent:{}", recipient.name),
         reason: format!("agent `{}` is archived; {answers}", recipient.name),
-    })
+    }
 }
 
+/// A send never unarchives a recipient: only an explicit wake does.
+pub(super) fn archived_conflict(reasons: &str) -> ApiError {
+    ApiError::conflict(format!(
+        "{reasons}. A send never wakes an archived agent: message a live agent instead, or \
+         explicitly wake the archived recipient first with `agents(action=\"wake\")`."
+    ))
+}
+
+/// Store one send for `name`. An archived recipient is refused here too,
+/// under its lifecycle lock, so a send racing an archive can never store
+/// mail it would not read nor flip it back to `running`.
 pub(super) fn deliver_agent_with_media(
     store: &Store,
     body: &SendRequest,
     name: &str,
     key: Option<&str>,
-    wake_archived: bool,
     upload: Option<&crate::telegram::MediaUpload>,
     turn_context: Option<(&anyagents_core::AgentId, &str)>,
 ) -> Result<Delivery, ApiError> {
@@ -629,8 +660,11 @@ pub(super) fn deliver_agent_with_media(
         .lock_agent_lifecycle(&agent.id)
         .map_err(ApiError::from_store)?;
     let agent = store.agent(&agent.id).map_err(ApiError::from_store)?;
+    if is_explicitly_archived(store.data_dir(), &agent) {
+        return Err(archived_conflict(&archived_skip(store, &agent).reason));
+    }
     // A crash may leave the mailbox row without a whole-send receipt. Check it
-    // before clearing markers/errors, not merely before the lifecycle SQL.
+    // before staging media or changing lifecycle state.
     if let Some(key) = key
         && let Some(message) = store
             .message_by_source_key(&agent.id, key)
@@ -645,15 +679,10 @@ pub(super) fn deliver_agent_with_media(
     }
     let (text, staged) =
         recipient_media_text(store, body, &agent, upload).map_err(ApiError::from_store)?;
-    if wake_archived && is_explicitly_archived(store.data_dir(), &agent) {
-        prepare_agent_wake(store, &agent)?;
-    }
     let trimmed = body.text.trim_start();
     let is_auto_subagent_lifecycle =
         trimmed.starts_with("[Sub-Agent Completed]") || trimmed.starts_with("[Sub-Agent Error]");
-    if !wake_archived
-        && (agent.state == "idle" || agent.state == "created")
-        && !is_explicitly_archived(store.data_dir(), &agent)
+    if (agent.state == "idle" || agent.state == "created")
         && !(agent.parent_id.is_none() && is_auto_subagent_lifecycle)
     {
         let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
@@ -690,9 +719,7 @@ pub(super) fn deliver_agent_with_media(
         received_at_ms: None,
     };
     let outcome = if let Some((sender, token)) = turn_context {
-        store.receive_turn_send(&agent.id, incoming, wake_archived, sender, token)
-    } else if wake_archived {
-        store.receive_direct_send(&agent.id, incoming)
+        store.receive_turn_send(&agent.id, incoming, sender, token)
     } else {
         store.receive(&agent.id, incoming)
     }

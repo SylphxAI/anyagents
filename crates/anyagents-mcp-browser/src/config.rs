@@ -2,12 +2,36 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 /// Default browser viewport width in CSS pixels.
 pub const DEFAULT_VIEWPORT_WIDTH: u32 = 1280;
 /// Default browser viewport height in CSS pixels.
 pub const DEFAULT_VIEWPORT_HEIGHT: u32 = 800;
+
+/// How the browser process is hosted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum BrowserMode {
+    /// Real headful browser inside a private `sway` Wayland session when `sway`
+    /// and a full (non `headless_shell`) browser are available; headless otherwise.
+    #[default]
+    Auto,
+    /// Always use the private `sway` Wayland session; fail when it is unavailable.
+    Desktop,
+    /// Always launch the browser directly (`--headless=new` unless `--headful`).
+    Headless,
+}
+
+impl BrowserMode {
+    /// Stable lowercase name used in logs and tool payloads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Desktop => "desktop",
+            Self::Headless => "headless",
+        }
+    }
+}
 
 /// CLI arguments and environment configuration for `anyagents-mcp-browser`.
 #[derive(Clone, Parser)]
@@ -56,6 +80,18 @@ pub struct BrowserServerConfig {
     #[arg(long, env = "ANYAGENTS_BROWSER_HEADFUL")]
     pub headful: bool,
 
+    /// Browser hosting mode: `auto` (default), `desktop`, or `headless`.
+    #[arg(long, env = "ANYAGENTS_BROWSER_MODE", value_enum, default_value_t = BrowserMode::Auto)]
+    pub browser_mode: BrowserMode,
+
+    /// IANA timezone for the browser (e.g. `Europe/London`); defaults to `$TZ`, then `UTC`.
+    #[arg(long, env = "ANYAGENTS_BROWSER_TIMEZONE")]
+    pub timezone: Option<String>,
+
+    /// Comma-separated BCP 47 browser languages, most preferred first (e.g. `en-GB,en`).
+    #[arg(long, env = "ANYAGENTS_BROWSER_LOCALE")]
+    pub locale: Option<String>,
+
     /// Extra whitespace-separated Chromium command-line flags.
     #[arg(long, env = "ANYAGENTS_BROWSER_ARGS")]
     pub extra_args: Option<String>,
@@ -86,6 +122,9 @@ impl std::fmt::Debug for BrowserServerConfig {
                 &self.proxy.as_deref().map(crate::proxy::redact_proxy_url),
             )
             .field("headful", &self.headful)
+            .field("browser_mode", &self.browser_mode)
+            .field("timezone", &self.timezone)
+            .field("locale", &self.locale)
             .field("extra_args", &self.extra_args)
             .field("viewport_width", &self.viewport_width)
             .field("viewport_height", &self.viewport_height)
@@ -104,6 +143,9 @@ impl Default for BrowserServerConfig {
             screenshot_dir: None,
             proxy: None,
             headful: false,
+            browser_mode: BrowserMode::Auto,
+            timezone: None,
+            locale: None,
             extra_args: None,
             viewport_width: DEFAULT_VIEWPORT_WIDTH,
             viewport_height: DEFAULT_VIEWPORT_HEIGHT,
@@ -119,6 +161,46 @@ impl BrowserServerConfig {
             .map(|raw| raw.split_whitespace().map(str::to_owned).collect())
             .unwrap_or_default()
     }
+
+    /// Browser languages from `--locale`, ignoring empty entries.
+    pub fn languages(&self) -> Vec<String> {
+        self.locale
+            .as_deref()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Browser timezone from `--timezone`, else an IANA-looking `$TZ`.
+    pub fn resolved_timezone(&self) -> Option<String> {
+        resolve_timezone(
+            self.timezone.as_deref(),
+            std::env::var("TZ").ok().as_deref(),
+        )
+    }
+}
+
+/// Pure timezone resolution: an explicit value wins verbatim (validated later by
+/// the browser launcher); `$TZ` is used only when it looks like an IANA name
+/// (POSIX rule strings such as `EST5EDT,M3.2.0` or file paths are ignored).
+pub fn resolve_timezone(explicit: Option<&str>, tz_env: Option<&str>) -> Option<String> {
+    if let Some(tz) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(tz.to_string());
+    }
+    let tz = tz_env?.trim().trim_start_matches(':');
+    let looks_iana = !tz.is_empty()
+        && !tz.starts_with('/')
+        && !tz.contains("..")
+        && tz
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'))
+        && (tz.contains('/') || tz == "UTC" || tz == "GMT");
+    looks_iana.then(|| tz.to_string())
 }
 
 #[cfg(test)]
@@ -134,6 +216,47 @@ mod tests {
         assert!(cfg.chromium_bin.is_none());
         assert!(cfg.profile_dir.is_none());
         assert!(cfg.parsed_extra_args().is_empty());
+        assert_eq!(cfg.browser_mode, BrowserMode::Auto);
+    }
+
+    #[test]
+    fn browser_mode_timezone_and_locale_parse() {
+        let cfg = BrowserServerConfig::try_parse_from([
+            "anyagents-mcp-browser",
+            "--browser-mode",
+            "desktop",
+            "--timezone",
+            "Europe/London",
+            "--locale",
+            "en-GB, en ,",
+        ])
+        .unwrap();
+        assert_eq!(cfg.browser_mode, BrowserMode::Desktop);
+        assert_eq!(cfg.resolved_timezone().as_deref(), Some("Europe/London"));
+        assert_eq!(cfg.languages(), vec!["en-GB", "en"]);
+        assert!(BrowserServerConfig::try_parse_from(["x", "--browser-mode", "bogus"]).is_err());
+        let headless =
+            BrowserServerConfig::try_parse_from(["x", "--browser-mode", "headless"]).unwrap();
+        assert_eq!(headless.browser_mode.as_str(), "headless");
+    }
+
+    #[test]
+    fn timezone_falls_back_to_iana_tz_env_only() {
+        assert_eq!(
+            resolve_timezone(None, Some(":Europe/London")).as_deref(),
+            Some("Europe/London")
+        );
+        assert_eq!(resolve_timezone(None, Some("UTC")).as_deref(), Some("UTC"));
+        assert_eq!(resolve_timezone(None, Some("EST5EDT,M3.2.0,M11.1.0")), None);
+        assert_eq!(
+            resolve_timezone(None, Some("/usr/share/zoneinfo/UTC")),
+            None
+        );
+        assert_eq!(resolve_timezone(None, None), None);
+        assert_eq!(
+            resolve_timezone(Some(" Asia/Tokyo "), Some("Europe/London")).as_deref(),
+            Some("Asia/Tokyo")
+        );
     }
 
     #[test]

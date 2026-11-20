@@ -200,13 +200,10 @@ impl SandboxProvider for SylphxProvider {
                     Some(client.wait_lease_ready(&cfg.parent, discovered, LEASE_READY_TIMEOUT)?);
             }
 
-            let (lease, freshly_created) = match reused_lease {
-                Some(active) => {
-                    let renewed = client
-                        .renew_lease(&cfg.parent, &active.resource_name, Some(&ttl_str))
-                        .unwrap_or(active);
-                    (renewed, false)
-                }
+            let lease = match reused_lease {
+                Some(active) => client
+                    .renew_lease(&cfg.parent, &active.resource_name, Some(&ttl_str))
+                    .unwrap_or(active),
                 None => {
                     let image = req
                         .image
@@ -249,12 +246,11 @@ impl SandboxProvider for SylphxProvider {
                             Some(&req.network),
                         ) {
                             Ok(created) => {
-                                let ready = client.wait_lease_ready(
+                                break client.wait_lease_ready(
                                     &cfg.parent,
                                     created,
                                     LEASE_READY_TIMEOUT,
                                 )?;
-                                break (ready, true);
                             }
                             Err(err) if is_lease_collision_or_timeout(&err) => {
                                 // Recover when a concurrent replica or a timed-out POST
@@ -268,14 +264,13 @@ impl SandboxProvider for SylphxProvider {
                                         discovered,
                                         LEASE_READY_TIMEOUT,
                                     )?;
-                                    let renewed = client
+                                    break client
                                         .renew_lease(
                                             &cfg.parent,
                                             &ready.resource_name,
                                             Some(&ttl_str),
                                         )
                                         .unwrap_or(ready);
-                                    break (renewed, false);
                                 }
                                 if attempt < COLLISION_BACKOFF_MS.len() {
                                     std::thread::sleep(Duration::from_millis(
@@ -297,14 +292,15 @@ impl SandboxProvider for SylphxProvider {
                 .clone()
                 .unwrap_or_else(|| lease.resource_name.clone());
 
-            if freshly_created {
-                client.init_persistent_layout(
-                    &data_plane_resource,
-                    &mount_path,
-                    &state_dir,
-                    &workdir,
-                )?;
-            }
+            // ALWAYS run the idempotent layout init on every attach (fresh, reused, or recovered
+            // after a POST timeout / 409): a lease whose creator never finished init would
+            // otherwise leave a root-owned volume without `state/`. Failure fails closed.
+            client.init_persistent_layout(
+                &data_plane_resource,
+                &mount_path,
+                &state_dir,
+                &workdir,
+            )?;
 
             let transport_url = lease.envd_url.clone().or_else(|| {
                 Some(format!(
@@ -532,8 +528,9 @@ fn resolve_data_plane_resource(parent: &str, handle: &SandboxHandle) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Bytes;
     use axum::extract::State;
-    use axum::http::Uri;
+    use axum::http::{Method, StatusCode, Uri};
     use axum::{Json, Router};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
@@ -653,6 +650,252 @@ mod tests {
             );
         }
 
+        server.abort();
+    }
+
+    const PARENT: &str = "orgs/o/projects/p/envs/e";
+
+    /// Stateful lease-lifecycle mock: volume lookup, lease list/get/renew, a configurable
+    /// `POST /leases` failure (simulated HTTP timeout / `409 Conflict`), and `:exec`.
+    #[derive(Clone)]
+    struct LeaseMockState {
+        create_failure: (u16, Value),
+        exec_exit_code: i64,
+        list_calls: Arc<AtomicU64>,
+        create_calls: Arc<AtomicU64>,
+        exec_bodies: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl LeaseMockState {
+        fn new(create_failure: (u16, Value), exec_exit_code: i64) -> Self {
+            Self {
+                create_failure,
+                exec_exit_code,
+                list_calls: Arc::default(),
+                create_calls: Arc::default(),
+                exec_bodies: Arc::default(),
+            }
+        }
+    }
+
+    fn lease_json(id: &str) -> Value {
+        json!({
+            "name": format!("{PARENT}/leases/{id}"),
+            "spec": { "volumes": [{
+                "volume": format!("{PARENT}/volumes/anyagents-agt-init"),
+                "mount_path": DEFAULT_MOUNT_PATH,
+            }] },
+            "status": { "state": "ready" }
+        })
+    }
+
+    async fn lease_mock_handler(
+        State(st): State<LeaseMockState>,
+        method: Method,
+        uri: Uri,
+        body: Bytes,
+    ) -> (StatusCode, Json<Value>) {
+        let path = uri.path().trim_start_matches("/v1/").to_string();
+        let last = |p: &str| p.rsplit('/').next().unwrap_or_default().to_string();
+        match (method.as_str(), path.as_str()) {
+            ("GET", p) if p.contains("/volumes/") => (
+                StatusCode::OK,
+                Json(json!({ "name": p, "status": { "state": "available" } })),
+            ),
+            ("GET", p) if p.ends_with("/leases") => {
+                // The pre-POST lookup sees nothing; the post-failure recovery lookup sees the
+                // lease the timed-out / conflicting grant actually attached to the volume.
+                let n = st.list_calls.fetch_add(1, Ordering::SeqCst);
+                let leases = if n == 0 {
+                    vec![]
+                } else {
+                    vec![lease_json("lease_recovered")]
+                };
+                (StatusCode::OK, Json(json!({ "leases": leases })))
+            }
+            ("GET", p) if p.contains("/leases/") => (StatusCode::OK, Json(lease_json(&last(p)))),
+            ("POST", p) if p.ends_with("/leases") => {
+                st.create_calls.fetch_add(1, Ordering::SeqCst);
+                let (code, body) = st.create_failure.clone();
+                (StatusCode::from_u16(code).unwrap(), Json(body))
+            }
+            ("POST", p) if p.ends_with(":renew") => (
+                StatusCode::OK,
+                Json(lease_json(&last(p.trim_end_matches(":renew")))),
+            ),
+            ("POST", p) if p.ends_with(":exec") => {
+                let parsed = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                st.exec_bodies.lock().unwrap().push(parsed);
+                (
+                    StatusCode::OK,
+                    Json(json!({ "exit_code": st.exec_exit_code, "stdout": "", "stderr": "" })),
+                )
+            }
+            _ => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "unmocked route" })),
+            ),
+        }
+    }
+
+    async fn spawn_lease_mock(st: LeaseMockState) -> (SylphxProvider, tokio::task::JoinHandle<()>) {
+        let app = Router::new().fallback(lease_mock_handler).with_state(st);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut cfg = SylphxConfig::new(PARENT);
+        cfg.endpoint = format!("http://{addr}");
+        (SylphxProvider::new(cfg).unwrap(), server)
+    }
+
+    /// The layout init must run as root, create `state/`, repair ownership, and stay
+    /// idempotent / non-destructive (warm volumes skip recursive chown; nothing is deleted).
+    fn assert_idempotent_layout_init(body: &Value) {
+        assert_eq!(body["user"], "root", "{body}");
+        let script = body["command"][2].as_str().expect("sh -lc script");
+        assert!(script.contains("mkdir -p"), "{script}");
+        assert!(script.contains("/home/user/agent-data/state"), "{script}");
+        assert!(script.contains("chown -R user:user"), "{script}");
+        assert!(script.contains("stat -Lc %U"), "{script}");
+        assert!(!script.contains("rm -"), "{script}");
+    }
+
+    #[tokio::test]
+    async fn ensure_initializes_layout_on_lease_recovered_after_create_timeout_or_409() {
+        let failures = [
+            (
+                409,
+                json!({ "code": "RESOURCE_IN_USE", "message": "volume is attached to another lease" }),
+            ),
+            (
+                504,
+                json!({ "code": "DEADLINE_EXCEEDED", "message": "lease grant timed out" }),
+            ),
+        ];
+        for (code, body) in failures {
+            let st = LeaseMockState::new((code, body), 0);
+            let (provider, server) = spawn_lease_mock(st.clone()).await;
+            let handle = provider
+                .ensure(&EnsureSandboxRequest::for_agent("agt_init"))
+                .await
+                .unwrap_or_else(|e| panic!("HTTP {code} recovery failed: {e}"));
+            assert_eq!(handle.sandbox_id, "lease_recovered");
+            assert_eq!(handle.state_dir, "/home/user/agent-data/state");
+            assert_eq!(st.create_calls.load(Ordering::SeqCst), 1);
+            let execs = st.exec_bodies.lock().unwrap().clone();
+            assert_eq!(execs.len(), 1, "HTTP {code}: layout init must run once");
+            assert_idempotent_layout_init(&execs[0]);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_reattaching_active_lease_still_ensures_layout_non_destructively() {
+        let st = LeaseMockState::new((500, json!({ "message": "create must not run" })), 0);
+        let (provider, server) = spawn_lease_mock(st.clone()).await;
+        let mut req = EnsureSandboxRequest::for_agent("agt_init");
+        req.existing = Some(SandboxHandle {
+            provider: ProviderKind::Sylphx,
+            sandbox_id: "lease_warm".to_string(),
+            volume_id: None,
+            mount_path: DEFAULT_MOUNT_PATH.to_string(),
+            state_dir: "/home/user/agent-data/state".to_string(),
+            workdir: "/home/user/agent-data/workspace".to_string(),
+            transport_url: None,
+            transport_token: None,
+            expires_at: None,
+            metadata: BTreeMap::from([(
+                "lease_resource".to_string(),
+                format!("{PARENT}/leases/lease_warm"),
+            )]),
+        });
+
+        // Attach twice: every re-attach re-runs the same idempotent init (no "already done" skip).
+        for _ in 0..2 {
+            let handle = provider.ensure(&req).await.unwrap();
+            assert_eq!(handle.sandbox_id, "lease_warm");
+        }
+        assert_eq!(st.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(st.list_calls.load(Ordering::SeqCst), 0);
+        let execs = st.exec_bodies.lock().unwrap().clone();
+        assert_eq!(execs.len(), 2);
+        // The per-call idempotency key differs by design; the init command must be identical.
+        assert_eq!(execs[0]["command"], execs[1]["command"]);
+        assert_idempotent_layout_init(&execs[0]);
+        assert_idempotent_layout_init(&execs[1]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn layout_script_requires_readable_ownership_and_preserves_warm_state() {
+        let st = LeaseMockState::new((409, json!({ "code": "RESOURCE_IN_USE" })), 0);
+        let (provider, server) = spawn_lease_mock(st.clone()).await;
+        provider
+            .ensure(&EnsureSandboxRequest::for_agent("agt_init"))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        // Run the captured shell script against a temporary home. Stub only account and
+        // ownership commands so the cases work without root or platform-specific stat.
+        let script = st.exec_bodies.lock().unwrap()[0]["command"][2]
+            .as_str()
+            .unwrap()
+            .replace("/home/user", home.to_str().unwrap());
+        let run = |ownership: &str| {
+            std::process::Command::new("/bin/sh")
+                .env("LAYOUT_TEST_OWNERSHIP", ownership)
+                .args([
+                    "-c",
+                    &format!(
+                        r#"id() {{ [ "$LAYOUT_TEST_OWNERSHIP" != no-user ]; }}
+                           stat() {{
+                               case "$LAYOUT_TEST_OWNERSHIP" in
+                                   unreadable) echo user; case "$3" in */state) return 1;; esac;;
+                                   wrong-owner) case "$3" in */workspace) echo root;; *) echo user;; esac;;
+                                   repair) echo "${{repaired:-root}}";;
+                                   *) echo user;;
+                               esac
+                           }}
+                           chown() {{ if [ "$1" = -R ]; then repaired=user; echo recursive-chown; fi; }}
+                           {script}"#
+                    ),
+                ])
+                .output()
+                .unwrap()
+        };
+        let fresh = run("repair");
+        assert!(fresh.status.success(), "{fresh:?}");
+        assert_eq!(fresh.stdout, b"recursive-chown\n");
+        let state = home.join("agent-data/state/sentinel");
+        std::fs::write(&state, b"preserved").unwrap();
+        let warm = run("ok");
+        assert!(warm.status.success(), "{warm:?}");
+        assert!(
+            warm.stdout.is_empty(),
+            "warm attach recursively chowned: {warm:?}"
+        );
+        assert_eq!(std::fs::read(state).unwrap(), b"preserved");
+        for ownership in ["unreadable", "wrong-owner", "no-user"] {
+            let refused = run(ownership);
+            assert!(!refused.status.success(), "{ownership}: {refused:?}");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ensure_fails_closed_when_layout_init_fails_on_recovered_lease() {
+        let st = LeaseMockState::new((409, json!({ "code": "RESOURCE_IN_USE" })), 1);
+        let (provider, server) = spawn_lease_mock(st.clone()).await;
+        let err = provider
+            .ensure(&EnsureSandboxRequest::for_agent("agt_init"))
+            .await
+            .expect_err("a lease without a verified layout must not be handed out");
+        assert!(err.contains("persistent layout init failed"), "{err}");
+        assert_eq!(st.exec_bodies.lock().unwrap().len(), 1);
         server.abort();
     }
 }

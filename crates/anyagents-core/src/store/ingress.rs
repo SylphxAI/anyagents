@@ -63,32 +63,10 @@ pub(super) fn history_read_probe() {
 
 impl Store {
     /// Append one message, or return the row already stored for this source key.
-    /// The sequence is assigned inside the insert transaction.
+    /// The sequence is assigned inside the insert transaction. This does not
+    /// change an archived recipient’s state.
     pub fn receive(&self, agent_id: &AgentId, incoming: Incoming) -> Result<ReceiveOutcome, Error> {
-        self.receive_with_wake(agent_id, incoming, false)
-    }
-
-    /// Append an intentional, directly addressed send and wake its recipient,
-    /// including an archived agent, in the same transaction. The caller must
-    /// authenticate the author, exclude fan-out and channel/system events, and
-    /// hold the lifecycle lock through clearing any explicit archive marker and
-    /// this call. Ordinary ingress must
-    /// use `receive`; a duplicate never changes the recipient's lifecycle.
-    pub fn receive_direct_send(
-        &self,
-        agent_id: &AgentId,
-        incoming: Incoming,
-    ) -> Result<ReceiveOutcome, Error> {
-        self.receive_with_wake(agent_id, incoming, true)
-    }
-
-    fn receive_with_wake(
-        &self,
-        agent_id: &AgentId,
-        incoming: Incoming,
-        wake_archived: bool,
-    ) -> Result<ReceiveOutcome, Error> {
-        self.receive_with_admission(agent_id, incoming, wake_archived, |_| Ok(true))
+        self.receive_with_admission(agent_id, incoming, false, |_| Ok(true))
             .map(|outcome| outcome.expect("unconditional message admission"))
     }
 
@@ -150,10 +128,10 @@ impl Store {
         &self,
         agent_id: &AgentId,
         incoming: Incoming,
-        wake_archived: bool,
+        wake_created: bool,
         admit: impl FnOnce(&dyn DbExec) -> Result<bool, Error>,
     ) -> Result<Option<ReceiveOutcome>, Error> {
-        self.receive_with_turn_admission(agent_id, incoming, wake_archived, admit, None)
+        self.receive_with_turn_admission(agent_id, incoming, wake_created, admit, None)
     }
 
     /// For a mounted stdio tool call, bind a newly committed delivery to the
@@ -163,14 +141,13 @@ impl Store {
         &self,
         agent_id: &AgentId,
         incoming: Incoming,
-        wake_archived: bool,
         sender: &AgentId,
         token: &str,
     ) -> Result<ReceiveOutcome, Error> {
         self.receive_with_turn_admission(
             agent_id,
             incoming,
-            wake_archived,
+            false,
             |_| Ok(true),
             Some((sender, token)),
         )
@@ -181,7 +158,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
         incoming: Incoming,
-        wake_archived: bool,
+        wake_created: bool,
         admit: impl FnOnce(&dyn DbExec) -> Result<bool, Error>,
         turn: Option<(&AgentId, &str)>,
     ) -> Result<Option<ReceiveOutcome>, Error> {
@@ -218,7 +195,7 @@ impl Store {
                 source_key,
                 received_at_ms,
                 history,
-                wake_archived,
+                wake_created,
                 None,
                 &mut merged,
             )?;
@@ -245,7 +222,7 @@ impl Store {
         source_key: Option<String>,
         received_at_ms: i64,
         history: IngressHistory,
-        wake_archived: bool,
+        wake_created: bool,
         trusted_event: Option<&str>,
         merged: &mut Vec<String>,
     ) -> Result<ReceiveTx, Error> {
@@ -597,10 +574,10 @@ impl Store {
             group_dedup_key.as_deref(),
         )?;
         let is_passive_reaction = message.context.event.as_deref() == Some("reaction_passive");
-        let woke_agent = if wake_archived {
+        let woke_agent = if wake_created {
             tx.db_execute(
                 "UPDATE agents SET state = 'running'
-                 WHERE id = ?1 AND state IN ('idle', 'created', 'archived')",
+                 WHERE id = ?1 AND state IN ('idle', 'created')",
                 &db_params![agent_id.as_str()],
             )? > 0
         } else if is_passive_reaction {

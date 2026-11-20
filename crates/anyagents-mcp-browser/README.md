@@ -25,12 +25,17 @@ Optional standalone stdio MCP server providing headless Chromium CDP browser aut
 | `--chromium-bin` | `ANYAGENTS_CHROMIUM_BIN` | Auto-discovered | Explicit Chromium / Chrome / Playwright binary path |
 | `--profile-dir` | `ANYAGENTS_BROWSER_PROFILE_DIR` | Ephemeral tempdir | Persistent Chromium profile directory |
 | `--proxy` | `ANYAGENTS_BROWSER_PROXY` | Direct | Optional browser-only HTTP/HTTPS/SOCKS5/SOCKS5H proxy URL (also supports per-profile `ANYAGENTS_BROWSER_PROXY_<PROFILE>` and per-call `proxy`/`proxy_env`; never reads global `HTTP_PROXY`) |
-| `--headful` | `ANYAGENTS_BROWSER_HEADFUL` | `false` | Launch with a visible window instead of `--headless=new` |
+| `--headful` | `ANYAGENTS_BROWSER_HEADFUL` | `false` | Launch directly with a visible window on the host display instead of `--headless=new` |
+| `--browser-mode` | `ANYAGENTS_BROWSER_MODE` | `auto` | `desktop`: real headful browser inside a private `sway` Wayland session (no `--headless`/`--disable-gpu`; the same window is used for `browser_takeover`, so takeover never restarts the browser); fails if `sway` is missing. `headless`: direct launch. `auto`: `desktop` when Linux `sway` and a full (non `headless_shell`) browser are available and `--headful` is unset, else `headless` (reason logged to stderr) |
+| `--timezone` | `ANYAGENTS_BROWSER_TIMEZONE` | `$TZ`, else `UTC` | IANA browser timezone (e.g. `Europe/London`); desktop mode records it in the profile's `fingerprint.json` when the profile is first created |
+| `--locale` | `ANYAGENTS_BROWSER_LOCALE` | `en-US,en` | Comma-separated BCP 47 browser languages (`--lang` / `Accept-Language`) |
 | `--extra-args` | `ANYAGENTS_BROWSER_ARGS` | None | Extra whitespace-separated Chromium flags |
 | `--viewport-width` | — | `1280` | Initial viewport width in CSS pixels |
 | `--viewport-height` | — | `800` | Initial viewport height in CSS pixels |
 
-Auto-discovery checks `ANYAGENTS_CHROMIUM_BIN`, `$PATH` (`chromium`, `chromium-browser`, `google-chrome-stable`, `google-chrome`, `chrome`), standard OS paths, and Playwright browser caches (`PLAYWRIGHT_BROWSERS_PATH`, `/opt/playwright`, `~/.cache/ms-playwright`, `~/Library/Caches/ms-playwright`).
+Auto-discovery checks `ANYAGENTS_CHROMIUM_BIN`, then standard binary directories preferring official Google Chrome (`google-chrome-stable`, `google-chrome`, `chrome`) over `chromium` / `chromium-browser`, standard OS paths, and Playwright browser caches (`PLAYWRIGHT_BROWSERS_PATH`, `/opt/playwright`, `~/.cache/ms-playwright`, `~/Library/Caches/ms-playwright`).
+
+`SIGTERM`, `SIGINT`, and `SIGHUP` trigger the same graceful shutdown as closing stdin: the browser is closed cleanly (flushing its cookie store) and the active named profile is synced back before exit.
 
 ## Example MCP Configuration
 

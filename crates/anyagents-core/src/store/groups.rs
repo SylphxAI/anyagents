@@ -48,6 +48,17 @@ impl Store {
         incoming: Incoming,
         mut deliver: impl FnMut(&Agent, Incoming) -> Result<ReceiveOutcome, Error>,
     ) -> Result<Vec<(Agent, ReceiveOutcome)>, Error> {
+        self.try_receive_room_with(room, incoming, |agent, one| deliver(agent, one).map(Some))
+    }
+
+    /// Like [Self::receive_room_with], but the callback can skip a recipient
+    /// whose eligibility changed after the room's membership was read.
+    pub fn try_receive_room_with(
+        &self,
+        room: &str,
+        incoming: Incoming,
+        mut deliver: impl FnMut(&Agent, Incoming) -> Result<Option<ReceiveOutcome>, Error>,
+    ) -> Result<Vec<(Agent, ReceiveOutcome)>, Error> {
         let sender = incoming.sender.clone();
         // Immutable IDs never fall back to a same-spelled display name. Legacy
         // names (with or without agent:) retain their existing alias lookup.
@@ -111,8 +122,9 @@ impl Store {
                 delivered.push((agent, ReceiveOutcome::Duplicate(message)));
                 continue;
             }
-            let outcome = deliver(&agent, one)?;
-            delivered.push((agent, outcome));
+            if let Some(outcome) = deliver(&agent, one)? {
+                delivered.push((agent, outcome));
+            }
         }
         Ok(delivered)
     }
