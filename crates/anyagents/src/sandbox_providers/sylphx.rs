@@ -1009,9 +1009,9 @@ impl SylphxSandboxClient {
         Ok(())
     }
 
-    /// Initialize `/home/user/agent-data/{state,workspace}`, backwards-compatible
-    /// symlinks (`/home/user/agent-state`, `/home/user/workspace`), and `user:user`
-    /// ownership on freshly formatted root-owned persistent volumes.
+    /// Idempotently ensure `{mount,state,workspace}` dirs, legacy symlinks, and `user:user`
+    /// ownership. Safe on every attach: warm volumes skip `chown -R` (owner already `user`),
+    /// root-owned/partial volumes get fixed, and unfixable ownership fails closed.
     pub fn init_persistent_layout(
         &self,
         resource: &str,
@@ -1026,10 +1026,13 @@ impl SylphxSandboxClient {
         let wd = super::providers::shell_single_quote(workdir);
         let script = format!(
             "{base_script}; \
-             if id user >/dev/null 2>&1; then \
-               chown -R user:user {mp} {sd} {wd} 2>/dev/null || true; \
-               chown -h user:user /home/user/agent-state /home/user/workspace 2>/dev/null || true; \
-             fi"
+             id user >/dev/null 2>&1 || {{ echo 'persistent layout requires user' >&2; exit 1; }}; \
+             for d in {mp} {sd} {wd}; do \
+               owner=$(stat -Lc %U \"$d\"); [ \"$owner\" != user ] || continue; \
+               chown -R user:user \"$d\"; \
+               owner=$(stat -Lc %U \"$d\") && [ \"$owner\" = user ] || {{ echo \"cannot verify user ownership of $d\" >&2; exit 1; }}; \
+             done; \
+             chown -h user:user /home/user/agent-state /home/user/workspace 2>/dev/null || true"
         );
         let out = self.exec_as_user(
             resource,
@@ -1254,14 +1257,14 @@ impl SylphxSandboxClient {
                 Some(self.wait_lease_ready(&provider.parent, fetched, LEASE_READY_TIMEOUT)?);
         }
 
-        let (lease, freshly_created) = match reused_lease {
+        let lease = match reused_lease {
             Some(active) => {
                 let _ = self.renew_lease(
                     &provider.parent,
                     &active.resource_name,
                     Some(DEFAULT_LEASE_TTL),
                 );
-                (active, false)
+                active
             }
             None => {
                 let created = self.create_lease(
@@ -1273,10 +1276,7 @@ impl SylphxSandboxClient {
                     env,
                     Some(DEFAULT_LEASE_TTL),
                 )?;
-                (
-                    self.wait_lease_ready(&provider.parent, created, LEASE_READY_TIMEOUT)?,
-                    true,
-                )
+                self.wait_lease_ready(&provider.parent, created, LEASE_READY_TIMEOUT)?
             }
         };
 
@@ -1306,14 +1306,13 @@ impl SylphxSandboxClient {
             envd_token: lease.envd_token.clone(),
             expires_at: lease.expires_at.clone(),
         };
-        if freshly_created {
-            let _ = self.init_persistent_layout(
-                &data_plane_resource,
-                &state.mount_path,
-                &state.state_dir(),
-                &state.workdir,
-            );
-        }
+        // Always (re)apply the idempotent layout: a reused lease may never have completed it.
+        self.init_persistent_layout(
+            &data_plane_resource,
+            &state.mount_path,
+            &state.state_dir(),
+            &state.workdir,
+        )?;
         state.save_to_config_dir(config_dir)?;
         Ok(state)
     }
@@ -3072,8 +3071,10 @@ mod tests {
 
         let list_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let post_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exec_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let list_ref = Arc::clone(&list_calls);
         let post_ref = Arc::clone(&post_calls);
+        let exec_ref = Arc::clone(&exec_calls);
         let (base_url, _server) = spawn_mock_http(move |method, path, _body| {
             match (method, path) {
                 ("GET", "/v1/orgs/o1/projects/p1/envs/e1/volumes/anyagents-agt-race") => (
@@ -3136,6 +3137,14 @@ mod tests {
                     }))
                     .unwrap(),
                 ),
+                ("POST", "/v1/orgs/o1/projects/p1/envs/e1/leases/lease_winner:exec") => {
+                    exec_ref.fetch_add(1, Ordering::SeqCst);
+                    (
+                        200,
+                        vec![("Content-Type".into(), "application/json".into())],
+                        serde_json::to_vec(&serde_json::json!({ "exit_code": 0 })).unwrap(),
+                    )
+                }
                 _ => (404, vec![], br#"{"error":"not found"}"#.to_vec()),
             }
         });
@@ -3163,6 +3172,8 @@ mod tests {
         assert_eq!(handle.sandbox_id, "lease_winner");
         assert_eq!(post_calls.load(Ordering::SeqCst), 1);
         assert!(list_calls.load(Ordering::SeqCst) >= 2);
+        // The 409-recovered lease must still get the persistent layout initialized.
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
