@@ -4330,7 +4330,7 @@ fn mark_delivered_up_to_is_monotonic_and_clears_undelivered() {
 }
 
 #[test]
-fn list_running_agents_with_undelivered_prefers_freshest_and_skips_active_turns() {
+fn list_running_agents_with_undelivered_orders_oldest_first_and_skips_active_turns() {
     let (_dir, store) = setup();
     let older = agent(&store, "older-unread");
     let newer = agent(&store, "newer-unread");
@@ -4344,14 +4344,14 @@ fn list_running_agents_with_undelivered_prefers_freshest_and_skips_active_turns(
     store.receive(&newer.id, Incoming::new("fresh dm")).unwrap();
 
     let ranked = store.list_running_agents_with_undelivered(10).unwrap();
-    assert_eq!(ranked, vec![newer.id.clone(), older.id.clone()]);
+    assert_eq!(ranked, vec![older.id.clone(), newer.id.clone()]);
 
     // An agent with an active remote turn must be skipped by tick backlog drain.
     let _ = store
         .remote_turn_store()
         .create_turn(&crate::NewRemoteTurn {
             turn_id: "turn_active_skip_test".to_string(),
-            agent_id: newer.id.clone(),
+            agent_id: older.id.clone(),
             harness_kind: "sandbox".to_string(),
             provider_kind: Some("sylphx".to_string()),
             remote_run_id: None,
@@ -4363,5 +4363,5 @@ fn list_running_agents_with_undelivered_prefers_freshest_and_skips_active_turns(
         })
         .unwrap();
     let ranked_after = store.list_running_agents_with_undelivered(10).unwrap();
-    assert_eq!(ranked_after, vec![older.id]);
+    assert_eq!(ranked_after, vec![newer.id]);
 }

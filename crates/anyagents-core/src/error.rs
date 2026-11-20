@@ -68,6 +68,8 @@ pub enum Error {
     },
     #[error("agent {agent} already has an unfinished lifecycle op {op_id}")]
     LifecycleOpActive { agent: String, op_id: String },
+    #[error("agent {0} already has an active remote turn")]
+    TurnAlreadyActive(String),
     #[error("agent name is reserved by an unfinished spawn: {0}")]
     NameReserved(String),
     #[error("{0}")]
@@ -115,6 +117,26 @@ impl Error {
                 err.code == rusqlite::ErrorCode::ConstraintViolation
             }
             Self::Postgres(sqlx::Error::Database(err)) => err.code().as_deref() == Some("23505"),
+            _ => false,
+        }
+    }
+
+    /// Returns true if this error indicates an atomic active-turn conflict
+    /// (another `dispatched` or `running` remote turn already exists for the agent).
+    pub fn is_active_turn_conflict(&self) -> bool {
+        match self {
+            Self::TurnAlreadyActive(_) => true,
+            Self::Postgres(sqlx::Error::Database(err)) => {
+                err.code().as_deref() == Some("23505")
+                    && (err.constraint() == Some("uq_pending_remote_turns_active_agent")
+                        || err
+                            .message()
+                            .contains("uq_pending_remote_turns_active_agent"))
+            }
+            Self::Db(rusqlite::Error::SqliteFailure(err, Some(msg))) => {
+                err.code == rusqlite::ErrorCode::ConstraintViolation
+                    && msg.contains("pending_remote_turns.agent_id")
+            }
             _ => false,
         }
     }

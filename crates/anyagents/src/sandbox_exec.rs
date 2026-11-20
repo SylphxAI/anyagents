@@ -706,7 +706,7 @@ struct BundleManifest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct SyncedRepoSpec {
+pub(crate) struct SyncedRepoSpec {
     repo: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
@@ -951,6 +951,10 @@ pub(crate) fn sandbox_handle_from_binding(binding: &SandboxBinding) -> Option<Sa
             .entry("volume_resource".to_string())
             .or_insert_with(|| binding.volume_resource.clone());
     }
+    if binding.lease_id.is_none() && binding.lease_resource.is_none() {
+        metadata.remove("lease_resource");
+        metadata.remove("data_plane_resource");
+    }
     if let Some(ref lr) = binding.lease_resource
         && !lr.trim().is_empty()
     {
@@ -1128,7 +1132,12 @@ fn binding_from_handle(
     if let Some(p) = parent {
         spec.insert("parent".into(), json!(p));
     }
-    if let Some(ref shape) = req.shape {
+    if let Some(shape) = req.shape.as_deref().or_else(|| {
+        prev_spec
+            .get("shape")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+    }) {
         spec.insert("shape".into(), json!(shape));
     }
     spec.insert("mount_path".into(), json!(handle.mount_path));
@@ -1895,7 +1904,9 @@ struct CollectedBundle {
 
 #[path = "sandbox_exec_env.rs"]
 mod sandbox_exec_env;
-pub(crate) use sandbox_exec_env::filter_sandbox_launch_env;
+pub(crate) use sandbox_exec_env::{
+    filter_sandbox_launch_env, resolve_sandbox_shape_and_volume_for_agent,
+};
 
 /// Collect relative `(rel_path, bytes)` bundle files + remote directories for
 /// syncing into `<state_root>` inside any remote sandbox provider.
@@ -2408,7 +2419,7 @@ fn run_provider_sandbox<R: BufRead + Send + 'static>(
     Ok(())
 }
 
-fn read_synced_repo_spec(config_dir: &Path) -> Option<SyncedRepoSpec> {
+pub(crate) fn read_synced_repo_spec(config_dir: &Path) -> Option<SyncedRepoSpec> {
     for rel in ["repo-spec.json", ".anyagents-managed-worktree.json"] {
         let path = config_dir.join(rel);
         let Ok(raw) = std::fs::read_to_string(&path) else {

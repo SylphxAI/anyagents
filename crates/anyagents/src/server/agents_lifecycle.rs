@@ -1189,14 +1189,20 @@ pub(super) async fn wake_agent_route(
         .await;
     drop(cancel_guard);
     let (view, agent_id) = out?;
-    if serverless::is_serverless_mode()
-        && let Err(err) =
-            serverless::dispatch_next_mailbox_message_if_serverless(dispatch_store, &agent_id).await
-    {
-        eprintln!(
-            "anyagents-serverless: wake dispatch failed for `{}`: {err}",
-            agent_id.as_str()
-        );
+    if serverless::is_serverless_mode() {
+        let call = in_flight::carry();
+        tokio::spawn(async move {
+            let _call = call;
+            if let Err(err) =
+                serverless::dispatch_next_mailbox_message_if_serverless(dispatch_store, &agent_id)
+                    .await
+            {
+                eprintln!(
+                    "anyagents-serverless: wake dispatch failed for `{}`: {err}",
+                    agent_id.as_str()
+                );
+            }
+        });
     }
     Ok(view)
 }

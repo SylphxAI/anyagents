@@ -23,7 +23,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::sandbox_providers::providers::{
-    ExecRequest, ImageSpec, LeasePolicy, ProviderKind, SandboxProvider as AsyncSandboxProvider,
+    ExecRequest, ProviderKind, SandboxProvider as AsyncSandboxProvider,
 };
 use anyagents_core::stateless::{
     NewRemoteTurn, PendingRemoteTurn, RemoteTurnEventUpdate, SettleRemoteTurn, constant_time_eq,
@@ -45,11 +45,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{ApiError, AppState, resolve_remote_sandbox_workdir, spawn_store};
+use super::{ApiError, AppState, spawn_store};
 use crate::sandbox_exec::{
-    GuestHeartbeatFrame, apply_guest_heartbeat, ensure_sandbox_with_provider,
-    hydrate_agent_files_from_store, resolve_registry_for_binding, resolve_remote_provider_registry,
-    sandbox_handle_from_binding, sweep_idle_sandboxes, sync_agent_bundle_tar_to_provider,
+    GuestHeartbeatFrame, apply_guest_heartbeat, resolve_registry_for_binding,
+    resolve_remote_provider_registry, sandbox_handle_from_binding, sweep_idle_sandboxes,
 };
 use crate::serverless_cloud::{
     CloudTurnDriver, CloudTurnSubmitRequest, GenericHttpCloudDriver, SpironServerlessDriver,
@@ -216,6 +215,16 @@ pub(crate) async fn dispatch_serverless_turn(
     store: Arc<Store>,
     input: ServerlessDispatchInput,
 ) -> Result<DispatchedRemoteTurn, String> {
+    let agent_id = input.agent.id.to_string();
+    dispatch_serverless_turn_opt(store, input)
+        .await?
+        .ok_or_else(|| anyagents_core::Error::TurnAlreadyActive(agent_id).to_string())
+}
+
+async fn dispatch_serverless_turn_opt(
+    store: Arc<Store>,
+    input: ServerlessDispatchInput,
+) -> Result<Option<DispatchedRemoteTurn>, String> {
     let base_url = input
         .callback_base_url
         .clone()
@@ -237,7 +246,7 @@ async fn dispatch_cloud_turn(
     store: Arc<Store>,
     input: ServerlessDispatchInput,
     base_url: &str,
-) -> Result<DispatchedRemoteTurn, String> {
+) -> Result<Option<DispatchedRemoteTurn>, String> {
     let store_budget = Arc::clone(&store);
     let agent_budget = input.agent.clone();
     run_store_blocking(move || {
@@ -315,11 +324,12 @@ async fn dispatch_cloud_turn(
     };
     let aid_mcp = input.agent.id.clone();
     let base_url_mcp = base_url.to_string();
-    let (created, mcp_servers) = run_store_blocking(move || {
-        let created = store_create
-            .remote_turn_store()
-            .create_turn(&new_turn)
-            .map_err(|e| format!("failed to persist pending cloud turn: {e}"))?;
+    let Some((created, mcp_servers)) = run_store_blocking(move || {
+        let created = match store_create.remote_turn_store().create_turn(&new_turn) {
+            Ok(turn) => turn,
+            Err(err) if err.is_active_turn_conflict() => return Ok(None),
+            Err(err) => return Err(format!("failed to persist pending cloud turn: {err}")),
+        };
         // Build per-turn Streamable HTTP MCP attachment without revoking sibling live tokens.
         let mcp_servers = super::serverless_envelope::ensure_serverless_remote_session_token(
             &store_create,
@@ -335,9 +345,12 @@ async fn dispatch_cloud_turn(
                 "bearer_token": token,
             }])
         });
-        Ok((created, mcp_servers))
+        Ok(Some((created, mcp_servers)))
     })
-    .await?;
+    .await?
+    else {
+        return Ok(None);
+    };
 
     let driver = resolve_cloud_driver_from_metadata(harness_kind, Some(&meta_val), None)?;
     let submit_req = CloudTurnSubmitRequest {
@@ -455,17 +468,17 @@ async fn dispatch_cloud_turn(
     })
     .await?;
 
-    Ok(DispatchedRemoteTurn {
+    Ok(Some(DispatchedRemoteTurn {
         turn: final_turn,
         callback_token,
-    })
+    }))
 }
 
 async fn dispatch_sandbox_turn(
     store: Arc<Store>,
     input: ServerlessDispatchInput,
     base_url: &str,
-) -> Result<DispatchedRemoteTurn, String> {
+) -> Result<Option<DispatchedRemoteTurn>, String> {
     let provider: Arc<dyn AsyncSandboxProvider> = if let Some(p) = input.sandbox_provider.clone() {
         p
     } else if let Some(reg) = resolve_remote_provider_registry(Some(store.data_dir()))? {
@@ -525,103 +538,17 @@ async fn dispatch_sandbox_turn(
         metadata_json: Some(Value::Object(meta)),
         next_poll_at_ms: None,
     };
-    let created = run_store_blocking(move || {
-        store_create
-            .remote_turn_store()
-            .create_turn(&new_turn)
-            .map_err(|e| format!("failed to persist pending sandbox turn: {e}"))
-    })
-    .await?;
-
-    let store_ensure = Arc::clone(&store);
-    let provider_ensure = Arc::clone(&provider);
-    let agent_ensure = input.agent.clone();
-    let extra_args_ensure = input.guest_extra_args.clone();
-    let prompt_for_media = input.prompt.clone();
-    let base_url_ensure = base_url.to_string();
-    let ensured: Result<(crate::sandbox_exec::EnsuredSandbox, String), String> =
-        tokio::task::spawn_blocking(move || {
-            let cfg_dir =
-                anyagents_core::agent_config_dir(store_ensure.data_dir(), &agent_ensure.id);
-            let remote_workdir = resolve_remote_sandbox_workdir(&store_ensure, &agent_ensure);
-            let lease_env: BTreeMap<String, String> =
-                crate::sandbox_exec::filter_sandbox_launch_env(&agent_ensure.launch_env)
-                    .into_iter()
-                    .collect();
-            let ensured = ensure_sandbox_with_provider(
-                &store_ensure,
-                Arc::clone(&provider_ensure),
-                &ImageSpec::default(),
-                &LeasePolicy::default(),
-                None,
-                None,
-                &agent_ensure.id,
-                Some(&agent_ensure.name),
-                &cfg_dir,
-                Some(&remote_workdir),
-                &lease_env,
-            )?;
-
-            // Hydrate PG config/secrets/memory, refresh `<learned_memory>`, stage media, and sync bundle tar.
-            let _ = hydrate_agent_files_from_store(&store_ensure, &agent_ensure.id, &cfg_dir)?;
-            super::serverless_envelope::ensure_deployment_skills_hydrated(&store_ensure);
-            let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(
-                &store_ensure,
-                &agent_ensure.id,
-            );
-            let _ = super::serverless_memory::refresh_hydrated_prompt_learned_memory(
-                &store_ensure,
-                &agent_ensure,
-                &cfg_dir,
-            );
-            super::serverless_envelope::deduplicate_hydrated_system_prompts(&cfg_dir);
-            if anyagents_harness::normalize_harness_name(&agent_ensure.harness) == "agy" {
-                let _ = crate::vendor::ensure_agy_steering_settings(
-                    &cfg_dir,
-                    std::path::Path::new(&ensured.handle.workdir),
-                    &store_ensure
-                        .data_dir()
-                        .join(anyagents_harness::media::MEDIA_DIR),
-                );
-            }
-            let rewritten_prompt = super::s3_media_profiles::hydrate_prompt_media_for_sandbox(
-                &store_ensure,
-                &cfg_dir,
-                &ensured.handle.state_dir,
-                &prompt_for_media,
-            );
-            if crate::remote::require_public_url(store_ensure.data_dir()).is_ok() {
-                let _ = super::serverless_envelope::ensure_serverless_remote_session_token(
-                    &store_ensure,
-                    &agent_ensure.id,
-                    &base_url_ensure,
-                )?;
-            }
-            if crate::remote::session_token(&cfg_dir).is_ok()
-                && crate::remote::resolve_public_mcp_url(&cfg_dir).is_ok()
-            {
-                sync_agent_bundle_tar_to_provider(
-                    provider_ensure.as_ref(),
-                    &ensured.handle,
-                    Some(&store_ensure),
-                    Some(store_ensure.data_dir()),
-                    &cfg_dir,
-                    agent_ensure.id.as_str(),
-                    &agent_ensure.harness,
-                    &extra_args_ensure,
-                )?;
-            }
-            Ok((ensured, rewritten_prompt))
-        })
-        .await
-        .map_err(|e| format!("sandbox ensure join error: {e}"))?;
-
-    let (ensured, effective_prompt) = match ensured {
-        Ok(pair) => pair,
-        Err(err) => {
-            fail_remote_turn(&store, &input.agent.id, &turn_id, err.clone()).await;
-            return Err(err);
-        }
+    let Some(created) =
+        run_store_blocking(
+            move || match store_create.remote_turn_store().create_turn(&new_turn) {
+                Ok(turn) => Ok(Some(turn)),
+                Err(err) if err.is_active_turn_conflict() => Ok(None),
+                Err(err) => Err(format!("failed to persist pending sandbox turn: {err}")),
+            },
+        )
+        .await?
+    else {
+        return Ok(None);
     };
 
     let guest_bin = input
@@ -630,75 +557,153 @@ async fn dispatch_sandbox_turn(
         .or_else(|| env_non_empty("ANYAGENTS_SANDBOX_GUEST_PATH"))
         .unwrap_or_else(|| "/usr/local/bin/anyagents-guest".to_string());
 
-    let mut argv = vec![
-        guest_bin,
-        "turn".to_string(),
-        "--detached".to_string(),
-        "--turn-id".to_string(),
-        turn_id.clone(),
-        "--agent-id".to_string(),
-        input.agent.id.as_str().to_string(),
-        "--harness".to_string(),
-        input.agent.harness.clone(),
-        "--prompt-stdin".to_string(),
-        "--callback-url".to_string(),
-        callback_url,
-        "--callback-token".to_string(),
-        callback_token.clone(),
-        "--state-dir".to_string(),
-        ensured.handle.state_dir.clone(),
-        "--workdir".to_string(),
-        ensured.handle.workdir.clone(),
-    ];
-    if let Some(ref prog) = input.guest_program {
-        argv.push("--program".to_string());
-        argv.push(prog.clone());
-    }
-    if let Some(ref model) = input.agent.model
-        && !model.trim().is_empty()
-    {
-        argv.push("--model".to_string());
-        argv.push(model.clone());
-    }
-    if let Some(hb) = input.heartbeat_interval_ms {
-        argv.push("--heartbeat-interval-ms".to_string());
-        argv.push(hb.to_string());
-    }
-    if !input.guest_extra_args.is_empty() {
-        argv.push("--".to_string());
-        argv.extend(input.guest_extra_args.iter().cloned());
-    }
+    let mut attempt = 0usize;
+    let (ensured, out) = loop {
+        let ensured_res = super::serverless_envelope::ensure_and_prepare_sandbox_for_turn(
+            Arc::clone(&store),
+            Arc::clone(&provider),
+            input.agent.clone(),
+            input.prompt.clone(),
+            base_url.to_string(),
+            input.guest_extra_args.clone(),
+        )
+        .await;
 
-    let mut exec_req = ExecRequest::argv(argv)
-        .with_cwd(ensured.handle.workdir.clone())
-        .with_timeout_ms(DETACHED_EXEC_TIMEOUT_MS);
-    let store_env = Arc::clone(&store);
-    let agent_env = input.agent.clone();
-    let resolved_env = run_store_blocking(move || {
-        let mut env = BTreeMap::new();
-        super::secrets::merge_sandbox_exec_env(&store_env, &agent_env, &mut env)?;
-        Ok(env)
-    })
-    .await;
-    match resolved_env {
-        Ok(env) => exec_req.env.extend(env),
-        Err(err) => {
-            fail_remote_turn(&store, &input.agent.id, &turn_id, err.clone()).await;
-            return Err(err);
+        let (ensured, effective_prompt) = match ensured_res {
+            Ok(pair) => pair,
+            Err((maybe_handle, err)) => {
+                if let Some(ref handle) = maybe_handle
+                    && attempt == 0
+                    && super::serverless_failure::is_unhealthy_lease_exec_error(&err)
+                {
+                    super::serverless_failure::release_unhealthy_lease_before_retry(
+                        &store,
+                        &provider,
+                        &input.agent.id,
+                        handle,
+                    )
+                    .await;
+                    attempt += 1;
+                    continue;
+                }
+                super::serverless_failure::fail_remote_turn(
+                    &store,
+                    &input.agent.id,
+                    &turn_id,
+                    err.clone(),
+                    maybe_handle.as_ref().map(|h| (&provider, h)),
+                )
+                .await;
+                return Err(err);
+            }
+        };
+
+        let store_env = Arc::clone(&store);
+        let agent_env = input.agent.clone();
+        let resolved_env = run_store_blocking(move || {
+            let mut env = BTreeMap::new();
+            super::secrets::merge_sandbox_exec_env(&store_env, &agent_env, &mut env)?;
+            Ok(env)
+        })
+        .await;
+        let mut exec_req = ExecRequest::argv(Vec::new())
+            .with_cwd(ensured.handle.workdir.clone())
+            .with_timeout_ms(DETACHED_EXEC_TIMEOUT_MS);
+        match resolved_env {
+            Ok(env) => exec_req.env.extend(env),
+            Err(err) => {
+                super::serverless_failure::fail_remote_turn(
+                    &store,
+                    &input.agent.id,
+                    &turn_id,
+                    err.clone(),
+                    Some((&provider, &ensured.handle)),
+                )
+                .await;
+                return Err(err);
+            }
         }
-    }
-    super::serverless_envelope::attach_outbound_message_env(
-        &mut exec_req,
-        input.outbound_message,
-        &effective_prompt,
-    );
-    exec_req = exec_req.with_stdin(effective_prompt.into_bytes());
+        let message_file = if let Some(msg_json) =
+            super::serverless_envelope::attach_outbound_message_env(
+                &mut exec_req,
+                input.outbound_message.clone(),
+                &effective_prompt,
+            ) {
+            match super::serverless_envelope::stage_oversized_outbound_message_file(
+                provider.as_ref(),
+                &ensured.handle,
+                &turn_id,
+                &msg_json,
+            )
+            .await
+            {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    if attempt == 0
+                        && super::serverless_failure::is_unhealthy_lease_exec_error(&err)
+                    {
+                        super::serverless_failure::release_unhealthy_lease_before_retry(
+                            &store,
+                            &provider,
+                            &input.agent.id,
+                            &ensured.handle,
+                        )
+                        .await;
+                        attempt += 1;
+                        continue;
+                    }
+                    super::serverless_failure::fail_remote_turn(
+                        &store,
+                        &input.agent.id,
+                        &turn_id,
+                        err.clone(),
+                        Some((&provider, &ensured.handle)),
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
+        } else {
+            None
+        };
+        exec_req.command = super::serverless_envelope::build_detached_guest_turn_argv(
+            guest_bin.clone(),
+            &turn_id,
+            &input.agent,
+            &callback_url,
+            &callback_token,
+            &ensured.handle,
+            input.guest_program.as_deref(),
+            input.heartbeat_interval_ms,
+            message_file.as_deref(),
+            &input.guest_extra_args,
+        );
+        exec_req = exec_req.with_stdin(effective_prompt.into_bytes());
 
-    let out = match provider.exec(&ensured.handle, &exec_req).await {
-        Ok(o) => o,
-        Err(err) => {
-            fail_remote_turn(&store, &input.agent.id, &turn_id, err.clone()).await;
-            return Err(err);
+        match provider.exec(&ensured.handle, &exec_req).await {
+            Ok(o) => break (ensured, o),
+            Err(err) => {
+                if attempt == 0 && super::serverless_failure::is_unhealthy_lease_exec_error(&err) {
+                    super::serverless_failure::release_unhealthy_lease_before_retry(
+                        &store,
+                        &provider,
+                        &input.agent.id,
+                        &ensured.handle,
+                    )
+                    .await;
+                    attempt += 1;
+                    continue;
+                }
+                super::serverless_failure::fail_remote_turn(
+                    &store,
+                    &input.agent.id,
+                    &turn_id,
+                    err.clone(),
+                    Some((&provider, &ensured.handle)),
+                )
+                .await;
+                return Err(err);
+            }
         }
     };
 
@@ -708,7 +713,14 @@ async fn dispatch_sandbox_turn(
             out.exit_code,
             out.stderr.trim()
         );
-        let masked = fail_remote_turn(&store, &input.agent.id, &turn_id, diag).await;
+        let masked = super::serverless_failure::fail_remote_turn(
+            &store,
+            &input.agent.id,
+            &turn_id,
+            diag,
+            Some((&provider, &ensured.handle)),
+        )
+        .await;
         return Err(masked);
     }
 
@@ -752,10 +764,10 @@ async fn dispatch_sandbox_turn(
     })
     .await?;
 
-    Ok(DispatchedRemoteTurn {
+    Ok(Some(DispatchedRemoteTurn {
         turn: updated,
         callback_token,
-    })
+    }))
 }
 
 /// When `ANYAGENTS_SERVERLESS=true`, synchronously dispatch all pending undelivered
@@ -846,7 +858,7 @@ pub(super) async fn dispatch_next_mailbox_message_inner(
     input.reply_target = reply_target;
     input.sandbox_provider = sandbox_provider;
     input.callback_base_url = callback_base_url;
-    dispatch_serverless_turn(store, input).await.map(Some)
+    dispatch_serverless_turn_opt(store, input).await
 }
 
 fn infer_reply_target_from_message(msg: &anyagents_core::Message) -> Option<ReplyTarget> {
@@ -881,37 +893,6 @@ pub(crate) struct SettleAndDeliverResult {
     pub settled_now: bool,
     pub delivered_reply: bool,
     pub notified_agent_id: Option<AgentId>,
-}
-
-async fn fail_remote_turn(
-    store: &Arc<Store>,
-    agent_id: &AgentId,
-    turn_id: &str,
-    err: String,
-) -> String {
-    let store_fail = Arc::clone(store);
-    let aid = agent_id.clone();
-    let tid = turn_id.to_string();
-    let err_in = err.clone();
-    run_store_blocking(move || {
-        let masked = super::secrets::mask_text_for_agent(&store_fail, &aid, &err_in);
-        let now = now_ms();
-        let _ = store_fail.remote_turn_store().settle_turn(
-            &tid,
-            &SettleRemoteTurn {
-                status: "failed".to_string(),
-                result_text: None,
-                error_text: Some(masked.clone()),
-                usage_json: None,
-                cursor: None,
-                settled_at_ms: now,
-            },
-        );
-        super::serverless_failure::cleanup_after_failed_sandbox_turn(&store_fail, &aid, now);
-        Ok(masked)
-    })
-    .await
-    .unwrap_or_else(|_| anyagents_core::masking::mask_known_secrets(&err).into_owned())
 }
 
 /// Idempotently settle `turn_id` in `pending_remote_turns`, persist transcript + usage
@@ -3190,7 +3171,15 @@ pub(crate) async fn run_tick_pass(
             // Bound each tick backlog dispatch so `/v1/internal/tick` responds promptly;
             // slow cold-start sandbox ensures continue running in the spawned task.
             let handle = tokio::spawn(async move {
-                dispatch_next_mailbox_message_if_serverless(store_disp, &aid).await
+                match dispatch_next_mailbox_message_if_serverless(store_disp, &aid).await {
+                    Ok(res) => Ok(res),
+                    Err(err) => {
+                        eprintln!(
+                            "anyagents-serverless: tick backlog dispatch failed for `{aid}`: {err}"
+                        );
+                        Err(err)
+                    }
+                }
             });
             if let Ok(Ok(Ok(Some(_)))) =
                 tokio::time::timeout(Duration::from_millis(750), handle).await
@@ -4071,6 +4060,9 @@ done
         let agent = store
             .create_agent(NewAgent::new("sec_agent", "claude-code"))
             .unwrap();
+        let agent_b = store
+            .create_agent(NewAgent::new("sec_agent_b", "claude-code"))
+            .unwrap();
 
         let tok_a = generate_callback_token();
         let tok_b = generate_callback_token();
@@ -4093,7 +4085,7 @@ done
             .remote_turn_store()
             .create_turn(&NewRemoteTurn {
                 turn_id: "turn_sec_b".into(),
-                agent_id: agent.id.clone(),
+                agent_id: agent_b.id.clone(),
                 harness_kind: "sandbox".into(),
                 provider_kind: Some("http".into()),
                 remote_run_id: None,
@@ -4898,5 +4890,272 @@ done
         .unwrap();
         assert_eq!(store.delivered_cursor(&agent.id).unwrap(), m3.seq);
         assert!(store.list_undelivered(&agent.id, 10).unwrap().is_empty());
+    }
+
+    struct InspectingMockProvider {
+        root: std::path::PathBuf,
+        ensure_reqs: Arc<Mutex<Vec<EnsureSandboxRequest>>>,
+        exec_reqs: Arc<Mutex<Vec<ExecRequest>>>,
+        synced_tars: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncSandboxProvider for InspectingMockProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Http
+        }
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities {
+                persistent_volumes: true,
+                volume_survives_release: true,
+                ..SandboxCapabilities::default()
+            }
+        }
+        async fn ensure(&self, req: &EnsureSandboxRequest) -> Result<SandboxHandle, String> {
+            self.ensure_reqs.lock().unwrap().push(req.clone());
+            let sd = self.root.join(&req.agent_id).join("state");
+            let wd = self.root.join(&req.agent_id).join("work");
+            std::fs::create_dir_all(&sd).unwrap();
+            std::fs::create_dir_all(&wd).unwrap();
+            Ok(SandboxHandle {
+                provider: ProviderKind::Http,
+                sandbox_id: format!("sbx-{}", req.agent_id),
+                volume_id: Some(format!("vol-{}", req.agent_id)),
+                mount_path: self.root.join(&req.agent_id).display().to_string(),
+                state_dir: sd.display().to_string(),
+                workdir: wd.display().to_string(),
+                transport_url: None,
+                transport_token: None,
+                expires_at: None,
+                metadata: BTreeMap::new(),
+            })
+        }
+        async fn exec(&self, _h: &SandboxHandle, req: &ExecRequest) -> Result<ExecOutput, String> {
+            self.exec_reqs.lock().unwrap().push(req.clone());
+            Ok(ExecOutput {
+                exit_code: 0,
+                stdout: r#"{"pid":1337}"#.to_string(),
+                stderr: String::new(),
+            })
+        }
+        async fn sync_bundle_tar(
+            &self,
+            _h: &SandboxHandle,
+            dest_dir: &str,
+            tar_gz: &[u8],
+        ) -> Result<(), String> {
+            self.synced_tars
+                .lock()
+                .unwrap()
+                .push((dest_dir.to_string(), tar_gz.to_vec()));
+            crate::sandbox_providers::providers::extract_bundle_tar_gz(
+                tar_gz,
+                std::path::Path::new(dest_dir),
+            )?;
+            Ok(())
+        }
+        async fn release(&self, _h: &SandboxHandle) -> Result<(), String> {
+            Ok(())
+        }
+        async fn destroy(&self, _h: &SandboxHandle) -> Result<(), String> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<ProviderHealth, String> {
+            Ok(ProviderHealth {
+                provider: ProviderKind::Http,
+                healthy: true,
+                message: "ok".into(),
+                latency_ms: Some(1),
+            })
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn dispatch_sandbox_turn_resolves_code_shape_and_volume_for_repo_agents_only() {
+        let _env = crate::server::tests::env_lock();
+        let prev_shape = std::env::var_os("ANYAGENTS_SANDBOX_CODE_SHAPE");
+        let prev_vol = std::env::var_os("ANYAGENTS_SANDBOX_CODE_VOLUME_SIZE_GIB");
+        unsafe {
+            std::env::set_var("ANYAGENTS_SANDBOX_CODE_SHAPE", "linux-xl");
+            std::env::set_var("ANYAGENTS_SANDBOX_CODE_VOLUME_SIZE_GIB", "40");
+        }
+
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let repo_agent = store
+            .create_agent(NewAgent::new("repo-coder", "codex"))
+            .unwrap();
+        let plain_agent = store
+            .create_agent(NewAgent::new("plain-assistant", "codex"))
+            .unwrap();
+
+        let repo_cfg = anyagents_core::agent_config_dir(store.data_dir(), &repo_agent.id);
+        std::fs::create_dir_all(&repo_cfg).unwrap();
+        std::fs::write(
+            repo_cfg.join("repo-spec.json"),
+            r#"{"repo":"https://github.com/example/sample.git","branch":"main"}"#,
+        )
+        .unwrap();
+
+        let ensure_reqs = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn AsyncSandboxProvider> = Arc::new(InspectingMockProvider {
+            root: dir.path().join("sbx"),
+            ensure_reqs: Arc::clone(&ensure_reqs),
+            exec_reqs: Arc::new(Mutex::new(Vec::new())),
+            synced_tars: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        let mut repo_input = ServerlessDispatchInput::for_agent(repo_agent.clone(), "fix bug");
+        repo_input.callback_base_url = Some("http://127.0.0.1:1".into());
+        repo_input.sandbox_provider = Some(Arc::clone(&provider));
+        dispatch_serverless_turn(Arc::clone(&store), repo_input)
+            .await
+            .unwrap();
+
+        let mut plain_input = ServerlessDispatchInput::for_agent(plain_agent.clone(), "say hi");
+        plain_input.callback_base_url = Some("http://127.0.0.1:1".into());
+        plain_input.sandbox_provider = Some(Arc::clone(&provider));
+        dispatch_serverless_turn(Arc::clone(&store), plain_input)
+            .await
+            .unwrap();
+
+        match prev_shape {
+            Some(v) => unsafe { std::env::set_var("ANYAGENTS_SANDBOX_CODE_SHAPE", v) },
+            None => unsafe { std::env::remove_var("ANYAGENTS_SANDBOX_CODE_SHAPE") },
+        }
+        match prev_vol {
+            Some(v) => unsafe { std::env::set_var("ANYAGENTS_SANDBOX_CODE_VOLUME_SIZE_GIB", v) },
+            None => unsafe { std::env::remove_var("ANYAGENTS_SANDBOX_CODE_VOLUME_SIZE_GIB") },
+        }
+
+        let reqs = ensure_reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].shape.as_deref(), Some("linux-xl"));
+        assert_eq!(reqs[0].volume.as_ref().and_then(|v| v.size_gib), Some(40));
+        assert_eq!(reqs[1].shape, None);
+        assert_eq!(reqs[1].volume.as_ref().and_then(|v| v.size_gib), None);
+
+        let repo_binding = store.sandbox_binding(&repo_agent.id).unwrap().unwrap();
+        assert_eq!(repo_binding.volume_size_gib, Some(40));
+        let spec: Value = serde_json::from_str(&repo_binding.spec_json).unwrap();
+        assert_eq!(spec.get("shape").and_then(Value::as_str), Some("linux-xl"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_sandbox_turn_stages_oversized_outbound_message_via_message_file() {
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("big-batch-agent", "codex"))
+            .unwrap();
+        store.set_agent_running(&agent.id, "/work").unwrap();
+
+        let huge_text = "B".repeat(
+            super::super::serverless_envelope::MAX_INLINE_GUEST_MESSAGE_B64_BYTES + 24 * 1024,
+        );
+        store
+            .receive(&agent.id, Incoming::new(huge_text.clone()))
+            .unwrap();
+
+        let exec_reqs = Arc::new(Mutex::new(Vec::new()));
+        let synced_tars = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn AsyncSandboxProvider> = Arc::new(InspectingMockProvider {
+            root: dir.path().join("sbx"),
+            ensure_reqs: Arc::new(Mutex::new(Vec::new())),
+            exec_reqs: Arc::clone(&exec_reqs),
+            synced_tars: Arc::clone(&synced_tars),
+        });
+
+        let dispatched = dispatch_next_mailbox_message_inner(
+            Arc::clone(&store),
+            &agent.id,
+            Some(provider),
+            Some("http://127.0.0.1:1".into()),
+        )
+        .await
+        .unwrap()
+        .expect("oversized batch must dispatch via --message-file");
+
+        let reqs = exec_reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            !reqs[0]
+                .env
+                .contains_key(anyagents_harness::GUEST_MESSAGE_B64_ENV),
+            "oversized message must not populate ANYAGENTS_GUEST_MESSAGE_B64"
+        );
+        let flag_pos = reqs[0]
+            .command
+            .iter()
+            .position(|a| a == "--message-file")
+            .expect("argv must include --message-file");
+        let remote_msg_path = &reqs[0].command[flag_pos + 1];
+        assert!(
+            remote_msg_path.ends_with(&format!("turns/{}.message.json", dispatched.turn.turn_id)),
+            "unexpected message-file path: {remote_msg_path}"
+        );
+        let raw = std::fs::read_to_string(remote_msg_path).expect("message file extracted");
+        let parsed: anyagents_harness::OutboundMessage = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.text, huge_text);
+        assert!(!synced_tars.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_sandbox_turn_conflict_returns_ok_none_without_clobbering_live_turn() {
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("race-agent", "codex"))
+            .unwrap();
+        let agent = store.set_agent_state(&agent.id, "running").unwrap();
+
+        let mut binding = anyagents_core::stateless::SandboxBinding::new(agent.id.clone(), "http");
+        binding.volume_id = "vol-live-1".into();
+        binding.lease_id = Some("sbx-live-1".into());
+        binding.lease_state = "ready".into();
+        store.sandbox_binding_store().upsert(&binding).unwrap();
+
+        store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "turn_live_winner".into(),
+                agent_id: agent.id.clone(),
+                harness_kind: "sandbox".into(),
+                provider_kind: Some("http".into()),
+                remote_run_id: Some("pid:100".into()),
+                callback_token_hash: "h_live".into(),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: None,
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+
+        let provider: Arc<dyn AsyncSandboxProvider> = Arc::new(InspectingMockProvider {
+            root: dir.path().join("sbx"),
+            ensure_reqs: Arc::new(Mutex::new(Vec::new())),
+            exec_reqs: Arc::new(Mutex::new(Vec::new())),
+            synced_tars: Arc::new(Mutex::new(Vec::new())),
+        });
+        let mut input = ServerlessDispatchInput::for_agent(agent.clone(), "racing prompt");
+        input.callback_base_url = Some("http://127.0.0.1:1".into());
+        input.sandbox_provider = Some(provider);
+
+        let raced = dispatch_serverless_turn_opt(Arc::clone(&store), input)
+            .await
+            .expect("active-turn conflict must cleanly return Ok(None)");
+        assert!(raced.is_none());
+
+        // Live turn and active lease remain completely untouched.
+        let live = store
+            .remote_turn_store()
+            .get_turn("turn_live_winner")
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.status, "running");
+        let kept = store.sandbox_binding(&agent.id).unwrap().unwrap();
+        assert_eq!(kept.lease_id.as_deref(), Some("sbx-live-1"));
+        assert_eq!(kept.lease_state, "ready");
     }
 }

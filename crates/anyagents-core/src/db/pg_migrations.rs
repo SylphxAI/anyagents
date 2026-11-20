@@ -10,7 +10,9 @@ pub const PG_DEPLOYMENT_SECRETS_SQL: &str =
 pub const PG_BROWSER_PROFILE_GRANTS_SQL: &str =
     include_str!("../../migrations_pg/005_browser_profile_grants.sql");
 pub const PG_AGENT_RUNTIME_SQL: &str = include_str!("../../migrations_pg/006_agent_runtime.sql");
-pub const PG_LATEST_VERSION: i64 = 6;
+pub const PG_ACTIVE_TURN_UNIQUE_SQL: &str =
+    include_str!("../../migrations_pg/007_active_turn_unique.sql");
+pub const PG_LATEST_VERSION: i64 = 7;
 
 pub(super) const PG_MIGRATIONS: &[(i64, &str)] = &[
     (1, PG_INIT_SQL),
@@ -19,4 +21,5 @@ pub(super) const PG_MIGRATIONS: &[(i64, &str)] = &[
     (4, PG_DEPLOYMENT_SECRETS_SQL),
     (5, PG_BROWSER_PROFILE_GRANTS_SQL),
     (6, PG_AGENT_RUNTIME_SQL),
+    (7, PG_ACTIVE_TURN_UNIQUE_SQL),
 ];

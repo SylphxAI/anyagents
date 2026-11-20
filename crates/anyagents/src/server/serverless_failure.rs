@@ -1,16 +1,113 @@
 //! Serverless turn outcome delivery: outbound reply fallback, terminal bootstrap
 //! failure classification, and fail-closed parent notification on child errors.
 
+use std::sync::Arc;
+
 use anyagents_core::stateless::PendingRemoteTurn;
 use anyagents_core::{Agent, AgentId, Incoming, ReceiveOutcome, Store};
 
 use super::serverless::ReplyTarget;
+use crate::sandbox_providers::providers::{SandboxHandle, SandboxProvider};
 
 pub(super) fn is_suppressed_fallback_reply(text: &str) -> bool {
     let trimmed = text.trim();
     trimmed.is_empty()
         || trimmed.eq_ignore_ascii_case("completed")
         || trimmed.eq_ignore_ascii_case("NO_REPLY")
+}
+
+/// Return true when a sandbox `exec` or bundle sync failure indicates a dead,
+/// stale, or split-brain zombie compute lease that should be released at the
+/// provider and retried once on a freshly ensured sandbox.
+pub(super) fn is_unhealthy_lease_exec_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("exec_outcome_unknown")
+        || lower.contains("failed_precondition")
+        || lower.contains("http 409")
+        || lower.contains("http 404")
+        || lower.contains("http 410")
+        || lower.contains("unavailable")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+}
+
+/// Release the compute lease at the sandbox provider (preserving persistent
+/// volumes) and always clear ephemeral lease columns in the binding store.
+pub(super) fn release_and_clear_sandbox_lease(store: &Store, agent_id: &AgentId) {
+    let cfg_dir = anyagents_core::agent_config_dir(store.data_dir(), agent_id);
+    if let Err(err) = crate::sandbox_exec::release_sandbox_for_agent(store, agent_id, &cfg_dir) {
+        eprintln!(
+            "anyagents-serverless: sandbox lease release failed for `{}` (clearing stored lease anyway): {err}",
+            agent_id.as_str()
+        );
+    }
+    let _ = store.sandbox_binding_store().clear_lease(agent_id);
+}
+
+/// Release an unhealthy/zombie lease via the active provider instance and clear
+/// the stored ephemeral lease before retrying dispatch once on a fresh lease.
+pub(super) async fn release_unhealthy_lease_before_retry(
+    store: &Arc<Store>,
+    provider: &Arc<dyn SandboxProvider>,
+    agent_id: &AgentId,
+    handle: &SandboxHandle,
+) {
+    if let Err(err) = provider.release(handle).await {
+        eprintln!(
+            "anyagents-serverless: unhealthy lease `{}` release failed for `{}` before retry: {err}",
+            handle.sandbox_id,
+            agent_id.as_str()
+        );
+    }
+    let store_clear = Arc::clone(store);
+    let aid = agent_id.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = store_clear.sandbox_binding_store().clear_lease(&aid);
+    })
+    .await;
+}
+
+/// Settle a failed dispatch turn, release any active sandbox compute lease
+/// (preserving persistent volumes), and clear orphaned runtime/recovery locks.
+pub(super) async fn fail_remote_turn(
+    store: &Arc<Store>,
+    agent_id: &AgentId,
+    turn_id: &str,
+    err: String,
+    active_lease: Option<(&Arc<dyn SandboxProvider>, &SandboxHandle)>,
+) -> String {
+    let released_explicit = if let Some((provider, handle)) = active_lease {
+        let _ = provider.release(handle).await;
+        true
+    } else {
+        false
+    };
+    let store_fail = Arc::clone(store);
+    let aid = agent_id.clone();
+    let tid = turn_id.to_string();
+    let err_in = err.clone();
+    tokio::task::spawn_blocking(move || {
+        let masked = super::secrets::mask_text_for_agent(&store_fail, &aid, &err_in);
+        let now = anyagents_core::now_ms();
+        let _ = store_fail.remote_turn_store().settle_turn(
+            &tid,
+            &anyagents_core::SettleRemoteTurn {
+                status: "failed".to_string(),
+                result_text: None,
+                error_text: Some(masked.clone()),
+                usage_json: None,
+                cursor: None,
+                settled_at_ms: now,
+            },
+        );
+        if released_explicit {
+            let _ = store_fail.sandbox_binding_store().clear_lease(&aid);
+        }
+        cleanup_after_failed_sandbox_turn(&store_fail, &aid, now);
+        masked
+    })
+    .await
+    .unwrap_or_else(|_| anyagents_core::masking::mask_known_secrets(&err).into_owned())
 }
 
 /// Deterministic bootstrap failures (e.g. failed private repo clone) should
@@ -87,7 +184,7 @@ pub(super) fn finalize_settled_turn_runtime_and_binding(
         },
     );
     if turn.status == "failed" && turn.harness_kind == "sandbox" && !still_active {
-        let _ = store.sandbox_binding_store().clear_lease(&turn.agent_id);
+        release_and_clear_sandbox_lease(store, &turn.agent_id);
     } else if let Ok(Some(binding)) = store.sandbox_binding(&turn.agent_id) {
         let _ = store
             .sandbox_binding_store()
@@ -121,7 +218,7 @@ pub(super) fn cleanup_after_failed_sandbox_turn(store: &Store, agent_id: &AgentI
     if still_active {
         return;
     }
-    let _ = store.sandbox_binding_store().clear_lease(agent_id);
+    release_and_clear_sandbox_lease(store, agent_id);
     let _ = store.reconcile_stale_open_turn(agent_id);
     let _ = store.update_runtime_heartbeat(
         agent_id,
@@ -195,6 +292,7 @@ pub(super) fn settle_timed_out_sandbox_turn(
     if suppress {
         let ok = cancel_remote_turn_silently(store, &turn.turn_id, now);
         if ok {
+            release_and_clear_sandbox_lease(store, &turn.agent_id);
             let _ = store.reconcile_stale_open_turn(&turn.agent_id);
         }
         return ok;
@@ -765,5 +863,235 @@ mod tests {
             Some("sbx-fresh-2")
         );
         assert!(seen.lock().unwrap().iter().all(|id| id.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn zombie_lease_409_exec_outcome_unknown_releases_and_self_heals_in_same_dispatch() {
+        use crate::sandbox_providers::providers::{
+            EnsureSandboxRequest, ExecOutput, ExecRequest, ProviderHealth, ProviderKind,
+            SandboxCapabilities,
+        };
+        use crate::server::serverless::dispatch_next_mailbox_message_inner;
+        use anyagents_core::stateless::SandboxBinding;
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ZombieLeaseMockProvider {
+            root: std::path::PathBuf,
+            ensures: AtomicUsize,
+            released_ids: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl SandboxProvider for ZombieLeaseMockProvider {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Http
+            }
+            fn capabilities(&self) -> SandboxCapabilities {
+                SandboxCapabilities {
+                    persistent_volumes: true,
+                    volume_survives_release: true,
+                    ..SandboxCapabilities::default()
+                }
+            }
+            async fn ensure(&self, req: &EnsureSandboxRequest) -> Result<SandboxHandle, String> {
+                let n = self.ensures.fetch_add(1, Ordering::SeqCst) + 1;
+                let sd = self.root.join("state");
+                let wd = self.root.join("work");
+                std::fs::create_dir_all(&sd).unwrap();
+                std::fs::create_dir_all(&wd).unwrap();
+                let sandbox_id = req
+                    .existing
+                    .as_ref()
+                    .map(|h| h.sandbox_id.clone())
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| format!("sbx-healed-{n}"));
+                Ok(SandboxHandle {
+                    provider: ProviderKind::Http,
+                    sandbox_id,
+                    volume_id: Some(
+                        req.volume
+                            .as_ref()
+                            .map(|v| v.id_or_name.clone())
+                            .unwrap_or_else(|| "vol-zombie-1".into()),
+                    ),
+                    mount_path: self.root.display().to_string(),
+                    state_dir: sd.display().to_string(),
+                    workdir: wd.display().to_string(),
+                    transport_url: None,
+                    transport_token: None,
+                    expires_at: None,
+                    metadata: BTreeMap::new(),
+                })
+            }
+            async fn exec(
+                &self,
+                handle: &SandboxHandle,
+                _req: &ExecRequest,
+            ) -> Result<ExecOutput, String> {
+                if handle.sandbox_id == "sbx-zombie-1" {
+                    return Err(
+                        "POST /leases/sbx-zombie-1:exec returned HTTP 409: EXEC_OUTCOME_UNKNOWN"
+                            .into(),
+                    );
+                }
+                Ok(ExecOutput {
+                    exit_code: 0,
+                    stdout: r#"{"pid":7777}"#.into(),
+                    stderr: String::new(),
+                })
+            }
+            async fn sync_bundle_tar(
+                &self,
+                _h: &SandboxHandle,
+                _d: &str,
+                _b: &[u8],
+            ) -> Result<(), String> {
+                Ok(())
+            }
+            async fn release(&self, handle: &SandboxHandle) -> Result<(), String> {
+                self.released_ids
+                    .lock()
+                    .unwrap()
+                    .push(handle.sandbox_id.clone());
+                Ok(())
+            }
+            async fn destroy(&self, _h: &SandboxHandle) -> Result<(), String> {
+                Ok(())
+            }
+            async fn health(&self) -> Result<ProviderHealth, String> {
+                Ok(ProviderHealth {
+                    provider: ProviderKind::Http,
+                    healthy: true,
+                    message: "ok".into(),
+                    latency_ms: Some(1),
+                })
+            }
+        }
+
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("zombie-worker", "codex"))
+            .unwrap();
+        let agent = store.set_agent_state(&agent.id, "running").unwrap();
+
+        let mut binding = SandboxBinding::new(agent.id.clone(), "http");
+        binding.volume_id = "vol-zombie-1".into();
+        binding.lease_id = Some("sbx-zombie-1".into());
+        binding.lease_state = "ready".into();
+        store.sandbox_binding_store().upsert(&binding).unwrap();
+
+        store
+            .receive(&agent.id, Incoming::new("recover zombie lease"))
+            .unwrap();
+
+        let released_ids = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn SandboxProvider> = Arc::new(ZombieLeaseMockProvider {
+            root: dir.path().join("sbx"),
+            ensures: AtomicUsize::new(0),
+            released_ids: Arc::clone(&released_ids),
+        });
+
+        let dispatched = dispatch_next_mailbox_message_inner(
+            Arc::clone(&store),
+            &agent.id,
+            Some(provider),
+            Some("http://127.0.0.1:1".to_string()),
+        )
+        .await
+        .expect("zombie 409 must self-heal on a fresh lease within the same dispatch")
+        .expect("expected dispatched remote turn");
+
+        assert_eq!(dispatched.turn.status, "running");
+        assert_eq!(
+            *released_ids.lock().unwrap(),
+            vec!["sbx-zombie-1".to_string()]
+        );
+        let after = store.sandbox_binding(&agent.id).unwrap().unwrap();
+        assert_eq!(after.lease_id.as_deref(), Some("sbx-healed-2"));
+        assert_eq!(after.volume_id, "vol-zombie-1");
+    }
+
+    #[tokio::test]
+    async fn settle_timed_out_sandbox_turn_releases_provider_lease_to_fence_split_brain() {
+        use anyagents_core::stateless::SandboxBinding;
+        use axum::extract::{Path as AxumPath, State};
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use std::sync::Mutex;
+
+        let released_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let app =
+            Router::new()
+                .route(
+                    "/v1/sandboxes/{id}/release",
+                    post(
+                        |State(log): State<Arc<Mutex<Vec<String>>>>,
+                         AxumPath(id): AxumPath<String>| async move {
+                            log.lock().unwrap().push(id);
+                            Json(json!({ "ok": true }))
+                        },
+                    ),
+                )
+                .with_state(Arc::clone(&released_paths));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("timeout-fenced", "codex"))
+            .unwrap();
+        let agent = store.set_agent_state(&agent.id, "running").unwrap();
+
+        let mut binding = SandboxBinding::new(agent.id.clone(), "http");
+        binding.volume_id = "vol-hung-1".into();
+        binding.lease_id = Some("sbx-hung-1".into());
+        binding.lease_state = "ready".into();
+        binding.spec_json = json!({ "endpoint": format!("http://{addr}") }).to_string();
+        store.sandbox_binding_store().upsert(&binding).unwrap();
+
+        let turn = store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "turn_timeout_fence_1".into(),
+                agent_id: agent.id.clone(),
+                harness_kind: "sandbox".into(),
+                provider_kind: Some("http".into()),
+                remote_run_id: None,
+                callback_token_hash: "h_timeout_fence".into(),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: None,
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+
+        let store_settle = Arc::clone(&store);
+        let settled = tokio::task::spawn_blocking(move || {
+            settle_timed_out_sandbox_turn(&store_settle, &turn, now_ms())
+        })
+        .await
+        .unwrap();
+        assert!(settled);
+
+        assert_eq!(
+            *released_paths.lock().unwrap(),
+            vec!["sbx-hung-1".to_string()],
+            "timed-out sandbox turn must call provider.release() to fence split-brain execution"
+        );
+        let after = store.sandbox_binding(&agent.id).unwrap().unwrap();
+        assert_eq!(
+            (after.lease_state.as_str(), after.lease_id.as_deref()),
+            ("detached", None)
+        );
+        assert_eq!(after.volume_id, "vol-hung-1");
+
+        server.abort();
     }
 }

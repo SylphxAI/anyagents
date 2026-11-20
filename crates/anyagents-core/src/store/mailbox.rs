@@ -305,8 +305,8 @@ impl Store {
     /// List up to `limit` live (`running`) agent IDs that currently have at least one
     /// undelivered message (`messages.seq > COALESCE(mailbox_cursors.delivered_seq, 0)`),
     /// excluding agents that already have an active remote turn or failed within the
-    /// recent failure cooldown (`failure_cooldown_ms`), ordered by freshest undelivered
-    /// message first so active human conversations are never starved by old backlogs.
+    /// recent failure cooldown (`failure_cooldown_ms`), ordered oldest undelivered
+    /// message first (FIFO) so backlog draining is starvation-free.
     pub fn list_running_agents_with_undelivered(
         &self,
         limit: usize,
@@ -350,7 +350,7 @@ impl Store {
                          )
                    )
                  GROUP BY a.id
-                 ORDER BY MAX(m.received_at_ms) DESC
+                 ORDER BY MIN(m.received_at_ms) ASC
                  LIMIT ?2",
                 &db_params![cooldown_cutoff, cap],
                 |r| r.get::<String>(0),
@@ -364,7 +364,7 @@ impl Store {
                  WHERE a.state = 'running'
                    AND m.seq > COALESCE(c.delivered_seq, 0)
                  GROUP BY a.id
-                 ORDER BY MAX(m.received_at_ms) DESC
+                 ORDER BY MIN(m.received_at_ms) ASC
                  LIMIT ?1",
                 &db_params![cap],
                 |r| r.get::<String>(0),
