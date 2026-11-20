@@ -16,6 +16,7 @@ pub const CLOUD_WORKSPACE_DIR: &str = "/home/user";
 
 /// Returns `true` when `token` is a Sylphx gateway key (`sylphx_sk_...`),
 /// which authenticates local/gateway model calls rather than Spiron Cloud.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_sylphx_gateway_key(token: &str) -> bool {
     token.trim().starts_with("sylphx_sk_")
 }

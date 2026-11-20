@@ -1325,6 +1325,7 @@ pub(crate) fn configure_agent_runtime_with_options(
     }))
 }
 
+#[cfg(test)]
 pub(crate) fn set_agent_harness(
     store: &Store,
     data: &Path,
