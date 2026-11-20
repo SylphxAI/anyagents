@@ -418,8 +418,25 @@ enum ZstdPipeError {
     Failed(String),
 }
 
+const ZSTD_CANDIDATE_PATHS: &[&str] = &[
+    "/usr/bin/zstd",
+    "/usr/local/bin/zstd",
+    "/opt/homebrew/bin/zstd",
+    "/bin/zstd",
+];
+
+fn find_zstd_binary() -> Option<PathBuf> {
+    ZSTD_CANDIDATE_PATHS
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+}
+
 fn run_zstd_pipe(args: &[&str], input: &[u8], max_output: u64) -> Result<Vec<u8>, ZstdPipeError> {
-    let mut child = Command::new("zstd")
+    let Some(zstd_bin) = find_zstd_binary() else {
+        return Err(ZstdPipeError::BinaryNotFound);
+    };
+    let mut child = Command::new(&zstd_bin)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -429,7 +446,7 @@ fn run_zstd_pipe(args: &[&str], input: &[u8], max_output: u64) -> Result<Vec<u8>
             if err.kind() == ErrorKind::NotFound {
                 ZstdPipeError::BinaryNotFound
             } else {
-                ZstdPipeError::Failed(format!("failed spawning `zstd`: {err}"))
+                ZstdPipeError::Failed(format!("failed spawning `{}`: {err}", zstd_bin.display()))
             }
         })?;
 
@@ -934,7 +951,7 @@ mod tests {
 
         let (archive, _ct) = pack_user_data_dir(&ud).unwrap();
         #[cfg(target_os = "linux")]
-        if Command::new("zstd").arg("--version").output().is_ok() {
+        if find_zstd_binary().is_some() {
             assert!(
                 archive.starts_with(ZSTD_MAGIC),
                 "expected zstd frame magic when zstd is installed"
