@@ -27,6 +27,7 @@ mod host_memory;
 mod identity;
 mod install;
 mod keeper;
+mod knowledge_cli;
 mod mcp;
 mod mcp_config;
 mod memory_service;
@@ -113,6 +114,8 @@ enum Command {
     Profiles(control_cli::ProfilesCliArgs),
     /// Manage write-only deployment secrets (`list`, `set`, `grant`, `revoke`, `delete`).
     Secrets(control_cli::SecretsCliArgs),
+    /// Manage organization knowledge grants as an owner.
+    Knowledge(knowledge_cli::KnowledgeCliArgs),
     /// List or manage agents.
     #[command(display_order = 2, visible_alias = "agent")]
     Agents {
@@ -316,7 +319,7 @@ enum Command {
     /// The keepers that hold harness processes across server restarts.
     Keepers {
         #[command(subcommand)]
-        action: KeepersCommand,
+        action: keeper::KeepersCommand,
     },
     /// Test double for a streaming vendor. It prints text and no result line,
     /// and records its argv and stdin when `ANYAGENTS_FAKE_LOG` names a file.
@@ -626,28 +629,6 @@ enum GroupsCommand {
     Members { group: String },
     /// List all named groups and their members.
     List,
-}
-
-#[derive(Subcommand)]
-enum KeepersCommand {
-    /// List every keeper: its agent, its harness process and the binary it runs.
-    List,
-    /// End keepers and their harness processes, and detached harness processes
-    /// (v2 Spiron): one agent's, or all of them. A running server starts a
-    /// running agent's harness again; use this before rolling back to a binary
-    /// without keepers or without detached harnesses.
-    Stop {
-        /// Agent name or `agt_...` id.
-        agent: Option<String>,
-        /// Every keeper.
-        #[arg(long, conflicts_with = "agent")]
-        all: bool,
-        /// Also end a keeper that does not answer while its process runs
-        /// (its socket is gone, or it is wedged), by signal, once its
-        /// recorded identity proves the process is that keeper.
-        #[arg(long)]
-        force: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -1102,23 +1083,14 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         },
         Command::Profiles(args) => control_cli::run_profiles_cmd(&data, args),
         Command::Secrets(args) => control_cli::run_secrets_cmd(&data, args),
+        Command::Knowledge(args) => knowledge_cli::run(args),
         Command::Mcp {
             config,
             _profile: _,
         } => mcp::run(&data, config.as_deref()),
         Command::AgentRun { config, command } => sandbox::run(&data, config.as_deref(), &command),
         Command::Boundary => print_boundary(&data),
-        Command::Keepers { action } => match action {
-            KeepersCommand::List => keeper::list(&data),
-            KeepersCommand::Stop { agent, all, force } => {
-                if agent.is_none() && !all {
-                    return Err(anyagents_core::Error::Message(
-                        "name an agent, or pass --all".into(),
-                    ));
-                }
-                keeper::stop(&data, agent.as_deref(), force)
-            }
-        },
+        Command::Keepers { action } => keeper::run_cli(&data, action),
         Command::FakeOpencode => fake_opencode::run(),
         Command::Harness {
             config,

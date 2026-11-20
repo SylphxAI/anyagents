@@ -337,6 +337,47 @@ fn extract_error_message(status: u16, body: &[u8]) -> String {
         })
 }
 
+fn read_json_response<T: DeserializeOwned>(
+    resp: &mut ureq::http::Response<ureq::Body>,
+    path: &str,
+) -> Result<T, Error> {
+    let status = resp.status().as_u16();
+    let mut raw = Vec::new();
+    let _ = resp
+        .body_mut()
+        .as_reader()
+        .take(MAX_RESPONSE_BYTES)
+        .read_to_end(&mut raw);
+    if !(200..300).contains(&status) {
+        return Err(Error::Message(extract_error_message(status, &raw)));
+    }
+    serde_json::from_slice(&raw)
+        .map_err(|err| Error::Message(format!("invalid JSON from {path}: {err}")))
+}
+
+/// Owner-only actions must never resolve through operator tokens or a local socket.
+pub(crate) fn post_device_json(
+    base_url: &str,
+    bearer: &str,
+    path: &str,
+    body: &Value,
+) -> Result<Value, Error> {
+    let url = format!("{base_url}{path}");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .build()
+        .into();
+    let mut resp = agent
+        .post(&url)
+        .header("accept", "application/json")
+        .header("authorization", format!("Bearer {bearer}"))
+        .send_json(body)
+        .map_err(|err| Error::Message(format!("control-plane request failed ({url}): {err}")))?;
+    read_json_response(&mut resp, path)
+}
+
 fn rest_call_json<T: DeserializeOwned>(
     data: &Path,
     explicit_url: Option<&str>,
@@ -409,18 +450,7 @@ fn rest_call_json<T: DeserializeOwned>(
                 Error::Message(format!("control-plane request failed ({url}): {err}"))
             })?;
 
-            let status = resp.status().as_u16();
-            let mut raw = Vec::new();
-            let _ = resp
-                .body_mut()
-                .as_reader()
-                .take(MAX_RESPONSE_BYTES)
-                .read_to_end(&mut raw);
-            if !(200..300).contains(&status) {
-                return Err(Error::Message(extract_error_message(status, &raw)));
-            }
-            serde_json::from_slice(&raw)
-                .map_err(|err| Error::Message(format!("invalid JSON from {path}: {err}")))
+            read_json_response(&mut resp, path)
         }
         ControlEndpoint::LocalSocket => {
             if !server::socket_path(data).exists() {

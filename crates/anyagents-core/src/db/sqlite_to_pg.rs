@@ -11,6 +11,11 @@ use sqlx::PgPool;
 #[path = "sqlite_to_pg_agents.rs"]
 mod agents;
 use agents::copy_agents_topological;
+#[path = "sqlite_to_pg_knowledge.rs"]
+mod knowledge;
+use knowledge::{KNOWLEDGE_INDEX, KNOWLEDGE_TABLES};
+#[path = "sqlite_to_pg_sequences.rs"]
+mod sequences;
 
 use super::{
     block_on_pg, build_pg_pool, configured_direct_database_url, is_postgres_url, migrate_postgres,
@@ -138,7 +143,13 @@ struct TableSpec {
     pg_table: &'static str,
     cols: &'static [ColSpec],
     extra_pg_cols: Option<&'static str>,
-    extra_pg_expr: Option<&'static str>,
+    pg_select: Option<&'static str>,
+    sqlite_projection: Option<SqliteProjection>,
+}
+
+struct SqliteProjection {
+    select: &'static str,
+    push: fn(&rusqlite::Row<'_>, &mut [ColBuf]) -> Result<(), Error>,
 }
 
 impl TableSpec {
@@ -153,7 +164,8 @@ impl TableSpec {
             pg_table,
             cols,
             extra_pg_cols: None,
-            extra_pg_expr: None,
+            pg_select: None,
+            sqlite_projection: None,
         }
     }
 }
@@ -310,10 +322,7 @@ fn build_unnest_insert_sql(spec: &TableSpec, bufs: &[ColBuf]) -> String {
         Some(extra) => format!("{col_list}, {extra}"),
         None => col_list.clone(),
     };
-    let select_expr = match spec.extra_pg_expr {
-        Some(expr) => format!("t.*, {expr}"),
-        None => "t.*".to_owned(),
-    };
+    let select_expr = spec.pg_select.unwrap_or("t.*");
     let unnest_args = bufs
         .iter()
         .enumerate()
@@ -364,15 +373,15 @@ fn copy_table(
     resume: bool,
 ) -> Result<TableMigrationStat, Error> {
     let pg_before = block_on_pg(pg_count(pool, spec.pg_table))?;
-    if !sqlite_table_exists(sqlite, spec.sqlite_table)? {
-        return Ok(TableMigrationStat {
-            pg_table: spec.pg_table.to_owned(),
-            sqlite_rows: 0,
-            pg_rows_before: pg_before,
-            pg_rows_after: pg_before,
-        });
-    }
-    let expected = sqlite_count(sqlite, spec.sqlite_table)?;
+    let expected = match &spec.sqlite_projection {
+        Some(_) if sqlite_table_exists(sqlite, spec.sqlite_table)? => sqlite.query_row(
+            &format!("SELECT COUNT(*) FROM {}", spec.sqlite_from),
+            [],
+            |r| r.get(0),
+        )?,
+        Some(_) => 0,
+        None => sqlite_count(sqlite, spec.sqlite_table)?,
+    };
     if expected == 0 {
         return Ok(TableMigrationStat {
             pg_table: spec.pg_table.to_owned(),
@@ -394,12 +403,15 @@ fn copy_table(
         });
     }
 
-    let select_cols = spec
-        .cols
-        .iter()
-        .map(|c| c.sqlite_expr)
-        .collect::<Vec<_>>()
-        .join(", ");
+    let select_cols = match &spec.sqlite_projection {
+        Some(projection) => projection.select.to_owned(),
+        None => spec
+            .cols
+            .iter()
+            .map(|c| c.sqlite_expr)
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
     let select_sql = format!("SELECT {select_cols} FROM {}", spec.sqlite_from);
     let mut stmt = sqlite.prepare(&select_sql)?;
     let mut rows = stmt.query([])?;
@@ -416,8 +428,12 @@ fn copy_table(
     let mut next_progress = progress_step;
     let mut copied = 0_i64;
     while let Some(row) = rows.next()? {
-        for (idx, col) in spec.cols.iter().enumerate() {
-            bufs[idx].push_cell(row.get_ref(idx)?, col.kind)?;
+        if let Some(projection) = &spec.sqlite_projection {
+            (projection.push)(row, &mut bufs)?;
+        } else {
+            for (idx, col) in spec.cols.iter().enumerate() {
+                bufs[idx].push_cell(row.get_ref(idx)?, col.kind)?;
+            }
         }
         copied += 1;
         if bufs[0].len() >= batch_size {
@@ -455,33 +471,6 @@ fn copy_table(
         pg_rows_before: pg_before,
         pg_rows_after: pg_after,
     })
-}
-
-async fn reset_identity_sequences(pool: &PgPool) -> Result<(), Error> {
-    const SEQUENCES: &[(&str, &str)] = &[
-        ("public.admin_audit", "id"),
-        ("public.credential_binding_audit", "id"),
-        ("public.messages", "rowid"),
-        ("public.operator_messages", "seq"),
-        ("public.outbound_messages", "rowid"),
-        ("public.skill_reads", "id"),
-        ("memory_index.rag_chunks", "rowid"),
-        ("host_index.host_documents", "rowid"),
-        ("host_index.host_windows", "id"),
-    ];
-    for &(table, col) in SEQUENCES {
-        let sql = format!(
-            "SELECT setval(pg_get_serial_sequence('{table}', '{col}'), \
-             COALESCE((SELECT MAX(\"{col}\") FROM {table}), 1), \
-             EXISTS (SELECT 1 FROM {table}))"
-        );
-        sqlx::query(&sql).execute(pool).await.map_err(|e| {
-            Error::Message(format!(
-                "failed to reset identity sequence on {table}.{col}: {e}"
-            ))
-        })?;
-    }
-    Ok(())
 }
 
 async fn run_reconcile_stale_runtime(pool: &PgPool) -> Result<(u64, u64, u64), Error> {
@@ -1067,6 +1056,7 @@ const MEMORY_INDEX_TABLES: &[TableSpec] = &[
     TableSpec {
         sqlite_table: "rag_chunks",
         sqlite_from: "rag_chunks r LEFT JOIN rag_chunks_fts f ON f.rowid = r.rowid",
+        sqlite_projection: None,
         pg_table: "memory_index.rag_chunks",
         cols: &[
             ColSpec {
@@ -1137,8 +1127,8 @@ const MEMORY_INDEX_TABLES: &[TableSpec] = &[
             ColSpec::expr_txt("COALESCE(f.search_tokens, '')", "search_tokens"),
         ],
         extra_pg_cols: Some("\"search_tsv\""),
-        extra_pg_expr: Some(
-            "to_tsvector('simple', coalesce(t.\"search_tokens\", '') || ' ' || coalesce(t.\"text\", ''))",
+        pg_select: Some(
+            "t.*, to_tsvector('simple', coalesce(t.\"search_tokens\", '') || ' ' || coalesce(t.\"text\", ''))",
         ),
     },
 ];
@@ -1215,6 +1205,7 @@ const HOST_INDEX_TABLES: &[TableSpec] = &[
         // `f.tokens` via `LEFT JOIN host_fts` always yields NULL while triggering a
         // random per-row virtual-table probe across millions of rows.
         sqlite_from: "host_windows w",
+        sqlite_projection: None,
         pg_table: "host_index.host_windows",
         cols: &[
             ColSpec {
@@ -1245,7 +1236,7 @@ const HOST_INDEX_TABLES: &[TableSpec] = &[
             ColSpec::expr_txt("''", "tokens"),
         ],
         extra_pg_cols: Some("\"tokens_tsv\""),
-        extra_pg_expr: Some("to_tsvector('simple', coalesce(t.\"tokens\", ''))"),
+        pg_select: Some("t.*, to_tsvector('simple', coalesce(t.\"tokens\", ''))"),
     },
 ];
 
@@ -2222,7 +2213,7 @@ pub fn migrate_sqlite_dir_to_postgres(
     let (agents_stat, valid_agents) =
         copy_agents_topological(&state_sqlite, &pool, batch_size, opts.resume)?;
     stats.push(agents_stat);
-    for spec in STATE_WAVE_AFTER_AGENTS {
+    for spec in STATE_WAVE_AFTER_AGENTS.iter().chain(KNOWLEDGE_TABLES) {
         stats.push(copy_table(
             &state_sqlite,
             &pool,
@@ -2251,6 +2242,13 @@ pub fn migrate_sqlite_dir_to_postgres(
     }
 
     if !opts.skip_index {
+        stats.push(copy_table(
+            &state_sqlite,
+            &pool,
+            &KNOWLEDGE_INDEX,
+            batch_size,
+            opts.resume,
+        )?);
         let mem_path = opts.source_dir.join("memory-index.db");
         if mem_path.is_file() {
             let mem_sqlite = open_sqlite_readonly(&mem_path)?;
@@ -2289,7 +2287,7 @@ pub fn migrate_sqlite_dir_to_postgres(
     )?;
     stats.extend(blob_stats);
 
-    block_on_pg(reset_identity_sequences(&pool))?;
+    block_on_pg(sequences::reset_identity_sequences(&pool))?;
     let (reconciled_archived_runtime, reconciled_legacy_faults, reconciled_stale_turns) =
         if opts.reconcile_stale_runtime {
             block_on_pg(run_reconcile_stale_runtime(&pool))?

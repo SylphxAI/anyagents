@@ -344,11 +344,12 @@ async fn dispatch_cloud_turn(
     };
 
     let driver = resolve_cloud_driver_from_metadata(harness_kind, Some(&meta_val), None)?;
+    let prompt = super::knowledge::cloud_wake_prompt(&store, &input).await;
     let submit_req = CloudTurnSubmitRequest {
         turn_id: turn_id.clone(),
         agent_id: input.agent.id.as_str().to_string(),
         remote_agent_id: saved_remote_agent,
-        prompt: input.prompt.clone(),
+        prompt,
         model: input.agent.model.clone(),
         instructions: input.agent.instructions.clone(),
         mcp_servers,

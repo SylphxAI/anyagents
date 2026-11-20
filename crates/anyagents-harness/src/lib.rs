@@ -68,7 +68,8 @@ pub fn ref_message(reference: &str) -> Option<&str> {
     (!id.is_empty() && !id.contains(':')).then_some(id)
 }
 
-/// The text one stored message becomes for every harness: the ID line, then an
+/// The rendered delivery for every harness: the ID line, optional wake context,
+/// then an
 /// optional `<topology>` event envelope (initial snapshot or incremental delta),
 /// an optional `<workspace>` git/file-change snapshot or delta, followed by the
 /// structured `<message>` XML envelope containing optional `<quoted_message>`
@@ -77,6 +78,10 @@ pub fn compose_message(id: &str, context: &Context, body: &str) -> String {
     let (main_body, quoted_xml) = extract_quoted_xml(body, context.reply_to_author.as_deref());
     let open_tag = context.open_tag(id);
     let mut out = format!("{MESSAGE_MARKER_PREFIX}{id}\n");
+    if let Some(instructions) = context.org_instructions.as_deref() {
+        out.push_str(instructions);
+        out.push('\n');
+    }
     if let Some(topo) = context.topology.as_deref() {
         out.push_str(topo);
         out.push('\n');
@@ -208,6 +213,9 @@ pub struct Context {
     /// when peers, siblings, children, or groups change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<String>,
+    /// Recipient-only wake context; not part of the stored or transported message.
+    #[serde(skip)]
+    pub org_instructions: Option<String>,
     /// The stored message a reply to this line names, when the line is not
     /// one itself: a `[Recovery]` note names the last message of the turn it
     /// covers, which the mailbox holds and a reply can bind to.
@@ -1241,6 +1249,26 @@ mod tests {
         assert_eq!(message_id_in_text(&text), Some("msg_1"));
         assert_eq!(message_id_in_text("hello"), None);
         assert_eq!(message_id_in_text("anyagents-message:"), None);
+    }
+
+    #[test]
+    fn wake_context_renders_after_the_marker_without_serializing() {
+        let context = Context {
+            org_instructions: Some("<org_instructions>example</org_instructions>".into()),
+            ..Default::default()
+        };
+        let rendered = compose_message("msg_1", &context, "body");
+        assert!(rendered.starts_with(
+            "anyagents-message:msg_1\n<org_instructions>example</org_instructions>\n"
+        ));
+        let serialized = serde_json::to_string(&context).unwrap();
+        assert!(!serialized.contains("example"));
+        assert!(
+            serde_json::from_str::<Context>(&serialized)
+                .unwrap()
+                .org_instructions
+                .is_none()
+        );
     }
 
     #[test]

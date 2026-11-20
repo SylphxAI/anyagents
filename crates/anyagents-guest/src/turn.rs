@@ -589,6 +589,7 @@ fn execute_turn_foreground(
             args.git_program.as_deref(),
         );
     }
+    crate::knowledge_wake::enrich(&mut msg, callback_url, callback_token, &args.turn_id);
     let delivery_id = msg.id.clone();
 
     let mut delivered_done = false;

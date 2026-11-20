@@ -43,8 +43,10 @@ pub(super) struct MemoryArgs {
     pub(super) offset: Option<usize>,
     /// Case-insensitive topic slug prefix for list.
     pub(super) prefix: Option<String>,
-    /// Use "shared" to list/read public peers only; omit agent when using this scope.
+    /// Use "shared" for public peer memory; "org", "domain:<slug>", "agent", or "all" for versioned knowledge.
     pub(super) scope: Option<String>,
+    #[serde(flatten)]
+    pub(super) knowledge: super::knowledge_tool::KnowledgeArgs,
 }
 
 impl AgentMcp {
@@ -52,6 +54,9 @@ impl AgentMcp {
         &self,
         args: MemoryArgs,
     ) -> Result<serde_json::Value, String> {
+        if super::knowledge_tool::selected(&args) {
+            return self.execute_knowledge(args).await;
+        }
         let raw_topic = args
             .topic
             .as_deref()

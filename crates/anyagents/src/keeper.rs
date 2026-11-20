@@ -27,6 +27,42 @@ use anyagents_supervisor::{Attached, Custody};
 use crate::ui;
 use crate::vendor::{AdapterLaunch, HarnessHost, VendorHarness};
 
+#[derive(clap::Subcommand)]
+pub(crate) enum KeepersCommand {
+    /// List every keeper: its agent, its harness process and the binary it runs.
+    List,
+    /// End keepers and their harness processes, and detached harness processes
+    /// (v2 Spiron): one agent's, or all of them. A running server starts a
+    /// running agent's harness again; use this before rolling back to a binary
+    /// without keepers or without detached harnesses.
+    Stop {
+        /// Agent name or `agt_...` id.
+        agent: Option<String>,
+        /// Every keeper.
+        #[arg(long, conflicts_with = "agent")]
+        all: bool,
+        /// Also end a keeper that does not answer while its process runs
+        /// (its socket is gone, or it is wedged), by signal, once its
+        /// recorded identity proves the process is that keeper.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+pub(crate) fn run_cli(data: &Path, action: KeepersCommand) -> Result<(), anyagents_core::Error> {
+    match action {
+        KeepersCommand::List => list(data),
+        KeepersCommand::Stop { agent, all, force } => {
+            if agent.is_none() && !all {
+                return Err(anyagents_core::Error::Message(
+                    "name an agent, or pass --all".into(),
+                ));
+            }
+            stop(data, agent.as_deref(), force)
+        }
+    }
+}
+
 /// Whether `serve` hosts harnesses in keepers on this platform: only where a
 /// process's identity can be proven (Linux).
 pub const HOSTED_IN_KEEPERS: bool = cfg!(target_os = "linux");

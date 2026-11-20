@@ -6,6 +6,7 @@
 mod priority;
 #[cfg(test)]
 mod priority_tests;
+mod wake_knowledge;
 
 use anyagents_core::{AgentId, Message, Store};
 use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage};
@@ -610,8 +611,10 @@ impl<H: Harness> DeliveryLoop<H> {
         } else {
             None
         };
+        let mut outbound = outbound(message);
+        wake_knowledge::enrich(&self.store, &self.agent_id, &self.harness, &mut outbound);
         self.harness
-            .deliver_with_turn_context(&outbound(message), context.as_deref())
+            .deliver_with_turn_context(&outbound, context.as_deref())
     }
 
     pub fn restore_admitted_seq(&mut self, delivered_seq: Option<i64>) {
@@ -681,7 +684,7 @@ impl<H: Harness> DeliveryLoop<H> {
         &mut self,
         open: &anyagents_core::OpenTurn,
     ) -> Result<DeliverOutcome, Error> {
-        let note = self
+        let mut note = self
             .recovery
             .get_or_insert_with(|| recovery_outbound(open))
             .clone();
@@ -697,6 +700,7 @@ impl<H: Harness> DeliveryLoop<H> {
         } else {
             None
         };
+        wake_knowledge::enrich(&self.store, &self.agent_id, &self.harness, &mut note);
         let outcome = match self
             .harness
             .deliver_with_turn_context(&note, context.as_deref())

@@ -91,6 +91,7 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         42,
         include_str!("../migrations/043_channel_identity_unique.sql"),
     ),
+    (43, include_str!("../migrations/044_knowledge.sql")),
 ];
 
 /// The version that moves the mailbox search index out of the state

@@ -2,6 +2,8 @@
 
 use super::*;
 
+#[path = "knowledge_tool.rs"]
+mod knowledge_tool;
 #[path = "memory_tool.rs"]
 mod memory_tool;
 use memory_tool::MemoryArgs;
@@ -1385,7 +1387,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Manage learned memory: list compact topic pages (limit, offset, query, prefix), read a topic, write/upsert, delete, or search. List/read accept a public peer name or ID in agent, or scope=shared to browse all public peers. Writes and deletes are self-only. With no action, delete=true deletes, content writes, query searches, topic reads, and no arguments lists."
+        description = "Manage learned memory: list compact topic pages (limit, offset, query, prefix), read a topic, write/upsert, delete, or search. List/read accept a public peer name or ID in agent, or scope=shared to browse all public peers. Writes and deletes are self-only. For versioned knowledge use scope=org, domain:<slug>, agent, or all, or specify a namespace. Versioned writes require reason and use expected_version. With no action, delete=true deletes, content writes, query searches, topic reads, and no arguments lists."
     )]
     pub(super) async fn memory(
         &self,

@@ -8,7 +8,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -902,15 +903,29 @@ impl RemoteTurnStore for PgRemoteTurnStore {
 #[derive(Clone, Debug)]
 pub struct FsRemoteTurnStore {
     root: PathBuf,
-    guard: Arc<Mutex<()>>,
 }
 
 impl FsRemoteTurnStore {
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
         Self {
             root: data_dir.as_ref().join(LOCAL_REMOTE_TURNS_DIR),
-            guard: Arc::new(Mutex::new(())),
         }
+    }
+
+    // Atomic rename protects readers, but a read/modify/replace must be
+    // serialized across independently opened handles to this ledger.
+    fn lock_mutations(&self) -> Result<MutationLock, Error> {
+        fs::create_dir_all(&self.root)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(self.root.join(".mutation.lock"))?;
+        file.lock()?;
+        Ok(MutationLock(file))
     }
 
     fn turn_path(&self, turn_id: &str) -> Result<PathBuf, Error> {
@@ -958,9 +973,18 @@ impl FsRemoteTurnStore {
     }
 }
 
+// Unlock even when a forked child briefly shares the open file description.
+struct MutationLock(fs::File);
+
+impl Drop for MutationLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 impl RemoteTurnStore for FsRemoteTurnStore {
     fn create_turn(&self, input: &NewRemoteTurn) -> Result<PendingRemoteTurn, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = self.lock_mutations()?;
         let turn_id = validate_turn_id(&input.turn_id)?.to_string();
         let status = validate_status(&input.status)?.to_string();
         if self.read_unlocked(&turn_id)?.is_some() {
@@ -1000,7 +1024,6 @@ impl RemoteTurnStore for FsRemoteTurnStore {
     }
 
     fn get_turn(&self, turn_id: &str) -> Result<Option<PendingRemoteTurn>, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
         if validate_turn_id(turn_id).is_err() {
             return Ok(None);
         }
@@ -1012,7 +1035,6 @@ impl RemoteTurnStore for FsRemoteTurnStore {
         harness_kind: Option<&str>,
         remote_run_id: &str,
     ) -> Result<Option<PendingRemoteTurn>, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
         let trimmed = remote_run_id.trim();
         if trimmed.is_empty() {
             return Ok(None);
@@ -1053,7 +1075,7 @@ impl RemoteTurnStore for FsRemoteTurnStore {
         next_poll_at_ms: Option<Option<i64>>,
         metadata_json: Option<&Value>,
     ) -> Result<Option<PendingRemoteTurn>, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = self.lock_mutations()?;
         let Some(mut turn) = self.read_unlocked(turn_id)? else {
             return Ok(None);
         };
@@ -1081,7 +1103,7 @@ impl RemoteTurnStore for FsRemoteTurnStore {
         turn_id: &str,
         update: &RemoteTurnEventUpdate,
     ) -> Result<Option<PendingRemoteTurn>, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = self.lock_mutations()?;
         let Some(mut turn) = self.read_unlocked(turn_id)? else {
             return Ok(None);
         };
@@ -1125,7 +1147,7 @@ impl RemoteTurnStore for FsRemoteTurnStore {
         turn_id: &str,
         settlement: &SettleRemoteTurn,
     ) -> Result<Option<SettleOutcome>, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = self.lock_mutations()?;
         let terminal = validate_terminal_status(&settlement.status)?;
         let Some(mut turn) = self.read_unlocked(turn_id)? else {
             return Ok(None);
@@ -1159,7 +1181,6 @@ impl RemoteTurnStore for FsRemoteTurnStore {
     }
 
     fn list_due_polls(&self, now: i64, limit: usize) -> Result<Vec<PendingRemoteTurn>, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
         let mut due: Vec<PendingRemoteTurn> = self
             .list_all_unlocked()?
             .into_iter()
@@ -1171,7 +1192,6 @@ impl RemoteTurnStore for FsRemoteTurnStore {
     }
 
     fn list_active_for_agent(&self, agent_id: &AgentId) -> Result<Vec<PendingRemoteTurn>, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
         let mut active: Vec<PendingRemoteTurn> = self
             .list_all_unlocked()?
             .into_iter()
@@ -1187,7 +1207,6 @@ impl RemoteTurnStore for FsRemoteTurnStore {
         stale_before_ms: i64,
         limit: usize,
     ) -> Result<Vec<PendingRemoteTurn>, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
         let kind = harness_kind.map(str::trim).filter(|s| !s.is_empty());
         let mut stale: Vec<PendingRemoteTurn> = self
             .list_all_unlocked()?
@@ -1210,7 +1229,7 @@ impl RemoteTurnStore for FsRemoteTurnStore {
         cursor: Option<&str>,
         now: i64,
     ) -> Result<bool, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = self.lock_mutations()?;
         let Some(mut turn) = self.read_unlocked(turn_id)? else {
             return Ok(false);
         };
@@ -1228,7 +1247,7 @@ impl RemoteTurnStore for FsRemoteTurnStore {
     }
 
     fn delete_turn(&self, turn_id: &str) -> Result<bool, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = self.lock_mutations()?;
         let path = self.turn_path(turn_id)?;
         match fs::remove_file(path) {
             Ok(()) => Ok(true),
@@ -1241,7 +1260,6 @@ impl RemoteTurnStore for FsRemoteTurnStore {
         &self,
         fresh_since_ms: i64,
     ) -> Result<HashMap<String, i64>, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
         let all = self.list_all_unlocked()?;
         Ok(super::remote_turns_ext::collect_active_fresh_by_agent(
             all.iter(),
@@ -1253,7 +1271,6 @@ impl RemoteTurnStore for FsRemoteTurnStore {
         &self,
         agent_id: &AgentId,
     ) -> Result<Option<super::remote_turns_ext::LatestRemoteTurnError>, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
         let all = self.list_all_unlocked()?;
         Ok(super::remote_turns_ext::latest_failed_for_agent_from_iter(
             all.iter(),
@@ -1264,7 +1281,6 @@ impl RemoteTurnStore for FsRemoteTurnStore {
     fn list_latest_failed_by_agent(
         &self,
     ) -> Result<HashMap<String, super::remote_turns_ext::LatestRemoteTurnError>, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
         let all = self.list_all_unlocked()?;
         Ok(super::remote_turns_ext::collect_latest_failed_by_agent(
             all.iter(),
@@ -1277,7 +1293,7 @@ impl RemoteTurnStore for FsRemoteTurnStore {
         max_read_seq: i64,
         now: i64,
     ) -> Result<usize, Error> {
-        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = self.lock_mutations()?;
         let mut updated = 0usize;
         for mut turn in self.list_all_unlocked()? {
             if &turn.agent_id == agent_id
@@ -1470,9 +1486,9 @@ mod tests {
             next_poll_at_ms: None,
         };
 
-        for store in [
-            Arc::clone(&fs_store) as Arc<dyn RemoteTurnStore>,
-            Arc::clone(&mem_store) as Arc<dyn RemoteTurnStore>,
+        for (use_fs, store) in [
+            (true, fs_store as Arc<dyn RemoteTurnStore>),
+            (false, mem_store as Arc<dyn RemoteTurnStore>),
         ] {
             let aid = AgentId::generate();
             let other = AgentId::generate();
@@ -1481,7 +1497,12 @@ mod tests {
             let barrier = Arc::new(std::sync::Barrier::new(8));
             let mut handles = Vec::new();
             for i in 0..8usize {
-                let s = Arc::clone(&store);
+                // Production callbacks and dispatch each open the local ledger independently.
+                let s: Arc<dyn RemoteTurnStore> = if use_fs {
+                    Arc::new(FsRemoteTurnStore::new(dir.path()))
+                } else {
+                    Arc::clone(&store)
+                };
                 let b = Arc::clone(&barrier);
                 let a = aid.clone();
                 let st = if i.is_multiple_of(2) {
