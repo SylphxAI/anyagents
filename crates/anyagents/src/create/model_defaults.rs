@@ -186,6 +186,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
         let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
 
         let (harness, model, _profile) = resolve_subagent_defaults(data, None, "agy", None, None);
         assert_eq!(harness, "agy");

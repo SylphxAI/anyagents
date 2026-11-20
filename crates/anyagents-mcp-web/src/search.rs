@@ -753,18 +753,39 @@ mod tests {
     }
 
     fn spawn_mock_json_server(status_line: &'static str, body: &'static str) -> String {
-        use std::io::{Read as _, Write as _};
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream);
+                let mut content_len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0
+                        || line == "\r\n"
+                        || line == "\n"
+                    {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_len > 0 {
+                    let mut req_body = vec![0u8; content_len];
+                    let _ = reader.read_exact(&mut req_body);
+                }
+                let mut stream = reader.into_inner();
                 let resp = format!(
                     "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         });
         format!("http://{addr}/search")

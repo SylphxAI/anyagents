@@ -380,7 +380,13 @@ mod tests {
         store.set_agent_running(&parent.id, "/work").unwrap();
         store.set_agent_running(&child.id, "/work").unwrap();
 
-        // Child has an active remote turn (no local HealthBoard entry at all).
+        // Child receives its task and runs an active remote turn (no local HealthBoard entry).
+        let anyagents_core::ReceiveOutcome::New(task_msg) = store
+            .receive(&child.id, Incoming::new("build slice"))
+            .unwrap()
+        else {
+            panic!("expected new task message");
+        };
         let turn = store
             .remote_turn_store()
             .create_turn(&NewRemoteTurn {
@@ -392,7 +398,7 @@ mod tests {
                 callback_token_hash: hash_callback_token("tok-1"),
                 cursor: None,
                 status: "running".into(),
-                metadata_json: Some(json!({ "message_seq": 1 })),
+                metadata_json: Some(json!({ "message_seq": task_msg.seq })),
                 next_poll_at_ms: None,
             })
             .unwrap();
@@ -426,8 +432,8 @@ mod tests {
         assert!(woken.is_empty());
         assert!(store.inbox(&parent.id, None).unwrap().is_empty());
 
-        // Settle remote turn and record turn completion -> next tick fires cleanly!
-        store
+        // Settle remote turn via the real serverless cursor settler -> next tick fires cleanly!
+        let settled = store
             .remote_turn_store()
             .settle_turn(
                 "turn_watch_1",
@@ -440,8 +446,9 @@ mod tests {
                     settled_at_ms: tick_now + 5_000,
                 },
             )
+            .unwrap()
             .unwrap();
-        store.note_turn_completed_for(&child.id, 1).unwrap();
+        settle_turn_mailbox_cursor(&store, &settled.turn);
 
         let (fired2, woken2) =
             tick_serverless_watches_and_schedules(&store, &empty_health, tick_now + 6_000);

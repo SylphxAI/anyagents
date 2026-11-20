@@ -352,7 +352,8 @@ impl Store {
             super::dedup::retain_dedup_alias(tx, agent_id, &id, group_dedup_key.as_deref())?;
             return Ok(ReceiveTx::Early(Some(ReceiveOutcome::Duplicate(existing))));
         }
-        if let Some(dedup_key) = group_dedup_key.as_deref()
+        if redelivery_identity.is_none()
+            && let Some(dedup_key) = group_dedup_key.as_deref()
             && let Some(existing) = super::dedup::message_by_source_alias(tx, agent_id, dedup_key)?
         {
             let id = retain_message_aliases(tx, &existing, ingress_origin, source_key.as_deref())?;
