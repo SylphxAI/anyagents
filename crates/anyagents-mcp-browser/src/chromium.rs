@@ -187,7 +187,7 @@ fn find_playwright_chromium(root: &Path) -> Option<PathBuf> {
     None
 }
 
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };

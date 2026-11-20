@@ -16,7 +16,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::BrowserServerConfig;
-use crate::session::{BrowserError, BrowserSession, select_explicit_target};
+use crate::secrets::{TypeInput, classify_type_input, resolve_secret, sanitize_secret_fill_error};
+use crate::session::{BrowserError, BrowserSession, LiveWebGuard, select_explicit_target};
+pub use crate::takeover::{BrowserTakeoverArgs, BrowserTakeoverStatusArgs};
 use crate::url_guard::{MAX_TEXT_BYTES, navigable_url, readable_page_url, truncate_utf8};
 
 /// Standalone MCP server for headless Chromium CDP browser automation.
@@ -205,11 +207,43 @@ impl BrowserMcpServer {
                 "`browser_type` requires a non-empty `selector`",
             ));
         }
+        let input = classify_type_input(args.text.as_deref(), args.secret_ref.as_deref())?;
+        let secret = match &input {
+            TypeInput::SecretRef(r) => {
+                let r_c = r.clone();
+                let s = tokio::task::spawn_blocking(move || resolve_secret(&r_c))
+                    .await
+                    .map_err(|_| BrowserError::new("SECRET_RESOLUTION_ERROR", "secret task"))??;
+                Some((r.clone(), s))
+            }
+            TypeInput::Plain(_) => None,
+        };
+        let is_secret = secret.is_some();
+        let map_err = |e| {
+            if is_secret {
+                sanitize_secret_fill_error(e)
+            } else {
+                e
+            }
+        };
+        let origin = args
+            .expect_origin
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
         let mut live = self.session.acquire().await?;
         let web = live.web();
         select_explicit_target(web, args.target_id.as_deref()).await?;
         ensure_readable_page(web).await?;
-        web.fill(&selector, &args.text).await?;
+        match (&input, secret) {
+            (_, Some((sr, sec))) => web
+                .fill_secret(&selector, &sr, sec, origin)
+                .await
+                .map_err(map_err)?,
+            (TypeInput::Plain(t), None) => web.fill(&selector, t).await?,
+            _ => unreachable!(),
+        }
         let mut submitted = false;
         if let Some(key) = args
             .press_key
@@ -217,24 +251,27 @@ impl BrowserMcpServer {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            web.press(key).await?;
+            web.press(key).await.map_err(map_err)?;
             submitted = key.eq_ignore_ascii_case("enter") || key.eq_ignore_ascii_case("return");
         } else if args.submit == Some(true) {
-            web.press("Enter").await?;
+            web.press("Enter").await.map_err(map_err)?;
             submitted = true;
         }
         optional_pause(args.wait_ms).await;
         let url = web.current_url().await.unwrap_or_default();
         let (target_id, title) = active_tab_meta(web).await;
-        Ok(json!({
-            "ok": true,
-            "selector": selector,
-            "chars": args.text.chars().count(),
-            "submitted": submitted,
-            "url": url,
-            "title": title,
-            "target_id": target_id,
-        }))
+        let mut payload = json!({
+            "ok": true, "selector": selector, "submitted": submitted,
+            "url": url, "title": title, "target_id": target_id,
+        });
+        match &input {
+            TypeInput::SecretRef(src) => {
+                payload["secret_source"] = json!(src);
+                payload["redacted"] = json!(true);
+            }
+            TypeInput::Plain(t) => payload["chars"] = json!(t.chars().count()),
+        }
+        Ok(payload)
     }
 
     async fn run_screenshot(
@@ -456,14 +493,20 @@ pub struct BrowserClickArgs {
 }
 
 /// Parameters for `browser_type`.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct BrowserTypeArgs {
     /// Input field to fill: a snapshot ref (`"@e1"` or `"@<snapshot_id>:e1"`) or a CSS selector.
     #[serde(alias = "ref", alias = "target")]
     pub selector: String,
-    /// Text to type into the field (replaces existing value).
-    #[serde(alias = "value")]
-    pub text: String,
+    /// Plain text to type into the field (replaces existing value). Values starting with `op://`, `op-otp://`, or `env:` are treated as `secret_ref`.
+    #[serde(default, alias = "value")]
+    pub text: Option<String>,
+    /// Explicit secret reference (`op://<vault>/<item>/<field>`, `op-otp://<vault>/<item>`, or `env:<VAR>`). Resolved in memory and never logged or returned.
+    #[serde(default)]
+    pub secret_ref: Option<String>,
+    /// Optional origin required to match the field's owning frame during secret fills.
+    #[serde(default)]
+    pub expect_origin: Option<String>,
     /// Press `Enter` inside the field after typing.
     #[serde(default)]
     pub submit: Option<bool>,
@@ -517,6 +560,10 @@ pub struct BrowserTabsArgs {
     pub target_id: Option<String>,
 }
 
+/// Parameters for `browser_profiles`.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct BrowserProfilesArgs {}
+
 /// Parameters for `browser_close`.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct BrowserCloseArgs {}
@@ -541,7 +588,7 @@ async fn optional_pause(wait_ms: Option<u64>) {
     }
 }
 
-async fn active_tab_meta(web: &mut agent_workstation::browser::Web) -> (Option<String>, String) {
+async fn active_tab_meta(web: &mut LiveWebGuard<'_>) -> (Option<String>, String) {
     web.tabs()
         .await
         .ok()
@@ -550,9 +597,7 @@ async fn active_tab_meta(web: &mut agent_workstation::browser::Web) -> (Option<S
         .unwrap_or((None, String::new()))
 }
 
-async fn ensure_readable_page(
-    web: &mut agent_workstation::browser::Web,
-) -> Result<String, BrowserError> {
+async fn ensure_readable_page(web: &mut LiveWebGuard<'_>) -> Result<String, BrowserError> {
     let url = web.current_url().await?;
     if !readable_page_url(&url) {
         return Err(BrowserError::invalid_input(
@@ -607,7 +652,7 @@ impl BrowserMcpServer {
     }
 
     #[tool(
-        description = "Focus, clear, and type `text` into an input field identified by a snapshot ref (`@e1` or `@<snapshot_id>:e1`) or CSS selector. Set `submit: true` to press Enter afterward, or pass `press_key` for any key chord.",
+        description = "Focus, clear, and fill an input field identified by a snapshot ref (`@e1` or `@<snapshot_id>:e1`) or CSS selector with plain `text` or an in-memory `secret_ref` (`op://<vault>/<item>/<field>` or `env:<VAR>`). Resolved secrets are never logged or returned. Set `submit: true` to press Enter afterward, or pass `press_key` for any key chord.",
         annotations(read_only_hint = false, open_world_hint = true)
     )]
     pub async fn browser_type(
@@ -663,7 +708,65 @@ impl BrowserMcpServer {
     }
 
     #[tool(
-        description = "Close the running headless Chromium instance cleanly. If `--profile-dir` / `ANYAGENTS_BROWSER_PROFILE_DIR` is configured, cookies and site storage remain on disk for future sessions.",
+        description = "List available browser profiles (coordinator capability-scoped when `ANYAGENTS_API_URL` is set, else local `--profile-dir`).",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub async fn browser_profiles(
+        &self,
+        Parameters(_args): Parameters<BrowserProfilesArgs>,
+    ) -> CallToolResult {
+        let mut g = self.session.inner.lock().await;
+        let (active, running) =
+            g.as_mut()
+                .map_or((self.session.config().profile.clone(), false), |i| {
+                    let alive = i.is_alive();
+                    (i.active_profile.clone(), alive)
+                });
+        drop(g);
+        let cfg = self.session.config().clone();
+        let res = tokio::task::spawn_blocking(move || {
+            crate::profile_sync::list_profiles(&cfg, active.as_deref(), running)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(BrowserError::new(
+                "PROFILE_SYNC_ERROR",
+                format!("task: {e}"),
+            ))
+        });
+        res.map_or_else(error_result, CallToolResult::structured)
+    }
+
+    #[tool(
+        description = "Start interactive human takeover (`sway` + `wayvnc` + tokenized noVNC URL on Linux, or visible `--headful` window).",
+        annotations(read_only_hint = false, open_world_hint = true)
+    )]
+    pub async fn browser_takeover(
+        &self,
+        Parameters(args): Parameters<BrowserTakeoverArgs>,
+    ) -> CallToolResult {
+        self.session
+            .start_takeover(args)
+            .await
+            .map_or_else(error_result, CallToolResult::structured)
+    }
+
+    #[tool(
+        description = "Check takeover status (`status`), reclaim control (`release`), or stop takeover cleanly (`stop`).",
+        annotations(read_only_hint = false, open_world_hint = false)
+    )]
+    pub async fn browser_takeover_status(
+        &self,
+        Parameters(args): Parameters<BrowserTakeoverStatusArgs>,
+    ) -> CallToolResult {
+        self.session
+            .takeover_status(args)
+            .await
+            .map_or_else(error_result, CallToolResult::structured)
+    }
+
+    #[tool(
+        description = "Close the running Chromium / takeover session cleanly. If `--profile-dir` or remote profile sync is configured, cookies and site storage remain preserved and synced.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -696,10 +799,11 @@ impl ServerHandler for BrowserMcpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Standalone Chromium CDP browser automation server. Call `browser_navigate` to open a page, \
-                 `browser_snapshot` for interactive `@eN` refs, `browser_click`/`browser_type`/`browser_eval` to \
-                 interact, `browser_screenshot` for visual inspection, `browser_tabs` to manage tabs, and \
-                 `browser_close` when finished.",
+                "Standalone Chromium CDP browser automation server. Call `browser_profiles` to list profiles, \
+                 `browser_navigate` to open a page, `browser_snapshot` for `@eN` refs, `browser_click`/`browser_type` \
+                 (with optional `secret_ref`)/`browser_eval` to interact, `browser_screenshot` for visual inspection, \
+                 `browser_tabs` for tabs, `browser_takeover`/`browser_takeover_status` for interactive human handoff, \
+                 and `browser_close` when finished.",
             )
     }
 
@@ -740,7 +844,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposes_all_eight_canonical_browser_tools_with_object_schemas() {
+    fn exposes_all_eleven_canonical_browser_tools_with_object_schemas() {
         let tools = BrowserMcpServer::list_tool_definitions();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         for expected in [
@@ -751,6 +855,9 @@ mod tests {
             "browser_screenshot",
             "browser_eval",
             "browser_tabs",
+            "browser_profiles",
+            "browser_takeover",
+            "browser_takeover_status",
             "browser_close",
         ] {
             assert!(
@@ -758,7 +865,7 @@ mod tests {
                 "missing expected MCP tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 11);
         for tool in &tools {
             assert_eq!(
                 tool.input_schema.get("type").and_then(Value::as_str),
@@ -821,5 +928,64 @@ mod tests {
             .await;
         assert_eq!(tab.is_error, Some(true));
         assert_eq!(tab.structured_content.unwrap()["code"], "INVALID_INPUT");
+
+        for (sr, code) in [
+            ("op://a/b", "INVALID_INPUT"),
+            ("env:ANYAGENTS_AGENT_TOKEN", "REFUSED"),
+        ] {
+            let a = BrowserTypeArgs {
+                selector: "#x".into(),
+                secret_ref: Some(sr.into()),
+                ..Default::default()
+            };
+            let r = server.browser_type(Parameters(a)).await;
+            assert!(r.is_error == Some(true) && r.structured_content.unwrap()["code"] == code);
+        }
+        let a = BrowserTakeoverArgs {
+            url: Some("javascript:alert(1)".into()),
+            ..Default::default()
+        };
+        let bt = server.browser_takeover(Parameters(a)).await;
+        assert!(
+            bt.is_error == Some(true) && bt.structured_content.unwrap()["code"] == "INVALID_INPUT"
+        );
+
+        // Takeover status (inactive/stop/invalid) & profiles (local vs fail-closed remote).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("alpha/user-data")).unwrap();
+        let cfg = BrowserServerConfig {
+            profile_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let srv = BrowserMcpServer::new(cfg.clone());
+        let st = srv
+            .browser_takeover_status(Parameters(Default::default()))
+            .await;
+        let v = st.structured_content.unwrap();
+        assert!(st.is_error == Some(false) && v["active"] == false && v["status"] == "inactive");
+        let tk = |act: &str| BrowserTakeoverStatusArgs {
+            action: Some(act.into()),
+            reason: None,
+        };
+        let stop = srv.browser_takeover_status(Parameters(tk("stop"))).await;
+        assert_eq!(stop.structured_content.unwrap()["status"], "stopped");
+        let bad = srv.browser_takeover_status(Parameters(tk("bogus"))).await;
+        assert_eq!(bad.structured_content.unwrap()["code"], "INVALID_INPUT");
+
+        let loc = srv
+            .browser_profiles(Parameters(BrowserProfilesArgs {}))
+            .await;
+        let lv = loc.structured_content.unwrap();
+        assert!(loc.is_error == Some(false) && lv["source"] == "local");
+        assert_eq!(lv["browser_profiles"], json!(["alpha"]));
+        let rcfg = BrowserServerConfig {
+            api_url: Some("http://127.0.0.1:1".into()),
+            ..cfg
+        };
+        let unauth = BrowserMcpServer::new(rcfg)
+            .browser_profiles(Parameters(BrowserProfilesArgs {}))
+            .await;
+        let uv = unauth.structured_content.unwrap().to_string();
+        assert!(unauth.is_error == Some(true) && !uv.contains("alpha"));
     }
 }

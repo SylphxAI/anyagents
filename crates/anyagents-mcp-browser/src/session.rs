@@ -1,12 +1,15 @@
 //! Headless Chromium process lifecycle and CDP `Web` session management.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_workstation::browser::Web;
 use agent_workstation::cdp::Cdp;
+use agent_workstation::{DesktopSession, Holder, PageImage, Secret, SecretResolver, Snapshot, Tab};
 use serde_json::{Value, json};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, MutexGuard};
@@ -17,6 +20,7 @@ use crate::profile_sync::{
     RemoteProfileSync, resolve_sync_config, sync_down_profile, sync_up_profile,
     validate_profile_name,
 };
+use crate::takeover::{TakeoverMode, TakeoverState};
 
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
@@ -67,12 +71,15 @@ impl std::error::Error for BrowserError {}
 impl From<agent_workstation::Error> for BrowserError {
     fn from(err: agent_workstation::Error) -> Self {
         let code = match &err {
+            agent_workstation::Error::HumanInControl { .. } => "HUMAN_IN_CONTROL",
+            agent_workstation::Error::Leased { .. } => "DESKTOP_IN_USE",
             agent_workstation::Error::StaleRef(_) => "STALE_REF",
             agent_workstation::Error::NotFound(_) => "NOT_FOUND",
             agent_workstation::Error::InvalidInput(_) => "INVALID_INPUT",
             agent_workstation::Error::Timeout(_) => "TIMEOUT",
             agent_workstation::Error::Script(_) => "SCRIPT_ERROR",
             agent_workstation::Error::Unsupported(_) => "UNSUPPORTED",
+            agent_workstation::Error::Refused(_) => "REFUSED",
             agent_workstation::Error::Process(_)
             | agent_workstation::Error::Profile(_)
             | agent_workstation::Error::Closed => "BROWSER_PROCESS_ERROR",
@@ -85,16 +92,63 @@ impl From<agent_workstation::Error> for BrowserError {
     }
 }
 
-/// Live Chromium child process + connected CDP controller.
+pub(crate) const DESKTOP_PRINCIPAL: &str = "anyagents-mcp-browser";
+
+#[derive(Debug)]
+struct PreResolvedSecret(std::sync::Mutex<Option<Secret>>);
+
+impl SecretResolver for PreResolvedSecret {
+    fn resolve<'a, 'b, 'c>(
+        &'a self,
+        _: &'b str,
+    ) -> Pin<Box<dyn Future<Output = agent_workstation::Result<Secret>> + Send + 'c>>
+    where
+        'a: 'c,
+        'b: 'c,
+        Self: 'c,
+    {
+        let taken = self.0.lock().unwrap_or_else(|p| p.into_inner()).take();
+        Box::pin(async move {
+            taken.ok_or_else(|| agent_workstation::Error::Refused("secret consumed".into()))
+        })
+    }
+}
+
+/// Active browser process backend (headless Chromium CDP or Wayland desktop takeover).
+pub enum BrowserBackend {
+    Headless {
+        child: Child,
+        ws_endpoint: String,
+        web: Box<Web>,
+    },
+    Desktop {
+        session: Arc<DesktopSession>,
+        _runtime_dir: tempfile::TempDir,
+    },
+}
+
+/// Live Chromium or desktop takeover instance + profile metadata.
 pub struct BrowserInstance {
-    pub child: Child,
-    pub ws_endpoint: String,
-    pub web: Web,
+    pub backend: BrowserBackend,
     pub persistent_profile: bool,
     pub active_profile: Option<String>,
     pub user_data_dir: PathBuf,
     pub remote_sync: Option<RemoteProfileSync>,
-    _ephemeral_dir: Option<tempfile::TempDir>,
+    pub takeover: TakeoverState,
+    pub(crate) _ephemeral_dir: Option<tempfile::TempDir>,
+}
+
+impl BrowserInstance {
+    pub(crate) fn is_alive(&mut self) -> bool {
+        match &mut self.backend {
+            BrowserBackend::Headless { child, .. } => matches!(child.try_wait(), Ok(None)),
+            BrowserBackend::Desktop { session, .. } => {
+                !session.is_closed()
+                    && (session.takeover_status().browser_running
+                        || matches!(session.gate().holder(), Holder::Human { .. }))
+            }
+        }
+    }
 }
 
 /// Result of closing a live browser session, including remote profile sync status.
@@ -106,27 +160,102 @@ pub struct CloseSessionOutcome {
     pub sync_error: Option<String>,
 }
 
-/// Exclusive lease over a live Chromium CDP controller.
+/// Exclusive lease over a live Chromium CDP controller (headless or desktop takeover).
 pub struct LiveWebGuard<'a> {
     guard: MutexGuard<'a, Option<BrowserInstance>>,
 }
 
+macro_rules! web_methods {
+    ($(pub async fn $name:ident(&mut self $(, $arg:ident : $ty:ty)*) -> Result<$ret:ty, BrowserError>;)*) => {
+        $(pub async fn $name(&mut self $(, $arg: $ty)*) -> Result<$ret, BrowserError> {
+            match &mut self.instance()?.backend {
+                BrowserBackend::Headless { web, .. } => Ok(web.$name($($arg),*).await?),
+                BrowserBackend::Desktop { session, .. } => Ok(session.lease(DESKTOP_PRINCIPAL)?.$name($($arg),*).await?),
+            }
+        })*
+    };
+}
+
 impl LiveWebGuard<'_> {
-    /// Borrow the connected `agent_workstation::browser::Web` CDP client mutably.
-    pub fn web(&mut self) -> &mut Web {
-        &mut self
+    /// Return a mutable handle implementing all CDP web operations.
+    pub fn web(&mut self) -> &mut Self {
+        self
+    }
+
+    fn instance(&mut self) -> Result<&mut BrowserInstance, BrowserError> {
+        let inst = self
             .guard
             .as_mut()
-            .expect("LiveWebGuard always holds a live BrowserInstance")
-            .web
+            .expect("LiveWebGuard holds live instance");
+        if inst.takeover.mode == TakeoverMode::VisibleWindow && inst.takeover.active {
+            return Err(BrowserError::new(
+                "HUMAN_IN_CONTROL",
+                "human holds takeover window; release or stop to resume",
+            ));
+        }
+        Ok(inst)
+    }
+
+    web_methods! {
+        pub async fn navigate(&mut self, url: &str) -> Result<String, BrowserError>;
+        pub async fn reload(&mut self) -> Result<String, BrowserError>;
+        pub async fn snapshot(&mut self) -> Result<Snapshot, BrowserError>;
+        pub async fn read(&mut self) -> Result<String, BrowserError>;
+        pub async fn html(&mut self, selector: Option<&str>) -> Result<String, BrowserError>;
+        pub async fn click(&mut self, selector: &str) -> Result<(), BrowserError>;
+        pub async fn fill(&mut self, selector: &str, text: &str) -> Result<(), BrowserError>;
+        pub async fn press(&mut self, key: &str) -> Result<(), BrowserError>;
+        pub async fn page_screenshot(&mut self, full_page: bool) -> Result<PageImage, BrowserError>;
+        pub async fn eval(&mut self, script: &str) -> Result<Value, BrowserError>;
+        pub async fn tabs(&mut self) -> Result<Vec<Tab>, BrowserError>;
+        pub async fn new_tab(&mut self, url: &str) -> Result<String, BrowserError>;
+        pub async fn select_tab(&mut self, id: &str) -> Result<(), BrowserError>;
+        pub async fn close_tab(&mut self, id: &str) -> Result<(), BrowserError>;
+        pub async fn current_url(&mut self) -> Result<String, BrowserError>;
+    }
+
+    pub async fn history(&mut self, delta: i64) -> Result<String, BrowserError> {
+        match &mut self.instance()?.backend {
+            BrowserBackend::Headless { web, .. } => Ok(web.history(delta).await?),
+            BrowserBackend::Desktop { session, .. } => {
+                let a = session.lease(DESKTOP_PRINCIPAL)?;
+                Ok(if delta < 0 {
+                    a.back().await?
+                } else {
+                    a.forward().await?
+                })
+            }
+        }
+    }
+
+    pub async fn fill_secret(
+        &mut self,
+        selector: &str,
+        secret_ref: &str,
+        secret: Secret,
+        expect_origin: Option<&str>,
+    ) -> Result<(), BrowserError> {
+        match &mut self.instance()?.backend {
+            BrowserBackend::Headless { web, .. } => {
+                Ok(web.fill_secret(selector, &secret, expect_origin).await?)
+            }
+            BrowserBackend::Desktop { session, .. } => {
+                let resolver = PreResolvedSecret(std::sync::Mutex::new(Some(secret)));
+                let a = session.lease(DESKTOP_PRINCIPAL)?;
+                Ok(
+                    a.fill_secret(selector, secret_ref, &resolver, expect_origin)
+                        .await?,
+                )
+            }
+        }
     }
 }
 
 /// Thread-safe lazily-initialized Chromium session handle.
 #[derive(Clone)]
 pub struct BrowserSession {
-    config: Arc<BrowserServerConfig>,
-    inner: Arc<Mutex<Option<BrowserInstance>>>,
+    pub(crate) config: Arc<BrowserServerConfig>,
+    pub(crate) inner: Arc<Mutex<Option<BrowserInstance>>>,
 }
 
 impl BrowserSession {
@@ -166,9 +295,7 @@ impl BrowserSession {
             .map_err(BrowserError::invalid_input)?;
 
         let mut guard = self.inner.lock().await;
-        let alive = guard
-            .as_mut()
-            .is_some_and(|inst| matches!(inst.child.try_wait(), Ok(None)));
+        let alive = guard.as_mut().is_some_and(BrowserInstance::is_alive);
         let profile_mismatch = alive
             && normalized_req.is_some()
             && guard
@@ -226,7 +353,7 @@ impl BrowserSession {
 /// Resolve an optional explicit `target_id` against live tabs, failing closed
 /// with `STALE_TARGET` if the requested tab does not exist.
 pub async fn select_explicit_target(
-    web: &mut Web,
+    web: &mut LiveWebGuard<'_>,
     target_id: Option<&str>,
 ) -> Result<Option<String>, BrowserError> {
     let Some(raw) = target_id else {
@@ -338,10 +465,18 @@ pub fn parse_devtools_stderr_url(log_text: &str) -> Option<(u16, String)> {
     None
 }
 
-async fn launch_instance(
+pub(crate) struct PreparedWorkspace {
+    pub active_profile: Option<String>,
+    pub user_data_dir: PathBuf,
+    pub persistent_profile: bool,
+    pub remote_sync: Option<RemoteProfileSync>,
+    pub ephemeral_dir: Option<tempfile::TempDir>,
+}
+
+pub(crate) async fn prepare_profile_workspace(
     config: &BrowserServerConfig,
     requested_profile: Option<&str>,
-) -> Result<BrowserInstance, BrowserError> {
+) -> Result<PreparedWorkspace, BrowserError> {
     let remote_sync = resolve_sync_config(config, requested_profile)?;
     let active_profile = remote_sync
         .as_ref()
@@ -356,9 +491,6 @@ async fn launch_instance(
     if let Some(ref name) = active_profile {
         validate_profile_name(name).map_err(BrowserError::invalid_input)?;
     }
-
-    let binary = discover_chromium(config.chromium_bin.as_deref())
-        .map_err(BrowserError::browser_not_found)?;
 
     let (user_data_dir, persistent_profile, ephemeral_dir): (
         PathBuf,
@@ -408,7 +540,23 @@ async fn launch_instance(
     #[cfg(target_os = "linux")]
     agent_workstation::profile::clear_stale_singleton(&user_data_dir)?;
 
-    let port_file = user_data_dir.join("DevToolsActivePort");
+    Ok(PreparedWorkspace {
+        active_profile,
+        user_data_dir,
+        persistent_profile,
+        remote_sync,
+        ephemeral_dir,
+    })
+}
+
+pub(crate) async fn launch_instance(
+    config: &BrowserServerConfig,
+    requested_profile: Option<&str>,
+) -> Result<BrowserInstance, BrowserError> {
+    let binary = discover_chromium(config.chromium_bin.as_deref())
+        .map_err(BrowserError::browser_not_found)?;
+    let ws = prepare_profile_workspace(config, requested_profile).await?;
+    let port_file = ws.user_data_dir.join("DevToolsActivePort");
     if let Err(err) = std::fs::remove_file(&port_file)
         && err.kind() != std::io::ErrorKind::NotFound
     {
@@ -418,7 +566,7 @@ async fn launch_instance(
         ));
     }
 
-    let log_path = user_data_dir.join("devtools.log");
+    let log_path = ws.user_data_dir.join("devtools.log");
     let log_file = std::fs::File::create(&log_path).map_err(|e| {
         BrowserError::new(
             "BROWSER_PROCESS_ERROR",
@@ -432,7 +580,7 @@ async fn launch_instance(
         )
     })?;
 
-    let args = build_launch_args(&binary, &user_data_dir, config);
+    let args = build_launch_args(&binary, &ws.user_data_dir, config);
     let mut cmd = Command::new(&binary);
     cmd.args(&args)
         .stdin(Stdio::null())
@@ -459,19 +607,22 @@ async fn launch_instance(
     };
 
     Ok(BrowserInstance {
-        child,
-        ws_endpoint,
-        web,
-        persistent_profile,
-        active_profile,
-        user_data_dir,
-        remote_sync,
-        _ephemeral_dir: ephemeral_dir,
+        backend: BrowserBackend::Headless {
+            child,
+            ws_endpoint,
+            web: Box::new(web),
+        },
+        persistent_profile: ws.persistent_profile,
+        active_profile: ws.active_profile,
+        user_data_dir: ws.user_data_dir,
+        remote_sync: ws.remote_sync,
+        takeover: TakeoverState::default(),
+        _ephemeral_dir: ws.ephemeral_dir,
     })
 }
 
-async fn finalize_instance(inst: &mut BrowserInstance) -> (bool, Option<String>) {
-    shutdown_instance(inst).await;
+pub(crate) async fn finalize_instance(inst: &mut BrowserInstance) -> (bool, Option<String>) {
+    shutdown_backend(&mut inst.backend).await;
     let Some(sync) = inst.remote_sync.take() else {
         return (false, None);
     };
@@ -541,8 +692,17 @@ async fn wait_for_devtools(
     }
 }
 
-async fn shutdown_instance(inst: &mut BrowserInstance) {
-    if let Ok(mut cdp) = Cdp::connect(&inst.ws_endpoint).await {
+pub(crate) async fn shutdown_backend(backend: &mut BrowserBackend) {
+    let BrowserBackend::Headless {
+        child, ws_endpoint, ..
+    } = backend
+    else {
+        if let BrowserBackend::Desktop { session, .. } = backend {
+            session.close().await;
+        }
+        return;
+    };
+    if let Ok(mut cdp) = Cdp::connect(ws_endpoint).await {
         for page in cdp.pages().await.unwrap_or_default() {
             if let Some(id) = page["targetId"].as_str() {
                 let _ = cdp
@@ -555,7 +715,7 @@ async fn shutdown_instance(inst: &mut BrowserInstance) {
                     .await;
             }
         }
-        if tokio::time::timeout(SHUTDOWN_GRACE, inst.child.wait())
+        if tokio::time::timeout(SHUTDOWN_GRACE, child.wait())
             .await
             .is_ok()
         {
@@ -564,11 +724,11 @@ async fn shutdown_instance(inst: &mut BrowserInstance) {
         let _ = tokio::time::timeout(Duration::from_secs(2), cdp.call("Browser.close", json!({})))
             .await;
     }
-    if tokio::time::timeout(SHUTDOWN_GRACE, inst.child.wait())
+    if tokio::time::timeout(SHUTDOWN_GRACE, child.wait())
         .await
         .is_err()
     {
-        let _ = inst.child.kill().await;
+        let _ = child.kill().await;
     }
 }
 
