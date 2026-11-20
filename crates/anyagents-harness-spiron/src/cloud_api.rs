@@ -153,6 +153,16 @@ fn gateway_key_err() -> RemoteSessionError {
 pub(crate) fn resolve_api_token(
     cfg: &SpironCloudConfig,
 ) -> Result<Option<String>, RemoteSessionError> {
+    resolve_api_token_with(cfg, env_trimmed)
+}
+
+fn resolve_api_token_with<F>(
+    cfg: &SpironCloudConfig,
+    mut lookup_env: F,
+) -> Result<Option<String>, RemoteSessionError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     if let Some(explicit) = cfg.api_token.as_deref().map(str::trim) {
         if explicit.is_empty() {
             return Ok(None);
@@ -173,7 +183,9 @@ pub(crate) fn resolve_api_token(
         "auth.json",
     ];
     let envs = [
+        "ANYAGENTS_SPIRON_CLOUD_API_KEY",
         "ANYAGENTS_SPIRON_API_KEY",
+        "SPIRON_CLOUD_API_KEY",
         "SPIRON_API_KEY",
         "SPIRON_TOKEN",
         "SYLPHX_API_KEY",
@@ -181,7 +193,7 @@ pub(crate) fn resolve_api_token(
     let mut cands: Vec<String> = read_json_token(&cfg.config_dir.join(files[0]))
         .into_iter()
         .collect();
-    cands.extend(envs.into_iter().filter_map(env_trimmed));
+    cands.extend(envs.into_iter().filter_map(&mut lookup_env));
     if let Ok(raw) = fs::read_to_string(cfg.config_dir.join(".spiron/key"))
         && !raw.trim().is_empty()
     {
@@ -1238,4 +1250,33 @@ pub(crate) fn sync_mcp_servers(
         persist_json(&sync_path, &digest, "Spiron MCP sync digest")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_api_token_recognizes_cloud_api_key_env_vars() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SpironCloudConfig::new(dir.path());
+
+        let tok = resolve_api_token_with(&cfg, |k| {
+            (k == "ANYAGENTS_SPIRON_CLOUD_API_KEY").then(|| "spiron_sk_from_cloud_env".into())
+        })
+        .unwrap();
+        assert_eq!(tok.as_deref(), Some("spiron_sk_from_cloud_env"));
+
+        let tok2 = resolve_api_token_with(&cfg, |k| {
+            (k == "SPIRON_CLOUD_API_KEY").then(|| "spiron_sk_from_short_cloud_env".into())
+        })
+        .unwrap();
+        assert_eq!(tok2.as_deref(), Some("spiron_sk_from_short_cloud_env"));
+
+        let err = resolve_api_token_with(&cfg, |k| {
+            (k == "ANYAGENTS_SPIRON_CLOUD_API_KEY").then(|| "sylphx_sk_gateway_only".into())
+        })
+        .unwrap_err();
+        assert!(matches!(err, RemoteSessionError::Auth(_)));
+    }
 }
