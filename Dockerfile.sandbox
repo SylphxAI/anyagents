@@ -155,6 +155,34 @@ RUN apt-get update \
     && cp /var/lib/anyagents/toolchain.toml /etc/anyagents/toolchain.toml \
     && rm -rf /var/lib/apt/lists/*
 
+# Official branded Google Chrome (`google-chrome-stable`) on linux/amd64, where Google
+# publishes it. `anyagents-mcp-browser` prefers it over Debian `chromium`, which stays
+# installed as the arm64 / fallback browser. The signing key is pinned by fingerprint,
+# and the package's own repository cron entry is disabled so later `apt-get update`
+# calls never see a duplicate source with a conflicting `Signed-By`.
+ARG TARGETARCH
+ARG GOOGLE_LINUX_SIGNING_KEY_FPR=EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796
+RUN set -eux; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    if [ "$arch" = "amd64" ]; then \
+        curl -fsSL https://dl.google.com/linux/linux_signing_key.pub -o /tmp/google-linux.pub; \
+        gpg --show-keys --with-colons /tmp/google-linux.pub \
+            | awk -F: '/^fpr:/ {print $10}' \
+            | grep -qx "${GOOGLE_LINUX_SIGNING_KEY_FPR}"; \
+        gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg /tmp/google-linux.pub; \
+        rm -f /tmp/google-linux.pub; \
+        echo 'repo_add_once="false"' > /etc/default/google-chrome; \
+        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+            > /etc/apt/sources.list.d/google-chrome.list; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends google-chrome-stable; \
+        /usr/bin/google-chrome-stable --version; \
+        rm -f /etc/apt/sources.list.d/google-chrome*.list; \
+        rm -rf /var/lib/apt/lists/*; \
+    else \
+        echo "google-chrome-stable is not published for ${arch}; using Debian chromium"; \
+    fi
+
 # Install `anyagents-guest` runtime supervisor + MCP proxy alongside
 # `agent-code-mode` (`agent-tools`).
 COPY --from=guest-builder /src/target/release/anyagents-guest /usr/local/bin/anyagents-guest

@@ -345,6 +345,81 @@ const STRIPPED_PATH_COMPONENTS: &[&str] = &[
     "devtools.log",
 ];
 
+/// Relative names of Chromium cookie stores: the legacy `Cookies` (+`-journal`)
+/// layout and the modern `Network/Cookies` (+`-journal` / `-wal` / `-shm`)
+/// layout used by current Chromium builds.
+const COOKIE_STORE_NAMES: &[&str] = &["Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm"];
+
+/// Cookie store files inside `user_data_dir` for the root profile and every
+/// sub-profile directory that exists: legacy `Cookies` locations (`Default`,
+/// `Profile N`) and modern `Network/Cookies` locations (`Default/Network`,
+/// `Profile N/Network`).
+pub fn cookie_store_paths(user_data_dir: &Path) -> Vec<PathBuf> {
+    let mut profile_dirs = vec![user_data_dir.to_path_buf()];
+    if let Ok(entries) = std::fs::read_dir(user_data_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                profile_dirs.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for profile_dir in &profile_dirs {
+        let network_dir = profile_dir.join("Network");
+        for dir in [profile_dir, &network_dir] {
+            for name in COOKIE_STORE_NAMES {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    out.push(candidate);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `fsync` every existing file in `paths`; missing files are skipped.
+/// Returns the files that could not be flushed.
+pub fn fsync_files(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut failed = Vec::new();
+    for path in paths {
+        if let Ok(file) = std::fs::File::open(path)
+            && file.sync_all().is_err()
+        {
+            failed.push(path.clone());
+        }
+    }
+    failed
+}
+
+/// Flush the cookie stores (including SQLite `Cookies-wal` / `-shm` sidecars)
+/// and the `Local State` file after the browser process is gone. Must run
+/// after the graceful shutdown path so un-checkpointed SQLite WAL frames and
+/// any racing `Local State` write (incl. DBSC keys) are already on disk before
+/// the profile archive is packed and uploaded.
+pub fn fsync_profile_files(user_data_dir: &Path) -> Result<(), String> {
+    let mut paths = cookie_store_paths(user_data_dir);
+    let local_state = user_data_dir.join("Local State");
+    if local_state.is_file() {
+        paths.push(local_state);
+    }
+    let failed = fsync_files(&paths);
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to flush files after browser shutdown: {}",
+            failed
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
 /// Return `true` when `rel_path` (relative to `user-data/`) is a disposable
 /// cache or Chromium lock file that must be stripped before archiving.
 pub fn should_strip_profile_path(rel_path: &Path) -> bool {
@@ -1205,6 +1280,134 @@ mod tests {
                 "expected `{stripped}` to be stripped"
             );
         }
+    }
+
+    #[test]
+    fn cookie_stores_survive_pack_and_unpack_into_a_fresh_container_dir() {
+        // Every on-disk cookie store layout Chromium/Chrome uses on Linux, plus the
+        // SQLite side files that hold not-yet-checkpointed rows, must round-trip
+        // byte-for-byte; host-bound singleton locks must not, so the restored
+        // profile opens on a different host without "profile in use" refusals.
+        let src = tempfile::tempdir().unwrap();
+        let ud = src.path().join("user-data");
+        let keep: &[(&str, &[u8])] = &[
+            ("Local State", b"{\"profile\":{\"last_used\":\"Default\"}}"),
+            ("Default/Cookies", b"SQLite format 3\0legacy-cookies"),
+            ("Default/Cookies-journal", b""),
+            (
+                "Default/Network/Cookies",
+                b"SQLite format 3\0v10-encrypted-rows",
+            ),
+            ("Default/Network/Cookies-journal", b"journal"),
+            (
+                "Default/Network/Cookies-wal",
+                b"wal-frames-not-checkpointed",
+            ),
+            ("Default/Network/Cookies-shm", b"shm-index"),
+            ("Default/Preferences", b"{}"),
+            (
+                "Profile 1/Network/Cookies",
+                b"SQLite format 3\0second-profile",
+            ),
+        ];
+        for (rel, bytes) in keep {
+            let p = ud.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("other-host-4242", ud.join("SingletonLock")).unwrap();
+            std::os::unix::fs::symlink("/tmp/gone/sock", ud.join("SingletonSocket")).unwrap();
+            std::os::unix::fs::symlink("1234567890", ud.join("SingletonCookie")).unwrap();
+        }
+        std::fs::write(ud.join("DevToolsActivePort"), b"9222\n/devtools/browser/x").unwrap();
+
+        let (archive, _) = pack_user_data_dir(&ud).unwrap();
+        drop(src); // the original container is gone
+
+        let fresh = tempfile::tempdir().unwrap();
+        let restored = fresh.path().join("user-data");
+        let files = unpack_user_data_archive(&archive, &restored).unwrap();
+        assert_eq!(files, keep.len());
+        for (rel, bytes) in keep {
+            assert_eq!(&std::fs::read(restored.join(rel)).unwrap(), bytes, "{rel}");
+        }
+        for gone in [
+            "SingletonLock",
+            "SingletonSocket",
+            "SingletonCookie",
+            "DevToolsActivePort",
+        ] {
+            assert!(restored.join(gone).symlink_metadata().is_err(), "{gone}");
+        }
+        #[cfg(target_os = "linux")]
+        agent_workstation::profile::clear_stale_singleton(&restored).unwrap();
+    }
+
+    #[test]
+    fn cookie_store_paths_covers_default_network_and_per_profile_layouts() {
+        let src = tempfile::tempdir().unwrap();
+        let ud = src.path().join("user-data");
+        for rel in [
+            "Default/Cookies",
+            "Default/Cookies-journal",
+            "Default/Cookies-wal",
+            "Default/Network/Cookies",
+            "Default/Network/Cookies-shm",
+            "Default/Network/Cookies-wal",
+            "Profile 1/Network/Cookies",
+        ] {
+            let p = ud.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"store").unwrap();
+        }
+        let mut got: Vec<String> = cookie_store_paths(&ud)
+            .into_iter()
+            .map(|p| {
+                p.strip_prefix(&ud)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "Default/Cookies",
+                "Default/Cookies-journal",
+                "Default/Cookies-wal",
+                "Default/Network/Cookies",
+                "Default/Network/Cookies-shm",
+                "Default/Network/Cookies-wal",
+                "Profile 1/Network/Cookies",
+            ]
+        );
+    }
+
+    #[test]
+    fn fsync_files_flushes_existing_and_ignores_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::write(&existing, b"data").unwrap();
+        assert!(fsync_files(&[existing.clone(), dir.path().join("missing")]).is_empty());
+    }
+
+    #[test]
+    fn fsync_profile_files_covers_cookie_stores_and_local_state() {
+        let src = tempfile::tempdir().unwrap();
+        let ud = src.path().join("user-data");
+        for rel in [
+            "Local State",
+            "Default/Cookies",
+            "Default/Network/Cookies-wal",
+        ] {
+            let p = ud.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"state").unwrap();
+        }
+        assert!(fsync_profile_files(&ud).is_ok());
     }
 
     fn compress_raw_tar(tar_bytes: &[u8]) -> Vec<u8> {

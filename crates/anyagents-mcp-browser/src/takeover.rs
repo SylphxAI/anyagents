@@ -7,26 +7,22 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_workstation::{
-    BrowserConfig, DesktopSession, HandBack, Holder, Profile, SessionConfig, TakeoverConfig,
-    TakeoverStatus,
-};
+use agent_workstation::{HandBack, Holder, TakeoverStatus};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use url::Url;
 
 use crate::chromium::{discover_chromium, is_executable_file};
+use crate::desktop::{DesktopTools, default_bin_dirs, launch_desktop_instance};
 use crate::profile_sync::{resolve_api_url, resolve_coordinator_auth, validate_profile_name};
-use crate::proxy::{ProxyHandle, ProxyOverride};
+use crate::proxy::ProxyOverride;
 use crate::session::{
     BrowserBackend, BrowserError, BrowserInstance, BrowserSession, DESKTOP_PRINCIPAL,
-    finalize_instance, prepare_profile_workspace, resolve_session_proxy,
+    finalize_instance, resolve_session_proxy,
 };
 use crate::tunnel::{TakeoverTunnelHandle, TunnelConfig};
 use crate::url_guard::navigable_url;
-
-const BIN_DIRS: &str = "/usr/local/bin /usr/bin /opt/homebrew/bin /bin /snap/bin";
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 pub struct BrowserTakeoverArgs {
@@ -158,7 +154,7 @@ impl BrowserSession {
         let proxy_ov = ProxyOverride::from_opts(req.proxy, req.proxy_env);
         let env_pub = std::env::var("ANYAGENTS_TAKEOVER_PUBLIC_URL").ok();
         let pub_url = parse_public_url(req.public_url.as_deref().or(env_pub.as_deref()))?;
-        let dirs: Vec<PathBuf> = BIN_DIRS.split_whitespace().map(PathBuf::from).collect();
+        let dirs = default_bin_dirs();
         if cfg!(target_os = "linux")
             && let (Some(sway), Some(vnc)) = (
                 find_binary_in("sway", &dirs),
@@ -192,59 +188,21 @@ impl BrowserSession {
                 }
                 let bin = discover_chromium(self.config.chromium_bin.as_deref())
                     .map_err(BrowserError::browser_not_found)?;
-                let ws = prepare_profile_workspace(&self.config, target_p.as_deref()).await?;
-                let proxy_handle = match &desired_proxy {
-                    Some(p) => Some(ProxyHandle::start(p).await?),
-                    None => None,
+                let tools = DesktopTools {
+                    compositor: sway,
+                    vnc: Some(vnc),
                 };
-                let rt = tempfile::Builder::new()
-                    .prefix("aa-desk-")
-                    .tempdir()
-                    .map_err(|e| {
-                        BrowserError::new("BROWSER_PROCESS_ERROR", format!("runtime: {e}"))
-                    })?;
-                let mut browser = BrowserConfig::new(bin);
-                browser.extra_args =
-                    "--no-sandbox --disable-dev-shm-usage --hide-crash-restore-bubble"
-                        .split_whitespace()
-                        .map(str::to_string)
-                        .collect();
-                if let Some(ref ph) = proxy_handle {
-                    browser.extra_args.extend(ph.chromium_args());
-                }
-                browser.extra_args.extend(self.config.parsed_extra_args());
-                let root = ws.user_data_dir.parent().unwrap_or(&ws.user_data_dir);
-                let p_cfg = Profile::new(ws.active_profile.as_deref().unwrap_or("default"), root);
-                let mut cfg = SessionConfig::new(p_cfg, browser, rt.path());
-                let bind = std::env::var("ANYAGENTS_TAKEOVER_BIND")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .or_else(|| TakeoverConfig::default().bind);
-                cfg.human_idle_timeout = None;
-                (cfg.compositor, cfg.vnc) = (sway, vnc);
-                cfg.takeover = Some(TakeoverConfig {
-                    bind,
-                    public_url: pub_url.clone(),
-                    token: None,
-                });
-                let session = Arc::new(DesktopSession::start(cfg).await?);
-                let _ = session.lease(DESKTOP_PRINCIPAL)?;
+                let inst = launch_desktop_instance(
+                    &self.config,
+                    target_p.as_deref(),
+                    desired_proxy,
+                    bin,
+                    &tools,
+                    pub_url.clone(),
+                )
+                .await?;
                 g = self.inner.lock().await;
-                *g = Some(BrowserInstance {
-                    backend: BrowserBackend::Desktop {
-                        session,
-                        _runtime_dir: rt,
-                    },
-                    persistent_profile: ws.persistent_profile,
-                    active_profile: ws.active_profile,
-                    active_proxy: desired_proxy,
-                    user_data_dir: ws.user_data_dir,
-                    remote_sync: ws.remote_sync,
-                    takeover: TakeoverState::default(),
-                    takeover_tunnel: None,
-                    _proxy_handle: proxy_handle,
-                    _ephemeral_dir: ws.ephemeral_dir,
-                });
+                *g = Some(inst);
             }
             let mut tunnel_error: Option<String> = None;
             if let Some(u) = pub_url {
