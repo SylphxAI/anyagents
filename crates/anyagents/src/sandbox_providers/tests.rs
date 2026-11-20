@@ -143,11 +143,15 @@ fn bundle_tar_roundtrip_and_path_traversal_rejection() {
             b"# Skill\n".to_vec(),
         ),
         (".mcp-token".to_string(), b"tok-123\n".to_vec()),
+        (
+            "guest-config.json".to_string(),
+            br#"{"session_id":"s1"}"#.to_vec(),
+        ),
     ];
     let tar_gz = build_bundle_tar_gz(&entries).unwrap();
     let dst = tempfile::tempdir().unwrap();
     let count = extract_bundle_tar_gz(&tar_gz, dst.path()).unwrap();
-    assert_eq!(count, 3);
+    assert_eq!(count, 4);
     assert_eq!(
         std::fs::read_to_string(dst.path().join("SYSTEM_PROMPT.md")).unwrap(),
         "# Prompt\n"
@@ -160,6 +164,24 @@ fn bundle_tar_roundtrip_and_path_traversal_rejection() {
         std::fs::read_to_string(dst.path().join(".mcp-token")).unwrap(),
         "tok-123\n"
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(dst.path().join("guest-config.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    let mtime = std::fs::metadata(dst.path().join("SYSTEM_PROMPT.md"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(mtime > 1_700_000_000, "tar mtime must not be 1970 epoch");
 
     // Reject traversal & absolute paths.
     assert!(build_bundle_tar_gz(&[("../escape.txt".into(), b"bad".to_vec())]).is_err());

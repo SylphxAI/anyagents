@@ -454,9 +454,11 @@ fn roster_authorization_matches_the_single_agent_checks() {
                     ),
                     "{context}"
                 );
+                let expect_instructions = target.state != "archived"
+                    && can_actor_read_agent_private(store, &principal, &target);
                 assert_eq!(
                     view.instructions.is_some(),
-                    can_actor_read_agent_private(store, &principal, &target),
+                    expect_instructions,
                     "{context}"
                 );
             }
@@ -9206,4 +9208,105 @@ fn decode_mcp_request_payload_supports_plain_json_and_base64_waf_framing() {
     let decoded_b64 =
         decode_mcp_request_payload(&b64_headers, axum::body::Bytes::from(b64_body)).unwrap();
     assert_eq!(decoded_b64, raw);
+}
+
+#[tokio::test]
+async fn list_agents_all_paginates_live_first_and_omits_archived_instructions_while_single_get_preserves_them()
+ {
+    let dir = crate::test_tempdir();
+    let state = archetype_validation_state(dir.path());
+    let store = &state.store;
+
+    let mut root_new = anyagents_core::NewAgent::new("root-live", "codex");
+    root_new.instructions = Some("ROOT_PRIVATE".into());
+    let root = store.create_agent(root_new).unwrap();
+    let mut child_new = anyagents_core::NewAgent::new("child-live", "codex");
+    child_new.parent_id = Some(root.id.clone());
+    let child = store.create_agent(child_new).unwrap();
+    let mut gc_new = anyagents_core::NewAgent::new("grandchild-arch", "codex");
+    gc_new.parent_id = Some(child.id.clone());
+    gc_new.instructions = Some("GRANDCHILD_PRIVATE".into());
+    let gc = store.create_agent(gc_new).unwrap();
+    store.set_agent_state(&gc.id, "archived").unwrap();
+
+    for idx in 0..209 {
+        let mut n = anyagents_core::NewAgent::new(format!("arch-{idx:03}"), "codex");
+        n.instructions = Some(format!("HUGE_INSTRUCTIONS_{idx}"));
+        let a = store.create_agent(n).unwrap();
+        store.set_agent_state(&a.id, "archived").unwrap();
+    }
+
+    // Default `state=all` caps at 200 rows, sorts live agents first, omits archived instructions,
+    // and still reports the exact total `archived_count` (210).
+    let Json(page1) = list_agents(
+        Principal::Operator,
+        State(state.clone()),
+        Query(ListAgentsQuery {
+            state: Some("all".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page1.archived_count, 210);
+    assert_eq!(page1.agents.len(), 200);
+    assert!(page1.agents[0].state != "archived");
+    assert!(page1.agents[1].state != "archived");
+    assert!(
+        page1
+            .agents
+            .iter()
+            .filter(|a| a.state == "archived")
+            .all(|a| a.instructions.is_none()),
+        "archived entries in list view must omit instructions"
+    );
+
+    // Explicit offset/limit reaches the remaining 12 archived rows.
+    let Json(page2) = list_agents(
+        Principal::Operator,
+        State(state.clone()),
+        Query(ListAgentsQuery {
+            state: Some("all".into()),
+            limit: Some(20),
+            offset: Some(200),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page2.archived_count, 210);
+    assert_eq!(page2.agents.len(), 12);
+
+    // `include_descendants=true` on `state=all` returns both child and archived grandchild.
+    let Json(subtree) = list_agents(
+        Principal::Operator,
+        State(state.clone()),
+        Query(ListAgentsQuery {
+            state: Some("all".into()),
+            parent: Some("root-live".into()),
+            include_descendants: Some(true),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(subtree.agents.len(), 2);
+    assert!(subtree.agents.iter().any(|a| a.name == "child-live"));
+    assert!(subtree.agents.iter().any(|a| a.name == "grandchild-arch"));
+
+    // Single-agent `GET /v1/agents/{name}` STILL returns full instructions for archived agents.
+    let Json(single) = get_agent(
+        Principal::Operator,
+        State(state.clone()),
+        AxumPath("grandchild-arch".to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(single.state, "archived");
+    assert!(
+        single
+            .instructions
+            .as_deref()
+            .is_some_and(|s| s.contains("GRANDCHILD_PRIVATE"))
+    );
 }

@@ -30,9 +30,9 @@ use crate::activity::{
 };
 use crate::guest::{
     build_guest_env, canonical_guest_harness, ensure_repo_checked_out, launch_guest_harness,
-    load_guest_config, load_repo_spec, persist_session, read_persisted_session,
-    resolve_default_state_dir, resolve_default_workdir, resolve_guest_program, signal_wake,
-    turn_state_label, usage_json, wait_wake,
+    load_guest_config, load_repo_spec, persist_session, resolve_default_state_dir,
+    resolve_default_workdir, resolve_guest_program, signal_wake, turn_state_label, usage_json,
+    wait_wake,
 };
 
 const POLL_TICK: Duration = Duration::from_millis(60);
@@ -83,6 +83,9 @@ pub struct TurnArgs {
     /// File containing the UTF-8 user prompt for this turn.
     #[arg(long)]
     pub prompt_file: Option<PathBuf>,
+    /// File containing a JSON-serialized [`OutboundMessage`] envelope for this turn.
+    #[arg(long)]
+    pub message_file: Option<PathBuf>,
     /// Read the UTF-8 user prompt from standard input.
     #[arg(long)]
     pub prompt_stdin: bool,
@@ -182,6 +185,14 @@ fn spawn_detached_turn(
         path
     };
 
+    // Materialize structured OutboundMessage envelope when provided via --message-file
+    // or ANYAGENTS_GUEST_MESSAGE_B64 so the detached child delivers full 6-dimension context.
+    let message_file = if let Some(ref existing) = args.message_file {
+        Some(existing.clone())
+    } else {
+        materialize_env_message_file(turns_dir, &args.turn_id)
+    };
+
     // Pass callback token via a 0600 file in `<state-dir>/turns/<turn-id>.token` rather
     // than exposing it on child argv (`/proc/<pid>/cmdline`).
     let token_file = turns_dir.join(format!("{}.token", args.turn_id));
@@ -217,6 +228,11 @@ fn spawn_detached_turn(
         .arg(state_dir)
         .arg("--workdir")
         .arg(workdir);
+
+    if let Some(ref mf) = message_file {
+        cmd.arg("--message-file").arg(mf);
+    }
+    cmd.env_remove(anyagents_harness::GUEST_MESSAGE_B64_ENV);
 
     if let Some(ref h) = args.harness {
         cmd.arg("--harness").arg(h);
@@ -337,11 +353,12 @@ fn execute_turn_foreground(
         .model
         .clone()
         .or_else(|| file_cfg.as_ref().and_then(|c| c.model.clone()));
-    let session = args
-        .session
-        .clone()
-        .or_else(|| file_cfg.as_ref().and_then(|c| c.session_id.clone()))
-        .or_else(|| read_persisted_session(state_dir, &harness_name));
+    let session = crate::workspace_delta::resolve_guest_session(
+        state_dir,
+        &harness_name,
+        args.session.as_deref(),
+        file_cfg.as_ref().and_then(|c| c.session_id.as_deref()),
+    );
     let mut extra_args = file_cfg
         .as_ref()
         .map(|c| c.extra_args.clone())
@@ -421,15 +438,15 @@ fn execute_turn_foreground(
         state_dir,
     );
 
-    let msg = OutboundMessage {
-        id: args.turn_id.clone(),
-        seq: 1,
-        text: prompt.to_string(),
-        sender: None,
-        reply_to: None,
-        source_time_ms: None,
-        context: Context::default(),
-    };
+    let mut msg = resolve_outbound_message(args, prompt);
+    if msg.context.workspace.is_none() {
+        msg.context.workspace = crate::workspace_delta::capture_and_diff(
+            &work_dir,
+            state_dir,
+            args.git_program.as_deref(),
+        );
+    }
+    let delivery_id = msg.id.clone();
 
     let mut delivered_done = false;
     let mut delivery_error: Option<String> = None;
@@ -478,7 +495,7 @@ fn execute_turn_foreground(
     if let Some(err_msg) = delivery_error {
         let sid = adapter.session_id().or(initial_sid);
         let usage = adapter
-            .usage_for_id(&args.turn_id)
+            .usage_for_id(&delivery_id)
             .unwrap_or_else(|| adapter.served_usage().difference(base_usage));
         clear_activity_snapshot(state_dir);
         adapter.stop();
@@ -511,7 +528,7 @@ fn execute_turn_foreground(
             }
 
             // Stream incremental deltas if harness accumulated new output.
-            if let Some(current_text) = adapter.answer_for(&args.turn_id, state_dir)
+            if let Some(current_text) = adapter.answer_for(&delivery_id, state_dir)
                 && current_text.len() > sent_text_len
                 && current_text.is_char_boundary(sent_text_len)
             {
@@ -537,7 +554,7 @@ fn execute_turn_foreground(
                 }
             }
 
-            let proven = adapter.proven(&args.turn_id);
+            let proven = adapter.proven(&delivery_id);
             let done_by_proof = matches!(
                 proven,
                 Some(Proof::Taken {
@@ -546,10 +563,10 @@ fn execute_turn_foreground(
             );
             let done_by_turns =
                 adapter.turns_served() > base_turns && health.turn_state == TurnState::Idle;
-            let done_by_failure = adapter.failure_for_id(&args.turn_id).is_some();
+            let done_by_failure = adapter.failure_for_id(&delivery_id).is_some();
 
             if done_by_proof || done_by_turns || done_by_failure || !health.process_alive {
-                err_override = adapter.failure_for_id(&args.turn_id).or_else(|| {
+                err_override = adapter.failure_for_id(&delivery_id).or_else(|| {
                     (!health.process_alive && !done_by_proof && !done_by_turns).then(|| {
                         adapter
                             .exit_diagnostic()
@@ -591,13 +608,13 @@ fn execute_turn_foreground(
     let _ = persist_session(state_dir, &harness_name, &sid);
 
     let usage = adapter
-        .usage_for_id(&args.turn_id)
+        .usage_for_id(&delivery_id)
         .unwrap_or_else(|| adapter.served_usage().difference(base_usage));
-    let reply_opt = adapter.answer_for(&args.turn_id, state_dir);
+    let reply_opt = adapter.answer_for(&delivery_id, state_dir);
     let reply_empty = reply_opt.as_deref().is_none_or(|s| s.trim().is_empty());
     if err_override.is_none() && reply_empty {
         err_override = adapter
-            .failure_for_id(&args.turn_id)
+            .failure_for_id(&delivery_id)
             .or_else(|| adapter.exit_diagnostic());
     }
 
@@ -1006,6 +1023,68 @@ fn resolve_callback_token(args: &TurnArgs) -> Result<String, String> {
     Err("missing callback token: pass --callback-token, --callback-token-file, or ANYAGENTS_CALLBACK_TOKEN".into())
 }
 
+fn materialize_env_message_file(turns_dir: &Path, turn_id: &str) -> Option<PathBuf> {
+    let encoded = std::env::var(anyagents_harness::GUEST_MESSAGE_B64_ENV).ok()?;
+    materialize_b64_message_file(turns_dir, turn_id, &encoded)
+}
+
+fn materialize_b64_message_file(turns_dir: &Path, turn_id: &str, encoded: &str) -> Option<PathBuf> {
+    if encoded.trim().is_empty() {
+        return None;
+    }
+    match anyagents_harness::decode_outbound_message_b64(encoded) {
+        Ok(msg) => {
+            let bytes = serde_json::to_vec(&msg).ok()?;
+            let path = turns_dir.join(format!("{turn_id}.message.json"));
+            if let Err(err) = anyagents_harness::atomic_write_file(&path, &bytes, 0o600) {
+                eprintln!("anyagents-guest: cannot persist turn message file: {err}");
+                return None;
+            }
+            Some(path)
+        }
+        Err(err) => {
+            eprintln!(
+                "anyagents-guest: ignoring invalid {}: {err}",
+                anyagents_harness::GUEST_MESSAGE_B64_ENV
+            );
+            None
+        }
+    }
+}
+
+fn load_outbound_message_file(path: &Path) -> Option<OutboundMessage> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<OutboundMessage>(&raw).ok()
+}
+
+fn resolve_outbound_message(args: &TurnArgs, prompt: &str) -> OutboundMessage {
+    let parsed = args
+        .message_file
+        .as_deref()
+        .and_then(load_outbound_message_file)
+        .or_else(|| {
+            std::env::var(anyagents_harness::GUEST_MESSAGE_B64_ENV)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .and_then(|s| anyagents_harness::decode_outbound_message_b64(&s).ok())
+        });
+    if let Some(mut msg) = parsed {
+        if msg.id.trim().is_empty() {
+            msg.id = args.turn_id.clone();
+        }
+        return msg;
+    }
+    OutboundMessage {
+        id: args.turn_id.clone(),
+        seq: 1,
+        text: prompt.to_string(),
+        sender: None,
+        reply_to: None,
+        source_time_ms: None,
+        context: Context::default(),
+    }
+}
+
 fn read_prompt(args: &TurnArgs) -> Result<String, String> {
     if let Some(ref inline) = args.prompt {
         return Ok(inline.clone());
@@ -1020,6 +1099,11 @@ fn read_prompt(args: &TurnArgs) -> Result<String, String> {
             .read_to_string(&mut buf)
             .map_err(|e| format!("cannot read prompt from stdin: {e}"))?;
         return Ok(buf);
+    }
+    if let Some(ref msg_path) = args.message_file
+        && let Some(msg) = load_outbound_message_file(msg_path)
+    {
+        return Ok(msg.text);
     }
     Err("turn requires --prompt-file, --prompt-stdin, or --prompt".into())
 }
@@ -1235,5 +1319,74 @@ mod tests {
             updated["permissions"]["deny"],
             serde_json::json!(["invoke_subagent", "search_web"])
         );
+    }
+
+    #[test]
+    fn message_file_and_b64_roundtrip_preserves_outbound_message_and_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let rich = OutboundMessage {
+            id: "msg_01realid".into(),
+            seq: 42,
+            text: "check deployment status".into(),
+            sender: Some("telegram:user:1234".into()),
+            reply_to: Some("telegram:chat:-1009:thread:5".into()),
+            source_time_ms: Some(1_795_137_786_000),
+            context: Context {
+                sender: Some("telegram:user:1234".into()),
+                chat_id: Some(-1009),
+                chat_title: Some("Release Room".into()),
+                thread_id: Some(5),
+                destination: Some("telegram:chat:-1009:thread:5".into()),
+                topology: Some("<topology event=\"initial\" self=\"agent:ops\" />".into()),
+                timestamp: Some("2026-11-20T01:23:06Z".into()),
+                ..Default::default()
+            },
+        };
+        let encoded = anyagents_harness::encode_outbound_message_b64(&rich).unwrap();
+        let msg_path =
+            materialize_b64_message_file(dir.path(), "turn_abc", &encoded).expect("message file");
+        assert!(msg_path.ends_with("turn_abc.message.json"));
+
+        let args = TurnArgs {
+            detached: false,
+            turn_id: "turn_abc".into(),
+            agent_id: "agt_test".into(),
+            harness: None,
+            program: None,
+            model: None,
+            session: None,
+            prompt_file: None,
+            message_file: Some(msg_path),
+            prompt_stdin: false,
+            prompt: None,
+            callback_url: "http://127.0.0.1:9999/v1/internal/guest/events".into(),
+            callback_token: Some("tok".into()),
+            callback_token_file: None,
+            heartbeat_interval_ms: None,
+            state_dir: None,
+            workdir: None,
+            git_program: None,
+            extra_args: Vec::new(),
+        };
+        assert_eq!(read_prompt(&args).unwrap(), "check deployment status");
+        let resolved = resolve_outbound_message(&args, "fallback prompt");
+        assert_eq!(resolved, rich);
+        let composed =
+            anyagents_harness::compose_message(&resolved.id, &resolved.context, &resolved.text);
+        assert!(composed.contains("id=\"msg_01realid\""));
+        assert!(composed.contains("from=\"telegram:user:1234\""));
+        assert!(composed.contains("chat_title=\"Release Room\""));
+        assert!(composed.contains("topic=\"5\""));
+        assert!(composed.contains("at=\"2026-11-20T01:23:06Z\""));
+        assert!(composed.contains("<topology event=\"initial\" self=\"agent:ops\" />"));
+        assert!(!composed.contains("from=\"unknown\""));
+        assert!(!composed.contains("anyagents:reply:turn_"));
+
+        // Fallback works cleanly when `--message-file` is absent.
+        let mut legacy_args = args;
+        legacy_args.message_file = None;
+        let fallback = resolve_outbound_message(&legacy_args, "plain prompt");
+        assert_eq!(fallback.id, "turn_abc");
+        assert_eq!(fallback.text, "plain prompt");
     }
 }

@@ -408,18 +408,6 @@ impl AgentMcp {
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
                 let mut response = self.client.get_agents_for_state(state_trimmed).await?;
-                match state_trimmed {
-                    Some(state_filter) if !state_filter.eq_ignore_ascii_case("all") => {
-                        response.agents.retain(|a| {
-                            a.state.eq_ignore_ascii_case(state_filter)
-                                || a.turn_state.eq_ignore_ascii_case(state_filter)
-                        });
-                    }
-                    Some(_) => {}
-                    None => {
-                        response.agents.retain(|a| a.state != "archived");
-                    }
-                }
                 if let Some(parent_filter) = args
                     .parent
                     .as_deref()
@@ -470,10 +458,21 @@ impl AgentMcp {
                                 .or_else(|| Some(cleaned.to_string()))
                         };
                         if let Some(wid) = wanted_id {
-                            response
-                                .agents
-                                .retain(|a| a.parent.as_deref() == Some(wid.as_str()));
+                            let sub = args.include_descendants.unwrap_or(false);
+                            retain_parent_or_descendants(&mut response.agents, &wid, sub);
                         }
+                    }
+                }
+                match state_trimmed {
+                    Some(state_filter) if !state_filter.eq_ignore_ascii_case("all") => {
+                        response.agents.retain(|a| {
+                            a.state.eq_ignore_ascii_case(state_filter)
+                                || a.turn_state.eq_ignore_ascii_case(state_filter)
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        response.agents.retain(|a| a.state != "archived");
                     }
                 }
                 let summary = filter_and_summarize_agent_list(
@@ -899,8 +898,11 @@ impl AgentMcp {
                             .map(|a| a.id.clone())
                             .unwrap_or_else(|| cleaned.to_string())
                     };
-                    resp.agents
-                        .retain(|a| a.parent.as_deref() == Some(wanted_id.as_str()));
+                    retain_parent_or_descendants(
+                        &mut resp.agents,
+                        &wanted_id,
+                        args.include_descendants.unwrap_or(false),
+                    );
                 }
                 if let Some(st) = args
                     .state

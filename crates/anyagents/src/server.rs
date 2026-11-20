@@ -53,6 +53,7 @@ pub(crate) mod s3_media_profiles;
 mod schedules;
 pub(crate) mod secrets;
 pub(crate) mod serverless;
+mod serverless_envelope;
 mod serverless_failure;
 mod serverless_memory;
 mod serverless_watches;

@@ -517,6 +517,10 @@ pub fn build_bundle_tar_gz(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, Str
     }
     sorted.sort_by(|a, b| a.0.cmp(b.0));
 
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1);
     let encoder = GzEncoder::new(Vec::new(), Compression::fast());
     let mut builder = tar::Builder::new(encoder);
     for (rel, bytes) in sorted {
@@ -528,7 +532,7 @@ pub fn build_bundle_tar_gz(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, Str
             0o644
         };
         header.set_mode(mode);
-        header.set_mtime(0);
+        header.set_mtime(now_secs);
         header.set_cksum();
         builder
             .append_data(&mut header, rel, bytes)
@@ -879,8 +883,20 @@ fn sanitize_archive_rel_path(path: &Path) -> Result<PathBuf, String> {
 
 fn is_private_bundle_file(rel: &str) -> bool {
     let lower = rel.to_ascii_lowercase();
-    lower.ends_with(".mcp-token")
-        || lower.ends_with("auth.json")
-        || lower.ends_with(".credentials.json")
-        || lower.ends_with("oauth-token")
+    let basename = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    matches!(
+        basename,
+        "guest-config.json"
+            | "credentials.json"
+            | ".credentials.json"
+            | "auth.json"
+            | "key"
+            | ".mcp-token"
+    ) || lower.contains(".config/opencode/")
+        || lower.starts_with("opencode/")
+        || basename.ends_with(".key")
+        || basename.ends_with("-session-id")
+        || basename.contains("token")
+        || basename.contains("secret")
+        || basename.contains("credential")
 }

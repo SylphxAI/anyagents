@@ -336,6 +336,10 @@ impl PgHandle {
             has_direct_override,
         };
         handle.ensure_schema()?;
+        let direct = handle
+            .has_direct_override
+            .then_some(handle.direct_url.as_str());
+        crate::store::ensure_pg_conversation_indexes(&handle.pool, direct, PG_MIGRATION_LOCK_KEY)?;
         Ok(handle)
     }
 

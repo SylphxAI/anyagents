@@ -141,6 +141,40 @@ impl Store {
         })
     }
 
+    /// Ensure `agent_id` has a live remote session token valid for `ttl_ms`
+    /// without revoking sibling active tokens of an already-live session.
+    ///
+    /// When a live non-revoked session exists, issues a fresh token under that
+    /// same `session_id` so concurrent in-flight MCP calls using earlier tokens
+    /// keep authenticating until their own expiry or explicit revocation (pause,
+    /// archive, or [`Self::revoke_remote_sessions`]). Only opens a new session
+    /// when no live session exists.
+    pub fn ensure_remote_session_token(
+        &self,
+        agent_id: &AgentId,
+        ttl_ms: i64,
+    ) -> Result<RemoteSessionToken, Error> {
+        let ttl_ms = checked_ttl(ttl_ms)?;
+        let fallback_session_id = format!("{SESSION_ID_PREFIX}{}", random_hex(SESSION_BYTES)?);
+        let now = now_ms();
+        self.write_tx(|tx| {
+            agent_exists(tx, agent_id)?;
+            let existing_session: Option<String> = tx.db_query_opt(
+                "SELECT session_id
+                   FROM remote_session_tokens
+                  WHERE agent_id = ?1 AND revoked_at_ms IS NULL AND expires_at_ms > ?2
+                  ORDER BY expires_at_ms DESC
+                  LIMIT 1",
+                &db_params![agent_id, now],
+                |row| row.get(0),
+            )?;
+            let session_id = existing_session
+                .as_deref()
+                .unwrap_or(fallback_session_id.as_str());
+            insert_token(tx, agent_id, session_id, now, ttl_ms)
+        })
+    }
+
     /// Issue a fresh token for a session that is still live, valid for
     /// `ttl_ms`. Earlier tokens of the session keep their own expiry, so a
     /// call the remote side made with the last token still completes. A
@@ -488,5 +522,31 @@ mod tests {
             })
             .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn ensure_remote_session_token_preserves_parallel_tokens_until_explicit_revocation() {
+        let (_dir, store, agent) = store();
+        let first = store
+            .ensure_remote_session_token(&agent, HOUR_MS)
+            .expect("first session token");
+        let second = store
+            .ensure_remote_session_token(&agent, HOUR_MS)
+            .expect("second sibling token on same live session");
+        assert_ne!(first.token, second.token);
+        assert_eq!(first.session_id, second.session_id);
+        assert!(store.authenticate_remote_session(&first.token).is_ok());
+        assert!(store.authenticate_remote_session(&second.token).is_ok());
+
+        // Explicit revocation immediately invalidates every sibling token.
+        let revoked = store.revoke_remote_sessions(&agent, None).unwrap();
+        assert_eq!(revoked, 2);
+        assert!(store.authenticate_remote_session(&first.token).is_err());
+        assert!(store.authenticate_remote_session(&second.token).is_err());
+
+        // After revocation, ensure_remote_session_token opens a brand-new session_id.
+        let third = store.ensure_remote_session_token(&agent, HOUR_MS).unwrap();
+        assert_ne!(third.session_id, first.session_id);
+        assert!(store.authenticate_remote_session(&third.token).is_ok());
     }
 }

@@ -662,11 +662,12 @@ pub(crate) fn run_serve_io<R: BufRead + Send + 'static, W: Write>(
         .model
         .clone()
         .or_else(|| file_cfg.as_ref().and_then(|c| c.model.clone()));
-    let session = args
-        .session
-        .clone()
-        .or_else(|| file_cfg.as_ref().and_then(|c| c.session_id.clone()))
-        .or_else(|| read_persisted_session(&state_dir, &harness_name));
+    let session = crate::workspace_delta::resolve_guest_session(
+        &state_dir,
+        &harness_name,
+        args.session.as_deref(),
+        file_cfg.as_ref().and_then(|c| c.session_id.as_deref()),
+    );
     let mut extra_args = file_cfg
         .as_ref()
         .map(|c| c.extra_args.clone())
@@ -1361,17 +1362,19 @@ pub(crate) fn build_guest_env(
         env.extend(cfg.env.iter().cloned());
     }
     let state_str = state_dir.display().to_string();
+    let config_home = crate::workspace_delta::ensure_xdg_config_home(state_dir);
     let data_home = state_dir.join("data-home");
     let state_home = state_dir.join("state-home");
     let omp_dir = state_dir.join(".omp/agent");
     for d in [&data_home, &state_home, &omp_dir] {
         let _ = std::fs::create_dir_all(d);
     }
+
     for (k, v) in [
         ("HOME", state_str.as_str()),
         ("CLAUDE_CONFIG_DIR", state_str.as_str()),
         ("CODEX_HOME", state_str.as_str()),
-        ("XDG_CONFIG_HOME", state_str.as_str()),
+        ("XDG_CONFIG_HOME", &config_home.display().to_string()),
         ("XDG_DATA_HOME", &data_home.display().to_string()),
         ("XDG_STATE_HOME", &state_home.display().to_string()),
         ("PI_CODING_AGENT_DIR", &omp_dir.display().to_string()),
@@ -1389,33 +1392,15 @@ pub(crate) fn build_guest_env(
 }
 
 pub(crate) fn load_guest_config(state_dir: &Path) -> Option<GuestConfig> {
-    let raw = std::fs::read_to_string(state_dir.join(GUEST_CONFIG_FILE)).ok()?;
-    serde_json::from_str(&raw).ok()
+    crate::workspace_delta::tighten_sensitive_permissions(state_dir);
+    serde_json::from_str(&std::fs::read_to_string(state_dir.join(GUEST_CONFIG_FILE)).ok()?).ok()
 }
 
 #[path = "repo.rs"]
 mod repo;
 pub(crate) use repo::{ensure_repo_checked_out, load_repo_spec};
 
-pub(crate) fn read_persisted_session(state_dir: &Path, harness: &str) -> Option<String> {
-    let raw = std::fs::read_to_string(state_dir.join(format!("{harness}-session-id"))).ok()?;
-    let trimmed = raw.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-pub(crate) fn persist_session(
-    state_dir: &Path,
-    harness: &str,
-    session_id: &str,
-) -> Result<(), String> {
-    let trimmed = session_id.trim();
-    if trimmed.is_empty() {
-        return Ok(());
-    }
-    let path = state_dir.join(format!("{harness}-session-id"));
-    anyagents_harness::atomic_write_nonempty_file(&path, format!("{trimmed}\n").as_bytes(), 0o600)
-        .map_err(|e| e.to_string())
-}
+pub(crate) use crate::workspace_delta::persist_session;
 
 fn read_claude_transcript_reply(state_dir: &Path, session_id: Option<&str>) -> Option<String> {
     let sid = session_id?;
