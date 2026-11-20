@@ -27,9 +27,6 @@ use super::{
 const INDEX_HTML: &str = include_str!("console/index.html");
 const CONSOLE_CSS: &str = include_str!("console/console.css");
 const CONSOLE_JS: &str = include_str!("console/console.js");
-const PROFILES_JS: &str = include_str!("console/profiles.js");
-const SECRETS_JS: &str = include_str!("console/secrets.js");
-const SIGNIN_JS: &str = include_str!("console/signin.js");
 
 fn static_asset_response(content_type: &'static str, body: &'static str) -> Response {
     console_html::console_response(StatusCode::OK, content_type, body.to_string())
@@ -79,18 +76,6 @@ pub(crate) async fn console_css_route() -> Response {
 
 pub(crate) async fn console_js_route() -> Response {
     static_asset_response("application/javascript; charset=utf-8", CONSOLE_JS)
-}
-
-pub(crate) async fn profiles_js_route() -> Response {
-    static_asset_response("application/javascript; charset=utf-8", PROFILES_JS)
-}
-
-pub(crate) async fn secrets_js_route() -> Response {
-    static_asset_response("application/javascript; charset=utf-8", SECRETS_JS)
-}
-
-pub(crate) async fn signin_js_route() -> Response {
-    static_asset_response("application/javascript; charset=utf-8", SIGNIN_JS)
 }
 
 /// `GET /admin/api/overview`: operator-only summary supplementing `/v1/agents` with
@@ -204,12 +189,13 @@ pub(crate) fn mount_admin_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/admin/", get(redirect_to_root_route))
         .route("/assets/console.css", get(console_css_route))
         .route("/assets/console.js", get(console_js_route))
-        .route("/assets/profiles.js", get(profiles_js_route))
-        .route("/assets/secrets.js", get(secrets_js_route))
-        .route("/assets/signin.js", get(signin_js_route))
+        // Legacy URLs route to the same generated React entry point.
+        .route("/assets/profiles.js", get(console_js_route))
+        .route("/assets/secrets.js", get(console_js_route))
+        .route("/assets/signin.js", get(console_js_route))
         .route("/admin/assets/styles.css", get(console_css_route))
         .route("/admin/assets/app.js", get(console_js_route))
-        .route("/admin/assets/secrets.js", get(secrets_js_route))
+        .route("/admin/assets/secrets.js", get(console_js_route))
         .route("/admin/auth/login", get(admin_auth::login_route))
         .route("/admin/auth/callback", get(admin_auth::callback_route))
         .route("/admin/auth/logout", post(admin_auth::logout_route))
@@ -468,8 +454,7 @@ mod tests {
         let root_html_bytes = authed_root.into_body().collect().await.unwrap().to_bytes();
         let root_html = String::from_utf8_lossy(&root_html_bytes);
         assert!(root_html.contains("AnyAgents Console"));
-        assert!(root_html.contains(r#"src="/assets/console.js""#));
-        assert!(root_html.contains(r#"src="/assets/profiles.js""#));
+        assert!(root_html.contains(r#"id="console-root""#));
         assert!(root_html.contains(r#"src="/assets/secrets.js""#));
         assert!(!root_html.contains("<script>"));
 
@@ -794,7 +779,7 @@ mod tests {
                 .to_bytes(),
         )
         .to_string();
-        assert!(expired_html.contains("Sign-in session expired"));
+        assert!(expired_html.contains("Your sign-in session expired before returning"));
         assert!(expired_html.contains("Sign in again"));
         assert!(expired_html.contains(r#"href="https://console.example.com/admin/auth/login""#));
 

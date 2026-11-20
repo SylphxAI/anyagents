@@ -1,78 +1,24 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Sign In — AnyAgents</title>
-  <link rel="stylesheet" href="/assets/console.css" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · AnyAgents</title>
+  <link rel="stylesheet" href="/assets/console.css">
+  <script type="module" src="/assets/signin.js"></script>
 </head>
-<body class="surface-grid-bg">
-  <div class="signin-shell">
-    <main class="signin-card" aria-labelledby="signin-heading">
-      <div class="signin-head">
-        <div class="signin-brand">
-          <span class="brand-mark brand-mark-lg" aria-hidden="true">
-            <svg viewBox="0 0 28 28" width="24" height="24" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <path d="M14 2.5L24 8.25V19.75L14 25.5L4 19.75V8.25L14 2.5Z" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round" />
-              <path d="M14 8.2L8.8 18.2M14 8.2L19.2 18.2M10.4 15.2H17.6" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" />
-              <circle cx="14" cy="8.2" r="1.9" fill="currentColor" />
-              <circle cx="8.8" cy="18.2" r="1.75" fill="currentColor" />
-              <circle cx="19.2" cy="18.2" r="1.75" fill="currentColor" />
-            </svg>
-          </span>
-          <div>
-            <h1 id="signin-heading" class="brand-title">AnyAgents</h1>
-            <span class="brand-subtitle">Control Plane Console</span>
-          </div>
-        </div>
-        <button id="theme-toggle" class="btn btn-ghost btn-icon" type="button" title="Toggle dark/light theme" aria-label="Toggle color theme">
-          <svg class="icon-sun" viewBox="0 0 16 16" width="15" height="15" fill="none" aria-hidden="true">
-            <circle cx="8" cy="8" r="3" stroke="currentColor" stroke-width="1.5" />
-            <path d="M8 1.5V3M8 13V14.5M1.5 8H3M13 8H14.5M3.4 3.4L4.46 4.46M11.54 11.54L12.6 12.6M12.6 3.4L11.54 4.46M4.46 11.54L3.4 12.6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-          </svg>
-          <svg class="icon-moon" viewBox="0 0 16 16" width="15" height="15" fill="none" aria-hidden="true">
-            <path d="M13.3 9.7A5.5 5.5 0 0 1 6.3 2.7a5.5 5.5 0 1 0 7 7Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
-          </svg>
-        </button>
+<body>
+  <main class="auth-layout">
+    <div class="auth-mast"><a class="brand" href="/"><span class="auth-mark" aria-hidden="true">A</span><strong>AnyAgents</strong></a><span id="auth-theme"></span></div>
+    <section class="auth-card panel">
+      <span class="eyebrow">OPERATOR ACCESS</span>
+      <h1>Sign in to AnyAgents</h1>
+      <p>Use your identity provider to access this coordinator’s control plane.</p>
+      <a class="button primary auth-cta" href="/admin/auth/login">Sign in with OIDC <span aria-hidden="true">↗</span></a>
+      <div class="auth-cli"><div class="auth-cli-head"><h2>Prefer the CLI?</h2><span id="auth-copy"></span></div>
+        <pre><code id="auth-command">anyagents auth login --url {{COORDINATOR_URL}}</code></pre>
       </div>
-
-      <h2 class="signin-title">Operator Authentication</h2>
-      <p class="signin-lead">
-        Sign in with your configured OpenID Connect identity provider to inspect fleet topology, manage provider quota, review usage telemetry, and administer encrypted secrets.
-      </p>
-
-      <div class="signin-actions">
-        <a id="oidc-signin-btn" class="btn btn-primary btn-lg" href="/admin/auth/login">
-          <span>Sign in with OIDC</span>
-          <svg viewBox="0 0 16 16" width="15" height="15" fill="none" aria-hidden="true">
-            <path d="M3.5 8H12.5M9 4.5L12.5 8L9 11.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-        </a>
-      </div>
-
-      <div class="signin-divider" role="separator"><span>or authenticate from the CLI</span></div>
-
-      <section class="signin-cli-box" aria-label="CLI Device Flow Sign-In">
-        <div class="signin-cli-head">
-          <span class="signin-cli-label">CLI Device Flow</span>
-          <button id="copy-cli-btn" class="btn btn-secondary btn-sm" type="button">Copy</button>
-        </div>
-        <div class="signin-cli-line">
-          <span class="signin-cli-prompt mono" aria-hidden="true">$</span>
-          <pre id="cli-login-cmd" class="signin-cli-code mono" data-coordinator-url="{{COORDINATOR_URL}}">anyagents auth login --url {{COORDINATOR_URL}}</pre>
-        </div>
-        <p class="muted text-sm signin-cli-note">
-          Starts an RFC 8628 device authorization grant and stores a scoped operator session locally.
-        </p>
-      </section>
-
-      <footer class="signin-footer muted text-sm">
-        <span>Same-origin CSRF &amp; strict CSP enforced</span>
-        <span>&bull;</span>
-        <span>Open-source Control Plane</span>
-      </footer>
-    </main>
-  </div>
-  <script src="/assets/signin.js" defer></script>
+    </section>
+  </main>
 </body>
 </html>

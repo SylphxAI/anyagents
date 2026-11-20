@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · AnyAgents</title>
+  <link rel="stylesheet" href="/assets/console.css">
+  <script type="module" src="/assets/signin.js"></script>
+</head>
+<body>
+  <main class="auth-layout">
+    <div class="auth-mast"><a class="brand" href="/"><span class="auth-mark" aria-hidden="true">A</span><strong>AnyAgents</strong></a><span id="auth-theme"></span></div>
+    <section class="auth-card panel">
+      <span class="eyebrow">OPERATOR ACCESS</span>
+      <h1>Sign in to AnyAgents</h1>
+      <p>Use your identity provider to access this coordinator’s control plane.</p>
+      <a class="button primary auth-cta" href="/admin/auth/login">Sign in with OIDC <span aria-hidden="true">↗</span></a>
+      <div class="auth-cli"><div class="auth-cli-head"><h2>Prefer the CLI?</h2><span id="auth-copy"></span></div>
+        <pre><code id="auth-command">anyagents auth login --url {{COORDINATOR_URL}}</code></pre>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
