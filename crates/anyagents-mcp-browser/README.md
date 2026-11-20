@@ -9,11 +9,14 @@ Optional standalone stdio MCP server providing headless Chromium CDP browser aut
 | `browser_navigate` | Navigate to a URL (`http://`, `https://`, `about:blank`) or step history (`back`, `forward`, `reload`). |
 | `browser_snapshot` | Capture an accessibility outline with interactive `@eN` / `@<snapshot_id>:eN` refs, visible page text, or outer HTML. |
 | `browser_click` | Click an element by snapshot ref or CSS selector. |
-| `browser_type` | Focus, clear, and type into a field (optional `submit: true` or `press_key`). |
+| `browser_type` | Focus, clear, and fill a field with `text` or in-memory `secret_ref` (`op://...`, `env:<VAR>`). |
 | `browser_screenshot` | Capture viewport or `full_page` PNG screenshot as a native MCP image block (optional `path` export). |
 | `browser_eval` | Evaluate a JavaScript expression in the active page (awaits promises). |
 | `browser_tabs` | List, open, activate, or close tabs (`target_id` fails closed with `STALE_TARGET`). |
-| `browser_close` | Shut down the running Chromium process cleanly (preserving `--profile-dir` on disk). |
+| `browser_profiles` | List capability-scoped coordinator profiles (`GET /v1/browser-profiles`) or local `--profile-dir` profiles. |
+| `browser_takeover` | Start interactive human takeover (`sway` + `wayvnc` + tokenized noVNC URL, or visible headful window handoff). |
+| `browser_takeover_status` | Inspect active takeover state (`status`), release control (`release`), or stop (`stop`). |
+| `browser_close` | Shut down the running Chromium / takeover session cleanly (preserving/syncing profile data). |
 
 ## Configuration
 

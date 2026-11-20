@@ -30,12 +30,18 @@ const GZIP_MAGIC: &[u8; 2] = b"\x1f\x8b";
 /// Environment variables checked when resolving coordinator profile sync.
 pub const API_URL_ENV: &str = "ANYAGENTS_API_URL";
 pub const AGENT_TOKEN_ENV: &str = "ANYAGENTS_AGENT_TOKEN";
+pub const CAPABILITY_TOKEN_ENV: &str = "ANYAGENTS_CAPABILITY_TOKEN";
 pub const CAPABILITY_ENV: &str = "ANYAGENTS_CAPABILITY";
+pub const SESSION_TOKEN_ENV: &str = "ANYAGENTS_SESSION_TOKEN";
+pub const MCP_TOKEN_ENV: &str = "ANYAGENTS_MCP_TOKEN";
 pub const MCP_TOKEN_FILE_ENV: &str = "ANYAGENTS_MCP_TOKEN_FILE";
+pub const OPERATOR_TOKEN_ENV: &str = "ANYAGENTS_OPERATOR_TOKEN";
+pub const OPERATOR_TOKEN_FILE_ENV: &str = "ANYAGENTS_OPERATOR_TOKEN_FILE";
 pub const AGENT_DATA_DIR_ENV: &str = "ANYAGENTS_AGENT_DATA_DIR";
 pub const SANDBOX_DATA_DIR_ENV: &str = "ANYAGENTS_SANDBOX_DATA_DIR";
 pub const GUEST_WORKDIR_ENV: &str = "ANYAGENTS_GUEST_WORKDIR";
 pub const SANDBOX_WORKDIR_ENV: &str = "ANYAGENTS_SANDBOX_WORKDIR";
+pub const DEFAULT_SANDBOX_DATA_DIR: &str = "/home/user/agent-data";
 
 /// Pure, testable sandbox-aligned directory resolution for `browser_screenshot`.
 ///
@@ -64,6 +70,15 @@ pub fn resolve_screenshot_dir_from(
     fallback_tmp.join("anyagents-screenshots")
 }
 
+/// Pick the first existing sandbox data dir, skipping nonexistent host paths.
+pub fn pick_existing_data_dir<'a>(candidates: &[Option<&'a Path>]) -> Option<&'a Path> {
+    candidates
+        .iter()
+        .copied()
+        .flatten()
+        .find(|p| !p.as_os_str().is_empty() && p.is_dir())
+}
+
 /// Resolve the default sandbox-accessible directory for `browser_screenshot`.
 pub fn default_screenshot_dir(config: &BrowserServerConfig) -> PathBuf {
     let agent_data = non_empty_env(AGENT_DATA_DIR_ENV).map(PathBuf::from);
@@ -71,9 +86,14 @@ pub fn default_screenshot_dir(config: &BrowserServerConfig) -> PathBuf {
     let workdir = non_empty_env(GUEST_WORKDIR_ENV)
         .or_else(|| non_empty_env(SANDBOX_WORKDIR_ENV))
         .map(PathBuf::from);
+    let existing = pick_existing_data_dir(&[
+        agent_data.as_deref(),
+        sandbox_data.as_deref(),
+        Some(Path::new(DEFAULT_SANDBOX_DATA_DIR)),
+    ]);
     resolve_screenshot_dir_from(
         config.screenshot_dir.as_deref(),
-        agent_data.as_deref(),
+        existing.or(agent_data.as_deref()),
         sandbox_data.as_deref(),
         workdir.as_deref(),
         &std::env::temp_dir(),
@@ -109,11 +129,45 @@ pub fn resolve_screenshot_path(config: &BrowserServerConfig, requested: Option<&
     dir.join(format!("shot-{ms}-{seq}.png"))
 }
 
+/// Single-authority coordinator credential (never mixes agent + operator headers).
+#[derive(Clone, PartialEq, Eq)]
+pub enum CoordinatorAuth {
+    Agent(String),
+    Operator(String),
+}
+
+impl fmt::Debug for CoordinatorAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = if self.is_agent() {
+            "Agent([redacted])"
+        } else {
+            "Operator([redacted])"
+        };
+        f.write_str(label)
+    }
+}
+
+impl CoordinatorAuth {
+    pub fn is_agent(&self) -> bool {
+        matches!(self, Self::Agent(_))
+    }
+
+    pub fn headers(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Agent(t) => vec![
+                ("x-anyagents-agent", t.clone()),
+                ("Authorization", format!("Bearer {t}")),
+            ],
+            Self::Operator(t) => vec![("x-anyagents-operator", t.clone())],
+        }
+    }
+}
+
 /// Coordinator remote sync target for a named browser profile.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RemoteProfileSync {
     pub api_url: String,
-    pub agent_token: String,
+    pub auth: CoordinatorAuth,
     pub profile_name: String,
 }
 
@@ -121,7 +175,7 @@ impl fmt::Debug for RemoteProfileSync {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RemoteProfileSync")
             .field("api_url", &self.api_url)
-            .field("agent_token", &"[redacted]")
+            .field("auth", &self.auth)
             .field("profile_name", &self.profile_name)
             .finish()
     }
@@ -181,32 +235,58 @@ fn non_empty_env(name: &str) -> Option<String> {
     }
 }
 
-/// Resolve the agent capability token from explicit config or sandbox environment
-/// (`ANYAGENTS_AGENT_TOKEN`, `ANYAGENTS_CAPABILITY`, or `ANYAGENTS_MCP_TOKEN_FILE`).
-pub fn resolve_agent_token(explicit: Option<&str>) -> Option<String> {
-    if let Some(tok) = non_empty_trimmed(explicit) {
-        return Some(tok);
-    }
-    if let Some(tok) = non_empty_env(AGENT_TOKEN_ENV) {
-        return Some(tok);
-    }
-    if let Some(tok) = non_empty_env(CAPABILITY_ENV) {
-        return Some(tok);
-    }
-    if let Some(path) = non_empty_env(MCP_TOKEN_FILE_ENV)
-        && let Ok(contents) = std::fs::read_to_string(path)
+/// Resolve coordinator auth (agent tokens always take precedence over operator tokens).
+pub fn resolve_coordinator_auth_from<F>(explicit: Option<&str>, env: F) -> Option<CoordinatorAuth>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let get = |k| env(k).and_then(|v| non_empty_trimmed(Some(&v)));
+    let file =
+        |k| get(k).and_then(|p| non_empty_trimmed(std::fs::read_to_string(p).ok().as_deref()));
+    let keys = "ANYAGENTS_AGENT_TOKEN ANYAGENTS_CAPABILITY_TOKEN ANYAGENTS_CAPABILITY \
+        ANYAGENTS_SESSION_TOKEN ANYAGENTS_MCP_TOKEN";
+    if let Some(t) = non_empty_trimmed(explicit)
+        .or_else(|| keys.split_whitespace().find_map(get))
+        .or_else(|| file(MCP_TOKEN_FILE_ENV))
     {
-        let trimmed = contents.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
+        return Some(CoordinatorAuth::Agent(t));
     }
-    None
+    get(OPERATOR_TOKEN_ENV)
+        .or_else(|| file(OPERATOR_TOKEN_FILE_ENV))
+        .map(CoordinatorAuth::Operator)
+}
+
+pub fn resolve_agent_token(explicit: Option<&str>) -> Option<String> {
+    match resolve_coordinator_auth(explicit) {
+        Some(CoordinatorAuth::Agent(t)) => Some(t),
+        _ => None,
+    }
+}
+
+pub fn resolve_coordinator_auth(explicit: Option<&str>) -> Option<CoordinatorAuth> {
+    resolve_coordinator_auth_from(explicit, non_empty_env)
+}
+
+pub fn resolve_api_url(config: &BrowserServerConfig) -> Result<Option<String>, BrowserError> {
+    let Some(u) =
+        non_empty_trimmed(config.api_url.as_deref()).or_else(|| non_empty_env(API_URL_ENV))
+    else {
+        return Ok(None);
+    };
+    let parsed = url::Url::parse(&u)
+        .map_err(|e| BrowserError::invalid_input(format!("invalid `ANYAGENTS_API_URL`: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(BrowserError::invalid_input(
+            "`ANYAGENTS_API_URL` must use http/https",
+        ));
+    }
+    Ok(Some(u.trim_end_matches('/').to_string()))
 }
 
 /// Resolve optional coordinator profile sync configuration for the active named
-/// profile. Returns `Ok(None)` when no named profile or no coordinator env is
-/// configured.
+/// profile. Returns `Ok(None)` when no named profile or no `ANYAGENTS_API_URL`
+/// is configured; fails closed with `UNAUTHORIZED` when `ANYAGENTS_API_URL` and
+/// a named profile are set without credentials.
 pub fn resolve_sync_config(
     config: &BrowserServerConfig,
     override_profile: Option<&str>,
@@ -217,23 +297,20 @@ pub fn resolve_sync_config(
         return Ok(None);
     };
     let profile_name = validate_profile_name(&raw_profile).map_err(BrowserError::invalid_input)?;
-    let api_url =
-        non_empty_trimmed(config.api_url.as_deref()).or_else(|| non_empty_env(API_URL_ENV));
-    let agent_token = resolve_agent_token(config.agent_token.as_deref());
-    let (Some(api_url), Some(agent_token)) = (api_url, agent_token) else {
+    let Some(api_url) = resolve_api_url(config)? else {
         return Ok(None);
     };
-    let parsed = url::Url::parse(&api_url).map_err(|err| {
-        BrowserError::invalid_input(format!("invalid `ANYAGENTS_API_URL` `{api_url}`: {err}"))
+    let auth = resolve_coordinator_auth(config.agent_token.as_deref()).ok_or_else(|| {
+        BrowserError::new(
+            "UNAUTHORIZED",
+            format!(
+                "cannot sync browser profile `{profile_name}` with coordinator: missing agent or operator token"
+            ),
+        )
     })?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(BrowserError::invalid_input(
-            "`ANYAGENTS_API_URL` must use http:// or https://",
-        ));
-    }
     Ok(Some(RemoteProfileSync {
-        api_url: api_url.trim_end_matches('/').to_string(),
-        agent_token,
+        api_url,
+        auth,
         profile_name,
     }))
 }
@@ -692,6 +769,16 @@ fn read_error_detail(resp: &mut ureq::http::Response<ureq::Body>) -> String {
     String::from_utf8_lossy(&buf).trim().to_string()
 }
 
+macro_rules! with_auth {
+    ($req:expr, $auth:expr) => {{
+        let mut r = $req;
+        for (k, v) in ($auth).headers() {
+            r = r.header(k, &v);
+        }
+        r
+    }};
+}
+
 /// Download and safely unpack a named browser profile archive from the
 /// coordinator before launching Chromium.
 ///
@@ -708,9 +795,7 @@ pub fn sync_down_profile(
         sync.profile_name
     );
     let agent = build_http_agent();
-    let mut resp = agent
-        .get(&url)
-        .header("x-anyagents-agent", &sync.agent_token)
+    let mut resp = with_auth!(agent.get(&url), &sync.auth)
         .call()
         .map_err(|err| {
             BrowserError::new(
@@ -845,9 +930,7 @@ pub fn sync_up_profile(
         sync.profile_name
     );
     let agent = build_http_agent();
-    let mut resp = agent
-        .put(&url)
-        .header("x-anyagents-agent", &sync.agent_token)
+    let mut resp = with_auth!(agent.put(&url), &sync.auth)
         .header("content-type", content_type)
         .send(archive.as_slice())
         .map_err(|err| {
@@ -862,6 +945,13 @@ pub fn sync_up_profile(
     let status = resp.status().as_u16();
     match status {
         200..=299 => Ok(archive.len()),
+        401 => Err(BrowserError::new(
+            "UNAUTHORIZED",
+            format!(
+                "coordinator rejected credential while uploading browser profile `{}`",
+                sync.profile_name
+            ),
+        )),
         403 => {
             let detail = read_error_detail(&mut resp);
             Err(BrowserError::new(
@@ -893,6 +983,108 @@ pub fn sync_up_profile(
             ))
         }
     }
+}
+
+/// Query capability-scoped profiles from `GET <api_url>/v1/browser-profiles`.
+pub fn list_remote_profiles(
+    api_url: &str,
+    auth: &CoordinatorAuth,
+    active: Option<&str>,
+) -> Result<serde_json::Value, BrowserError> {
+    use serde_json::{Value, json};
+    let url = format!("{}/v1/browser-profiles", api_url.trim_end_matches('/'));
+    let mut resp = with_auth!(build_http_agent().get(&url), auth)
+        .call()
+        .map_err(|e| BrowserError::new("PROFILE_SYNC_ERROR", format!("list failed: {e}")))?;
+    match resp.status().as_u16() {
+        401 => Err(BrowserError::new("UNAUTHORIZED", "rejected credential")),
+        403 => Err(BrowserError::new(
+            "PROFILE_FORBIDDEN",
+            read_error_detail(&mut resp),
+        )),
+        200..=299 => {
+            let mut body = Vec::new();
+            let _ = resp
+                .body_mut()
+                .as_reader()
+                .take(4 * 1024 * 1024)
+                .read_to_end(&mut body);
+            let p: Value = serde_json::from_slice(&body)
+                .map_err(|e| BrowserError::new("PROFILE_SYNC_ERROR", format!("bad JSON: {e}")))?;
+            let (mut profiles, mut names) = (Vec::new(), Vec::new());
+            for item in p["profiles"].as_array().into_iter().flatten() {
+                if let Some(mut o) = item.as_object().cloned()
+                    && let Some(n) = o.get("profile").and_then(Value::as_str).map(str::to_owned)
+                {
+                    o.insert("active".into(), json!(active == Some(n.as_str())));
+                    names.push(n);
+                    profiles.push(Value::Object(o));
+                }
+            }
+            let s3 = p["s3_configured"].as_bool().unwrap_or(false);
+            Ok(json!({
+                "source": "coordinator", "scoped": auth.is_agent(), "s3_configured": s3,
+                "active_profile": active, "count": profiles.len(),
+                "profiles": profiles, "browser_profiles": names,
+            }))
+        }
+        s => Err(BrowserError::new("PROFILE_SYNC_ERROR", format!("HTTP {s}"))),
+    }
+}
+
+/// List local persistent browser profiles under `profile_dir` (standalone mode).
+pub fn list_local_profiles(
+    profile_dir: Option<&Path>,
+    active: Option<&str>,
+    running: bool,
+) -> Result<serde_json::Value, BrowserError> {
+    use serde_json::{Value, json};
+    let mut names = std::collections::BTreeSet::new();
+    if let Some(dir) = profile_dir
+        && dir.is_dir()
+    {
+        for e in std::fs::read_dir(dir)
+            .map_err(|e| BrowserError::new("IO_ERROR", format!("read: {e}")))?
+            .flatten()
+        {
+            if let Ok(m) = std::fs::symlink_metadata(e.path())
+                && !m.file_type().is_symlink()
+                && m.file_type().is_dir()
+                && let Some(n) = e.file_name().to_str()
+                && n != "user-data"
+                && validate_profile_name(n).is_ok()
+            {
+                names.insert(n.to_string());
+            }
+        }
+    }
+    let list: Vec<String> = names.iter().cloned().collect();
+    let profiles: Vec<Value> = names
+        .into_iter()
+        .map(|n| {
+            let act = active == Some(n.as_str());
+            let st = if act && running { "running" } else { "stopped" };
+            let ud = profile_dir.is_some_and(|d| d.join(&n).join("user-data").is_dir());
+            json!({"profile": n, "status": st, "active": act, "has_user_data": ud})
+        })
+        .collect();
+    Ok(json!({
+        "source": "local", "scoped": false, "active_profile": active,
+        "count": profiles.len(), "profiles": profiles, "browser_profiles": list,
+    }))
+}
+
+pub fn list_profiles(
+    config: &BrowserServerConfig,
+    active: Option<&str>,
+    running: bool,
+) -> Result<serde_json::Value, BrowserError> {
+    if let Some(api_url) = resolve_api_url(config)? {
+        let auth = resolve_coordinator_auth(config.agent_token.as_deref())
+            .ok_or_else(|| BrowserError::new("UNAUTHORIZED", "missing token"))?;
+        return list_remote_profiles(&api_url, &auth, active);
+    }
+    list_local_profiles(config.profile_dir.as_deref(), active, running)
 }
 
 #[cfg(test)]
@@ -1073,6 +1265,8 @@ mod tests {
                 let path = parts.next().unwrap_or("/").to_string();
                 let mut content_length = 0usize;
                 let mut token = String::new();
+                let mut bearer = String::new();
+                let mut op_tok = String::new();
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0
@@ -1086,6 +1280,10 @@ mod tests {
                             content_length = v.trim().parse().unwrap_or(0);
                         } else if k.trim().eq_ignore_ascii_case("x-anyagents-agent") {
                             token = v.trim().to_string();
+                        } else if k.trim().eq_ignore_ascii_case("authorization") {
+                            bearer = v.trim().to_string();
+                        } else if k.trim().eq_ignore_ascii_case("x-anyagents-operator") {
+                            op_tok = v.trim().to_string();
                         }
                     }
                 }
@@ -1094,7 +1292,29 @@ mod tests {
                     let _ = reader.read_exact(&mut body);
                 }
                 let mut stream = stream;
-                if token != "valid-agent-token" {
+                if path == "/v1/browser-profiles" || (!token.is_empty() && !op_tok.is_empty()) {
+                    let (st, m) = match (token.as_str(), bearer.as_str(), op_tok.as_str()) {
+                        ("valid-agent-token", "Bearer valid-agent-token", "") => (
+                            "200 OK",
+                            r#"{"s3_configured":true,"profiles":[{"profile":"demo-profile","granted":true}]}"#,
+                        ),
+                        ("other-agent-token", "Bearer other-agent-token", "") => {
+                            ("200 OK", r#"{"s3_configured":true,"profiles":[]}"#)
+                        }
+                        ("", "", "op-token") => (
+                            "200 OK",
+                            r#"{"s3_configured":true,"profiles":[{"profile":"demo-profile"},{"profile":"private-profile"}]}"#,
+                        ),
+                        _ => ("401 Unauthorized", r#"{"error":"unauthorized"}"#),
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {st}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{m}",
+                        m.len()
+                    );
+                    continue;
+                }
+                if token != "valid-agent-token" || bearer != "Bearer valid-agent-token" {
                     let msg = r#"{"error":"profile not granted"}"#;
                     let _ = write!(
                         stream,
@@ -1144,7 +1364,7 @@ mod tests {
         let api_url = format!("http://{addr}");
         let sync = RemoteProfileSync {
             api_url: api_url.clone(),
-            agent_token: "valid-agent-token".into(),
+            auth: CoordinatorAuth::Agent("valid-agent-token".into()),
             profile_name: "demo-profile".into(),
         };
 
@@ -1176,13 +1396,91 @@ mod tests {
 
         // 3. 403 -> PROFILE_FORBIDDEN with clear message.
         let denied_sync = RemoteProfileSync {
-            api_url,
-            agent_token: "ungranted-token".into(),
+            api_url: api_url.clone(),
+            auth: CoordinatorAuth::Agent("ungranted-token".into()),
             profile_name: "demo-profile".into(),
         };
         let err = sync_down_profile(&denied_sync, &fresh_ud).unwrap_err();
         assert_eq!(err.code, "PROFILE_FORBIDDEN");
         assert!(err.message.contains("not granted"));
+
+        // 4. Capability-scoped GET /v1/browser-profiles isolates agents & fails closed.
+        let a = CoordinatorAuth::Agent("valid-agent-token".into());
+        let b = CoordinatorAuth::Agent("other-agent-token".into());
+        let op = CoordinatorAuth::Operator("op-token".into());
+        let la = list_remote_profiles(&api_url, &a, Some("demo-profile")).unwrap();
+        assert!(la["scoped"] == true && la["profiles"][0]["active"] == true);
+        assert_eq!(la["browser_profiles"], serde_json::json!(["demo-profile"]));
+        let lb = list_remote_profiles(&api_url, &b, None).unwrap();
+        let lo = list_remote_profiles(&api_url, &op, None).unwrap();
+        assert!(lb["count"] == 0 && lo["scoped"] == false && lo["count"] == 2);
+        let bad = CoordinatorAuth::Agent("bad".into());
+        assert_eq!(
+            list_remote_profiles(&api_url, &bad, None).unwrap_err().code,
+            "UNAUTHORIZED"
+        );
+    }
+
+    #[test]
+    fn coordinator_auth_precedence_single_authority_and_local_profile_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mcp_f, op_f) = (dir.path().join("mcp"), dir.path().join("op"));
+        std::fs::write(&mcp_f, "file-agent\n").unwrap();
+        std::fs::write(&op_f, "file-op\n").unwrap();
+        let exp = resolve_coordinator_auth_from(Some("exp"), |k| match k {
+            AGENT_TOKEN_ENV => Some("env-a".into()),
+            OPERATOR_TOKEN_ENV => Some("env-op".into()),
+            _ => None,
+        })
+        .unwrap();
+        let h = exp.headers();
+        assert!(exp.is_agent() && !format!("{exp:?}").contains("exp"));
+        assert!(h[0].0 == "x-anyagents-agent" && h[1].1 == "Bearer exp");
+        for key in [
+            AGENT_TOKEN_ENV,
+            CAPABILITY_TOKEN_ENV,
+            CAPABILITY_ENV,
+            SESSION_TOKEN_ENV,
+            MCP_TOKEN_ENV,
+        ] {
+            let a = resolve_coordinator_auth_from(None, |k| (k == key).then(|| "tok".into()));
+            assert!(
+                a.unwrap()
+                    .headers()
+                    .iter()
+                    .all(|(k, _)| *k != "x-anyagents-operator")
+            );
+        }
+        let (ms, os) = (mcp_f.display().to_string(), op_f.display().to_string());
+        let fa = resolve_coordinator_auth_from(None, |k| match k {
+            MCP_TOKEN_FILE_ENV => Some(ms.clone()),
+            OPERATOR_TOKEN_ENV => Some("op".into()),
+            _ => None,
+        });
+        assert_eq!(fa, Some(CoordinatorAuth::Agent("file-agent".into())));
+        let op = resolve_coordinator_auth_from(None, |k| {
+            (k == OPERATOR_TOKEN_FILE_ENV).then(|| os.clone())
+        })
+        .unwrap();
+        assert!(
+            op.headers()[0] == ("x-anyagents-operator", "file-op".into())
+                && !format!("{op:?}").contains("file-op")
+        );
+
+        let pdir = dir.path().join("profiles");
+        for d in ["work/user-data", "research", "user-data", ".stage"] {
+            std::fs::create_dir_all(pdir.join(d)).unwrap();
+        }
+        std::fs::write(pdir.join("file"), b"x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(pdir.join("work"), pdir.join("linked")).unwrap();
+        let l = list_local_profiles(Some(&pdir), Some("work"), true).unwrap();
+        assert_eq!(
+            l["browser_profiles"],
+            serde_json::json!(["research", "work"])
+        );
+        assert!(l["profiles"][1]["status"] == "running");
+        assert!(l["profiles"][1]["has_user_data"] == true);
     }
 
     #[test]
@@ -1202,6 +1500,13 @@ mod tests {
             resolve_screenshot_dir_from(Some(explicit), Some(agent_data), None, None, fallback),
             PathBuf::from("/custom/shots")
         );
+
+        // Skips nonexistent host path in favor of existing sandbox dir.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("agent-data");
+        std::fs::create_dir_all(&real).unwrap();
+        let picked = pick_existing_data_dir(&[Some(&tmp.path().join("missing")), Some(&real)]);
+        assert_eq!(picked, Some(real.as_path()));
 
         let cfg = BrowserServerConfig {
             screenshot_dir: Some(PathBuf::from("/home/user/agent-data/tmp/screenshots")),
