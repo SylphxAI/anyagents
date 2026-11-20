@@ -1,6 +1,5 @@
 //! Inbox, memory, conversation history, redaction, media serving, and operator inbox routes.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use anyagents_core::{Error, Store};
@@ -16,8 +15,8 @@ use crate::api::{
 use crate::auth::Principal;
 
 use super::types::{
-    ApiError, AppState, conversation_visibility, every_agent_id, is_self_or_ancestor,
-    require_operator_audited, spawn_store,
+    ApiError, AppState, conversation_visibility, every_agent_id, require_operator_audited,
+    spawn_store,
 };
 use super::{hybrid, memory_backlog};
 
@@ -250,180 +249,6 @@ pub(super) async fn redact_conversation_route(
     .await
 }
 
-/// `GET /v1/agents/{name}/memory`: return the hydrated learned-memory topic list,
-/// index markdown, and sleep-consolidation status for `name` (authorized with the
-/// same visibility boundary as `conversation(scope="memory")`).
-pub(super) async fn agent_memory_route(
-    principal: Principal,
-    State(state): State<AppState>,
-    AxumPath(name): AxumPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    spawn_store(move || {
-        let (resolved_name, visible_agent_ids) =
-            conversation_visibility(&state.store, &principal, &name)?;
-        let target = if resolved_name.eq_ignore_ascii_case("self")
-            || resolved_name.eq_ignore_ascii_case("all")
-            || resolved_name == "*"
-        {
-            match &principal {
-                Principal::Agent { agent_id, .. } => {
-                    state.store.agent(agent_id).map_err(ApiError::from_store)?
-                }
-                Principal::Operator => {
-                    return Err(ApiError::new(
-                        StatusCode::BAD_REQUEST,
-                        "operator memory listing requires an explicit agent name",
-                    ));
-                }
-            }
-        } else {
-            state
-                .store
-                .agent_by_name(
-                    resolved_name
-                        .strip_prefix("agent:")
-                        .unwrap_or(&resolved_name),
-                )
-                .map_err(ApiError::from_store)?
-        };
-        if let Some(visible) = visible_agent_ids.as_ref()
-            && !visible
-                .iter()
-                .any(|v| v == target.id.as_str() || v == &target.name)
-        {
-            return Err(ApiError::forbidden(
-                "cannot read private memory of another agent",
-            ));
-        }
-        let agent_root = state
-            .store
-            .data_dir()
-            .join("agents")
-            .join(target.id.as_str());
-        let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(&state.store, &target.id);
-        let mem_dir = agent_root.join("memory");
-        let mem_dir_safe = std::fs::symlink_metadata(&mem_dir)
-            .ok()
-            .is_some_and(|m| m.file_type().is_dir());
-        let read_no_follow = |path: &Path| -> Option<String> {
-            use std::io::Read as _;
-            if !mem_dir_safe
-                || state
-                    .store
-                    .is_host_path_redacted(target.id.as_str(), path)
-                    .unwrap_or(true)
-            {
-                return None;
-            }
-            let mut f = anyagents_core::raw_segment::open_readonly(path).ok()?;
-            let mut bytes = Vec::new();
-            f.read_to_end(&mut bytes).ok()?;
-            Some(String::from_utf8_lossy(&bytes).into_owned())
-        };
-        let mut topics: Vec<anyagents_core::learned_memory::MemoryTopicEntry> = Vec::new();
-        if mem_dir_safe && let Ok(entries) = std::fs::read_dir(&mem_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                if fname.starts_with('.')
-                    || fname.eq_ignore_ascii_case("MEMORY.md")
-                    || !fname.ends_with(".md")
-                {
-                    continue;
-                }
-                let Ok(smeta) = std::fs::symlink_metadata(&path) else {
-                    continue;
-                };
-                if !smeta.file_type().is_file() {
-                    continue;
-                }
-                let Some(raw) = read_no_follow(&path) else {
-                    continue;
-                };
-                let slug = fname.strip_suffix(".md").unwrap_or(fname).to_string();
-                let (_, description, _, fm_updated_ms, _) =
-                    anyagents_core::learned_memory::parse_topic_frontmatter_full(&slug, &raw);
-                let fs_mtime_ms = smeta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
-                    .unwrap_or(0);
-                topics.push(anyagents_core::learned_memory::MemoryTopicEntry {
-                    slug,
-                    filename: fname.to_string(),
-                    description,
-                    updated_at_ms: fm_updated_ms.filter(|&ts| ts > 0).unwrap_or(fs_mtime_ms),
-                    bytes: raw.len(),
-                });
-            }
-            topics.sort_by(|a, b| {
-                b.updated_at_ms
-                    .cmp(&a.updated_at_ms)
-                    .then_with(|| a.slug.cmp(&b.slug))
-            });
-        }
-        let index_path = mem_dir.join("MEMORY.md");
-        let index_is_symlink = std::fs::symlink_metadata(&index_path)
-            .ok()
-            .is_some_and(|m| m.file_type().is_symlink());
-        let existing_index = if index_is_symlink {
-            None
-        } else {
-            read_no_follow(&index_path)
-        };
-        let needs_index_rebuild = mem_dir_safe
-            && !index_is_symlink
-            && !topics.is_empty()
-            && existing_index
-                .as_deref()
-                .is_none_or(|s| s.contains("No topic files recorded yet."));
-        if needs_index_rebuild
-            && let Ok(index) = anyagents_core::learned_memory::rebuild_memory_index(
-                &agent_root,
-                &target.name,
-                target.role.as_deref(),
-            )
-        {
-            crate::sandbox_exec::persist_agent_memory_file_to_store(
-                &state.store,
-                &target.id,
-                "MEMORY.md",
-                index.as_bytes(),
-            );
-        }
-        let index_text = if index_is_symlink {
-            String::new()
-        } else {
-            read_no_follow(&index_path).unwrap_or_else(|| {
-                format!(
-                    "# {} — Learned Memory Index\n- No topic files recorded yet.\n",
-                    target.name
-                )
-            })
-        };
-        let sleep_path = mem_dir.join(".sleep-state.json");
-        let sleep_state: anyagents_core::learned_memory::SleepState = read_no_follow(&sleep_path)
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
-        let topic_count = topics.len();
-        Ok(Json(serde_json::json!({
-            "agent": target.name,
-            "agent_id": target.id.as_str(),
-            "topics": topics,
-            "topic_count": topic_count,
-            "index": index_text,
-            "index_bytes": index_text.len(),
-            "index_lines": index_text.lines().count(),
-            "last_consolidated_ms": sleep_state.last_consolidated_ms,
-            "consolidated_topics": sleep_state.consolidated_topics,
-        })))
-    })
-    .await
-}
-
 pub(super) async fn conversation_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -631,12 +456,12 @@ pub(super) async fn conversation_route(
             let allowed = match &principal {
                 Principal::Operator => true,
                 Principal::Agent { agent_id, .. } => {
-                    is_self_or_ancestor(&state.store, agent_id, &target)
+                    *agent_id == target.id
                 }
             };
             if !allowed {
                 return Err(ApiError::forbidden(
-                    "memory write requires self, ancestor, or operator authority",
+                    "memory writes and deletes require self or operator authority",
                 ));
             }
             let _guard = state

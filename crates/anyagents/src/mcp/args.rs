@@ -725,39 +725,6 @@ pub(super) struct ScheduleArgs {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
-pub(super) struct MemoryArgs {
-    /// Learned-memory operation to perform:
-    /// - `"list"` (default when no `topic`, `query`, `content`, or `delete` is passed): Read `MEMORY.md` and list all topic entries.
-    /// - `"read"` (inferred when `topic` is provided without `content` or `delete`): Read `<agent_root>/memory/<topic>.md` in O(1).
-    /// - `"write"` / `"upsert"` (inferred when `content` is provided): Create or update `<agent_root>/memory/<topic>.md` and rebuild `MEMORY.md`.
-    /// - `"delete"` (inferred when `delete: true` is provided): Delete `<agent_root>/memory/<topic>.md` and rebuild `MEMORY.md`.
-    /// - `"search"` (inferred when `query` is provided): Search the FTS5 learned-memory index.
-    #[serde(default)]
-    pub(super) action: Option<String>,
-    /// Learned-memory topic slug (`<agent_root>/memory/<topic>.md`, e.g. `"deployment-runbook"`).
-    #[serde(default, alias = "slug", alias = "name")]
-    pub(super) topic: Option<String>,
-    /// 1-line trigger description indexed in `MEMORY.md` when `action = "write"` / `"upsert"`.
-    #[serde(default, alias = "summary", alias = "trigger")]
-    pub(super) description: Option<String>,
-    /// Markdown body to write into `<agent_root>/memory/<topic>.md` when `action = "write"` / `"upsert"`.
-    #[serde(default, alias = "body", alias = "text", alias = "markdown")]
-    pub(super) content: Option<String>,
-    /// Search query when `action = "search"`.
-    #[serde(default, alias = "q", alias = "search")]
-    pub(super) query: Option<String>,
-    /// When `true`, deletes `<agent_root>/memory/<topic>.md` and rebuilds `MEMORY.md`.
-    #[serde(default)]
-    pub(super) delete: Option<bool>,
-    /// Target agent name or `agt_...` ID (defaults to this agent itself).
-    #[serde(default, alias = "target")]
-    pub(super) agent: Option<String>,
-    /// Maximum number of results when `action = "search"` or `"list"` (default 20).
-    #[serde(default)]
-    pub(super) limit: Option<usize>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(super) struct InboxArgs {
     /// Optional sequence number cursor (`seq > since`).
     #[serde(default, alias = "after_seq", alias = "from_seq")]

@@ -85,8 +85,10 @@ fn memory_backlog_follows_wakes_and_idle_consolidation_visits_nothing() {
     consolidate_idle_agent_memory(&store, dir.path(), &HealthBoard::default(), &backlog);
     assert!(!sleep_state.exists(), "idle agent was visited");
 
+    // A non-substantive turn still wakes the agent but never requires an
+    // external sleep model or its cooldown to settle the backlog.
     store
-        .receive(&agent.id, anyagents_core::Incoming::new("new work"))
+        .receive(&agent.id, anyagents_core::Incoming::new("NO_REPLY"))
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while backlog.pending().is_empty() && std::time::Instant::now() < deadline {
@@ -7269,6 +7271,9 @@ async fn http(
     let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, value)
 }
+
+#[path = "memory_http_tests.rs"]
+mod memory_http_tests;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn over_http_only_operator_root_creation_can_request_a_named_seat() {
