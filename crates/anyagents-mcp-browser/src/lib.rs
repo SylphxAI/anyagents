@@ -7,6 +7,7 @@
 pub mod chromium;
 pub mod config;
 pub mod profile_sync;
+pub mod proxy;
 pub mod secrets;
 pub mod server;
 pub mod session;

@@ -18,9 +18,10 @@ use url::Url;
 
 use crate::chromium::{discover_chromium, is_executable_file};
 use crate::profile_sync::validate_profile_name;
+use crate::proxy::{ProxyHandle, ProxyOverride};
 use crate::session::{
     BrowserBackend, BrowserError, BrowserInstance, BrowserSession, DESKTOP_PRINCIPAL,
-    finalize_instance, prepare_profile_workspace,
+    finalize_instance, prepare_profile_workspace, resolve_session_proxy,
 };
 use crate::url_guard::navigable_url;
 
@@ -36,6 +37,12 @@ pub struct BrowserTakeoverArgs {
     pub reason: Option<String>,
     /// Optional public base URL override for the noVNC takeover page.
     pub public_url: Option<String>,
+    /// Optional browser-only proxy URL (`http://`, `https://`, `socks5://`, `socks5h://`) or `op://` secret_ref.
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// Optional env var name (e.g. from Named Encrypted Secrets) holding a browser-only proxy URL.
+    #[serde(default)]
+    pub proxy_env: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
@@ -147,6 +154,7 @@ impl BrowserSession {
             .map(validate_profile_name)
             .transpose()
             .map_err(inv)?;
+        let proxy_ov = ProxyOverride::from_opts(req.proxy, req.proxy_env);
         let env_pub = std::env::var("ANYAGENTS_TAKEOVER_PUBLIC_URL").ok();
         let pub_url = parse_public_url(req.public_url.as_deref().or(env_pub.as_deref()))?;
         let dirs: Vec<PathBuf> = BIN_DIRS.split_whitespace().map(PathBuf::from).collect();
@@ -160,8 +168,20 @@ impl BrowserSession {
             let alive = g.as_mut().is_some_and(BrowserInstance::is_alive);
             let cur_prof = g.as_ref().and_then(|i| i.active_profile.clone());
             let same_p = prof.is_none() || cur_prof == prof;
+            let target_p = prof
+                .clone()
+                .or_else(|| same_p.then_some(cur_prof.clone()).flatten());
+            let effective_prof = target_p.as_deref().or(self.config.profile.as_deref());
+            drop(g);
+            let desired_proxy =
+                resolve_session_proxy(&self.config, effective_prof, proxy_ov.as_ref()).await?;
+            g = self.inner.lock().await;
+            let alive = g.as_mut().is_some_and(BrowserInstance::is_alive);
+            let same_proxy =
+                proxy_ov.is_none() || g.as_ref().map(|i| &i.active_proxy) == Some(&desired_proxy);
             let reuse = alive
                 && same_p
+                && same_proxy
                 && g.as_ref()
                     .is_some_and(|i| matches!(i.backend, BrowserBackend::Desktop { .. }));
             if !reuse {
@@ -170,10 +190,13 @@ impl BrowserSession {
                 if let Some(mut old) = old {
                     finalize_instance(&mut old).await;
                 }
-                let target_p = prof.or_else(|| same_p.then_some(cur_prof).flatten());
                 let bin = discover_chromium(self.config.chromium_bin.as_deref())
                     .map_err(BrowserError::browser_not_found)?;
                 let ws = prepare_profile_workspace(&self.config, target_p.as_deref()).await?;
+                let proxy_handle = match &desired_proxy {
+                    Some(p) => Some(ProxyHandle::start(p).await?),
+                    None => None,
+                };
                 let rt = tempfile::Builder::new()
                     .prefix("aa-desk-")
                     .tempdir()
@@ -186,8 +209,8 @@ impl BrowserSession {
                         .split_whitespace()
                         .map(str::to_string)
                         .collect();
-                if let Some(p) = trimmed(self.config.proxy.as_deref()) {
-                    browser.extra_args.push(format!("--proxy-server={p}"));
+                if let Some(ref ph) = proxy_handle {
+                    browser.extra_args.extend(ph.chromium_args());
                 }
                 browser.extra_args.extend(self.config.parsed_extra_args());
                 let root = ws.user_data_dir.parent().unwrap_or(&ws.user_data_dir);
@@ -214,9 +237,11 @@ impl BrowserSession {
                     },
                     persistent_profile: ws.persistent_profile,
                     active_profile: ws.active_profile,
+                    active_proxy: desired_proxy,
                     user_data_dir: ws.user_data_dir,
                     remote_sync: ws.remote_sync,
                     takeover: TakeoverState::default(),
+                    _proxy_handle: proxy_handle,
                     _ephemeral_dir: ws.ephemeral_dir,
                 });
             }
@@ -252,7 +277,9 @@ impl BrowserSession {
             return Ok(p);
         }
         if self.config.headful {
-            let mut live = self.acquire_with_profile(prof.as_deref()).await?;
+            let mut live = self
+                .acquire_with_options(prof.as_deref(), proxy_ov.as_ref())
+                .await?;
             if let Some(u) = url.as_deref() {
                 live.navigate(u).await?;
             }

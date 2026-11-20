@@ -20,6 +20,7 @@ use crate::profile_sync::{
     RemoteProfileSync, resolve_sync_config, sync_down_profile, sync_up_profile,
     validate_profile_name,
 };
+use crate::proxy::{BrowserProxy, ProxyHandle, ProxyOverride, resolve_browser_proxy};
 use crate::takeover::{TakeoverMode, TakeoverState};
 
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
@@ -132,9 +133,11 @@ pub struct BrowserInstance {
     pub backend: BrowserBackend,
     pub persistent_profile: bool,
     pub active_profile: Option<String>,
+    pub active_proxy: Option<BrowserProxy>,
     pub user_data_dir: PathBuf,
     pub remote_sync: Option<RemoteProfileSync>,
     pub takeover: TakeoverState,
+    pub(crate) _proxy_handle: Option<ProxyHandle>,
     pub(crate) _ephemeral_dir: Option<tempfile::TempDir>,
 }
 
@@ -287,6 +290,16 @@ impl BrowserSession {
         &self,
         requested_profile: Option<&str>,
     ) -> Result<LiveWebGuard<'_>, BrowserError> {
+        self.acquire_with_options(requested_profile, None).await
+    }
+
+    /// Acquire exclusive access to a live Chromium session, optionally selecting
+    /// a named persistent browser profile and/or browser-only proxy override.
+    pub async fn acquire_with_options(
+        &self,
+        requested_profile: Option<&str>,
+        proxy_override: Option<&ProxyOverride>,
+    ) -> Result<LiveWebGuard<'_>, BrowserError> {
         let normalized_req = requested_profile
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -296,20 +309,53 @@ impl BrowserSession {
 
         let mut guard = self.inner.lock().await;
         let alive = guard.as_mut().is_some_and(BrowserInstance::is_alive);
+        let cur_profile = guard.as_ref().and_then(|i| i.active_profile.clone());
         let profile_mismatch = alive
             && normalized_req.is_some()
-            && guard
-                .as_ref()
-                .and_then(|inst| inst.active_profile.as_deref())
-                != normalized_req.as_deref();
+            && cur_profile.as_deref() != normalized_req.as_deref();
 
-        if !alive || profile_mismatch {
+        let effective_profile = normalized_req
+            .as_deref()
+            .or(cur_profile.as_deref())
+            .or(self.config.profile.as_deref())
+            .map(str::to_string);
+        let desired_proxy = if !alive || profile_mismatch || proxy_override.is_some() {
+            drop(guard);
+            let p =
+                resolve_session_proxy(&self.config, effective_profile.as_deref(), proxy_override)
+                    .await?;
+            guard = self.inner.lock().await;
+            Some(p)
+        } else {
+            None
+        };
+        let alive = guard.as_mut().is_some_and(BrowserInstance::is_alive);
+        let proxy_mismatch = alive
+            && desired_proxy
+                .as_ref()
+                .is_some_and(|want| guard.as_ref().map(|i| &i.active_proxy) != Some(want));
+
+        if !alive || profile_mismatch || proxy_mismatch {
             if let Some(mut old) = guard.take() {
                 drop(guard);
                 finalize_instance(&mut old).await;
                 guard = self.inner.lock().await;
             }
-            let launched = launch_instance(&self.config, normalized_req.as_deref()).await?;
+            let proxy = match desired_proxy {
+                Some(p) => p,
+                None => {
+                    drop(guard);
+                    let p = resolve_session_proxy(
+                        &self.config,
+                        effective_profile.as_deref(),
+                        proxy_override,
+                    )
+                    .await?;
+                    guard = self.inner.lock().await;
+                    p
+                }
+            };
+            let launched = launch_instance(&self.config, normalized_req.as_deref(), proxy).await?;
             *guard = Some(launched);
         }
         Ok(LiveWebGuard { guard })
@@ -399,6 +445,22 @@ pub fn build_launch_args(
     user_data_dir: &Path,
     config: &BrowserServerConfig,
 ) -> Vec<String> {
+    let direct = config
+        .proxy
+        .as_deref()
+        .and_then(|raw| BrowserProxy::parse(raw).ok())
+        .filter(|p| !p.is_authenticated())
+        .map(|p| p.direct_chromium_args());
+    build_launch_args_with_proxy(binary, user_data_dir, config, direct.as_deref())
+}
+
+/// Build Chromium launch flags using pre-resolved, credential-free proxy flags.
+pub fn build_launch_args_with_proxy(
+    binary: &Path,
+    user_data_dir: &Path,
+    config: &BrowserServerConfig,
+    proxy_args: Option<&[String]>,
+) -> Vec<String> {
     let mut args = Vec::new();
     if !config.headful && !is_headless_shell_binary(binary) {
         args.push("--headless=new".to_string());
@@ -421,17 +483,27 @@ pub fn build_launch_args(
         config.viewport_width.max(320),
         config.viewport_height.max(240)
     ));
-    if let Some(proxy) = config
-        .proxy
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        args.push(format!("--proxy-server={proxy}"));
+    if let Some(p_args) = proxy_args {
+        args.extend(p_args.iter().cloned());
     }
     args.extend(config.parsed_extra_args());
     args.push("about:blank".to_string());
     args
+}
+
+pub(crate) async fn resolve_session_proxy(
+    config: &BrowserServerConfig,
+    profile: Option<&str>,
+    proxy_override: Option<&ProxyOverride>,
+) -> Result<Option<BrowserProxy>, BrowserError> {
+    let cfg_proxy = config.proxy.clone();
+    let prof = profile.map(str::to_string);
+    let ov = proxy_override.cloned();
+    tokio::task::spawn_blocking(move || {
+        resolve_browser_proxy(cfg_proxy.as_deref(), prof.as_deref(), ov.as_ref())
+    })
+    .await
+    .map_err(|e| BrowserError::new("PROXY_CONFIG_ERROR", format!("proxy resolve task: {e}")))?
 }
 
 /// Parse Chromium's `<user-data-dir>/DevToolsActivePort` into a `ws://127.0.0.1:<port><path>` URL.
@@ -552,10 +624,15 @@ pub(crate) async fn prepare_profile_workspace(
 pub(crate) async fn launch_instance(
     config: &BrowserServerConfig,
     requested_profile: Option<&str>,
+    proxy: Option<BrowserProxy>,
 ) -> Result<BrowserInstance, BrowserError> {
     let binary = discover_chromium(config.chromium_bin.as_deref())
         .map_err(BrowserError::browser_not_found)?;
     let ws = prepare_profile_workspace(config, requested_profile).await?;
+    let proxy_handle = match &proxy {
+        Some(p) => Some(ProxyHandle::start(p).await?),
+        None => None,
+    };
     let port_file = ws.user_data_dir.join("DevToolsActivePort");
     if let Err(err) = std::fs::remove_file(&port_file)
         && err.kind() != std::io::ErrorKind::NotFound
@@ -580,7 +657,9 @@ pub(crate) async fn launch_instance(
         )
     })?;
 
-    let args = build_launch_args(&binary, &ws.user_data_dir, config);
+    let proxy_args = proxy_handle.as_ref().map(ProxyHandle::chromium_args);
+    let args =
+        build_launch_args_with_proxy(&binary, &ws.user_data_dir, config, proxy_args.as_deref());
     let mut cmd = Command::new(&binary);
     cmd.args(&args)
         .stdin(Stdio::null())
@@ -614,15 +693,18 @@ pub(crate) async fn launch_instance(
         },
         persistent_profile: ws.persistent_profile,
         active_profile: ws.active_profile,
+        active_proxy: proxy,
         user_data_dir: ws.user_data_dir,
         remote_sync: ws.remote_sync,
         takeover: TakeoverState::default(),
+        _proxy_handle: proxy_handle,
         _ephemeral_dir: ws.ephemeral_dir,
     })
 }
 
 pub(crate) async fn finalize_instance(inst: &mut BrowserInstance) -> (bool, Option<String>) {
     shutdown_backend(&mut inst.backend).await;
+    inst._proxy_handle = None;
     let Some(sync) = inst.remote_sync.take() else {
         return (false, None);
     };
@@ -751,8 +833,28 @@ mod tests {
         assert!(args.contains(&"--remote-debugging-address=127.0.0.1".to_string()));
         assert!(args.contains(&"--user-data-dir=/tmp/ud".to_string()));
         assert!(args.contains(&"--proxy-server=http://127.0.0.1:8888".to_string()));
+        assert!(args.contains(&format!(
+            "--proxy-bypass-list={}",
+            crate::proxy::PROXY_BYPASS_LIST
+        )));
         assert!(args.contains(&"--mute-audio".to_string()));
         assert_eq!(args.last().map(String::as_str), Some("about:blank"));
+
+        // Direct build_launch_args must never leak authenticated proxy credentials into argv.
+        let authed = BrowserServerConfig {
+            proxy: Some("http://user:topsecret@proxy.example:3128".into()),
+            ..Default::default()
+        };
+        let authed_args = build_launch_args(
+            Path::new("/usr/bin/chromium"),
+            Path::new("/tmp/ud"),
+            &authed,
+        );
+        assert!(
+            authed_args
+                .iter()
+                .all(|a| !a.contains("topsecret") && !a.contains("user:"))
+        );
     }
 
     #[test]

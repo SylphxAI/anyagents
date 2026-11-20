@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::BrowserServerConfig;
+use crate::proxy::ProxyOverride;
 use crate::secrets::{TypeInput, classify_type_input, resolve_secret, sanitize_secret_fill_error};
 use crate::session::{BrowserError, BrowserSession, LiveWebGuard, select_explicit_target};
 pub use crate::takeover::{BrowserTakeoverArgs, BrowserTakeoverStatusArgs};
@@ -69,9 +70,10 @@ impl BrowserMcpServer {
             }
         };
 
+        let proxy_ov = ProxyOverride::from_opts(args.proxy, args.proxy_env);
         let mut live = self
             .session
-            .acquire_with_profile(args.profile.as_deref())
+            .acquire_with_options(args.profile.as_deref(), proxy_ov.as_ref())
             .await?;
         let web = live.web();
         select_explicit_target(web, args.target_id.as_deref()).await?;
@@ -462,6 +464,12 @@ pub struct BrowserNavigateArgs {
     /// (`GET/PUT <ANYAGENTS_API_URL>/v1/browser-profiles/<profile>/archive`).
     #[serde(default)]
     pub profile: Option<String>,
+    /// Optional browser-only proxy URL (`http://`, `https://`, `socks5://`, `socks5h://`) or `op://` secret_ref.
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// Optional env var name (e.g. from Named Encrypted Secrets) holding a browser-only proxy URL.
+    #[serde(default)]
+    pub proxy_env: Option<String>,
 }
 
 /// Parameters for `browser_snapshot`.
@@ -899,6 +907,31 @@ mod tests {
             .await;
         assert_eq!(nav.is_error, Some(true));
         assert_eq!(nav.structured_content.unwrap()["code"], "INVALID_INPUT");
+
+        let nav_bad_proxy = server
+            .browser_navigate(Parameters(BrowserNavigateArgs {
+                url: Some("https://example.com".into()),
+                proxy: Some("ftp://u:p@bad.example:21".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(nav_bad_proxy.is_error, Some(true));
+        let nbp = nav_bad_proxy.structured_content.unwrap();
+        assert_eq!(nbp["code"], "INVALID_INPUT");
+        assert!(!nbp.to_string().contains("u:p"));
+
+        let nav_reserved_env = server
+            .browser_navigate(Parameters(BrowserNavigateArgs {
+                url: Some("https://example.com".into()),
+                proxy_env: Some("ANYAGENTS_AGENT_TOKEN".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(nav_reserved_env.is_error, Some(true));
+        assert_eq!(
+            nav_reserved_env.structured_content.unwrap()["code"],
+            "REFUSED"
+        );
 
         let click = server
             .browser_click(Parameters(BrowserClickArgs {
