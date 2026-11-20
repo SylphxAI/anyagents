@@ -46,14 +46,14 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{ApiError, AppState, resolve_remote_sandbox_workdir, spawn_store};
-use crate::cloud_harness::serverless::{
-    CloudTurnDriver, CloudTurnSubmitRequest, GenericHttpCloudDriver, SpironServerlessDriver,
-    resolve_cloud_driver_from_metadata,
-};
 use crate::sandbox_exec::{
     GuestHeartbeatFrame, apply_guest_heartbeat, ensure_sandbox_with_provider,
     hydrate_agent_files_from_store, resolve_registry_for_binding, resolve_remote_provider_registry,
     sandbox_handle_from_binding, sweep_idle_sandboxes, sync_agent_bundle_tar_to_provider,
+};
+use crate::serverless_cloud::{
+    CloudTurnDriver, CloudTurnSubmitRequest, GenericHttpCloudDriver, SpironServerlessDriver,
+    resolve_cloud_driver_from_metadata,
 };
 
 const DEFAULT_CLOUD_POLL_DELAY_MS: i64 = 5_000;

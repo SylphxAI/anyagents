@@ -16,7 +16,6 @@ mod api;
 mod auth;
 mod channel;
 mod client;
-mod cloud_harness;
 mod create;
 mod data;
 mod fake_opencode;
@@ -43,6 +42,7 @@ mod sandbox_providers;
 mod schedule;
 mod seat_tree;
 mod server;
+mod serverless_cloud;
 mod signin;
 mod spiron;
 mod telegram;
@@ -453,9 +453,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Run the outbound cloud harness adapter (`spiron-cloud`, `claude-cloud`, `openai-cloud`, `cursor-cloud`) speaking `stream-json`.
-    #[command(name = "cloud-harness", hide = true)]
-    CloudHarness(cloud_harness::CloudHarnessArgs),
     /// Run a local CLI harness inside a remote sandbox (`POST /v1/sandboxes/{id}/exec`) speaking `stream-json`.
     #[command(name = "sandbox-exec", hide = true)]
     SandboxExec(sandbox_exec::SandboxExecArgs),
@@ -1072,15 +1069,6 @@ fn main() -> ExitCode {
     if let Some(code) = keeper::try_run(&raw_argv) {
         return ExitCode::from(u8::try_from(code).unwrap_or(1));
     }
-    if let Some(cloud_args) = cloud_harness::try_parse_from_raw_argv(&raw_argv) {
-        return match cloud_harness::run(cloud_args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                ui::error(&err.to_string());
-                ExitCode::FAILURE
-            }
-        };
-    }
     if let Some(sbx_args) = sandbox_exec::try_parse_from_raw_argv(&raw_argv) {
         return match sandbox_exec::run(sbx_args) {
             Ok(()) => ExitCode::SUCCESS,
@@ -1571,7 +1559,6 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             OutboundCommand::Retry { key } => outbound::retry(&data, &key, json),
             OutboundCommand::Discard { key } => outbound::discard(&data, &key, json),
         },
-        Command::CloudHarness(args) => cloud_harness::run(args),
         Command::SandboxExec(args) => sandbox_exec::run(args),
         Command::MemoryService(args) => memory_service::run(&data, args),
         Command::Db { action } => db_cmd(&data, *action),
@@ -3122,7 +3109,6 @@ mod cli_query_tests {
         for command in [
             "agent-run",
             "fake-opencode",
-            "cloud-harness",
             "sandbox-exec",
             "boundary",
             "flush",

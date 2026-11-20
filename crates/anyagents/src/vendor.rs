@@ -23,6 +23,7 @@ use anyagents_supervisor::LaunchRequest;
 use serde::{Deserialize, Serialize};
 
 mod in_process;
+mod remote_session;
 pub use in_process::InProcessRemoteHarness;
 
 /// One vendor adapter over its vendor process, in the process that hosts it:
@@ -37,8 +38,10 @@ pub enum LocalAdapter {
     /// The external Spiron CLI.
     Spiron(Box<SpironHarness>),
     Contract(Box<ContractHarness>),
-    /// In-process cloud or remote-sandbox harness (zero local OS shim processes).
+    /// In-process remote-sandbox harness (zero local OS shim processes).
     InProcessRemote(Box<InProcessRemoteHarness>),
+    /// In-process ADR 0010 D7 remote session (zero local child processes or keepers).
+    RemoteSession(Box<remote_session::RemoteSessionAdapter>),
 }
 
 /// Where vendor adapters run.
@@ -143,7 +146,7 @@ impl VendorHarness {
         } = planned;
         let host = if matches!(
             launch,
-            AdapterLaunch::InProcessCloud { .. } | AdapterLaunch::InProcessSandbox { .. }
+            AdapterLaunch::RemoteSession { .. } | AdapterLaunch::InProcessSandbox { .. }
         ) {
             Host::Local(
                 launch.start_with_store(shared_store.map(|s| (s, request.agent.id.clone())))?,
@@ -404,12 +407,16 @@ pub enum AdapterLaunch {
         env: Vec<(String, String)>,
         work_dir: PathBuf,
     },
-    /// In-process cloud harness (`HarnessHost::InProcess` under `remote_required`).
-    InProcessCloud {
-        config_dir: PathBuf,
+    /// In-process ADR 0010 D7 remote session (zero local child processes or keepers).
+    RemoteSession {
         harness: String,
+        config_dir: PathBuf,
+        agent_id: String,
+        agent_name: String,
         model: Option<String>,
         session: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_budget_micros: Option<u64>,
         env: Vec<(String, String)>,
     },
     /// In-process remote-sandbox harness (`HarnessHost::InProcess` under `remote_required`).
@@ -427,14 +434,15 @@ pub enum AdapterLaunch {
 const KEEPER_START_SLACK: Duration = Duration::from_secs(30);
 
 impl AdapterLaunch {
-    /// Whether this launch runs the harness off this host: the cloud adapter
-    /// or a remote-sandbox spawn. Such a launch begins a remote session.
+    /// Whether this launch runs the harness off this host: an ADR 0010 D7
+    /// remote session or a remote-sandbox spawn. Such a launch begins a remote
+    /// session.
     fn runs_off_host(&self) -> bool {
         matches!(
             self,
-            Self::InProcessCloud { .. } | Self::InProcessSandbox { .. }
+            Self::RemoteSession { .. } | Self::InProcessSandbox { .. }
         ) || matches!(self, Self::Claude { args, .. }
-            if args.iter().any(|arg| arg == "cloud-harness" || arg == "sandbox-exec"))
+            if args.iter().any(|arg| arg == "sandbox-exec"))
     }
 
     /// How long this adapter's start may take, as the adapter declares it.
@@ -464,7 +472,7 @@ impl AdapterLaunch {
             | Self::Spiron { env, .. }
             | Self::OpenCode { env, .. }
             | Self::Codex { env, .. }
-            | Self::InProcessCloud { env, .. }
+            | Self::RemoteSession { env, .. }
             | Self::InProcessSandbox { env, .. } => env,
         }
     }
@@ -632,19 +640,24 @@ impl AdapterLaunch {
                 &env,
                 &work_dir,
             )?)),
-            Self::InProcessCloud {
-                config_dir,
+            Self::RemoteSession {
                 harness,
+                config_dir,
+                agent_id,
+                agent_name,
                 model,
                 session,
-                ..
-            } => LocalAdapter::InProcessRemote(Box::new(InProcessRemoteHarness::start_cloud(
-                crate::cloud_harness::CloudHarnessArgs {
-                    config: Some(config_dir),
-                    harness: Some(harness),
-                    model,
-                    resume: session,
-                },
+                remote_budget_micros,
+                env,
+            } => LocalAdapter::RemoteSession(Box::new(remote_session::start_remote_session(
+                &harness,
+                &config_dir,
+                &agent_id,
+                &agent_name,
+                model.as_deref(),
+                session.as_deref(),
+                remote_budget_micros,
+                &env,
             )?)),
             Self::InProcessSandbox {
                 config_dir,
@@ -1751,53 +1764,23 @@ fn plan_adapter(
             "omp",
         ))
     } else if effective_cloud {
-        let canonical_owned = crate::remote::agent_cloud_selector(&request.agent);
-        let canonical = canonical_owned.as_str();
-        let session_file = format!("{canonical}-session-id");
+        let cloud_selector = crate::remote::agent_cloud_selector(&request.agent);
+        let canonical_harness = request.agent.canonical_harness();
+        let session_file = format!("{cloud_selector}-session-id");
         let session = session_from_file(&request.config_dir, &session_file)?;
-        let bin_override_var = format!(
-            "ANYAGENTS_{}_BIN",
-            canonical.to_uppercase().replace('-', "_")
-        );
-        if sandbox_mode.is_remote_required()
-            && !scripted
-            && std::env::var_os(&bin_override_var).is_none()
-        {
-            return Ok(planned(
-                AdapterLaunch::InProcessCloud {
-                    config_dir: request.config_dir.clone(),
-                    harness: canonical.to_string(),
-                    model,
-                    session,
-                    env,
-                },
-                Some(&session_file),
-                canonical,
-            ));
-        }
-        let program = crate::install::program(root, canonical);
-        let mut args = vec![
-            "cloud-harness".to_string(),
-            "--config".to_string(),
-            request.config_dir.display().to_string(),
-            "--harness".to_string(),
-            canonical.to_string(),
-        ];
-        if let Some(model) = model {
-            args.push("--model".to_string());
-            args.push(model);
-        }
         Ok(planned(
-            AdapterLaunch::Claude {
-                program: program.display().to_string(),
-                args,
+            AdapterLaunch::RemoteSession {
+                harness: canonical_harness,
+                config_dir: request.config_dir.clone(),
+                agent_id: request.agent.id.as_str().to_string(),
+                agent_name: request.agent.name.clone(),
+                model,
                 session,
+                remote_budget_micros: request.agent.remote_budget_micros,
                 env,
-                work_dir: request.work_dir.clone(),
-                cloud: true,
             },
             Some(&session_file),
-            canonical,
+            &cloud_selector,
         ))
     } else if spiron_uses_local_execution(
         &request.agent.harness,
@@ -2581,16 +2564,45 @@ fn pairs(env: &[(String, String)]) -> Vec<(&str, &str)> {
         .collect()
 }
 
+impl LocalAdapter {
+    fn as_harness(&self) -> &dyn Harness {
+        match self {
+            Self::Claude(harness) => harness.as_ref(),
+            Self::Codex(harness) => harness.as_ref(),
+            Self::OpenCode(harness) => harness.as_ref(),
+            Self::Agy(harness) => harness.as_ref(),
+            Self::Muse(harness) => harness.as_ref(),
+            Self::Omp(harness) => harness.as_ref(),
+            Self::Spiron(harness) => harness.as_ref(),
+            Self::Contract(harness) => harness.as_ref(),
+            Self::InProcessRemote(harness) => harness.as_ref(),
+            Self::RemoteSession(harness) => harness.as_ref(),
+        }
+    }
+
+    fn as_harness_mut(&mut self) -> &mut dyn Harness {
+        match self {
+            Self::Claude(harness) => harness.as_mut(),
+            Self::Codex(harness) => harness.as_mut(),
+            Self::OpenCode(harness) => harness.as_mut(),
+            Self::Agy(harness) => harness.as_mut(),
+            Self::Muse(harness) => harness.as_mut(),
+            Self::Omp(harness) => harness.as_mut(),
+            Self::Spiron(harness) => harness.as_mut(),
+            Self::Contract(harness) => harness.as_mut(),
+            Self::InProcessRemote(harness) => harness.as_mut(),
+            Self::RemoteSession(harness) => harness.as_mut(),
+        }
+    }
+}
+
 impl Harness for LocalAdapter {
     fn supports_turn_tool_context(&self) -> bool {
-        matches!(self, Self::Spiron(harness) if harness.supports_turn_tool_context())
+        self.as_harness().supports_turn_tool_context()
     }
 
     fn task_turn_result(&self, input_id: &str) -> Option<(String, String)> {
-        match self {
-            Self::Spiron(harness) => harness.task_turn_result(input_id),
-            _ => None,
-        }
+        self.as_harness().task_turn_result(input_id)
     }
 
     fn deliver_with_turn_context(
@@ -2598,171 +2610,56 @@ impl Harness for LocalAdapter {
         message: &OutboundMessage,
         context: Option<&str>,
     ) -> Result<DeliverOutcome, HarnessError> {
-        match self {
-            Self::Spiron(harness) => harness.deliver_with_turn_context(message, context),
-            _ => self.deliver(message),
-        }
+        self.as_harness_mut()
+            .deliver_with_turn_context(message, context)
     }
+
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        match self {
-            Self::Claude(harness) => harness.deliver(message),
-            Self::Codex(harness) => harness.deliver(message),
-            Self::OpenCode(harness) => harness.deliver(message),
-            Self::Agy(harness) => harness.deliver(message),
-            Self::Muse(harness) => harness.deliver(message),
-            Self::Omp(harness) => harness.deliver(message),
-            Self::Spiron(harness) => harness.deliver(message),
-            Self::Contract(harness) => harness.deliver(message),
-            Self::InProcessRemote(harness) => harness.deliver(message),
-        }
+        self.as_harness_mut().deliver(message)
     }
 
     fn proven(&self, message_id: &str) -> Option<anyagents_harness::Proof> {
-        match self {
-            Self::Claude(harness) => harness.proven(message_id),
-            Self::Codex(harness) => harness.proven(message_id),
-            Self::OpenCode(harness) => harness.proven(message_id),
-            Self::Agy(harness) => harness.proven(message_id),
-            Self::Muse(harness) => harness.proven(message_id),
-            Self::Omp(harness) => harness.proven(message_id),
-            Self::Spiron(harness) => harness.proven(message_id),
-            Self::Contract(harness) => harness.proven(message_id),
-            Self::InProcessRemote(harness) => harness.proven(message_id),
-        }
+        self.as_harness().proven(message_id)
     }
 
     fn stop(&mut self) {
-        match self {
-            Self::Claude(harness) => harness.stop(),
-            Self::Codex(harness) => harness.stop(),
-            Self::OpenCode(harness) => harness.stop(),
-            Self::Agy(harness) => harness.stop(),
-            Self::Muse(harness) => harness.stop(),
-            Self::Omp(harness) => harness.stop(),
-            Self::Spiron(harness) => harness.stop(),
-            Self::Contract(harness) => harness.stop(),
-            Self::InProcessRemote(harness) => harness.stop(),
-        }
+        self.as_harness_mut().stop();
     }
 
     fn stop_verified(&mut self) -> Result<(), HarnessError> {
-        match self {
-            Self::Claude(harness) => harness.stop_verified(),
-            Self::Codex(harness) => harness.stop_verified(),
-            Self::OpenCode(harness) => harness.stop_verified(),
-            Self::Agy(harness) => harness.stop_verified(),
-            Self::Muse(harness) => harness.stop_verified(),
-            Self::Omp(harness) => harness.stop_verified(),
-            Self::Spiron(harness) => harness.stop_verified(),
-            Self::Contract(harness) => harness.stop_verified(),
-            Self::InProcessRemote(harness) => harness.stop_verified(),
-        }
+        self.as_harness_mut().stop_verified()
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {
-        match self {
-            Self::Claude(harness) => harness.background(),
-            Self::Codex(harness) => harness.background(),
-            Self::OpenCode(harness) => harness.background(),
-            Self::Agy(harness) => harness.background(),
-            Self::Muse(harness) => harness.background(),
-            Self::Omp(harness) => harness.background(),
-            Self::Spiron(harness) => harness.background(),
-            Self::Contract(harness) => harness.background(),
-            Self::InProcessRemote(harness) => harness.background(),
-        }
+        self.as_harness_mut().background()
     }
 
     fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
-        match self {
-            Self::Claude(harness) => harness.resume(session),
-            Self::Codex(harness) => harness.resume(session),
-            Self::OpenCode(harness) => harness.resume(session),
-            Self::Agy(harness) => harness.resume(session),
-            Self::Muse(harness) => harness.resume(session),
-            Self::Omp(harness) => harness.resume(session),
-            Self::Spiron(harness) => harness.resume(session),
-            Self::Contract(harness) => harness.resume(session),
-            Self::InProcessRemote(harness) => harness.resume(session),
-        }
+        self.as_harness_mut().resume(session)
     }
 
     fn cancel(&mut self) -> Result<(), HarnessError> {
-        match self {
-            Self::Claude(harness) => harness.cancel(),
-            Self::Codex(harness) => harness.cancel(),
-            Self::OpenCode(harness) => harness.cancel(),
-            Self::Agy(harness) => harness.cancel(),
-            Self::Muse(harness) => harness.cancel(),
-            Self::Omp(harness) => harness.cancel(),
-            Self::Spiron(harness) => harness.cancel(),
-            Self::Contract(harness) => harness.cancel(),
-            Self::InProcessRemote(harness) => harness.cancel(),
-        }
+        self.as_harness_mut().cancel()
     }
 
     fn exit_diagnostic(&self) -> Option<String> {
-        match self {
-            Self::Claude(harness) => harness.exit_diagnostic(),
-            Self::InProcessRemote(harness) => harness.exit_diagnostic(),
-            _ => None,
-        }
+        self.as_harness().exit_diagnostic()
     }
 
     fn health(&self) -> HarnessHealth {
-        match self {
-            Self::Claude(harness) => harness.health(),
-            Self::Codex(harness) => harness.health(),
-            Self::OpenCode(harness) => harness.health(),
-            Self::Agy(harness) => harness.health(),
-            Self::Muse(harness) => harness.health(),
-            Self::Omp(harness) => harness.health(),
-            Self::Spiron(harness) => harness.health(),
-            Self::Contract(harness) => harness.health(),
-            Self::InProcessRemote(harness) => harness.health(),
-        }
+        self.as_harness().health()
     }
 
     fn pending_input_owner(&self) -> Option<String> {
-        match self {
-            Self::Claude(harness) => harness.pending_input_owner(),
-            Self::Codex(harness) => harness.pending_input_owner(),
-            Self::OpenCode(harness) => harness.pending_input_owner(),
-            Self::Agy(harness) => harness.pending_input_owner(),
-            Self::Muse(harness) => harness.pending_input_owner(),
-            Self::Omp(harness) => harness.pending_input_owner(),
-            Self::Spiron(harness) => harness.pending_input_owner(),
-            Self::Contract(harness) => harness.pending_input_owner(),
-            Self::InProcessRemote(harness) => harness.pending_input_owner(),
-        }
+        self.as_harness().pending_input_owner()
     }
 
     fn input_ready(&self) -> bool {
-        match self {
-            Self::Claude(harness) => harness.input_ready(),
-            Self::Codex(harness) => harness.input_ready(),
-            Self::OpenCode(harness) => harness.input_ready(),
-            Self::Agy(harness) => harness.input_ready(),
-            Self::Muse(harness) => harness.input_ready(),
-            Self::Omp(harness) => harness.input_ready(),
-            Self::Spiron(harness) => harness.input_ready(),
-            Self::Contract(harness) => harness.input_ready(),
-            Self::InProcessRemote(harness) => harness.input_ready(),
-        }
+        self.as_harness().input_ready()
     }
 
     fn last_usage(&self) -> TurnUsage {
-        match self {
-            Self::Claude(harness) => harness.last_usage(),
-            Self::Codex(harness) => harness.last_usage(),
-            Self::OpenCode(harness) => harness.last_usage(),
-            Self::Agy(harness) => harness.last_usage(),
-            Self::Muse(harness) => harness.last_usage(),
-            Self::Omp(harness) => harness.last_usage(),
-            Self::Spiron(harness) => harness.served_usage(),
-            Self::Contract(harness) => harness.last_usage(),
-            Self::InProcessRemote(harness) => harness.served_usage(),
-        }
+        self.as_harness().last_usage()
     }
 
     fn served_usage(&self) -> TurnUsage {
@@ -2770,87 +2667,27 @@ impl Harness for LocalAdapter {
     }
 
     fn turns_served(&self) -> u32 {
-        match self {
-            Self::Claude(harness) => harness.turns_served(),
-            Self::Codex(harness) => harness.turns_served(),
-            Self::OpenCode(harness) => harness.turns_served(),
-            Self::Agy(harness) => harness.turns_served(),
-            Self::Muse(harness) => harness.turns_served(),
-            Self::Omp(harness) => harness.turns_served(),
-            Self::Spiron(harness) => harness.turns_served(),
-            Self::Contract(harness) => harness.turns_served(),
-            Self::InProcessRemote(harness) => harness.turns_served(),
-        }
+        self.as_harness().turns_served()
     }
 
     fn quiet_for(&self, id: &str, quiet: Duration, patience: Duration) -> bool {
-        match self {
-            Self::Claude(harness) => harness.quiet_for(id, quiet, patience),
-            Self::Codex(harness) => harness.quiet_for(id, quiet, patience),
-            Self::OpenCode(harness) => harness.quiet_for(id, quiet, patience),
-            Self::Agy(harness) => harness.quiet_for(id, quiet, patience),
-            Self::Muse(harness) => harness.quiet_for(id, quiet, patience),
-            Self::Omp(harness) => harness.quiet_for(id, quiet, patience),
-            Self::Spiron(_) => false,
-            Self::Contract(harness) => harness.quiet_for(id, quiet, patience),
-            Self::InProcessRemote(harness) => harness.quiet_for(id, quiet, patience),
-        }
+        self.as_harness().quiet_for(id, quiet, patience)
     }
 
     fn ends_on_quiet(&self) -> Option<Duration> {
-        match self {
-            Self::Claude(harness) => harness.ends_on_quiet(),
-            Self::Codex(harness) => harness.ends_on_quiet(),
-            Self::OpenCode(harness) => harness.ends_on_quiet(),
-            Self::Agy(harness) => harness.ends_on_quiet(),
-            Self::Muse(harness) => harness.ends_on_quiet(),
-            Self::Omp(harness) => harness.ends_on_quiet(),
-            Self::Spiron(_) => None,
-            Self::Contract(harness) => harness.ends_on_quiet(),
-            Self::InProcessRemote(harness) => harness.ends_on_quiet(),
-        }
+        self.as_harness().ends_on_quiet()
     }
 
     fn clear_quota(&mut self) {
-        match self {
-            Self::Claude(harness) => harness.clear_quota(),
-            Self::Codex(harness) => harness.clear_quota(),
-            Self::OpenCode(harness) => harness.clear_quota(),
-            Self::Agy(harness) => harness.clear_quota(),
-            Self::Muse(harness) => harness.clear_quota(),
-            Self::Omp(harness) => harness.clear_quota(),
-            Self::Spiron(harness) => harness.clear_quota(),
-            Self::Contract(harness) => harness.clear_quota(),
-            Self::InProcessRemote(harness) => harness.clear_quota(),
-        }
+        self.as_harness_mut().clear_quota();
     }
 
     fn process_id(&self) -> Option<u32> {
-        match self {
-            Self::Claude(harness) => harness.process_id(),
-            Self::Codex(harness) => harness.process_id(),
-            Self::OpenCode(harness) => harness.process_id(),
-            Self::Agy(harness) => harness.process_id(),
-            Self::Muse(harness) => harness.process_id(),
-            Self::Omp(harness) => harness.process_id(),
-            Self::Spiron(harness) => harness.process_id(),
-            Self::Contract(harness) => harness.process_id(),
-            Self::InProcessRemote(harness) => harness.process_id(),
-        }
+        self.as_harness().process_id()
     }
 
     fn watch_activity(&self, notify: std::sync::Arc<dyn Fn() + Send + Sync>) {
-        match self {
-            Self::Claude(harness) => harness.watch_activity(notify),
-            Self::Codex(harness) => harness.watch_activity(notify),
-            Self::OpenCode(harness) => harness.watch_activity(notify),
-            Self::Agy(harness) => harness.watch_activity(notify),
-            Self::Muse(harness) => harness.watch_activity(notify),
-            Self::Omp(harness) => harness.watch_activity(notify),
-            Self::Spiron(harness) => harness.watch_activity(notify),
-            Self::Contract(harness) => harness.watch_activity(notify),
-            Self::InProcessRemote(harness) => harness.watch_activity(notify),
-        }
+        self.as_harness().watch_activity(notify);
     }
 }
 
@@ -2866,11 +2703,16 @@ impl Hosted for LocalAdapter {
             Self::Spiron(harness) => harness.session_id(),
             Self::Contract(_) => None,
             Self::InProcessRemote(harness) => harness.session_id(),
+            Self::RemoteSession(harness) => harness.session_id(),
         }
     }
 
     fn session_invalidated(&self) -> bool {
-        matches!(self, Self::Codex(harness) if harness.thread_invalidated())
+        match self {
+            Self::Codex(harness) => harness.thread_invalidated(),
+            Self::RemoteSession(harness) => harness.session_invalidated(),
+            _ => false,
+        }
     }
 }
 
@@ -4135,39 +3977,88 @@ for raw in reader:
         assert_eq!(contract.keeper_ready(floor), floor);
     }
 
-    /// A cloud harness runs behind the Claude adapter at turn-end delivery
-    /// until its peer declares more (`docs/delivery.md`). The launch the
-    /// kernel hands its keeper says so, and keeps saying so across the wire.
+    /// Cloud agents plan directly to an in-process ADR 0010 D7 `RemoteSession`
+    /// (`runs_off_host() == true`) with zero keeper or `cloud-harness` child
+    /// processes, preserving existing `*-cloud-session-id` resume pointers.
     #[test]
-    fn a_cloud_harness_launch_keeps_turn_end_delivery_across_its_keeper() {
-        use anyagents_core::{NewAgent, Store};
+    fn cloud_harness_launch_plans_in_process_remote_session_without_keeper() {
+        use anyagents_core::{ExecutionRuntime, NewAgent, Store};
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
-        let agent = store
-            .create_agent(NewAgent::new("cloudy", "claude-cloud"))
+
+        let spiron_agent = store
+            .create_agent(
+                NewAgent::new("spiron-cloudy", "spiron")
+                    .with_runtime(ExecutionRuntime::Cloud)
+                    .with_budget_micros(2_500_000),
+            )
             .unwrap();
-        let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
-        std::fs::create_dir_all(&config).unwrap();
-        let request = LaunchRequest {
-            agent,
+        let spiron_cfg = anyagents_core::agent_config_dir(dir.path(), &spiron_agent.id);
+        std::fs::create_dir_all(&spiron_cfg).unwrap();
+        let spiron_req = LaunchRequest {
+            agent: spiron_agent,
             data_dir: dir.path().to_owned(),
-            config_dir: config.clone(),
-            work_dir: dir.path().join("work"),
+            config_dir: spiron_cfg.clone(),
+            work_dir: dir.path().join("work-spiron"),
             extra_env: vec![],
             lock: None,
         };
-        let planned = plan_adapter(&request, dir.path(), Vec::new(), false).unwrap();
-        let wire = serde_json::to_value(&planned.launch).unwrap();
+        let spiron_planned = plan_adapter(&spiron_req, dir.path(), Vec::new(), false).unwrap();
+        assert!(spiron_planned.launch.runs_off_host());
+        assert_eq!(spiron_planned.selector, "spiron-cloud");
+        assert_eq!(
+            spiron_planned.pointer,
+            Some(spiron_cfg.join("spiron-cloud-session-id"))
+        );
+        let spiron_wire = serde_json::to_value(&spiron_planned.launch).unwrap();
         assert!(
             matches!(
-                serde_json::from_value(wire).unwrap(),
-                AdapterLaunch::Claude { cloud: true, .. }
+                serde_json::from_value(spiron_wire).unwrap(),
+                AdapterLaunch::RemoteSession {
+                    harness,
+                    remote_budget_micros: Some(2_500_000),
+                    ..
+                } if harness == "spiron"
             ),
             "{:?}",
-            planned.launch
+            spiron_planned.launch
+        );
+
+        let claude_agent = store
+            .create_agent(NewAgent::new("cloudy", "claude-cloud"))
+            .unwrap();
+        let claude_cfg = anyagents_core::agent_config_dir(dir.path(), &claude_agent.id);
+        std::fs::create_dir_all(&claude_cfg).unwrap();
+        let claude_req = LaunchRequest {
+            agent: claude_agent,
+            data_dir: dir.path().to_owned(),
+            config_dir: claude_cfg.clone(),
+            work_dir: dir.path().join("work-claude"),
+            extra_env: vec![],
+            lock: None,
+        };
+        let claude_planned = plan_adapter(&claude_req, dir.path(), Vec::new(), false).unwrap();
+        assert!(claude_planned.launch.runs_off_host());
+        assert_eq!(claude_planned.selector, "claude-cloud");
+        assert_eq!(
+            claude_planned.pointer,
+            Some(claude_cfg.join("claude-cloud-session-id"))
+        );
+        let claude_wire = serde_json::to_value(&claude_planned.launch).unwrap();
+        assert!(
+            matches!(
+                serde_json::from_value(claude_wire).unwrap(),
+                AdapterLaunch::RemoteSession { harness, .. } if harness == "claude-code"
+            ),
+            "{:?}",
+            claude_planned.launch
         );
         assert_eq!(
             declared_delivery("claude-cloud"),
+            anyagents_harness_claude::CLOUD_DELIVERY
+        );
+        assert_eq!(
+            declared_delivery("spiron-cloud"),
             anyagents_harness_claude::CLOUD_DELIVERY
         );
         assert_eq!(
