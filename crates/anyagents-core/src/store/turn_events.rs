@@ -410,12 +410,12 @@ mod tests {
             store.note_delivered(&child.id, opener.seq).unwrap();
             assert!(
                 store
-                    .receive_turn_send(&parent.id, send.clone(), false, &other.id, &token)
+                    .receive_turn_send(&parent.id, send.clone(), &other.id, &token)
                     .is_err()
             );
             let recipient = if seq < 3 { &parent } else { &other };
             let result = store
-                .receive_turn_send(&recipient.id, send.clone(), false, &child.id, &token)
+                .receive_turn_send(&recipient.id, send.clone(), &child.id, &token)
                 .unwrap();
             assert!(matches!(result, ReceiveOutcome::Duplicate(_)) == (seq == 2));
             assert!(
@@ -429,13 +429,7 @@ mod tests {
             );
             assert!(
                 store
-                    .receive_turn_send(
-                        &parent.id,
-                        Incoming::new("late send"),
-                        false,
-                        &child.id,
-                        &token
-                    )
+                    .receive_turn_send(&parent.id, Incoming::new("late send"), &child.id, &token)
                     .is_err()
             );
         }
@@ -513,7 +507,6 @@ mod tests {
                         .receive_turn_send(
                             &parent.id,
                             Incoming::new("revoked"),
-                            false,
                             &child.id,
                             token.as_deref().unwrap()
                         )

@@ -4084,6 +4084,16 @@ fn mark_explicitly_archived(store: &Store, data_dir: &Path, agent: &Agent) {
 }
 
 fn authored_send(store: &Store, actor: &Actor, to: &str, text: &str, key: &str) -> SendResponse {
+    try_authored_send(store, actor, to, text, key).unwrap_or_else(|e| panic!("{}", e.message))
+}
+
+fn try_authored_send(
+    store: &Store,
+    actor: &Actor,
+    to: &str,
+    text: &str,
+    key: &str,
+) -> Result<SendResponse, ApiError> {
     let body = SendRequest {
         sender: Some(actor.as_address()),
         to: vec![to.to_string()],
@@ -4092,10 +4102,8 @@ fn authored_send(store: &Store, actor: &Actor, to: &str, text: &str, key: &str) 
         ..Default::default()
     };
     let key = send_key(&body);
-    let plan = SendPlan::parse(store, actor, &body).unwrap_or_else(|e| panic!("{}", e.message));
-    send_sync(store, actor, body, plan, key)
-        .unwrap_or_else(|e| panic!("{}", e.message))
-        .0
+    let plan = SendPlan::parse(store, actor, &body)?;
+    send_sync(store, actor, body, plan, key).map(|response| response.0)
 }
 
 #[test]
@@ -4119,9 +4127,8 @@ fn a_named_bot_is_part_of_the_send_key() {
     }
 }
 
-/// A send that cannot wake an archived recipient (through an alias, or to
-/// several recipients) is refused for it with who answers for it, and
-/// nothing is stored unread. A send with no live recipient fails.
+/// An archived recipient is skipped with who answers for it. A send
+/// addressed only to archived recipients fails without storing anything.
 #[test]
 fn a_send_an_archived_agent_would_never_read_is_refused_with_its_parent() {
     let dir = tempfile::tempdir().unwrap();
@@ -4280,121 +4287,115 @@ fn closing_sends_do_not_store_messages_receipts_or_wake_archived_targets() {
     assert_eq!(store.inbox(&target.id, None).unwrap().len(), 1);
 }
 
+/// No send unarchives its recipient: by name or `agt_...` id, from an agent
+/// or the operator, alone or with a lifecycle-looking body, it fails closed
+/// with `409`, stores nothing and leaves the agent archived. Only an explicit
+/// wake revives it, after which the same send is delivered; live agents
+/// still receive and wake as before.
 #[test]
-fn direct_authored_sends_wake_archived_agents_once_in_mailbox_order_and_survive_reopen() {
+fn sends_never_wake_archived_agents_and_only_an_explicit_wake_does() {
     let _env = env_lock();
     unsafe {
         std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
     }
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("state.db");
-    let store = Store::open(&db).unwrap();
+    let dir = crate::test_tempdir();
+    let state = archetype_validation_state(dir.path());
+    let store: &Store = &state.store;
     let parent = store
         .create_agent(anyagents_core::NewAgent::new("parent-agent", "opencode"))
         .unwrap();
+    store.set_agent_state(&parent.id, "running").unwrap();
     let mut new = anyagents_core::NewAgent::new("worker", "opencode");
     new.parent_id = Some(parent.id.clone());
     let child = store.create_agent(new).unwrap();
-    let actor = Actor::Agent(parent.name.clone());
     store
         .receive(&child.id, Incoming::new("queued before archive"))
         .unwrap();
-    store.set_agent_state(&child.id, "archived").unwrap();
-    mark_explicitly_archived(&store, dir.path(), &child);
-    let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
-    for file in [
-        ".anyagents-last-error.json",
-        ".anyagents-notified-parent-error.json",
-    ] {
-        std::fs::write(cfg.join(file), "old error").unwrap();
+    mark_explicitly_archived(store, dir.path(), &child);
+    let agent = Actor::Agent(parent.name.clone());
+    let operator = Actor::Operator("operator".into());
+    let by_id = child.id.to_string();
+    let attempts = [
+        (&agent, "agent:worker", "follow-up"),
+        (&agent, "worker", "follow-up"),
+        (&agent, by_id.as_str(), "follow-up"),
+        (
+            &agent,
+            "worker",
+            "[Sub-Agent Completed] quoted in a follow-up",
+        ),
+        (&operator, "worker", "operator follow-up"),
+        (&operator, by_id.as_str(), "operator follow-up"),
+    ];
+    for (index, (actor, to, text)) in attempts.into_iter().enumerate() {
+        let key = format!("refused-{index}");
+        let refused = try_authored_send(store, actor, to, text, &key).expect_err("archived");
+        assert_eq!(refused.status, StatusCode::CONFLICT, "{to}");
+        assert!(
+            refused
+                .message
+                .contains("agent `worker` is archived; its parent is `parent-agent`")
+                && refused.message.contains("agents(action=\"wake\")"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(store.agent(&child.id).unwrap().state, "archived", "{to}");
+        assert!(has_explicit_archive_marker(dir.path(), &child.id), "{to}");
+        assert_eq!(store.inbox(&child.id, None).unwrap().len(), 1, "{to}");
+        let receipt = send_key(&SendRequest {
+            sender: Some(actor.as_address()),
+            to: vec![to.to_string()],
+            text: text.to_string(),
+            idempotency_key: Some(key),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(store.send_receipt(&receipt).unwrap().is_none(), "{to}");
     }
-    // An authored quotation of a lifecycle prefix is still a direct send:
-    // bodies are not the wake discriminator.
-    let sent = authored_send(
-        &store,
-        &actor,
-        "agent:worker",
-        "[Sub-Agent Completed] quoted in a follow-up",
-        "direct-1",
-    );
+    // A store record left `archived` without the marker is refused alike.
+    let mut new = anyagents_core::NewAgent::new("legacy", "opencode");
+    new.parent_id = Some(parent.id.clone());
+    let legacy = store.create_agent(new).unwrap();
+    store.set_agent_state(&legacy.id, "archived").unwrap();
+    let refused =
+        try_authored_send(store, &agent, "legacy", "hello", "legacy-1").expect_err("archived");
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert_eq!(store.agent(&legacy.id).unwrap().state, "archived");
+    assert!(store.inbox(&legacy.id, None).unwrap().is_empty());
+
+    // The explicit wake is the one way back; the send then goes through.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let Json(woken) = rt
+        .block_on(wake_agent_route(
+            Principal::Operator,
+            State(state.clone()),
+            AxumPath("worker".into()),
+            axum::http::HeaderMap::new(),
+        ))
+        .unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(woken.state, "running");
+    assert!(!has_explicit_archive_marker(dir.path(), &child.id));
+    let sent = authored_send(store, &agent, by_id.as_str(), "after wake", "woken-1");
+    assert_eq!(sent.deliveries.len(), 1);
     assert_eq!(sent.deliveries[0].seq, 2);
     assert_eq!(store.agent(&child.id).unwrap().state, "running");
-    assert!(!has_explicit_archive_marker(dir.path(), &child.id));
-    assert!(!cfg.join(".anyagents-last-error.json").exists());
-    assert!(!cfg.join(".anyagents-notified-parent-error.json").exists());
-    assert!(anyagents_core::agent_work_dir(dir.path(), &child.id).exists());
-    let retried = authored_send(
-        &store,
-        &actor,
-        "agent:worker",
-        "[Sub-Agent Completed] quoted in a follow-up",
-        "direct-1",
-    );
-    assert_eq!(retried.deliveries[0].id, sent.deliveries[0].id);
-    assert_eq!(store.inbox(&child.id, None).unwrap().len(), 2);
-    // Replay after a new archive is not a fresh wake instruction.
-    store.set_agent_state(&child.id, "archived").unwrap();
-    mark_explicitly_archived(&store, dir.path(), &child);
-    authored_send(
-        &store,
-        &actor,
-        "agent:worker",
-        "[Sub-Agent Completed] quoted in a follow-up",
-        "direct-1",
-    );
-    assert_eq!(store.agent(&child.id).unwrap().state, "archived");
-    assert!(has_explicit_archive_marker(dir.path(), &child.id));
-    // Operator-authored direct sends also work by immutable id.
-    authored_send(
-        &store,
-        &Actor::Operator("operator".into()),
-        child.id.as_str(),
-        "operator follow-up",
-        "direct-2",
-    );
-    drop(store);
-    let store = Store::open(&db).unwrap();
-    assert_eq!(store.agent(&child.id).unwrap().state, "running");
-    assert!(!has_explicit_archive_marker(dir.path(), &child.id));
-    let inbox = store.inbox(&child.id, None).unwrap();
-    assert_eq!(
-        inbox.iter().map(|m| m.seq).collect::<Vec<_>>(),
-        vec![1, 2, 3]
-    );
-    assert_eq!(inbox[2].text, "operator follow-up");
-    mark_explicitly_archived(&store, dir.path(), &child);
-    let replayed = authored_send(
-        &store,
-        &Actor::Operator("operator".into()),
-        child.id.as_str(),
-        "operator follow-up",
-        "direct-2",
-    );
-    assert_eq!(replayed.deliveries[0].seq, 3);
-    assert_eq!(store.agent(&child.id).unwrap().state, "archived");
-    assert!(has_explicit_archive_marker(dir.path(), &child.id));
-    // Simulate a stop after mailbox commit but before whole-send receipt.
-    rusqlite::Connection::open(&db)
-        .unwrap()
-        .execute("DELETE FROM sends", [])
-        .unwrap();
-    std::fs::write(
-        cfg.join(".anyagents-last-error.json"),
-        "new error after archive",
-    )
-    .unwrap();
-    let replayed = authored_send(
-        &store,
-        &Actor::Operator("operator".into()),
-        child.id.as_str(),
-        "operator follow-up",
-        "direct-2",
-    );
-    assert!(replayed.deliveries[0].duplicate);
-    assert_eq!(store.agent(&child.id).unwrap().state, "archived");
-    assert!(has_explicit_archive_marker(dir.path(), &child.id));
-    assert!(cfg.join(".anyagents-last-error.json").exists());
-    assert_eq!(store.inbox(&child.id, None).unwrap().len(), 3);
+
+    // Idle and created agents still receive and wake.
+    for (name, start) in [("idle-peer", Some("idle")), ("fresh-peer", None)] {
+        let mut new = anyagents_core::NewAgent::new(name, "opencode");
+        new.parent_id = Some(parent.id.clone());
+        let peer = store.create_agent(new).unwrap();
+        if let Some(start) = start {
+            store.set_agent_state(&peer.id, start).unwrap();
+        }
+        let sent = authored_send(store, &agent, name, "live follow-up", name);
+        assert_eq!(sent.deliveries.len(), 1, "{name}");
+        assert_eq!(store.agent(&peer.id).unwrap().state, "running", "{name}");
+        assert_eq!(store.inbox(&peer.id, None).unwrap().len(), 1, "{name}");
+    }
     unsafe {
         std::env::remove_var("ANYAGENTS_FAKE_MODE");
     }
@@ -4474,7 +4475,7 @@ fn archived_agents_stay_retired_on_channel_senders_aliases_groups_and_deleted_ta
     assert!(store.agent(&deleted_id).is_err());
 }
 #[test]
-fn direct_send_and_archive_serialize_across_store_connections() {
+fn send_and_archive_serialize_across_store_connections() {
     let _env = env_lock();
     unsafe {
         std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
@@ -4492,14 +4493,14 @@ fn direct_send_and_archive_serialize_across_store_connections() {
     let other = Store::open(&db).unwrap();
     let sender = std::thread::spawn(move || {
         started_tx.send(()).unwrap();
-        let receipt = authored_send(
+        let outcome = try_authored_send(
             &other,
             &Actor::Operator("operator".into()),
             "recipient",
             "follow-up",
             "interleave",
         );
-        done_tx.send(receipt).unwrap();
+        done_tx.send(outcome).unwrap();
     });
     started_rx.recv().unwrap();
     assert!(
@@ -4510,13 +4511,23 @@ fn direct_send_and_archive_serialize_across_store_connections() {
     store.set_agent_state(&recipient.id, "archived").unwrap();
     mark_explicitly_archived_locked(&store, dir.path(), &recipient).unwrap();
     drop(guard);
-    let receipt = done_rx
+    // The send admitted before the archive is refused under the lifecycle
+    // lock: it neither stores mail nor flips the recipient back to running.
+    let refused = done_rx
         .recv_timeout(std::time::Duration::from_secs(2))
-        .unwrap();
+        .unwrap()
+        .expect_err("archived while the send waited");
     sender.join().unwrap();
-    assert_eq!(receipt.deliveries[0].seq, 1);
-    assert_eq!(store.agent(&recipient.id).unwrap().state, "running");
-    assert!(!has_explicit_archive_marker(dir.path(), &recipient.id));
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert!(
+        refused.message.contains("is archived"),
+        "{}",
+        refused.message
+    );
+    assert!(store.inbox(&recipient.id, None).unwrap().is_empty());
+    assert_eq!(store.agent(&recipient.id).unwrap().state, "archived");
+    assert!(has_explicit_archive_marker(dir.path(), &recipient.id));
+    store.set_agent_state(&recipient.id, "running").unwrap();
     // The converse ordering leaves a coherent archive, not running+marker.
     let guard = store.lock_agent_lifecycle(&recipient.id).unwrap();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -6762,7 +6773,10 @@ fn calls_over_http_mcp_cannot_start_or_read_on_the_host() {
             };
             let refused = |result: &serde_json::Value, why: &str| {
                 assert_eq!(result["result"]["isError"], true, "{result}");
-                assert!(result.to_string().contains(why), "{why}: {result}");
+                let text = result["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("MCP tool error text");
+                assert!(text.contains(why), "{why}: {result}");
             };
 
             // Spawning a host-executed agent, through either tool.
@@ -6796,16 +6810,20 @@ fn calls_over_http_mcp_cannot_start_or_read_on_the_host() {
             let child_after = state.store.agent(&child.id).unwrap();
             assert_eq!(child_after.harness, "claude-code");
             assert_eq!(child_after.runtime, anyagents_core::ExecutionRuntime::Cloud);
-            // Waking an archived host agent, explicitly or by a direct send.
+            // HTTP MCP cannot explicitly wake an archived host agent,
+            // and a send cannot wake it over any transport.
             refused(
                 &call("wake", serde_json::json!({ "agent": sleeper.name })).await,
                 "cannot wake it",
             );
-            let _ = call(
-                "send",
-                serde_json::json!({ "to": [sleeper.name], "text": "wake up" }),
-            )
-            .await;
+            refused(
+                &call(
+                    "send",
+                    serde_json::json!({ "to": [sleeper.name], "text": "wake up" }),
+                )
+                .await,
+                "agents(action=\"wake\")",
+            );
             assert_eq!(state.store.agent(&sleeper.id).unwrap().state, "archived");
             // Attaching a host file as media, by path or by bare name.
             for source in [secret.display().to_string(), "operator-token".to_string()] {

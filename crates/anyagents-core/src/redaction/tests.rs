@@ -730,7 +730,7 @@ fn all_coalescence_paths_retain_aliases_across_redaction_reopen_and_aged_history
         let mut retry = Incoming::new(canary);
         retry.source_key = Some(key.into());
         assert_eq!(
-            store.receive_direct_send(&f.target.id, retry).unwrap(),
+            store.receive(&f.target.id, retry).unwrap(),
             ReceiveOutcome::Duplicate(expected.clone())
         );
     }

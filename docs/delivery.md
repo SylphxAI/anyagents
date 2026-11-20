@@ -151,15 +151,15 @@ and never causes another notice; a child's own lifecycle notices
 "Who answers for" an agent is its nearest running or idle ancestor: a paused
 or archived one reads nothing.
 
-- **To an archived agent.** A send that cannot wake its archived recipient
-  (one sent through `parent` or another alias, to several recipients, or
-  over HTTP MCP to a host agent) is refused for that recipient: the response
-  lists it in `skipped` with `agent X is archived; its parent is Y` (or the
-  nearest running agent above it), and nothing is stored unread. A send with
-  no other recipient fails with that reason. A direct send to the archived
-  agent alone, by name, still wakes it where the caller may. Mail that
-  reaches an archived agent another way is stored, and its agent sender is
-  told (`[Undeliverable]`), once per message.
+- **To an archived agent.** No send wakes an archived agent, however it is
+  addressed (by name, by `agt_...` id, through `parent` or another alias, or
+  alone): only an explicit `agents(action="wake")` does. A send is refused
+  for that recipient: the response lists it in `skipped` with `agent X is
+  archived; its parent is Y` (or the nearest running agent above it), and
+  nothing is stored unread. A send with no other recipient fails with `409`,
+  that reason and instructions for explicitly waking the recipient. Mail
+  that reaches an archived agent another way is stored, and its agent sender is told
+  (`[Undeliverable]`), once per message.
 - **To a paused agent.** The mail is stored and waits. Its agent sender, or,
   when the sender is a person, a schedule or the operator, whoever answers
   for the paused agent, is told once per pause (`[Queued]`); the notice is

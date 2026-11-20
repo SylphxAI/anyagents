@@ -342,7 +342,8 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
     );
     assert!(root_archived.starts_with("HTTP/1.1 200"), "{root_archived}");
 
-    // An intentional direct send wakes an explicitly archived agent.
+    // A direct send never wakes an explicitly archived agent: it fails
+    // closed with 409, and only an explicit wake revives it.
     let archived = support::call_raw(
         &socket,
         "POST",
@@ -359,21 +360,19 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         &alpha_auth,
     );
     assert!(
-        send_while_archived.starts_with("HTTP/1.1 200"),
+        send_while_archived.starts_with("HTTP/1.1 409"),
         "{send_while_archived}"
     );
-    let agents_archived = support::call_raw(&socket, "GET", "/v1/agents", "", &support::header());
-    let agents_archived_json: Value =
-        serde_json::from_str(agents_archived.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    let gamma_archived_row = agents_archived_json["agents"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["name"] == "gamma")
-        .unwrap();
-    assert_eq!(
-        gamma_archived_row["state"], "running",
-        "{gamma_archived_row}"
+    assert!(
+        send_while_archived.contains("agents(action="),
+        "{send_while_archived}"
+    );
+    // The default roster hides archived agents; their archived state is
+    // observable on the detail route.
+    let gamma_archived = support::call_raw(&socket, "GET", "/v1/agents/gamma", "", &alpha_auth);
+    assert!(
+        gamma_archived.contains("\"state\":\"archived\""),
+        "{gamma_archived}"
     );
     let woke_explicit =
         support::call_raw(&socket, "POST", "/v1/agents/gamma/wake", "{}", &alpha_auth);
@@ -389,6 +388,17 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         .unwrap();
     assert_eq!(gamma_row["state"], "running", "{gamma_row}");
     assert_eq!(gamma_row["parent"], alpha, "{gamma_row}");
+    let send_after_wake = support::call_raw(
+        &socket,
+        "POST",
+        "/v1/send",
+        &json!({"to": ["gamma"], "text": "message after explicit wake"}).to_string(),
+        &alpha_auth,
+    );
+    assert!(
+        send_after_wake.starts_with("HTTP/1.1 200"),
+        "{send_after_wake}"
+    );
 
     // A replaced session stops working at once.
     let re_minted = support::call_raw(

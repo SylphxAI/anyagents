@@ -1321,16 +1321,20 @@ async fn mcp_tools_use_the_server_socket() {
         "{all_recipients:?}"
     );
 
-    // An intentional direct send by immutable id wakes the archived sub-agent.
-    let queued_send: SendResponse = ok_json(
-        call(
+    // A direct send, by immutable id or by name, never wakes the archived
+    // sub-agent: it fails closed and names the explicit wake.
+    for to in [spawned.id.as_str(), "worker-1"] {
+        let refused = call(
             &alpha,
             "send",
-            serde_json::json!({"to": [&spawned.id], "text": "wake up and continue"}),
+            serde_json::json!({"to": [to], "text": "wake up and continue"}),
         )
-        .await,
-    );
-    assert_eq!(queued_send.deliveries[0].to, "agent:worker-1");
+        .await;
+        assert_eq!(refused.is_error, Some(true), "{refused:?}");
+        let text = format!("{refused:?}");
+        assert!(text.contains("is archived"), "{text}");
+        assert!(text.contains("agents(action="), "{text}");
+    }
     let after_send: AgentsResponse = ok_json(
         call(
             &alpha,
@@ -1344,7 +1348,7 @@ async fn mcp_tools_use_the_server_socket() {
         .iter()
         .find(|a| a.id == spawned.id)
         .expect("worker-1");
-    assert_eq!(worker_row.state, "running");
+    assert_eq!(worker_row.state, "archived");
 
     let woken: AgentView = ok_json(
         call(
@@ -1355,6 +1359,15 @@ async fn mcp_tools_use_the_server_socket() {
         .await,
     );
     assert_eq!(woken.state, "running");
+    let queued_send: SendResponse = ok_json(
+        call(
+            &alpha,
+            "send",
+            serde_json::json!({"to": [&spawned.id], "text": "continue after wake"}),
+        )
+        .await,
+    );
+    assert_eq!(queued_send.deliveries[0].to, "agent:worker-1");
 
     let baseline_worker: serde_json::Value = ok_json(
         call(
