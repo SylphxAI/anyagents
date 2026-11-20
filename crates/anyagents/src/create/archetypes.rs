@@ -479,7 +479,7 @@ pub(crate) fn resolve_archetype_template(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ArchetypeSource {
+pub(super) enum ArchetypeSource {
     Disk,
     Builtin,
 }
