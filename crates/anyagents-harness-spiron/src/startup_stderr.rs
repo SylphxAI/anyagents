@@ -15,7 +15,25 @@ const MAX_BYTES: usize = 2048;
 // sequence isn't cut off at the display limit before we can sanitize it.
 const READ_BYTES: usize = 16 * 1024;
 
-pub(super) fn open_log(path: &Path, read: bool) -> Result<File, String> {
+// Keep the existing combined log for callers that haven't opted in.
+pub(super) fn launch_logs(path: &Path, tail: bool) -> Result<(File, File, Option<File>), String> {
+    let file = if tail {
+        open_private_log(path, true)?
+    } else {
+        File::create(path).map_err(|err| format!("cannot open {}: {err}", path.display()))?
+    };
+    let stderr = file
+        .try_clone()
+        .map_err(|err| format!("cannot duplicate {}: {err}", path.display()))?;
+    if tail {
+        let stdout = open_private_log(&path.with_extension("stdout.log"), false)?;
+        Ok((stdout, stderr, Some(file)))
+    } else {
+        Ok((file, stderr, None))
+    }
+}
+
+fn open_private_log(path: &Path, read: bool) -> Result<File, String> {
     OpenOptions::new()
         .read(read)
         .write(true)
@@ -28,16 +46,26 @@ pub(super) fn open_log(path: &Path, read: bool) -> Result<File, String> {
 
 pub(super) fn exit_before_listen(
     status: ExitStatus,
-    stderr: &File,
+    stderr: Option<&File>,
+    log: &Path,
     environment: &[(String, String)],
 ) -> ListenError {
     let mut error = format!("spiron exited with {status} before it listened");
-    if let Ok(tail) = read_tail(stderr, environment)
-        && !tail.is_empty()
-    {
-        error.push_str(" (stderr tail: ");
-        error.push_str(&tail);
-        error.push(')');
+    if let Some(stderr) = stderr {
+        if let Ok(tail) = read_tail(stderr, environment)
+            && !tail.is_empty()
+        {
+            error.push_str(" (stderr tail: ");
+            error.push_str(&tail);
+            error.push(')');
+        }
+    } else {
+        let combined = anyagents_harness_stream::read_bounded_masked_log(log);
+        let trimmed = combined.trim();
+        if !trimmed.is_empty() {
+            error.push_str(": ");
+            error.push_str(trimmed);
+        }
     }
     ListenError::Failed(error)
 }

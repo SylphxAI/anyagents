@@ -5,7 +5,7 @@ use anyagents_harness_spiron::{ListenError, SpironHarness, SpironLaunch};
 fn launch_failure(script: &str) -> String {
     let root = tempfile::tempdir_in("/tmp").unwrap();
     let dir = root.path();
-    let result = SpironHarness::launch_listening(
+    let result = SpironHarness::launch_listening_with_stderr_tail(
         SpironLaunch {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), script.into(), "fake-spiron".into()],

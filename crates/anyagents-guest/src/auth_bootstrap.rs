@@ -106,11 +106,14 @@ pub(crate) fn launch_guest_spiron(
     };
     let _ = std::fs::remove_file(&socket);
     let log = state_dir.join("spiron.log");
-    let harness =
-        SpironHarness::launch_listening(launch, &socket, &log, Duration::from_secs(60), |_pid| {
-            Ok(())
-        })
-        .map_err(|anyagents_harness_spiron::ListenError::Failed(err)| HarnessError::Failed(err))?;
+    let harness = SpironHarness::launch_listening_with_stderr_tail(
+        launch,
+        &socket,
+        &log,
+        Duration::from_secs(60),
+        |_pid| Ok(()),
+    )
+    .map_err(|anyagents_harness_spiron::ListenError::Failed(err)| HarnessError::Failed(err))?;
     Ok((harness, Some(socket)))
 }
 
