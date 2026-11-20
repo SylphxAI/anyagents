@@ -671,7 +671,14 @@ fn reconcile_agent_runtime_config_inner(
             repair_unseated_config_mode(config, pre_existing_mode.unwrap_or(0o0700))?;
         }
     }
-    verify_harness_runtime_config(config, &agent.harness, agent.model.as_deref())?;
+    let verify_selector = if spiron_cloud_active {
+        "spiron-cloud"
+    } else if agent.canonical_harness() == "spiron" {
+        "spiron-local"
+    } else {
+        &agent.harness
+    };
+    verify_harness_runtime_config(config, verify_selector, agent.model.as_deref())?;
     Ok(continuity)
 }
 
@@ -920,14 +927,23 @@ pub(crate) fn verify_harness_runtime_config(
         }
         selector
             if crate::vendor::is_spiron_harness(selector)
-                || normalize_harness_name(selector) == "spiron-cloud" =>
+                || anyagents_harness::decompose_harness_selector(selector)
+                    .is_ok_and(|(h, _)| h == "spiron") =>
         {
             let data_dir = config
                 .parent()
                 .and_then(Path::parent)
                 .and_then(Path::parent);
-            let local_exec =
-                crate::vendor::spiron_uses_local_execution(selector, data_dir, Some(config));
+            let implied_rt = anyagents_harness::decompose_harness_selector(selector)
+                .ok()
+                .and_then(|(_, rt)| rt);
+            let local_exec = matches!(implied_rt, Some(anyagents_core::ExecutionRuntime::Local))
+                || (implied_rt.is_none()
+                    && crate::vendor::spiron_uses_local_execution(
+                        selector,
+                        data_dir,
+                        Some(config),
+                    ));
             let cloud_path = config.join("cloud.json");
             if !local_exec {
                 if cloud_path.is_file() {

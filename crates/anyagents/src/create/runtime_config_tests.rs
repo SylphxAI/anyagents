@@ -3344,8 +3344,10 @@ fn spiron_routes_to_cloud_json_while_spiron_local_requires_mcp_config() {
         .unwrap();
 
     let cloud_agent = store
-        .create_agent(NewAgent::new("spiron-default-cloud", "spiron"))
+        .create_agent(NewAgent::new("spiron-default-cloud", "spiron@cloud"))
         .unwrap();
+    assert_eq!(cloud_agent.harness, "spiron");
+    assert_eq!(cloud_agent.runtime, anyagents_core::ExecutionRuntime::Cloud);
     let cloud_cfg = agent_config_dir(data, &cloud_agent.id);
     let cloud_work = data.join("work-cloud");
     std::fs::create_dir_all(cloud_cfg.join(".spiron")).unwrap();
@@ -3356,7 +3358,8 @@ fn spiron_routes_to_cloud_json_while_spiron_local_requires_mcp_config() {
     )
     .unwrap();
     reconcile_agent_runtime_config(&store, data, &cloud_agent, &cloud_cfg, &cloud_work).unwrap();
-    verify_harness_runtime_config(&cloud_cfg, "spiron", cloud_agent.model.as_deref()).unwrap();
+    verify_harness_runtime_config(&cloud_cfg, "spiron@cloud", cloud_agent.model.as_deref())
+        .unwrap();
     let cloud_json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(cloud_cfg.join("cloud.json")).unwrap()).unwrap();
     assert_eq!(cloud_json["api_key"], "spiron_sk_test_123");
@@ -3365,6 +3368,8 @@ fn spiron_routes_to_cloud_json_while_spiron_local_requires_mcp_config() {
     let local_agent = store
         .create_agent(NewAgent::new("spiron-explicit-local", "spiron-local"))
         .unwrap();
+    assert_eq!(local_agent.harness, "spiron");
+    assert_eq!(local_agent.runtime, anyagents_core::ExecutionRuntime::Local);
     let local_cfg = agent_config_dir(data, &local_agent.id);
     let local_work = data.join("work-local");
     std::fs::create_dir_all(&local_cfg).unwrap();
@@ -3374,4 +3379,5 @@ fn spiron_routes_to_cloud_json_while_spiron_local_requires_mcp_config() {
         .unwrap();
     assert!(local_cfg.join("spiron-mcp.json").is_file());
     assert!(local_cfg.join("config.toml").is_file());
+    assert!(!local_cfg.join("cloud.json").exists());
 }

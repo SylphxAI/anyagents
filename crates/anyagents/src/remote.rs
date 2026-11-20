@@ -297,21 +297,18 @@ pub fn normalize_public_url(raw: &str) -> Result<String, String> {
     Ok(format!("{}://{rest}", scheme.to_ascii_lowercase()))
 }
 
-/// Whether this agent executes via a vendor-hosted cloud runtime (`cloud`),
-/// respecting its explicit `runtime` column first (`sandbox` never falls back
-/// to cloud) and preserving legacy Spiron cloud defaults when `runtime == local`.
+/// Whether this agent executes via a vendor-hosted cloud runtime (`cloud`).
+///
+/// Governed authoritatively by the agent's first-class `runtime` column (with
+/// a fallback for legacy `*-cloud` harness values if a row bypassed
+/// canonicalization): `local` and `sandbox[:provider]` agents never silently
+/// hijack into cloud execution.
 pub(crate) fn is_agent_cloud(
     agent: &Agent,
-    data_dir: Option<&Path>,
-    config_dir: Option<&Path>,
+    _data_dir: Option<&Path>,
+    _config_dir: Option<&Path>,
 ) -> bool {
-    if agent.runtime.is_cloud() {
-        return true;
-    }
-    if agent.runtime.is_sandbox() {
-        return false;
-    }
-    crate::vendor::is_effective_cloud_harness(&agent.harness, data_dir, config_dir)
+    agent.runtime.is_cloud() || crate::vendor::is_cloud_harness(&agent.harness)
 }
 
 /// Declared delivery guarantee for an agent, respecting its first-class `runtime`

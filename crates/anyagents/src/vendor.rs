@@ -963,11 +963,13 @@ fn vendor_launch_authorized(
     prepare_host_session(&request)?;
     // A Spiron hold means something only to a local Spiron session; any other
     // harness (including Cloud-routed Spiron) starts its own, so settle first.
-    if !spiron_uses_local_execution(
-        &request.agent.harness,
-        Some(&request.data_dir),
-        Some(&request.config_dir),
-    ) {
+    if !is_spiron_harness(&request.agent.harness)
+        || crate::remote::is_agent_cloud(
+            &request.agent,
+            Some(&request.data_dir),
+            Some(&request.config_dir),
+        )
+    {
         settle_legacy_spiron_hold(&request.config_dir)?;
     }
     let config_dir = request.config_dir.clone();
@@ -1782,11 +1784,7 @@ fn plan_adapter(
             Some(&session_file),
             &cloud_selector,
         ))
-    } else if spiron_uses_local_execution(
-        &request.agent.harness,
-        Some(&request.data_dir),
-        Some(&request.config_dir),
-    ) {
+    } else if is_spiron_harness(&request.agent.harness) {
         let session = session_from_file(&request.config_dir, "spiron-session-id")?;
         let program = std::env::var("ANYAGENTS_SPIRON_BIN")
             .map(PathBuf::from)
