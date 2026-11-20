@@ -211,6 +211,7 @@ where
 
 /// Dispatch one remote turn synchronously in <1s without spawning any coordinator-side
 /// background loops or long-lived pipes/SSE streams.
+#[allow(dead_code)]
 pub(crate) async fn dispatch_serverless_turn(
     store: Arc<Store>,
     input: ServerlessDispatchInput,
@@ -572,7 +573,7 @@ async fn dispatch_sandbox_turn(
         let (ensured, effective_prompt) = match ensured_res {
             Ok(pair) => pair,
             Err((maybe_handle, err)) => {
-                if let Some(ref handle) = maybe_handle
+                if let Some(handle) = maybe_handle.as_deref()
                     && attempt == 0
                     && super::serverless_failure::is_unhealthy_lease_exec_error(&err)
                 {
@@ -591,7 +592,7 @@ async fn dispatch_sandbox_turn(
                     &input.agent.id,
                     &turn_id,
                     err.clone(),
-                    maybe_handle.as_ref().map(|h| (&provider, h)),
+                    maybe_handle.as_deref().map(|h| (&provider, h)),
                 )
                 .await;
                 return Err(err);
@@ -4892,11 +4893,13 @@ done
         assert!(store.list_undelivered(&agent.id, 10).unwrap().is_empty());
     }
 
+    type RecordedTars = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
     struct InspectingMockProvider {
         root: std::path::PathBuf,
         ensure_reqs: Arc<Mutex<Vec<EnsureSandboxRequest>>>,
         exec_reqs: Arc<Mutex<Vec<ExecRequest>>>,
-        synced_tars: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+        synced_tars: RecordedTars,
     }
 
     #[async_trait::async_trait]

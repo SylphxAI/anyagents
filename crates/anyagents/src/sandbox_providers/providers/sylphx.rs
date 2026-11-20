@@ -539,9 +539,11 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use serde_json::{Value, json};
 
+    type RecordedBytes = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
     #[derive(Clone, Default)]
     struct MockSylphxState {
-        write_files: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+        write_files: RecordedBytes,
         exec_commands: Arc<Mutex<Vec<Vec<String>>>>,
     }
 

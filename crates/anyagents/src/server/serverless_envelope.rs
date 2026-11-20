@@ -451,7 +451,7 @@ pub(crate) async fn ensure_and_prepare_sandbox_for_turn(
     prompt_for_media: String,
     base_url: String,
     extra_args: Vec<String>,
-) -> Result<(crate::sandbox_exec::EnsuredSandbox, String), (Option<SandboxHandle>, String)> {
+) -> Result<(crate::sandbox_exec::EnsuredSandbox, String), (Option<Box<SandboxHandle>>, String)> {
     tokio::task::spawn_blocking(move || {
         let cfg_dir = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
         let remote_workdir = super::resolve_remote_sandbox_workdir(&store, &agent);
@@ -524,7 +524,7 @@ pub(crate) async fn ensure_and_prepare_sandbox_for_turn(
         })();
         match prep {
             Ok(rewritten) => Ok((ensured, rewritten)),
-            Err(e) => Err((Some(ensured.handle), e)),
+            Err(e) => Err((Some(Box::new(ensured.handle)), e)),
         }
     })
     .await
