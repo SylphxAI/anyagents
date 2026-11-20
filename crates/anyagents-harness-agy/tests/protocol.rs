@@ -176,8 +176,15 @@ fn agy_multi_step_next_step_steer_incorporates_into_step2_and_fails_closed() {
     std::fs::write(
         &py,
         r#"
-import base64, json, os, pathlib, sys, threading, time, uuid
+import base64, json, os, pathlib, socketserver, sys, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class FastHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
 
 state_dir = pathlib.Path(os.environ["MOCK_STATE_DIR"])
 home = pathlib.Path(os.environ["MOCK_AGY_HOME"])
@@ -232,6 +239,7 @@ def append_transcript(source, kind, **fields):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
     def log_message(self, *a): pass
+    def address_string(self): return "127.0.0.1"
     def do_POST(self):
         global refuse_next, exit_on_next_steer
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
@@ -277,7 +285,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+server = FastHTTPServer(("127.0.0.1", 0), Handler)
 port = server.server_address[1]
 threading.Thread(target=server.serve_forever, daemon=True).start()
 

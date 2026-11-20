@@ -1537,8 +1537,15 @@ fn opencode_multi_step_next_step_steer_incorporates_into_step2_and_fails_closed(
     std::fs::write(
         &py,
         r#"
-import json, os, pathlib, socket, sys, threading, time, urllib.error, urllib.request
+import json, os, pathlib, socket, socketserver, sys, threading, time, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class FastHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
 
 state_dir = pathlib.Path(os.environ["MOCK_STATE_DIR"])
 trace_path = state_dir / "oc_trace.jsonl"
@@ -1600,6 +1607,7 @@ def run_serve(args):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         def log_message(self, *a): pass
+        def address_string(self): return "127.0.0.1"
         def send_json(self, status, obj):
             raw = json.dumps(obj).encode()
             self.send_response(status)
@@ -1680,7 +1688,7 @@ def run_serve(args):
             else:
                 self.send_json(200, {})
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = FastHTTPServer(("127.0.0.1", port), Handler)
     server.daemon_threads = True
     print(f"server listening on http://127.0.0.1:{port}", flush=True)
     print("server password mock-pass", flush=True)
