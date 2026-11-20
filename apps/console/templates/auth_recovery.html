@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign-in recovery · AnyAgents</title>
+  <link rel="stylesheet" href="/assets/console.css">
+  <script type="module" src="/assets/signin.js"></script>
+</head>
+<body>
+  <main class="auth-layout">
+    <div class="auth-mast"><a class="brand" href="{{HOME_URL}}"><span class="auth-mark" aria-hidden="true">A</span><strong>AnyAgents</strong></a><span id="auth-theme"></span></div>
+    <section class="auth-card panel">
+      <span class="eyebrow">OPERATOR ACCESS / RECOVERY</span>
+      <h1>Restart sign-in</h1>
+      <div class="problem" role="alert"><div>{{REASON}}</div></div>
+      <p>Start a new sign-in from the same browser, or return to the console.</p>
+      <a class="button primary auth-cta" href="{{LOGIN_URL}}">Sign in again <span aria-hidden="true">↗</span></a>
+      <a class="button recovery-home" href="{{HOME_URL}}">Back to console</a>
+    </section>
+  </main>
+</body>
+</html>
