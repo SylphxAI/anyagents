@@ -272,19 +272,35 @@ impl Store {
                 .or_else(|| parse_edited_message_text(&incoming.text).map(|(id, _)| id));
             origin
         });
+        super::dedup::lock_telegram_group_dedup(
+            tx,
+            agent_id,
+            ingress_origin,
+            source_key.as_deref(),
+            incoming.sender.as_deref(),
+        )?;
+        let group_dedup_key = super::dedup::telegram_group_dedup_key(
+            ingress_origin,
+            source_key.as_deref(),
+            incoming.sender.as_deref(),
+            incoming.source_time_ms,
+            &incoming.text,
+        );
         if let Some(existing) =
             redacted_message_by_ingress(tx, agent_id, ingress_origin, source_key.as_deref())?
         {
             // A known alias can reveal another route (for example a new source
             // key on a known origin). Retain that link without changing the
             // canonical message or audit, so a source-only retry stays erased.
-            retain_message_aliases(tx, &existing, ingress_origin, source_key.as_deref())?;
+            let id = retain_message_aliases(tx, &existing, ingress_origin, source_key.as_deref())?;
+            super::dedup::retain_dedup_alias(tx, agent_id, &id, group_dedup_key.as_deref())?;
             return Ok(ReceiveTx::Early(Some(ReceiveOutcome::Duplicate(existing))));
         }
         if let Some(key) = &source_key
             && let Some(existing) = message_by_source(tx, agent_id, key)?
         {
-            retain_message_aliases(tx, &existing, ingress_origin, Some(key))?;
+            let id = retain_message_aliases(tx, &existing, ingress_origin, Some(key))?;
+            super::dedup::retain_dedup_alias(tx, agent_id, &id, group_dedup_key.as_deref())?;
             return Ok(ReceiveTx::Early(Some(ReceiveOutcome::Duplicate(existing))));
         }
         let mut body = incoming.body();
@@ -332,6 +348,16 @@ impl Store {
                 merged,
             )?
         {
+            let id = retain_message_aliases(tx, &existing, ingress_origin, source_key.as_deref())?;
+            super::dedup::retain_dedup_alias(tx, agent_id, &id, group_dedup_key.as_deref())?;
+            return Ok(ReceiveTx::Early(Some(ReceiveOutcome::Duplicate(existing))));
+        }
+        if redelivery_identity.is_none()
+            && let Some(dedup_key) = group_dedup_key.as_deref()
+            && let Some(existing) = super::dedup::message_by_source_alias(tx, agent_id, dedup_key)?
+        {
+            let id = retain_message_aliases(tx, &existing, ingress_origin, source_key.as_deref())?;
+            super::dedup::retain_dedup_alias(tx, agent_id, &id, Some(dedup_key))?;
             return Ok(ReceiveTx::Early(Some(ReceiveOutcome::Duplicate(existing))));
         }
         if let Some((edited_msg_id, new_raw_text)) = parse_edited_message_text(&incoming.text) {
@@ -562,7 +588,14 @@ impl Store {
                 &db_params![agent_id.as_str(), message.id.as_str(), identity_id],
             )?;
         }
-        retain_message_aliases(tx, &message, ingress_origin, message.source_key.as_deref())?;
+        let inserted_identity =
+            retain_message_aliases(tx, &message, ingress_origin, message.source_key.as_deref())?;
+        super::dedup::retain_dedup_alias(
+            tx,
+            agent_id,
+            &inserted_identity,
+            group_dedup_key.as_deref(),
+        )?;
         let is_passive_reaction = message.context.event.as_deref() == Some("reaction_passive");
         let woke_agent = if wake_archived {
             tx.db_execute(

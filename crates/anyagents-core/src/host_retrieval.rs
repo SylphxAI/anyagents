@@ -806,6 +806,8 @@ impl Store {
         let local_root_present = agent_root_safe(&mut walk, agents)?;
         if local_root_present {
             match class {
+                // In Postgres mode, `agent_files(namespace='memory')` is SSOT; skip local hydrated copies.
+                MemoryScope::Memory if self.is_postgres() => {}
                 MemoryScope::Memory => {
                     batch::refresh_local_memory_files(
                         index,
@@ -905,11 +907,8 @@ impl Store {
                 if keep.contains(segment) || !source_class(cursor).is_none_or(|c| c == class) {
                     return false;
                 }
-                // On a stateless PostgreSQL replica whose local `<data>/agents/<id>`
-                // directory does not exist, never wipe pre-indexed host or migrated
-                // sources belonging to another pod; only prune deleted `pg://agent_files/`
-                // blobs we authoritatively listed above.
-                if self.is_postgres() && !local_root_present {
+                // Preserve other-pod transcript segments when local root is absent; PG memory is SSOT.
+                if self.is_postgres() && !local_root_present && class != MemoryScope::Memory {
                     return segment.starts_with(PG_AGENT_FILE_PREFIX);
                 }
                 true

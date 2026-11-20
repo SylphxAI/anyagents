@@ -856,6 +856,7 @@ mod spawn_args_tests {
             state: "active".into(),
             created_at_ms: 1_794_500_000_000,
         }];
+        let single_agent_body = serde_json::to_vec(&child).unwrap();
         let agents_body = serde_json::to_vec(&AgentsResponse {
             archived_count: 0,
             agents: vec![child],
@@ -888,6 +889,8 @@ mod spawn_args_tests {
                 let path = line.split_whitespace().nth(1).unwrap();
                 let body = if path.contains("/conversation") {
                     &conv_body
+                } else if path.contains("/v1/agents/") {
+                    &single_agent_body
                 } else {
                     &agents_body
                 };
@@ -1449,12 +1452,6 @@ mod tool_server_runtime_tests {
             Some(parent_id.as_str()),
         );
         archived_child.instructions = Some("ARCHIVED_INSTRUCTIONS".into());
-        let empty_live = serde_json::to_vec(&AgentsResponse {
-            archived_count: 1,
-            agents: Vec::new(),
-            gateway: None,
-        })
-        .unwrap();
         let single_body = serde_json::to_vec(&archived_child).unwrap();
         let conv_body = serde_json::to_vec(&ConversationResponse {
             retrieval: None,
@@ -1464,7 +1461,7 @@ mod tool_server_runtime_tests {
         })
         .unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..3 {
+            for _ in 0..2 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut req = Vec::new();
                 loop {
@@ -1476,9 +1473,7 @@ mod tool_server_runtime_tests {
                 let line = std::str::from_utf8(&req).unwrap().lines().next().unwrap();
                 let uri: hyper::Uri = line.split_whitespace().nth(1).unwrap().parse().unwrap();
                 let path = uri.path();
-                let body = if path == "/v1/agents" {
-                    &empty_live
-                } else if path == "/v1/agents/archived-worker" {
+                let body = if path == "/v1/agents/archived-worker" {
                     &single_body
                 } else {
                     &conv_body

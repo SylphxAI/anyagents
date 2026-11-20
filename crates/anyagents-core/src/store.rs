@@ -82,6 +82,7 @@ mod audit_tests;
 mod capabilities;
 mod channels;
 mod credentials;
+mod dedup;
 mod group_policy;
 mod groups;
 mod harness_leases;
@@ -131,6 +132,7 @@ pub use credentials::{
     CredentialSlot, CredentialTarget,
 };
 pub use group_policy::{Group, GroupAction, GroupActor};
+pub use groups::GroupSummary;
 pub use harness_leases::HarnessLease;
 pub use index_sync::{clean_rag_text, rag_content_hash, tokenize_hybrid_search_tokens};
 pub use lifecycle::{LifecycleKind, LifecycleOp, LifecyclePhase, NewLifecycleOp, SchedulePending};

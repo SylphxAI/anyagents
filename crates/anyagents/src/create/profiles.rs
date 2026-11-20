@@ -680,7 +680,7 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
 /// `deployment_blobs(namespace = 'profiles')` into `<data>/profiles` so stateless
 /// replicas observe fresh native-refreshed OAuth tokens persisted by any other
 /// replica or sandbox turn.
-fn hydrate_profiles_from_store_if_postgres(store: &Store, data: &Path) {
+pub(crate) fn hydrate_profiles_from_store_if_postgres(store: &Store, data: &Path) {
     if !store.is_postgres() {
         return;
     }

@@ -359,39 +359,6 @@ impl Client {
         };
         self.get(path, None).await
     }
-
-    pub(super) async fn get_agent(&self, target: &str) -> Result<crate::api::AgentView, String> {
-        let encoded = super::urlencoding_simple(target);
-        self.get(&format!("/v1/agents/{encoded}"), None).await
-    }
-
-    /// Resolve a target agent for `inspect` / `status`. Checks the live roster
-    /// first and falls back to `GET /v1/agents/{id_or_name}` so recently
-    /// archived agents remain inspectable by ID, name, or alias.
-    pub(super) async fn resolve_agent_for_inspect(
-        &self,
-        self_id: &str,
-        clean: &str,
-        label: &str,
-    ) -> Result<crate::api::AgentView, String> {
-        let resp: AgentsResponse = self.get_agents().await?;
-        if let Some(view) = resp.agents.into_iter().find(|a| {
-            (clean.eq_ignore_ascii_case("self") && a.id == self_id)
-                || a.name.eq_ignore_ascii_case(clean)
-                || a.id == clean
-                || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(clean))
-        }) {
-            return Ok(view);
-        }
-        let lookup = if clean.eq_ignore_ascii_case("self") {
-            self_id
-        } else {
-            clean
-        };
-        self.get_agent(lookup)
-            .await
-            .map_err(|_| format!("{label} `{clean}` not found"))
-    }
 }
 
 pub(super) fn error_message(bytes: &[u8]) -> String {

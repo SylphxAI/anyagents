@@ -619,6 +619,9 @@ pub(super) struct GroupsArgs {
     /// Optional group visibility toggle: `false` (default = Private / Invite-Only group; participation requires membership or an invitation) or `true` (Public / Open group).
     #[serde(default, alias = "allow_external")]
     pub(super) public: Option<bool>,
+    /// Optional flag for `action: "list"`: include archived groups (default `false`).
+    #[serde(default)]
+    pub(super) include_archived: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]

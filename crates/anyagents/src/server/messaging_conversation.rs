@@ -198,14 +198,28 @@ pub(super) async fn inbox(
                 agent_id.clone()
             }
         };
-        inbox_of(
+        let resp = inbox_of(
             &state.store,
             &agent_id,
             query.since,
             query.limit,
             query.unread.unwrap_or(false),
             query.sender.as_deref(),
-        )
+        )?;
+        // When an agent reads its own inbox mid-turn in serverless mode, record
+        // the highest sequence observed on its active `pending_remote_turns` row
+        // so `turn_complete` advances `delivered_seq` past messages already read
+        // during the turn (without advancing on crash/failure).
+        if matches!(principal, Principal::Agent { .. })
+            && let Some(max_read_seq) = resp.0.messages.iter().map(|m| m.seq).max()
+        {
+            let _ = state.store.remote_turn_store().record_agent_inbox_read_seq(
+                &agent_id,
+                max_read_seq,
+                anyagents_core::now_ms(),
+            );
+        }
+        Ok(resp)
     })
     .await
 }

@@ -611,6 +611,12 @@ fn execute_turn_foreground(
         .usage_for_id(&delivery_id)
         .unwrap_or_else(|| adapter.served_usage().difference(base_usage));
     let reply_opt = adapter.answer_for(&delivery_id, state_dir);
+    let reply_empty = reply_opt.as_deref().is_none_or(|s| s.trim().is_empty());
+    if err_override.is_none() && reply_empty {
+        err_override = adapter
+            .failure_for_id(&delivery_id)
+            .or_else(|| adapter.exit_diagnostic());
+    }
 
     // Capture live descendant snapshot right before stopping adapter so coordinator
     // knows whether any background child subprocesses outlive the turn.

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use anyagents_core::Store;
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -260,31 +260,76 @@ fn build_group_roster(store: &Store, members: &[String]) -> Vec<crate::api::Grou
     out
 }
 
+#[derive(Default, Deserialize)]
+struct ListGroupsQuery {
+    #[serde(default)]
+    include_archived: Option<bool>,
+}
+
+fn roster_views_from_agents(agents: &[anyagents_core::Agent]) -> Vec<crate::api::GroupMemberView> {
+    agents
+        .iter()
+        .map(|agent| crate::api::GroupMemberView {
+            id: agent.id.to_string(),
+            name: agent.name.clone(),
+            role: agent.role.clone(),
+            harness: agent.harness.clone(),
+            model: agent.model.clone(),
+            state: agent.state.clone(),
+            description: agent.public_description(),
+        })
+        .collect()
+}
+
+fn filter_groups_for_principal(
+    store: &Store,
+    principal: &Principal,
+    include_archived: bool,
+) -> Result<Vec<GroupView>, ApiError> {
+    let summaries = store
+        .list_groups_with_roster()
+        .map_err(ApiError::from_store)?;
+    let mut groups = Vec::with_capacity(summaries.len());
+    for g in summaries {
+        if let Principal::Agent { agent_id, .. } = principal {
+            let is_member = g.members.iter().any(|a| &a.id == agent_id);
+            let is_owner = g.owner_agent_id.as_ref() == Some(agent_id);
+            if !g.public && !is_member && !is_owner {
+                continue;
+            }
+        }
+        if !include_archived {
+            let all_members_archived =
+                !g.members.is_empty() && g.members.iter().all(|a| a.state == "archived");
+            let empty_archived_owner = g.members.is_empty()
+                && g.owner_agent_id
+                    .as_ref()
+                    .is_some_and(|oid| store.agent(oid).is_ok_and(|a| a.state == "archived"));
+            if all_members_archived || empty_archived_owner {
+                continue;
+            }
+        }
+        let members = g.members.iter().map(|a| a.name.clone()).collect();
+        let roster = roster_views_from_agents(&g.members);
+        groups.push(GroupView {
+            name: g.name,
+            public: g.public,
+            owner_agent_id: g.owner_agent_id.map(|id| id.to_string()),
+            members,
+            roster,
+        });
+    }
+    Ok(groups)
+}
+
 async fn list_groups_route(
-    _principal: Principal,
+    principal: Principal,
     State(state): State<AppState>,
+    Query(query): Query<ListGroupsQuery>,
 ) -> Result<Json<GroupsResponse>, ApiError> {
+    let include_archived = query.include_archived.unwrap_or(false);
     spawn_store(move || {
-        let rows = state.store.list_groups().map_err(ApiError::from_store)?;
-        let groups = rows
-            .into_iter()
-            .map(|(name, members)| {
-                let public = state.store.is_group_public(&name);
-                let roster = build_group_roster(&state.store, &members);
-                Ok(GroupView {
-                    owner_agent_id: state
-                        .store
-                        .group(&name)
-                        .map_err(ApiError::from_store)?
-                        .and_then(|g| g.owner_agent_id)
-                        .map(|id| id.to_string()),
-                    name,
-                    public,
-                    members,
-                    roster,
-                })
-            })
-            .collect::<Result<Vec<_>, ApiError>>()?;
+        let groups = filter_groups_for_principal(&state.store, &principal, include_archived)?;
         Ok(Json(GroupsResponse { groups }))
     })
     .await
@@ -392,4 +437,98 @@ async fn group_action_route(
         }))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyagents_core::NewAgent;
+
+    #[test]
+    fn groups_list_isolates_private_groups_and_excludes_archived_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("state.db")).unwrap();
+
+        let alpha = store
+            .create_agent(NewAgent::new("alpha", "claude-code"))
+            .unwrap();
+        let beta = store
+            .create_agent(NewAgent::new("beta", "claude-code"))
+            .unwrap();
+        let archived_member = store
+            .create_agent(NewAgent::new("retired", "claude-code"))
+            .unwrap();
+        store.set_agent_running(&alpha.id, "/work").unwrap();
+        store.set_agent_running(&beta.id, "/work").unwrap();
+        store
+            .set_agent_running(&archived_member.id, "/work")
+            .unwrap();
+
+        // Domain A private group (`public: false`) with only `alpha`.
+        store
+            .group_action_as(
+                &anyagents_core::GroupActor::Agent(alpha.id.clone()),
+                "domain-a-private",
+                anyagents_core::GroupAction::Join,
+                std::slice::from_ref(&alpha.id),
+                Some(false),
+            )
+            .unwrap();
+        // Public group (`public: true`) with only `alpha`.
+        store
+            .group_action_as(
+                &anyagents_core::GroupActor::Agent(alpha.id.clone()),
+                "open-commons",
+                anyagents_core::GroupAction::Join,
+                std::slice::from_ref(&alpha.id),
+                Some(true),
+            )
+            .unwrap();
+        // Public group whose sole member gets archived.
+        store
+            .group_action_as(
+                &anyagents_core::GroupActor::Operator,
+                "legacy-archived-room",
+                anyagents_core::GroupAction::Join,
+                std::slice::from_ref(&archived_member.id),
+                Some(true),
+            )
+            .unwrap();
+        store
+            .set_agent_state(&archived_member.id, "archived")
+            .unwrap();
+
+        let beta_principal = Principal::Agent {
+            agent_id: beta.id.clone(),
+            name: beta.name.clone(),
+        };
+        let beta_groups = filter_groups_for_principal(&store, &beta_principal, false).unwrap();
+        let beta_names: Vec<&str> = beta_groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            beta_names,
+            vec!["open-commons"],
+            "non-member agent must NOT see private cross-domain or archived groups"
+        );
+
+        let beta_with_archived =
+            filter_groups_for_principal(&store, &beta_principal, true).unwrap();
+        let beta_arch_names: Vec<&str> =
+            beta_with_archived.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            beta_arch_names,
+            vec!["legacy-archived-room", "open-commons"]
+        );
+
+        let alpha_principal = Principal::Agent {
+            agent_id: alpha.id.clone(),
+            name: alpha.name.clone(),
+        };
+        let alpha_groups = filter_groups_for_principal(&store, &alpha_principal, false).unwrap();
+        let alpha_names: Vec<&str> = alpha_groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(alpha_names, vec!["domain-a-private", "open-commons"]);
+
+        let op_groups = filter_groups_for_principal(&store, &Principal::Operator, false).unwrap();
+        let op_names: Vec<&str> = op_groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(op_names, vec!["domain-a-private", "open-commons"]);
+    }
 }

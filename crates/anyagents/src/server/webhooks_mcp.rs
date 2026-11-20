@@ -344,12 +344,44 @@ async fn public_mcp_post_route(
     mcp_post(McpListener::Public, state, headers, payload).await
 }
 
+fn mcp_hydration_needs(payload: &serde_json::Value) -> (bool, bool) {
+    let method = payload
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if method != "tools/call" {
+        return (false, false);
+    }
+    let tool = payload
+        .pointer("/params/name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let needs_memory = tool == "memory"
+        || tool == "conversation"
+        || tool.starts_with("memory_")
+        || tool.starts_with("conversation_");
+    let action = payload
+        .pointer("/params/arguments/action")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let is_fast_read_agent_action = matches!(
+        action,
+        "list" | "inspect" | "status" | "get" | "info" | "show" | "models" | "catalog" | "profiles"
+    );
+    let needs_lease = tool == "workspace"
+        || tool.starts_with("workspace_")
+        || (matches!(tool, "agents" | "subagents") && !is_fast_read_agent_action);
+    (needs_lease, needs_memory)
+}
+
 async fn mcp_post(
     listener: McpListener,
     state: AppState,
     headers: axum::http::HeaderMap,
     payload: serde_json::Value,
 ) -> Result<axum::response::Response, ApiError> {
+    let (needs_lease, needs_memory) = mcp_hydration_needs(&payload);
     let mcp = spawn_store(move || {
         let caller = authenticate_mcp_request(&state.store, &headers, listener)?;
         let McpCaller { agent, .. } = caller;
@@ -362,15 +394,21 @@ async fn mcp_post(
             name: agent.name.clone(),
         };
         let _ = std::fs::create_dir_all(&config_dir);
-        // Hydrate remote sandbox lease metadata + learned memory from PostgreSQL on
-        // stateless replicas so `workspace.*` and `memory.*` tools work identically
-        // across scale-to-zero and replica switches.
-        let hydrated_workdir = crate::sandbox_exec::hydrate_sandbox_lease_file_from_store(
-            &state.store,
-            &agent.id,
-            &config_dir,
-        );
-        let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(&state.store, &agent.id);
+        // Hydrate remote sandbox lease metadata + learned memory lazily only for
+        // tools that read them so fast read calls (`agents(inspect)`, `groups(list)`,
+        // `schedules(list)`, `inbox`, `send`) avoid redundant PG blob round-trips.
+        let hydrated_workdir = if needs_lease {
+            crate::sandbox_exec::hydrate_sandbox_lease_file_from_store(
+                &state.store,
+                &agent.id,
+                &config_dir,
+            )
+        } else {
+            None
+        };
+        if needs_memory {
+            let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(&state.store, &agent.id);
+        }
         let effective_workdir = hydrated_workdir
             .map(PathBuf::from)
             .or_else(|| agent.workdir.as_deref().map(PathBuf::from));
@@ -409,4 +447,49 @@ async fn mcp_post(
         axum::http::HeaderValue::from_static("base64"),
     );
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn mcp_hydration_skips_fast_read_tools_and_enables_memory_and_workspace_tools() {
+        assert_eq!(
+            mcp_hydration_needs(&json!({
+                "method": "tools/call",
+                "params": { "name": "agents", "arguments": { "action": "inspect", "name": "self" } }
+            })),
+            (false, false)
+        );
+        assert_eq!(
+            mcp_hydration_needs(&json!({
+                "method": "tools/call",
+                "params": { "name": "groups", "arguments": { "action": "list" } }
+            })),
+            (false, false)
+        );
+        assert_eq!(
+            mcp_hydration_needs(&json!({
+                "method": "tools/call",
+                "params": { "name": "schedules", "arguments": { "action": "list" } }
+            })),
+            (false, false)
+        );
+        assert_eq!(
+            mcp_hydration_needs(&json!({
+                "method": "tools/call",
+                "params": { "name": "memory", "arguments": { "action": "search", "query": "test" } }
+            })),
+            (false, true)
+        );
+        assert_eq!(
+            mcp_hydration_needs(&json!({
+                "method": "tools/call",
+                "params": { "name": "agents", "arguments": { "action": "spawn", "name": "worker" } }
+            })),
+            (true, false)
+        );
+    }
 }

@@ -77,7 +77,7 @@ pub use storage::{
 pub use store::holds_store_writer;
 pub use store::{
     Ack, Agent, AgentLock, AgentQueryMetadata, AgentSchedule, AgentSummary, BillingMode, Channel,
-    ConversationTurn, DEFAULT_ARCHIVE_ROSTER_LIMIT, Group, GroupAction, GroupActor,
+    ConversationTurn, DEFAULT_ARCHIVE_ROSTER_LIMIT, Group, GroupAction, GroupActor, GroupSummary,
     HistorySearchQuery, HistorySort, Incoming, Lag, MAX_RECOVERY_ATTEMPTS, Message, NewAgent,
     NewChannel, NewSchedule, NewUsage, OPERATOR_BURST, OPERATOR_FLEET_BURST,
     OPERATOR_FLEET_HOURLY_CAP, OPERATOR_HOURLY_CAP, OpenTurn, OperatorMessage, OperatorReceipt,
