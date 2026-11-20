@@ -325,7 +325,7 @@ pub(super) struct AgentsArgs {
     /// Page size for list (default 100, clamped to 1..=100), or recent turns for inspect (default 10).
     #[serde(default)]
     pub(super) limit: Option<usize>,
-    /// For `usage`: include causal descendants of the target (alias `subtree`).
+    /// For `list` (with `parent`) and `usage`: include all causal descendants of the target/parent (children, grandchildren, ...; alias `subtree`).
     #[serde(default, alias = "subtree")]
     pub(super) include_descendants: Option<bool>,
     /// For `usage`: window start, inclusive (unix ms).
@@ -563,6 +563,9 @@ pub(super) struct SubagentsArgs {
     /// Page size for list (default 100, clamped to 1..=100), or recent turns for inspect (default 10).
     #[serde(default)]
     pub(super) limit: Option<usize>,
+    /// For `list`: include all causal descendants of `parent` (children, grandchildren, ...; alias `subtree`).
+    #[serde(default, alias = "subtree")]
+    pub(super) include_descendants: Option<bool>,
     /// Optional list of named deployment secret bundles when `action` is `"spawn"`,
     /// `"update"`, or `"secrets"`. Non-admin parents may only grant secrets they hold.
     #[serde(default)]

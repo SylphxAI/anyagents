@@ -95,6 +95,9 @@ impl Store {
         agent_id: Option<&AgentId>,
         active_only: bool,
     ) -> Result<Vec<AgentSchedule>, Error> {
+        if !super::holds_store_writer() {
+            let _ = self.repair_null_schedule_next_fire(now_ms());
+        }
         let conn = self.read_conn();
         let (sql, params) = match (agent_id, active_only) {
             (Some(aid), true) => (
@@ -134,6 +137,32 @@ impl Store {
             ),
         };
         conn.db_query_vec(sql, &params, schedule_from_row_db)
+    }
+
+    /// Self-heal active `at` / `every` schedules whose `next_fire_at_ms` is `NULL`:
+    /// - For `kind = 'at'`: parse RFC3339 `spec` and restore `next_fire_at_ms` only
+    ///   when strictly in the future (`target_ms > now_ms`), never retroactively
+    ///   firing already-missed past one-shot rows.
+    /// - For `kind = 'every'` with `interval_ms > 0`: advance from
+    ///   `last_fired_at_ms.unwrap_or(created_at_ms)` by multiples of `interval_ms`
+    ///   until strictly `> now_ms`.
+    pub fn repair_null_schedule_next_fire(&self, now_ms: i64) -> Result<usize, Error> {
+        let candidates = load_null_schedule_candidates(&self.read_conn())?;
+        let any_repairable = candidates.iter().any(|row| {
+            compute_repaired_next_fire(
+                &row.kind,
+                &row.spec,
+                row.interval_ms,
+                row.last_fired_at_ms,
+                row.created_at_ms,
+                now_ms,
+            )
+            .is_some()
+        });
+        if !any_repairable {
+            return Ok(0);
+        }
+        self.write_tx(|tx| repair_null_schedule_next_fire(tx, now_ms))
     }
 
     pub fn get_schedule(&self, id: &str) -> Result<Option<AgentSchedule>, Error> {
@@ -431,4 +460,178 @@ fn claim_schedule_tick_on(
         )?,
     };
     Ok(updated == 1)
+}
+
+struct NullScheduleCandidate {
+    id: String,
+    kind: String,
+    spec: String,
+    interval_ms: Option<i64>,
+    last_fired_at_ms: Option<i64>,
+    created_at_ms: i64,
+}
+
+fn load_null_schedule_candidates(
+    conn: &(impl DbExec + ?Sized),
+) -> Result<Vec<NullScheduleCandidate>, Error> {
+    conn.db_query_vec(
+        "SELECT id, kind, spec, interval_ms, last_fired_at_ms, created_at_ms
+         FROM agent_schedules
+         WHERE state = 'active'
+           AND next_fire_at_ms IS NULL
+           AND kind IN ('at', 'every')",
+        &[],
+        |row| {
+            Ok(NullScheduleCandidate {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                spec: row.get(2)?,
+                interval_ms: row.get(3)?,
+                last_fired_at_ms: row.get(4)?,
+                created_at_ms: row.get(5)?,
+            })
+        },
+    )
+}
+
+fn compute_repaired_next_fire(
+    kind: &str,
+    spec: &str,
+    interval_ms: Option<i64>,
+    last_fired_at_ms: Option<i64>,
+    created_at_ms: i64,
+    now_ms: i64,
+) -> Option<i64> {
+    match kind {
+        "at" => {
+            let target_ms = chrono::DateTime::parse_from_rfc3339(spec.trim())
+                .ok()?
+                .timestamp_millis();
+            (target_ms > now_ms).then_some(target_ms)
+        }
+        "every" => {
+            let interval = interval_ms.filter(|&iv| iv > 0)?;
+            let base = last_fired_at_ms.unwrap_or(created_at_ms);
+            if base > now_ms {
+                Some(base)
+            } else {
+                let elapsed = now_ms.saturating_sub(base);
+                let steps = (elapsed / interval).saturating_add(1);
+                Some(base.saturating_add(steps.saturating_mul(interval)))
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn repair_null_schedule_next_fire(
+    tx: &(impl DbExec + ?Sized),
+    now_ms: i64,
+) -> Result<usize, Error> {
+    let candidates = load_null_schedule_candidates(tx)?;
+    let mut repaired = 0usize;
+    for row in candidates {
+        if let Some(next_ms) = compute_repaired_next_fire(
+            &row.kind,
+            &row.spec,
+            row.interval_ms,
+            row.last_fired_at_ms,
+            row.created_at_ms,
+            now_ms,
+        ) {
+            repaired += tx.db_execute(
+                "UPDATE agent_schedules
+                 SET next_fire_at_ms = ?2
+                 WHERE id = ?1 AND state = 'active' AND next_fire_at_ms IS NULL",
+                &db_params![row.id, next_ms],
+            )?;
+        }
+    }
+    Ok(repaired)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::NewAgent;
+
+    #[test]
+    fn repair_null_schedule_next_fire_heals_future_at_and_every_without_firing_past_at() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store.create_agent(NewAgent::new("sched", "codex")).unwrap();
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-20T01:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let future_spec = "2026-11-20T02:30:00Z";
+        let future_ms = chrono::DateTime::parse_from_rfc3339(future_spec)
+            .unwrap()
+            .timestamp_millis();
+        let past_spec = "2026-11-19T20:00:00Z";
+
+        let s_future_at = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "at".into(),
+                spec: future_spec.into(),
+                prompt: "future one-shot".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: None,
+            })
+            .unwrap();
+        let s_past_at = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "at".into(),
+                spec: past_spec.into(),
+                prompt: "missed one-shot".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: None,
+            })
+            .unwrap();
+        let s_every = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "every".into(),
+                spec: "5m".into(),
+                prompt: "recurring check".into(),
+                interval_ms: Some(300_000),
+                next_fire_at_ms: None,
+                watch_baseline: None,
+            })
+            .unwrap();
+        // Anchor the `every` schedule to a deterministic historical `created_at_ms`
+        // 12 minutes before `now` so the repaired next fire lands 3 minutes after `now`.
+        let anchor = now - 720_000;
+        store
+            .write_tx(|tx| {
+                tx.db_execute(
+                    "UPDATE agent_schedules SET created_at_ms = ?2, last_fired_at_ms = NULL WHERE id = ?1",
+                    &db_params![s_every.id.as_str(), anchor],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let repaired = store.repair_null_schedule_next_fire(now).unwrap();
+        assert_eq!(repaired, 2);
+
+        let healed_future = store.get_schedule(&s_future_at.id).unwrap().unwrap();
+        assert_eq!(healed_future.next_fire_at_ms, Some(future_ms));
+
+        let unhealed_past = store.get_schedule(&s_past_at.id).unwrap().unwrap();
+        assert_eq!(
+            unhealed_past.next_fire_at_ms, None,
+            "missed past `at` schedule must never be retroactively armed"
+        );
+
+        let healed_every = store.get_schedule(&s_every.id).unwrap().unwrap();
+        assert_eq!(healed_every.next_fire_at_ms, Some(anchor + 3 * 300_000));
+
+        // Second pass is an idempotent no-op.
+        assert_eq!(store.repair_null_schedule_next_fire(now).unwrap(), 0);
+    }
 }

@@ -2546,9 +2546,8 @@ fn is_excluded_agent_sync_rel(rel: &str) -> bool {
         || lower.ends_with(".tmp")
 }
 
-/// Materialize an agent's persisted PostgreSQL `agent_files` (`config` and decrypted `secrets`)
-/// into the ephemeral `config_dir` so stateless replicas can build and sync the full remote
-/// sandbox bundle without local disk state.
+/// Materialize persisted PostgreSQL `agent_files` (`config`, `markers`, `secrets`,
+/// and `session_pin`) into ephemeral `config_dir` for stateless sandbox bundle sync.
 pub(crate) fn hydrate_agent_files_from_store(
     store: &Store,
     agent_id: &AgentId,
@@ -2563,6 +2562,7 @@ pub(crate) fn hydrate_agent_files_from_store(
         ("config", 0o644u32),
         ("markers", 0o644u32),
         ("secrets", 0o600u32),
+        ("session_pin", 0o600u32),
     ] {
         let entries = blobs
             .get_agent_files_all(agent_id, ns)

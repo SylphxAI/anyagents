@@ -19,6 +19,23 @@ use crate::error::Error;
 use crate::id::AgentId;
 
 const AGENT_COLS: &str = agent_cols!();
+const AGENT_LIST_COLS: &str = "id, name, harness, model, workdir, \
+     CASE WHEN state = 'archived' THEN NULL ELSE instructions END AS instructions, \
+     state, created_at_ms, launch_env, parent_id, is_admin, role, description";
+
+/// Default page size for unbounded `"all"` / `"archived"` roster queries.
+pub const DEFAULT_ARCHIVE_ROSTER_LIMIT: usize = 200;
+
+/// Options for SQL-paged roster queries ([`Store::roster_agents_paged`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RosterPageQuery<'a> {
+    pub state: Option<&'a str>,
+    pub parent_id: Option<&'a AgentId>,
+    pub root_only: bool,
+    pub include_descendants: bool,
+    pub limit: Option<usize>,
+    pub offset: usize,
+}
 
 fn is_scope_env_key(key: &str) -> bool {
     matches!(key, "ANYAGENTS_SCOPE" | "ANYAGENTS_PUBLIC")
@@ -463,6 +480,89 @@ impl Store {
                     agent_from_row_db,
                 )?
             }
+        };
+        Ok((agents, archived as usize))
+    }
+
+    /// SQL-paged roster query for `"all"` and `"archived"` states (pushing
+    /// `LIMIT`/`OFFSET`, non-archived-first `created_at_ms DESC, name ASC`
+    /// ordering, `NULL` archived `instructions`, and optional `WITH RECURSIVE`
+    /// descendant traversal directly into SQLite/PostgreSQL).
+    ///
+    /// Always reports the exact total `archived_count`. For live states
+    /// (`None`, `"running"`, `"idle"`, `"paused"`, `"created"`), delegates to
+    /// [`Self::roster_agents`].
+    pub fn roster_agents_paged(
+        &self,
+        query: RosterPageQuery<'_>,
+    ) -> Result<(Vec<Agent>, usize), Error> {
+        if !matches!(query.state, Some("all" | "archived")) {
+            return self.roster_agents(query.state);
+        }
+        let conn = self.read_conn();
+        let archived: i64 = conn.db_query_one(
+            "SELECT count(*) FROM agents WHERE state = 'archived'",
+            &[],
+            |r| r.get(0),
+        )?;
+        let limit = i64::try_from(query.limit.unwrap_or(DEFAULT_ARCHIVE_ROSTER_LIMIT).max(1))
+            .unwrap_or(i64::MAX);
+        let offset = i64::try_from(query.offset).unwrap_or(i64::MAX);
+        let state_clause = if query.state == Some("archived") {
+            "state = 'archived'"
+        } else {
+            "1 = 1"
+        };
+        let order_clause = "ORDER BY (CASE WHEN state = 'archived' THEN 1 ELSE 0 END) ASC, \
+                            created_at_ms DESC, name ASC";
+
+        let agents = if let Some(pid) = query.parent_id {
+            if query.include_descendants {
+                let sql = format!(
+                    "WITH RECURSIVE descendants(id) AS (
+                         SELECT id FROM agents WHERE parent_id = ?1
+                         UNION
+                         SELECT a.id FROM agents a JOIN descendants d ON a.parent_id = d.id
+                     )
+                     SELECT {AGENT_LIST_COLS} FROM agents
+                     WHERE id IN (SELECT id FROM descendants) AND {state_clause}
+                     {order_clause}
+                     LIMIT ?2 OFFSET ?3"
+                );
+                conn.db_query_vec(
+                    &sql,
+                    &db_params![pid.as_str(), limit, offset],
+                    agent_from_row_db,
+                )?
+            } else {
+                let sql = format!(
+                    "SELECT {AGENT_LIST_COLS} FROM agents
+                     WHERE parent_id = ?1 AND {state_clause}
+                     {order_clause}
+                     LIMIT ?2 OFFSET ?3"
+                );
+                conn.db_query_vec(
+                    &sql,
+                    &db_params![pid.as_str(), limit, offset],
+                    agent_from_row_db,
+                )?
+            }
+        } else if query.root_only {
+            let sql = format!(
+                "SELECT {AGENT_LIST_COLS} FROM agents
+                 WHERE parent_id IS NULL AND {state_clause}
+                 {order_clause}
+                 LIMIT ?1 OFFSET ?2"
+            );
+            conn.db_query_vec(&sql, &db_params![limit, offset], agent_from_row_db)?
+        } else {
+            let sql = format!(
+                "SELECT {AGENT_LIST_COLS} FROM agents
+                 WHERE {state_clause}
+                 {order_clause}
+                 LIMIT ?1 OFFSET ?2"
+            );
+            conn.db_query_vec(&sql, &db_params![limit, offset], agent_from_row_db)?
         };
         Ok((agents, archived as usize))
     }
