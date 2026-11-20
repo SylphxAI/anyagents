@@ -311,25 +311,6 @@ pub(crate) fn release_stale_unadmitted_names_on_start(
     store.release_unadmitted_names()
 }
 
-// Use the eventual TCP listener for liveness while the deployment files are
-// restored. Do not build the application routers (including auth), start
-// workers, or infer the final listener policy from a partially restored tree.
-async fn with_startup_health<T: Send + 'static>(
-    listener: Option<tokio::net::TcpListener>,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, tokio::task::JoinError> {
-    let mut work = tokio::task::spawn_blocking(work);
-    if let Some(listener) = listener {
-        let probes =
-            axum::Router::new().route("/healthz", axum::routing::get(super::ops::public_healthz));
-        tokio::select! {
-            result = &mut work => return result,
-            _ = axum::serve(listener, probes).into_future() => {}
-        }
-    }
-    work.await
-}
-
 async fn serve(
     data: &Path,
     sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
@@ -347,23 +328,27 @@ async fn serve(
     anyagents_toolchain::init_server(data, crate::sandbox::host_home_dir());
     let remote_required = crate::sandbox_providers::SandboxMode::from_env().is_remote_required();
     let root = data.to_path_buf();
-    let startup_probe = if serverless || remote_required {
+    // Keep liveness available through startup, even after store hydration but
+    // before the final listener policy and authenticated routes are installed.
+    let (stopping, _) = tokio::sync::watch::channel(false);
+    let startup_listener = if serverless || remote_required {
         match webhook_listen_addr(false, port_override) {
             Some(addr) => tokio::net::TcpListener::bind(&addr)
                 .await
                 .ok()
-                .and_then(|socket| socket.into_std().ok())
-                .map(|socket| (addr, socket)),
+                .map(|listener| {
+                    (
+                        addr,
+                        super::webhooks_mcp::StartupListener::new(listener, stopped(&stopping)),
+                    )
+                }),
             None => None,
         }
     } else {
         None
     };
     let store = if serverless || remote_required {
-        let probe = startup_probe.as_ref().and_then(|(_, socket)| {
-            tokio::net::TcpListener::from_std(socket.try_clone().ok()?).ok()
-        });
-        with_startup_health(probe, move || {
+        tokio::task::spawn_blocking(move || {
             let store = Store::open(root.join("state.db"))?;
             if store.is_postgres()
                 && let Err(err) = hydrate_deployment_blobs_on_start(&store, &root)
@@ -522,18 +507,6 @@ async fn serve(
         profiles: Default::default(),
         timer_backend,
     };
-    if serverless || crate::server::timer_fire::configured_timer_scheduler_url().is_some() {
-        let rec_store = Arc::clone(&store);
-        let rec_timer = Arc::clone(&state.timer_backend);
-        tokio::spawn(async move {
-            if let Err(err) =
-                super::serverless_maintenance::startup_reconcile_serverless(rec_store, rec_timer)
-                    .await
-            {
-                eprintln!("anyagents-serverless: startup reconciliation warning: {err}");
-            }
-        });
-    }
     let _ = boundary;
     let listener = api_listener;
     let poller = if serverless {
@@ -544,10 +517,6 @@ async fn serve(
                 .map_err(Error::Message)?,
         )
     };
-    // Set once a stop is requested: every listener (the socket and both TCP
-    // listeners) stops taking connections at once, calls running on any of
-    // them drain together, and every background loop ends at once.
-    let (stopping, _) = tokio::sync::watch::channel(false);
     if !serverless
         && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
         && !crate::sandbox::is_isolated_test_env()
@@ -752,19 +721,19 @@ async fn serve(
     let webhook_addr = webhook_listen_addr(public_configured, port_override);
     // Reuse the socket only when it is also the final local listener. Let a
     // public listener configured by a restored blob bind as usual otherwise.
-    let startup_listener = startup_probe.and_then(|(addr, socket)| {
-        if webhook_addr.as_ref() == Some(&addr)
-            && public_listen.is_none_or(|public| {
-                socket
-                    .local_addr()
-                    .is_ok_and(|local| local.port() != public.port())
-            })
+    let startup_listener = match startup_listener {
+        Some((addr, listener))
+            if webhook_addr.as_ref() == Some(&addr)
+                && public_listen.is_none_or(|public| listener.addr().port() != public.port()) =>
         {
-            Some(socket)
-        } else {
+            Some(listener)
+        }
+        Some((_, listener)) => {
+            listener.close().await;
             None
         }
-    });
+        None => None,
+    };
     let mut public_listener = None;
     if let Some(addr) = public_listen {
         match tokio::net::TcpListener::bind(addr).await {
@@ -794,23 +763,26 @@ async fn serve(
                  it accepts every local credential, so bind it to 127.0.0.1"
             );
         }
-        let bound = match startup_listener {
-            Some(socket) => tokio::net::TcpListener::from_std(socket),
-            None => tokio::net::TcpListener::bind(&addr).await,
+        let bound = match startup_listener.as_ref() {
+            Some(listener) => Ok(listener.addr()),
+            None => tokio::net::TcpListener::bind(&addr)
+                .await
+                .and_then(|listener| {
+                    let addr = listener.local_addr()?;
+                    webhook_listener = Some(listener);
+                    Ok(addr)
+                }),
         };
         match bound {
-            Ok(tcp_listener) => {
-                if let Ok(local) = tcp_listener.local_addr() {
-                    let addr_path = data.join("webhook.addr");
-                    if let Err(err) = anyagents_harness::atomic_write_nonempty_file(
-                        &addr_path,
-                        format!("{local}\n").as_bytes(),
-                        0o644,
-                    ) {
-                        eprintln!("cannot persist {}: {err}", addr_path.display());
-                    }
+            Ok(local) => {
+                let addr_path = data.join("webhook.addr");
+                if let Err(err) = anyagents_harness::atomic_write_nonempty_file(
+                    &addr_path,
+                    format!("{local}\n").as_bytes(),
+                    0o644,
+                ) {
+                    eprintln!("cannot persist {}: {err}", addr_path.display());
                 }
-                webhook_listener = Some(tcp_listener);
             }
             Err(err) => {
                 eprintln!("warning: webhook TCP listener ({addr}) did not bind: {err}");
@@ -842,15 +814,31 @@ async fn serve(
                 .await;
         })
     });
-    let webhook_task = webhook_listener.map(|tcp_listener| {
-        let webhook_app = build_webhook_router(state.clone());
-        let stop = stopped(&stopping);
-        tokio::spawn(async move {
-            let _ = axum::serve(tcp_listener, webhook_app)
-                .with_graceful_shutdown(stop)
-                .await;
+    let webhook_task = if let Some(listener) = startup_listener {
+        Some(listener.mount(build_webhook_router(state.clone())))
+    } else {
+        webhook_listener.map(|tcp_listener| {
+            let webhook_app = build_webhook_router(state.clone());
+            let stop = stopped(&stopping);
+            tokio::spawn(async move {
+                let _ = axum::serve(tcp_listener, webhook_app)
+                    .with_graceful_shutdown(stop)
+                    .await;
+            })
         })
-    });
+    };
+    if serverless || crate::server::timer_fire::configured_timer_scheduler_url().is_some() {
+        let rec_store = Arc::clone(&store);
+        let rec_timer = Arc::clone(&state.timer_backend);
+        tokio::spawn(async move {
+            if let Err(err) =
+                super::serverless_maintenance::startup_reconcile_serverless(rec_store, rec_timer)
+                    .await
+            {
+                eprintln!("anyagents-serverless: startup reconciliation warning: {err}");
+            }
+        });
+    }
     let app = build_router(state);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let serving = axum::serve(listener, app)
@@ -1368,48 +1356,6 @@ async fn run_serverless_startup_backlog_drain(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn startup_listener_answers_health_before_store_and_hydration_finish() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let (ready, listener) = listen_on_loopback(0).unwrap();
-        let (release, finish) = tokio::sync::oneshot::channel();
-        let work = tokio::spawn(with_startup_health(Some(listener), move || {
-            finish.blocking_recv().unwrap();
-        }));
-        for (path, status) in [("/healthz", "200 OK"), ("/v1/agents", "404 Not Found")] {
-            let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                let mut client = tokio::net::TcpStream::connect(("127.0.0.1", ready))
-                    .await
-                    .unwrap();
-                client
-                    .write_all(
-                        format!(
-                            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-                let mut response = String::new();
-                client.read_to_string(&mut response).await.unwrap();
-                response
-            })
-            .await
-            .expect("startup health must answer without waiting for the store");
-            assert!(
-                response.starts_with(&format!("HTTP/1.1 {status}")),
-                "{response}"
-            );
-            if path == "/healthz" {
-                assert!(response.contains("cache-control: no-store"));
-            }
-        }
-        assert!(!work.is_finished());
-        release.send(()).unwrap();
-        work.await.unwrap().unwrap();
-    }
 
     #[tokio::test]
     async fn serverless_startup_backlog_drain_cancels_cleanly_on_shutdown() {

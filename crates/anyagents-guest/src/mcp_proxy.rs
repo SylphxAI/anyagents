@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Args;
 use serde_json::{Value, json};
@@ -13,6 +13,25 @@ use serde_json::{Value, json};
 /// sandbox-accessible tmp directory (`$ANYAGENTS_AGENT_DATA_DIR/tmp`).
 const PROXY_TEXT_SPILL_BYTES: usize = 56 * 1024;
 const MAX_CONCURRENT_RPC: usize = 32;
+const HANDSHAKE_RETRY_DELAYS_MS: [u64; 10] =
+    [100, 250, 500, 1000, 2000, 3000, 4000, 5000, 5000, 5000];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RpcKind {
+    Initialize,
+    Discovery,
+    Other,
+}
+
+impl From<&str> for RpcKind {
+    fn from(method: &str) -> Self {
+        match method {
+            "initialize" => Self::Initialize,
+            "notifications/initialized" | "tools/list" | "ping" => Self::Discovery,
+            _ => Self::Other,
+        }
+    }
+}
 
 #[derive(Args, Clone, Debug)]
 pub struct McpProxyArgs {
@@ -143,9 +162,10 @@ fn dispatch_single_rpc<W: Write>(
     spill_dir: &Path,
     spill_seq: &AtomicU64,
     req_id: Option<Value>,
+    kind: RpcKind,
     body: &str,
 ) -> Result<(), String> {
-    match forward_rpc(http, url, token, state, body) {
+    match forward_rpc(http, url, token, state, kind, body) {
         Ok(responses) => {
             let processed: Vec<String> = responses
                 .iter()
@@ -228,17 +248,19 @@ pub(crate) fn run_proxy_io<R: BufRead, W: Write + Send>(
                 }
             };
             let req_id = req_val.get("id").cloned();
-            let method = req_val
-                .get("method")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let kind = RpcKind::from(
+                req_val
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
             let token = resolve_token(args);
             let body = trimmed.to_string();
 
             // Run the very first request (typically `initialize`) synchronously so
             // `mcp-session-id` and base64 framing negotiation complete before concurrent
             // tool calls fan out. All subsequent requests run concurrently with zero HoL.
-            let should_run_sync = method == "initialize"
+            let should_run_sync = kind == RpcKind::Initialize
                 || !state.lock().unwrap_or_else(|e| e.into_inner()).negotiated;
             if should_run_sync {
                 dispatch_single_rpc(
@@ -250,9 +272,9 @@ pub(crate) fn run_proxy_io<R: BufRead, W: Write + Send>(
                     &spill_dir,
                     &spill_seq,
                     req_id,
+                    kind,
                     &body,
                 )?;
-                state.lock().unwrap_or_else(|e| e.into_inner()).negotiated = true;
                 continue;
             }
 
@@ -274,6 +296,7 @@ pub(crate) fn run_proxy_io<R: BufRead, W: Write + Send>(
                     spill_dir_ref,
                     spill_seq_ref,
                     req_id,
+                    kind,
                     &body,
                 ) {
                     let mut slot = err_slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -315,6 +338,14 @@ fn resolve_token(args: &McpProxyArgs) -> Option<String> {
 
 const PAYLOAD_ENCODING_HEADER: &str = "x-anyagents-payload-encoding";
 
+struct RpcResponse {
+    status: u16,
+    session_id: Option<String>,
+    advertises_base64: bool,
+    content_type: String,
+    body: String,
+}
+
 fn send_rpc_once(
     http: &ureq::Agent,
     url: &str,
@@ -322,9 +353,13 @@ fn send_rpc_once(
     session_id: Option<&str>,
     body: &str,
     encode_base64: bool,
-) -> Result<(u16, Option<String>, bool, String, String), String> {
+    timeout: Option<Duration>,
+) -> Result<RpcResponse, ureq::Error> {
     let mut req = http
         .post(url)
+        .config()
+        .timeout_global(timeout)
+        .build()
         .header("accept", "application/json, text/event-stream");
     if let Some(tok) = token {
         req = req.header("authorization", &format!("Bearer {tok}"));
@@ -332,7 +367,7 @@ fn send_rpc_once(
     if let Some(sid) = session_id {
         req = req.header("mcp-session-id", sid);
     }
-    let resp = if encode_base64 {
+    let mut resp = if encode_base64 {
         let encoded = crate::turn::encode_base64_standard(body.as_bytes());
         req.header("content-type", "application/octet-stream")
             .header(PAYLOAD_ENCODING_HEADER, "base64")
@@ -340,32 +375,45 @@ fn send_rpc_once(
     } else {
         req.header("content-type", "application/json")
             .send(body.as_bytes())
+    }?;
+    Ok(RpcResponse {
+        status: resp.status().as_u16(),
+        session_id: resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        advertises_base64: resp
+            .headers()
+            .get(PAYLOAD_ENCODING_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("base64")),
+        content_type: resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase(),
+        body: resp.body_mut().read_to_string()?,
+    })
+}
+
+fn interrupted_during_rollover(result: &Result<RpcResponse, ureq::Error>) -> bool {
+    match result {
+        Ok(response) => matches!(response.status, 404 | 502 | 503),
+        Err(ureq::Error::ConnectionFailed) => true,
+        Err(ureq::Error::Io(err)) => matches!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
     }
-    .map_err(|err| format!("MCP POST `{url}` failed: {err}"))?;
-    let status = resp.status().as_u16();
-    let next_sid = resp
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let advertises_b64 = resp
-        .headers()
-        .get(PAYLOAD_ENCODING_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("base64"));
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let raw_body = resp
-        .into_body()
-        .read_to_string()
-        .map_err(|err| format!("MCP response read error: {err}"))?;
-    Ok((status, next_sid, advertises_b64, content_type, raw_body))
 }
 
 fn forward_rpc(
@@ -373,60 +421,97 @@ fn forward_rpc(
     url: &str,
     token: Option<&str>,
     state: &Mutex<ProxyState>,
+    kind: RpcKind,
     body: &str,
 ) -> Result<Vec<String>, String> {
     let (session_snapshot, attempt_b64) = {
         let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        (guard.session_id.clone(), guard.use_base64_payload)
+        let session = if kind == RpcKind::Initialize {
+            None // A new initialize must not refer to an old HTTP session.
+        } else {
+            guard.session_id.clone()
+        };
+        (session, guard.use_base64_payload)
     };
-    let (mut status, mut next_sid, mut advertises_b64, mut content_type, mut raw_body) =
+    let started = Instant::now();
+    let timeout = http.config().timeouts().global;
+    let send = |base64| {
+        let remaining = if kind == RpcKind::Other {
+            timeout
+        } else {
+            timeout.map(|total| total.saturating_sub(started.elapsed()))
+        };
         send_rpc_once(
             http,
             url,
             token,
             session_snapshot.as_deref(),
             body,
-            attempt_b64,
-        )?;
+            base64,
+            remaining,
+        )
+    };
+    let mut sent = send(attempt_b64);
+    // A failed handshake can make a harness disable MCP until the next turn.
+    // Retry discovery over the same URL/credential; the coordinator is stateless.
+    // Never replay tools/call (or a batch): the old coordinator may have applied
+    // the side effect before its response was lost.
+    if kind != RpcKind::Other {
+        for wait in HANDSHAKE_RETRY_DELAYS_MS.map(Duration::from_millis) {
+            if !interrupted_during_rollover(&sent)
+                || timeout.is_some_and(|total| total.saturating_sub(started.elapsed()) <= wait)
+            {
+                break;
+            }
+            std::thread::sleep(wait);
+            sent = send(attempt_b64);
+        }
+    }
+    let request_error = |err| format!("MCP POST `{url}` failed: {err}");
+    let mut response = sent.map_err(request_error)?;
 
-    // If an intermediate WAF blocks plaintext JSON containing shell/SQL fragments with
-    // HTTP 403, retry once with opaque base64 framing (`application/octet-stream`).
+    // Preserve framing negotiation with the configured coordinator.
     let mut next_b64 = None;
-    if status == 403 && !attempt_b64 {
-        if let Ok(retry) = send_rpc_once(http, url, token, session_snapshot.as_deref(), body, true)
-            && retry.0 != 415
-            && retry.0 != 400
+    if response.status == 403 && !attempt_b64 {
+        if let Ok(retry) = send(true)
+            && !matches!(retry.status, 400 | 415)
         {
-            (status, next_sid, advertises_b64, content_type, raw_body) = retry;
-            if (200..300).contains(&status) {
+            response = retry;
+            if (200..300).contains(&response.status) {
                 next_b64 = Some(true);
             }
         }
-    } else if attempt_b64 && status == 415 {
-        // Older coordinators without base64 framing support return 415; fall back cleanly.
+    } else if attempt_b64 && response.status == 415 {
+        // Older coordinators without base64 framing support return 415.
+        response = send(false).map_err(request_error)?;
         next_b64 = Some(false);
-        (status, next_sid, advertises_b64, content_type, raw_body) =
-            send_rpc_once(http, url, token, session_snapshot.as_deref(), body, false)?;
     }
 
-    if advertises_b64 || next_b64.is_some() || next_sid.is_some() {
-        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(b) = next_b64 {
-            guard.use_base64_payload = b;
-        }
-        if advertises_b64 {
-            guard.use_base64_payload = true;
-        }
-        if let Some(sid) = next_sid {
-            guard.session_id = Some(sid);
-        }
-    }
-
+    let RpcResponse {
+        status,
+        session_id,
+        advertises_base64,
+        content_type,
+        body: raw_body,
+    } = response;
     if !(200..300).contains(&status) {
         return Err(format!(
             "MCP server returned HTTP {status}: {}",
             raw_body.trim()
         ));
+    }
+    {
+        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(b) = next_b64 {
+            guard.use_base64_payload = b;
+        }
+        if advertises_base64 {
+            guard.use_base64_payload = true;
+        }
+        if kind == RpcKind::Initialize || session_id.is_some() {
+            guard.session_id = session_id;
+        }
+        guard.negotiated = true;
     }
     if raw_body.trim().is_empty() || status == 202 || status == 204 {
         return Ok(Vec::new());
