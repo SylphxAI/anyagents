@@ -15,22 +15,22 @@ async fn main() {
     let exit_code = match server.serve(rmcp::transport::io::stdio()).await {
         Ok(running) => {
             let cancel = running.cancellation_token();
+            let mut code = 0i32;
             tokio::select! {
-                res = running.waiting() => match res {
-                    Ok(_) => 0,
-                    Err(err) => {
+                res = running.waiting() => {
+                    if let Err(err) = res {
                         eprintln!("anyagents-mcp-browser transport error: {err}");
-                        1
+                        code = 1;
                     }
-                },
+                }
                 sig = terminate_signal() => {
                     eprintln!(
                         "anyagents-mcp-browser: received {sig}; closing browser and syncing profile"
                     );
                     cancel.cancel();
-                    0
                 }
             }
+            code
         }
         Err(err) => {
             eprintln!("anyagents-mcp-browser failed to initialize MCP stdio transport: {err}");
@@ -39,7 +39,5 @@ async fn main() {
     };
 
     shutdown_handle.shutdown().await;
-    if exit_code != 0 {
-        std::process::exit(exit_code);
-    }
+    std::process::exit(exit_code);
 }

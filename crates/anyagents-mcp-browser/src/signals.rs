@@ -6,22 +6,36 @@
 //! back, while the browser (in its own process group) is orphaned.
 
 /// Resolve with the signal name once the process is asked to terminate.
+///
+/// Every signal whose stream registers successfully is watched; the future
+/// resolves with the first delivered signal name.
 #[cfg(unix)]
 pub async fn terminate_signal() -> &'static str {
     use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-        signal(SignalKind::hangup()),
-    ) else {
-        std::future::pending::<()>().await;
-        unreachable!()
-    };
-    tokio::select! {
-        _ = term.recv() => "SIGTERM",
-        _ = int.recv() => "SIGINT",
-        _ = hup.recv() => "SIGHUP",
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<&'static str>(1);
+    for (kind, name) in [
+        (SignalKind::terminate(), "SIGTERM"),
+        (SignalKind::interrupt(), "SIGINT"),
+        (SignalKind::hangup(), "SIGHUP"),
+    ] {
+        match signal(kind) {
+            Ok(mut stream) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    while stream.recv().await.is_some() {
+                        if tx.send(name).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            Err(err) => {
+                eprintln!("anyagents-mcp-browser: cannot watch {name}: {err}");
+            }
+        }
     }
+    rx.recv().await.unwrap_or("unknown")
 }
 
 /// Resolve with the signal name once the process is asked to terminate.
