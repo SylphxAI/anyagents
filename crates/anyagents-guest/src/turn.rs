@@ -15,6 +15,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -40,6 +41,10 @@ const DEFAULT_MAX_RETRIES: usize = 5;
 const DEFAULT_INITIAL_BACKOFF_MS: u64 = 200;
 const CALLBACK_TIMEOUT_SECS: u64 = 15;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_SILENT_PROGRESS_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 1_800;
+const SILENT_PROGRESS_TIMEOUT_ENV: &str = "ANYAGENTS_GUEST_SILENT_TIMEOUT_SECS";
+const MAX_TURN_DURATION_ENV: &str = "ANYAGENTS_GUEST_MAX_TURN_SECS";
 
 /// Allowlisted native-harness OAuth credential files relative to `state_dir`.
 ///
@@ -297,9 +302,89 @@ fn spawn_detached_turn(
     Ok(())
 }
 
+fn resolve_timeout_secs_from(raw: Option<&str>, default_secs: u64) -> Option<Duration> {
+    let secs = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default_secs);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+fn resolve_timeout_secs(env_key: &str, default_secs: u64) -> Option<Duration> {
+    resolve_timeout_secs_from(std::env::var(env_key).ok().as_deref(), default_secs)
+}
+
+/// Bounded deadlock and max-duration watchdog shared between the foreground
+/// turn loop and [`HeartbeatGuard`].
+///
+/// Prevents a deadlocked inner harness (0 stdout/stderr/activity progress) from
+/// being masked indefinitely by background heartbeats.
+#[derive(Clone)]
+struct TurnWatchdog {
+    started_at: Instant,
+    last_activity_ms: Arc<AtomicU64>,
+    silent_timeout: Option<Duration>,
+    max_duration: Option<Duration>,
+}
+
+impl TurnWatchdog {
+    fn new(silent_timeout: Option<Duration>, max_duration: Option<Duration>) -> Self {
+        Self {
+            started_at: Instant::now(),
+            last_activity_ms: Arc::new(AtomicU64::new(0)),
+            silent_timeout,
+            max_duration,
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::new(
+            resolve_timeout_secs(
+                SILENT_PROGRESS_TIMEOUT_ENV,
+                DEFAULT_SILENT_PROGRESS_TIMEOUT_SECS,
+            ),
+            resolve_timeout_secs(MAX_TURN_DURATION_ENV, DEFAULT_MAX_TURN_DURATION_SECS),
+        )
+    }
+
+    fn touch(&self) {
+        let elapsed = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_activity_ms.store(elapsed, Ordering::Relaxed);
+    }
+
+    fn silent_elapsed(&self) -> Duration {
+        let now = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let last = self.last_activity_ms.load(Ordering::Relaxed);
+        Duration::from_millis(now.saturating_sub(last))
+    }
+
+    fn expired_reason(&self, in_turn: bool, harness: &str) -> Option<String> {
+        if let Some(max_d) = self.max_duration
+            && self.started_at.elapsed() >= max_d
+        {
+            return Some(format!(
+                "guest harness `{harness}` exceeded max turn duration ({}s)",
+                max_d.as_secs()
+            ));
+        }
+        if in_turn
+            && let Some(silent_d) = self.silent_timeout
+            && self.silent_elapsed() >= silent_d
+        {
+            return Some(format!(
+                "guest harness `{harness}` produced no output or progress for {}s (deadlock watchdog)",
+                silent_d.as_secs()
+            ));
+        }
+        None
+    }
+}
+
 /// RAII background heartbeat ticker that keeps the coordinator's remote-turn
 /// lease alive continuously across blocking startup phases (`cloning`,
-/// `starting`, `in_turn`) and joins cleanly on drop.
+/// `starting`, `in_turn`) and joins cleanly on drop. Stops automatically if
+/// [`TurnWatchdog`] expires so a deadlocked child cannot mask itself forever.
 struct HeartbeatGuard {
     stop: Arc<(Mutex<bool>, Condvar)>,
     phase: Arc<Mutex<(Option<String>, &'static str)>>,
@@ -318,6 +403,7 @@ impl HeartbeatGuard {
         initial_phase: &'static str,
         interval: Option<Duration>,
         state_dir: &Path,
+        watchdog: TurnWatchdog,
     ) -> Self {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let phase = Arc::new(Mutex::new((initial_session, initial_phase)));
@@ -333,11 +419,17 @@ impl HeartbeatGuard {
         let handle = std::thread::Builder::new()
             .name("anyagents-guest-hb".into())
             .spawn(move || {
-                let tick = || {
+                let tick = || -> bool {
                     let (sid, st) = phase_bg.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if watchdog.expired_reason(st == "in_turn", &harness).is_some() {
+                        return false;
+                    }
                     emit_heartbeat(&url, &token, &tid, &aid, &harness, sid, st, 1, &sdir);
+                    true
                 };
-                tick();
+                if !tick() {
+                    return;
+                }
                 let Some(iv) = interval else {
                     return;
                 };
@@ -351,7 +443,9 @@ impl HeartbeatGuard {
                         break;
                     }
                     drop(stopped);
-                    tick();
+                    if !tick() {
+                        break;
+                    }
                 }
             })
             .ok();
@@ -436,8 +530,11 @@ fn execute_turn_foreground(
         .and_then(|c| c.repo_spec.clone())
         .or_else(|| load_repo_spec(state_dir));
 
+    let watchdog = TurnWatchdog::from_env();
+
     // Start independent background heartbeat ticker before repo clone and harness
-    // launch so long blocking phases never trigger false coordinator heartbeat timeouts.
+    // launch so long blocking phases never trigger false coordinator heartbeat timeouts,
+    // while bounding heartbeats by `TurnWatchdog` so a deadlocked child cannot mask itself.
     let mut hb_guard = HeartbeatGuard::start(
         callback_url,
         callback_token,
@@ -452,6 +549,7 @@ fn execute_turn_foreground(
         },
         heartbeat_interval,
         state_dir,
+        watchdog.clone(),
     );
 
     if let Some(ref spec) = repo_spec
@@ -534,13 +632,24 @@ fn execute_turn_foreground(
     let wakeup = Arc::new((Mutex::new(false), Condvar::new()));
     {
         let w = Arc::clone(&wakeup);
-        adapter.watch_activity(Arc::new(move || signal_wake(&w)));
+        let wd = watchdog.clone();
+        adapter.watch_activity(Arc::new(move || {
+            wd.touch();
+            signal_wake(&w);
+        }));
     }
 
     let base_usage = adapter.served_usage();
+    let mut last_usage_tokens = (
+        base_usage.input_tokens,
+        base_usage.output_tokens,
+        base_usage.cache_read_tokens,
+        base_usage.cache_write_tokens,
+    );
     let base_turns = adapter.turns_served();
 
     let initial_sid = adapter.session_id().or(session);
+    watchdog.touch();
     hb_guard.set_phase(initial_sid.clone(), "in_turn");
 
     let mut msg = resolve_outbound_message(args, prompt);
@@ -645,6 +754,7 @@ fn execute_turn_foreground(
             {
                 let chunk = &current_text[sent_text_len..];
                 if !chunk.is_empty() {
+                    watchdog.touch();
                     delta_seq += 1;
                     sent_text_len = current_text.len();
                     let _ = post_callback_with_retry(
@@ -663,6 +773,18 @@ fn execute_turn_foreground(
                         HEARTBEAT_TIMEOUT_SECS,
                     );
                 }
+            }
+
+            let cur_usage = adapter.served_usage();
+            let cur_tokens = (
+                cur_usage.input_tokens,
+                cur_usage.output_tokens,
+                cur_usage.cache_read_tokens,
+                cur_usage.cache_write_tokens,
+            );
+            if cur_tokens != last_usage_tokens {
+                last_usage_tokens = cur_tokens;
+                watchdog.touch();
             }
 
             let proven = adapter.proven(&delivery_id);
@@ -686,6 +808,11 @@ fn execute_turn_foreground(
                             .unwrap_or_else(|| "guest harness process exited mid-turn".into())
                     })
                 });
+                break;
+            }
+
+            if let Some(reason) = watchdog.expired_reason(true, &harness_name) {
+                err_override = Some(reason);
                 break;
             }
 
@@ -1549,6 +1676,7 @@ mod tests {
             "cloning",
             Some(Duration::from_millis(40)),
             dir.path(),
+            TurnWatchdog::new(Some(Duration::from_secs(60)), Some(Duration::from_secs(60))),
         );
         // Simulate a blocking phase (e.g. long clone or silent startup).
         std::thread::sleep(Duration::from_millis(180));
@@ -1578,5 +1706,118 @@ mod tests {
                 .iter()
                 .any(|v| v["turn_state"] == "in_turn" && v["session_id"] == "sess-9")
         );
+    }
+
+    #[test]
+    fn watchdog_stops_heartbeats_on_silent_deadlock_and_respects_activity_and_max_duration() {
+        assert_eq!(
+            resolve_timeout_secs_from(None, 600),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(resolve_timeout_secs_from(Some("0"), 600), None);
+        assert_eq!(
+            resolve_timeout_secs_from(Some("120"), 600),
+            Some(Duration::from_secs(120))
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop_srv = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_srv_bg = Arc::clone(&stop_srv);
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let events_bg = Arc::clone(&events);
+
+        let srv = std::thread::spawn(move || {
+            while !stop_srv_bg.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut content_len = 0usize;
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            let n = reader.read_line(&mut line).unwrap_or(0);
+                            if n == 0 || line == "\r\n" || line == "\n" {
+                                break;
+                            }
+                            if let Some(v) =
+                                line.to_ascii_lowercase().strip_prefix("content-length:")
+                            {
+                                content_len = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body = vec![0u8; content_len];
+                        if reader.read_exact(&mut body).is_ok()
+                            && let Ok(val) = serde_json::from_slice::<Value>(&body)
+                        {
+                            events_bg.lock().unwrap().push(val);
+                        }
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+                        );
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("http://{addr}/v1/internal/guest/events");
+        let wd = TurnWatchdog::new(
+            Some(Duration::from_millis(90)),
+            Some(Duration::from_secs(30)),
+        );
+        let guard = HeartbeatGuard::start(
+            &url,
+            "tok_wd",
+            "turn_wd_1",
+            "agt_wd",
+            "agy",
+            None,
+            "in_turn",
+            Some(Duration::from_millis(30)),
+            dir.path(),
+            wd.clone(),
+        );
+        // Active touches keep the watchdog alive.
+        std::thread::sleep(Duration::from_millis(50));
+        wd.touch();
+        assert!(wd.expired_reason(true, "agy").is_none());
+
+        // Now go completely silent past silent_timeout while guard is STILL alive.
+        std::thread::sleep(Duration::from_millis(180));
+        let reason = wd
+            .expired_reason(true, "agy")
+            .expect("silent deadlock must trip watchdog");
+        assert!(reason.contains("deadlock watchdog"), "{reason}");
+
+        let count_after_expiry = events.lock().unwrap().len();
+        std::thread::sleep(Duration::from_millis(120));
+        let count_later = events.lock().unwrap().len();
+        drop(guard);
+        stop_srv.store(true, Ordering::SeqCst);
+        srv.join().unwrap();
+
+        assert_eq!(
+            count_after_expiry, count_later,
+            "heartbeat guard must stop posting once silent deadlock watchdog expires"
+        );
+
+        // Max turn duration enforces an absolute ceiling even when activity keeps arriving.
+        let max_wd = TurnWatchdog::new(
+            Some(Duration::from_secs(60)),
+            Some(Duration::from_millis(40)),
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        max_wd.touch();
+        let max_reason = max_wd
+            .expired_reason(true, "agy")
+            .expect("max turn duration must trip even with fresh touches");
+        assert!(max_reason.contains("max turn duration"), "{max_reason}");
     }
 }
