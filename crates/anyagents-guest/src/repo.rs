@@ -1,9 +1,12 @@
 use std::io::Read as _;
+use std::net::ToSocketAddrs as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const DEFAULT_GIT_CLONE_TIMEOUT_SECS: u64 = 120;
+const DNS_WAIT_MAX_ATTEMPTS: usize = 5;
+const MAX_DNS_CLONE_RETRIES: usize = 2;
 
 use super::{
     GuestRepoSpec, REPO_SPEC_FILE, load_guest_config, resolve_default_state_dir, spawn_command,
@@ -407,6 +410,125 @@ fn is_missing_remote_branch_error(stderr: &str) -> bool {
         || lower.contains("not found in upstream")
 }
 
+/// Extract the bare hostname from an `http://` or `https://` repository URL,
+/// stripping any embedded `user:pass@` userinfo and `:port`.
+pub(crate) fn extract_http_repo_host(repo: &str) -> Option<String> {
+    let rest = repo
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| repo.trim().strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    }
+    .trim();
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+fn is_transient_dns_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("could not resolve host")
+        || lower.contains("temporary failure in name resolution")
+}
+
+fn is_filter_unsupported_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("filtering not recognized")
+        || lower.contains("does not support filter")
+        || lower.contains("invalid filter-spec")
+        || lower.contains("uploadpack.allowfilter")
+        || lower.contains("unsupported capability")
+}
+
+/// Bounded cold-boot DNS readiness check (linear backoff capped ~10s total for 5 attempts).
+fn wait_for_dns_with<F>(max_attempts: usize, base_backoff: Duration, mut resolve: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    for attempt in 1..=max_attempts.max(1) {
+        if resolve() {
+            return true;
+        }
+        if attempt < max_attempts {
+            std::thread::sleep(base_backoff.saturating_mul(attempt as u32));
+        }
+    }
+    false
+}
+
+fn wait_for_dns_host(host: &str) -> bool {
+    wait_for_dns_with(DNS_WAIT_MAX_ATTEMPTS, Duration::from_secs(1), || {
+        (host, 443)
+            .to_socket_addrs()
+            .is_ok_and(|mut it| it.next().is_some())
+    })
+}
+
+struct CloneContext<'a> {
+    git_bin: &'a Path,
+    clone_cwd: &'a Path,
+    work_dir: &'a Path,
+    repo: &'a str,
+    gh_token: Option<&'a str>,
+    shallow: bool,
+    timeout: Duration,
+}
+
+fn prepare_clean_clone_dir(work_dir: &Path) {
+    if work_dir.exists() && !work_dir.join(".git").exists() {
+        let _ = std::fs::remove_dir_all(work_dir);
+    }
+    if let Some(parent) = work_dir.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::create_dir_all(work_dir);
+}
+
+fn run_clone_attempt(
+    ctx: &CloneContext<'_>,
+    branch: Option<&str>,
+    mut use_filter: bool,
+) -> Result<Output, String> {
+    let mut dns_retries = 0usize;
+    loop {
+        let mut cmd = configure_git_command(ctx.git_bin, ctx.repo, ctx.gh_token)?;
+        cmd.current_dir(ctx.clone_cwd).arg("clone");
+        if ctx.shallow {
+            if use_filter {
+                cmd.arg("--filter=blob:none");
+            }
+            cmd.args(["--depth", "1", "--single-branch"]);
+        }
+        if let Some(b) = branch {
+            cmd.arg("--branch").arg(b);
+        }
+        cmd.arg(ctx.repo).arg(ctx.work_dir);
+        let out = run_git_with_timeout(&mut cmd, ctx.timeout)?;
+        if out.status.success() {
+            return Ok(out);
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if ctx.shallow && use_filter && is_filter_unsupported_error(&stderr) {
+            use_filter = false;
+            prepare_clean_clone_dir(ctx.work_dir);
+            continue;
+        }
+        if is_transient_dns_error(&stderr) && dns_retries < MAX_DNS_CLONE_RETRIES {
+            dns_retries += 1;
+            std::thread::sleep(Duration::from_secs((dns_retries as u64) * 2));
+            prepare_clean_clone_dir(ctx.work_dir);
+            continue;
+        }
+        return Ok(out);
+    }
+}
+
 fn format_clone_error(repo: &str, detail: &str, gh_token: Option<&str>) -> String {
     let safe_repo = redact_secrets(repo, gh_token);
     let safe_detail = redact_secrets(detail.trim(), gh_token);
@@ -457,16 +579,26 @@ pub(crate) fn ensure_repo_checked_out(
 
     let timeout = clone_timeout();
     let shallow = std::env::var("ANYAGENTS_GIT_CLONE_FULL").ok().as_deref() != Some("1");
-    let mut cmd = configure_git_command(&git_bin, &repo, gh_token.as_deref())?;
-    cmd.current_dir(clone_cwd).arg("clone");
-    if shallow {
-        cmd.args(["--depth", "1", "--single-branch"]);
+    let http_host = extract_http_repo_host(&repo);
+    if let Some(ref host) = http_host {
+        let _ = wait_for_dns_host(host);
     }
-    if let Some(branch) = wanted_branch.or(base_branch) {
-        cmd.arg("--branch").arg(branch);
-    }
-    cmd.arg(&repo).arg(work_dir);
-    let out = run_git_with_timeout(&mut cmd, timeout)
+    let use_filter = shallow
+        && http_host.is_some()
+        && std::env::var("ANYAGENTS_GIT_CLONE_NO_FILTER")
+            .ok()
+            .as_deref()
+            != Some("1");
+    let ctx = CloneContext {
+        git_bin: &git_bin,
+        clone_cwd,
+        work_dir,
+        repo: &repo,
+        gh_token: gh_token.as_deref(),
+        shallow,
+        timeout,
+    };
+    let out = run_clone_attempt(&ctx, wanted_branch.or(base_branch), use_filter)
         .map_err(|e| format_clone_error(&repo, &e, gh_token.as_deref()))?;
     let mut create_local_branch: Option<&str> = None;
     if !out.status.success() {
@@ -474,20 +606,8 @@ pub(crate) fn ensure_repo_checked_out(
         if let Some(branch) = wanted_branch
             && is_missing_remote_branch_error(&stderr)
         {
-            if work_dir.exists() && !work_dir.join(".git").exists() {
-                let _ = std::fs::remove_dir_all(work_dir);
-                let _ = std::fs::create_dir_all(work_dir);
-            }
-            let mut fallback = configure_git_command(&git_bin, &repo, gh_token.as_deref())?;
-            fallback.current_dir(clone_cwd).arg("clone");
-            if shallow {
-                fallback.args(["--depth", "1", "--single-branch"]);
-            }
-            if let Some(base) = base_branch {
-                fallback.arg("--branch").arg(base);
-            }
-            fallback.arg(&repo).arg(work_dir);
-            let fb_out = run_git_with_timeout(&mut fallback, timeout)
+            prepare_clean_clone_dir(work_dir);
+            let fb_out = run_clone_attempt(&ctx, base_branch, use_filter)
                 .map_err(|e| format_clone_error(&repo, &e, gh_token.as_deref()))?;
             if !fb_out.status.success() {
                 return Err(format_clone_error(
@@ -760,5 +880,94 @@ mod tests {
         slow.args(["-c", "sleep 5"]);
         let err = run_git_with_timeout(&mut slow, Duration::from_millis(120)).unwrap_err();
         assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn extracts_http_repo_host_and_detects_dns_and_filter_errors() {
+        assert_eq!(
+            extract_http_repo_host("https://github.com/Org/Repo.git").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            extract_http_repo_host("https://x-access-token:secret@github.com:443/Org/Repo.git")
+                .as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            extract_http_repo_host("http://git.example.invalid:8080/team/app").as_deref(),
+            Some("git.example.invalid")
+        );
+        assert_eq!(
+            extract_http_repo_host("https://[::1]:8443/org/repo").as_deref(),
+            Some("::1")
+        );
+        assert_eq!(extract_http_repo_host("/tmp/local-bare.git"), None);
+        assert_eq!(extract_http_repo_host("git@github.com:Org/Repo.git"), None);
+
+        assert!(is_transient_dns_error(
+            "fatal: unable to access 'https://github.com/a/b.git/': Could not resolve host: github.com"
+        ));
+        assert!(is_transient_dns_error(
+            "Temporary failure in name resolution"
+        ));
+        assert!(!is_transient_dns_error("Repository not found"));
+
+        for msg in [
+            "warning: filtering not recognized by server, ignoring",
+            "fatal: server does not support filter",
+            "fatal: invalid filter-spec 'blob:none'",
+            "error: uploadpack.allowFilter is not enabled",
+            "fatal: unsupported capability: filter",
+        ] {
+            assert!(is_filter_unsupported_error(msg), "{msg}");
+        }
+        assert!(!is_filter_unsupported_error(
+            "Permission denied (publickey)"
+        ));
+
+        let mut tries = 0usize;
+        assert!(wait_for_dns_with(5, Duration::from_millis(5), || {
+            tries += 1;
+            tries >= 3
+        }));
+        assert_eq!(tries, 3);
+        let mut exhausted = 0usize;
+        assert!(!wait_for_dns_with(3, Duration::from_millis(2), || {
+            exhausted += 1;
+            false
+        }));
+        assert_eq!(exhausted, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_filter_clone_falls_back_cleanly_when_server_rejects_filter() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_git = tmp.path().join("fake-git");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(
+            &fake_git,
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"--filter=blob:none\" ]; then\n    echo 'fatal: server does not support filter' >&2\n    exit 128\n  fi\ndone\neval \"last=\\$$#\"\nmkdir -p \"$last/.git\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let ctx = CloneContext {
+            git_bin: &fake_git,
+            clone_cwd: tmp.path(),
+            work_dir: &work,
+            repo: "https://example.invalid/org/repo.git",
+            gh_token: None,
+            shallow: true,
+            timeout: Duration::from_secs(5),
+        };
+        let out = run_clone_attempt(&ctx, None, true).unwrap();
+        assert!(
+            out.status.success(),
+            "expected fallback clone without --filter=blob:none"
+        );
+        assert!(work.join(".git").is_dir());
     }
 }

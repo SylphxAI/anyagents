@@ -297,6 +297,98 @@ fn spawn_detached_turn(
     Ok(())
 }
 
+/// RAII background heartbeat ticker that keeps the coordinator's remote-turn
+/// lease alive continuously across blocking startup phases (`cloning`,
+/// `starting`, `in_turn`) and joins cleanly on drop.
+struct HeartbeatGuard {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    phase: Arc<Mutex<(Option<String>, &'static str)>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HeartbeatGuard {
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        callback_url: &str,
+        callback_token: &str,
+        turn_id: &str,
+        agent_id: &str,
+        harness_name: &str,
+        initial_session: Option<String>,
+        initial_phase: &'static str,
+        interval: Option<Duration>,
+        state_dir: &Path,
+    ) -> Self {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let phase = Arc::new(Mutex::new((initial_session, initial_phase)));
+        let stop_bg = Arc::clone(&stop);
+        let phase_bg = Arc::clone(&phase);
+        let url = callback_url.to_string();
+        let token = callback_token.to_string();
+        let tid = turn_id.to_string();
+        let aid = agent_id.to_string();
+        let harness = harness_name.to_string();
+        let sdir = state_dir.to_path_buf();
+
+        let handle = std::thread::Builder::new()
+            .name("anyagents-guest-hb".into())
+            .spawn(move || {
+                let tick = || {
+                    let (sid, st) = phase_bg.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    emit_heartbeat(&url, &token, &tid, &aid, &harness, sid, st, 1, &sdir);
+                };
+                tick();
+                let Some(iv) = interval else {
+                    return;
+                };
+                let (lock, cv) = &*stop_bg;
+                loop {
+                    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let (stopped, _) = cv
+                        .wait_timeout_while(guard, iv, |s| !*s)
+                        .unwrap_or_else(|e| e.into_inner());
+                    if *stopped {
+                        break;
+                    }
+                    drop(stopped);
+                    tick();
+                }
+            })
+            .ok();
+
+        Self {
+            stop,
+            phase,
+            handle,
+        }
+    }
+
+    fn set_phase(&self, session_id: Option<String>, turn_state: &'static str) {
+        let mut g = self.phase.lock().unwrap_or_else(|e| e.into_inner());
+        if session_id.is_some() {
+            g.0 = session_id;
+        }
+        g.1 = turn_state;
+    }
+
+    fn stop(&mut self) {
+        {
+            let mut stopped = self.stop.0.lock().unwrap_or_else(|e| e.into_inner());
+            *stopped = true;
+        }
+        self.stop.1.notify_all();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_turn_foreground(
     args: &TurnArgs,
@@ -323,13 +415,50 @@ fn execute_turn_foreground(
         .or_else(|| file_cfg.as_ref().and_then(|c| c.harness.clone()))
         .unwrap_or_else(|| "claude-code".to_string());
     let harness_name = canonical_guest_harness(&raw_harness);
-
-    if let Some(spec) = file_cfg
+    let session = crate::workspace_delta::resolve_guest_session(
+        state_dir,
+        &harness_name,
+        args.session.as_deref(),
+        file_cfg.as_ref().and_then(|c| c.session_id.as_deref()),
+    );
+    let heartbeat_interval_ms = args
+        .heartbeat_interval_ms
+        .or_else(|| {
+            std::env::var("ANYAGENTS_GUEST_HEARTBEAT_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL_MS);
+    let heartbeat_interval =
+        (heartbeat_interval_ms > 0).then(|| Duration::from_millis(heartbeat_interval_ms));
+    let repo_spec = file_cfg
         .as_ref()
         .and_then(|c| c.repo_spec.clone())
-        .or_else(|| load_repo_spec(state_dir))
-        && let Err(err) = ensure_repo_checked_out(&work_dir, &spec, args.git_program.as_deref())
+        .or_else(|| load_repo_spec(state_dir));
+
+    // Start independent background heartbeat ticker before repo clone and harness
+    // launch so long blocking phases never trigger false coordinator heartbeat timeouts.
+    let mut hb_guard = HeartbeatGuard::start(
+        callback_url,
+        callback_token,
+        &args.turn_id,
+        &args.agent_id,
+        &harness_name,
+        session.clone(),
+        if repo_spec.is_some() {
+            "cloning"
+        } else {
+            "starting"
+        },
+        heartbeat_interval,
+        state_dir,
+    );
+
+    if let Some(ref spec) = repo_spec
+        && let Err(err) = ensure_repo_checked_out(&work_dir, spec, args.git_program.as_deref())
     {
+        hb_guard.stop();
+        clear_activity_snapshot(state_dir);
         let _ = send_turn_failed(
             callback_url,
             callback_token,
@@ -344,6 +473,7 @@ fn execute_turn_foreground(
         );
         return Err(err);
     }
+    hb_guard.set_phase(None, "starting");
 
     let program = args
         .program
@@ -354,12 +484,6 @@ fn execute_turn_foreground(
         .model
         .clone()
         .or_else(|| file_cfg.as_ref().and_then(|c| c.model.clone()));
-    let session = crate::workspace_delta::resolve_guest_session(
-        state_dir,
-        &harness_name,
-        args.session.as_deref(),
-        file_cfg.as_ref().and_then(|c| c.session_id.as_deref()),
-    );
     let mut extra_args = file_cfg
         .as_ref()
         .map(|c| c.extra_args.clone())
@@ -367,17 +491,6 @@ fn execute_turn_foreground(
     if !args.extra_args.is_empty() {
         extra_args = args.extra_args.clone();
     }
-
-    let heartbeat_interval_ms = args
-        .heartbeat_interval_ms
-        .or_else(|| {
-            std::env::var("ANYAGENTS_GUEST_HEARTBEAT_INTERVAL_MS")
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-        })
-        .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL_MS);
-    let heartbeat_interval =
-        (heartbeat_interval_ms > 0).then(|| Duration::from_millis(heartbeat_interval_ms));
 
     let env = build_guest_env(state_dir, &work_dir, file_cfg.as_ref());
     if harness_name == "agy" {
@@ -399,6 +512,8 @@ fn execute_turn_foreground(
         Ok(a) => a,
         Err(err) => {
             let msg = format!("failed to start guest harness `{harness_name}`: {err}");
+            hb_guard.stop();
+            clear_activity_snapshot(state_dir);
             let synced_auth = collect_changed_syncable_auth_files(state_dir, &pre_turn_auth);
             let _ = send_turn_failed(
                 callback_url,
@@ -425,19 +540,8 @@ fn execute_turn_foreground(
     let base_usage = adapter.served_usage();
     let base_turns = adapter.turns_served();
 
-    // Emit initial active heartbeat immediately so coordinator records live PID + turn_state.
     let initial_sid = adapter.session_id().or(session);
-    emit_heartbeat(
-        callback_url,
-        callback_token,
-        &args.turn_id,
-        &args.agent_id,
-        &harness_name,
-        initial_sid.clone(),
-        "in_turn",
-        1,
-        state_dir,
-    );
+    hb_guard.set_phase(initial_sid.clone(), "in_turn");
 
     let mut msg = resolve_outbound_message(args, prompt);
     msg.text = crate::media::hydrate_turn_media_refs(&msg.text, state_dir, &env, file_cfg.as_ref());
@@ -499,6 +603,7 @@ fn execute_turn_foreground(
         let usage = adapter
             .usage_for_id(&delivery_id)
             .unwrap_or_else(|| adapter.served_usage().difference(base_usage));
+        hb_guard.stop();
         clear_activity_snapshot(state_dir);
         adapter.stop();
         let synced_auth = collect_changed_syncable_auth_files(state_dir, &pre_turn_auth);
@@ -517,7 +622,6 @@ fn execute_turn_foreground(
         return Err(err_msg);
     }
 
-    let mut last_heartbeat = Instant::now();
     let mut sent_text_len = 0usize;
     let mut delta_seq = 0u64;
     let mut err_override: Option<String> = None;
@@ -525,9 +629,14 @@ fn execute_turn_foreground(
     if !delivered_done {
         loop {
             let health = adapter.health();
-            if let Some(sid) = adapter.session_id() {
-                let _ = persist_session(state_dir, &harness_name, &sid);
+            let live_sid = adapter.session_id();
+            if let Some(ref sid) = live_sid {
+                let _ = persist_session(state_dir, &harness_name, sid);
             }
+            hb_guard.set_phase(
+                live_sid.or_else(|| initial_sid.clone()),
+                turn_state_label(health.turn_state),
+            );
 
             // Stream incremental deltas if harness accumulated new output.
             if let Some(current_text) = adapter.answer_for(&delivery_id, state_dir)
@@ -580,23 +689,6 @@ fn execute_turn_foreground(
                 break;
             }
 
-            if let Some(iv) = heartbeat_interval
-                && last_heartbeat.elapsed() >= iv
-            {
-                emit_heartbeat(
-                    callback_url,
-                    callback_token,
-                    &args.turn_id,
-                    &args.agent_id,
-                    &harness_name,
-                    adapter.session_id().or_else(|| initial_sid.clone()),
-                    turn_state_label(health.turn_state),
-                    1,
-                    state_dir,
-                );
-                last_heartbeat = Instant::now();
-            }
-
             let wait_dur = match heartbeat_interval {
                 Some(iv) => POLL_TICK.min(iv.max(Duration::from_millis(10))),
                 None => POLL_TICK,
@@ -622,6 +714,9 @@ fn execute_turn_foreground(
             .or_else(|| adapter.exit_diagnostic());
     }
 
+    // Stop background heartbeat ticker before terminal snapshot/callbacks so no
+    // stale heartbeat races after `turn_complete` or `turn_failed`.
+    hb_guard.stop();
     // Capture live descendant snapshot right before stopping adapter so coordinator
     // knows whether any background child subprocesses outlive the turn.
     let final_snap =
@@ -1392,5 +1487,96 @@ mod tests {
         let fallback = resolve_outbound_message(&legacy_args, "plain prompt");
         assert_eq!(fallback.id, "turn_abc");
         assert_eq!(fallback.text, "plain prompt");
+    }
+
+    #[test]
+    fn heartbeat_guard_ticks_while_caller_blocks_and_stops_cleanly_on_drop() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop_srv = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_srv_bg = Arc::clone(&stop_srv);
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let events_bg = Arc::clone(&events);
+
+        let srv = std::thread::spawn(move || {
+            while !stop_srv_bg.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut content_len = 0usize;
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            let n = reader.read_line(&mut line).unwrap_or(0);
+                            if n == 0 || line == "\r\n" || line == "\n" {
+                                break;
+                            }
+                            if let Some(v) =
+                                line.to_ascii_lowercase().strip_prefix("content-length:")
+                            {
+                                content_len = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body = vec![0u8; content_len];
+                        if reader.read_exact(&mut body).is_ok()
+                            && let Ok(val) = serde_json::from_slice::<Value>(&body)
+                        {
+                            events_bg.lock().unwrap().push(val);
+                        }
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+                        );
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("http://{addr}/v1/internal/guest/events");
+        let guard = HeartbeatGuard::start(
+            &url,
+            "tok_hb",
+            "turn_hb_1",
+            "agt_hb",
+            "codex",
+            None,
+            "cloning",
+            Some(Duration::from_millis(40)),
+            dir.path(),
+        );
+        // Simulate a blocking phase (e.g. long clone or silent startup).
+        std::thread::sleep(Duration::from_millis(180));
+        guard.set_phase(Some("sess-9".into()), "in_turn");
+        std::thread::sleep(Duration::from_millis(90));
+        drop(guard);
+
+        let count_after_drop = events.lock().unwrap().len();
+        std::thread::sleep(Duration::from_millis(120));
+        let count_later = events.lock().unwrap().len();
+        stop_srv.store(true, Ordering::SeqCst);
+        srv.join().unwrap();
+
+        assert!(
+            count_after_drop >= 2,
+            "expected >= 2 heartbeats during blocking sleep, got {count_after_drop}"
+        );
+        assert_eq!(
+            count_after_drop, count_later,
+            "heartbeat guard must stop cleanly on drop with zero trailing ticks"
+        );
+        let recorded = events.lock().unwrap();
+        assert!(recorded.iter().all(|v| v["event_type"] == "heartbeat"));
+        assert!(recorded.iter().any(|v| v["turn_state"] == "cloning"));
+        assert!(
+            recorded
+                .iter()
+                .any(|v| v["turn_state"] == "in_turn" && v["session_id"] == "sess-9")
+        );
     }
 }
