@@ -1,0 +1,354 @@
+//! Agent and fleet schedule CRUD and action HTTP routes.
+
+use std::collections::HashMap;
+
+use anyagents_core::{Agent, Store};
+use axum::extract::{Path as AxumPath, State};
+use axum::http::StatusCode;
+use axum::routing::get;
+use axum::{Json, Router};
+use serde::Deserialize;
+
+use crate::auth::Principal;
+
+use super::types::{
+    ApiError, AppState, is_self_or_ancestor, require_admin_or_operator, spawn_store,
+};
+
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/v1/agents/{name}/schedules",
+            get(list_schedules_route).post(schedules_action_route),
+        )
+        .route(
+            "/v1/schedules",
+            get(list_self_schedules_route).post(self_schedules_action_route),
+        )
+}
+
+/// Unused fields arrive as `null` or `"null"`; both are absent.
+#[derive(Deserialize, Default)]
+pub(super) struct ScheduleRequest {
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
+    pub(super) action: Option<String>,
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
+    pub(super) at: Option<String>,
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
+    pub(super) every: Option<String>,
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
+    pub(super) watch: Option<String>,
+    /// A trigger value or mode under a generic name; see
+    /// `schedule::resolve_schedule_call`.
+    #[serde(
+        default,
+        alias = "kind",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
+    pub(super) spec: Option<String>,
+    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
+    pub(super) prompt: Option<String>,
+    #[serde(
+        default,
+        alias = "schedule_id",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
+    pub(super) id: Option<String>,
+    #[serde(
+        default,
+        alias = "name",
+        deserialize_with = "crate::api::absent_if_null"
+    )]
+    pub(super) agent: Option<String>,
+}
+
+pub(super) fn authorize_schedule_target(
+    store: &Store,
+    principal: &Principal,
+    target_name: Option<&str>,
+) -> Result<Agent, ApiError> {
+    match (
+        principal,
+        target_name.map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        (Principal::Agent { agent_id, .. }, None) => {
+            store.agent(agent_id).map_err(ApiError::from_store)
+        }
+        (Principal::Agent { agent_id, .. }, Some(name)) => {
+            let clean = name.strip_prefix("agent:").unwrap_or(name);
+            if clean.eq_ignore_ascii_case("self") {
+                return store.agent(agent_id).map_err(ApiError::from_store);
+            }
+            let found = store.agent_by_name(clean).map_err(ApiError::from_store)?;
+            if &found.id == agent_id
+                || (agent_id != &found.id && is_self_or_ancestor(store, agent_id, &found))
+            {
+                return Ok(found);
+            }
+            require_admin_or_operator(store, principal, "agents.schedule", &found.name)?;
+            Ok(found)
+        }
+        (Principal::Operator, Some(name)) => {
+            let clean = name.strip_prefix("agent:").unwrap_or(name);
+            store.agent_by_name(clean).map_err(ApiError::from_store)
+        }
+        (Principal::Operator, None) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "operator schedule call requires an agent name",
+        )),
+    }
+}
+
+fn is_fleet_schedule_target(target: Option<&str>) -> bool {
+    target.is_some_and(|name| {
+        let name = name.trim();
+        name.strip_prefix("agent:")
+            .unwrap_or(name)
+            .eq_ignore_ascii_case("all")
+    })
+}
+
+/// Roster visibility is not schedule authority. Reuse the per-owner authorization
+/// boundary, skip only permission denials, and propagate unreadable state.
+pub(super) fn list_fleet_schedules(
+    store: &Store,
+    principal: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    // Reject unknown/absent agent principals fail-closed even when no schedules exist.
+    if let Principal::Agent { agent_id, .. } = principal {
+        store.agent(agent_id).map_err(ApiError::from_store)?;
+    }
+    // Load all schedules in a single query instead of iterating every archived/active
+    // agent (which caused O(N) queries across thousands of archived agents).
+    let all_schedules = store
+        .list_schedules(None, true)
+        .map_err(ApiError::from_store)?;
+    let mut authorized_names: HashMap<String, Option<String>> = HashMap::new();
+    let mut schedules = Vec::with_capacity(all_schedules.len());
+    for sched in all_schedules {
+        let owner_id = sched.agent_id.as_str().to_string();
+        let owner_name = if let Some(cached) = authorized_names.get(&owner_id) {
+            cached.clone()
+        } else {
+            let resolved = match authorize_schedule_target(store, principal, Some(&owner_id)) {
+                Ok(agent) => Some(agent.name),
+                Err(error) if error.status == StatusCode::FORBIDDEN => None,
+                Err(error) if error.status == StatusCode::NOT_FOUND => None,
+                Err(error) => return Err(error),
+            };
+            authorized_names.insert(owner_id.clone(), resolved.clone());
+            resolved
+        };
+        let Some(owner_name) = owner_name else {
+            continue;
+        };
+        let schedule = crate::api::ScheduleView::from(sched);
+        let mut row = serde_json::to_value(&schedule)
+            .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        row["agent_name"] = serde_json::json!(owner_name);
+        row["next_fire_at_ms"] = serde_json::json!(schedule.next_fire_at_ms);
+        row["last_observed"] = serde_json::json!(schedule.last_observed);
+        schedules.push(row);
+    }
+    Ok(serde_json::json!({"agent": "all", "schedules": schedules}))
+}
+
+pub(super) async fn list_schedules_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        if is_fleet_schedule_target(Some(&name)) {
+            return list_fleet_schedules(&state.store, &principal).map(Json);
+        }
+        let target = authorize_schedule_target(&state.store, &principal, Some(&name))?;
+        let schedules: Vec<crate::api::ScheduleView> = state
+            .store
+            .list_schedules(Some(&target.id), true)
+            .map_err(ApiError::from_store)?
+            .into_iter()
+            .map(crate::api::ScheduleView::from)
+            .collect();
+        Ok(Json(serde_json::json!({
+            "agent": target.name,
+            "agent_id": target.id.as_str(),
+            "schedules": schedules,
+        })))
+    })
+    .await
+}
+
+async fn list_self_schedules_route(
+    principal: Principal,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || match &principal {
+        Principal::Agent { agent_id, name } => {
+            let schedules: Vec<crate::api::ScheduleView> = state
+                .store
+                .list_schedules(Some(agent_id), true)
+                .map_err(ApiError::from_store)?
+                .into_iter()
+                .map(crate::api::ScheduleView::from)
+                .collect();
+            Ok(Json(serde_json::json!({
+                "agent": name,
+                "agent_id": agent_id.as_str(),
+                "schedules": schedules,
+            })))
+        }
+        Principal::Operator => {
+            let schedules: Vec<crate::api::ScheduleView> = state
+                .store
+                .list_schedules(None, true)
+                .map_err(ApiError::from_store)?
+                .into_iter()
+                .map(crate::api::ScheduleView::from)
+                .collect();
+            Ok(Json(serde_json::json!({
+                "schedules": schedules,
+            })))
+        }
+    })
+    .await
+}
+
+async fn schedules_action_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(mut body): Json<ScheduleRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    body.agent = Some(name);
+    handle_schedule_action(principal, state, body).await
+}
+
+async fn self_schedules_action_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<ScheduleRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    handle_schedule_action(principal, state, body).await
+}
+
+pub(super) async fn handle_schedule_action(
+    principal: Principal,
+    state: AppState,
+    mut body: ScheduleRequest,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::schedule::ScheduleVerb;
+    spawn_store(move || {
+        let mut trigger = crate::schedule::ScheduleTrigger {
+            at: body.at.take(),
+            every: body.every.take(),
+            watch: body.watch.take(),
+            spec: body.spec.take(),
+        };
+        let verb = crate::schedule::resolve_schedule_call(
+            body.action.as_deref(),
+            &mut trigger,
+            body.id.is_some(),
+        )
+        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+        body.at = trigger.at;
+        body.every = trigger.every;
+        body.watch = trigger.watch;
+
+        if is_fleet_schedule_target(body.agent.as_deref()) {
+            if !matches!(verb, ScheduleVerb::List) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "fleet schedules are read-only; select one agent to create or cancel",
+                ));
+            }
+            return list_fleet_schedules(&state.store, &principal).map(Json);
+        }
+
+        match verb {
+            ScheduleVerb::List => {
+                if matches!(principal, Principal::Operator) && body.agent.is_none() {
+                    let schedules: Vec<crate::api::ScheduleView> = state
+                        .store
+                        .list_schedules(None, true)
+                        .map_err(ApiError::from_store)?
+                        .into_iter()
+                        .map(crate::api::ScheduleView::from)
+                        .collect();
+                    return Ok(Json(serde_json::json!({ "schedules": schedules })));
+                }
+                let target =
+                    authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
+                let schedules: Vec<crate::api::ScheduleView> = state
+                    .store
+                    .list_schedules(Some(&target.id), true)
+                    .map_err(ApiError::from_store)?
+                    .into_iter()
+                    .map(crate::api::ScheduleView::from)
+                    .collect();
+                Ok(Json(serde_json::json!({
+                    "agent": target.name,
+                    "agent_id": target.id.as_str(),
+                    "schedules": schedules,
+                })))
+            }
+            ScheduleVerb::Create => {
+                let target =
+                    authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
+                let prompt = body.prompt.as_deref().unwrap_or("");
+                let created = crate::schedule::create_agent_schedule(
+                    &state.store,
+                    &state.health,
+                    &target,
+                    body.at.as_deref(),
+                    body.every.as_deref(),
+                    body.watch.as_deref(),
+                    prompt,
+                )
+                .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+                let schedules: Vec<crate::api::ScheduleView> = state
+                    .store
+                    .list_schedules(Some(&target.id), true)
+                    .map_err(ApiError::from_store)?
+                    .into_iter()
+                    .map(crate::api::ScheduleView::from)
+                    .collect();
+                Ok(Json(serde_json::json!({
+                    "agent": target.name,
+                    "agent_id": target.id.as_str(),
+                    "schedule": created,
+                    "schedules": schedules,
+                })))
+            }
+            ScheduleVerb::Cancel => {
+                let target =
+                    authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
+                let id_or_all = body
+                    .id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("all");
+                let cancelled = state
+                    .store
+                    .cancel_schedule(Some(&target.id), id_or_all)
+                    .map_err(ApiError::from_store)?;
+                crate::schedule::schedules_changed(state.store.data_dir());
+                let schedules: Vec<crate::api::ScheduleView> = state
+                    .store
+                    .list_schedules(Some(&target.id), true)
+                    .map_err(ApiError::from_store)?
+                    .into_iter()
+                    .map(crate::api::ScheduleView::from)
+                    .collect();
+                Ok(Json(serde_json::json!({
+                    "agent": target.name,
+                    "agent_id": target.id.as_str(),
+                    "cancelled": cancelled,
+                    "schedules": schedules,
+                })))
+            }
+        }
+    })
+    .await
+}
