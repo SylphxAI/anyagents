@@ -851,7 +851,9 @@ async fn parent_grants_secrets_to_existing_paused_child_and_enforces_subset_befo
     let _ = mk("paused-gc", Some(&cid), true, false);
     let (_, scap) = mk("sibling-worker", Some(&pid), false, true);
     let (_, ocap) = mk("unrelated-root", None, false, true);
-    let hdr = |c: &str| Some((crate::operator::AGENT_HEADER, c));
+    fn hdr(c: &str) -> Option<(&'static str, &str)> {
+        Some((crate::operator::AGENT_HEADER, c))
+    }
     let (ph, sh, oh) = (hdr(&pcap), hdr(&scap), hdr(&ocap));
     let (ok, both) = (
         json!({ "secrets": ["gh-token"] }),

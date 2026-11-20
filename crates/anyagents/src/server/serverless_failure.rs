@@ -57,6 +57,130 @@ pub(super) fn cancel_active_remote_turns_for_archived_agent(store: &Store, id: &
     }
 }
 
+/// Reconcile open-turn locks, update `agent_runtime` heartbeat, and detach
+/// crashed sandbox leases (or update idle state on healthy bindings).
+pub(super) fn finalize_settled_turn_runtime_and_binding(
+    store: &Store,
+    turn: &PendingRemoteTurn,
+    now: i64,
+    inflight_children: i32,
+) {
+    let still_active = store
+        .remote_turn_store()
+        .list_active_for_agent(&turn.agent_id)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if !still_active {
+        let _ = store.reconcile_stale_open_turn(&turn.agent_id);
+    }
+    let busy = still_active || inflight_children > 0;
+    let idle_since = (!busy).then_some(now);
+    let _ = store.update_runtime_heartbeat(
+        &turn.agent_id,
+        &anyagents_core::RuntimeHeartbeat {
+            owner_replica_id: Some(store.replica_id().to_string()),
+            turn_state: if busy { "in_turn" } else { "idle" }.to_string(),
+            retry_at_ms: None,
+            heartbeat_at_ms: Some(now),
+            idle_since_ms: idle_since,
+            inflight_children: inflight_children.max(0),
+        },
+    );
+    if turn.status == "failed" && turn.harness_kind == "sandbox" && !still_active {
+        let _ = store.sandbox_binding_store().clear_lease(&turn.agent_id);
+    } else if let Ok(Some(binding)) = store.sandbox_binding(&turn.agent_id) {
+        let _ = store
+            .sandbox_binding_store()
+            .touch_heartbeat(&turn.agent_id, now);
+        if binding.lease_state == "ready" {
+            let next_idle = if busy {
+                None
+            } else {
+                binding.idle_since_ms.or(idle_since)
+            };
+            if binding.idle_since_ms != next_idle {
+                let _ = store.sandbox_binding_store().update_lease_state(
+                    &turn.agent_id,
+                    "ready",
+                    next_idle,
+                );
+            }
+        }
+    }
+}
+
+/// Detach any stale/failed sandbox lease and clear orphaned turn-recovery/runtime
+/// state after an abnormal sandbox turn failure so the next wake provisions a
+/// fresh sandbox (preserving persistent volumes) instead of wedging on a dead lease.
+pub(super) fn cleanup_after_failed_sandbox_turn(store: &Store, agent_id: &AgentId, now_ms: i64) {
+    let still_active = store
+        .remote_turn_store()
+        .list_active_for_agent(agent_id)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if still_active {
+        return;
+    }
+    let _ = store.sandbox_binding_store().clear_lease(agent_id);
+    let _ = store.reconcile_stale_open_turn(agent_id);
+    let _ = store.update_runtime_heartbeat(
+        agent_id,
+        &anyagents_core::RuntimeHeartbeat {
+            owner_replica_id: Some(store.replica_id().to_string()),
+            turn_state: "idle".to_string(),
+            retry_at_ms: None,
+            heartbeat_at_ms: Some(now_ms),
+            idle_since_ms: Some(now_ms),
+            inflight_children: 0,
+        },
+    );
+}
+
+/// Detach any non-ready cached sandbox lease (`failed`/`expired`/`detached`) with
+/// a leftover `lease_id` before dispatch so `ensure_sandbox_with_provider` never
+/// tries to reuse a dead lease.
+pub(super) fn clear_unhealthy_sandbox_lease(store: &Store, agent_id: &AgentId) {
+    if let Ok(Some(binding)) = store.sandbox_binding(agent_id)
+        && binding.lease_id.is_some()
+        && matches!(
+            binding.lease_state.as_str(),
+            "failed" | "expired" | "detached"
+        )
+    {
+        let _ = store.sandbox_binding_store().clear_lease(agent_id);
+    }
+}
+
+/// Returns true when a live (non-paused/non-archived) agent has an undelivered
+/// inbound message newer than `failed_turn`'s `message_seq`, allowing immediate
+/// re-dispatch on a fresh sandbox without causing a tight retry loop on the
+/// crashing message itself.
+pub(super) fn should_drain_after_failed_turn(store: &Store, turn: &PendingRemoteTurn) -> bool {
+    if turn
+        .error_text
+        .as_deref()
+        .is_some_and(is_terminal_bootstrap_failure)
+    {
+        return false;
+    }
+    if store
+        .agent(&turn.agent_id)
+        .map(|a| matches!(a.state.as_str(), "paused" | "archived"))
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let failed_seq = turn
+        .metadata_json
+        .as_ref()
+        .and_then(|m| m.get("message_seq").and_then(serde_json::Value::as_i64))
+        .unwrap_or(0);
+    store
+        .list_undelivered(&turn.agent_id, 20)
+        .ok()
+        .is_some_and(|msgs| msgs.last().is_some_and(|m| m.seq > failed_seq))
+}
+
 /// Settle a timed-out sandbox turn; archived/deleted agents cancel silently without notifying parent.
 pub(super) fn settle_timed_out_sandbox_turn(
     store: &Store,
@@ -427,5 +551,215 @@ mod tests {
             .unwrap();
         assert!(late.settled_now && late.notified_agent_id.is_none());
         assert!(s.list_undelivered(&p.id, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_crash_sandbox_failure_detaches_lease_and_wakes_on_new_message() {
+        use crate::sandbox_providers::providers::{
+            EnsureSandboxRequest, ExecOutput, ExecRequest, ProviderHealth, ProviderKind,
+            SandboxCapabilities, SandboxHandle, SandboxProvider,
+        };
+        use crate::server::serverless::dispatch_next_mailbox_message_inner;
+        use anyagents_core::stateless::SandboxBinding;
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct RecoveryMockProvider {
+            root: std::path::PathBuf,
+            ensures: AtomicUsize,
+            fail_first_exec: Arc<Mutex<bool>>,
+            seen_existing_ids: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl SandboxProvider for RecoveryMockProvider {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Http
+            }
+            fn capabilities(&self) -> SandboxCapabilities {
+                SandboxCapabilities {
+                    persistent_volumes: true,
+                    volume_survives_release: true,
+                    ..SandboxCapabilities::default()
+                }
+            }
+            async fn ensure(&self, req: &EnsureSandboxRequest) -> Result<SandboxHandle, String> {
+                let prev = req
+                    .existing
+                    .as_ref()
+                    .map(|h| h.sandbox_id.clone())
+                    .unwrap_or_default();
+                self.seen_existing_ids.lock().unwrap().push(prev.clone());
+                if prev == "sbx-dead-1" {
+                    return Err("stale dead lease reused".into());
+                }
+                let n = self.ensures.fetch_add(1, Ordering::SeqCst) + 1;
+                let sd = self.root.join("state");
+                let wd = self.root.join("work");
+                std::fs::create_dir_all(&sd).unwrap();
+                std::fs::create_dir_all(&wd).unwrap();
+                Ok(SandboxHandle {
+                    provider: ProviderKind::Http,
+                    sandbox_id: format!("sbx-fresh-{n}"),
+                    volume_id: Some(
+                        req.volume
+                            .as_ref()
+                            .map(|v| v.id_or_name.clone())
+                            .unwrap_or_else(|| "vol-child-1".into()),
+                    ),
+                    mount_path: self.root.display().to_string(),
+                    state_dir: sd.display().to_string(),
+                    workdir: wd.display().to_string(),
+                    transport_url: None,
+                    transport_token: None,
+                    expires_at: None,
+                    metadata: BTreeMap::new(),
+                })
+            }
+            async fn exec(
+                &self,
+                _h: &SandboxHandle,
+                _r: &ExecRequest,
+            ) -> Result<ExecOutput, String> {
+                let mut fail = self.fail_first_exec.lock().unwrap();
+                if *fail {
+                    *fail = false;
+                    return Err("sandbox lease crashed during exec".into());
+                }
+                Ok(ExecOutput {
+                    exit_code: 0,
+                    stdout: r#"{"pid":4242}"#.into(),
+                    stderr: String::new(),
+                })
+            }
+            async fn sync_bundle_tar(
+                &self,
+                _h: &SandboxHandle,
+                _d: &str,
+                _b: &[u8],
+            ) -> Result<(), String> {
+                Ok(())
+            }
+            async fn release(&self, _h: &SandboxHandle) -> Result<(), String> {
+                Ok(())
+            }
+            async fn destroy(&self, _h: &SandboxHandle) -> Result<(), String> {
+                Ok(())
+            }
+            async fn health(&self) -> Result<ProviderHealth, String> {
+                Ok(ProviderHealth {
+                    provider: ProviderKind::Http,
+                    healthy: true,
+                    message: "ok".into(),
+                    latency_ms: Some(1),
+                })
+            }
+        }
+
+        let dir = crate::test_tempdir();
+        let s = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let p = s.create_agent(NewAgent::new("lead-rec", "codex")).unwrap();
+        let mut cn = NewAgent::new("child-rec", "codex");
+        cn.parent_id = Some(p.id.clone());
+        let cid = s.create_agent(cn).unwrap().id;
+        let c = s.set_agent_state(&cid, "running").unwrap();
+
+        let mut b = SandboxBinding::new(c.id.clone(), "http");
+        b.volume_id = "vol-child-1".into();
+        b.lease_id = Some("sbx-dead-1".into());
+        b.lease_state = "ready".into();
+        s.sandbox_binding_store().upsert(&b).unwrap();
+
+        let mut m1 = Incoming::new("initial task");
+        m1.sender = Some(format!("agent:{}", p.id));
+        let ReceiveOutcome::New(m1) = s.receive(&c.id, m1).unwrap() else {
+            panic!("expected m1");
+        };
+        s.remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "turn_crash_1".into(),
+                agent_id: c.id.clone(),
+                harness_kind: "sandbox".into(),
+                provider_kind: Some("http".into()),
+                remote_run_id: None,
+                callback_token_hash: "h_crash_1".into(),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: Some(json!({ "message_seq": m1.seq })),
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+
+        // (1) Mid-turn crash settles -> dead lease is detached (volume preserved), runtime is idle,
+        // and no tight retry triggers until a newer inbound message arrives.
+        let crash = settle_turn_payload("failed", Some("sandbox process exited (137)"), now_ms());
+        let res = settle_remote_turn_and_deliver(&s, "turn_crash_1", crash, None, 0)
+            .unwrap()
+            .unwrap();
+        assert!(res.settled_now);
+        let detached = s.sandbox_binding(&c.id).unwrap().unwrap();
+        assert_eq!(
+            (detached.lease_state.as_str(), detached.lease_id.as_deref()),
+            ("detached", None)
+        );
+        assert_eq!(detached.volume_id, "vol-child-1");
+        assert_eq!(
+            s.runtime_heartbeat(&c.id).unwrap().unwrap().turn_state,
+            "idle"
+        );
+        assert!(!should_drain_after_failed_turn(&s, &res.turn));
+
+        // (2) A new inbound message arrives: `should_drain_after_failed_turn` flips true.
+        // First dispatch hits a simulated exec crash -> `fail_remote_turn` detaches that lease
+        // too, and the subsequent wake provisions a fresh sandbox cleanly instead of wedging!
+        let mut m2 = Incoming::new("follow-up wake");
+        m2.sender = Some(format!("agent:{}", p.id));
+        s.receive(&c.id, m2).unwrap();
+        assert!(should_drain_after_failed_turn(&s, &res.turn));
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn SandboxProvider> = Arc::new(RecoveryMockProvider {
+            root: dir.path().join("sbx"),
+            ensures: AtomicUsize::new(0),
+            fail_first_exec: Arc::new(Mutex::new(true)),
+            seen_existing_ids: Arc::clone(&seen),
+        });
+        let cb = Some("http://127.0.0.1:1".to_string());
+        let first = dispatch_next_mailbox_message_inner(
+            Arc::clone(&s),
+            &c.id,
+            Some(Arc::clone(&provider)),
+            cb.clone(),
+        )
+        .await;
+        assert!(first.is_err());
+        let after_exec_fail = s.sandbox_binding(&c.id).unwrap().unwrap();
+        assert_eq!(
+            (
+                after_exec_fail.lease_state.as_str(),
+                after_exec_fail.lease_id.as_deref()
+            ),
+            ("detached", None)
+        );
+        assert_eq!(
+            s.runtime_heartbeat(&c.id).unwrap().unwrap().turn_state,
+            "idle"
+        );
+
+        let woken = dispatch_next_mailbox_message_inner(Arc::clone(&s), &c.id, Some(provider), cb)
+            .await
+            .unwrap()
+            .expect("must wake on fresh sandbox");
+        assert_eq!(woken.turn.status, "running");
+        assert_eq!(
+            s.sandbox_binding(&c.id)
+                .unwrap()
+                .unwrap()
+                .lease_id
+                .as_deref(),
+            Some("sbx-fresh-2")
+        );
+        assert!(seen.lock().unwrap().iter().all(|id| id.is_empty()));
     }
 }

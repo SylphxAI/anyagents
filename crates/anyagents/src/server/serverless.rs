@@ -769,6 +769,15 @@ pub(crate) async fn dispatch_next_mailbox_message_if_serverless(
     if !is_serverless_mode() {
         return Ok(None);
     }
+    dispatch_next_mailbox_message_inner(store, agent_id, None, None).await
+}
+
+pub(super) async fn dispatch_next_mailbox_message_inner(
+    store: Arc<Store>,
+    agent_id: &AgentId,
+    sandbox_provider: Option<Arc<dyn AsyncSandboxProvider>>,
+    callback_base_url: Option<String>,
+) -> Result<Option<DispatchedRemoteTurn>, String> {
     let store_r = Arc::clone(&store);
     let aid = agent_id.clone();
     let next_batch = run_store_blocking(move || {
@@ -795,6 +804,7 @@ pub(crate) async fn dispatch_next_mailbox_message_if_serverless(
         if live_active > 0 {
             return Ok(None);
         }
+        super::serverless_failure::clear_unhealthy_sandbox_lease(&store_r, &aid);
         if store_r.has_open_turn(&aid).unwrap_or(false) {
             let _ = store_r.reconcile_stale_open_turn(&aid);
         }
@@ -834,6 +844,8 @@ pub(crate) async fn dispatch_next_mailbox_message_if_serverless(
     input.message_seq = Some(last.seq);
     input.opener_id = Some(last.id.to_string());
     input.reply_target = reply_target;
+    input.sandbox_provider = sandbox_provider;
+    input.callback_base_url = callback_base_url;
     dispatch_serverless_turn(store, input).await.map(Some)
 }
 
@@ -883,6 +895,7 @@ async fn fail_remote_turn(
     let err_in = err.clone();
     run_store_blocking(move || {
         let masked = super::secrets::mask_text_for_agent(&store_fail, &aid, &err_in);
+        let now = now_ms();
         let _ = store_fail.remote_turn_store().settle_turn(
             &tid,
             &SettleRemoteTurn {
@@ -891,9 +904,10 @@ async fn fail_remote_turn(
                 error_text: Some(masked.clone()),
                 usage_json: None,
                 cursor: None,
-                settled_at_ms: now_ms(),
+                settled_at_ms: now,
             },
         );
+        super::serverless_failure::cleanup_after_failed_sandbox_turn(&store_fail, &aid, now);
         Ok(masked)
     })
     .await
@@ -1056,55 +1070,14 @@ pub(crate) fn settle_remote_turn_and_deliver(
     {
         let _ = store.mark_delivered_up_to(&turn.agent_id, seq);
     }
-    // Always close any remaining stale `turn_recovery` open-turn lock if no active
-    // remote turns remain for this agent.
-    if store
-        .remote_turn_store()
-        .list_active_for_agent(&turn.agent_id)
-        .map(|v| v.is_empty())
-        .unwrap_or(false)
-    {
-        let _ = store.reconcile_stale_open_turn(&turn.agent_id);
-    }
-
-    // 5. Update `agent_runtime` heartbeat & `agent_sandbox_bindings` idle marker.
-    let still_active = store
-        .remote_turn_store()
-        .list_active_for_agent(&turn.agent_id)
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let busy = still_active || inflight_children > 0;
-    let idle_since = (!busy).then_some(now);
-    let _ = store.update_runtime_heartbeat(
-        &turn.agent_id,
-        &RuntimeHeartbeat {
-            owner_replica_id: Some(store.replica_id().to_string()),
-            turn_state: if busy { "in_turn" } else { "idle" }.to_string(),
-            retry_at_ms: None,
-            heartbeat_at_ms: Some(now),
-            idle_since_ms: idle_since,
-            inflight_children: inflight_children.max(0),
-        },
+    // 5. Reconcile open-turn locks, update `agent_runtime` heartbeat, and
+    // detach crashed sandbox bindings (or mark healthy ones idle).
+    super::serverless_failure::finalize_settled_turn_runtime_and_binding(
+        store,
+        &turn,
+        now,
+        inflight_children,
     );
-    if let Ok(Some(binding)) = store.sandbox_binding(&turn.agent_id) {
-        let _ = store
-            .sandbox_binding_store()
-            .touch_heartbeat(&turn.agent_id, now);
-        if binding.lease_state == "ready" {
-            let next_idle = if busy {
-                None
-            } else {
-                binding.idle_since_ms.or(idle_since)
-            };
-            if binding.idle_since_ms != next_idle {
-                let _ = store.sandbox_binding_store().update_lease_state(
-                    &turn.agent_id,
-                    "ready",
-                    next_idle,
-                );
-            }
-        }
-    }
 
     // 6. Trigger outbound reply delivery or fail-closed parent error notification.
     let (delivered_reply, notified_agent_id) =
@@ -2276,7 +2249,7 @@ pub(crate) async fn guest_events_route(
                             "turn_id": turn.turn_id,
                             "event_type": "heartbeat",
                         })),
-                        None::<AgentId>,
+                        None::<(AgentId, bool)>,
                         None::<AgentId>,
                         0usize,
                     ))
@@ -2324,7 +2297,9 @@ pub(crate) async fn guest_events_route(
                     )
                     .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
                     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
-                    let drain_aid = settled.settled_now.then(|| settled.turn.agent_id.clone());
+                    let drain_aid = settled
+                        .settled_now
+                        .then(|| (settled.turn.agent_id.clone(), true));
                     let notify_aid = settled.notified_agent_id;
                     Ok((
                         Json(json!({
@@ -2359,7 +2334,13 @@ pub(crate) async fn guest_events_route(
                     )
                     .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
                     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
-                    let drain_aid = settled.settled_now.then(|| settled.turn.agent_id.clone());
+                    let drain_aid = settled.settled_now.then(|| {
+                        let drain_now = super::serverless_failure::should_drain_after_failed_turn(
+                            &store,
+                            &settled.turn,
+                        );
+                        (settled.turn.agent_id.clone(), drain_now)
+                    });
                     let notify_aid = settled.notified_agent_id;
                     Ok((
                         Json(json!({
@@ -2392,7 +2373,9 @@ pub(crate) async fn guest_events_route(
                     )
                     .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
                     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
-                    let drain_aid = settled.settled_now.then(|| settled.turn.agent_id.clone());
+                    let drain_aid = settled
+                        .settled_now
+                        .then(|| (settled.turn.agent_id.clone(), false));
                     Ok((
                         Json(json!({
                             "ok": true,
@@ -2418,7 +2401,7 @@ pub(crate) async fn guest_events_route(
     }
     if is_terminal_event
         && is_serverless_mode()
-        && let Some(drain_aid) = settled_agent_id
+        && let Some((drain_aid, should_drain)) = settled_agent_id
     {
         tokio::spawn(async move {
             if synced_auth_updates == 0 {
@@ -2429,11 +2412,7 @@ pub(crate) async fn guest_events_route(
                 )
                 .await;
             }
-            // Only immediately drain queued mailbox messages after a *completed* turn.
-            // Failed/cancelled turns do not advance the delivery cursor, so re-dispatching
-            // immediately would cause an unbounded tight retry storm; `/v1/internal/tick`
-            // retries them after the failure backoff window instead.
-            if is_completed_event
+            if should_drain
                 && let Err(err) = dispatch_next_mailbox_message_if_serverless(
                     Arc::clone(&store_for_drain),
                     &drain_aid,
@@ -3161,12 +3140,13 @@ pub(crate) async fn run_tick_pass(
     // 2b. Mark stale/dead sandbox turns whose heartbeats exceeded the stale threshold.
     let stale_before = now.saturating_sub(sandbox_stale_threshold_ms());
     let store_stale = Arc::clone(&store);
-    let stale_settled = spawn_store(move || {
+    let (stale_settled, wake_after_timeout) = spawn_store(move || {
         let stale = store_stale
             .remote_turn_store()
             .list_stale_active(Some("sandbox"), stale_before, TICK_STALE_SANDBOX_LIMIT)
             .map_err(ApiError::from_store)?;
         let mut count = 0usize;
+        let mut wake = Vec::new();
         for turn in stale {
             if super::serverless_failure::settle_timed_out_sandbox_turn(
                 &store_stale,
@@ -3174,9 +3154,12 @@ pub(crate) async fn run_tick_pass(
                 now_ms(),
             ) {
                 count += 1;
+                if super::serverless_failure::should_drain_after_failed_turn(&store_stale, &turn) {
+                    wake.push(turn.agent_id);
+                }
             }
         }
-        Ok(count)
+        Ok((count, wake))
     })
     .await?;
     summary.turns_settled += stale_settled;
@@ -3185,7 +3168,7 @@ pub(crate) async fn run_tick_pass(
     // remote turns) and drain queued undelivered mailbox messages for idle running agents.
     if is_serverless_mode() {
         let store_rec = Arc::clone(&store);
-        let (cleared, pending_agents) = spawn_store(move || {
+        let (cleared, mut pending_agents) = spawn_store(move || {
             let cleared = store_rec
                 .reconcile_all_stale_serverless_open_turns()
                 .unwrap_or(0);
@@ -3195,6 +3178,11 @@ pub(crate) async fn run_tick_pass(
             Ok((cleared, agents))
         })
         .await?;
+        for aid in wake_after_timeout {
+            if !pending_agents.contains(&aid) {
+                pending_agents.push(aid);
+            }
+        }
         summary.stale_open_turns_cleared = cleared;
 
         for aid in pending_agents {
