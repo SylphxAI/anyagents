@@ -11,11 +11,11 @@ use super::profile_identity::{
     read_first_non_empty_file,
 };
 use super::quota::{
-    anthropic_tier_label, format_anthropic_usage_summary, format_reset_eta_epoch_ms,
-    format_reset_eta_iso, format_reset_eta_secs, observed_agy_tier, observed_fraction_pct,
-    observed_remaining_pct, observed_window_min, overlay_active_quota_reset_on_cached_usage,
-    probe_opencode_profile_credentials, profile_has_sylphx_credentials,
-    sync_anthropic_profile_metadata,
+    anthropic_tier_label, format_anthropic_usage_summary, format_openai_usage_summary,
+    format_reset_eta_epoch_ms, format_reset_eta_iso, format_reset_eta_secs, observed_agy_tier,
+    observed_fraction_pct, observed_remaining_pct, observed_window_min,
+    overlay_active_quota_reset_on_cached_usage, probe_opencode_profile_credentials,
+    profile_has_sylphx_credentials, sync_anthropic_profile_metadata,
 };
 use super::{
     extract_profile_account_identity, parse_remaining_pct_from_usage,
@@ -26,6 +26,15 @@ pub(crate) fn probe_one_profile_usage(
     data: &Path,
     provider: &str,
     profile: &str,
+) -> Option<String> {
+    probe_one_profile_usage_with_options(data, provider, profile, false)
+}
+
+pub(crate) fn probe_one_profile_usage_with_options(
+    data: &Path,
+    provider: &str,
+    profile: &str,
+    bypass_cache: bool,
 ) -> Option<String> {
     let prof_dir = data.join("profiles").join(provider).join(profile);
     // A probe records its reading inside the profile; a profile that does not
@@ -46,7 +55,8 @@ pub(crate) fn probe_one_profile_usage(
             .and_then(|m| m.modified().ok())
             .is_some_and(|tok_mtime| tok_mtime > cache_mtime)
     };
-    if provider != "anthropic"
+    if !bypass_cache
+        && provider != "anthropic"
         && let Ok(meta) = std::fs::metadata(&last_usage_path)
         && let Ok(mtime) = meta.modified()
         && !cred_newer_than_usage_cache(mtime)
@@ -157,7 +167,8 @@ pub(crate) fn probe_one_profile_usage(
                         }
                         (!raw.is_empty()).then_some(raw)
                     };
-                if expires_at > now_ms
+                if !bypass_cache
+                    && expires_at > now_ms
                     && let Ok(meta) = std::fs::metadata(&last_usage_path)
                     && let Ok(mtime) = meta.modified()
                     && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH)
@@ -350,9 +361,14 @@ pub(crate) fn probe_one_profile_usage(
                         .as_deref()
                         .or((!acc_id.is_empty()).then_some(acc_id.as_str())),
                 );
+                let openai_usage_url = std::env::var("ANYAGENTS_OPENAI_USAGE_URL")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "https://chatgpt.com/backend-api/wham/usage".to_string());
                 let fetch_wham = |tok: &str| -> Option<serde_json::Value> {
                     let mut req = http
-                        .get("https://chatgpt.com/backend-api/wham/usage")
+                        .get(&openai_usage_url)
                         .header("authorization", &format!("Bearer {tok}"))
                         .header("user-agent", "codex-cli/0.164.0");
                     if !acc_id.is_empty() {
@@ -440,25 +456,7 @@ pub(crate) fn probe_one_profile_usage(
                         fetch_wham(&new_acc)?
                     }
                 };
-                let used = val
-                    .pointer("/rate_limit/primary_window/used_percent")
-                    .and_then(serde_json::Value::as_f64)?;
-                let rem = (100.0 - used).clamp(0.0, 100.0).round() as i64;
-                let eta = (rem < 100)
-                    .then(|| {
-                        val.pointer("/rate_limit/primary_window/reset_after_seconds")
-                            .and_then(serde_json::Value::as_i64)
-                            .and_then(format_reset_eta_secs)
-                    })
-                    .flatten()
-                    .map(|e| format!(" ↻{e}"))
-                    .unwrap_or_default();
-                match val.get("plan_type").and_then(serde_json::Value::as_str) {
-                    Some(plan) if !plan.is_empty() => {
-                        Some(format!("7d: {rem}% left{eta} ({plan})"))
-                    }
-                    _ => Some(format!("7d: {rem}% left{eta}")),
-                }
+                format_openai_usage_summary(&val)
             }
             "google-antigravity" => {
                 let tok_rel = ".gemini/antigravity-cli/antigravity-oauth-token";

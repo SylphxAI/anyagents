@@ -1,7 +1,7 @@
 //! Persistent per-agent browser profile grants on SQLite and PostgreSQL.
 //!
 //! Enforces a pure Capability Attenuation Law with zero role-name hardcoding:
-//! - Operator or root `is_admin=true` agent: may grant or revoke any valid
+//! - Operator: may grant or revoke any valid browser profile on any agent.
 //!   `profile_name` on any agent.
 //! - Non-admin parent agent: may grant or revoke `profile_name` on direct
 //!   children (`child.parent_id == Some(caller.id)`) if and only if the parent
@@ -92,20 +92,11 @@ fn query_agent_profiles(
     )
 }
 
-fn load_caller_meta(
-    exec: &(impl DbExec + ?Sized),
-    caller_id: &AgentId,
-) -> Result<(String, Option<AgentId>, bool), Error> {
+fn load_caller_name(exec: &(impl DbExec + ?Sized), caller_id: &AgentId) -> Result<String, Error> {
     exec.db_query_opt(
-        "SELECT name, parent_id, is_admin FROM agents WHERE id = ?1",
+        "SELECT name FROM agents WHERE id = ?1",
         &db_params![caller_id],
-        |row| {
-            Ok((
-                row.get::<String>(0)?,
-                row.get::<Option<AgentId>>(1)?,
-                row.get::<bool>(2)?,
-            ))
-        },
+        |row| row.get::<String>(0),
     )?
     .ok_or_else(|| Error::AgentNotFound(caller_id.to_string()))
 }
@@ -172,14 +163,10 @@ impl Store {
         match actor {
             BrowserProfileActor::Operator => Ok(normalized),
             BrowserProfileActor::Agent(caller_id) => {
-                let (_name, caller_parent, caller_is_admin) = load_caller_meta(&conn, caller_id)?;
-                if caller_is_admin && caller_parent.is_none() {
-                    return Ok(normalized);
-                }
+                let _name = load_caller_name(&conn, caller_id)?;
                 if parent_id != Some(caller_id) {
                     return Err(Error::PermissionDenied(
-                        "only an operator, admin, or direct parent may grant browser profiles"
-                            .into(),
+                        "only an operator or direct parent may grant browser profiles".into(),
                     ));
                 }
                 let held: BTreeSet<String> = query_agent_profiles(&conn, caller_id)?
@@ -199,8 +186,8 @@ impl Store {
 
     /// Replace `target_agent_id`'s browser profile grants atomically under the
     /// pure Capability Attenuation Law:
-    /// - Operator or root `is_admin=true` agent: any valid profile set on any agent.
-    /// - Non-admin agent: denied self-mutation; allowed only on direct children
+    /// - Operator: any valid profile set on any agent.
+    /// - Agent: denied self-mutation; allowed only on direct children
     ///   (`target.parent_id == Some(caller_id)`) and strictly `profiles ⊆ caller.profiles`.
     pub fn set_agent_browser_profiles_as(
         &self,
@@ -222,34 +209,28 @@ impl Store {
             let granted_by = match actor {
                 BrowserProfileActor::Operator => Some("operator".to_string()),
                 BrowserProfileActor::Agent(caller_id) => {
-                    let (caller_name, caller_parent, caller_is_admin) =
-                        load_caller_meta(tx, caller_id)?;
-                    if caller_is_admin && caller_parent.is_none() {
-                        Some(format!("agent:{caller_name}"))
-                    } else {
-                        if caller_id == target_agent_id {
-                            return Err(Error::PermissionDenied(
-                                "non-admin agent cannot modify its own browser profile grants"
-                                    .into(),
-                            ));
-                        }
-                        if target_parent.as_ref() != Some(caller_id) {
-                            return Err(Error::PermissionDenied(
-                                "only an operator, admin, or the agent's direct parent may modify browser profile grants"
-                                    .into(),
-                            ));
-                        }
-                        let held: BTreeSet<String> =
-                            query_agent_profiles(tx, caller_id)?.into_iter().collect();
-                        for profile in &normalized {
-                            if !held.contains(profile) {
-                                return Err(Error::PermissionDenied(format!(
-                                    "cannot grant browser profile `{profile}`: parent does not hold grant for `{profile}`"
-                                )));
-                            }
-                        }
-                        Some(format!("agent:{caller_name}"))
+                    let caller_name = load_caller_name(tx, caller_id)?;
+                    if caller_id == target_agent_id {
+                        return Err(Error::PermissionDenied(
+                            "an agent cannot modify its own browser profile grants".into(),
+                        ));
                     }
+                    if target_parent.as_ref() != Some(caller_id) {
+                        return Err(Error::PermissionDenied(
+                            "only an operator or the agent's direct parent may modify browser profile grants"
+                                .into(),
+                        ));
+                    }
+                    let held: BTreeSet<String> =
+                        query_agent_profiles(tx, caller_id)?.into_iter().collect();
+                    for profile in &normalized {
+                        if !held.contains(profile) {
+                            return Err(Error::PermissionDenied(format!(
+                                "cannot grant browser profile `{profile}`: parent does not hold grant for `{profile}`"
+                            )));
+                        }
+                    }
+                    Some(format!("agent:{caller_name}"))
                 }
             };
 
@@ -314,14 +295,13 @@ mod tests {
     }
 
     #[test]
-    fn capability_attenuation_law_enforces_subset_denies_self_and_allows_operator_admin() {
+    fn capability_attenuation_law_enforces_subset_denies_self_and_allows_operator() {
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
 
-        let admin = store
-            .create_agent(NewAgent::new("admin-root", "claude-code"))
+        let peer_root = store
+            .create_agent(NewAgent::new("peer-root", "claude-code"))
             .unwrap();
-        store.set_agent_admin(&admin.id, true).unwrap();
 
         let parent = store
             .create_agent(NewAgent::new("parent-root", "claude-code"))
@@ -443,15 +423,25 @@ mod tests {
             Error::PermissionDenied(_)
         ));
 
-        // Root admin agent can grant any profile to any agent (including itself).
-        let admin_set = store
+        // Unrelated root agent has no cross-tree admin authority; only Operator can grant cross-tree.
+        assert!(matches!(
+            store
+                .set_agent_browser_profiles_as(
+                    &BrowserProfileActor::Agent(peer_root.id.clone()),
+                    &other.id,
+                    &["profile-z".into()],
+                )
+                .unwrap_err(),
+            Error::PermissionDenied(_)
+        ));
+        let op_set = store
             .set_agent_browser_profiles_as(
-                &BrowserProfileActor::Agent(admin.id.clone()),
+                &BrowserProfileActor::Operator,
                 &other.id,
                 &["profile-z".into()],
             )
             .unwrap();
-        assert_eq!(admin_set, vec!["profile-z".to_string()]);
+        assert_eq!(op_set, vec!["profile-z".to_string()]);
 
         // Parent can revoke from direct child cleanly.
         let revoked = store

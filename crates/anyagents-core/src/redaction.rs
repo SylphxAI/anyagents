@@ -89,14 +89,11 @@ fn authorize(
     match actor {
         Actor::Operator => Ok("operator".into()),
         Actor::Agent(id) => {
-            let (admin, parent, name): (bool, Option<String>, String) = conn.db_query_one(
-                "SELECT is_admin, parent_id, name FROM agents WHERE id = ?1",
+            let name: String = conn.db_query_one(
+                "SELECT name FROM agents WHERE id = ?1",
                 &db_params![id.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| r.get(0),
             )?;
-            if admin && parent.is_none() {
-                return Ok(format!("agent:{name}"));
-            }
             let mut visited = HashSet::new();
             let mut current: Option<String> = conn.db_query_one(
                 "SELECT parent_id FROM agents WHERE id = ?1",
@@ -117,7 +114,7 @@ fn authorize(
                 )?;
             }
             Err(Error::PermissionDenied(
-                "conversation.redact requires a target ancestor or admin; self and peers are refused".into(),
+                "conversation.redact requires a target ancestor or the operator; self and peers are refused".into(),
             ))
         }
     }

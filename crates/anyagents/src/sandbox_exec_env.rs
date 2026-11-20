@@ -47,6 +47,12 @@ pub(crate) fn is_blocked_sandbox_env_key(key: &str) -> bool {
             | "ANYAGENTS_GATEWAY_URL"
             | "ANYAGENTS_GATEWAY_TOKEN"
     ) || upper.starts_with("ANYAGENTS_OPERATOR_")
+        || upper.starts_with("ANYAGENTS_ADMIN_")
+        || upper.starts_with("ANYAGENTS_OIDC_")
+        || upper.starts_with("ANYAGENTS_CONTROL_")
+        || upper.starts_with("ANYAGENTS_AUTH_")
+        || upper == "ANYAGENTS_BEARER_TOKEN"
+        || upper == "XDG_STATE_HOME"
         || upper.starts_with("ANYAGENTS_TICK_")
         || upper.starts_with("ANYAGENTS_S3_")
         || upper.starts_with(SANDBOX_ENV_PREFIX)
@@ -608,6 +614,52 @@ mod tests {
                 Vec::<(String, String)>::new(),
             ),
             (Some("c1m2".into()), Some(10))
+        );
+    }
+
+    #[test]
+    fn sandbox_env_strips_control_plane_and_oidc_auth_vars() {
+        for forbidden in [
+            "ANYAGENTS_ADMIN_OIDC_ISSUER",
+            "ANYAGENTS_ADMIN_OIDC_CLIENT_SECRET",
+            "ANYAGENTS_ADMIN_SESSION_SECRET",
+            "ANYAGENTS_ADMIN_EMAILS",
+            "ANYAGENTS_OIDC_TOKEN",
+            "ANYAGENTS_CONTROL_AUTH_FILE",
+            "ANYAGENTS_CONTROL_URL",
+            "ANYAGENTS_AUTH_TOKEN",
+            "ANYAGENTS_BEARER_TOKEN",
+            "XDG_STATE_HOME",
+        ] {
+            assert!(
+                is_blocked_sandbox_env_key(forbidden),
+                "sandbox must strip `{forbidden}` so child sandboxes inherit zero admin rights"
+            );
+        }
+        let filtered = filter_sandbox_launch_env_with_defaults(
+            &[
+                (
+                    "ANYAGENTS_CONTROL_AUTH_FILE".into(),
+                    "/secret/auth.json".into(),
+                ),
+                ("ANYAGENTS_ADMIN_OIDC_CLIENT_SECRET".into(), "shh".into()),
+                ("XDG_STATE_HOME".into(), "/home/op/.local/state".into()),
+                ("SAFE_APP_ENV".into(), "ok".into()),
+            ],
+            vec![
+                (
+                    "ANYAGENTS_SANDBOX_ENV_ANYAGENTS_BEARER_TOKEN".into(),
+                    "leaked".into(),
+                ),
+                ("ANYAGENTS_SANDBOX_ENV_GOOD_DEFAULT".into(), "1".into()),
+            ],
+        );
+        assert_eq!(
+            filtered,
+            vec![
+                ("GOOD_DEFAULT".into(), "1".into()),
+                ("SAFE_APP_ENV".into(), "ok".into()),
+            ]
         );
     }
 }

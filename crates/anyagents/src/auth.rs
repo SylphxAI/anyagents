@@ -205,7 +205,8 @@ impl Mode {
         // One request carries one authority, never two.
         let authorities = usize::from(presented.agent_token.is_some())
             + usize::from(presented.operator_token.is_some())
-            + usize::from(presented.admin_session.is_some());
+            + usize::from(presented.admin_session.is_some())
+            + usize::from(presented.bearer_token.is_some());
         if authorities > 1 {
             return Some(Err(AuthError::Unauthenticated(
                 "one authority per call".to_string(),
@@ -251,10 +252,21 @@ pub struct Presented {
     agent_token: Option<String>,
     operator_token: Option<String>,
     admin_session: Option<String>,
+    bearer_token: Option<String>,
     admin_csrf: bool,
     is_state_changing: bool,
     agent_id: Option<String>,
     route_agent: Option<String>,
+}
+
+fn bearer_header(parts: &Parts) -> Option<String> {
+    let raw = header(parts, "authorization")?;
+    let (scheme, token) = raw.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let trimmed = token.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 impl Presented {
@@ -263,6 +275,7 @@ impl Presented {
             agent_token: header(parts, operator::AGENT_HEADER),
             operator_token: header(parts, operator::HEADER),
             admin_session: crate::server::admin_auth::extract_session_cookie(&parts.headers),
+            bearer_token: bearer_header(parts),
             admin_csrf: header(parts, crate::server::admin_auth::ADMIN_CSRF_HEADER).as_deref()
                 == Some("1"),
             is_state_changing: matches!(
@@ -409,6 +422,14 @@ impl FromRequestParts<AppState> for Principal {
         let presented = Presented::of(parts);
         if let Some(decided) = state.auth.principal_without_store(&presented) {
             return decided.map_err(AuthRejection);
+        }
+        if let Some(bearer) = presented.bearer_token.as_deref() {
+            return crate::server::oidc_bearer::authenticate_bearer_token(
+                state.store.data_dir(),
+                bearer,
+            )
+            .await
+            .map_err(AuthRejection);
         }
         let auth = state.auth.clone();
         let store = std::sync::Arc::clone(&state.store);

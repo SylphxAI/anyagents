@@ -208,7 +208,6 @@ impl AgentView {
         let runtime = anyagents_harness::ExecutionRuntime::parse(&self.runtime)
             .unwrap_or_else(|_| anyagents_harness::resolve_stored_runtime(&self.harness, &[]));
         Ok(anyagents_core::Agent {
-            is_admin: false,
             id: anyagents_core::AgentId::parse(&self.id)?,
             name: self.name,
             role: self.role,

@@ -21,7 +21,7 @@ use crate::create::ProviderProfileEntry;
 /// A snapshot at least this old is refreshed when a request reads it.
 const REFRESH_AFTER: Duration = Duration::from_secs(30);
 
-type Refresh = dyn Fn(&Store, &Path) -> Vec<ProviderProfileEntry> + Send + Sync;
+type Refresh = dyn Fn(&Store, &Path, bool) -> Vec<ProviderProfileEntry> + Send + Sync;
 
 /// The listing one refresh produced.
 struct Snapshot {
@@ -39,6 +39,8 @@ struct State {
     /// The oldest generation a request may be answered from. A change of
     /// profiles bumps it, so no request is answered from before the change.
     wanted: u64,
+    /// Generation through which refreshes must bypass stale on-disk usage caches.
+    fresh_through: u64,
     /// How many refreshes failed, and the generation and reason of the last.
     failures: u64,
     failed: Option<(u64, String)>,
@@ -53,8 +55,12 @@ pub(crate) struct ProfileSnapshots {
 
 impl Default for ProfileSnapshots {
     fn default() -> Self {
-        Self::with_refresh(Arc::new(|store: &Store, data: &Path| {
-            crate::create::list_provider_profiles_fast(store, data)
+        Self::with_refresh(Arc::new(|store: &Store, data: &Path, fresh: bool| {
+            if fresh {
+                crate::create::list_provider_profiles_fresh(store, data)
+            } else {
+                crate::create::list_provider_profiles_fast(store, data)
+            }
         }))
     }
 }
@@ -70,6 +76,11 @@ pub(crate) struct ServedProfile {
 }
 
 impl ProfileSnapshots {
+    #[cfg(test)]
+    pub(crate) fn with_refresh_for_test(refresh: Arc<Refresh>) -> Self {
+        Self::with_refresh(refresh)
+    }
+
     fn with_refresh(refresh: Arc<Refresh>) -> Self {
         Self {
             state: Mutex::new(State::default()),
@@ -92,7 +103,10 @@ impl ProfileSnapshots {
         fresh: bool,
     ) -> Result<Vec<ServedProfile>, String> {
         if fresh {
-            self.invalidate(store);
+            let mut state = self.lock();
+            state.wanted += 1;
+            state.fresh_through = state.wanted;
+            self.start(&mut state, store);
         }
         // Subscribe before looking, so a refresh that ends in between is seen.
         let mut published = self.published.subscribe();
@@ -150,9 +164,15 @@ impl ProfileSnapshots {
 
     fn refresh_until_current(&self, store: &Store) {
         loop {
-            let generation = self.lock().wanted;
+            let (generation, bypass_cache) = {
+                let state = self.lock();
+                (
+                    state.wanted,
+                    state.fresh_through > 0 && state.fresh_through >= state.wanted,
+                )
+            };
             let listed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (self.refresh)(store, store.data_dir())
+                (self.refresh)(store, store.data_dir(), bypass_cache)
             }));
             let mut state = self.lock();
             match listed {
@@ -185,9 +205,23 @@ fn served(snapshot: &Snapshot, age: i64) -> Vec<ServedProfile> {
     snapshot
         .entries
         .iter()
-        .map(|entry| ServedProfile {
-            entry: entry.clone(),
-            usage_age_ms: Some(age),
+        .map(|entry| {
+            let mut cloned = entry.clone();
+            if let Some(ref usage) = cloned.usage
+                && (cloned.quota_5h.is_none() || cloned.quota_weekly.is_none())
+            {
+                let (q5, q7) = crate::create::parse_quota_windows_from_usage(usage);
+                if cloned.quota_5h.is_none() {
+                    cloned.quota_5h = q5;
+                }
+                if cloned.quota_weekly.is_none() {
+                    cloned.quota_weekly = q7;
+                }
+            }
+            ServedProfile {
+                entry: cloned,
+                usage_age_ms: Some(age),
+            }
         })
         .collect()
 }
@@ -208,6 +242,8 @@ mod tests {
             assigned_agents: Vec::new(),
             subagent_count: 0,
             usage: Some(usage.into()),
+            quota_5h: None,
+            quota_weekly: None,
         }
     }
 
@@ -235,7 +271,7 @@ mod tests {
 
         fn snapshots(self: &Arc<Self>) -> Arc<ProfileSnapshots> {
             let gate = Arc::clone(self);
-            Arc::new(ProfileSnapshots::with_refresh(Arc::new(move |_, _| {
+            Arc::new(ProfileSnapshots::with_refresh(Arc::new(move |_, _, _| {
                 let run = gate.runs.fetch_add(1, Ordering::SeqCst) + 1;
                 let mut open = gate.open.lock().unwrap();
                 while !*open {
@@ -388,7 +424,9 @@ mod tests {
     /// agent whose creation is in flight or failed: a rollback that removed
     /// its tree stays removed, and the agent is still counted on its profile.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
     async fn a_listing_never_writes_into_an_agent_being_created() {
+        let _env = crate::server::tests::env_lock();
         let (dir, store) = store();
         let data = dir.path();
         std::fs::create_dir_all(data.join("profiles/openai/default")).unwrap();
@@ -431,7 +469,7 @@ mod tests {
         let (_dir, store) = store();
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&calls);
-        let snapshots = Arc::new(ProfileSnapshots::with_refresh(Arc::new(move |_, _| {
+        let snapshots = Arc::new(ProfileSnapshots::with_refresh(Arc::new(move |_, _, _| {
             if counted.fetch_add(1, Ordering::SeqCst) == 0 {
                 panic!("probe exploded");
             }

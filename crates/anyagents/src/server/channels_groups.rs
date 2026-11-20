@@ -15,7 +15,7 @@ use crate::auth::Principal;
 use super::messaging::{Actor, can_actor_message_agent};
 use super::serverless;
 use super::types::{
-    ApiError, AppState, is_self_or_ancestor, require_admin_or_operator, spawn_store,
+    ApiError, AppState, is_self_or_ancestor, require_operator_audited, spawn_store,
 };
 
 pub(super) fn router() -> Router<AppState> {
@@ -108,7 +108,7 @@ pub(super) async fn channels_route(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
-        require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
+        require_operator_audited(&state.store, &principal, "channels.list", "channels")?;
         let channels: Vec<_> = state
             .store
             .list_channels()
@@ -220,7 +220,7 @@ async fn add_channel_route(
             Principal::Operator => true,
         };
         if !authorized_by_lineage {
-            require_admin_or_operator(&state.store, &principal, "channels.add", &body.agent)?;
+            require_operator_audited(&state.store, &principal, "channels.add", &body.agent)?;
         }
         let result = crate::telegram::request_or_bind_telegram_channel(
             &state.store,

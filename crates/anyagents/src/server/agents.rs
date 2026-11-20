@@ -25,8 +25,7 @@ use super::channels_groups::group_actor;
 use super::messaging::{Actor, can_actor_message_agent, can_actor_read_agent_private};
 use super::types::{
     ApiError, AppState, is_self_or_ancestor, owner_workdir, refuse_host_placement_over_http,
-    require_admin_or_operator, require_operator, require_remote_callback, spawn_store,
-    via_http_mcp,
+    require_operator_audited, require_remote_callback, spawn_store, via_http_mcp,
 };
 use super::{outbound_history, serverless};
 
@@ -39,7 +38,6 @@ pub(super) fn router() -> Router<AppState> {
                 .patch(super::secrets::patch_agent_route)
                 .delete(delete_agent_route),
         )
-        .route("/v1/agents/{name}/admin", post(set_admin_route))
         .route("/v1/agents/{name}/rename", post(rename_agent_route))
         .route("/v1/agents/{name}/role", post(role_agent_route))
         .route("/v1/agents/{name}/transfer", post(transfer_agent_route))
@@ -62,47 +60,6 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/agents/{name}/pause", post(pause_agent_route))
         .route("/v1/agents/{name}/wake", post(wake_agent_route))
         .route("/v1/agents/{name}/verdict", post(verdict_route))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AdminRequest {
-    admin: bool,
-}
-
-async fn set_admin_route(
-    principal: Principal,
-    State(state): State<AppState>,
-    AxumPath(name): AxumPath<String>,
-    Json(body): Json<AdminRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    require_operator(&principal)?;
-    spawn_store(move || {
-        let agent = state
-            .store
-            .agent_by_name(&name)
-            .map_err(ApiError::from_store)?;
-        state
-            .store
-            .set_agent_admin(&agent.id, body.admin)
-            .map_err(ApiError::from_store)?;
-        state
-            .store
-            .record_admin_audit(
-                "operator",
-                if body.admin {
-                    "agents.grant_admin"
-                } else {
-                    "agents.revoke_admin"
-                },
-                &agent.name,
-            )
-            .map_err(ApiError::from_store)?;
-        Ok(Json(
-            serde_json::json!({"agent": agent.name, "admin": body.admin}),
-        ))
-    })
-    .await
 }
 
 // Socket requests carry secret values, never host filesystem paths.
@@ -150,7 +107,7 @@ pub(super) async fn reset_session_route(
                 if agent_id != &found.id && is_self_or_ancestor(&state.store, agent_id, &found) => {
             }
             _ => {
-                require_admin_or_operator(
+                require_operator_audited(
                     &state.store,
                     &principal,
                     "agents.reset_session",
@@ -185,9 +142,7 @@ pub(super) async fn harness_route(
             } if agent_id != &found.id && is_self_or_ancestor(&state.store, agent_id, &found) => {
                 format!("agent:{caller_name}")
             }
-            _ => {
-                require_admin_or_operator(&state.store, &principal, "agents.harness", &found.name)?
-            }
+            _ => require_operator_audited(&state.store, &principal, "agents.harness", &found.name)?,
         };
         require_remote_callback(
             state.store.data_dir(),
@@ -289,7 +244,7 @@ async fn transfer_agent_route(
                 format!("agent:{caller_name}")
             }
             _ => {
-                require_admin_or_operator(&state.store, &principal, "agents.transfer", &found.name)?
+                require_operator_audited(&state.store, &principal, "agents.transfer", &found.name)?
             }
         };
         let updated = state
@@ -374,7 +329,7 @@ async fn model_route(
     Json(body): Json<ModelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
-        let actor = require_admin_or_operator(&state.store, &principal, "agents.model", &name)?;
+        let actor = require_operator_audited(&state.store, &principal, "agents.model", &name)?;
         let agent = state
             .store
             .agent_by_name(&name)
@@ -468,7 +423,7 @@ async fn rename_agent_route(
             Principal::Operator => true,
         };
         if !is_ancestor {
-            require_admin_or_operator(&state.store, &principal, "agents.rename", &old.name)?;
+            require_operator_audited(&state.store, &principal, "agents.rename", &old.name)?;
         }
         let updated = state
             .store
@@ -540,7 +495,7 @@ async fn role_agent_route(
             Principal::Operator => true,
         };
         if !is_ancestor {
-            require_admin_or_operator(&state.store, &principal, "agents.role", &found.name)?;
+            require_operator_audited(&state.store, &principal, "agents.role", &found.name)?;
         }
         let data_dir = state.store.data_dir();
         let parent_wd = found
@@ -684,7 +639,7 @@ pub(super) async fn set_description_route(
             && body.public.is_none()
             && !body.clear.unwrap_or(false)
         {
-            require_admin_or_operator(&state.store, &principal, "agents.sync_instructions", "all")?;
+            require_operator_audited(&state.store, &principal, "agents.sync_instructions", "all")?;
             create::sync_all_agent_instructions(&state.store, state.store.data_dir())
                 .map_err(ApiError::from_store)?;
             return Ok(Json(serde_json::json!({
@@ -716,7 +671,7 @@ pub(super) async fn set_description_route(
             Principal::Operator => true,
         };
         if !is_ancestor {
-            require_admin_or_operator(
+            require_operator_audited(
                 &state.store,
                 &principal,
                 "agents.set_description",
@@ -730,7 +685,7 @@ pub(super) async fn set_description_route(
         let mut rec = target;
         if let Some(ref scope_val) = body.scope {
             if !is_ancestor {
-                require_admin_or_operator(&state.store, &principal, "agents.scope", &rec.name)?;
+                require_operator_audited(&state.store, &principal, "agents.scope", &rec.name)?;
             }
             rec = state
                 .store
@@ -738,7 +693,7 @@ pub(super) async fn set_description_route(
                 .map_err(ApiError::from_store)?;
         } else if let Some(pub_val) = body.public {
             if !is_ancestor {
-                require_admin_or_operator(&state.store, &principal, "agents.public", &rec.name)?;
+                require_operator_audited(&state.store, &principal, "agents.public", &rec.name)?;
             }
             rec = state
                 .store
@@ -747,7 +702,7 @@ pub(super) async fn set_description_route(
         }
         if let Some(ref lifecycle_val) = body.lifecycle {
             if !is_ancestor {
-                require_admin_or_operator(&state.store, &principal, "agents.lifecycle", &rec.name)?;
+                require_operator_audited(&state.store, &principal, "agents.lifecycle", &rec.name)?;
             }
             rec = state
                 .store
@@ -756,7 +711,7 @@ pub(super) async fn set_description_route(
         }
         if let Some(ref role_str) = body.role {
             if !is_ancestor {
-                require_admin_or_operator(&state.store, &principal, "agents.role", &rec.name)?;
+                require_operator_audited(&state.store, &principal, "agents.role", &rec.name)?;
             }
             let new_role = if role_str.trim().is_empty() {
                 None
@@ -957,7 +912,7 @@ pub(super) async fn create_agent_route(
             .map_err(ApiError::from_store)?;
         let parent_agent = match (&caller_agent, body.parent.as_deref()) {
             (_, Some("root" | "")) => {
-                require_admin_or_operator(
+                require_operator_audited(
                     &state.store,
                     &principal,
                     "agents.create_root",

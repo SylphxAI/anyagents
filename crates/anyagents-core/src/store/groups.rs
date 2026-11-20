@@ -267,7 +267,7 @@ impl Store {
         )?;
         let member_rows: Vec<(String, Agent)> = conn.db_query_vec(
             "SELECT g.group_name, a.id, a.name, a.harness, a.model, a.workdir, a.instructions, \
-             a.state, a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role, \
+             a.state, a.created_at_ms, a.launch_env, a.parent_id, a.role, \
              a.description, a.runtime, a.remote_budget_micros \
              FROM group_agents AS g \
              JOIN agents AS a ON a.id = g.agent_id \
@@ -285,8 +285,8 @@ impl Store {
                     Some(raw) if !raw.is_empty() => Some(AgentId::parse(&raw)?),
                     _ => None,
                 };
-                let runtime_raw: Option<String> = row.get(14)?;
-                let budget_raw: Option<i64> = row.get(15)?;
+                let runtime_raw: Option<String> = row.get(13)?;
+                let budget_raw: Option<i64> = row.get(14)?;
                 let runtime = decode_runtime_column(runtime_raw.as_deref(), &harness, &launch_env);
                 let remote_budget_micros = decode_budget_column(budget_raw, &launch_env);
                 let agent = Agent {
@@ -302,9 +302,8 @@ impl Store {
                     created_at_ms: row.get(8)?,
                     launch_env,
                     parent_id,
-                    is_admin: row.get(11)?,
-                    role: row.get(12)?,
-                    description: row.get(13)?,
+                    role: row.get(11)?,
+                    description: row.get(12)?,
                 };
                 Ok((group_name, agent))
             },

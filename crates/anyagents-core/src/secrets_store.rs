@@ -58,7 +58,7 @@ pub fn is_reserved_secret_env_key(key: &str) -> bool {
     upper.starts_with("ANYAGENTS_")
         || matches!(
             upper.as_str(),
-            "HOME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_CACHE_HOME"
+            "HOME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_CACHE_HOME" | "XDG_STATE_HOME"
         )
 }
 

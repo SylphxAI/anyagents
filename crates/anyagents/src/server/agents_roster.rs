@@ -127,8 +127,7 @@ impl<'a> RosterCaller<'a> {
             .is_ok(),
         );
         // [`can_actor_read_agent_private`] for this caller.
-        let reads_private = self.is_self_or_ancestor(&self.caller.id, agent)
-            || (self.caller.is_admin && self.caller.parent_id.is_none());
+        let reads_private = self.is_self_or_ancestor(&self.caller.id, agent);
         if !reads_private {
             view.instructions = None;
             view.secrets.clear();
