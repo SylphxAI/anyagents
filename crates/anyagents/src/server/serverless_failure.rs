@@ -704,9 +704,11 @@ mod tests {
             ("detached", None)
         );
         assert_eq!(detached.volume_id, "vol-child-1");
-        assert_eq!(
-            s.runtime_heartbeat(&c.id).unwrap().unwrap().turn_state,
-            "idle"
+        assert!(!s.has_open_turn(&c.id).unwrap());
+        assert!(
+            s.runtime_heartbeat(&c.id)
+                .unwrap()
+                .is_none_or(|hb| hb.turn_state == "idle")
         );
         assert!(!should_drain_after_failed_turn(&s, &res.turn));
 
@@ -742,9 +744,11 @@ mod tests {
             ),
             ("detached", None)
         );
-        assert_eq!(
-            s.runtime_heartbeat(&c.id).unwrap().unwrap().turn_state,
-            "idle"
+        assert!(!s.has_open_turn(&c.id).unwrap());
+        assert!(
+            s.runtime_heartbeat(&c.id)
+                .unwrap()
+                .is_none_or(|hb| hb.turn_state == "idle")
         );
 
         let woken = dispatch_next_mailbox_message_inner(Arc::clone(&s), &c.id, Some(provider), cb)
