@@ -8,6 +8,9 @@ use crate::db_params;
 use crate::error::Error;
 use crate::id::{AgentId, ChannelId};
 
+#[cfg(test)]
+mod tests;
+
 impl Store {
     pub fn create_channel(&self, new: NewChannel) -> Result<Channel, Error> {
         if new.kind.is_empty() {
@@ -28,9 +31,10 @@ impl Store {
             agents: Vec::new(),
         };
         self.write_tx(|tx| {
-            tx.db_execute(
+            let inserted = tx.db_execute(
                 "INSERT INTO channels (id, kind, identity, config, credential_ref, state, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (kind, identity) DO NOTHING",
                 &db_params![
                     channel.id.as_str(),
                     channel.kind,
@@ -41,6 +45,11 @@ impl Store {
                     channel.created_at_ms,
                 ],
             )?;
+            if inserted == 0 {
+                // Do not return the existing channel as though the caller created it;
+                // callers may immediately change its credential or attachments.
+                return Err(Error::Message("channel kind and identity already registered".into()));
+            }
             Ok(())
         })?;
         Ok(channel)
