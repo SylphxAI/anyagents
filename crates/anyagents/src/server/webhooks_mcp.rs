@@ -39,6 +39,8 @@ pub(super) fn local_router() -> Router<AppState> {
 /// Authenticates raw request bytes against `[server].webhook_secret` (or
 /// `ANYAGENTS_WEBHOOK_SECRET`) via HMAC-SHA256 (`x-anyagents-signature-256` or
 /// `x-hub-signature-256`) or `Authorization: Bearer <secret>`.
+/// Use a unique `x-anyagents-delivery` per event and reuse it on retry (including
+/// after a 503). Without a delivery ID, each request is a new event.
 async fn event_webhook(
     State(state): State<AppState>,
     AxumPath(topic): AxumPath<String>,
@@ -83,7 +85,7 @@ async fn event_webhook(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("evt-{}-{}", anyagents_core::now_ms(), body.len()));
+        .unwrap_or_else(crate::schedule::fresh_delivery_id);
     let topic = topic.trim().trim_start_matches('/').to_string();
     if topic.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
@@ -126,6 +128,9 @@ async fn event_webhook(
                 }
             });
         }
+    }
+    if dispatch.retry_required {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     (
         StatusCode::ACCEPTED,

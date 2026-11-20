@@ -293,6 +293,8 @@ pub struct AgentSchedule {
     pub created_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_timer_id: Option<String>,
+    #[serde(default)]
+    pub persistent: bool,
 }
 
 /// Input for [`Store::create_schedule`].

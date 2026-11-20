@@ -315,6 +315,8 @@ pub struct ScheduleView {
     pub watch_baseline: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_observed: Option<String>,
+    #[serde(default)]
+    pub persistent: bool,
     pub state: String,
     pub created_at_ms: i64,
 }
@@ -332,6 +334,7 @@ impl From<anyagents_core::AgentSchedule> for ScheduleView {
             last_fired_at_ms: s.last_fired_at_ms,
             watch_baseline: s.watch_baseline,
             last_observed: s.last_observed,
+            persistent: s.persistent,
             state: s.state,
             created_at_ms: s.created_at_ms,
         }

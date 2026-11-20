@@ -630,6 +630,8 @@ pub(super) struct ScheduleArgs {
     /// - `"file:<path>"` / `"path:<path>"` (local file/directory created or modified)
     #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     pub(super) watch: Option<String>,
+    /// Keep a webhook/event watch active for each distinct delivery. Defaults to false.
+    pub(super) persistent: Option<bool>,
     /// The trigger value when `action` names the trigger (`{action: "at", spec: "20m"}`).
     #[serde(
         default,

@@ -24,6 +24,77 @@ fn pg_url() -> Option<String> {
 }
 
 #[test]
+fn postgres_persistent_webhook_wakes_serialize_retries_and_survive_reopen() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping PostgreSQL webhook test: ANYAGENTS_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _guard = test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let first = Store::open_postgres(&url, dir.path()).unwrap();
+    let peer = Store::open_postgres(&url, dir.path()).unwrap();
+    let agent = first
+        .create_agent(NewAgent::new(format!("sub_{}", uuid_tag()), "codex"))
+        .unwrap();
+    let input = || NewSchedule {
+        agent_id: agent.id.clone(),
+        kind: "watch".into(),
+        spec: "webhook:sample".into(),
+        prompt: "inspect sample".into(),
+        interval_ms: None,
+        next_fire_at_ms: None,
+        watch_baseline: None,
+    };
+    let one_shot = first.create_schedule(input()).unwrap();
+    let sub = first.create_persistent_webhook_watch(input()).unwrap();
+    assert_eq!(
+        peer.create_persistent_webhook_watch(input()).unwrap().id,
+        sub.id
+    );
+    assert_ne!(one_shot.id, sub.id);
+    assert!(!one_shot.persistent);
+    let deliver = |store: &Store, id: &str, text: &str, now| {
+        store
+            .deliver_persistent_webhook_wake(&sub.id, &agent.id, id, text.into(), id, now)
+            .unwrap()
+    };
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let concurrent = scope.spawn(|| {
+            barrier.wait();
+            deliver(&peer, "first", "first payload", 1)
+        });
+        barrier.wait();
+        assert_ne!(
+            deliver(&first, "first", "first payload", 1),
+            concurrent.join().unwrap()
+        );
+    });
+    assert!(deliver(&peer, "second", "second payload", 2));
+    let inbox = first.inbox(&agent.id, None).unwrap();
+    assert_eq!(
+        inbox.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+        ["first payload", "second payload"]
+    );
+    first.note_delivered(&agent.id, inbox[1].seq).unwrap();
+    drop(first);
+    drop(peer);
+    let reopened = Store::open_postgres(&url, dir.path()).unwrap();
+    assert!(!deliver(&reopened, "first", "retry", 3));
+    let loaded = reopened.get_schedule(&sub.id).unwrap().unwrap();
+    assert!(loaded.persistent);
+    assert_eq!(loaded.state, "active");
+    assert_eq!(loaded.last_fired_at_ms, Some(2));
+    assert_eq!(loaded.last_observed.as_deref(), Some("second"));
+    assert_eq!(
+        reopened.cancel_schedule(Some(&agent.id), &sub.id).unwrap(),
+        1
+    );
+    assert!(!deliver(&reopened, "third", "cancelled", 4));
+    assert_eq!(reopened.inbox(&agent.id, None).unwrap().len(), 2);
+}
+
+#[test]
 fn postgres_end_to_end_store_search_host_index_redaction_and_concurrency() {
     let Some(url) = pg_url() else {
         eprintln!("skipping postgres_store test: ANYAGENTS_TEST_POSTGRES_URL not set");

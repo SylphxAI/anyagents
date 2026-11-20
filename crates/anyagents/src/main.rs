@@ -549,6 +549,9 @@ struct ScheduleArgs {
     /// Event watch (`webhook:<topic>`, `event:<topic>`, `agent:idle:<name_or_id>`, `pid:<pid>`, `file:<path>`).
     #[arg(long)]
     watch: Option<String>,
+    /// Keep a webhook/event watch active after each delivery.
+    #[arg(long, requires = "watch", conflicts_with = "cancel")]
+    persistent: bool,
     /// Prompt delivered when the schedule or event watch fires.
     #[arg(long)]
     prompt: Option<String>,
@@ -1455,14 +1458,17 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 at,
                 every,
                 watch,
+                persistent,
                 prompt,
                 cancel,
                 json,
             } = *schedule_args;
-            schedule_cmd(&data, agent, at, every, watch, prompt, cancel, json, all)
+            schedule_cmd(
+                &data, agent, at, every, watch, persistent, prompt, cancel, json, all,
+            )
         }
         Command::Automations { json } => {
-            schedule_cmd(&data, None, None, None, None, None, None, json, true)
+            schedule_cmd(&data, None, None, None, None, false, None, None, json, true)
         }
         Command::Inspect { agent, limit, json } => inspect_cmd(&data, agent, limit, json),
         Command::Outbound { action, json } => match action.unwrap_or(OutboundCommand::List) {
@@ -1541,6 +1547,7 @@ fn schedule_cmd(
     at: Option<String>,
     every: Option<String>,
     watch: Option<String>,
+    persistent: bool,
     prompt: Option<String>,
     cancel: Option<String>,
     json: bool,
@@ -1574,6 +1581,7 @@ fn schedule_cmd(
         "at": at,
         "every": every,
         "watch": watch,
+        "persistent": persistent,
         "prompt": prompt,
         "id": cancel,
         "agent": target,
@@ -1666,7 +1674,7 @@ fn schedule_cmd(
         "set" => {
             let prompt_text = prompt.unwrap_or_default();
             let health = anyagents_supervisor::HealthBoard::default();
-            let created = schedule::create_agent_schedule(
+            let created = schedule::create_agent_schedule_with_mode(
                 &store,
                 &health,
                 &rec,
@@ -1674,6 +1682,7 @@ fn schedule_cmd(
                 every.as_deref(),
                 watch.as_deref(),
                 &prompt_text,
+                persistent,
             )
             .map_err(anyagents_core::Error::Message)?;
             if json {

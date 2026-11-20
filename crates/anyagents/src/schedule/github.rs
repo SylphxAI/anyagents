@@ -697,6 +697,7 @@ mod tests {
             state: "active".into(),
             created_at_ms: 1_000,
             external_timer_id: None,
+            persistent: false,
         }
     }
 

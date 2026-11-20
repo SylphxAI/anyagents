@@ -757,6 +757,7 @@ mod spawn_args_tests {
                 last_fired_at_ms: None,
                 watch_baseline: None,
                 last_observed: None,
+                persistent: false,
                 state: "active".into(),
                 created_at_ms: 1_794_500_000_000,
             }];
@@ -884,6 +885,7 @@ mod spawn_args_tests {
             last_fired_at_ms: None,
             watch_baseline: None,
             last_observed: None,
+            persistent: false,
             state: "active".into(),
             created_at_ms: 1_794_500_000_000,
         }];
