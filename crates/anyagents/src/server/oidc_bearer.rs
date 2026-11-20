@@ -838,6 +838,7 @@ mod tests {
             auth,
             identity: Arc::new(crate::identity::ServingIdentity::capture()),
             profiles: Default::default(),
+            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         };
         let app = crate::server::build_webhook_router(state);
 
