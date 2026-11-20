@@ -62,6 +62,52 @@ pub(super) struct ScheduleRequest {
     pub(super) agent: Option<String>,
 }
 
+fn can_read_agent_schedules(caller: &Agent, target: &Agent, is_descendant: bool) -> bool {
+    is_descendant || (!caller.is_isolated() && target.scope() == "public")
+}
+
+/// Authorize read-only schedule listing for a single target agent:
+/// `self`, any descendant, or any `scope == "public"` peer (unless caller is `isolated`),
+/// or an Operator principal. Mutations MUST use [`authorize_schedule_target`].
+pub(super) fn authorize_schedule_read_target(
+    store: &Store,
+    principal: &Principal,
+    target_name: Option<&str>,
+) -> Result<Agent, ApiError> {
+    match (
+        principal,
+        target_name.map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        (Principal::Agent { agent_id, .. }, None) => {
+            store.agent(agent_id).map_err(ApiError::from_store)
+        }
+        (Principal::Agent { agent_id, .. }, Some(name)) => {
+            let caller = store.agent(agent_id).map_err(ApiError::from_store)?;
+            let clean = name.strip_prefix("agent:").unwrap_or(name);
+            if clean.eq_ignore_ascii_case("self") {
+                return Ok(caller);
+            }
+            let found = store.agent_by_name(clean).map_err(ApiError::from_store)?;
+            let is_desc = &found.id == agent_id || is_self_or_ancestor(store, agent_id, &found);
+            if can_read_agent_schedules(&caller, &found, is_desc) {
+                return Ok(found);
+            }
+            require_operator_audited(store, principal, "agents.schedule", &found.name)?;
+            Ok(found)
+        }
+        (Principal::Operator, Some(name)) => {
+            let clean = name.strip_prefix("agent:").unwrap_or(name);
+            store.agent_by_name(clean).map_err(ApiError::from_store)
+        }
+        (Principal::Operator, None) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "operator schedule call requires an agent name",
+        )),
+    }
+}
+
+/// Authorize mutating (`create`/`cancel`) schedule authority strictly downward-only
+/// (`self + descendants`) or Operator. Public peers are NEVER mutable by other peers.
 pub(super) fn authorize_schedule_target(
     store: &Store,
     principal: &Principal,
@@ -169,7 +215,13 @@ pub(super) fn list_fleet_schedules(
             let resolved = match (&caller_agent, owner_opt) {
                 (_, None) => None,
                 (None, Some(agent)) => Some(agent.name),
-                (Some(caller), Some(agent)) if is_descendant_in_map(&caller.id, &agent) => {
+                (Some(caller), Some(agent))
+                    if can_read_agent_schedules(
+                        caller,
+                        &agent,
+                        is_descendant_in_map(&caller.id, &agent),
+                    ) =>
+                {
                     Some(agent.name)
                 }
                 (Some(_), Some(_)) => None,
@@ -200,7 +252,7 @@ pub(super) async fn list_schedules_route(
         if is_fleet_schedule_target(Some(&name)) {
             return list_fleet_schedules(&state.store, &principal).map(Json);
         }
-        let target = authorize_schedule_target(&state.store, &principal, Some(&name))?;
+        let target = authorize_schedule_read_target(&state.store, &principal, Some(&name))?;
         let schedules: Vec<crate::api::ScheduleView> = state
             .store
             .list_schedules(Some(&target.id), true)
@@ -315,8 +367,11 @@ pub(super) async fn handle_schedule_action(
                         .collect();
                     return Ok(Json(serde_json::json!({ "schedules": schedules })));
                 }
-                let target =
-                    authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
+                let target = authorize_schedule_read_target(
+                    &state.store,
+                    &principal,
+                    body.agent.as_deref(),
+                )?;
                 let schedules: Vec<crate::api::ScheduleView> = state
                     .store
                     .list_schedules(Some(&target.id), true)
@@ -416,4 +471,194 @@ pub(super) async fn handle_schedule_action(
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use anyagents_core::{NewAgent, NewSchedule};
+    use anyagents_supervisor::HealthBoard;
+
+    use super::*;
+
+    fn test_state(data: &std::path::Path) -> AppState {
+        let store = Arc::new(Store::open(data.join("state.db")).unwrap());
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        AppState {
+            store,
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(crate::server::types::ProcessRunner)),
+            identity: Arc::new(crate::identity::ServingIdentity::capture()),
+            profiles: Default::default(),
+            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
+            auth: crate::auth::Mode::Trusted {
+                data_dir: data.into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn public_peer_schedules_are_read_only_visible_and_private_peer_subagents_remain_hidden()
+    {
+        let dir = crate::test_tempdir();
+        let state = test_state(dir.path());
+        let store = &state.store;
+
+        let alpha = store
+            .create_agent(NewAgent::new("peer-alpha", "codex"))
+            .unwrap();
+        let alpha_task = store
+            .create_agent(NewAgent {
+                parent_id: Some(alpha.id.clone()),
+                ..NewAgent::new("alpha-private-task", "codex")
+            })
+            .unwrap();
+        let beta = store
+            .create_agent(NewAgent::new("peer-beta", "codex"))
+            .unwrap();
+        let beta_private_task = store
+            .create_agent(NewAgent {
+                parent_id: Some(beta.id.clone()),
+                ..NewAgent::new("beta-private-task", "codex")
+            })
+            .unwrap();
+        let beta_public_sub = store
+            .create_agent(NewAgent {
+                parent_id: Some(beta.id.clone()),
+                ..NewAgent::new("beta-public-standing", "codex")
+            })
+            .unwrap();
+        store
+            .set_agent_scope_as(&beta_public_sub.id, "public", "operator")
+            .unwrap();
+        let isolated_caller = store
+            .create_agent(NewAgent::new("isolated-peer", "codex"))
+            .unwrap();
+        store
+            .set_agent_scope_as(&isolated_caller.id, "isolated", "operator")
+            .unwrap();
+        let private_root = store
+            .create_agent(NewAgent::new("private-root", "codex"))
+            .unwrap();
+        store
+            .set_agent_scope_as(&private_root.id, "private", "operator")
+            .unwrap();
+
+        for agent in [
+            &alpha,
+            &alpha_task,
+            &beta,
+            &beta_private_task,
+            &beta_public_sub,
+            &isolated_caller,
+            &private_root,
+        ] {
+            store
+                .create_schedule(NewSchedule {
+                    agent_id: agent.id.clone(),
+                    kind: "watch".into(),
+                    spec: "file:/tmp/peer-schedule-fixture".into(),
+                    prompt: format!("schedule for {}", agent.name),
+                    interval_ms: None,
+                    next_fire_at_ms: None,
+                    watch_baseline: None,
+                })
+                .unwrap();
+        }
+
+        let alpha_principal = Principal::Agent {
+            agent_id: alpha.id.clone(),
+            name: alpha.name.clone(),
+        };
+        let isolated_principal = Principal::Agent {
+            agent_id: isolated_caller.id.clone(),
+            name: isolated_caller.name.clone(),
+        };
+
+        // (a) Peer sees self + own descendants + scope=="public" peers (root and public sub-agent).
+        let list_all: ScheduleRequest =
+            serde_json::from_value(serde_json::json!({"action": "list", "agent": "all"})).unwrap();
+        let resp = handle_schedule_action(alpha_principal.clone(), state.clone(), list_all)
+            .await
+            .unwrap()
+            .0;
+        let visible_owners: std::collections::BTreeSet<String> = resp["schedules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["agent_name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            visible_owners,
+            [
+                "peer-alpha",
+                "alpha-private-task",
+                "peer-beta",
+                "beta-public-standing",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
+
+        // (b) Peer does NOT see another peer's scope=="private" task sub-agent, private root, or isolated peer.
+        assert!(!visible_owners.contains("beta-private-task"));
+        assert!(!visible_owners.contains("private-root"));
+        assert!(!visible_owners.contains("isolated-peer"));
+
+        // An isolated caller sees ONLY self + descendants (never public peers).
+        let isolated_all = list_fleet_schedules(store, &isolated_principal).unwrap();
+        let isolated_owners: Vec<&str> = isolated_all["schedules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["agent_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(isolated_owners, vec!["isolated-peer"]);
+
+        // Single-agent read-only list matches: public peer allowed, private peer sub-agent forbidden.
+        let read_beta = list_schedules_route(
+            alpha_principal.clone(),
+            State(state.clone()),
+            AxumPath("peer-beta".into()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(read_beta["schedules"].as_array().unwrap().len(), 1);
+        let read_private_err = list_schedules_route(
+            alpha_principal.clone(),
+            State(state.clone()),
+            AxumPath("beta-private-task".into()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(read_private_err.status, StatusCode::FORBIDDEN);
+
+        // (c) Peer CANNOT cancel or create/mutate a public peer's schedule (403 Forbidden).
+        for mutation in [
+            serde_json::json!({"action": "cancel", "agent": "peer-beta", "id": "all"}),
+            serde_json::json!({"action": "cancel", "agent": "beta-public-standing", "id": "all"}),
+            serde_json::json!({"action": "every", "agent": "peer-beta", "every": "1h", "prompt": "no"}),
+            serde_json::json!({"action": "at", "agent": "beta-public-standing", "at": "1h", "prompt": "no"}),
+        ] {
+            let req: ScheduleRequest = serde_json::from_value(mutation).unwrap();
+            let err = handle_schedule_action(alpha_principal.clone(), state.clone(), req)
+                .await
+                .unwrap_err();
+            assert_eq!(err.status, StatusCode::FORBIDDEN);
+        }
+        // Public peers' schedules remain untouched in the store.
+        assert_eq!(store.list_schedules(Some(&beta.id), true).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_schedules(Some(&beta_public_sub.id), true)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }

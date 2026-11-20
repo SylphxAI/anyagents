@@ -332,6 +332,13 @@ pub trait RemoteTurnStore: Send + Sync {
         &self,
         fresh_since_ms: i64,
     ) -> Result<HashMap<String, i64>, Error>;
+    fn latest_failed_for_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<super::remote_turns_ext::LatestRemoteTurnError>, Error>;
+    fn list_latest_failed_by_agent(
+        &self,
+    ) -> Result<HashMap<String, super::remote_turns_ext::LatestRemoteTurnError>, Error>;
     fn record_agent_inbox_read_seq(
         &self,
         agent_id: &AgentId,
@@ -863,6 +870,19 @@ impl RemoteTurnStore for PgRemoteTurnStore {
         super::remote_turns_ext::pg_list_active_fresh_by_agent(&self.pool, fresh_since_ms)
     }
 
+    fn latest_failed_for_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<super::remote_turns_ext::LatestRemoteTurnError>, Error> {
+        super::remote_turns_ext::pg_latest_failed_for_agent(&self.pool, agent_id)
+    }
+
+    fn list_latest_failed_by_agent(
+        &self,
+    ) -> Result<HashMap<String, super::remote_turns_ext::LatestRemoteTurnError>, Error> {
+        super::remote_turns_ext::pg_list_latest_failed_by_agent(&self.pool)
+    }
+
     fn record_agent_inbox_read_seq(
         &self,
         agent_id: &AgentId,
@@ -1226,6 +1246,28 @@ impl RemoteTurnStore for FsRemoteTurnStore {
         Ok(super::remote_turns_ext::collect_active_fresh_by_agent(
             all.iter(),
             fresh_since_ms,
+        ))
+    }
+
+    fn latest_failed_for_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<super::remote_turns_ext::LatestRemoteTurnError>, Error> {
+        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let all = self.list_all_unlocked()?;
+        Ok(super::remote_turns_ext::latest_failed_for_agent_from_iter(
+            all.iter(),
+            agent_id,
+        ))
+    }
+
+    fn list_latest_failed_by_agent(
+        &self,
+    ) -> Result<HashMap<String, super::remote_turns_ext::LatestRemoteTurnError>, Error> {
+        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let all = self.list_all_unlocked()?;
+        Ok(super::remote_turns_ext::collect_latest_failed_by_agent(
+            all.iter(),
         ))
     }
 

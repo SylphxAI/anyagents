@@ -35,8 +35,25 @@ pub(crate) const SYS_RECONCILE_PREFIX: &str = "sys:reconcile:";
 const SYS_TIMERS_BLOB_NS: &str = "markers";
 const MIN_LEASE_RENEW_LEAD_MS: i64 = 5_000;
 const OVERDUE_SCHEDULE_CATCHUP_DELAY_MS: i64 = 1_000;
-const RECONCILE_RETRY_DELAY_MS: i64 = 15_000;
+/// Bounded exponential backoff delays for transient serverless cold-wake / dispatch retries:
+/// `15s -> 30s -> 60s` (3 attempts max, never an infinite hot loop).
+pub(crate) const DISPATCH_RETRY_BACKOFF_MS: &[i64] = &[15_000, 30_000, 60_000];
+const DISPATCH_RETRY_BLOB_PATH: &str = "sys_timers/dispatch_retry";
 const STARTUP_ACTIVE_TURN_LIMIT: usize = 64;
+
+/// Durable per-agent transient dispatch retry & error state stored in `agent_files`
+/// (`namespace = "markers"`, `path = "sys_timers/dispatch_retry"`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DispatchRetryState {
+    pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_seq: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub last_error_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_at_ms: Option<i64>,
+}
 
 pub(crate) fn is_system_timer_id(id: &str) -> bool {
     id.trim().starts_with("sys:")
@@ -239,17 +256,130 @@ pub(crate) fn cancel_lease_renew_timer(
     cancel_system_timer(store, backend, agent_id, &lease_renew_timer_id(agent_id));
 }
 
-pub(crate) fn arm_reconcile_timer(
+/// Read persisted transient dispatch retry & error state for `agent_id`.
+pub(crate) fn read_dispatch_retry_state(
+    store: &Store,
+    agent_id: &AgentId,
+) -> Option<DispatchRetryState> {
+    store
+        .blob_store()
+        .get_agent_file(agent_id, SYS_TIMERS_BLOB_NS, DISPATCH_RETRY_BLOB_PATH)
+        .ok()
+        .flatten()
+        .and_then(|entry| serde_json::from_slice::<DispatchRetryState>(&entry.content).ok())
+}
+
+fn write_dispatch_retry_state(store: &Store, agent_id: &AgentId, state: &DispatchRetryState) {
+    if let Ok(bytes) = serde_json::to_vec(state) {
+        let _ = store.blob_store().put_agent_file(
+            agent_id,
+            SYS_TIMERS_BLOB_NS,
+            DISPATCH_RETRY_BLOB_PATH,
+            &bytes,
+            false,
+        );
+    }
+}
+
+/// Clear transient dispatch retry state and cancel any armed `sys:reconcile:<agent_id>` timer
+/// (no-op on `backend` when no retry state or reconcile timer exists).
+pub(crate) fn clear_dispatch_retry_state(
+    store: &Store,
+    backend: Option<&dyn TimerBackend>,
+    agent_id: &AgentId,
+) {
+    let had_state = read_dispatch_retry_state(store, agent_id).is_some();
+    if had_state {
+        let _ = store.blob_store().delete_agent_file(
+            agent_id,
+            SYS_TIMERS_BLOB_NS,
+            DISPATCH_RETRY_BLOB_PATH,
+        );
+    }
+    let tid = reconcile_timer_id(agent_id);
+    let timer_blob = sys_timer_blob_path(&tid);
+    let had_timer = store
+        .blob_store()
+        .get_agent_file(agent_id, SYS_TIMERS_BLOB_NS, &timer_blob)
+        .ok()
+        .flatten()
+        .is_some();
+    if had_state || had_timer {
+        if let Some(tb) = backend {
+            cancel_system_timer(store, tb, agent_id, &tid);
+        } else {
+            clear_system_timer_blob(store, agent_id, &tid);
+        }
+    }
+}
+
+/// Record a transient serverless dispatch failure so `AgentView.last_error` surfaces it
+/// visibly and arm a bounded idempotent backoff retry timer (`15s -> 30s -> 60s`, capped
+/// at [`DISPATCH_RETRY_BACKOFF_MS.len()`] retries) when the agent still has undelivered
+/// mailbox messages and no active remote turn.
+pub(crate) fn record_dispatch_failure_and_arm_retry(
     store: &Store,
     backend: &dyn TimerBackend,
     agent_id: &AgentId,
-    delay_ms: i64,
-) {
-    let fire_at = now_ms().saturating_add(delay_ms.max(1_000));
-    let tid = reconcile_timer_id(agent_id);
-    if let Err(err) = arm_system_timer(store, backend, agent_id, &tid, fire_at) {
-        eprintln!("anyagents-timer: failed to arm {tid}: {err}");
+    error: &str,
+) -> DispatchRetryState {
+    let Ok(agent) = store.agent(agent_id) else {
+        clear_dispatch_retry_state(store, Some(backend), agent_id);
+        return DispatchRetryState::default();
+    };
+    if matches!(agent.state.as_str(), "paused" | "archived") {
+        clear_dispatch_retry_state(store, Some(backend), agent_id);
+        return DispatchRetryState::default();
     }
+    let has_active_turn = store
+        .remote_turn_store()
+        .list_active_for_agent(agent_id)
+        .map(|turns| !turns.is_empty())
+        .unwrap_or(false);
+    if has_active_turn {
+        return read_dispatch_retry_state(store, agent_id).unwrap_or_default();
+    }
+
+    let now = now_ms();
+    let masked = super::secrets::mask_text_for_agent(store, agent_id, error);
+    let trimmed_err = masked.trim().to_string();
+    let target_seq = store
+        .list_undelivered(agent_id, 20)
+        .ok()
+        .and_then(|msgs| msgs.last().map(|m| m.seq));
+    let prev = read_dispatch_retry_state(store, agent_id);
+    let prev_attempts = match &prev {
+        Some(st) if st.target_seq == target_seq => st.attempts,
+        _ => 0,
+    };
+
+    let terminal_bootstrap = super::serverless_failure::is_terminal_bootstrap_failure(&trimmed_err);
+    let can_retry = target_seq.is_some()
+        && !terminal_bootstrap
+        && (prev_attempts as usize) < DISPATCH_RETRY_BACKOFF_MS.len();
+
+    let (attempts, next_retry_at_ms) = if can_retry {
+        let delay_ms = DISPATCH_RETRY_BACKOFF_MS[prev_attempts as usize];
+        let fire_at = now.saturating_add(delay_ms);
+        let tid = reconcile_timer_id(agent_id);
+        if let Err(arm_err) = arm_system_timer(store, backend, agent_id, &tid, fire_at) {
+            eprintln!("anyagents-timer: failed to arm {tid}: {arm_err}");
+        }
+        (prev_attempts + 1, Some(fire_at))
+    } else {
+        clear_system_timer_blob(store, agent_id, &reconcile_timer_id(agent_id));
+        (prev_attempts, None)
+    };
+
+    let state = DispatchRetryState {
+        attempts,
+        target_seq,
+        last_error: (!trimmed_err.is_empty()).then_some(trimmed_err),
+        last_error_at_ms: now,
+        next_retry_at_ms,
+    };
+    write_dispatch_retry_state(store, agent_id, &state);
+    state
 }
 
 /// Cancel turn-scoped timers upon settlement, and cancel the agent's lease-renewal
@@ -299,6 +429,11 @@ pub(crate) fn cancel_all_agent_system_timers(
     }
     cancel_lease_renew_timer(store, backend, agent_id);
     cancel_system_timer(store, backend, agent_id, &reconcile_timer_id(agent_id));
+    let _ = store.blob_store().delete_agent_file(
+        agent_id,
+        SYS_TIMERS_BLOB_NS,
+        DISPATCH_RETRY_BLOB_PATH,
+    );
 }
 
 // ============================================================================
@@ -705,38 +840,23 @@ async fn handle_lease_renew_fire(
 // ============================================================================
 
 /// Pump queued mailbox messages for `agent_id` after turn settlement.
-/// If dispatch hits a transient error while undelivered mail remains, arms a bounded
-/// `sys:reconcile:<agent_id>` delayed retry on `TimerBackend`.
+/// Bounded retry arming & error recording are handled inside
+/// [`dispatch_next_mailbox_message_with_timer`].
 pub(crate) async fn pump_agent_backlog_after_settlement(
     store: Arc<Store>,
     timer_backend: Arc<dyn TimerBackend>,
     agent_id: &AgentId,
 ) {
-    match dispatch_next_mailbox_message_with_timer(
+    if let Err(err) = dispatch_next_mailbox_message_with_timer(
         Arc::clone(&store),
         agent_id,
         Some(Arc::clone(&timer_backend)),
     )
     .await
     {
-        Ok(_) => {}
-        Err(err) => {
-            eprintln!(
-                "anyagents-serverless: post-settlement backlog pump deferred for {agent_id}: {err}"
-            );
-            let aid = agent_id.clone();
-            let store_b = Arc::clone(&store);
-            let tb_b = Arc::clone(&timer_backend);
-            let _ = tokio::task::spawn_blocking(move || {
-                if store_b
-                    .list_undelivered(&aid, 1)
-                    .is_ok_and(|msgs| !msgs.is_empty())
-                {
-                    arm_reconcile_timer(&store_b, tb_b.as_ref(), &aid, RECONCILE_RETRY_DELAY_MS);
-                }
-            })
-            .await;
-        }
+        eprintln!(
+            "anyagents-serverless: post-settlement backlog pump deferred for {agent_id}: {err}"
+        );
     }
 }
 
@@ -756,26 +876,40 @@ async fn handle_reconcile_fire(
         });
     };
     let store_rec = Arc::clone(&store);
+    let tb_rec = Arc::clone(&timer_backend);
     let aid_rec = aid.clone();
     let timer_id_clr = timer_id.to_string();
-    let has_undelivered = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-        clear_system_timer_blob(&store_rec, &aid_rec, &timer_id_clr);
-        let _ = store_rec.reconcile_stale_open_turn(&aid_rec);
-        let msgs = store_rec
-            .list_undelivered(&aid_rec, 1)
-            .map_err(|e| format!("list undelivered for {aid_rec}: {e}"))?;
-        Ok(!msgs.is_empty())
-    })
-    .await
-    .map_err(|e| format!("reconcile join error: {e}"))??;
+    let skip_reason =
+        tokio::task::spawn_blocking(move || -> Result<Option<&'static str>, String> {
+            clear_system_timer_blob(&store_rec, &aid_rec, &timer_id_clr);
+            let Ok(agent) = store_rec.agent(&aid_rec) else {
+                clear_dispatch_retry_state(&store_rec, Some(tb_rec.as_ref()), &aid_rec);
+                return Ok(Some("agent_not_found"));
+            };
+            if matches!(agent.state.as_str(), "paused" | "archived") {
+                clear_dispatch_retry_state(&store_rec, Some(tb_rec.as_ref()), &aid_rec);
+                return Ok(Some("agent_paused_or_archived"));
+            }
+            let _ = store_rec.reconcile_stale_open_turn(&aid_rec);
+            let msgs = store_rec
+                .list_undelivered(&aid_rec, 1)
+                .map_err(|e| format!("list undelivered for {aid_rec}: {e}"))?;
+            if msgs.is_empty() {
+                clear_dispatch_retry_state(&store_rec, Some(tb_rec.as_ref()), &aid_rec);
+                return Ok(Some("no_undelivered_mail"));
+            }
+            Ok(None)
+        })
+        .await
+        .map_err(|e| format!("reconcile join error: {e}"))??;
 
-    if !has_undelivered {
+    if let Some(reason) = skip_reason {
         return Ok(FireResult {
             fired: false,
             schedule_id: timer_id.to_string(),
             agent_id: Some(aid.as_str().to_string()),
             next_run_ms: None,
-            reason: Some("no_undelivered_mail".to_string()),
+            reason: Some(reason.to_string()),
         });
     }
 
@@ -802,25 +936,25 @@ async fn handle_reconcile_fire(
         }),
         Err(err) => {
             eprintln!("anyagents-serverless: reconcile dispatch deferred for {aid}: {err}");
-            let store_arm = Arc::clone(&store);
-            let tb_arm = Arc::clone(&timer_backend);
-            let aid_arm = aid.clone();
-            let next_at = now_ms().saturating_add(RECONCILE_RETRY_DELAY_MS);
-            let _ = tokio::task::spawn_blocking(move || {
-                arm_reconcile_timer(
-                    &store_arm,
-                    tb_arm.as_ref(),
-                    &aid_arm,
-                    RECONCILE_RETRY_DELAY_MS,
-                );
+            let store_read = Arc::clone(&store);
+            let aid_read = aid.clone();
+            let next_at = tokio::task::spawn_blocking(move || {
+                read_dispatch_retry_state(&store_read, &aid_read).and_then(|s| s.next_retry_at_ms)
             })
-            .await;
+            .await
+            .ok()
+            .flatten();
+            let reason = if next_at.is_some() {
+                "dispatch_retry_armed"
+            } else {
+                "dispatch_retry_exhausted"
+            };
             Ok(FireResult {
                 fired: false,
                 schedule_id: timer_id.to_string(),
                 agent_id: Some(aid.as_str().to_string()),
-                next_run_ms: Some(next_at),
-                reason: Some("dispatch_retry_armed".to_string()),
+                next_run_ms: next_at,
+                reason: Some(reason.to_string()),
             })
         }
     }
@@ -1182,18 +1316,6 @@ pub(crate) async fn startup_reconcile_serverless(
                 eprintln!(
                     "anyagents-serverless: startup backlog dispatch deferred for {aid}: {err}"
                 );
-                let store_arm = Arc::clone(&store);
-                let tb_arm = Arc::clone(&timer_backend);
-                let aid_arm = aid.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    arm_reconcile_timer(
-                        &store_arm,
-                        tb_arm.as_ref(),
-                        &aid_arm,
-                        RECONCILE_RETRY_DELAY_MS,
-                    );
-                })
-                .await;
             }
         }
     }
@@ -2146,5 +2268,342 @@ mod tests {
             "overdue recurring catch-up failed: {fired_every:?}"
         );
         assert!(fired_every.next_run_ms.unwrap() > overdue_every_armed);
+    }
+
+    /// Regression test: when initial serverless cold-wake dispatch fails transiently on a queued
+    /// message, the failure is surfaced in `AgentView.last_error`, bounded backoff retries
+    /// (`15s -> 30s -> 60s`, capped at 3 attempts) are armed on `TimerBackend` (never an infinite
+    /// hot loop), and once the provider recovers firing `sys:reconcile:<agent_id>` drains the
+    /// undelivered queue and clears `last_error` + `retry_at_ms`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn cold_wake_transient_dispatch_failure_arms_bounded_backoff_and_recovers_queue() {
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(&[
+            "ANYAGENTS_SERVERLESS",
+            "ANYAGENTS_TIMER_TOKEN",
+            "ANYAGENTS_CLOUD_HTTP_URL",
+            "ANYAGENTS_CLOUD_HTTP_TOKEN",
+            "ANYAGENTS_PUBLIC_URL",
+        ]);
+
+        let submit_attempts = Arc::new(AtomicUsize::new(0));
+        let fail_limit = Arc::new(AtomicUsize::new(4));
+        let submit_attempts_srv = Arc::clone(&submit_attempts);
+        let fail_limit_srv = Arc::clone(&fail_limit);
+        let mock_cloud = Router::new().route(
+            "/turns",
+            post(move || {
+                let n = submit_attempts_srv.fetch_add(1, Ordering::SeqCst);
+                let limit = fail_limit_srv.load(Ordering::SeqCst);
+                async move {
+                    if n < limit {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({ "error": "transient capacity contention 503" })),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "run_id": format!("recovered_run_{n}"),
+                                "status": "running",
+                                "next_poll_after_ms": 5000
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cloud_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_cloud).await;
+        });
+
+        unsafe {
+            std::env::set_var("ANYAGENTS_SERVERLESS", "true");
+            std::env::set_var("ANYAGENTS_TIMER_TOKEN", "cold-wake-retry-secret");
+            std::env::set_var("ANYAGENTS_CLOUD_HTTP_URL", format!("http://{cloud_addr}"));
+            std::env::set_var("ANYAGENTS_CLOUD_HTTP_TOKEN", "cloud-tok-retry");
+            std::env::set_var("ANYAGENTS_PUBLIC_URL", "https://coord.example.test");
+        }
+
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let health = HealthBoard::default();
+        let agent = store
+            .create_agent(NewAgent::new("cold-wake-worker", "http-cloud"))
+            .unwrap();
+        store.set_agent_running(&agent.id, "/work").unwrap();
+        let agent = store.agent(&agent.id).unwrap();
+
+        // Enqueue initial prompt (`seq = 1`).
+        store
+            .receive(&agent.id, Incoming::new("initial spawn prompt"))
+            .unwrap();
+
+        let recorder = Arc::new(MockTimerRecorder::default());
+        let app = crate::server::build_public_router(make_state(
+            Arc::clone(&store),
+            dir.path(),
+            Arc::clone(&recorder) as Arc<dyn TimerBackend>,
+        ));
+        let rec_tid = reconcile_timer_id(&agent.id);
+
+        // Attempt 1 (initial cold-wake dispatch): fails transiently -> surfaces error & arms 15s retry.
+        let t0 = now_ms();
+        let err1 = dispatch_next_mailbox_message_with_timer(
+            Arc::clone(&store),
+            &agent.id,
+            Some(Arc::clone(&recorder) as Arc<dyn TimerBackend>),
+        )
+        .await
+        .unwrap_err();
+        assert!(err1.contains("503"), "unexpected err1: {err1}");
+
+        let view1 = crate::server::agents_roster::agent_view(&store, &health, &agent).unwrap();
+        assert!(
+            view1
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("503")),
+            "expected transient dispatch error surfaced in AgentView.last_error, got {:?}",
+            view1.last_error
+        );
+        assert_eq!(view1.turn_state, "errored");
+        assert!(view1.retry_at_ms.is_some_and(|ms| ms >= t0 + 14_000));
+        assert!(view1.oldest_undelivered_age_ms.is_some());
+
+        let armed_1 = recorder.scheduled.lock().unwrap().clone();
+        assert_eq!(armed_1.len(), 1);
+        assert_eq!(armed_1[0].0, rec_tid);
+        assert!(armed_1[0].1 >= t0 + DISPATCH_RETRY_BACKOFF_MS[0] - 1_000);
+
+        // Attempt 2 (reconcile timer fire): still failing -> backs off to 30s.
+        let t1 = now_ms();
+        let fire2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/internal/fire/{rec_tid}"))
+                    .header("authorization", "Bearer cold-wake-retry-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fire2.status(), StatusCode::OK);
+        let j2: Value =
+            serde_json::from_slice(&fire2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(j2["fired"], false);
+        assert_eq!(j2["reason"], "dispatch_retry_armed");
+        assert!(j2["next_run_ms"].as_i64().unwrap() >= t1 + DISPATCH_RETRY_BACKOFF_MS[1] - 1_000);
+
+        // Attempt 3 (reconcile timer fire): still failing -> backs off to 60s.
+        let t2 = now_ms();
+        let fire3 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/internal/fire/{rec_tid}"))
+                    .header("authorization", "Bearer cold-wake-retry-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let j3: Value =
+            serde_json::from_slice(&fire3.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(j3["reason"], "dispatch_retry_armed");
+        assert!(j3["next_run_ms"].as_i64().unwrap() >= t2 + DISPATCH_RETRY_BACKOFF_MS[2] - 1_000);
+        assert_eq!(recorder.scheduled.lock().unwrap().len(), 3);
+
+        // Attempt 4 (final retry fires while still failing): cap reached -> NO further timer armed!
+        let fire4 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/internal/fire/{rec_tid}"))
+                    .header("authorization", "Bearer cold-wake-retry-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let j4: Value =
+            serde_json::from_slice(&fire4.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(j4["fired"], false);
+        assert_eq!(j4["reason"], "dispatch_retry_exhausted");
+        assert!(j4.get("next_run_ms").is_none());
+        assert_eq!(recorder.scheduled.lock().unwrap().len(), 3);
+
+        // Now provider recovers (4 failures reached); firing reconcile/wake drains queue and clears error!
+        let fire5 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/internal/fire/{rec_tid}"))
+                    .header("authorization", "Bearer cold-wake-retry-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let j5: Value =
+            serde_json::from_slice(&fire5.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(j5["fired"], true);
+        assert!(store.list_undelivered(&agent.id, 10).unwrap().is_empty());
+        assert!(read_dispatch_retry_state(&store, &agent.id).is_none());
+
+        let recovered = crate::server::agents_roster::agent_view(&store, &health, &agent).unwrap();
+        assert_eq!(recovered.process, "up");
+        assert_eq!(recovered.turn_state, "in_turn");
+        assert_eq!(recovered.last_error, None);
+        assert_eq!(recovered.retry_at_ms, None);
+    }
+
+    /// Regression test: spawning an agent with an initial prompt via `create_agent_route` in
+    /// serverless mode commits `seq=1` strictly before dispatching, surfaces transient dispatch
+    /// failures in `AgentView.last_error` + `retry_at_ms`, arms `sys:reconcile:<agent_id>`,
+    /// and recovers cleanly once the provider comes back up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn spawn_agent_route_serverless_cold_wake_commits_prompt_and_arms_retry_on_failure() {
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(&[
+            "ANYAGENTS_SERVERLESS",
+            "ANYAGENTS_TIMER_TOKEN",
+            "ANYAGENTS_CLOUD_HTTP_URL",
+            "ANYAGENTS_CLOUD_HTTP_TOKEN",
+            "ANYAGENTS_PUBLIC_URL",
+            "ANYAGENTS_SANDBOX_MODE",
+        ]);
+
+        let submit_hits = Arc::new(AtomicUsize::new(0));
+        let submit_hits_srv = Arc::clone(&submit_hits);
+        let mock_cloud = Router::new().route(
+            "/turns",
+            post(move || {
+                let n = submit_hits_srv.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({ "error": "initial spawn lease 503" })),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "run_id": "spawn_recovered_run",
+                                "status": "running",
+                                "next_poll_after_ms": 5000
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cloud_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_cloud).await;
+        });
+
+        unsafe {
+            std::env::set_var("ANYAGENTS_SERVERLESS", "true");
+            std::env::set_var("ANYAGENTS_TIMER_TOKEN", "spawn-cold-wake-secret");
+            std::env::set_var("ANYAGENTS_CLOUD_HTTP_URL", format!("http://{cloud_addr}"));
+            std::env::set_var("ANYAGENTS_CLOUD_HTTP_TOKEN", "cloud-tok-spawn");
+            std::env::set_var("ANYAGENTS_PUBLIC_URL", "https://coord.example.test");
+            std::env::remove_var("ANYAGENTS_SANDBOX_MODE");
+        }
+
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        let recorder = Arc::new(MockTimerRecorder::default());
+        let state = make_state(
+            Arc::clone(&store),
+            dir.path(),
+            Arc::clone(&recorder) as Arc<dyn TimerBackend>,
+        );
+        let body: crate::api::CreateAgentRequest = serde_json::from_value(json!({
+            "name": "spawn-cold-worker",
+            "harness": "claude-cloud",
+            "runtime": "cloud",
+            "prompt": "execute initial task"
+        }))
+        .unwrap();
+
+        let (status, Json(created_view)) = crate::server::agents::create_agent_route(
+            crate::auth::Principal::Operator,
+            axum::extract::State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        let aid = AgentId::parse(&created_view.id).unwrap();
+        // Initial prompt (`seq=1`) is already committed synchronously before `201 Created`.
+        let undelivered = store.list_undelivered(&aid, 10).unwrap();
+        assert_eq!(undelivered.len(), 1);
+        assert_eq!(undelivered[0].seq, 1);
+
+        // Wait briefly for the spawned initial dispatch task to hit the transient 503 and arm retry.
+        let rec_tid = reconcile_timer_id(&aid);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !recorder.scheduled_ids().contains(&rec_tid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for spawn cold-wake retry timer; scheduled={:?}",
+                recorder.scheduled_ids()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let agent = store.agent(&aid).unwrap();
+        let failed_view =
+            crate::server::agents_roster::agent_view(&store, &state.health, &agent).unwrap();
+        assert!(
+            failed_view
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("503")),
+            "expected spawn dispatch error in AgentView.last_error, got {:?}",
+            failed_view.last_error
+        );
+        assert!(failed_view.retry_at_ms.is_some());
+
+        // Firing the armed reconcile timer recovers and drains `seq=1`.
+        let app = crate::server::build_public_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/internal/fire/{rec_tid}"))
+                    .header("authorization", "Bearer spawn-cold-wake-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_json: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body_json["fired"], true);
+        assert!(store.list_undelivered(&aid, 10).unwrap().is_empty());
+        let ok_view =
+            crate::server::agents_roster::agent_view(&store, &state.health, &agent).unwrap();
+        assert_eq!(ok_view.process, "up");
+        assert_eq!(ok_view.turn_state, "in_turn");
+        assert_eq!(ok_view.last_error, None);
     }
 }

@@ -876,6 +876,11 @@ pub(super) async fn pause_agent_route(
             .store
             .set_agent_state(&found.id, "paused")
             .map_err(ApiError::from_store)?;
+        super::serverless_maintenance::clear_dispatch_retry_state(
+            &state.store,
+            Some(state.timer_backend.as_ref()),
+            &found.id,
+        );
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &found.id);
         if let Err(err) =
             crate::sandbox_exec::release_sandbox_for_agent(&state.store, &found.id, &cfg)
@@ -1208,6 +1213,11 @@ pub(super) async fn wake_agent_route(
             }
 
             if found.state == "running" {
+                super::serverless_maintenance::clear_dispatch_retry_state(
+                    &state.store,
+                    Some(state.timer_backend.as_ref()),
+                    &found.id,
+                );
                 create::poke_agent_wake_socket(state.store.data_dir(), &found.id);
                 return Ok((
                     Json(agent_view(&state.store, &state.health, &found)?),
@@ -1215,6 +1225,11 @@ pub(super) async fn wake_agent_route(
                 ));
             }
 
+            super::serverless_maintenance::clear_dispatch_retry_state(
+                &state.store,
+                Some(state.timer_backend.as_ref()),
+                &found.id,
+            );
             prepare_agent_wake_with_options(
                 &state.store,
                 &found,

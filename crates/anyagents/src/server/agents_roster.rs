@@ -523,17 +523,31 @@ pub(super) fn persisted_fault(
     rotated_ms: i64,
     now: i64,
 ) -> (Option<i64>, Option<String>) {
+    let (quota, error_with_ts) = persisted_fault_with_ts(harness, markers, rotated_ms, now);
+    (quota, error_with_ts.map(|(err, _)| err))
+}
+
+fn fault_floor_ms(harness: &str, markers: &Markers<'_>, rotated_ms: i64) -> i64 {
+    if harness == "agy" {
+        rotated_ms.max(markers.ms(QUOTA_CLEARED))
+    } else {
+        rotated_ms
+    }
+}
+
+fn persisted_fault_with_ts(
+    harness: &str,
+    markers: &Markers<'_>,
+    rotated_ms: i64,
+    now: i64,
+) -> (Option<i64>, Option<(String, i64)>) {
     let Some(record) = markers
         .read(LAST_ERROR)
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
     else {
         return (None, None);
     };
-    let floor = if harness == "agy" {
-        rotated_ms.max(markers.ms(QUOTA_CLEARED))
-    } else {
-        rotated_ms
-    };
+    let floor = fault_floor_ms(harness, markers, rotated_ms);
     let recorded_at = record
         .get("timestamp_ms")
         .and_then(serde_json::Value::as_i64)
@@ -544,7 +558,7 @@ pub(super) fn persisted_fault(
     let error = record
         .get("error")
         .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
+        .map(|s| (s.to_string(), recorded_at));
     if harness == "claude-code" {
         return (None, error);
     }
@@ -552,6 +566,24 @@ pub(super) fn persisted_fault(
         Some(reset_ms) if reset_ms > now => (Some(reset_ms), error),
         Some(_) => (None, None),
         None => (None, error),
+    }
+}
+
+fn pick_fresher_error(
+    local: Option<(String, i64)>,
+    remote: Option<(String, i64)>,
+) -> (Option<String>, bool) {
+    match (local, remote) {
+        (None, None) => (None, false),
+        (Some((err, _)), None) => (Some(err), false),
+        (None, Some((err, _))) => (Some(err), true),
+        (Some((local_err, local_ts)), Some((remote_err, remote_ts))) => {
+            if remote_ts > local_ts {
+                (Some(remote_err), true)
+            } else {
+                (Some(local_err), false)
+            }
+        }
     }
 }
 
@@ -698,10 +730,55 @@ fn agent_view_preloaded(
     let markers = Markers { files, cfg: &cfg };
     let rotated_ms = markers.ms(PROFILE_ROTATED);
     let instructions_rotated_ms = markers.ms(INSTRUCTIONS_ROTATED);
+    let error_floor_ms = fault_floor_ms(&agent.harness, &markers, rotated_ms);
     // The supervisor's board is the live state; a fault outlives its process
     // only as the record an adapter persisted. A view never reads a vendor
     // transcript, log or session store.
-    let (session_quota, session_error) = persisted_fault(&agent.harness, &markers, rotated_ms, now);
+    let (session_quota, session_error_ts) =
+        persisted_fault_with_ts(&agent.harness, &markers, rotated_ms, now);
+    let remote_turn_error = if active_remote_started_ms.is_some() {
+        None
+    } else if let Some(metadata) = metadata.as_ref() {
+        metadata
+            .latest_remote_turn_errors
+            .get(agent.id.as_str())
+            .cloned()
+    } else {
+        store
+            .remote_turn_store()
+            .latest_failed_for_agent(&agent.id)
+            .ok()
+            .flatten()
+    }
+    .filter(|err| err.settled_at_ms > error_floor_ms);
+    let dispatch_retry = if active_remote_started_ms.is_none()
+        && (metadata.is_none() || lag.oldest_undelivered_age_ms.is_some())
+    {
+        super::serverless_maintenance::read_dispatch_retry_state(store, &agent.id)
+    } else {
+        None
+    };
+    let dispatch_retry_error = dispatch_retry.as_ref().and_then(|st| {
+        if st.last_error_at_ms <= error_floor_ms {
+            return None;
+        }
+        st.last_error
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|err| (err.to_string(), st.last_error_at_ms))
+    });
+    let remote_error = match (
+        remote_turn_error.map(|e| (e.error_text, e.settled_at_ms)),
+        dispatch_retry_error,
+    ) {
+        (Some(a), Some(b)) => Some(if b.1 > a.1 { b } else { a }),
+        (a, b) => a.or(b),
+    };
+    let dispatch_retry_at_ms = dispatch_retry
+        .as_ref()
+        .and_then(|st| st.next_retry_at_ms)
+        .filter(|&ms| ms > now && lag.oldest_undelivered_age_ms.is_some());
     let (
         process,
         mut turn_state,
@@ -713,19 +790,23 @@ fn agent_view_preloaded(
         pending_switch,
         last_error,
         retry_at_ms,
+        error_from_remote,
     ) = match health.get(&agent.id) {
         Some(live) => {
             // The supervisor retries a transient capacity fault by itself and
             // publishes the work as in progress: neither the fault nor the
             // record its adapter persisted for it is an error of the agent's.
             let retry_at_ms = live.retry_at_ms.filter(|_| live.process_alive);
-            let (session_quota, session_error) = if retry_at_ms.is_some() {
-                (None, None)
+            let (session_quota, session_error_ts, remote_error) = if retry_at_ms.is_some() {
+                (None, None, None)
             } else {
-                (session_quota, session_error)
+                (session_quota, session_error_ts, remote_error)
             };
             let effective_quota = live.quota_reset_at_ms.or(session_quota);
-            let effective_err = live.last_error.clone().or(session_error);
+            let (effective_err, from_remote) = match live.last_error.clone() {
+                Some(err) => (Some(err), false),
+                None => pick_fresher_error(session_error_ts, remote_error),
+            };
             let working = live.process_alive
                 && effective_quota.is_none()
                 && effective_err.is_none()
@@ -760,6 +841,7 @@ fn agent_view_preloaded(
                 switch_pending,
                 effective_err,
                 retry_at_ms,
+                from_remote,
             )
         }
         None => {
@@ -773,8 +855,9 @@ fn agent_view_preloaded(
                     agent.model.clone(),
                     Some(started_ms),
                     false,
-                    session_error,
+                    session_error_ts.map(|(err, _)| err),
                     None,
+                    false,
                 )
             } else {
                 let lock_busy = if store.is_postgres() {
@@ -788,6 +871,8 @@ fn agent_view_preloaded(
                 };
                 let proc_str = if lock_busy { "alive" } else { "down" };
                 let turn_str = if lock_busy { "working" } else { "idle" };
+                let (effective_err, from_remote) =
+                    pick_fresher_error(session_error_ts, remote_error);
                 (
                     proc_str,
                     turn_str,
@@ -805,8 +890,9 @@ fn agent_view_preloaded(
                     },
                     None,
                     false,
-                    session_error,
-                    None,
+                    effective_err,
+                    dispatch_retry_at_ms,
+                    from_remote,
                 )
             }
         }
@@ -825,7 +911,7 @@ fn agent_view_preloaded(
             } else {
                 "errored"
             };
-            if markers.parent_notice_due(agent, rotated_ms, err_msg) {
+            if !error_from_remote && markers.parent_notice_due(agent, rotated_ms, err_msg) {
                 create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
             }
         } else if markers.read(NOTIFIED_PARENT).is_some() {
@@ -1261,5 +1347,180 @@ mod tests {
         .unwrap();
         assert_eq!(listed.agents.len(), 1);
         assert_eq!(listed.agents[0].aliases, vec!["arch-alias".to_string()]);
+    }
+
+    #[test]
+    fn agent_view_surfaces_failed_remote_turn_error_and_clears_on_completed_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let parent = store
+            .create_agent(NewAgent::new("remote-parent", "codex"))
+            .unwrap();
+        store.set_agent_running(&parent.id, "/work").unwrap();
+        let worker = store
+            .create_agent(NewAgent {
+                parent_id: Some(parent.id.clone()),
+                ..NewAgent::new("remote-err-worker", "codex")
+            })
+            .unwrap();
+        store.set_agent_running(&worker.id, "/work").unwrap();
+        let worker = store.agent(&worker.id).unwrap();
+
+        let t1 = store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "trn_err_1".into(),
+                agent_id: worker.id.clone(),
+                harness_kind: "sandbox".into(),
+                provider_kind: Some("http".into()),
+                remote_run_id: Some("pid:1".into()),
+                callback_token_hash: hash_callback_token("tok-err-1"),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: None,
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+        store
+            .remote_turn_store()
+            .settle_turn(
+                "trn_err_1",
+                &SettleRemoteTurn {
+                    status: "failed".into(),
+                    result_text: None,
+                    error_text: Some("sandbox lease Pending Unschedulable".into()),
+                    usage_json: None,
+                    cursor: None,
+                    settled_at_ms: t1.created_at_ms + 100,
+                },
+            )
+            .unwrap();
+
+        // Single-agent inspect and bulk roster both surface the failed remote turn's error_text
+        // without injecting duplicate parent error notices on read.
+        let single = agent_view(&store, &health, &worker).unwrap();
+        assert_eq!(
+            single.last_error.as_deref(),
+            Some("sandbox lease Pending Unschedulable")
+        );
+        assert_eq!(single.turn_state, "errored");
+        assert_eq!(single.block_reason.as_deref(), Some("delivery_error"));
+        assert!(store.list_undelivered(&parent.id, 10).unwrap().is_empty());
+
+        let listed =
+            roster_views(&store, &health, &[&worker], 0, &ListAgentsQuery::default()).unwrap();
+        assert_eq!(
+            listed.agents[0].last_error.as_deref(),
+            Some("sandbox lease Pending Unschedulable")
+        );
+        assert_eq!(listed.agents[0].turn_state, "errored");
+
+        // While a newer remote turn is actively running, the view projects live in-turn status.
+        store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "trn_ok_2".into(),
+                agent_id: worker.id.clone(),
+                harness_kind: "sandbox".into(),
+                provider_kind: Some("http".into()),
+                remote_run_id: Some("pid:2".into()),
+                callback_token_hash: hash_callback_token("tok-ok-2"),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: None,
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+        let active_view = agent_view(&store, &health, &worker).unwrap();
+        assert_eq!(active_view.process, "up");
+        assert_eq!(active_view.turn_state, "in_turn");
+        assert_eq!(active_view.last_error, None);
+
+        // Settling the newer turn as completed clears AgentView.last_error in both paths.
+        store
+            .remote_turn_store()
+            .settle_turn(
+                "trn_ok_2",
+                &SettleRemoteTurn {
+                    status: "completed".into(),
+                    result_text: Some("done".into()),
+                    error_text: None,
+                    usage_json: None,
+                    cursor: None,
+                    settled_at_ms: t1.created_at_ms + 300,
+                },
+            )
+            .unwrap();
+        let recovered = agent_view(&store, &health, &worker).unwrap();
+        assert_eq!(recovered.last_error, None);
+        assert_eq!(recovered.turn_state, "idle");
+        assert_eq!(recovered.block_reason, None);
+
+        let listed_after =
+            roster_views(&store, &health, &[&worker], 0, &ListAgentsQuery::default()).unwrap();
+        assert_eq!(listed_after.agents[0].last_error, None);
+        assert_eq!(listed_after.agents[0].turn_state, "idle");
+    }
+
+    #[test]
+    fn newer_failed_remote_turn_supersedes_older_local_persisted_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let worker = store
+            .create_agent(NewAgent::new("local-vs-remote", "codex"))
+            .unwrap();
+        store.set_agent_running(&worker.id, "/work").unwrap();
+        let worker = store.agent(&worker.id).unwrap();
+
+        let cfg = anyagents_core::agent_config_dir(store.data_dir(), &worker.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        let base = now_ms();
+        std::fs::write(
+            cfg.join(LAST_ERROR),
+            serde_json::json!({
+                "timestamp_ms": base - 5_000,
+                "error": "older local error",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "trn_newer_err".into(),
+                agent_id: worker.id.clone(),
+                harness_kind: "sandbox".into(),
+                provider_kind: Some("http".into()),
+                remote_run_id: None,
+                callback_token_hash: hash_callback_token("tok-newer"),
+                cursor: None,
+                status: "dispatched".into(),
+                metadata_json: None,
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+        store
+            .remote_turn_store()
+            .settle_turn(
+                "trn_newer_err",
+                &SettleRemoteTurn {
+                    status: "failed".into(),
+                    result_text: None,
+                    error_text: Some("newer remote timeout 1800s".into()),
+                    usage_json: None,
+                    cursor: None,
+                    settled_at_ms: base + 100,
+                },
+            )
+            .unwrap();
+
+        let view = agent_view(&store, &health, &worker).unwrap();
+        assert_eq!(
+            view.last_error.as_deref(),
+            Some("newer remote timeout 1800s")
+        );
     }
 }

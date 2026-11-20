@@ -5720,7 +5720,13 @@ async fn fleet_schedules_enforce_owner_authority_and_reject_all_mutations() {
     let unrelated = store
         .create_agent(anyagents_core::NewAgent::new("fleet-unrelated", "codex"))
         .unwrap();
-    for agent in [&parent, &child, &unrelated] {
+    let unrelated_private = store
+        .create_agent(anyagents_core::NewAgent {
+            parent_id: Some(unrelated.id.clone()),
+            ..anyagents_core::NewAgent::new("fleet-unrelated-private", "codex")
+        })
+        .unwrap();
+    for agent in [&parent, &child, &unrelated, &unrelated_private] {
         store
             .create_schedule(anyagents_core::NewSchedule {
                 agent_id: agent.id.clone(),
@@ -5747,10 +5753,12 @@ async fn fleet_schedules_enforce_owner_authority_and_reject_all_mutations() {
             .status,
         StatusCode::FORBIDDEN
     );
+    // Parent & child see self + descendants + scope=="public" peers (parent, unrelated),
+    // never another peer's scope=="private" sub-agent (`unrelated_private`). Operator sees all 4.
     for (actor, expected) in [
-        (&principal, 2),
-        (&child_principal, 1),
-        (&Principal::Operator, 3),
+        (&principal, 3),
+        (&child_principal, 3),
+        (&Principal::Operator, 4),
     ] {
         for target in ["all", "ALL", " agent:All "] {
             let request: ScheduleRequest =
@@ -5767,8 +5775,8 @@ async fn fleet_schedules_enforce_owner_authority_and_reject_all_mutations() {
                 assert!(row["agent_id"].is_string());
                 assert!(row.get("next_fire_at_ms").unwrap().is_null());
                 assert!(row.get("last_observed").unwrap().is_null());
-                if expected < 3 {
-                    assert_ne!(row["agent_name"], unrelated.name);
+                if expected < 4 {
+                    assert_ne!(row["agent_name"], unrelated_private.name);
                 }
             }
         }
@@ -5782,7 +5790,7 @@ async fn fleet_schedules_enforce_owner_authority_and_reject_all_mutations() {
     .await
     .unwrap()
     .0;
-    assert_eq!(get["schedules"].as_array().unwrap().len(), 2);
+    assert_eq!(get["schedules"].as_array().unwrap().len(), 3);
     for actor in [&principal, &Principal::Operator] {
         for payload in [
             serde_json::json!({"action": "create", "at": "1h", "prompt": "no"}),
@@ -5804,29 +5812,29 @@ async fn fleet_schedules_enforce_owner_authority_and_reject_all_mutations() {
             );
         }
     }
-    assert_eq!(store.list_schedules(None, true).unwrap().len(), 3);
+    assert_eq!(store.list_schedules(None, true).unwrap().len(), 4);
     assert!(authorize_schedule_target(store, &Principal::Operator, None).is_err());
-    // Child sees only its own schedule (1), parent sees itself + child (2), operator sees all (3).
+    // Child sees self + public roots (3), parent sees self + child + public peer (3), operator sees all (4).
     assert_eq!(
         list_fleet_schedules(store, &child_principal).unwrap()["schedules"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(
-        list_fleet_schedules(store, &Principal::Operator).unwrap()["schedules"]
             .as_array()
             .unwrap()
             .len(),
         3
     );
     assert_eq!(
+        list_fleet_schedules(store, &Principal::Operator).unwrap()["schedules"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
         list_fleet_schedules(store, &principal).unwrap()["schedules"]
             .as_array()
             .unwrap()
             .len(),
-        2
+        3
     );
     // An unreadable caller is an error, not a fleet-wide visibility grant.
     let absent = Principal::Agent {

@@ -25,6 +25,173 @@ pub const ACTIVE_REMOTE_TURN_FRESHNESS_MS: i64 = 180_000;
 /// an active serverless remote turn.
 pub const MAX_INBOX_SEQ_META_KEY: &str = "max_inbox_seq";
 
+/// Latest unrecovered terminal remote turn failure for an agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LatestRemoteTurnError {
+    pub turn_id: String,
+    pub error_text: String,
+    pub settled_at_ms: i64,
+}
+
+fn terminal_turn_rank(turn: &PendingRemoteTurn) -> (i64, i64, bool, &str) {
+    (
+        turn.updated_at_ms,
+        turn.created_at_ms,
+        turn.status == "completed",
+        turn.turn_id.as_str(),
+    )
+}
+
+fn failed_turn_to_error(turn: &PendingRemoteTurn) -> Option<LatestRemoteTurnError> {
+    if turn.status != "failed" {
+        return None;
+    }
+    let error_text = turn
+        .error_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some(LatestRemoteTurnError {
+        turn_id: turn.turn_id.clone(),
+        error_text: error_text.to_string(),
+        settled_at_ms: turn.updated_at_ms,
+    })
+}
+
+/// Return the latest unrecovered failed remote turn for `agent_id` in PostgreSQL.
+/// Returns `Ok(None)` when the agent's latest terminal (`completed`/`failed`) turn
+/// completed cleanly or has empty error text.
+pub(super) fn pg_latest_failed_for_agent(
+    pool: &PgPool,
+    agent_id: &AgentId,
+) -> Result<Option<LatestRemoteTurnError>, Error> {
+    let pool = pool.clone();
+    let aid = agent_id.as_str().to_string();
+    block_on_pg(async move {
+        use sqlx::Row as _;
+        let row = sqlx::query(
+            "SELECT turn_id, status, error_text, updated_at_ms
+             FROM public.pending_remote_turns
+             WHERE agent_id = $1
+               AND status IN ('completed', 'failed')
+             ORDER BY updated_at_ms DESC, created_at_ms DESC, (status = 'completed') DESC, turn_id DESC
+             LIMIT 1",
+        )
+        .bind(&aid)
+        .fetch_optional(&pool)
+        .await
+        .map_err(Error::from)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let status: String = row.try_get("status").map_err(Error::from)?;
+        if status != "failed" {
+            return Ok(None);
+        }
+        let error_text: Option<String> = row.try_get("error_text").map_err(Error::from)?;
+        let Some(trimmed) = error_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let turn_id: String = row.try_get("turn_id").map_err(Error::from)?;
+        let settled_at_ms: i64 = row.try_get("updated_at_ms").map_err(Error::from)?;
+        Ok(Some(LatestRemoteTurnError {
+            turn_id,
+            error_text: trimmed.to_string(),
+            settled_at_ms,
+        }))
+    })
+}
+
+/// Single-query PostgreSQL lookup returning `agent_id -> LatestRemoteTurnError`
+/// for all agents whose latest terminal (`completed`/`failed`) remote turn failed.
+pub(super) fn pg_list_latest_failed_by_agent(
+    pool: &PgPool,
+) -> Result<HashMap<String, LatestRemoteTurnError>, Error> {
+    let pool = pool.clone();
+    block_on_pg(async move {
+        use sqlx::Row as _;
+        let rows = sqlx::query(
+            "SELECT agent_id, turn_id, error_text, updated_at_ms
+             FROM (
+                 SELECT DISTINCT ON (agent_id)
+                        agent_id, turn_id, status, error_text, updated_at_ms
+                 FROM public.pending_remote_turns
+                 WHERE status IN ('completed', 'failed')
+                 ORDER BY agent_id, updated_at_ms DESC, created_at_ms DESC, (status = 'completed') DESC, turn_id DESC
+             ) latest
+             WHERE status = 'failed'
+               AND error_text IS NOT NULL
+               AND btrim(error_text) <> ''",
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(Error::from)?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let aid: String = row.try_get("agent_id").map_err(Error::from)?;
+            let turn_id: String = row.try_get("turn_id").map_err(Error::from)?;
+            let error_text: String = row.try_get("error_text").map_err(Error::from)?;
+            let trimmed = error_text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let settled_at_ms: i64 = row.try_get("updated_at_ms").map_err(Error::from)?;
+            out.insert(
+                aid,
+                LatestRemoteTurnError {
+                    turn_id,
+                    error_text: trimmed.to_string(),
+                    settled_at_ms,
+                },
+            );
+        }
+        Ok(out)
+    })
+}
+
+/// Collect `agent_id -> LatestRemoteTurnError` from an in-memory/filesystem turn slice.
+pub(super) fn collect_latest_failed_by_agent<'a>(
+    turns: impl IntoIterator<Item = &'a PendingRemoteTurn>,
+) -> HashMap<String, LatestRemoteTurnError> {
+    let mut latest_by_agent: HashMap<&str, &'a PendingRemoteTurn> = HashMap::new();
+    for turn in turns {
+        if !matches!(turn.status.as_str(), "completed" | "failed") {
+            continue;
+        }
+        latest_by_agent
+            .entry(turn.agent_id.as_str())
+            .and_modify(|existing| {
+                if terminal_turn_rank(turn) > terminal_turn_rank(existing) {
+                    *existing = turn;
+                }
+            })
+            .or_insert(turn);
+    }
+    let mut out = HashMap::new();
+    for (aid, turn) in latest_by_agent {
+        if let Some(err) = failed_turn_to_error(turn) {
+            out.insert(aid.to_string(), err);
+        }
+    }
+    out
+}
+
+/// Find the latest unrecovered failed remote turn for `agent_id` from an iterator.
+pub(super) fn latest_failed_for_agent_from_iter<'a>(
+    turns: impl IntoIterator<Item = &'a PendingRemoteTurn>,
+    agent_id: &AgentId,
+) -> Option<LatestRemoteTurnError> {
+    let winner = turns
+        .into_iter()
+        .filter(|t| &t.agent_id == agent_id && matches!(t.status.as_str(), "completed" | "failed"))
+        .max_by(|a, b| terminal_turn_rank(a).cmp(&terminal_turn_rank(b)))?;
+    failed_turn_to_error(winner)
+}
+
 /// Single-query PostgreSQL lookup returning `agent_id -> earliest created_at_ms`
 /// for all agents with a fresh non-terminal remote turn.
 pub(super) fn pg_list_active_fresh_by_agent(
@@ -427,6 +594,19 @@ impl RemoteTurnStore for InMemoryRemoteTurnStore {
         Ok(collect_active_fresh_by_agent(map.values(), fresh_since_ms))
     }
 
+    fn latest_failed_for_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<LatestRemoteTurnError>, Error> {
+        let map = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(latest_failed_for_agent_from_iter(map.values(), agent_id))
+    }
+
+    fn list_latest_failed_by_agent(&self) -> Result<HashMap<String, LatestRemoteTurnError>, Error> {
+        let map = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(collect_latest_failed_by_agent(map.values()))
+    }
+
     fn record_agent_inbox_read_seq(
         &self,
         agent_id: &AgentId,
@@ -569,6 +749,94 @@ mod tests {
                     .record_agent_inbox_read_seq(&aid_done, 99, fresh_now + 40)
                     .unwrap(),
                 0
+            );
+        }
+    }
+
+    #[test]
+    fn latest_failed_remote_turn_surfaces_and_clears_on_subsequent_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs_store = FsRemoteTurnStore::new(tmp.path());
+        let mem_store = InMemoryRemoteTurnStore::new();
+
+        for store in [
+            &fs_store as &dyn RemoteTurnStore,
+            &mem_store as &dyn RemoteTurnStore,
+        ] {
+            let aid = AgentId::generate();
+            let base = now_ms();
+            store
+                .create_turn(&sample_turn("trn_fail_1", &aid, 1))
+                .unwrap();
+            store
+                .settle_turn(
+                    "trn_fail_1",
+                    &SettleRemoteTurn {
+                        status: "failed".into(),
+                        result_text: None,
+                        error_text: Some("lease Pending Unschedulable".into()),
+                        usage_json: None,
+                        cursor: None,
+                        settled_at_ms: base + 100,
+                    },
+                )
+                .unwrap();
+
+            let single = store.latest_failed_for_agent(&aid).unwrap().unwrap();
+            assert_eq!(single.turn_id, "trn_fail_1");
+            assert_eq!(single.error_text, "lease Pending Unschedulable");
+            let bulk = store.list_latest_failed_by_agent().unwrap();
+            assert_eq!(bulk.get(aid.as_str()), Some(&single));
+
+            // A newer failure supersedes the older one.
+            store
+                .create_turn(&sample_turn("trn_fail_2", &aid, 2))
+                .unwrap();
+            store
+                .settle_turn(
+                    "trn_fail_2",
+                    &SettleRemoteTurn {
+                        status: "failed".into(),
+                        result_text: None,
+                        error_text: Some("sandbox API 503".into()),
+                        usage_json: None,
+                        cursor: None,
+                        settled_at_ms: base + 200,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .latest_failed_for_agent(&aid)
+                    .unwrap()
+                    .unwrap()
+                    .error_text,
+                "sandbox API 503"
+            );
+
+            // A subsequent completed turn clears the unrecovered failure cleanly.
+            store
+                .create_turn(&sample_turn("trn_ok_3", &aid, 3))
+                .unwrap();
+            store
+                .settle_turn(
+                    "trn_ok_3",
+                    &SettleRemoteTurn {
+                        status: "completed".into(),
+                        result_text: Some("ok".into()),
+                        error_text: None,
+                        usage_json: None,
+                        cursor: None,
+                        settled_at_ms: base + 300,
+                    },
+                )
+                .unwrap();
+            assert!(store.latest_failed_for_agent(&aid).unwrap().is_none());
+            assert!(
+                !store
+                    .list_latest_failed_by_agent()
+                    .unwrap()
+                    .contains_key(aid.as_str())
             );
         }
     }
