@@ -35,10 +35,7 @@ impl StartupListener {
         // without constructing its authenticated handlers from partial state.
         let startup = Router::new()
             .route("/healthz", get(super::ops::public_healthz))
-            .route("/readyz", get(startup_unavailable))
-            .route("/", get(startup_unavailable))
-            .route("/v1/{*path}", axum::routing::any(startup_unavailable))
-            .route("/mcp", get(startup_unavailable).post(startup_unavailable));
+            .fallback(startup_unavailable);
         let app = Router::new().fallback(move |request: axum::extract::Request| {
             use hyper::service::Service as _;
             let router = mounted.borrow().clone().unwrap_or_else(|| startup.clone());
@@ -590,14 +587,13 @@ mod tests {
             ("GET", "/readyz", 503),
             ("GET", "/", 503),
             ("GET", "/v1/agents", 503),
+            ("GET", "/admin/api/versions", 503),
             ("POST", crate::remote::MCP_PATH, 503),
-            ("GET", "/unrelated", 404),
+            ("GET", "/unrelated", 503),
         ] {
             let (status, headers) = request(method, path).await.unwrap();
             assert_eq!(status, expected, "{method} {path}");
-            if expected != 404 {
-                assert_eq!(headers["cache-control"], "no-store");
-            }
+            assert_eq!(headers["cache-control"], "no-store", "{method} {path}");
         }
 
         let task = listener.mount(
@@ -609,6 +605,7 @@ mod tests {
                 ),
         );
         assert_eq!(request("GET", "/readyz").await.unwrap().0, 200);
+        assert_eq!(request("GET", "/unrelated").await.unwrap().0, 404);
         assert_eq!(
             request("POST", crate::remote::MCP_PATH).await.unwrap().0,
             401
