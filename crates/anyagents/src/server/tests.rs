@@ -4718,7 +4718,7 @@ fn archetype_absence_preserves_http_harness_defaults_and_explicit_inheritance() 
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         for (name, parent_ref, harness, expected) in [
             ("root-default", "root", None, "claude-code"),
-            ("child-default", parent.id.as_str(), None, "claude-code"),
+            ("child-default", parent.id.as_str(), None, "opencode"),
             ("child-empty", parent.id.as_str(), Some(""), "opencode"),
             ("child-inherit", parent.id.as_str(), Some("inherit"), "opencode"),
             ("child-explicit", parent.id.as_str(), Some("codex"), "codex"),

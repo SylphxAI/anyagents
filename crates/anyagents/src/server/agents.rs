@@ -1,7 +1,7 @@
 //! Agent CRUD, spawning, and runtime configuration HTTP routes.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use anyagents_core::{Agent, Incoming, ReceiveOutcome, Store};
 use axum::extract::{Path as AxumPath, Query, State};
@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::api::{AgentView, AgentsResponse, CreateAgentRequest, Delivery};
 use crate::auth::Principal;
@@ -122,6 +123,35 @@ pub(super) async fn reset_session_route(
     .await
 }
 
+// These mutations run file and sandbox operations between short Store calls.
+// Share a limit across both routes; reject overload before taking a blocking
+// thread or connection. Move each permit into the work, not just the request.
+static RUNTIME_CHANGES: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
+
+fn admit_runtime_change(limit: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, ApiError> {
+    Arc::clone(limit).try_acquire_owned().map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many runtime changes in progress; retry shortly",
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_changes_reject_overload_and_recover_when_work_finishes() {
+        let limit = Arc::new(Semaphore::new(1));
+        let permit = admit_runtime_change(&limit).unwrap();
+        let err = admit_runtime_change(&limit).unwrap_err();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        drop(permit);
+        assert!(admit_runtime_change(&limit).is_ok());
+    }
+}
+
 pub(super) async fn harness_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -130,7 +160,9 @@ pub(super) async fn harness_route(
     Json(body): Json<HarnessRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let via_http = via_http_mcp(&headers);
+    let permit = admit_runtime_change(&RUNTIME_CHANGES)?;
     spawn_store(move || {
+        let _permit = permit;
         let found = state
             .store
             .agent_by_name(&name)
@@ -159,7 +191,7 @@ pub(super) async fn harness_route(
             &state.store,
             state.store.data_dir(),
             &actor,
-            &found.name,
+            found.id.as_str(),
             &body.harness,
             body.runtime.as_deref(),
             body.model.as_deref(),
@@ -411,6 +443,8 @@ async fn rename_agent_route(
     AxumPath(name): AxumPath<String>,
     Json(body): Json<RenameAgentRequest>,
 ) -> Result<Json<AgentView>, ApiError> {
+    let permit = admit_runtime_change(&RUNTIME_CHANGES)?;
+    let call = super::in_flight::carry();
     spawn_store(move || {
         let old = state
             .store
@@ -425,6 +459,11 @@ async fn rename_agent_route(
         if !is_ancestor {
             require_operator_audited(&state.store, &principal, "agents.rename", &old.name)?;
         }
+        let lifecycle = state
+            .store
+            .try_lock_agent_lifecycle(&old.id)
+            .map_err(ApiError::from_store)?;
+        let old = state.store.agent(&old.id).map_err(ApiError::from_store)?;
         let updated = state
             .store
             .rename_agent(&old.id, &body.name)
@@ -444,27 +483,39 @@ async fn rename_agent_route(
                 }
             }
         }
-        let cfg = anyagents_core::agent_config_dir(data_dir, &updated.id);
-        let work_dir = updated
-            .workdir
-            .as_deref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| anyagents_core::agent_work_dir(data_dir, &updated.id));
-        let started_ms = state
-            .health
-            .get(&updated.id)
-            .and_then(|h| h.process_started_at_ms);
-        create::reconcile_agent_runtime_config_for_live(
-            &state.store,
-            data_dir,
-            &updated,
-            &cfg,
-            &work_dir,
-            started_ms,
-        )
-        .map_err(ApiError::from_store)?;
-        crate::telegram::sync_agent_telegram_bot_name(&state.store, data_dir, &updated);
-        Ok(Json(agent_view(&state.store, &state.health, &updated)?))
+        let view = agent_view(&state.store, &state.health, &updated);
+        // Once the name and alias commit, finish the projection even if the
+        // client disconnects. Keep the lifecycle guard across the handoff so a
+        // newer rename or harness change cannot be overwritten by this one.
+        tokio::task::spawn_blocking(move || {
+            let (_permit, _lifecycle, _call) = (permit, lifecycle, call);
+            let data_dir = state.store.data_dir();
+            let cfg = anyagents_core::agent_config_dir(data_dir, &updated.id);
+            let work_dir = updated
+                .workdir
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| anyagents_core::agent_work_dir(data_dir, &updated.id));
+            let started_ms = state
+                .health
+                .get(&updated.id)
+                .and_then(|h| h.process_started_at_ms);
+            if let Err(err) = create::reconcile_agent_runtime_config_for_live(
+                &state.store,
+                data_dir,
+                &updated,
+                &cfg,
+                &work_dir,
+                started_ms,
+            ) {
+                eprintln!(
+                    "anyagents: config reconciliation after rename of {} failed: {err}",
+                    updated.id
+                );
+            }
+            crate::telegram::sync_agent_telegram_bot_name(&state.store, data_dir, &updated);
+        });
+        view.map(Json)
     })
     .await
 }
@@ -972,7 +1023,7 @@ pub(super) async fn create_agent_route(
         let (harness, model, profile) = create::resolve_subagent_defaults(
             state.store.data_dir(),
             parent_agent.as_ref(),
-            body.harness.as_deref().unwrap_or("claude-code"),
+            body.harness.as_deref().unwrap_or_default(),
             body.model,
             body.profile,
         );
