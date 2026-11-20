@@ -48,6 +48,7 @@ mod profiles;
 mod quota_rotation;
 mod reap_queue;
 mod schedules;
+pub(crate) mod secrets;
 pub(crate) mod serverless;
 mod types;
 mod webhooks_mcp;
@@ -153,6 +154,7 @@ fn build_webhook_router(state: AppState) -> Router {
 fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .merge(agents::router())
+        .merge(secrets::router())
         .merge(schedules::router())
         .merge(messaging::router())
         .merge(channels_groups::router())

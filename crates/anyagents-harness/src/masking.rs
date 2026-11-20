@@ -2,8 +2,54 @@
 //! explicit credential assignments and provider token prefixes, not arbitrary
 //! personal data or passwords without a label. Unchanged text is borrowed.
 use std::borrow::Cow;
+use std::sync::{LazyLock, RwLock};
 
 const MARKER: &str = "[redacted]";
+const MIN_REGISTERED_SECRET_LEN: usize = 8;
+const MIN_EXPLICIT_SECRET_LEN: usize = 4;
+const MAX_REGISTERED_SECRETS: usize = 2048;
+
+static REGISTERED_SECRETS: LazyLock<RwLock<Vec<String>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// Register decrypted deployment secret values in the process-wide masker so
+/// every durable boundary (`mask_known_secrets`, `mask_json_strings`, turn
+/// outputs, tool logs, and transcripts) scrubs them automatically.
+pub fn register_secret_values<I, S>(values: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let candidates: Vec<String> = values
+        .into_iter()
+        .map(|s| s.as_ref().to_string())
+        .filter(|s| {
+            s.len() >= MIN_REGISTERED_SECRET_LEN
+                && s != MARKER
+                && !s.trim().is_empty()
+                && !reference(s)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let mut guard = REGISTERED_SECRETS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut changed = false;
+    for value in candidates {
+        if !guard.iter().any(|existing| existing == &value) {
+            if guard.len() >= MAX_REGISTERED_SECRETS {
+                guard.remove(0);
+            }
+            guard.push(value);
+            changed = true;
+        }
+    }
+    if changed {
+        guard.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    }
+}
 
 fn identifier(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
@@ -33,6 +79,33 @@ fn reference(value: &str) -> bool {
 }
 
 pub fn mask_known_secrets(text: &str) -> Cow<'_, str> {
+    mask_known_secrets_inner(text, &[])
+}
+
+/// Mask known credential patterns, registered deployment secrets, and an
+/// explicit slice of secret values (such as an agent's currently granted
+/// secrets) from `text`. Unchanged text is borrowed without allocation.
+pub fn mask_with_secrets<'a, S: AsRef<str>>(text: &'a str, secrets: &[S]) -> Cow<'a, str> {
+    if secrets.is_empty() {
+        return mask_known_secrets_inner(text, &[]);
+    }
+    let mut refs: Vec<&str> = secrets
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|s| {
+            s.len() >= MIN_EXPLICIT_SECRET_LEN
+                && *s != MARKER
+                && !s.trim().is_empty()
+                && !reference(s)
+                && !matches!(*s, "true" | "false" | "null")
+        })
+        .collect();
+    refs.sort_by(|a, b| b.len().cmp(&a.len()));
+    refs.dedup();
+    mask_known_secrets_inner(text, &refs)
+}
+
+fn mask_known_secrets_inner<'a>(text: &'a str, extra_secrets: &[&str]) -> Cow<'a, str> {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
     let mut pos = 0;
@@ -172,6 +245,20 @@ pub fn mask_known_secrets(text: &str) -> Cow<'_, str> {
             spans.push((start, start + at));
         }
     }
+    // Scrub process-wide registered deployment secret values and any
+    // caller-provided explicit secret values (even without a known prefix).
+    if let Ok(guard) = REGISTERED_SECRETS.read() {
+        for secret in guard.iter() {
+            for (start, _) in text.match_indices(secret.as_str()) {
+                spans.push((start, start + secret.len()));
+            }
+        }
+    }
+    for secret in extra_secrets {
+        for (start, _) in text.match_indices(*secret) {
+            spans.push((start, start + secret.len()));
+        }
+    }
     if spans.is_empty() {
         return Cow::Borrowed(text);
     }
@@ -200,13 +287,21 @@ pub fn mask_known_secrets(text: &str) -> Cow<'_, str> {
 /// Mask string values, never structural keys, while retaining the JSON shape.
 /// This also covers persisted native-turn snapshots containing nested outputs.
 pub fn mask_json_strings(value: &mut serde_json::Value) {
+    mask_json_with_secrets::<&str>(value, &[]);
+}
+
+/// Mask string values in `value` using both pattern masking, registered
+/// deployment secrets, and an explicit list of secret values.
+pub fn mask_json_with_secrets<S: AsRef<str>>(value: &mut serde_json::Value, secrets: &[S]) {
     match value {
         serde_json::Value::String(text) => {
-            if let Cow::Owned(masked) = mask_known_secrets(text) {
+            if let Cow::Owned(masked) = mask_with_secrets(text, secrets) {
                 *text = masked;
             }
         }
-        serde_json::Value::Array(items) => items.iter_mut().for_each(mask_json_strings),
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| mask_json_with_secrets(item, secrets)),
         serde_json::Value::Object(fields) => {
             for (key, value) in fields {
                 if credential_key(key)
@@ -215,7 +310,7 @@ pub fn mask_json_strings(value: &mut serde_json::Value) {
                 {
                     *text = MARKER.to_string();
                 } else {
-                    mask_json_strings(value);
+                    mask_json_with_secrets(value, secrets);
                 }
             }
         }
@@ -324,5 +419,29 @@ mod external_forms {
         ] {
             assert_eq!(mask_known_secrets(safe), safe);
         }
+    }
+
+    #[test]
+    fn registered_and_explicit_secret_values_are_scrubbed_from_text_and_json() {
+        let custom_registered = "CANARY_REGISTERED_DEPLOY_SECRET_778899";
+        let custom_explicit = "CANARY_EXPLICIT_SCOPED_SECRET_445566";
+        register_secret_values([custom_registered, "short"]);
+
+        let raw = format!("output leaked {custom_registered} and {custom_explicit} end");
+        assert_eq!(
+            mask_known_secrets(&raw),
+            format!("output leaked [redacted] and {custom_explicit} end")
+        );
+        assert_eq!(
+            mask_with_secrets(&raw, &[custom_explicit]),
+            "output leaked [redacted] and [redacted] end"
+        );
+        let mut doc = serde_json::json!({
+            "delta": format!("chunk {custom_registered} / {custom_explicit}"),
+            "ok": true
+        });
+        mask_json_with_secrets(&mut doc, &[custom_explicit]);
+        assert_eq!(doc["delta"], "chunk [redacted] / [redacted]");
+        assert_eq!(doc["ok"], true);
     }
 }

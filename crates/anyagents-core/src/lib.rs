@@ -24,6 +24,7 @@ pub mod quote;
 pub mod raw_segment;
 pub mod redaction;
 mod secret;
+pub mod secrets_store;
 pub mod stateless;
 pub mod storage;
 mod store;
@@ -36,6 +37,10 @@ pub use error::Error;
 pub use id::{AgentId, ChannelId, MessageId, UsageId};
 pub use quote::{Quote, QuoteRef};
 pub use secret::{CredentialStore, FileCredentialStore, Secret};
+pub use secrets_store::{
+    DeploymentSecretMetadata, is_reserved_secret_env_key, require_deployment_master_key,
+    validate_secret_env_key, validate_secret_name,
+};
 pub use stateless::{
     AGENT_FILE_NAMESPACES, BlobEntry, BlobMeta, CAPABILITY_KEY_ENV, CoordinatorLease,
     CoordinatorLeaseGuard, CoordinatorLockBackend, DEFAULT_LEASE_TTL,

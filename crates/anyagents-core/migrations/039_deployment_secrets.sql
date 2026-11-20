@@ -1,0 +1,17 @@
+CREATE TABLE IF NOT EXISTS deployment_secrets (
+    name                    TEXT PRIMARY KEY,
+    env_entries_ciphertext  TEXT NOT NULL,
+    key_names_json          TEXT NOT NULL,
+    updated_at_ms           BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_secret_grants (
+    agent_id      TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    secret_name   TEXT NOT NULL REFERENCES deployment_secrets(name) ON DELETE CASCADE,
+    granted_by    TEXT,
+    granted_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (agent_id, secret_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_secret_grants_secret_name
+    ON agent_secret_grants(secret_name, agent_id);
