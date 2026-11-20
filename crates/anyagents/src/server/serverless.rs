@@ -966,8 +966,9 @@ async fn fail_remote_turn(
     let store_fail = Arc::clone(store);
     let aid = agent_id.clone();
     let tid = turn_id.to_string();
+    let err_in = err.clone();
     run_store_blocking(move || {
-        let masked = super::secrets::mask_text_for_agent(&store_fail, &aid, &err);
+        let masked = super::secrets::mask_text_for_agent(&store_fail, &aid, &err_in);
         let _ = store_fail.remote_turn_store().settle_turn(
             &tid,
             &SettleRemoteTurn {

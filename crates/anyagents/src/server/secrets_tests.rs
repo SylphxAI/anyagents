@@ -624,7 +624,7 @@ async fn sandbox_env_resolution_and_turn_output_masking_scrub_granted_secrets() 
         .get_agent_file(&agent.id, "sessions", &format!("turns/{turn_id}.json"))
         .unwrap()
         .expect("transcript persisted");
-    let transcript_str = String::from_utf8_lossy(&transcript.data);
+    let transcript_str = String::from_utf8_lossy(&transcript.content);
     assert!(!transcript_str.contains(canary));
     assert!(transcript_str.contains("[redacted]"));
 }
