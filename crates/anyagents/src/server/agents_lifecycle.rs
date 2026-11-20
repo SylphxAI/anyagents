@@ -1271,13 +1271,8 @@ pub(super) async fn wake_agent_route(
     Ok(view)
 }
 
-/// Restore the same runtime and archive-marker state for an explicit wake or
-/// an intentional direct send. The caller commits `running` only after this
-/// succeeds; direct sends commit it atomically with their mailbox append.
-pub(super) fn prepare_agent_wake(store: &Store, found: &Agent) -> Result<(), ApiError> {
-    prepare_agent_wake_with_options(store, found, true, true, true)
-}
-
+/// Restore runtime and archive-marker state for an explicit wake. The caller
+/// commits `running` only after this succeeds.
 fn prepare_agent_wake_with_options(
     store: &Store,
     found: &Agent,

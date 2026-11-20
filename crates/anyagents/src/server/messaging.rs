@@ -19,13 +19,13 @@ use super::messaging_conversation::{
     operator_reports, redact_conversation_route,
 };
 use super::messaging_delivery::{
-    archived_refusal, deliver_agent_with_media, deliver_operator, deliver_room_with_media,
-    deliver_telegram, format_internal_send_text, interact_route, operator_limited, operator_sender,
-    prepare_telegram, room_recipients, room_skipped,
+    archived_conflict, archived_refusal, deliver_agent_with_media, deliver_operator,
+    deliver_room_with_media, deliver_telegram, format_internal_send_text, interact_route,
+    operator_limited, operator_sender, prepare_telegram, room_recipients, room_skipped,
 };
 use super::types::{
     ApiError, AppState, is_self_or_ancestor, refuse_host_media_over_http, require_operator,
-    runs_off_host, spawn_store, via_http_mcp,
+    spawn_store, via_http_mcp,
 };
 use super::{outbound_history, serverless};
 
@@ -242,11 +242,6 @@ pub(super) async fn send(
             ..body
         };
         let mut plan = plan_send(&state.store, &principal, &actor, &body)?;
-        // Over HTTP MCP a send never revives an archived host agent: that
-        // would start a host process on the call's behalf. Such a send is
-        // refused for it with the reason, as any send that cannot wake an
-        // archived recipient is.
-        plan.revive_host_agents = !via_http;
         if let Some((caller, token)) = turn_context {
             if plan.sender_id.as_ref() != Some(&caller) {
                 return Err(ApiError::forbidden(
@@ -463,9 +458,6 @@ pub(super) struct SendPlan {
     /// Immutable identity admitted at planning; a reused display name is not authority.
     pub(super) sender_id: Option<anyagents_core::AgentId>,
     pub(super) principal_id: Option<anyagents_core::AgentId>,
-    /// Whether an authored send may revive an archived agent that runs on
-    /// this host. False for a call made over HTTP MCP.
-    pub(super) revive_host_agents: bool,
     pub(super) turn_context: Option<String>,
 }
 
@@ -684,7 +676,6 @@ impl SendPlan {
             reply: None,
             sender_id: sender.as_ref().map(|agent| agent.id.clone()),
             principal_id: None,
-            revive_host_agents: true,
             turn_context: None,
         })
     }
@@ -874,6 +865,10 @@ pub(super) fn check_targets(
                     }
                 }
                 if room_recipients(store, body, room).is_empty() {
+                    let (archived, _) = room_skipped(store, body, room);
+                    if let Some(archived) = archived.first() {
+                        return Err(archived_conflict(&archived.reason));
+                    }
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
                         format!("room {room} has no agent to deliver to"),
@@ -1011,22 +1006,11 @@ pub(super) fn send_sync(
         let history_key = key.as_ref().map(|key| format!("{key}:{target_index}"));
         match target {
             Target::Agent(name) => {
-                // Only a single, explicitly named recipient of an authored
-                // send may unarchive. Resolved replies and fan-out aliases do
-                // not acquire that authority when expanded into agent targets.
-                let wake_archived = matches!(actor, Actor::Agent(_))
-                    || matches!(actor, Actor::Operator(sender) if sender == "operator");
-                let wake_archived = wake_archived
-                    && body.to.len() == 1
-                    && matches!(Address::parse(&body.to[0]), Ok(Address::Agent(ref name))
-                        if !matches!(name.as_str(), "all" | "peers" | "siblings" | "team" | "children" | "parent"))
-                    && (plan.revive_host_agents
-                        || store
-                            .agent_by_name(name)
-                            .is_ok_and(|agent| runs_off_host(store, &agent)));
-                // An archived recipient this send cannot wake would never read
-                // it: refused with the reason, never stored unread.
-                if !wake_archived && let Some(refusal) = archived_refusal(store, name) {
+                // No send unarchives its recipient, however it is addressed:
+                // only an explicit `agents(action="wake")` does. An archived
+                // recipient would never read it, so it is refused with the
+                // reason and never stored unread.
+                if let Some(refusal) = archived_refusal(store, name) {
                     refused_archived.push(refusal.reason.clone());
                     skipped.push(refusal);
                     continue;
@@ -1047,7 +1031,6 @@ pub(super) fn send_sync(
                                 &internal_body,
                                 name,
                                 key.as_deref(),
-                                wake_archived,
                                 upload.as_ref(),
                                 plan.turn_context.as_deref().map(|token| (sid, token)),
                             )?])
@@ -1059,7 +1042,6 @@ pub(super) fn send_sync(
                         &internal_body,
                         name,
                         key.as_deref(),
-                        wake_archived,
                         upload.as_ref(),
                         None,
                     )?]
@@ -1101,9 +1083,18 @@ pub(super) fn send_sync(
                         upload.as_ref(),
                     )?
                 };
-                let mut room_skip = room_skipped(store, &body, room);
+                let (archived, inactive) = room_skipped(store, &body, room);
+                let archived = archived
+                    .into_iter()
+                    .filter(|s| !all.iter().any(|d| d.to == s.to));
+                for s in archived {
+                    refused_archived.push(s.reason.clone());
+                    if !skipped.iter().any(|existing| existing.to == s.to) {
+                        skipped.push(s);
+                    }
+                }
                 deliveries.append(&mut all);
-                for s in room_skip.drain(..) {
+                for s in inactive {
                     if !skipped
                         .iter()
                         .any(|existing: &crate::api::SkippedDelivery| existing.to == s.to)
@@ -1156,13 +1147,7 @@ pub(super) fn send_sync(
         }
     }
     if deliveries.is_empty() && !refused_archived.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            format!(
-                "nothing was sent: {}. Message a live agent instead, or wake this one by sending to it alone, by name.",
-                refused_archived.join("; ")
-            ),
-        ));
+        return Err(archived_conflict(&refused_archived.join("; ")));
     }
     let response = SendResponse {
         deliveries,

@@ -2600,12 +2600,12 @@ fn subagent_scales_to_idle_when_done_wakes_on_message_and_stays_archived_when_re
 }
 
 #[test]
-fn only_direct_send_ingress_wakes_archived_and_duplicate_does_not_rewake() {
+fn no_ingress_wakes_an_archived_agent_and_idle_still_wakes() {
     let (dir, store) = setup();
     let recipient = agent(&store, "recipient");
     store.set_agent_state(&recipient.id, "archived").unwrap();
-    // Lifecycle, channel and schedule ingress uses receive, even when a
-    // generated notification names an agent as its sender.
+    // Lifecycle, channel, schedule and authored agent ingress alike leave an
+    // archived recipient archived: only an explicit wake revives it.
     for (sender, key, text) in [
         (
             "agent:child",
@@ -2621,6 +2621,7 @@ fn only_direct_send_ingress_wakes_archived_and_duplicate_does_not_rewake() {
         ("telegram:user:123", "telegram:123:1", "channel update"),
         ("schedule:timer", "schedule:timer:1", "timer prompt"),
         ("schedule:watch", "watch:watch:1", "watch prompt"),
+        ("agent:parent", "direct-1", "intentional follow-up"),
     ] {
         let mut incoming = Incoming::new(text);
         incoming.sender = Some(sender.into());
@@ -2628,24 +2629,15 @@ fn only_direct_send_ingress_wakes_archived_and_duplicate_does_not_rewake() {
         store.receive(&recipient.id, incoming).unwrap();
         assert_eq!(store.agent(&recipient.id).unwrap().state, "archived");
     }
-    let mut incoming = Incoming::new("intentional follow-up");
-    incoming.sender = Some("agent:parent".into());
-    incoming.source_key = Some("direct-1".into());
-    let sent = store
-        .receive_direct_send(&recipient.id, incoming.clone())
-        .unwrap();
-    assert!(matches!(sent, ReceiveOutcome::New(_)));
-    assert_eq!(store.agent(&recipient.id).unwrap().state, "running");
     drop(store);
     let store = Store::open(dir.path().join("state.db")).unwrap();
-    assert_eq!(store.agent(&recipient.id).unwrap().state, "running");
-    store.set_agent_state(&recipient.id, "archived").unwrap();
-    assert!(matches!(
-        store.receive_direct_send(&recipient.id, incoming).unwrap(),
-        ReceiveOutcome::Duplicate(_)
-    ));
     assert_eq!(store.agent(&recipient.id).unwrap().state, "archived");
-    assert_eq!(store.inbox(&recipient.id, None).unwrap().len(), 7);
+    store.set_agent_state(&recipient.id, "idle").unwrap();
+    let mut incoming = Incoming::new("after an explicit wake");
+    incoming.sender = Some("agent:parent".into());
+    store.receive(&recipient.id, incoming).unwrap();
+    assert_eq!(store.agent(&recipient.id).unwrap().state, "running");
+    assert_eq!(store.inbox(&recipient.id, None).unwrap().len(), 8);
 }
 
 #[test]
