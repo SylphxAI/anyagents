@@ -49,7 +49,7 @@ pub use s3_store::{
     S3_FORCE_PATH_STYLE_ENV, S3_PREFIX_ENV, S3_REGION_ENV, S3_SECRET_ACCESS_KEY_ENV, S3Config,
     S3Store,
 };
-pub use secret::{CredentialStore, FileCredentialStore, Secret};
+pub use secret::{CredentialStore, FileCredentialStore, Secret, StoreCredentialStore};
 pub use secrets_store::{
     DeploymentSecretMetadata, is_reserved_secret_env_key, require_deployment_master_key,
     validate_secret_env_key, validate_secret_name,

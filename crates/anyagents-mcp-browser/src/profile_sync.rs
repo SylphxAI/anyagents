@@ -267,6 +267,18 @@ pub fn resolve_coordinator_auth(explicit: Option<&str>) -> Option<CoordinatorAut
     resolve_coordinator_auth_from(explicit, non_empty_env)
 }
 
+/// Strip MCP/webhook path suffixes so coordinator API URLs resolve to the origin root.
+pub fn normalize_api_base_url(raw: &str) -> String {
+    let mut url = raw.trim().trim_end_matches('/');
+    for suffix in ["/v1/webhooks/mcp", "/v1/mcp", "/mcp", "/v1/webhooks"] {
+        if let Some(stripped) = url.strip_suffix(suffix) {
+            url = stripped.trim_end_matches('/');
+            break;
+        }
+    }
+    url.to_string()
+}
+
 pub fn resolve_api_url(config: &BrowserServerConfig) -> Result<Option<String>, BrowserError> {
     let Some(u) =
         non_empty_trimmed(config.api_url.as_deref()).or_else(|| non_empty_env(API_URL_ENV))
@@ -280,7 +292,8 @@ pub fn resolve_api_url(config: &BrowserServerConfig) -> Result<Option<String>, B
             "`ANYAGENTS_API_URL` must use http/https",
         ));
     }
-    Ok(Some(u.trim_end_matches('/').to_string()))
+    let normalized = normalize_api_base_url(&u);
+    Ok((!normalized.is_empty()).then_some(normalized))
 }
 
 /// Resolve optional coordinator profile sync configuration for the active named
@@ -1529,5 +1542,27 @@ mod tests {
             resolve_screenshot_path(&cfg, Some("/tmp/abs.png")),
             PathBuf::from("/tmp/abs.png")
         );
+    }
+
+    #[test]
+    fn resolve_api_url_normalizes_webhook_and_mcp_suffixes() {
+        for raw in [
+            "https://coord.example/v1/webhooks/mcp",
+            "https://coord.example/v1/webhooks/mcp/",
+            "https://coord.example/v1/webhooks",
+            "https://coord.example/v1/mcp",
+            "https://coord.example/mcp",
+            "https://coord.example/",
+        ] {
+            let cfg = BrowserServerConfig {
+                api_url: Some(raw.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                resolve_api_url(&cfg).unwrap().as_deref(),
+                Some("https://coord.example"),
+                "{raw}"
+            );
+        }
     }
 }
