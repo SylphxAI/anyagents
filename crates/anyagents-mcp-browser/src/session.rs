@@ -119,7 +119,7 @@ pub enum BrowserBackend {
     Headless {
         child: Child,
         ws_endpoint: String,
-        web: Web,
+        web: Box<Web>,
     },
     Desktop {
         session: Arc<DesktopSession>,
@@ -610,7 +610,7 @@ pub(crate) async fn launch_instance(
         backend: BrowserBackend::Headless {
             child,
             ws_endpoint,
-            web,
+            web: Box::new(web),
         },
         persistent_profile: ws.persistent_profile,
         active_profile: ws.active_profile,
