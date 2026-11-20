@@ -4704,7 +4704,7 @@ fn archetype_templates_apply_frontmatter_defaults_and_prepend_instructions() {
 }
 
 #[test]
-fn archetype_absence_preserves_http_harness_defaults_and_explicit_inheritance() {
+fn http_spawn_uses_deployment_harness_for_roots_but_parent_for_children() {
     let _env = env_lock();
     unsafe {
         std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
@@ -4716,9 +4716,16 @@ fn archetype_absence_preserves_http_harness_defaults_and_explicit_inheritance() 
         .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
         .unwrap();
     tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let unconfigured = create_agent_route(
+            Principal::Operator, State(state.clone()), axum::http::HeaderMap::new(),
+            Json(serde_json::from_value(serde_json::json!({"name": "unconfigured", "parent": "root"})).unwrap()),
+        ).await.err().expect("root without a harness or deployment default must be refused");
+        assert_eq!(unconfigured.status, StatusCode::BAD_REQUEST);
+        assert!(state.store.agent_by_name("unconfigured").is_err());
+        std::fs::write(dir.path().join("subagent-defaults.json"), r#"{"default":{"mode":"preset","harness":"codex"}}"#).unwrap();
         for (name, parent_ref, harness, expected) in [
-            ("root-default", "root", None, "claude-code"),
-            ("child-default", parent.id.as_str(), None, "claude-code"),
+            ("root-default", "root", None, "codex"),
+            ("child-default", parent.id.as_str(), None, "opencode"),
             ("child-empty", parent.id.as_str(), Some(""), "opencode"),
             ("child-inherit", parent.id.as_str(), Some("inherit"), "opencode"),
             ("child-explicit", parent.id.as_str(), Some("codex"), "codex"),
@@ -4860,6 +4867,7 @@ fn create_agent_route_defaults_omitted_and_empty_role_to_builtin_general() {
         ] {
             let mut body = serde_json::json!({
                 "name": name,
+                "harness": "claude-code",
                 "workdir": work,
             });
             if let Some(obj) = extra.as_object() {
