@@ -16,6 +16,87 @@ use super::bootstrap::socket_path;
 use super::types::{ApiError, AppState, spawn_store};
 use super::{build_router, in_flight, serverless};
 
+/// The early socket stays bound through startup. Switch its entire router at
+/// once so neither existing connections nor new ones see an unmounted API.
+pub(super) struct StartupListener {
+    addr: std::net::SocketAddr,
+    router: tokio::sync::watch::Sender<Option<Router>>,
+    serving: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StartupListener {
+    pub(super) fn new(
+        listener: tokio::net::TcpListener,
+        stop: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        let addr = listener.local_addr().expect("bound startup socket");
+        let (router, mounted) = tokio::sync::watch::channel::<Option<Router>>(None);
+        // Liveness is not readiness. Recognize the booting API as unavailable
+        // without constructing its authenticated handlers from partial state.
+        let startup = Router::new()
+            .route("/healthz", get(super::ops::public_healthz))
+            .route("/readyz", get(startup_unavailable))
+            .route("/", get(startup_unavailable))
+            .route("/v1/{*path}", axum::routing::any(startup_unavailable))
+            .route("/mcp", get(startup_unavailable).post(startup_unavailable));
+        let app = Router::new().fallback(move |request: axum::extract::Request| {
+            use hyper::service::Service as _;
+            let router = mounted.borrow().clone().unwrap_or_else(|| startup.clone());
+            async move {
+                match hyper_util::service::TowerToHyperService::new(router)
+                    .call(request)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(never) => match never {},
+                }
+            }
+        });
+        let serving = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(stop)
+                .await;
+        });
+        Self {
+            addr,
+            router,
+            serving: Some(serving),
+        }
+    }
+
+    pub(super) fn addr(&self) -> std::net::SocketAddr {
+        self.addr
+    }
+
+    /// Release the provisional bind before binding the final listener policy.
+    pub(super) async fn close(mut self) {
+        if let Some(task) = self.serving.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    pub(super) fn mount(mut self, app: Router) -> tokio::task::JoinHandle<()> {
+        self.router.send_replace(Some(app));
+        self.serving.take().expect("startup listener task")
+    }
+}
+
+impl Drop for StartupListener {
+    fn drop(&mut self) {
+        if let Some(task) = self.serving.take() {
+            task.abort();
+        }
+    }
+}
+
+async fn startup_unavailable() -> impl IntoResponse {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+    )
+}
+
 pub(super) fn public_router() -> Router<AppState> {
     Router::new()
         .route("/v1/webhooks/events/{*topic}", post(event_webhook))
@@ -467,6 +548,69 @@ async fn mcp_post(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn startup_listener_reports_unavailable_until_routes_are_mounted() {
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let listener = StartupListener::new(socket, async move {
+            let _ = stopped.await;
+        });
+        let addr = listener.addr();
+        let clients = ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .timeout_global(Some(std::time::Duration::from_secs(2)))
+            .build()
+            .new_agent();
+        let request = |method: &'static str, path: &'static str| {
+            let clients = clients.clone();
+            tokio::task::spawn_blocking(move || {
+                let url = format!("http://{addr}{path}");
+                let response = if method == "POST" {
+                    clients
+                        .post(&url)
+                        .send(br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#)
+                } else {
+                    clients.get(&url).call()
+                }
+                .unwrap();
+                let (parts, mut body) = response.into_parts();
+                let _ = body.read_to_vec().unwrap(); // return the connection to the pool
+                (parts.status, parts.headers)
+            })
+        };
+        for (method, path, expected) in [
+            ("GET", "/healthz", 200),
+            ("GET", "/readyz", 503),
+            ("GET", "/", 503),
+            ("GET", "/v1/agents", 503),
+            ("POST", crate::remote::MCP_PATH, 503),
+            ("GET", "/unrelated", 404),
+        ] {
+            let (status, headers) = request(method, path).await.unwrap();
+            assert_eq!(status, expected, "{method} {path}");
+            if expected != 404 {
+                assert_eq!(headers["cache-control"], "no-store");
+            }
+        }
+
+        let task = listener.mount(
+            Router::new()
+                .route("/readyz", get(super::super::ops::public_healthz))
+                .route(
+                    crate::remote::MCP_PATH,
+                    post(|| async { StatusCode::UNAUTHORIZED }),
+                ),
+        );
+        assert_eq!(request("GET", "/readyz").await.unwrap().0, 200);
+        assert_eq!(
+            request("POST", crate::remote::MCP_PATH).await.unwrap().0,
+            401
+        );
+        stop.send(()).unwrap();
+        task.await.unwrap();
+    }
 
     #[test]
     fn mcp_hydration_skips_fast_read_tools_and_enables_memory_and_workspace_tools() {
