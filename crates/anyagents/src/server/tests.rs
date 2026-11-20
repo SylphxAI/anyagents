@@ -2884,16 +2884,17 @@ fn archive_reap_marker_survives_restart_and_is_invalidated_by_wake_and_rearchive
     }
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("state.db");
-    let store = Store::open(&db).unwrap();
+    let state = archetype_validation_state(dir.path());
+    let store = state.store.as_ref();
     let parent = store
         .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
         .unwrap();
-    let child = archived_reap_fixture(&store, "worker", &parent);
+    let child = archived_reap_fixture(store, "worker", &parent);
     let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
     let generation = std::fs::read(cfg.join(".anyagents-archived")).unwrap();
     std::fs::write(cfg.join(".anyagents-reaped"), b"foreign generation").unwrap();
     std::fs::create_dir_all(cfg.join(".cache")).unwrap();
-    reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+    reap_archived_agents(store, dir.path(), &HealthBoard::default());
     assert!(!cfg.join(".cache").exists());
     assert_eq!(
         std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
@@ -2905,13 +2906,19 @@ fn archive_reap_marker_survives_restart_and_is_invalidated_by_wake_and_rearchive
     reap_archived_agents(&restarted, dir.path(), &HealthBoard::default());
     assert!(cfg.join("cache-home").exists());
     let stale_child = restarted.agent(&child.id).unwrap();
-    authored_send(
-        &store,
-        &Actor::Agent(parent.name.clone()),
-        "worker",
-        "continue",
-        "wake-reaped",
-    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let Json(woken) = rt
+        .block_on(wake_agent_route(
+            Principal::Operator,
+            State(state.clone()),
+            AxumPath(child.name.clone()),
+            axum::http::HeaderMap::new(),
+        ))
+        .unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(woken.state, "running");
     assert!(!cfg.join(".anyagents-reaped").exists());
     assert!(!cfg.join(".anyagents-archived").exists());
     {
@@ -2923,13 +2930,13 @@ fn archive_reap_marker_survives_restart_and_is_invalidated_by_wake_and_rearchive
         "stale cleanup deleted running config"
     );
     assert_eq!(store.agent(&child.id).unwrap().state, "running");
-    mark_explicitly_archived(&store, dir.path(), &child);
+    mark_explicitly_archived(store, dir.path(), &child);
     assert_ne!(
         std::fs::read(cfg.join(".anyagents-archived")).unwrap(),
         generation
     );
     assert!(!cfg.join(".anyagents-reaped").exists());
-    reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+    reap_archived_agents(store, dir.path(), &HealthBoard::default());
     assert!(!cfg.join("cache-home").exists());
     assert_eq!(
         std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
@@ -4418,9 +4425,39 @@ fn archived_agents_stay_retired_on_channel_senders_aliases_groups_and_deleted_ta
     store.join_group("crew", &child.id).unwrap();
     let operator = Actor::Operator("operator".into());
     for to in ["all", "group:all", "group:crew"] {
-        authored_send(&store, &operator, to, "broadcast", to);
+        let response = authored_send(&store, &operator, to, "broadcast", to);
+        assert!(response.deliveries.iter().all(|d| d.to != "agent:worker"));
+        if to == "group:crew" {
+            assert!(
+                response
+                    .skipped
+                    .iter()
+                    .any(|s| s.to == "agent:worker" && s.reason.contains("is archived"))
+            );
+        }
         assert_eq!(store.agent(&child.id).unwrap().state, "archived");
+        assert!(store.inbox(&child.id, None).unwrap().is_empty());
     }
+    // A marker alone must exclude a named member from fan-out too.
+    store.set_agent_state(&child.id, "running").unwrap();
+    let mixed = authored_send(&store, &operator, "group:crew", "no unread mail", "mixed");
+    assert_eq!(mixed.deliveries.len(), 1);
+    assert_eq!(mixed.skipped[0].to, "agent:worker");
+    assert!(store.inbox(&child.id, None).unwrap().is_empty());
+    store.set_agent_state(&child.id, "archived").unwrap();
+    store.join_group("retired", &child.id).unwrap();
+    let refused = try_authored_send(
+        &store,
+        &operator,
+        "group:retired",
+        "no unread mail",
+        "retired",
+    )
+    .expect_err("named group has only archived members");
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert!(refused.message.contains("agent `worker` is archived"));
+    assert!(refused.message.contains("agents(action=\"wake\")"));
+    assert!(store.inbox(&child.id, None).unwrap().is_empty());
     let actor = Actor::Agent(parent.name.clone());
     for to in ["children", "group:children", "siblings"] {
         let body = SendRequest {

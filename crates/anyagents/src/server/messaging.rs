@@ -865,6 +865,10 @@ pub(super) fn check_targets(
                     }
                 }
                 if room_recipients(store, body, room).is_empty() {
+                    let (archived, _) = room_skipped(store, body, room);
+                    if let Some(archived) = archived.first() {
+                        return Err(archived_conflict(&archived.reason));
+                    }
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
                         format!("room {room} has no agent to deliver to"),
@@ -1079,9 +1083,18 @@ pub(super) fn send_sync(
                         upload.as_ref(),
                     )?
                 };
-                let mut room_skip = room_skipped(store, &body, room);
+                let (archived, inactive) = room_skipped(store, &body, room);
+                let archived = archived
+                    .into_iter()
+                    .filter(|s| !all.iter().any(|d| d.to == s.to));
+                for s in archived {
+                    refused_archived.push(s.reason.clone());
+                    if !skipped.iter().any(|existing| existing.to == s.to) {
+                        skipped.push(s);
+                    }
+                }
                 deliveries.append(&mut all);
-                for s in room_skip.drain(..) {
+                for s in inactive {
                     if !skipped
                         .iter()
                         .any(|existing: &crate::api::SkippedDelivery| existing.to == s.to)

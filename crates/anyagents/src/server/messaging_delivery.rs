@@ -468,15 +468,19 @@ pub(super) fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> 
         .collect()
 }
 
-/// Non-running agents in a room that a broadcast or group send skipped, with their state reason.
+/// Archived and otherwise inactive agents a room send skipped. Broadcasts do
+/// not address retired agents; explicit group membership can.
 pub(super) fn room_skipped(
     store: &Store,
     body: &SendRequest,
     room: &str,
-) -> Vec<crate::api::SkippedDelivery> {
+) -> (
+    Vec<crate::api::SkippedDelivery>,
+    Vec<crate::api::SkippedDelivery>,
+) {
     let name = room.strip_prefix("group:").unwrap_or(room);
     if name == "all" || name == "peers" {
-        return store
+        let inactive = store
             .list_live_agents()
             .unwrap_or_default()
             .into_iter()
@@ -490,10 +494,11 @@ pub(super) fn room_skipped(
                 reason: agent.state,
             })
             .collect();
+        return (Vec::new(), inactive);
     }
     let members = match store.room_members(room) {
         Ok(Some(members)) => members,
-        _ => return Vec::new(),
+        _ => return (Vec::new(), Vec::new()),
     };
     // One row per member name, in name order.
     let members: std::collections::BTreeMap<_, _> = members
@@ -502,15 +507,22 @@ pub(super) fn room_skipped(
         .filter(|agent| members.contains(&agent.name))
         .map(|agent| (agent.name.clone(), agent))
         .collect();
-    members
+    let mut archived = Vec::new();
+    let mut inactive = Vec::new();
+    for agent in members
         .into_values()
         .filter(|agent| !body_author_is(body, agent))
-        .filter(|agent| agent.state != "running" && agent.state != "idle")
-        .map(|agent| crate::api::SkippedDelivery {
-            to: format!("agent:{}", agent.name),
-            reason: agent.state,
-        })
-        .collect()
+    {
+        if is_explicitly_archived(store.data_dir(), &agent) {
+            archived.push(archived_skip(store, &agent));
+        } else if agent.state != "running" && agent.state != "idle" {
+            inactive.push(crate::api::SkippedDelivery {
+                to: format!("agent:{}", agent.name),
+                reason: agent.state,
+            });
+        }
+    }
+    (archived, inactive)
 }
 
 /// One room message, one delivery per recipient.
@@ -553,7 +565,7 @@ pub(super) fn deliver_room_with_media(
     upload: Option<&crate::telegram::MediaUpload>,
 ) -> Result<Vec<Delivery>, ApiError> {
     let delivered = store
-        .receive_room_with(
+        .try_receive_room_with(
             room,
             Incoming {
                 text: body.text.clone(),
@@ -566,7 +578,12 @@ pub(super) fn deliver_room_with_media(
                 received_at_ms: None,
             },
             |agent, mut incoming| {
-                let (text, staged) = recipient_media_text(store, body, agent, upload)?;
+                let _lifecycle = store.lock_agent_lifecycle(&agent.id)?;
+                let agent = store.agent(&agent.id)?;
+                if is_explicitly_archived(store.data_dir(), &agent) {
+                    return Ok(None);
+                }
+                let (text, staged) = recipient_media_text(store, body, &agent, upload)?;
                 incoming.text = text;
                 let outcome = store.receive(&agent.id, incoming)?;
                 if matches!(outcome, ReceiveOutcome::New(_))
@@ -574,7 +591,7 @@ pub(super) fn deliver_room_with_media(
                 {
                     staged.retain();
                 }
-                Ok(outcome)
+                Ok(Some(outcome))
             },
         )
         .map_err(ApiError::from_store)?;
