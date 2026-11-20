@@ -3,22 +3,25 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
   <title>Sign in · AnyAgents</title>
   <link rel="stylesheet" href="/assets/console.css">
   <script type="module" src="/assets/signin.js"></script>
 </head>
-<body>
-  <main class="auth-layout">
-    <div class="auth-mast"><a class="brand" href="/"><span class="auth-mark" aria-hidden="true">A</span><strong>AnyAgents</strong></a><span id="auth-theme"></span></div>
-    <section class="auth-card panel">
-      <span class="eyebrow">OPERATOR ACCESS</span>
+<body class="auth">
+  <header class="auth-bar"><a class="brand" href="/"><svg class="mark" width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><rect width="24" height="24" rx="6" fill="currentColor"/><path d="M6.2 17.5 11 6.5h2l4.8 11h-2.4l-1-2.4H9.6l-1 2.4H6.2Zm4.2-4.4h3.2L12 9.1l-1.6 4Z" fill="var(--mark-ink)" fill-rule="evenodd"/></svg><span>AnyAgents</span></a><span id="auth-theme"></span></header>
+  <main class="auth-main">
+    <section class="auth-card">
       <h1>Sign in to AnyAgents</h1>
-      <p>Use your identity provider to access this coordinator’s control plane.</p>
-      <a class="button primary auth-cta" href="/admin/auth/login">Sign in with OIDC <span aria-hidden="true">↗</span></a>
-      <div class="auth-cli"><div class="auth-cli-head"><h2>Prefer the CLI?</h2><span id="auth-copy"></span></div>
+      <p class="auth-lede">Use your identity provider to open this coordinator’s control plane.</p>
+      <a class="btn primary auth-cta" href="/admin/auth/login">Sign in with OIDC</a>
+      <div class="auth-divider"><span>or use the CLI</span></div>
+      <div class="auth-cli">
         <pre><code id="auth-command">anyagents auth login --url {{COORDINATOR_URL}}</code></pre>
+        <span id="auth-copy"></span>
       </div>
     </section>
+    <p class="auth-foot">Access is limited to operators configured for this deployment.</p>
   </main>
 </body>
 </html>
