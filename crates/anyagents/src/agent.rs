@@ -954,18 +954,27 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
             }
         }
     }
+    offline_agent_view(&store, data, agent)
+}
+
+fn offline_agent_view(
+    store: &Store,
+    data: &Path,
+    agent: anyagents_core::Agent,
+) -> Result<AgentView, Error> {
     let lag = store.lag(&agent.id, anyagents_core::now_ms())?;
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
-    let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
+    let secrets = store.list_agent_secrets(&agent.id).unwrap_or_default();
+    let seat_info = crate::create::resolved_agent_seat_info(store, &agent);
     let public_desc = agent.public_description();
     let scope_val = agent.scope().to_string();
     let lifecycle_val = agent.lifecycle().to_string();
     let delivery: crate::api::DeliveryView =
         (&crate::vendor::declared_delivery(&agent.harness)).into();
     let effective_instructions =
-        crate::create::effective_agent_instructions(Some(&store), data, &agent);
+        crate::create::effective_agent_instructions(Some(store), data, &agent);
     let schedules =
-        crate::schedule::list_agent_schedules(&store, &agent.id, false).map_err(Error::Message)?;
+        crate::schedule::list_agent_schedules(store, &agent.id, false).map_err(Error::Message)?;
     let automations = crate::api::AutomationCountsView::from_schedules(&schedules);
     Ok(AgentView {
         has_open_turn: false,
@@ -1007,6 +1016,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         automations,
         turn_errors: None,
         unsettled_outbound: Vec::new(),
+        secrets,
         retry_at_ms: None,
     })
 }
@@ -1115,62 +1125,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
             .receive(&agent.id, anyagents_core::Incoming::new(prompt))
             .map_err(|e| e.to_string())?;
     }
-    let lag = store
-        .lag(&agent.id, anyagents_core::now_ms())
-        .map_err(|err| err.to_string())?;
-    let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
-    let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
-    let public_desc = agent.public_description();
-    let scope_val = agent.scope().to_string();
-    let lifecycle_val = agent.lifecycle().to_string();
-    let delivery: crate::api::DeliveryView =
-        (&crate::vendor::declared_delivery(&agent.harness)).into();
-    let effective_instructions =
-        crate::create::effective_agent_instructions(Some(&store), data, &agent);
-    let schedules = crate::schedule::list_agent_schedules(&store, &agent.id, false)?;
-    let automations = crate::api::AutomationCountsView::from_schedules(&schedules);
-    Ok(AgentView {
-        has_open_turn: false,
-        open_turn_age_ms: None,
-        profile: None,
-        id: agent.id.to_string(),
-        name: agent.name,
-        role: agent.role,
-        aliases,
-        parent: agent.parent_id.as_ref().map(ToString::to_string),
-        scope: scope_val,
-        lifecycle: lifecycle_val,
-        relationship: None,
-        can_message: None,
-        harness: agent.harness,
-        model: agent.model,
-        live_harness: None,
-        live_model: None,
-        process_started_at_ms: None,
-        pending_switch: false,
-        workdir: agent.workdir,
-        state: agent.state,
-        process: "-".to_string(),
-        turn_state: "idle".to_string(),
-        delivery_mode: delivery.legacy_mode(),
-        steer_support: delivery.legacy_steer(),
-        delivery,
-        quota_reset_at_ms: None,
-        block_reason: None,
-        last_error: None,
-        oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
-        install: "-".to_string(),
-        description: public_desc,
-        instructions: effective_instructions,
-        seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
-        seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
-        seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
-        schedules,
-        automations,
-        turn_errors: None,
-        unsettled_outbound: Vec::new(),
-        retry_at_ms: None,
-    })
+    offline_agent_view(&store, data, agent).map_err(|err| err.to_string())
 }
 
 /// End an agent's remote sessions: through the server when it runs, else in

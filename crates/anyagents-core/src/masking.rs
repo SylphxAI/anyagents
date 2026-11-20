@@ -1,5 +1,8 @@
 //! Shared credential masking for transport ingestion and durable history.
-pub use anyagents_harness::masking::{mask_json_strings, mask_known_secrets};
+pub use anyagents_harness::masking::{
+    mask_json_strings, mask_json_with_secrets, mask_known_secrets, mask_with_secrets,
+    register_secret_values,
+};
 
 #[cfg(test)]
 mod persistence_tests {

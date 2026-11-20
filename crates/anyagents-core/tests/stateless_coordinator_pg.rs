@@ -737,7 +737,7 @@ fn pg_remote_turn_store_survives_replica_handoff_and_settles_idempotently() {
     let store_b = Store::open_postgres_isolated(&url, dir_b.path(), format!("rturn-b-{tag}"))
         .expect("open replica B");
 
-    assert_eq!(anyagents_core::db::PG_LATEST_VERSION, 3);
+    assert_eq!(anyagents_core::db::PG_LATEST_VERSION, 4);
 
     let agent = store_a
         .create_agent(NewAgent::new(
