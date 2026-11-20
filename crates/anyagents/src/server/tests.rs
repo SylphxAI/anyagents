@@ -1284,6 +1284,7 @@ fn reset_session_requires_management_authority_and_quiescence_before_any_pin_cha
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let principal = |a: &Agent| Principal::Agent {
@@ -1400,6 +1401,7 @@ fn a_search_past_its_index_budget_answers_partial_and_the_background_completes_i
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let search = |term: &str| {
@@ -1556,6 +1558,7 @@ fn hybrid_search_fuses_cited_dense_ranges_reranks_and_never_widens_access() {
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let principal = Principal::Agent {
@@ -1649,6 +1652,7 @@ fn canonical_raw_ranges_bind_owned_digest_and_return_bounded_exact_bytes() {
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let principal = || Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() };
@@ -1735,6 +1739,7 @@ fn canonical_conversation_scopes_files_under_real_ancestor_authority() {
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
@@ -2103,6 +2108,7 @@ fn writes_on_the_tcp_listeners_hold_the_stop() {
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         use tokio::io::AsyncWriteExt;
@@ -2182,6 +2188,7 @@ fn sign_in_route_carries_in_flight_token_until_blocking_work_finishes() {
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         use hyper::service::Service as _;
@@ -2361,6 +2368,7 @@ fn describe_preserves_scope_and_audits_authorized_policy_updates() {
         sign_in: Arc::new(Mutex::new(ProcessRunner)),
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         auth: auth::Mode::Trusted {
             data_dir: dir.path().to_path_buf(),
         },
@@ -2463,6 +2471,7 @@ fn spawn_defaults_to_private_regardless_of_role() {
         sign_in: Arc::new(Mutex::new(ProcessRunner)),
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         auth: auth::Mode::Trusted {
             data_dir: dir.path().into(),
         },
@@ -3051,6 +3060,7 @@ fn roots_and_role_bearing_children_can_self_archive_without_losing_browser_profi
         sign_in: Arc::new(Mutex::new(ProcessRunner)),
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         auth: auth::Mode::Trusted {
             data_dir: dir.path().into(),
         },
@@ -4577,6 +4587,7 @@ fn archetype_templates_apply_frontmatter_defaults_and_prepend_instructions() {
         sign_in: Arc::new(Mutex::new(ProcessRunner)),
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         auth: auth::Mode::Trusted {
             data_dir: dir.path().into(),
         },
@@ -4767,6 +4778,7 @@ fn archetype_validation_state(data: &Path) -> AppState {
         sign_in: Arc::new(Mutex::new(ProcessRunner)),
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         auth: auth::Mode::Trusted {
             data_dir: data.into(),
         },
@@ -9001,6 +9013,7 @@ fn stateless_two_replicas_mcp_and_gateway_never_revoke_capabilities_or_overwrite
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     let state_b = AppState {
         store: Arc::clone(&store_b),
@@ -9011,6 +9024,7 @@ fn stateless_two_replicas_mcp_and_gateway_never_revoke_capabilities_or_overwrite
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
 
     // 1. Replica A creates a remote-sandbox-backed agent with a live local capability,

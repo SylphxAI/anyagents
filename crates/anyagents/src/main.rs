@@ -48,6 +48,7 @@ mod serverless_cloud;
 mod signin;
 mod spiron;
 mod telegram;
+mod timer;
 mod ui;
 mod vendor;
 
@@ -2794,22 +2795,24 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
     Ok(())
 }
 
-/// Physical fixture roots keep system aliases (for example a temporary-root
-/// symlink) outside the boundary. Product readers still refuse all symlinks.
 #[cfg(test)]
-pub(crate) fn test_tempdir() -> tempfile::TempDir {
-    tempfile::tempdir_in(
-        std::env::temp_dir()
-            .canonicalize()
-            .expect("physical temporary root"),
-    )
-    .expect("owned temporary fixture")
-}
+pub(crate) use cli_query_tests::test_tempdir;
 
 #[cfg(test)]
 mod cli_query_tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// Physical fixture roots keep system aliases (for example a temporary-root
+    /// symlink) outside the boundary. Product readers still refuse all symlinks.
+    pub(crate) fn test_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in(
+            std::env::temp_dir()
+                .canonicalize()
+                .expect("physical temporary root"),
+        )
+        .expect("owned temporary fixture")
+    }
 
     #[test]
     fn internal_commands_are_hidden_but_direct_help_still_parses() {

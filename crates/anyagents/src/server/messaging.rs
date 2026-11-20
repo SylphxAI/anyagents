@@ -192,6 +192,7 @@ pub(super) async fn send(
     // that is the one place a body chooses the author, and an inbox is still
     // only ever its own.
     let dispatch_store = Arc::clone(&state.store);
+    let dispatch_timer = Arc::clone(&state.timer_backend);
     let response = spawn_store(move || {
         let route_named = match &principal {
             Principal::Agent { name, .. } if state.auth.is_trusted() => body
@@ -284,6 +285,7 @@ pub(super) async fn send(
         // a dispatch mid-flight after recording `pending_remote_turns`.
         for agent_name in recipient_names {
             let store_disp = Arc::clone(&dispatch_store);
+            let timer_disp = Arc::clone(&dispatch_timer);
             let call = super::in_flight::carry();
             tokio::spawn(async move {
                 let _call = call;
@@ -295,9 +297,12 @@ pub(super) async fn send(
                 else {
                     return;
                 };
-                if let Err(err) =
-                    serverless::dispatch_next_mailbox_message_if_serverless(store_disp, &agent.id)
-                        .await
+                if let Err(err) = serverless::dispatch_next_mailbox_message_with_timer(
+                    store_disp,
+                    &agent.id,
+                    Some(timer_disp),
+                )
+                .await
                 {
                     eprintln!(
                         "anyagents-serverless: /v1/send dispatch failed for {}: {err}",

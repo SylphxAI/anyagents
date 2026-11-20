@@ -742,6 +742,7 @@ mod tests {
             },
             identity: Arc::new(crate::identity::ServingIdentity::capture()),
             profiles,
+            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         };
         build_router(state)
     }

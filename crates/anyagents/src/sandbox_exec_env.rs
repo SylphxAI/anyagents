@@ -36,6 +36,15 @@ pub(crate) fn is_blocked_sandbox_env_key(key: &str) -> bool {
             | "ANYAGENTS_TICK_ISS"
             | "ANYAGENTS_TICK_JWKS_URL"
             | "ANYAGENTS_TICK_SIGNATURE_HEADER"
+            | "ANYAGENTS_TIMER_TOKEN"
+            | "ANYAGENTS_TIMER_AUD"
+            | "ANYAGENTS_TIMER_ISS"
+            | "ANYAGENTS_TIMER_SUB"
+            | "ANYAGENTS_TIMER_JWKS_URL"
+            | "ANYAGENTS_TIMER_SIGNATURE_HEADER"
+            | "ANYAGENTS_TIMER_SCHEDULER_URL"
+            | "ANYAGENTS_TIMER_SCHEDULER_TOKEN"
+            | "ANYAGENTS_TIMER_SCHEDULER_MODE"
             | "ANYAGENTS_SANDBOX_TOKEN"
             | "ANYAGENTS_SYLPHX_TOKEN"
             | "ANYAGENTS_CLOUD_WEBHOOK_SECRET"
@@ -54,6 +63,7 @@ pub(crate) fn is_blocked_sandbox_env_key(key: &str) -> bool {
         || upper == "ANYAGENTS_BEARER_TOKEN"
         || upper == "XDG_STATE_HOME"
         || upper.starts_with("ANYAGENTS_TICK_")
+        || upper.starts_with("ANYAGENTS_TIMER_")
         || upper.starts_with("ANYAGENTS_S3_")
         || upper.starts_with(SANDBOX_ENV_PREFIX)
 }
@@ -475,6 +485,18 @@ mod tests {
             (
                 "ANYAGENTS_SANDBOX_ENV_ANYAGENTS_TICK_TOKEN".into(),
                 "tick-secret".into(),
+            ),
+            (
+                "ANYAGENTS_SANDBOX_ENV_ANYAGENTS_TIMER_TOKEN".into(),
+                "timer-secret".into(),
+            ),
+            (
+                "ANYAGENTS_SANDBOX_ENV_ANYAGENTS_TIMER_SCHEDULER_TOKEN".into(),
+                "timer-sched-secret".into(),
+            ),
+            (
+                "ANYAGENTS_SANDBOX_ENV_ANYAGENTS_TIMER_JWKS_URL".into(),
+                "https://jwks.example.test/.well-known/jwks.json".into(),
             ),
             (
                 "ANYAGENTS_SANDBOX_ENV_ANYAGENTS_SANDBOX_TOKEN".into(),

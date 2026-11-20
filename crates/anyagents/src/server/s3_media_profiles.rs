@@ -964,6 +964,7 @@ mod tests {
             },
             identity: Arc::new(crate::identity::ServingIdentity::capture()),
             profiles: Default::default(),
+            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         };
         router().with_state(state)
     }

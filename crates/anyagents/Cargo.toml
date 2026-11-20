@@ -37,6 +37,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 futures = "0.3"
 hyper-util = { version = "0.1", features = ["service", "tokio"] }
+jiff = "0.2"
 libc = "0.2"
 ring = "0.17"
 rmcp = { version = "3.5", features = [

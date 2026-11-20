@@ -140,17 +140,18 @@ pub(crate) async fn overview_route(
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let tick_token_configured = serverless::configured_tick_token().is_some();
-        let tick_jwks_configured = std::env::var("ANYAGENTS_TICK_JWKS_URL")
-            .ok()
-            .is_some_and(|s| !s.trim().is_empty());
+        let timer_token_configured = super::timer_fire::configured_timer_token().is_some();
+        let timer_jwks_configured = super::timer_fire::configured_timer_jwks_url().is_some();
+        let timer_scheduler_configured =
+            super::timer_fire::configured_timer_scheduler_url().is_some();
 
         Ok(Json(json!({
             "serverless": serverless::is_serverless_mode(),
             "public_url": serverless::resolve_public_url(store.data_dir()),
             "sandbox_provider": sandbox_provider,
-            "tick_token_configured": tick_token_configured,
-            "tick_jwks_configured": tick_jwks_configured,
+            "timer_token_configured": timer_token_configured,
+            "timer_jwks_configured": timer_jwks_configured,
+            "timer_scheduler_configured": timer_scheduler_configured,
             "active_sandboxes_count": active_sandboxes_count,
             "agents_meta": Value::Object(agents_meta),
             "active_remote_turns": active_remote_turns,
@@ -223,6 +224,7 @@ mod tests {
             auth,
             identity: Arc::new(crate::identity::ServingIdentity::capture()),
             profiles: Default::default(),
+            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         }
     }
 
