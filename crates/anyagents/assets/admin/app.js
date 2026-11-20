@@ -525,25 +525,12 @@
     clearNode(badgesEl);
     if (meta.is_admin) badgesEl.appendChild(pill("ADMIN", "purple"));
     badgesEl.appendChild(pill(st, stateTone(st)));
+    if (agent.runtime) badgesEl.appendChild(pill(`${agent.harness}@${agent.runtime}`, agent.runtime === "cloud" ? "accent" : "muted"));
     if (agent.turn_state) badgesEl.appendChild(pill(`turn:${agent.turn_state}`, "muted"));
-    if (agent.has_open_turn) {
-      badgesEl.appendChild(
-        pill(
-          agent.open_turn_age_ms ? `open turn (${fmtRelativeMs(agent.open_turn_age_ms)})` : "open turn",
-          "accent"
-        )
-      );
-    }
-    if (meta.unread_count > 0) {
-      badgesEl.appendChild(pill(`${meta.unread_count} unread`, "warning"));
-    }
+    if (agent.has_open_turn) badgesEl.appendChild(pill(agent.open_turn_age_ms ? `open turn (${fmtRelativeMs(agent.open_turn_age_ms)})` : "open turn", "accent"));
+    if (meta.unread_count > 0) badgesEl.appendChild(pill(`${meta.unread_count} unread`, "warning"));
     if (meta.sandbox_lease && meta.sandbox_lease.lease_state) {
-      badgesEl.appendChild(
-        pill(
-          `sandbox ${meta.sandbox_lease.provider}:${meta.sandbox_lease.lease_state}`,
-          meta.sandbox_lease.lease_state === "ready" ? "success" : "muted"
-        )
-      );
+      badgesEl.appendChild(pill(`sandbox ${meta.sandbox_lease.provider}:${meta.sandbox_lease.lease_state}`, meta.sandbox_lease.lease_state === "ready" ? "success" : "muted"));
     }
 
     // Button visibility & state
@@ -570,8 +557,9 @@
     const parentAgent = agent.parent ? state.agents.find((a) => a.id === agent.parent) : null;
     const lease = meta.sandbox_lease;
     const fields = [
-      ["Harness", agent.harness],
+      ["Harness", agent.runtime ? `${agent.harness} (${agent.runtime})` : agent.harness],
       ["Model", agent.model || "(default)"],
+      ...(agent.remote_budget_micros ? [["Budget Cap", `$${(agent.remote_budget_micros / 1e6).toFixed(2)}`]] : []),
       ["Profile", agent.profile || "(auto)"],
       ["Parent", parentAgent ? parentAgent.name : agent.parent || "(root)"],
       ["Process", agent.process || "-"],
@@ -669,22 +657,19 @@
       openModal("modal-spawn");
     });
 
+    const parseBudgetMicros = (id) => {
+      const raw = $(id).value.trim();
+      if (!raw) return null;
+      const usd = Number(raw);
+      return Number.isFinite(usd) && usd >= 0 ? Math.round(usd * 1e6) : null;
+    };
+
     $("form-spawn").addEventListener("submit", async (evt) => {
       evt.preventDefault();
-      const body = {
-        name: $("spawn-name").value.trim(),
-        harness: $("spawn-harness").value,
-      };
-      const optFields = [
-        ["parent", "spawn-parent"],
-        ["model", "spawn-model"],
-        ["profile", "spawn-profile"],
-        ["role", "spawn-role"],
-        ["description", "spawn-description"],
-        ["instructions", "spawn-instructions"],
-        ["prompt", "spawn-prompt"],
-      ];
-      for (const [key, id] of optFields) {
+      const body = { name: $("spawn-name").value.trim(), harness: $("spawn-harness").value, runtime: $("spawn-runtime").value };
+      const cap = parseBudgetMicros("spawn-budget-usd");
+      if (cap !== null && cap > 0) body.budget_cap_micros = cap;
+      for (const [key, id] of [["parent", "spawn-parent"], ["model", "spawn-model"], ["profile", "spawn-profile"], ["role", "spawn-role"], ["description", "spawn-description"], ["instructions", "spawn-instructions"], ["prompt", "spawn-prompt"]]) {
         const v = $(id).value.trim();
         if (v) body[key] = v;
       }
@@ -704,6 +689,9 @@
       if (!agent) return;
       $("runtime-agent-name").value = agent.name;
       $("runtime-harness").value = agent.harness;
+      const rt = (agent.runtime || "local").split(":")[0];
+      $("runtime-runtime").value = ["sandbox", "local", "cloud"].includes(rt) ? rt : "local";
+      $("runtime-budget-usd").value = agent.remote_budget_micros ? (agent.remote_budget_micros / 1e6).toFixed(2) : "";
       $("runtime-model").value = agent.model || "";
       $("runtime-profile").value = agent.profile || "";
       openModal("modal-runtime");
@@ -715,19 +703,20 @@
       const agent = state.agents.find((a) => a.name === name);
       if (!agent) return;
       const harness = $("runtime-harness").value;
+      const runtime = $("runtime-runtime").value;
+      const cap = parseBudgetMicros("runtime-budget-usd");
+      const clearBudget = !$("runtime-budget-usd").value.trim() && Boolean(agent.remote_budget_micros);
       const model = $("runtime-model").value.trim() || null;
       const profile = $("runtime-profile").value.trim() || null;
+      const curRt = (agent.runtime || "local").split(":")[0];
       try {
-        if (harness !== agent.harness) {
-          await api(`/v1/agents/${encodeURIComponent(name)}/harness`, {
-            method: "POST",
-            body: { harness, model, profile },
-          });
+        if (harness !== agent.harness || runtime !== curRt || cap !== null || clearBudget) {
+          const body = { harness, runtime: runtime !== curRt ? runtime : (agent.runtime || runtime), model, profile };
+          if (cap !== null) body.budget_cap_micros = cap;
+          if (clearBudget) body.clear_budget = true;
+          await api(`/v1/agents/${encodeURIComponent(name)}/runtime`, { method: "POST", body });
         } else {
-          await api(`/v1/agents/${encodeURIComponent(name)}/model`, {
-            method: "POST",
-            body: { harness, model, profile },
-          });
+          await api(`/v1/agents/${encodeURIComponent(name)}/model`, { method: "POST", body: { harness, model, profile } });
         }
         closeModal("modal-runtime");
         toast(`Updated runtime for "${name}"`, "success");

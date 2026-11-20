@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyagents_harness::normalize_harness_name;
+use anyagents_harness::{ExecutionRuntime, resolve_harness_and_runtime};
 use rusqlite::Connection;
 
 use super::helpers::{
@@ -21,7 +21,19 @@ use crate::id::AgentId;
 const AGENT_COLS: &str = agent_cols!();
 const AGENT_LIST_COLS: &str = "id, name, harness, model, workdir, \
      CASE WHEN state = 'archived' THEN NULL ELSE instructions END AS instructions, \
-     state, created_at_ms, launch_env, parent_id, is_admin, role, description";
+     state, created_at_ms, launch_env, parent_id, is_admin, role, description, \
+     runtime, remote_budget_micros";
+
+fn budget_micros_to_db(cap_micros: Option<u64>) -> Result<Option<i64>, Error> {
+    match cap_micros.filter(|&cap| cap > 0) {
+        None => Ok(None),
+        Some(cap) => i64::try_from(cap).map(Some).map_err(|_| {
+            Error::Message(format!(
+                "remote_budget_micros {cap} exceeds maximum supported i64"
+            ))
+        }),
+    }
+}
 
 /// Default page size for unbounded `"all"` / `"archived"` roster queries.
 pub const DEFAULT_ARCHIVE_ROSTER_LIMIT: usize = 200;
@@ -90,10 +102,24 @@ impl Store {
     pub fn create_agent(&self, new: NewAgent) -> Result<Agent, Error> {
         validate_token(&new.name, "agent name")?;
         refuse_reserved_agent_name(&new.name)?;
-        let harness = normalize_harness_name(&new.harness);
-        if harness.is_empty() {
+        if new.harness.trim().is_empty() {
             return Err(Error::Message("harness is empty".into()));
         }
+        let explicit_runtime = new
+            .runtime
+            .as_ref()
+            .map(ExecutionRuntime::as_canonical_string);
+        let resolved = resolve_harness_and_runtime(
+            &new.harness,
+            explicit_runtime.as_deref(),
+            ExecutionRuntime::Local,
+        )
+        .map_err(|err| Error::Message(err.to_string()))?;
+        if resolved.harness.is_empty() {
+            return Err(Error::Message("harness is empty".into()));
+        }
+        let budget_db = budget_micros_to_db(new.remote_budget_micros)?;
+        let budget_cap = budget_db.map(|v| v as u64);
         let clean_role = new
             .role
             .as_deref()
@@ -116,13 +142,16 @@ impl Store {
                     .filter(|s| !s.is_empty())
                     .map(|line| line.chars().take(300).collect())
             });
+        let runtime_str = resolved.runtime.as_canonical_string();
         let mut agent = Agent {
             is_admin: false,
             id: AgentId::generate(),
             name: new.name,
             role: clean_role,
             description: clean_description,
-            harness: harness.to_string(),
+            harness: resolved.harness,
+            runtime: resolved.runtime,
+            remote_budget_micros: budget_cap,
             model: new.model,
             workdir: new.workdir,
             instructions: new.instructions,
@@ -146,8 +175,8 @@ impl Store {
             }
             tx.db_execute(
                 "INSERT INTO agents (
-                    id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role, description, launch_env
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8, ?9, ?10, ?11)",
+                    id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role, description, launch_env, runtime, remote_budget_micros
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 &db_params![
                     agent.id.as_str(),
                     agent.name,
@@ -160,6 +189,8 @@ impl Store {
                     agent.role,
                     agent.description,
                     encode_env(&agent.launch_env),
+                    runtime_str,
+                    budget_db,
                 ],
             )?;
             tx.db_execute(
@@ -208,15 +239,20 @@ impl Store {
     }
 
     pub fn set_agent_harness(&self, agent_id: &AgentId, harness: &str) -> Result<Agent, Error> {
-        let clean = normalize_harness_name(harness);
-        if clean.is_empty() {
+        if harness.trim().is_empty() {
             return Err(Error::Message("harness is empty".into()));
         }
         let updated = self.write_tx(|tx| {
-            agent_exists(tx, agent_id)?;
+            let current = agent_by_id(tx, agent_id)?;
+            let resolved = resolve_harness_and_runtime(harness, None, current.runtime)
+                .map_err(|err| Error::Message(err.to_string()))?;
+            if resolved.harness.is_empty() {
+                return Err(Error::Message("harness is empty".into()));
+            }
+            let runtime_str = resolved.runtime.as_canonical_string();
             tx.db_execute(
-                "UPDATE agents SET harness = ?2 WHERE id = ?1",
-                &db_params![agent_id.as_str(), clean],
+                "UPDATE agents SET harness = ?2, runtime = ?3 WHERE id = ?1",
+                &db_params![agent_id.as_str(), resolved.harness, runtime_str],
             )?;
             agent_by_id(tx, agent_id)
         })?;
@@ -224,6 +260,93 @@ impl Store {
             agent_id: agent_id.clone(),
         });
         Ok(updated)
+    }
+
+    pub fn set_agent_runtime(
+        &self,
+        agent_id: &AgentId,
+        runtime: &ExecutionRuntime,
+    ) -> Result<(), Error> {
+        let explicit = runtime.as_canonical_string();
+        self.write_tx(|tx| {
+            let current = agent_by_id(tx, agent_id)?;
+            let resolved = resolve_harness_and_runtime(
+                &current.canonical_harness(),
+                Some(&explicit),
+                ExecutionRuntime::Local,
+            )
+            .map_err(|err| Error::Message(err.to_string()))?;
+            let runtime_str = resolved.runtime.as_canonical_string();
+            tx.db_execute(
+                "UPDATE agents SET harness = ?2, runtime = ?3 WHERE id = ?1",
+                &db_params![agent_id.as_str(), resolved.harness, runtime_str],
+            )?;
+            Ok(())
+        })?;
+        self.notify(Wake::Agent {
+            agent_id: agent_id.clone(),
+        });
+        Ok(())
+    }
+
+    pub fn set_agent_harness_and_runtime(
+        &self,
+        agent_id: &AgentId,
+        harness: &str,
+        runtime: &ExecutionRuntime,
+        model: Option<&str>,
+    ) -> Result<(), Error> {
+        if harness.trim().is_empty() {
+            return Err(Error::Message("harness is empty".into()));
+        }
+        let explicit = runtime.as_canonical_string();
+        let resolved =
+            resolve_harness_and_runtime(harness, Some(&explicit), ExecutionRuntime::Local)
+                .map_err(|err| Error::Message(err.to_string()))?;
+        if resolved.harness.is_empty() {
+            return Err(Error::Message("harness is empty".into()));
+        }
+        let runtime_str = resolved.runtime.as_canonical_string();
+        let clean_model = model.map(str::trim).filter(|s| !s.is_empty());
+        self.write_tx(|tx| {
+            agent_exists(tx, agent_id)?;
+            if let Some(m) = clean_model {
+                tx.db_execute(
+                    "UPDATE agents SET harness = ?2, runtime = ?3, model = ?4 WHERE id = ?1",
+                    &db_params![agent_id.as_str(), resolved.harness, runtime_str, m],
+                )?;
+            } else {
+                tx.db_execute(
+                    "UPDATE agents SET harness = ?2, runtime = ?3 WHERE id = ?1",
+                    &db_params![agent_id.as_str(), resolved.harness, runtime_str],
+                )?;
+            }
+            Ok(())
+        })?;
+        self.notify(Wake::Agent {
+            agent_id: agent_id.clone(),
+        });
+        Ok(())
+    }
+
+    pub fn set_agent_budget_micros(
+        &self,
+        agent_id: &AgentId,
+        cap_micros: Option<u64>,
+    ) -> Result<(), Error> {
+        let db_cap = budget_micros_to_db(cap_micros)?;
+        self.write_tx(|tx| {
+            agent_exists(tx, agent_id)?;
+            tx.db_execute(
+                "UPDATE agents SET remote_budget_micros = ?2 WHERE id = ?1",
+                &db_params![agent_id.as_str(), db_cap],
+            )?;
+            Ok(())
+        })?;
+        self.notify(Wake::Agent {
+            agent_id: agent_id.clone(),
+        });
+        Ok(())
     }
 
     /// Rename an agent in place while preserving its immutable `AgentId`,
@@ -407,7 +530,8 @@ impl Store {
         }
         let aliased = conn.db_query_opt(
             "SELECT a.id, a.name, a.harness, a.model, a.workdir, a.instructions, a.state, \
-                    a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role, a.description \
+                    a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role, \
+                    a.description, a.runtime, a.remote_budget_micros \
              FROM agent_aliases al \
              JOIN agents a ON a.id = al.agent_id \
              WHERE al.alias = ?1",
@@ -1214,6 +1338,8 @@ fn roster_entry(
         role: role.clone(),
         parent_id: None,
         harness: String::new(),
+        runtime: ExecutionRuntime::Local,
+        remote_budget_micros: None,
         model: None,
         workdir: None,
         description,

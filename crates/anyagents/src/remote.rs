@@ -297,6 +297,70 @@ pub fn normalize_public_url(raw: &str) -> Result<String, String> {
     Ok(format!("{}://{rest}", scheme.to_ascii_lowercase()))
 }
 
+/// Whether this agent executes via a vendor-hosted cloud runtime (`cloud`).
+///
+/// Governed authoritatively by the agent's first-class `runtime` column (with
+/// a fallback for legacy `*-cloud` harness values if a row bypassed
+/// canonicalization): `local` and `sandbox[:provider]` agents never silently
+/// hijack into cloud execution.
+pub(crate) fn is_agent_cloud(
+    agent: &Agent,
+    _data_dir: Option<&Path>,
+    _config_dir: Option<&Path>,
+) -> bool {
+    agent.runtime.is_cloud() || crate::vendor::is_cloud_harness(&agent.harness)
+}
+
+/// Declared delivery guarantee for an agent, respecting its first-class `runtime`
+/// (`cloud` uses remote cloud delivery regardless of canonical harness name).
+pub(crate) fn declared_delivery_for_agent(agent: &Agent) -> anyagents_harness::Delivery {
+    if agent.runtime.is_cloud() {
+        anyagents_harness_claude::CLOUD_DELIVERY
+    } else {
+        crate::vendor::declared_delivery(&agent.harness)
+    }
+}
+
+/// Legacy `*-cloud` adapter selector for an agent routed to cloud execution
+/// (`(spiron, Cloud) -> "spiron-cloud"`, `(claude-code, Cloud) -> "claude-cloud"`, etc.).
+pub(crate) fn agent_cloud_selector(agent: &Agent) -> String {
+    anyagents_harness::ResolvedExecution {
+        harness: agent.canonical_harness(),
+        runtime: anyagents_core::ExecutionRuntime::Cloud,
+    }
+    .legacy_harness_selector()
+}
+
+/// Resolve the public MCP callback URL for an off-host (cloud or sandbox) agent.
+/// Prefers `<config>/.anyagents-mcp-url` written by the server from `public_url`,
+/// falling back to `ANYAGENTS_PUBLIC_MCP_URL` or `<config>/cloud.json` `mcp_url`.
+pub(crate) fn resolve_public_mcp_url(config: &Path) -> Result<String, String> {
+    if let Ok(file_url) = std::fs::read_to_string(config.join(MCP_URL_FILE)) {
+        let trimmed = file_url.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    if let Ok(url) = std::env::var("ANYAGENTS_PUBLIC_MCP_URL") {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    if let Ok(raw) = std::fs::read_to_string(config.join("cloud.json"))
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+        && let Some(url) = val.get("mcp_url").and_then(serde_json::Value::as_str)
+        && !url.trim().is_empty()
+    {
+        return Ok(url.trim().to_string());
+    }
+    Err(format!(
+        "no MCP callback URL for this remote agent in {}: set `public_url` under `[server]` in \
+         the server's `{CONFIG_FILE}` and start the agent again",
+        config.display()
+    ))
+}
+
 /// Whether this agent's harness runs off this host: a cloud harness, or a
 /// harness spawned into a remote sandbox. These are the agents that hold
 /// remote session tokens.
@@ -305,7 +369,8 @@ pub fn runs_off_host(agent: &Agent, config_dir: &Path) -> bool {
         .parent()
         .and_then(Path::parent)
         .and_then(Path::parent);
-    crate::vendor::is_cloud_harness(&agent.harness)
+    agent.runtime.is_off_host()
+        || crate::vendor::is_cloud_harness(&agent.harness)
         || crate::sandbox_exec::has_remote_sandbox_provider(data_dir)
         || crate::sandbox_providers::sylphx::SylphxLeaseConfig::from_config_dir(config_dir)
             .is_some()

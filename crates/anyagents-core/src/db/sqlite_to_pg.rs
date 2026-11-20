@@ -1,12 +1,16 @@
 //! Batched SQLite -> PostgreSQL migration and stale-runtime reconciliation.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use serde::Serialize;
 use sqlx::PgPool;
+
+#[path = "sqlite_to_pg_agents.rs"]
+mod agents;
+use agents::copy_agents_topological;
 
 use super::{
     block_on_pg, build_pg_pool, configured_direct_database_url, is_postgres_url, migrate_postgres,
@@ -451,205 +455,6 @@ fn copy_table(
         pg_rows_before: pg_before,
         pg_rows_after: pg_after,
     })
-}
-
-/// Topologically orders `agents` so parents always insert before children, and
-/// strips dangling `parent_id` references so self-referential FK constraints succeed.
-fn copy_agents_topological(
-    sqlite: &Connection,
-    pool: &PgPool,
-    batch_size: usize,
-    resume: bool,
-) -> Result<(TableMigrationStat, HashSet<String>), Error> {
-    let pg_before = block_on_pg(pg_count(pool, "public.agents"))?;
-    let expected = sqlite_count(sqlite, "agents")?;
-    if resume && expected > 0 && pg_before >= expected {
-        let mut ids = HashSet::with_capacity(expected as usize);
-        let mut stmt = sqlite.prepare("SELECT id FROM agents")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            if let Some(id) = sqlite_cell_to_string(row.get_ref(0)?)? {
-                ids.insert(id);
-            }
-        }
-        eprintln!(
-            "  [migrate] public.agents: {pg_before} rows OK (resumed: pg={pg_before} >= sqlite={expected})"
-        );
-        return Ok((
-            TableMigrationStat {
-                pg_table: "public.agents".to_owned(),
-                sqlite_rows: expected,
-                pg_rows_before: pg_before,
-                pg_rows_after: pg_before,
-            },
-            ids,
-        ));
-    }
-
-    #[derive(Clone)]
-    struct AgentRow {
-        id: String,
-        name: String,
-        harness: String,
-        model: Option<String>,
-        workdir: Option<String>,
-        instructions: Option<String>,
-        state: String,
-        created_at_ms: i64,
-        launch_env: Option<String>,
-        parent_id: Option<String>,
-        is_admin: i64,
-        role: Option<String>,
-        description: Option<String>,
-    }
-
-    let mut stmt = sqlite.prepare(
-        "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms,
-                launch_env, parent_id, is_admin, role, description
-         FROM agents",
-    )?;
-    let mut rows = stmt.query([])?;
-    let mut all = Vec::with_capacity(expected.max(0) as usize);
-    let mut ids = HashSet::with_capacity(expected.max(0) as usize);
-    while let Some(row) = rows.next()? {
-        let id = sqlite_cell_to_string(row.get_ref(0)?)?.unwrap_or_default();
-        ids.insert(id.clone());
-        all.push(AgentRow {
-            id,
-            name: sqlite_cell_to_string(row.get_ref(1)?)?.unwrap_or_default(),
-            harness: sqlite_cell_to_string(row.get_ref(2)?)?.unwrap_or_default(),
-            model: sqlite_cell_to_string(row.get_ref(3)?)?,
-            workdir: sqlite_cell_to_string(row.get_ref(4)?)?,
-            instructions: sqlite_cell_to_string(row.get_ref(5)?)?,
-            state: sqlite_cell_to_string(row.get_ref(6)?)?.unwrap_or_default(),
-            created_at_ms: sqlite_cell_to_i64(row.get_ref(7)?)?.unwrap_or(0),
-            launch_env: sqlite_cell_to_string(row.get_ref(8)?)?,
-            parent_id: sqlite_cell_to_string(row.get_ref(9)?)?,
-            is_admin: sqlite_cell_to_i64(row.get_ref(10)?)?.unwrap_or(0),
-            role: sqlite_cell_to_string(row.get_ref(11)?)?,
-            description: sqlite_cell_to_string(row.get_ref(12)?)?,
-        });
-    }
-
-    let mut children: HashMap<Option<String>, Vec<usize>> = HashMap::new();
-    for (idx, a) in all.iter_mut().enumerate() {
-        if let Some(pid) = &a.parent_id
-            && !ids.contains(pid)
-        {
-            a.parent_id = None;
-        }
-        children.entry(a.parent_id.clone()).or_default().push(idx);
-    }
-
-    let mut ordered = Vec::with_capacity(all.len());
-    let mut seen = vec![false; all.len()];
-    let mut queue = VecDeque::new();
-    if let Some(roots) = children.get(&None) {
-        for &idx in roots {
-            queue.push_back(idx);
-        }
-    }
-    while let Some(idx) = queue.pop_front() {
-        if seen[idx] {
-            continue;
-        }
-        seen[idx] = true;
-        ordered.push(idx);
-        if let Some(kids) = children.get(&Some(all[idx].id.clone())) {
-            for &kid in kids {
-                if !seen[kid] {
-                    queue.push_back(kid);
-                }
-            }
-        }
-    }
-    // Any remaining node belongs to a parent cycle; null its parent_id to preserve the agent row.
-    for idx in 0..all.len() {
-        if !seen[idx] {
-            all[idx].parent_id = None;
-            ordered.push(idx);
-        }
-    }
-
-    let sql = "INSERT INTO public.agents (\"id\", \"name\", \"harness\", \"model\", \"workdir\", \
-               \"instructions\", \"state\", \"created_at_ms\", \"launch_env\", \"parent_id\", \
-               \"is_admin\", \"role\", \"description\") \
-               SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], \
-               $6::text[], $7::text[], $8::bigint[], $9::text[], $10::text[], $11::bigint[], \
-               $12::text[], $13::text[]) ON CONFLICT DO NOTHING";
-
-    for chunk in ordered.chunks(batch_size) {
-        let n = chunk.len();
-        let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5, mut c6) = (
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
-        );
-        let (mut c7, mut c8, mut c9, mut c10, mut c11, mut c12) = (
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
-        );
-        for &idx in chunk {
-            let a = &all[idx];
-            c0.push(a.id.as_str());
-            c1.push(a.name.as_str());
-            c2.push(a.harness.as_str());
-            c3.push(a.model.as_deref());
-            c4.push(a.workdir.as_deref());
-            c5.push(a.instructions.as_deref());
-            c6.push(a.state.as_str());
-            c7.push(a.created_at_ms);
-            c8.push(a.launch_env.as_deref());
-            c9.push(a.parent_id.as_deref());
-            c10.push(a.is_admin);
-            c11.push(a.role.as_deref());
-            c12.push(a.description.as_deref());
-        }
-        block_on_pg(async {
-            sqlx::query(sql)
-                .bind(&c0)
-                .bind(&c1)
-                .bind(&c2)
-                .bind(&c3)
-                .bind(&c4)
-                .bind(&c5)
-                .bind(&c6)
-                .bind(&c7)
-                .bind(&c8)
-                .bind(&c9)
-                .bind(&c10)
-                .bind(&c11)
-                .bind(&c12)
-                .execute(pool)
-                .await
-                .map_err(|e| Error::Message(format!("postgres agents batch failed: {e}")))
-        })?;
-    }
-
-    let pg_after = block_on_pg(pg_count(pool, "public.agents"))?;
-    if pg_after < expected {
-        return Err(Error::Message(format!(
-            "row count mismatch on public.agents: sqlite={expected}, postgres={pg_after}"
-        )));
-    }
-    eprintln!("  [migrate] public.agents: {pg_after} rows OK");
-    Ok((
-        TableMigrationStat {
-            pg_table: "public.agents".to_owned(),
-            sqlite_rows: expected,
-            pg_rows_before: pg_before,
-            pg_rows_after: pg_after,
-        },
-        ids,
-    ))
 }
 
 async fn reset_identity_sequences(pool: &PgPool) -> Result<(), Error> {

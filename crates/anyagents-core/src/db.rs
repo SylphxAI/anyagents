@@ -38,7 +38,12 @@ pub const PG_MAX_CONNECTIONS_ENV: &str = "ANYAGENTS_PG_MAX_CONNECTIONS";
 pub const PG_STATEMENT_CACHE_ENV: &str = "ANYAGENTS_PG_STATEMENT_CACHE";
 pub const TEST_POSTGRES_URL_ENV: &str = "ANYAGENTS_TEST_POSTGRES_URL";
 
+mod pg_migrations;
 pub mod sqlite_to_pg;
+pub use pg_migrations::{
+    PG_AGENT_RUNTIME_SQL, PG_BROWSER_PROFILE_GRANTS_SQL, PG_DEPLOYMENT_SECRETS_SQL, PG_INIT_SQL,
+    PG_LATEST_VERSION, PG_SERVERLESS_TURNS_SQL, PG_STATELESS_SQL,
+};
 pub use sqlite_to_pg::{
     MigrateToPostgresOptions, MigrateToPostgresReport, TableMigrationStat,
     migrate_sqlite_dir_to_postgres,
@@ -48,14 +53,6 @@ pub use sqlite_to_pg::{
 /// operator/deployment setup (0600 regular file). Env vars take precedence.
 pub const DATABASE_URL_POINTER_FILE: &str = "database-url";
 
-pub const PG_INIT_SQL: &str = include_str!("../migrations_pg/001_init.sql");
-pub const PG_STATELESS_SQL: &str = include_str!("../migrations_pg/002_stateless_coordinator.sql");
-pub const PG_SERVERLESS_TURNS_SQL: &str = include_str!("../migrations_pg/003_serverless_turns.sql");
-pub const PG_DEPLOYMENT_SECRETS_SQL: &str =
-    include_str!("../migrations_pg/004_deployment_secrets.sql");
-pub const PG_BROWSER_PROFILE_GRANTS_SQL: &str =
-    include_str!("../migrations_pg/005_browser_profile_grants.sql");
-pub const PG_LATEST_VERSION: i64 = 5;
 const PG_MIGRATION_LOCK_KEY: i64 = 0x616e_7961_676e_7473_u64 as i64; // "anyagnts"
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -400,13 +397,7 @@ impl PgHandle {
                 } else {
                     0
                 };
-                for (ver, sql) in [
-                    (1i64, PG_INIT_SQL),
-                    (2, PG_STATELESS_SQL),
-                    (3, PG_SERVERLESS_TURNS_SQL),
-                    (4, PG_DEPLOYMENT_SECRETS_SQL),
-                    (5, PG_BROWSER_PROFILE_GRANTS_SQL),
-                ] {
+                for &(ver, sql) in pg_migrations::PG_MIGRATIONS {
                     if current >= ver {
                         continue;
                     }
@@ -424,7 +415,7 @@ impl PgHandle {
                         let compat_ver = crate::migrate::MIGRATIONS
                             .last()
                             .map(|(v, _)| *v)
-                            .unwrap_or(39);
+                            .unwrap_or(40);
                         sqlx::query(
                             "INSERT INTO public.schema_migrations (version, applied_at_ms)
                              VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",

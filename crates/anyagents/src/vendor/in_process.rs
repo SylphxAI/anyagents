@@ -1,11 +1,11 @@
 //! In-process stream-json harness host for `HarnessHost::InProcess` under
 //! `ANYAGENTS_SANDBOX_MODE=remote_required`.
 //!
-//! Runs `cloud_harness::run_with_io` or `sandbox_exec::run_with_io` directly
-//! inside the coordinator process on a lightweight worker thread over an
-//! in-memory pipe — spawning ZERO local OS shim processes (`anyagents
-//! cloud-harness`, `anyagents sandbox-exec`, or `anyagents keeper`) on the
-//! coordinator pod.
+//! Runs `sandbox_exec::run_with_io_in_store` directly inside the coordinator
+//! process on a lightweight worker thread over an in-memory pipe — spawning
+//! ZERO local OS shim processes (`anyagents sandbox-exec` or `anyagents
+//! keeper`) on the coordinator pod. Vendor-hosted cloud sessions run natively
+//! via `vendor::remote_session::RemoteSessionAdapter` (`RemoteSessionHarness`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -127,8 +127,8 @@ impl SharedState {
     }
 }
 
-/// In-process stream-json harness driving cloud or remote-sandbox execution
-/// on a Rust thread without spawning any local OS child process.
+/// In-process stream-json harness driving remote-sandbox execution on a Rust
+/// thread without spawning any local OS child process.
 pub struct InProcessRemoteHarness {
     shared: Arc<Mutex<SharedState>>,
     stdin: Arc<Mutex<Option<PipeWriter>>>,
@@ -139,6 +139,7 @@ pub struct InProcessRemoteHarness {
 }
 
 impl InProcessRemoteHarness {
+    #[cfg(test)]
     pub fn start_with_worker<F>(
         cloud: bool,
         label: &'static str,
@@ -249,12 +250,6 @@ impl InProcessRemoteHarness {
             },
             worker: Some(worker),
             reader: Some(reader),
-        })
-    }
-
-    pub fn start_cloud(args: crate::cloud_harness::CloudHarnessArgs) -> Result<Self, String> {
-        Self::start_with_worker(true, "cloud", move |reader, writer| {
-            crate::cloud_harness::run_with_io(args, reader, writer)
         })
     }
 

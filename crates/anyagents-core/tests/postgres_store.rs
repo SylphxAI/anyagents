@@ -403,6 +403,8 @@ fn sqlite_to_postgres_migration_preserves_data_and_sequences() {
         .create_agent(NewAgent {
             name: parent_name.clone(),
             harness: "claude-code".into(),
+            runtime: None,
+            remote_budget_micros: None,
             model: Some("sonnet".into()),
             workdir: Some("/tmp/mig".into()),
             instructions: Some("parent".into()),
@@ -415,6 +417,8 @@ fn sqlite_to_postgres_migration_preserves_data_and_sequences() {
         .create_agent(NewAgent {
             name: child_name.clone(),
             harness: "spiron".into(),
+            runtime: Some(anyagents_core::ExecutionRuntime::Cloud),
+            remote_budget_micros: Some(5_000_000),
             model: Some("sonnet".into()),
             workdir: Some("/tmp/mig".into()),
             instructions: Some("child".into()),
@@ -427,6 +431,8 @@ fn sqlite_to_postgres_migration_preserves_data_and_sequences() {
         .create_agent(NewAgent {
             name: arch_name.clone(),
             harness: "codex".into(),
+            runtime: None,
+            remote_budget_micros: None,
             model: None,
             workdir: None,
             instructions: None,
@@ -506,6 +512,11 @@ fn sqlite_to_postgres_migration_preserves_data_and_sequences() {
     let pg_store = Store::open_postgres(&url, pg_dir.path()).unwrap();
     let migrated_child = pg_store.agent(&child.id).unwrap();
     assert_eq!(migrated_child.parent_id.as_ref(), Some(&parent.id));
+    assert_eq!(
+        migrated_child.runtime,
+        anyagents_core::ExecutionRuntime::Cloud
+    );
+    assert_eq!(migrated_child.remote_budget_micros, Some(5_000_000));
 
     // Verify NUL sanitization on migrated text and IDENTITY sequence advancement after migration.
     let inbox = pg_store.inbox(&child.id, None).unwrap();

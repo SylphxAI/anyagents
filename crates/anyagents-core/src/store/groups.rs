@@ -1,7 +1,7 @@
 //! Named groups, room fan-out, chat membership, and inter-agent reachability.
 
 use super::channels::telegram_chat_links;
-use super::helpers::{agent_exists, decode_env};
+use super::helpers::{agent_exists, decode_budget_column, decode_env, decode_runtime_column};
 use super::types::{Agent, Incoming, ReceiveOutcome};
 use super::{Store, now_ms};
 use crate::db::{DbExec, DbExecExt};
@@ -267,7 +267,8 @@ impl Store {
         )?;
         let member_rows: Vec<(String, Agent)> = conn.db_query_vec(
             "SELECT g.group_name, a.id, a.name, a.harness, a.model, a.workdir, a.instructions, \
-             a.state, a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role, a.description \
+             a.state, a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role, \
+             a.description, a.runtime, a.remote_budget_micros \
              FROM group_agents AS g \
              JOIN agents AS a ON a.id = g.agent_id \
              ORDER BY g.group_name, a.name",
@@ -275,23 +276,31 @@ impl Store {
             |row| {
                 let group_name: String = row.get(0)?;
                 let agent_id = row.parse_str(1)?;
+                let harness: String = row.get(3)?;
+                let launch_env = row
+                    .get::<Option<String>>(9)?
+                    .map(|json| decode_env(&json))
+                    .unwrap_or_default();
                 let parent_id = match row.get::<Option<String>>(10)? {
                     Some(raw) if !raw.is_empty() => Some(AgentId::parse(&raw)?),
                     _ => None,
                 };
+                let runtime_raw: Option<String> = row.get(14)?;
+                let budget_raw: Option<i64> = row.get(15)?;
+                let runtime = decode_runtime_column(runtime_raw.as_deref(), &harness, &launch_env);
+                let remote_budget_micros = decode_budget_column(budget_raw, &launch_env);
                 let agent = Agent {
                     id: agent_id,
                     name: row.get(2)?,
-                    harness: row.get(3)?,
+                    harness,
+                    runtime,
+                    remote_budget_micros,
                     model: row.get(4)?,
                     workdir: row.get(5)?,
                     instructions: row.get(6)?,
                     state: row.get(7)?,
                     created_at_ms: row.get(8)?,
-                    launch_env: row
-                        .get::<Option<String>>(9)?
-                        .map(|json| decode_env(&json))
-                        .unwrap_or_default(),
+                    launch_env,
                     parent_id,
                     is_admin: row.get(11)?,
                     role: row.get(12)?,

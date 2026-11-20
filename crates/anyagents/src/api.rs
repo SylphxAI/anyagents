@@ -126,6 +126,10 @@ pub struct AgentView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub can_message: Option<bool>,
     pub harness: String,
+    #[serde(default)]
+    pub runtime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_budget_micros: Option<u64>,
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_harness: Option<String>,
@@ -199,6 +203,31 @@ pub struct AgentView {
 }
 
 impl AgentView {
+    /// Convert an HTTP/socket `AgentView` back into a client-side [`anyagents_core::Agent`].
+    pub fn into_agent(self) -> Result<anyagents_core::Agent, anyagents_core::Error> {
+        let runtime = anyagents_harness::ExecutionRuntime::parse(&self.runtime)
+            .unwrap_or_else(|_| anyagents_harness::resolve_stored_runtime(&self.harness, &[]));
+        Ok(anyagents_core::Agent {
+            is_admin: false,
+            id: anyagents_core::AgentId::parse(&self.id)?,
+            name: self.name,
+            role: self.role,
+            parent_id: self
+                .parent
+                .and_then(|p| anyagents_core::AgentId::parse(&p).ok()),
+            harness: self.harness,
+            runtime,
+            remote_budget_micros: self.remote_budget_micros,
+            model: self.model,
+            workdir: self.workdir,
+            description: self.description,
+            instructions: self.instructions,
+            state: self.state,
+            created_at_ms: 0,
+            launch_env: Vec::new(),
+        })
+    }
+
     /// The lifecycle a listing shows: `faulted` for an agent parked because
     /// its turns kept ending in an error (its `state` is `paused`).
     pub fn display_state(&self) -> &str {
@@ -328,6 +357,12 @@ pub struct CreateAgentRequest {
     /// empty string or `inherit` lets sub-agent defaults select the harness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
+    /// Execution runtime (`local`, `sandbox`, `sandbox:<provider>`, or `cloud`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// Optional hard remote spend cap in micro-USD (`1_000_000` = US$1.00).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_cap_micros: Option<u64>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

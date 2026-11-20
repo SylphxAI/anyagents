@@ -236,6 +236,8 @@ mod tests {
                 name: "agy-child".into(),
                 role: None,
                 harness: "agy".into(),
+                runtime: None,
+                budget_cap_micros: None,
                 model: None,
                 profile: None,
                 repo: None,

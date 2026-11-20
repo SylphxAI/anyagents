@@ -697,32 +697,19 @@ impl AgentMcp {
                     .await?;
                 Ok(rmcp::handler::server::wrapper::Json(updated))
             }
-            "harness" | "set_harness" => {
-                let target = args
-                    .name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "`agents harness` requires `name`".to_string())?;
-                let clean = target.strip_prefix("agent:").unwrap_or(target);
-                let harness = args
-                    .harness
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "`agents harness` requires `harness`".to_string())?;
-                let body = serde_json::json!({
-                    "harness": harness,
-                    "model": args.model,
-                    "profile": args.profile,
-                });
-                let updated: serde_json::Value = self
-                    .client
-                    .get(
-                        &format!("/v1/agents/{clean}/harness"),
-                        Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
-                    )
-                    .await?;
+            "harness" | "set_harness" | "runtime" => {
+                let updated = super::agent_secrets::switch_agent_harness_or_runtime(
+                    &self.client,
+                    "agents harness",
+                    "name",
+                    args.name.as_deref(),
+                    args.harness.as_deref(),
+                    args.runtime.as_deref(),
+                    args.budget_cap_micros,
+                    args.model,
+                    args.profile,
+                )
+                .await?;
                 Ok(rmcp::handler::server::wrapper::Json(updated))
             }
             "transfer" | "reparent" => {
@@ -1068,32 +1055,19 @@ impl AgentMcp {
                     serde_json::to_value(view).map_err(|e| e.to_string())?,
                 ))
             }
-            "harness" | "set_harness" => {
-                let target = args
-                    .agent
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "`subagents harness` requires `agent`".to_string())?;
-                let clean = target.strip_prefix("agent:").unwrap_or(target);
-                let harness = args
-                    .harness
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "`subagents harness` requires `harness`".to_string())?;
-                let body = serde_json::json!({
-                    "harness": harness,
-                    "model": args.model,
-                    "profile": args.profile,
-                });
-                let updated: serde_json::Value = self
-                    .client
-                    .get(
-                        &format!("/v1/agents/{clean}/harness"),
-                        Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
-                    )
-                    .await?;
+            "harness" | "set_harness" | "runtime" => {
+                let updated = super::agent_secrets::switch_agent_harness_or_runtime(
+                    &self.client,
+                    "subagents harness",
+                    "agent",
+                    args.agent.as_deref(),
+                    args.harness.as_deref(),
+                    args.runtime.as_deref(),
+                    args.budget_cap_micros,
+                    args.model,
+                    args.profile,
+                )
+                .await?;
                 Ok(rmcp::handler::server::wrapper::Json(updated))
             }
             "transfer" | "reparent" => {
@@ -1369,6 +1343,7 @@ impl AgentMcp {
                         "relationship": a.relationship,
                         "can_message": a.can_message,
                         "harness": a.harness,
+                        "runtime": a.runtime,
                         "model": a.model,
                         "state": a.state,
                         "description": a.description,

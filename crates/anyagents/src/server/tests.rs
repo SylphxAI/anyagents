@@ -6235,6 +6235,8 @@ fn remote_agents_cannot_be_created_without_a_public_url() {
             axum::http::HeaderMap::new(),
             Json(HarnessRequest {
                 harness: "openai-cloud".into(),
+                runtime: None,
+                budget_cap_micros: None,
                 model: None,
                 profile: None,
             }),
@@ -6588,7 +6590,7 @@ fn a_remote_token_stops_authenticating_once_its_agent_runs_on_the_host() {
         assert_eq!(status, StatusCode::OK);
         state
             .store
-            .set_agent_harness(&cloud.id, "claude-code")
+            .set_agent_runtime(&cloud.id, &anyagents_core::ExecutionRuntime::Local)
             .unwrap();
         let err = post_mcp_as(&state, &remote, None, tools_list())
             .await
@@ -6776,7 +6778,9 @@ fn calls_over_http_mcp_cannot_start_or_read_on_the_host() {
                 .await,
                 "only on a cloud harness",
             );
-            assert_eq!(state.store.agent(&child.id).unwrap().harness, "claude-cloud");
+            let child_after = state.store.agent(&child.id).unwrap();
+            assert_eq!(child_after.harness, "claude-code");
+            assert_eq!(child_after.runtime, anyagents_core::ExecutionRuntime::Cloud);
             // Waking an archived host agent, explicitly or by a direct send.
             refused(
                 &call("wake", serde_json::json!({ "agent": sleeper.name })).await,

@@ -16,7 +16,6 @@ mod api;
 mod auth;
 mod channel;
 mod client;
-mod cloud_harness;
 mod create;
 mod data;
 mod fake_opencode;
@@ -36,12 +35,14 @@ mod outbound;
 mod remote;
 mod reply;
 mod repo;
+mod runtime_cli;
 mod sandbox;
 mod sandbox_exec;
 mod sandbox_providers;
 mod schedule;
 mod seat_tree;
 mod server;
+mod serverless_cloud;
 mod signin;
 mod spiron;
 mod telegram;
@@ -176,39 +177,7 @@ enum Command {
         clear: bool,
     },
     /// Spawn a new agent or sub-agent and optionally deliver an initial task prompt.
-    Spawn {
-        /// Optional agent name (`[a-z0-9][a-z0-9_-]*`). Auto-generated when omitted.
-        name: Option<String>,
-        /// Role template slug (for example `general`) that dynamically provides role instructions.
-        #[arg(long)]
-        role: Option<String>,
-        #[arg(long)]
-        harness: Option<String>,
-        #[arg(long)]
-        model: Option<String>,
-        /// Optional upstream provider account profile (e.g. `acct-a`, `acct-b`, `anthropic/acct-b`).
-        #[arg(long)]
-        profile: Option<String>,
-        /// Optional repository (`<org>/<repo>`, local repo path, or `inherit`) to provision a Git repository of the agent's own.
-        #[arg(long)]
-        repo: Option<String>,
-        /// Optional Git branch name for the managed checkout when `--repo` is set (defaults to `agent/<name>`).
-        #[arg(long)]
-        branch: Option<String>,
-        /// Optional starting Git ref/branch when `--repo` is set (defaults to `origin/HEAD`).
-        #[arg(long)]
-        base: Option<String>,
-        #[arg(long)]
-        workdir: Option<PathBuf>,
-        #[arg(long)]
-        description: Option<String>,
-        #[arg(long, visible_alias = "instruction", visible_alias = "system-prompt")]
-        instructions: Option<String>,
-        #[arg(long)]
-        parent: Option<String>,
-        #[arg(long)]
-        prompt: Option<String>,
-    },
+    Spawn(runtime_cli::SpawnCliArgs),
     /// Archive an agent (`state = archived`), scaling its process to zero while keeping its session.
     Archive {
         /// Agent name or `agt_...` id (defaults to this agent when run inside an agent).
@@ -484,9 +453,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Run the outbound cloud harness adapter (`spiron-cloud`, `claude-cloud`, `openai-cloud`, `cursor-cloud`) speaking `stream-json`.
-    #[command(name = "cloud-harness", hide = true)]
-    CloudHarness(cloud_harness::CloudHarnessArgs),
     /// Run a local CLI harness inside a remote sandbox (`POST /v1/sandboxes/{id}/exec`) speaking `stream-json`.
     #[command(name = "sandbox-exec", hide = true)]
     SandboxExec(sandbox_exec::SandboxExecArgs),
@@ -995,6 +961,8 @@ enum AgentsCommand {
         role: Option<String>,
         #[arg(long, default_value = "")]
         harness: String,
+        #[command(flatten)]
+        runtime_args: runtime_cli::RuntimeCliArgs,
         #[arg(long)]
         model: Option<String>,
         /// Optional upstream provider account profile (e.g. `acct-a`, `acct-b`, `anthropic/acct-b`).
@@ -1067,6 +1035,8 @@ enum AgentsCommand {
         /// Target harness ID flag (`--harness codex`).
         #[arg(long = "harness")]
         harness_flag: Option<String>,
+        #[command(flatten)]
+        runtime_args: runtime_cli::RuntimeCliArgs,
         /// Optional model override (retains existing model when omitted).
         #[arg(long)]
         model: Option<String>,
@@ -1098,15 +1068,6 @@ fn main() -> ExitCode {
     let raw_argv: Vec<String> = std::env::args().collect();
     if let Some(code) = keeper::try_run(&raw_argv) {
         return ExitCode::from(u8::try_from(code).unwrap_or(1));
-    }
-    if let Some(cloud_args) = cloud_harness::try_parse_from_raw_argv(&raw_argv) {
-        return match cloud_harness::run(cloud_args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                ui::error(&err.to_string());
-                ExitCode::FAILURE
-            }
-        };
     }
     if let Some(sbx_args) = sandbox_exec::try_parse_from_raw_argv(&raw_argv) {
         return match sandbox_exec::run(sbx_args) {
@@ -1241,7 +1202,9 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 agent::harness_cmd(
                     &data,
                     &config.to_string_lossy(),
-                    target_harness,
+                    Some(target_harness),
+                    None,
+                    None,
                     model.as_deref(),
                     profile.as_deref(),
                 )
@@ -1321,36 +1284,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 )
             }
         }
-        Command::Spawn {
-            name,
-            role,
-            harness,
-            model,
-            profile,
-            repo,
-            branch,
-            base,
-            workdir,
-            description,
-            instructions,
-            parent,
-            prompt,
-        } => agent::spawn(
-            &data,
-            name,
-            role,
-            harness,
-            model,
-            profile,
-            repo,
-            branch,
-            base,
-            workdir,
-            description,
-            instructions,
-            parent,
-            prompt,
-        ),
+        Command::Spawn(args) => agent::spawn(&data, args),
         Command::Archive { name } => agent::archive_cmd(&data, name),
         Command::Pause { name } => agent::pause_cmd(&data, name),
         Command::Wake { name, prompt } => agent::resume_cmd(&data, &name, prompt),
@@ -1625,7 +1559,6 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             OutboundCommand::Retry { key } => outbound::retry(&data, &key, json),
             OutboundCommand::Discard { key } => outbound::discard(&data, &key, json),
         },
-        Command::CloudHarness(args) => cloud_harness::run(args),
         Command::SandboxExec(args) => sandbox_exec::run(args),
         Command::MemoryService(args) => memory_service::run(&data, args),
         Command::Db { action } => db_cmd(&data, *action),
@@ -2125,7 +2058,15 @@ fn model_cmd(
         && key_file.is_none()
         && base_url.is_none()
     {
-        return agent::harness_cmd(data, agent, target_harness, model, profile);
+        return agent::harness_cmd(
+            data,
+            agent,
+            Some(target_harness),
+            None,
+            None,
+            model,
+            profile,
+        );
     }
     let clean_model = model.map(str::trim).filter(|s| !s.is_empty());
     let clean_profile = profile.map(str::trim).filter(|s| !s.is_empty());
@@ -3168,7 +3109,6 @@ mod cli_query_tests {
         for command in [
             "agent-run",
             "fake-opencode",
-            "cloud-harness",
             "sandbox-exec",
             "boundary",
             "flush",

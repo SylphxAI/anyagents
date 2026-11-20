@@ -30,7 +30,8 @@ macro_rules! message_cols {
 macro_rules! agent_cols {
     () => {
         "id, name, harness, model, workdir, instructions, state, \
-         created_at_ms, launch_env, parent_id, is_admin, role, description"
+         created_at_ms, launch_env, parent_id, is_admin, role, description, \
+         runtime, remote_budget_micros"
     };
 }
 macro_rules! schedule_cols {
@@ -71,10 +72,14 @@ macro_rules! idle_release_predicate {
 
 macro_rules! agent_summary_cols {
     () => {
-        "id, name, harness, model, state, parent_id, role, is_admin, created_at_ms"
+        "id, name, harness, model, state, parent_id, role, is_admin, created_at_ms, \
+         runtime, remote_budget_micros"
     };
 }
 
+#[cfg(test)]
+#[path = "store/agent_runtime_tests.rs"]
+mod agent_runtime_tests;
 mod agents;
 #[cfg(test)]
 #[path = "store/audit_tests.rs"]

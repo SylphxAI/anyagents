@@ -45,6 +45,10 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/agents/{name}/transfer", post(transfer_agent_route))
         .route("/v1/agents/{name}/model", post(model_route))
         .route("/v1/agents/{name}/harness", post(harness_route))
+        .route(
+            "/v1/agents/{name}/runtime",
+            post(super::runtime::runtime_route),
+        )
         .route("/v1/agents/{name}/session/reset", post(reset_session_route))
         .route(
             "/v1/agents/{name}/description",
@@ -116,6 +120,10 @@ struct ModelRequest {
 pub(super) struct HarnessRequest {
     pub(super) harness: String,
     #[serde(default)]
+    pub(super) runtime: Option<String>,
+    #[serde(default)]
+    pub(super) budget_cap_micros: Option<u64>,
+    #[serde(default)]
     pub(super) model: Option<String>,
     #[serde(default)]
     pub(super) profile: Option<String>,
@@ -180,16 +188,27 @@ pub(super) async fn harness_route(
                 require_admin_or_operator(&state.store, &principal, "agents.harness", &found.name)?
             }
         };
-        require_remote_callback(state.store.data_dir(), &body.harness)?;
-        refuse_host_placement_over_http(via_http, state.store.data_dir(), &body.harness)?;
-        let out = create::set_agent_harness(
+        require_remote_callback(
+            state.store.data_dir(),
+            &body.harness,
+            body.runtime.as_deref(),
+        )?;
+        refuse_host_placement_over_http(
+            via_http,
+            state.store.data_dir(),
+            &body.harness,
+            body.runtime.as_deref(),
+        )?;
+        let out = create::set_agent_harness_with_options(
             &state.store,
             state.store.data_dir(),
             &actor,
             &found.name,
             &body.harness,
+            body.runtime.as_deref(),
             body.model.as_deref(),
             body.profile.as_deref(),
+            body.budget_cap_micros.map(|cap| (cap > 0).then_some(cap)),
         )
         .map_err(ApiError::from_store)?;
         // The agent's profile binding may have moved.
@@ -1001,8 +1020,13 @@ pub(super) async fn create_agent_route(
             body.model,
             body.profile,
         );
-        require_remote_callback(state.store.data_dir(), &harness)?;
-        refuse_host_placement_over_http(via_http, state.store.data_dir(), &harness)?;
+        require_remote_callback(state.store.data_dir(), &harness, body.runtime.as_deref())?;
+        refuse_host_placement_over_http(
+            via_http,
+            state.store.data_dir(),
+            &harness,
+            body.runtime.as_deref(),
+        )?;
         let request = CreateRequest {
             name: body.name,
             role: Some(
@@ -1014,6 +1038,8 @@ pub(super) async fn create_agent_route(
                     .to_string(),
             ),
             harness,
+            runtime: body.runtime,
+            budget_cap_micros: body.budget_cap_micros,
             model,
             profile,
             repo: body.repo,

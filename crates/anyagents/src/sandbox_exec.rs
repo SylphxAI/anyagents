@@ -486,7 +486,7 @@ pub fn materialize_remote_mcp_config(
     config_dir: &Path,
 ) -> Result<String, String> {
     let capability = crate::remote::session_token(config_dir)?;
-    let mcp_url = crate::cloud_harness::resolve_public_mcp_url(config_dir)?;
+    let mcp_url = crate::remote::resolve_public_mcp_url(config_dir)?;
     let mcp_doc = json!({
         "mcpServers": {
             "anyagents": {
@@ -1930,7 +1930,7 @@ fn collect_agent_bundle_entries(
     }
 
     // 3. Remote MCP token + harness configs targeting `<state_root>` & `mcp-proxy`.
-    let mcp_url = crate::cloud_harness::resolve_public_mcp_url(config_dir)?;
+    let mcp_url = crate::remote::resolve_public_mcp_url(config_dir)?;
     let mcp_token = crate::remote::session_token(config_dir)?;
     let token_path_in_vm = format!("{state_root}/.mcp-token");
     uploads.push((
@@ -3768,6 +3768,8 @@ mod tests {
                     name: "remote-worker".into(),
                     role: None,
                     harness: "claude-code".into(),
+                    runtime: None,
+                    budget_cap_micros: None,
                     model: None,
                     profile: None,
                     repo: None,

@@ -26,13 +26,16 @@ The established pattern for running vendor agents is a long-lived gateway that d
 
 `anyagents serve` is the kernel: the API, identity, the mailboxes, supervision, schedules and the one embedded database run in it. Each harness process is held by its own keeper, a small process (`anyagents keeper`, the same binary) that starts the harness, owns its pipes and hosts the vendor adapter, so the kernel can stop, crash or be replaced by a newer binary while every harness keeps running ([ADR 0007](adr/0007-process-architecture.md)); on Linux only, see [Agents](#agents-create-and-supervise). The protocol gateway, used only in API-key mode, runs inside the kernel. Dense retrieval and reranking run beside it as a separate, optional process, `anyagents memory-service` ([host-memory.md](host-memory.md#hybrid-retrieval-and-the-memory-service)); without it the server ranks history lexically and says so.
 
-## Three-axis vendor-neutral model (`Harness × Profile × Sandbox`)
+## Orthogonal vendor-neutral model (`Harness × Runtime × Profile`)
 
-AnyAgents never runs an internal LLM loop. Every agent is a pure composition of three orthogonal axes:
+AnyAgents never runs an internal LLM loop. Every agent is a pure composition of orthogonal axes:
 
-- **Harness (`anyagents-harness`, `spiron`, `cloud_harness`):** Which external single-agent loop executes turns (`spiron` CLI / `spiron-cloud` at `https://api.spiron.ai`, `claude-code` / `claude-cloud`, `codex` / `openai-cloud`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, `cursor-cloud`).
+- **Harness (`anyagents-harness`):** Which external single-agent loop executes turns (`spiron`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, `cursor`).
+- **Runtime (`local`, `sandbox[:<provider>]`, `cloud`):** Where and how that harness executes (selected via `--runtime` or `harness@runtime`, with lossless compatibility for legacy `*-cloud` / `spiron-local` selectors and fail-closed validation on invalid pairs):
+  - `local`: Host or OS-sandboxed process supervised through a keeper (Linux) or in-process.
+  - `sandbox` / `sandbox:<provider>`: Isolated remote or container workspace backed by pluggable `SandboxProvider` drivers and `agent_tools::WorkspaceBackend` (`LocalWorkspace`, `RemoteSandboxWorkspace` over Cloud Sandbox / E2B / Daytona / Modal / Cloudflare / OCI HTTP APIs, or `DockerWorkspace`).
+  - `cloud`: Vendor-hosted cloud agent driven directly in-process via the ADR 0010 D7 `RemoteSessionProvider` / `RemoteSessionHarness` contract (`create`, `deliver`/`steer`, `events`, `interrupt`, `stop`, `budget`) — such as `SpironCloudProvider` (`spiron@cloud` at `https://api.spiron.ai`) — or via stateless serverless `CloudTurnDriver` (`SpironServerlessDriver`, `GenericHttpCloudDriver`). Remote sessions spawn zero local child processes, keepers, or legacy `cloud-harness` stdio shims, enforce coordination-only MCP callback tokens, and support per-agent micro-USD spend caps (`remote_budget_micros`).
 - **Profile (`profiles/<provider>/<profile>`):** Which upstream subscription or API key authenticates (`anthropic`, `openai`, `google-antigravity`, `muse`, `openrouter`, `sylphx`, Coding Plans). Profile-to-harness resolution is strictly **fail-closed**: if a bound profile has no mapping for the target harness (for example, binding an OAuth-only subscription profile to `opencode` without an OpenCode provider/auth/key mapping), AnyAgents refuses configuration rather than writing an empty config that silently degrades to an external free tier.
-- **Sandbox (`agent_tools::WorkspaceBackend` trait from `SylphxAI/agent-kit`):** Where filesystem and shell operations execute—`LocalWorkspace` (default host directory or git worktree), `RemoteSandboxWorkspace` (Cloud Sandbox / E2B HTTP APIs), `DockerWorkspace` (`docker://<host>`), or custom trait implementations.
 
 System prompt rendering (`write_agent_instructions_with_continuity`) injects a minimal, persona-neutral identity and routing envelope (`arXiv:2611.05306`, `arXiv:2611.03931`) so each sub-agent starts with an unpolluted short context window while tool schemas carry API parameter details.
 
@@ -50,7 +53,8 @@ An agent is configured on three independent choices:
 
 | Axis | Values (first version) | Notes |
 | --- | --- | --- |
-| Harness | `spiron` (`sylphx` compatibility alias), `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, and more by adapter | All harnesses are external processes; Spiron must be installed on `PATH` or selected with `ANYAGENTS_SPIRON_BIN`. |
+| Harness | `spiron` (`sylphx` compatibility alias), `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, `cursor`, and more by adapter | Local harnesses run as external processes; cloud harnesses run directly over ADR 0010 D7 `RemoteSessionProvider` connections. |
+| Runtime | `local`, `sandbox[:<provider>]`, `cloud` | Orthogonal to harness (`--runtime` or `harness@runtime`); invalid pairs fail closed and remote sessions carry optional `remote_budget_micros` spend caps. |
 | Model | `sylphx/openai/gpt-6.1-sol#xhigh`, Claude, GPT, Gemini, DeepSeek, Grok, MiMo and any model a configured provider serves | Chosen separately from the harness. |
 | Auth | `sylphx` (RFC 8628 Device Flow), `subscription`, or `api-key` | Decides which (harness, model) pairs are valid. |
 

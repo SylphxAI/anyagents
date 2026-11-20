@@ -560,9 +560,8 @@ fn reconcile_agent_runtime_config_inner(
         )?;
     }
 
-    let spiron_cloud_active = (crate::vendor::is_spiron_harness(&agent.harness)
-        || normalize_harness_name(&agent.harness) == "spiron-cloud")
-        && crate::vendor::is_effective_cloud_harness(&agent.harness, Some(data), Some(config));
+    let spiron_cloud_active = agent.canonical_harness() == "spiron"
+        && crate::remote::is_agent_cloud(agent, Some(data), Some(config));
     if spiron_cloud_active {
         ensure_spiron_cloud_config(data, config, agent.model.as_deref())?;
     }
@@ -672,7 +671,14 @@ fn reconcile_agent_runtime_config_inner(
             repair_unseated_config_mode(config, pre_existing_mode.unwrap_or(0o0700))?;
         }
     }
-    verify_harness_runtime_config(config, &agent.harness, agent.model.as_deref())?;
+    let verify_selector = if spiron_cloud_active {
+        "spiron-cloud"
+    } else if agent.canonical_harness() == "spiron" {
+        "spiron-local"
+    } else {
+        &agent.harness
+    };
+    verify_harness_runtime_config(config, verify_selector, agent.model.as_deref())?;
     Ok(continuity)
 }
 
@@ -921,14 +927,23 @@ pub(crate) fn verify_harness_runtime_config(
         }
         selector
             if crate::vendor::is_spiron_harness(selector)
-                || normalize_harness_name(selector) == "spiron-cloud" =>
+                || anyagents_harness::decompose_harness_selector(selector)
+                    .is_ok_and(|(h, _)| h == "spiron") =>
         {
             let data_dir = config
                 .parent()
                 .and_then(Path::parent)
                 .and_then(Path::parent);
-            let local_exec =
-                crate::vendor::spiron_uses_local_execution(selector, data_dir, Some(config));
+            let implied_rt = anyagents_harness::decompose_harness_selector(selector)
+                .ok()
+                .and_then(|(_, rt)| rt);
+            let local_exec = matches!(implied_rt, Some(anyagents_core::ExecutionRuntime::Local))
+                || (implied_rt.is_none()
+                    && crate::vendor::spiron_uses_local_execution(
+                        selector,
+                        data_dir,
+                        Some(config),
+                    ));
             let cloud_path = config.join("cloud.json");
             if !local_exec {
                 if cloud_path.is_file() {
@@ -1104,6 +1119,23 @@ pub(crate) fn configure_agent_runtime(
     model: Option<&str>,
     profile: Option<&str>,
 ) -> Result<serde_json::Value, Error> {
+    configure_agent_runtime_with_options(
+        store, data, actor, name, harness, None, model, profile, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn configure_agent_runtime_with_options(
+    store: &Store,
+    data: &Path,
+    actor: &str,
+    name: &str,
+    harness: Option<&str>,
+    runtime: Option<&str>,
+    model: Option<&str>,
+    profile: Option<&str>,
+    budget_cap_micros: Option<Option<u64>>,
+) -> Result<serde_json::Value, Error> {
     let existing = store.agent_by_name(name)?;
     // One transition per agent at a time, across processes: a harness, model
     // or profile switch rewrites the seat's markers and vendor configs, and
@@ -1116,28 +1148,50 @@ pub(crate) fn configure_agent_runtime(
     };
     let existing = store.agent(&existing.id)?;
     let previous_harness = existing.harness.clone();
+    let previous_runtime = existing.runtime.clone();
     let resolved_model = model
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .or_else(|| existing.model.clone());
     let config = agent_config_dir(data, &existing.id);
-    let target_harness = match harness.map(str::trim) {
+    let raw_harness = match harness.map(str::trim) {
         Some("") => return Err(Error::Message("harness is empty".into())),
-        Some(h) => normalize_harness_name(h).to_string(),
-        None => normalize_harness_name(&existing.harness).to_string(),
+        Some(h) => h.to_string(),
+        None => existing.canonical_harness(),
     };
-    crate::install::adapter(&target_harness)?;
+    let resolved = anyagents_harness::resolve_harness_and_runtime(
+        &raw_harness,
+        runtime,
+        existing.runtime.clone(),
+    )
+    .map_err(|err| Error::Message(err.to_string()))?;
     let remote_required = crate::sandbox_providers::SandboxMode::from_env().is_remote_required();
+    if remote_required && resolved.runtime == anyagents_core::ExecutionRuntime::Local {
+        return Err(Error::Message(
+            "runtime `local` is refused when ANYAGENTS_SANDBOX_MODE=remote_required; use `sandbox` or `cloud`"
+                .into(),
+        ));
+    }
+    let target_harness = resolved.harness.clone();
+    let target_runtime = resolved.runtime.clone();
+    let adapter_selector = resolved.legacy_harness_selector();
+    crate::install::adapter(&target_harness)
+        .or_else(|_| crate::install::adapter(&adapter_selector))?;
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
         && !crate::sandbox::is_isolated_test_env()
         && !remote_required
         && actor != "system:profile-rebalance"
     {
+        let install_target = if target_runtime.is_cloud() {
+            adapter_selector.as_str()
+        } else {
+            target_harness.as_str()
+        };
         install_changed_harness(
             data,
             &previous_harness,
-            &target_harness,
+            install_target,
             crate::install::record,
         )?;
     }
@@ -1193,19 +1247,28 @@ pub(crate) fn configure_agent_runtime(
     let lock_busy = matches!(store.try_lock_agent(&existing.id), Err(Error::AgentBusy));
     let in_progress_turn = existing.state == "running" && (open_turn || lock_busy);
 
-    let audit_action = if harness.is_some() {
+    let audit_action = if runtime.is_some() || budget_cap_micros.is_some() {
+        "agents.runtime"
+    } else if harness.is_some() {
         "agents.harness"
     } else {
         "agents.model"
     };
     store.record_admin_audit(actor, audit_action, &existing.name)?;
-    if existing.harness != target_harness {
-        store.set_agent_harness(&existing.id, &target_harness)?;
-    }
-    if let Some(ref m) = resolved_model
+    if existing.harness != target_harness || existing.runtime != target_runtime {
+        store.set_agent_harness_and_runtime(
+            &existing.id,
+            &target_harness,
+            &target_runtime,
+            resolved_model.as_deref(),
+        )?;
+    } else if let Some(ref m) = resolved_model
         && existing.model.as_deref() != Some(m.as_str())
     {
         store.set_agent_model(&existing.id, m)?;
+    }
+    if let Some(cap) = budget_cap_micros {
+        store.set_agent_budget_micros(&existing.id, cap)?;
     }
     let updated = store.agent(&existing.id)?;
 
@@ -1249,7 +1312,8 @@ pub(crate) fn configure_agent_runtime(
     let turn_state = if in_progress_turn { "working" } else { "idle" };
     let cutover_status = if in_progress_turn {
         "pending_active_turn"
-    } else if lock_busy && previous_harness == target_harness {
+    } else if lock_busy && previous_harness == target_harness && previous_runtime == target_runtime
+    {
         "running"
     } else {
         "ready_on_next_wake"
@@ -1261,7 +1325,10 @@ pub(crate) fn configure_agent_runtime(
         "agent": updated.name,
         "parent": updated.parent_id.as_ref().map(|p| p.as_str()),
         "previous_harness": previous_harness,
+        "previous_runtime": previous_runtime.as_canonical_string(),
         "harness": updated.harness,
+        "runtime": updated.runtime.as_canonical_string(),
+        "remote_budget_micros": updated.remote_budget_micros,
         "model": updated.model,
         "profile": normalized_profile,
         "workdir": updated.workdir,
@@ -1274,6 +1341,7 @@ pub(crate) fn configure_agent_runtime(
     }))
 }
 
+#[cfg(test)]
 pub(crate) fn set_agent_harness(
     store: &Store,
     data: &Path,
@@ -1283,10 +1351,37 @@ pub(crate) fn set_agent_harness(
     model: Option<&str>,
     profile: Option<&str>,
 ) -> Result<serde_json::Value, Error> {
+    set_agent_harness_with_options(
+        store, data, actor, name, harness, None, model, profile, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn set_agent_harness_with_options(
+    store: &Store,
+    data: &Path,
+    actor: &str,
+    name: &str,
+    harness: &str,
+    runtime: Option<&str>,
+    model: Option<&str>,
+    profile: Option<&str>,
+    budget_cap_micros: Option<Option<u64>>,
+) -> Result<serde_json::Value, Error> {
     if harness.trim().is_empty() {
         return Err(Error::Message("harness is empty".into()));
     }
-    configure_agent_runtime(store, data, actor, name, Some(harness), model, profile)
+    configure_agent_runtime_with_options(
+        store,
+        data,
+        actor,
+        name,
+        Some(harness),
+        runtime,
+        model,
+        profile,
+        budget_cap_micros,
+    )
 }
 
 pub(crate) fn poke_agent_wake_socket(data: &Path, agent_id: &AgentId) {

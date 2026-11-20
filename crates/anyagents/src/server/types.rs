@@ -137,19 +137,44 @@ pub(super) fn runs_off_host(store: &Store, agent: &Agent) -> bool {
     )
 }
 
-/// Over HTTP MCP an agent is created on, or moved to, a cloud harness only:
-/// any other harness would run on this host on the call's behalf.
+/// Over HTTP MCP an agent is created on, or moved to, an off-host runtime (`cloud` or
+/// `sandbox`) only: a `local` runtime would run on this host on the call's behalf.
 pub(super) fn refuse_host_placement_over_http(
     via_http: bool,
     data_dir: &Path,
     harness: &str,
+    explicit_runtime: Option<&str>,
 ) -> Result<(), ApiError> {
-    let remote_capable = vendor::is_effective_cloud_harness(harness, Some(data_dir), None)
-        || crate::sandbox_providers::SandboxMode::from_env().is_remote_required();
-    if via_http && !remote_capable {
+    if !via_http {
+        return Ok(());
+    }
+    let remote_required = crate::sandbox_providers::SandboxMode::from_env().is_remote_required();
+    let default_runtime = if remote_required || super::serverless::is_serverless_mode() {
+        anyagents_core::ExecutionRuntime::Sandbox { provider: None }
+    } else {
+        anyagents_core::ExecutionRuntime::Local
+    };
+    let resolved =
+        anyagents_harness::resolve_harness_and_runtime(harness, explicit_runtime, default_runtime)
+            .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    let explicitly_local = explicit_runtime
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| anyagents_core::ExecutionRuntime::parse(s).ok())
+        .is_some_and(|rt| rt == anyagents_core::ExecutionRuntime::Local)
+        || anyagents_harness::decompose_harness_selector(harness)
+            .ok()
+            .and_then(|(_, rt)| rt)
+            .is_some_and(|rt| rt == anyagents_core::ExecutionRuntime::Local);
+    let remote_capable = !explicitly_local
+        && (resolved.runtime.is_off_host()
+            || vendor::is_effective_cloud_harness(&resolved.harness, Some(data_dir), None)
+            || remote_required);
+    if !remote_capable {
         return Err(ApiError::forbidden(format!(
             "a call over HTTP MCP places agents only on a cloud harness (`claude-cloud`, \
-             `openai-cloud`, `cursor-cloud`, `spiron-cloud`); `{harness}` would run on this host"
+             `openai-cloud`, `cursor-cloud`, `spiron-cloud`, or `--runtime cloud`/`sandbox`); \
+             `{harness}` would run on this host"
         )));
     }
     Ok(())
@@ -174,8 +199,35 @@ pub(super) fn refuse_host_media_over_http(body: &SendRequest) -> Result<(), ApiE
 /// A harness that runs off this host can only call back through
 /// `public_url`; refuse to create or move an agent onto one without it, before
 /// anything is written.
-pub(super) fn require_remote_callback(data_dir: &Path, harness: &str) -> Result<(), ApiError> {
-    if vendor::is_cloud_harness(harness) {
+pub(super) fn require_remote_callback(
+    data_dir: &Path,
+    harness: &str,
+    explicit_runtime: Option<&str>,
+) -> Result<(), ApiError> {
+    let default_runtime = if crate::sandbox_providers::SandboxMode::from_env().is_remote_required()
+        || super::serverless::is_serverless_mode()
+    {
+        anyagents_core::ExecutionRuntime::Sandbox { provider: None }
+    } else {
+        anyagents_core::ExecutionRuntime::Local
+    };
+    let is_cloud =
+        anyagents_harness::resolve_harness_and_runtime(harness, explicit_runtime, default_runtime)
+            .map(|r| r.runtime.is_cloud())
+            .unwrap_or_else(|_| vendor::is_cloud_harness(harness));
+    if is_cloud {
+        crate::remote::require_public_url(data_dir)
+            .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
+    }
+    Ok(())
+}
+
+/// Require `public_url` whenever explicitly switching an agent to an off-host runtime (`cloud` or `sandbox`).
+pub(super) fn require_remote_callback_for_runtime(
+    data_dir: &Path,
+    runtime: &anyagents_core::ExecutionRuntime,
+) -> Result<(), ApiError> {
+    if runtime.is_off_host() {
         crate::remote::require_public_url(data_dir)
             .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
     }

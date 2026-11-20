@@ -557,7 +557,7 @@ pub(super) fn persisted_fault(
 }
 
 pub(super) fn archived_agent_view_fast(agent: &Agent) -> AgentView {
-    let delivery: crate::api::DeliveryView = (&declared_delivery_for_mode(&agent.harness)).into();
+    let delivery: crate::api::DeliveryView = (&declared_delivery_for_agent_mode(agent)).into();
     AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -572,6 +572,8 @@ pub(super) fn archived_agent_view_fast(agent: &Agent) -> AgentView {
         relationship: None,
         can_message: None,
         harness: agent.harness.clone(),
+        runtime: agent.runtime.as_canonical_string(),
+        remote_budget_micros: agent.remote_budget_micros,
         model: agent.model.clone(),
         live_harness: None,
         live_model: None,
@@ -743,7 +745,7 @@ fn agent_view_preloaded(
                 if working { "working" } else { "idle" },
                 live.delivery
                     .clone()
-                    .unwrap_or_else(|| declared_delivery_for_mode(&agent.harness)),
+                    .unwrap_or_else(|| declared_delivery_for_agent_mode(agent)),
                 effective_quota,
                 if live.process_alive {
                     live.live_harness.clone()
@@ -766,7 +768,7 @@ fn agent_view_preloaded(
                 (
                     "up",
                     "in_turn",
-                    declared_delivery_for_mode(&agent.harness),
+                    declared_delivery_for_agent_mode(agent),
                     session_quota,
                     Some(agent.harness.clone()),
                     agent.model.clone(),
@@ -790,7 +792,7 @@ fn agent_view_preloaded(
                 (
                     proc_str,
                     turn_str,
-                    declared_delivery_for_mode(&agent.harness),
+                    declared_delivery_for_agent_mode(agent),
                     session_quota,
                     if proc_str == "alive" {
                         Some(agent.harness.clone())
@@ -925,6 +927,8 @@ fn agent_view_preloaded(
         relationship: None,
         can_message: None,
         harness: agent.harness.clone(),
+        runtime: agent.runtime.as_canonical_string(),
+        remote_budget_micros: agent.remote_budget_micros,
         model: agent.model.clone(),
         live_harness,
         live_model,
@@ -1019,10 +1023,15 @@ fn installed_on_disk(files: &file_cache::FileCache, root: &Path, harness: &str) 
 
 /// Honest delivery semantics for the current runtime mode: in serverless per-turn
 /// dispatch, mid-turn stdin steering is inactive, so never advertise `steer_support: "yes"`.
-fn declared_delivery_for_mode(harness: &str) -> anyagents_harness::Delivery {
-    declared_delivery_for_serverless(harness, serverless::is_serverless_mode())
+fn declared_delivery_for_agent_mode(agent: &Agent) -> anyagents_harness::Delivery {
+    if serverless::is_serverless_mode() {
+        anyagents_harness_stream::LINE_PER_TURN
+    } else {
+        crate::remote::declared_delivery_for_agent(agent)
+    }
 }
 
+#[cfg(test)]
 fn declared_delivery_for_serverless(
     harness: &str,
     serverless_mode: bool,

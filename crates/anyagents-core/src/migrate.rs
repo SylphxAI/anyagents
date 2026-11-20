@@ -82,6 +82,7 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         39,
         include_str!("../migrations/040_browser_profile_grants.sql"),
     ),
+    (40, include_str!("../migrations/041_agent_runtime.sql")),
 ];
 
 /// The version that moves the mailbox search index out of the state
@@ -245,6 +246,94 @@ mod tests {
         assert_eq!(
             fetch("agt_keep"),
             (Some("engineer".into()), Some("Keep engineer prompt".into()))
+        );
+    }
+
+    #[test]
+    fn agent_runtime_migration_upgrades_v39_preserving_rows_and_backfilling_cloud() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);",
+        )
+        .unwrap();
+        for (version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version <= 39) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_migrations VALUES (?1, 0)", [version])
+                .unwrap();
+        }
+        assert_eq!(current_version(&conn).unwrap(), 39);
+
+        let fixtures = [
+            ("agt_local_cc", "local-cc", "claude-code", "Keep cc prompt"),
+            ("agt_local_sp", "local-sp", "spiron", "Keep spiron prompt"),
+            ("agt_cld_sp", "cld-sp", "spiron-cloud", "Keep spiron cloud"),
+            ("agt_cld_cc", "cld-cc", "claude-cloud", "Keep claude cloud"),
+            ("agt_cld_oa", "cld-oa", "openai-cloud", "Keep openai cloud"),
+            ("agt_cld_cu", "cld-cu", "cursor-cloud", "Keep cursor cloud"),
+        ];
+        for (id, name, harness, instructions) in fixtures {
+            conn.execute(
+                "INSERT INTO agents (id, name, role, harness, instructions, state, created_at_ms)
+                 VALUES (?1, ?2, 'engineer', ?3, ?4, 'idle', 1234)",
+                rusqlite::params![id, name, harness, instructions],
+            )
+            .unwrap();
+        }
+
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            current_version(&conn).unwrap(),
+            MIGRATIONS.last().unwrap().0
+        );
+
+        let fetch = |id: &str| -> (String, String, Option<String>, String, Option<i64>) {
+            conn.query_row(
+                "SELECT name, harness, instructions, runtime, remote_budget_micros FROM agents WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            fetch("agt_local_cc"),
+            (
+                "local-cc".into(),
+                "claude-code".into(),
+                Some("Keep cc prompt".into()),
+                "local".into(),
+                None
+            )
+        );
+        assert_eq!(
+            fetch("agt_local_sp"),
+            (
+                "local-sp".into(),
+                "spiron".into(),
+                Some("Keep spiron prompt".into()),
+                "local".into(),
+                None
+            )
+        );
+        for (id, name, harness, instructions) in &fixtures[2..] {
+            assert_eq!(
+                fetch(id),
+                (
+                    (*name).into(),
+                    (*harness).into(),
+                    Some((*instructions).into()),
+                    "cloud".into(),
+                    None
+                ),
+                "legacy cloud agent {id} must backfill runtime = 'cloud'"
+            );
+        }
+
+        // Idempotent re-run at latest version.
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            current_version(&conn).unwrap(),
+            MIGRATIONS.last().unwrap().0
         );
     }
 }

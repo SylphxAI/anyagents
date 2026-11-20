@@ -22,6 +22,7 @@ pub(super) fn agent_matches_query(agent: &AgentView, query: &str) -> bool {
         .to_ascii_lowercase();
     let workdir = agent.workdir.as_deref().unwrap_or("").to_ascii_lowercase();
     let harness = agent.harness.to_ascii_lowercase();
+    let runtime = agent.runtime.to_ascii_lowercase();
     let model = agent.model.as_deref().unwrap_or("").to_ascii_lowercase();
     let aliases: Vec<String> = agent
         .aliases
@@ -36,6 +37,7 @@ pub(super) fn agent_matches_query(agent: &AgentView, query: &str) -> bool {
             || desc.contains(tok)
             || workdir.contains(tok)
             || harness.contains(tok)
+            || runtime.contains(tok)
             || model.contains(tok)
             || aliases.iter().any(|al| al.contains(tok))
     })
@@ -185,6 +187,8 @@ pub(super) fn compact_agent_row(row: &mut serde_json::Value) {
                 | "relationship"
                 | "can_message"
                 | "harness"
+                | "runtime"
+                | "remote_budget_micros"
                 | "model"
                 | "live_harness"
                 | "live_model"
