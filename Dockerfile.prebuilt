@@ -2,4 +2,4 @@
 # Prebuilt coordinator wrapper referencing the immutable OCI image published by
 # `.github/workflows/docker-publish.yml` to GHCR, enabling rapid (<30s) hosting
 # rollouts without recompiling the full Rust workspace from source.
-FROM ghcr.io/sylphxai/anyagents@sha256:195993c2613f309569cf7255850c89193d8ece1c7c5f89cf513dc84b446b29fe
+FROM ghcr.io/sylphxai/anyagents@sha256:0c0a8d10fdab33274f8d58a763ad924f6efbe00df4034abf73769f7f76af42ef
