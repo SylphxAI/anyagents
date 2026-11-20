@@ -193,7 +193,10 @@ pub(super) struct AgentsArgs {
     /// - `"inspect"` / `"status"` (inspect an agent or sub-agent's live status, schedules, and recent conversation turns)
     /// - `"spawn"` (spawn a new sub-agent under this agent, with optional `repo` / `branch` / `base` / `workdir` for an isolated Git repository of its own)
     /// - `"create"` (admin-only: create a standalone root agent with no parent)
+    /// - `"update"` / `"patch"` (update an agent's metadata, `secrets`, and/or `browser_profiles`; non-admin ancestors enforce `child ⊆ parent`)
+    /// - `"secrets"` (read or replace an agent's granted deployment secret bundle names; non-admin ancestors enforce `child ⊆ parent` and self-mutation is denied)
     /// - `"describe"` (read any agent's role & responsibility `description` / `instructions`, defaulting `name` to `"self"`, or update a target's `description` / `instructions` / `role` / `scope` — mutations require the target's Parent/Ancestor agent or an Admin)
+    /// - `"verdict"` (judge the work of `name`, a descendant: `verdict` is `accepted`, `rework`, `rejected`, or `abandoned`, with an optional `reason`; never your own work)
     /// - `"steer"` / `"send"` (send/steer a follow-up `prompt` into an agent or sub-agent, waking it if archived)
     /// - `"wake"` / `"resume"` (wake an archived or paused agent, with optional `prompt`)
     /// - `"reset_session"` / `"new_session"` (new session for a quiescent managed agent; preserves old pins and raw state)
@@ -222,9 +225,13 @@ pub(super) struct AgentsArgs {
     /// Optional end-exclusive decoded-text span. Omit to tombstone the whole body.
     #[serde(default)]
     pub(super) span: Option<crate::api::RedactionSpan>,
-    /// Required audit reason for redact (never repeat sensitive text here).
-    #[serde(default)]
+    /// Required audit reason for redact (never repeat sensitive text here); the
+    /// optional reason for a verdict.
+    #[serde(default, alias = "note")]
     pub(super) reason: Option<String>,
+    /// For `verdict`: `"accepted"`, `"rework"`, `"rejected"`, or `"abandoned"`.
+    #[serde(default)]
+    pub(super) verdict: Option<String>,
     /// Optional state filter for `list`: `"running"`, `"working"`, `"errored"`, `"idle"`, `"paused"`, `"archived"`, or `"all"` (default `"all"`).
     #[serde(default)]
     pub(super) state: Option<String>,
@@ -343,8 +350,7 @@ pub(super) struct AgentsArgs {
     /// For `usage`: trailing window in days, intersected with `since_ms`/`until_ms`.
     #[serde(default)]
     pub(super) days: Option<i64>,
-    /// For `usage`: grouping dimension (`agent`, `day`, `model`, `harness`); for
-    /// `outcomes`: `model`, `harness`, `role`, `profile`, `agent` or `skill`.
+    /// For `usage`: grouping dimension (`agent`, `day`, `model`, `harness`).
     #[serde(default)]
     pub(super) group_by: Option<String>,
     /// Optional list of named deployment secret bundles to grant when `action` is

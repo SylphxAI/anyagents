@@ -104,6 +104,7 @@ mod mcp_ops;
 pub mod memory_index;
 mod operator_inbox;
 mod origin;
+mod outcomes;
 mod pg_conversation;
 mod registry;
 mod remote_sessions;
@@ -148,6 +149,7 @@ pub use operator_inbox::{
     OperatorMessage, OperatorReceipt, OperatorReport,
 };
 pub(crate) use origin::origin_namespace;
+pub use outcomes::{Outcome, OutcomeKind};
 pub(crate) use pg_conversation::ensure_pg_conversation_indexes;
 pub use registry::holds_store_writer;
 pub use remote_sessions::{

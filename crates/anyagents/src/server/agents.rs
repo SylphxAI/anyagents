@@ -16,7 +16,7 @@ use crate::create::{self, CreateRequest};
 use crate::operator;
 
 use super::agents_lifecycle::{
-    archive_agent_route, delete_agent_route, pause_agent_route, wake_agent_route,
+    archive_agent_route, delete_agent_route, pause_agent_route, verdict_route, wake_agent_route,
 };
 use super::agents_roster::{
     ListAgentsQuery, agent_view, compute_caller_relationship, list_agents_sync_for_principal,
@@ -61,6 +61,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/agents/{name}/archive", post(archive_agent_route))
         .route("/v1/agents/{name}/pause", post(pause_agent_route))
         .route("/v1/agents/{name}/wake", post(wake_agent_route))
+        .route("/v1/agents/{name}/verdict", post(verdict_route))
 }
 
 #[derive(Deserialize)]

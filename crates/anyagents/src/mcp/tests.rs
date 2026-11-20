@@ -1284,6 +1284,11 @@ mod tool_server_runtime_tests {
             }
             let result = mcp.dispatch_any_tool("memory", args).await.unwrap();
             assert_eq!(result["agent"], expected, "agent argument: {agent:?}");
+            assert!(result.get("matches").is_some(), "missing canonical matches");
+            assert!(
+                result.get("turns").is_none(),
+                "memory(search) must not duplicate hits under turns"
+            );
         }
 
         let result = mcp
@@ -1537,5 +1542,121 @@ mod tool_server_runtime_tests {
         assert_eq!(inspected["agent"]["state"], "archived");
         assert_eq!(inspected["agent"]["instructions"], "ARCHIVED_INSTRUCTIONS");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_search_and_recall_return_single_canonical_matches_array() {
+        use axum::{http::StatusCode, response::IntoResponse, routing::get};
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        let note = "---\ndescription: x\n---\nlocal needle\n";
+        std::fs::write(dir.path().join("memory/n.md"), note).unwrap();
+        let sock = dir.path().join("anyagents.sock");
+        let lis = tokio::net::UnixListener::bind(&sock).unwrap();
+        let app = axum::Router::new().route(
+            "/v1/agents/{t}/conversation",
+            get(|axum::extract::Path(t): axum::extract::Path<String>| async move {
+                if t == "down" {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({ "error": "down" }))).into_response();
+                }
+                let turn = json!({
+                    "seq": 1, "id": "memory:agt_1:topic", "direction": "in",
+                    "from": "agent:w", "to": "agent:w", "reply_to": "topic.md",
+                    "text": "deployment needle", "timestamp_ms": 1700000000000i64, "source": "memory"
+                });
+                axum::Json(json!({ "agent": t, "agent_id": t, "turns": [turn] })).into_response()
+            }),
+        );
+        let srv = tokio::spawn(async move { axum::serve(lis, app).await.unwrap() });
+        let mk = |name: &str| AgentMcp {
+            agent: AgentRef {
+                id: AgentId::generate(),
+                name: name.into(),
+                workdir: Some(dir.path().into()),
+            },
+            client: Client::new(sock.clone(), dir.path().join("config"), "test-cap".into()),
+        };
+        for (name, act) in [("w", "search"), ("w", "recall"), ("down", "search")] {
+            let args = json!({ "action": act, "query": "needle" });
+            let res = mk(name).dispatch_any_tool("memory", args).await.unwrap();
+            assert_eq!(res["count"], 1);
+            assert_eq!(res["matches"].as_array().map(Vec::len), Some(1));
+            assert!(res.get("turns").is_none());
+        }
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn agents_verdict_works_over_mcp_and_enforces_downward_supervision() {
+        use anyagents_core::{NewAgent, Store};
+        use anyagents_installer::{CommandRunner, InstallError, LineSink};
+        use serde_json::json;
+        use std::sync::Mutex;
+
+        struct Noop;
+        impl CommandRunner for Noop {
+            fn run(
+                &mut self,
+                _: &str,
+                _: &[String],
+                _: &Path,
+                _: &[(&str, &str)],
+                _: &mut dyn LineSink,
+            ) -> Result<(), InstallError> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let add = |n: &str, p: Option<&AgentId>| {
+            let mut a = NewAgent::new(n, "codex");
+            a.parent_id = p.cloned();
+            s.create_agent(a).unwrap()
+        };
+        let p = add("lead", None);
+        let c = add("child-v", Some(&p.id));
+        let sib = add("sib-v", Some(&p.id));
+        let router = server::build_router(server::AppState {
+            store: Arc::clone(&s),
+            health: anyagents_supervisor::HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(Noop)),
+            auth: crate::auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+            identity: Arc::new(crate::identity::ServingIdentity::capture()),
+            profiles: Default::default(),
+        });
+        let mk = |a: &anyagents_core::Agent| {
+            let r = AgentRef {
+                id: a.id.clone(),
+                name: a.name.clone(),
+                workdir: None,
+            };
+            let pr = crate::auth::Principal::Agent {
+                agent_id: a.id.clone(),
+                name: a.name.clone(),
+            };
+            let cfg = anyagents_core::agent_config_dir(dir.path(), &a.id);
+            AgentMcp::new_for_http(r, dir.path().join("s.sock"), cfg, pr, router.clone())
+        };
+        let (pm, cm, sm) = (mk(&p), mk(&c), mk(&sib));
+        let v = |k: &str| json!({ "action": "verdict", "name": "child-v", "verdict": k });
+        assert!(cm.dispatch_any_tool("agents", v("accepted")).await.is_err());
+        assert!(sm.dispatch_any_tool("agents", v("accepted")).await.is_err());
+        assert!(pm.dispatch_any_tool("agents", v("bogus")).await.is_err());
+
+        let rw = json!({ "action": "verdict", "agent": "child-v", "verdict": "rework", "reason": "fix" });
+        let out = pm.dispatch_any_tool("agents", rw).await.unwrap();
+        assert_eq!(
+            (&out["kind"], &out["actor"], &out["note"]),
+            (&json!("rework"), &json!("agent:lead"), &json!("fix"))
+        );
+        assert_eq!(s.agent(&c.id).unwrap().state, "running");
+
+        let ok = pm.dispatch_any_tool("agents", v("accepted")).await.unwrap();
+        assert_eq!(ok["kind"], "accepted");
+        assert_eq!(s.agent(&c.id).unwrap().state, "archived");
     }
 }

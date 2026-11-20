@@ -47,14 +47,15 @@ impl Store {
         let self_addr = format!("agent:{}", agent.name);
         let since = since_ms.unwrap_or(0);
         let peer_filter = with_peer.map(str::trim).filter(|s| !s.is_empty());
+        let peer_forms = peer_filter
+            .map(|p| self.conversation_peer_forms(p))
+            .unwrap_or_default();
+        let self_match = peer_forms.iter().any(|f| matches_peer_field(&self_addr, f));
+        let sql_peers: &[String] = if self_match { &[] } else { &peer_forms };
         let mut turns = Vec::new();
 
-        // Fast SQL-pushed LIMIT when no post-query peer filter is active.
-        let sql_limit = if peer_filter.is_none() {
-            limit.map(|l| i64::try_from(l.max(1)).unwrap_or(i64::MAX))
-        } else {
-            None
-        };
+        // Push LIMIT directly into SQL for both unfiltered and peer-filtered reads.
+        let sql_limit = limit.map(|l| i64::try_from(l.max(1)).unwrap_or(i64::MAX));
 
         let mut query_params = db_params![agent_id.as_str(), since];
         if let Some(lim) = sql_limit {
@@ -62,24 +63,31 @@ impl Store {
         }
 
         // 1. Inbound messages received by this agent.
+        let mut in_params = query_params.clone();
+        let in_p = build_peer_sql(
+            sql_peers,
+            PeerTarget::Messages("", None),
+            conn.backend(),
+            &mut in_params,
+        );
         let in_sql = match (sql_limit, since_ms.is_none()) {
             (Some(_), true) => format!(
                 "SELECT {MESSAGE_COLS}
-                 FROM messages WHERE agent_id = ?1 AND received_at_ms > ?2
+                 FROM messages WHERE agent_id = ?1 AND received_at_ms > ?2{in_p}
                  ORDER BY received_at_ms DESC, seq DESC LIMIT ?3"
             ),
             (Some(_), false) => format!(
                 "SELECT {MESSAGE_COLS}
-                 FROM messages WHERE agent_id = ?1 AND received_at_ms > ?2
+                 FROM messages WHERE agent_id = ?1 AND received_at_ms > ?2{in_p}
                  ORDER BY received_at_ms ASC, seq ASC LIMIT ?3"
             ),
             (None, _) => format!(
                 "SELECT {MESSAGE_COLS}
-                 FROM messages WHERE agent_id = ?1 AND received_at_ms > ?2
+                 FROM messages WHERE agent_id = ?1 AND received_at_ms > ?2{in_p}
                  ORDER BY received_at_ms, seq"
             ),
         };
-        let inbound_msgs = conn.db_query_vec(&in_sql, &query_params, |row| {
+        let inbound_msgs = conn.db_query_vec(&in_sql, &in_params, |row| {
             message_from_row_with_cursor_db(row, delivered)
         })?;
         for msg in inbound_msgs {
@@ -88,6 +96,7 @@ impl Store {
                 .reply_to
                 .clone()
                 .filter(|r| r.starts_with("telegram:chat:") || r.starts_with("group:"))
+                .or_else(|| origin_chat_destination(msg.origin))
                 .unwrap_or_else(|| self_addr.clone());
             turns.push(ConversationTurn {
                 seq: msg.seq,
@@ -102,24 +111,31 @@ impl Store {
         }
 
         // 2. Outbound messages sent by this agent.
+        let mut out_params = query_params;
+        let out_p = build_peer_sql(
+            sql_peers,
+            PeerTarget::Outbound("", None),
+            conn.backend(),
+            &mut out_params,
+        );
         let out_sql = match (sql_limit, since_ms.is_none()) {
-            (Some(_), true) => {
+            (Some(_), true) => format!(
                 "SELECT id, destination, reply_to, body, sent_at_ms, seq
-                 FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
+                 FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2{out_p}
                  ORDER BY sent_at_ms DESC, id DESC LIMIT ?3"
-            }
-            (Some(_), false) => {
+            ),
+            (Some(_), false) => format!(
                 "SELECT id, destination, reply_to, body, sent_at_ms, seq
-                 FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
+                 FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2{out_p}
                  ORDER BY sent_at_ms ASC, id ASC LIMIT ?3"
-            }
-            (None, _) => {
+            ),
+            (None, _) => format!(
                 "SELECT id, destination, reply_to, body, sent_at_ms, seq
-                 FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
+                 FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2{out_p}
                  ORDER BY sent_at_ms, id"
-            }
+            ),
         };
-        let out_turns = conn.db_query_vec(out_sql, &query_params, |row| {
+        let out_turns = conn.db_query_vec(&out_sql, &out_params, |row| {
             Ok(ConversationTurn {
                 seq: row.get(5)?,
                 id: row.get(0)?,
@@ -133,9 +149,12 @@ impl Store {
         })?;
         turns.extend(out_turns);
 
-        if let Some(peer) = peer_filter {
-            let peers = self.conversation_peer_forms(peer);
-            turns.retain(|turn| peers.iter().any(|p| matches_conversation_peer(turn, p)));
+        if !peer_forms.is_empty() {
+            turns.retain(|turn| {
+                peer_forms
+                    .iter()
+                    .any(|p| matches_conversation_peer(turn, p))
+            });
         }
 
         turns.sort_by(|a, b| {
@@ -191,45 +210,66 @@ impl Store {
             .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
             .unwrap_or(i64::MAX / 8);
         let peer_filter = with_peer.map(str::trim).filter(|s| !s.is_empty());
-        let fetch_limit = if peer_filter.is_some() {
-            lim.saturating_mul(4)
+        let peer_forms = peer_filter
+            .map(|p| self.conversation_peer_forms(p))
+            .unwrap_or_default();
+        let fetch_limit = if !peer_forms.is_empty() {
+            lim.saturating_mul(2)
         } else {
             lim
         };
         let visibility_sql = visible_agent_ids_sql("agent_id", visible_agent_ids, 3);
+        let mut pp = Vec::new();
+        let off = 2 + visible_agent_ids.map_or(0, |v| v.len());
+        let peer_sql = build_peer_sql_at(
+            &peer_forms,
+            PeerTarget::RagChunks,
+            conn.backend(),
+            off,
+            &mut pp,
+        );
         let sql = if since_ms.is_some() {
             format!(
-                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, seq
+                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, seq,
+                        (SELECT m.origin FROM messages m WHERE m.agent_id = rag_chunks.agent_id AND m.id = rag_chunks.chunk_id)
                  FROM rag_chunks
-                 WHERE timestamp_ms > ?1 {visibility_sql}
+                 WHERE timestamp_ms > ?1 {visibility_sql}{peer_sql}
                  ORDER BY timestamp_ms ASC, chunk_id ASC
                  LIMIT ?2"
             )
         } else {
             format!(
-                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, seq
+                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, seq,
+                        (SELECT m.origin FROM messages m WHERE m.agent_id = rag_chunks.agent_id AND m.id = rag_chunks.chunk_id)
                  FROM rag_chunks
-                 WHERE timestamp_ms > ?1 {visibility_sql}
+                 WHERE timestamp_ms > ?1 {visibility_sql}{peer_sql}
                  ORDER BY timestamp_ms DESC, chunk_id DESC
                  LIMIT ?2"
             )
         };
-        let all_params = scoped_params(db_params![since, fetch_limit], visible_agent_ids);
+        let mut all_params = scoped_params(db_params![since, fetch_limit], visible_agent_ids);
+        all_params.extend(pp);
         let mut turns = conn.db_query_vec(&sql, &all_params, |row| {
+            let direction: String = row.get(1)?;
+            let origin_raw: Option<String> = row.get(7)?;
+            let to = resolve_inbound_dest(&direction, row.get(3)?, origin_raw.as_deref());
             Ok(ConversationTurn {
                 seq: row.get(6)?,
                 id: row.get(0)?,
-                direction: row.get(1)?,
+                direction,
                 from: row.get(2)?,
-                to: row.get(3)?,
+                to,
                 reply_to: None,
                 text: row.get(4)?,
                 timestamp_ms: row.get(5)?,
             })
         })?;
-        if let Some(peer) = peer_filter {
-            let peers = self.conversation_peer_forms(peer);
-            turns.retain(|turn| peers.iter().any(|p| matches_conversation_peer(turn, p)));
+        if !peer_forms.is_empty() {
+            turns.retain(|turn| {
+                peer_forms
+                    .iter()
+                    .any(|p| matches_conversation_peer(turn, p))
+            });
         }
         turns.sort_by(|a, b| {
             a.timestamp_ms
@@ -289,6 +329,9 @@ impl Store {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        let peer_forms: Vec<String> = peer_filter
+            .map(|peer| self.conversation_peer_forms(peer))
+            .unwrap_or_default();
         let dir_filter = req
             .direction
             .as_deref()
@@ -397,8 +440,10 @@ impl Store {
                 {
                     return false;
                 }
-                if let Some(peer) = peer_filter
-                    && !matches_conversation_peer(turn, peer)
+                if !peer_forms.is_empty()
+                    && !peer_forms
+                        .iter()
+                        .any(|p| matches_conversation_peer(turn, p))
                 {
                     return false;
                 }
@@ -443,6 +488,15 @@ impl Store {
                     if fts_query.is_empty() {
                         None
                     } else {
+                        let mut pp = Vec::new();
+                        let off = 4 + visible_agent_ids.map_or(0, |v| v.len());
+                        let peer_sql = build_peer_sql_at(
+                            &peer_forms,
+                            PeerTarget::RagChunks,
+                            conn.backend(),
+                            off,
+                            &mut pp,
+                        );
                         let sql = format!(
                                 "SELECT c.chunk_id, c.direction, c.sender, c.destination,
                                         COALESCE(
@@ -450,13 +504,14 @@ impl Store {
                                             (SELECT o.body FROM outbound_messages o WHERE o.agent_id = c.agent_id AND o.id = c.chunk_id),
                                             c.text
                                         ),
-                                        c.timestamp_ms, c.agent_name, c.kind, c.tool_name, c.seq, f.score
+                                        c.timestamp_ms, c.agent_name, c.kind, c.tool_name, c.seq, f.score,
+                                        (SELECT m.origin FROM messages m WHERE m.agent_id = c.agent_id AND m.id = c.chunk_id)
                                  FROM (
                                      SELECT chunk_id, bm25(rag_chunks_fts, 0.5, 1.0, 1.0, 1.0, 0.5, 2.0, 3.0, 2.5) as score
                                      FROM rag_chunks_fts
                                      WHERE rag_chunks_fts MATCH ?1
                                        AND chunk_id IN (
-                                           SELECT chunk_id FROM rag_chunks WHERE 1=1{visibility_sql}
+                                           SELECT chunk_id FROM rag_chunks WHERE 1=1{visibility_sql}{peer_sql}
                                        )
                                      ORDER BY score ASC
                                      LIMIT ?4
@@ -465,16 +520,21 @@ impl Store {
                                  WHERE c.timestamp_ms > ?2 AND c.timestamp_ms <= ?3
                                  ORDER BY f.score ASC"
                             );
-                        let p = scoped_params(
+                        let mut p = scoped_params(
                             db_params![fts_query, since, until, fts_limit],
                             visible_agent_ids,
                         );
+                        p.extend(pp);
                         conn.db_query_vec(&sql, &p, |r| {
+                            let direction: String = r.get(1)?;
+                            let origin_raw: Option<String> = r.get(11)?;
+                            let to =
+                                resolve_inbound_dest(&direction, r.get(3)?, origin_raw.as_deref());
                             Ok((
                                 r.get(0)?,
-                                r.get(1)?,
+                                direction,
                                 r.get(2)?,
-                                r.get(3)?,
+                                to,
                                 r.get(4)?,
                                 r.get(5)?,
                                 r.get(6)?,
@@ -610,18 +670,28 @@ impl Store {
                         continue;
                     }
                     let like_pat = format!("%{}%", q_trim.replace('%', "\\%").replace('_', "\\_"));
+                    let mut pp = Vec::new();
+                    let off = 8 + visible_agent_ids.map_or(0, |v| v.len());
+                    let peer_sql = build_peer_sql_at(
+                        &peer_forms,
+                        PeerTarget::RagChunks,
+                        conn.backend(),
+                        off,
+                        &mut pp,
+                    );
                     let sql = format!(
                         "SELECT chunk_id, direction, sender, destination, text, timestamp_ms,
-                                agent_name, kind, tool_name, seq
+                                agent_name, kind, tool_name, seq, origin_raw
                          FROM (
                              SELECT chunk_id, direction, sender, destination, text, timestamp_ms,
-                                    agent_name, kind, tool_name, seq
+                                    agent_name, kind, tool_name, seq,
+                                    (SELECT m.origin FROM messages m WHERE m.agent_id = rag_chunks.agent_id AND m.id = rag_chunks.chunk_id) AS origin_raw
                              FROM rag_chunks
                              WHERE timestamp_ms > ?1 AND timestamp_ms <= ?2
                                AND (?5 IS NULL OR LOWER(agent_name) = ?5)
                                AND (?6 IS NULL OR kind = ?6)
                                AND (?7 IS NULL OR seq >= ?7)
-                               AND (?8 IS NULL OR seq <= ?8){}
+                               AND (?8 IS NULL OR seq <= ?8){}{peer_sql}
                              ORDER BY timestamp_ms DESC
                              LIMIT 2000
                          ) AS _recent
@@ -630,7 +700,7 @@ impl Store {
                          LIMIT ?4",
                         visible_agent_ids_sql("agent_id", visible_agent_ids, 9)
                     );
-                    let p = scoped_params(
+                    let mut p = scoped_params(
                         db_params![
                             since,
                             until,
@@ -643,12 +713,17 @@ impl Store {
                         ],
                         visible_agent_ids,
                     );
+                    p.extend(pp);
                     let lrows = conn.db_query_vec(&sql, &p, |row| {
+                        let direction: String = row.get(1)?;
+                        let origin_raw: Option<String> = row.get(10)?;
+                        let to =
+                            resolve_inbound_dest(&direction, row.get(3)?, origin_raw.as_deref());
                         Ok((
                             row.get::<String>(0)?,
-                            row.get::<String>(1)?,
+                            direction,
                             row.get::<String>(2)?,
-                            row.get::<String>(3)?,
+                            to,
                             row.get::<String>(4)?,
                             row.get::<i64>(5)?,
                             row.get::<String>(6)?,
@@ -699,21 +774,31 @@ impl Store {
             } else {
                 "ORDER BY timestamp_ms DESC, seq DESC, chunk_id DESC"
             };
+            let mut pp = Vec::new();
+            let off = 8 + visible_agent_ids.map_or(0, |v| v.len());
+            let peer_sql = build_peer_sql_at(
+                &peer_forms,
+                PeerTarget::RagChunks,
+                conn.backend(),
+                off,
+                &mut pp,
+            );
             let sql = format!(
                 "SELECT chunk_id, direction, sender, destination, text, timestamp_ms,
-                        agent_name, kind, tool_name, seq
+                        agent_name, kind, tool_name, seq,
+                        (SELECT m.origin FROM messages m WHERE m.agent_id = rag_chunks.agent_id AND m.id = rag_chunks.chunk_id)
                  FROM rag_chunks
                  WHERE timestamp_ms > ?1 AND timestamp_ms <= ?2
                    AND (?4 IS NULL OR LOWER(agent_name) = ?4)
                    AND (?5 IS NULL OR kind = ?5)
                    AND (?6 IS NULL OR LOWER(direction) = ?6)
                    AND (?7 IS NULL OR seq >= ?7)
-                   AND (?8 IS NULL OR seq <= ?8){}
+                   AND (?8 IS NULL OR seq <= ?8){}{peer_sql}
                  {order_sql}
                  LIMIT ?3",
                 visible_agent_ids_sql("agent_id", visible_agent_ids, 9)
             );
-            let p = scoped_params(
+            let mut p = scoped_params(
                 db_params![
                     since,
                     until,
@@ -726,12 +811,16 @@ impl Store {
                 ],
                 visible_agent_ids,
             );
+            p.extend(pp);
             let brows = conn.db_query_vec(&sql, &p, |row| {
+                let direction: String = row.get(1)?;
+                let origin_raw: Option<String> = row.get(10)?;
+                let to = resolve_inbound_dest(&direction, row.get(3)?, origin_raw.as_deref());
                 Ok((
                     row.get::<String>(0)?,
-                    row.get::<String>(1)?,
+                    direction,
                     row.get::<String>(2)?,
-                    row.get::<String>(3)?,
+                    to,
                     row.get::<String>(4)?,
                     row.get::<i64>(5)?,
                     row.get::<String>(6)?,
@@ -1065,23 +1154,193 @@ impl Store {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TelegramChatPeer {
+    chat_id: i64,
+    topic_id: Option<i64>,
+}
+
+impl TelegramChatPeer {
+    fn parse(peer: &str) -> Option<Self> {
+        let lo = peer.trim().to_ascii_lowercase();
+        let mut it = lo.strip_prefix("telegram:chat:")?.split(':');
+        let chat_id = it.next()?.parse::<i64>().ok()?;
+        let topic_id = match it.next() {
+            Some(r) if !r.is_empty() => Some(r.parse::<i64>().ok()?),
+            Some(_) => return None,
+            None => None,
+        };
+        it.next().is_none().then_some(Self { chat_id, topic_id })
+    }
+
+    fn prefixes(self, bare: bool) -> Vec<String> {
+        let sfx = self.topic_id.map_or_else(
+            || self.chat_id.to_string(),
+            |t| format!("{}:{t}", self.chat_id),
+        );
+        let mut out = vec![format!("telegram:chat:{sfx}")];
+        if bare {
+            out.push(sfx);
+        }
+        if self.topic_id.is_none() && self.chat_id > 0 {
+            out.push(format!("telegram:user:{}", self.chat_id));
+        }
+        out
+    }
+}
+
+fn origin_chat_destination(origin: Option<super::types::Origin>) -> Option<String> {
+    let o = origin?;
+    let cid = o.chat_id?;
+    Some(o.thread_id.map_or_else(
+        || format!("telegram:chat:{cid}"),
+        |tid| format!("telegram:chat:{cid}:{tid}"),
+    ))
+}
+
+pub(super) fn resolve_inbound_dest(dir: &str, dest: String, origin_json: Option<&str>) -> String {
+    if dir == "in" && !dest.starts_with("telegram:chat:") && !dest.starts_with("group:") {
+        let origin = origin_json
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| serde_json::from_str::<super::types::Origin>(s).ok());
+        if let Some(chat) = origin_chat_destination(origin) {
+            return chat;
+        }
+    }
+    dest
+}
+
+fn escape_like_literal(raw: &str) -> String {
+    raw.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn strip_peer_prefix(peer: &str) -> &str {
+    ["agent:", "group:", "telegram:chat:", "telegram:user:"]
+        .into_iter()
+        .find_map(|p| peer.strip_prefix(p))
+        .unwrap_or(peer)
+}
+
+fn push_param<T: ToDbParam>(params: &mut Vec<DbParam>, offset: usize, val: T) -> usize {
+    params.push(val.to_db_param());
+    offset + params.len()
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum PeerTarget<'a> {
+    Messages(&'a str, Option<&'a str>),
+    Outbound(&'a str, Option<&'a str>),
+    RagChunks,
+}
+
+pub(super) fn build_peer_sql(
+    peer_forms: &[String],
+    target: PeerTarget<'_>,
+    backend: DbBackend,
+    params: &mut Vec<DbParam>,
+) -> String {
+    build_peer_sql_at(peer_forms, target, backend, 0, params)
+}
+
+fn build_peer_sql_at(
+    peer_forms: &[String],
+    target: PeerTarget<'_>,
+    backend: DbBackend,
+    offset: usize,
+    params: &mut Vec<DbParam>,
+) -> String {
+    if peer_forms.is_empty() {
+        return String::new();
+    }
+    let (cols, bare_tg, origin_col, rag) = match target {
+        PeerTarget::Messages(p, s) => {
+            let mut c = vec![format!("{p}reply_to"), format!("{p}sender")];
+            c.extend(s.map(str::to_string));
+            (c, false, Some(format!("{p}origin")), false)
+        }
+        PeerTarget::Outbound(p, s) => {
+            let mut c = vec![format!("{p}destination"), format!("{p}reply_to")];
+            c.extend(s.map(str::to_string));
+            (c, true, None, false)
+        }
+        PeerTarget::RagChunks => (
+            vec!["rag_chunks.destination".into(), "rag_chunks.sender".into()],
+            true,
+            Some("_m.origin".into()),
+            true,
+        ),
+    };
+    let mut forms = Vec::new();
+    for form in peer_forms {
+        let mut parts = Vec::new();
+        if let Some(tg) = TelegramChatPeer::parse(form) {
+            for pfx in tg.prefixes(bare_tg) {
+                let pat = format!("{}:%", escape_like_literal(&pfx));
+                let eq = push_param(params, offset, pfx);
+                let lk = push_param(params, offset, pat);
+                for c in &cols[..2] {
+                    parts.push(format!("{c} = ?{eq} OR {c} LIKE ?{lk} ESCAPE '\\'"));
+                }
+            }
+            if let Some(oc) = origin_col.as_deref() {
+                let ce = backend.sql_json_extract_i64(oc, "chat_id");
+                let pc = push_param(params, offset, tg.chat_id);
+                let ph = push_param(params, offset, format!("%{}%", tg.chat_id));
+                let tid_sql = tg.topic_id.map_or_else(String::new, |tid| {
+                    let te = backend.sql_json_extract_i64(oc, "thread_id");
+                    format!(" AND {te} = ?{}", push_param(params, offset, tid))
+                });
+                let pred = format!(
+                    "({oc} IS NOT NULL AND {oc} LIKE ?{ph} ESCAPE '\\' AND {ce} = ?{pc}{tid_sql})"
+                );
+                parts.push(if rag {
+                    format!("EXISTS (SELECT 1 FROM messages _m WHERE _m.agent_id = rag_chunks.agent_id AND _m.id = rag_chunks.chunk_id AND {pred})")
+                } else {
+                    pred
+                });
+            }
+        } else {
+            let bare = strip_peer_prefix(form);
+            let pf = push_param(params, offset, form);
+            let pb = push_param(params, offset, bare);
+            let pp = push_param(params, offset, format!("{}:%", escape_like_literal(form)));
+            let ps = push_param(params, offset, format!("%:{}", escape_like_literal(bare)));
+            let pm = push_param(params, offset, format!("%:{}:%", escape_like_literal(bare)));
+            for c in &cols {
+                parts.push(format!("{c} = ?{pf} OR {c} = ?{pb} OR {c} LIKE ?{pp} ESCAPE '\\' OR {c} LIKE ?{ps} ESCAPE '\\' OR {c} LIKE ?{pm} ESCAPE '\\'"));
+            }
+        }
+        forms.push(format!("({})", parts.join(" OR ")));
+    }
+    format!(" AND ({})", forms.join(" OR "))
+}
+
+pub(super) fn matches_peer_field(field: &str, peer: &str) -> bool {
+    if let Some(tg) = TelegramChatPeer::parse(peer) {
+        let lower = field.to_ascii_lowercase();
+        return tg
+            .prefixes(true)
+            .into_iter()
+            .any(|p| lower == p || lower.starts_with(&format!("{p}:")));
+    }
+    let bare = strip_peer_prefix(peer);
+    field == peer
+        || field == bare
+        || field.starts_with(&format!("{peer}:"))
+        || field.ends_with(&format!(":{bare}"))
+        || field.contains(&format!(":{bare}:"))
+}
+
 pub(super) fn matches_conversation_peer(turn: &ConversationTurn, peer: &str) -> bool {
-    let bare = peer
-        .strip_prefix("agent:")
-        .or_else(|| peer.strip_prefix("group:"))
-        .or_else(|| peer.strip_prefix("telegram:chat:"))
-        .or_else(|| peer.strip_prefix("telegram:user:"))
-        .unwrap_or(peer);
-    let fields = [
+    [
         Some(turn.from.as_str()),
         Some(turn.to.as_str()),
         turn.reply_to.as_deref(),
-    ];
-    fields.into_iter().flatten().any(|field| {
-        field == peer
-            || field == bare
-            || field.starts_with(&format!("{peer}:"))
-            || field.ends_with(&format!(":{bare}"))
-            || field.contains(&format!(":{bare}:"))
-    })
+    ]
+    .into_iter()
+    .flatten()
+    .any(|field| matches_peer_field(field, peer))
 }

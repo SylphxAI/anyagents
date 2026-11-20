@@ -787,20 +787,7 @@ pub(crate) async fn dispatch_next_mailbox_message_if_serverless(
         let mut live_active = 0usize;
         for turn in active {
             if turn.harness_kind == "sandbox" && turn.last_event_at_ms <= stale_before {
-                let _ = settle_remote_turn_and_deliver(
-                    &store_r,
-                    &turn.turn_id,
-                    SettleRemoteTurn {
-                        status: "failed".to_string(),
-                        result_text: None,
-                        error_text: Some("sandbox turn heartbeat timed out".to_string()),
-                        usage_json: None,
-                        cursor: None,
-                        settled_at_ms: now,
-                    },
-                    None,
-                    0,
-                );
+                super::serverless_failure::settle_timed_out_sandbox_turn(&store_r, &turn, now);
             } else {
                 live_active += 1;
             }
@@ -3181,21 +3168,11 @@ pub(crate) async fn run_tick_pass(
             .map_err(ApiError::from_store)?;
         let mut count = 0usize;
         for turn in stale {
-            if let Ok(Some(res)) = settle_remote_turn_and_deliver(
+            if super::serverless_failure::settle_timed_out_sandbox_turn(
                 &store_stale,
-                &turn.turn_id,
-                SettleRemoteTurn {
-                    status: "failed".to_string(),
-                    result_text: None,
-                    error_text: Some("sandbox turn heartbeat timed out".to_string()),
-                    usage_json: None,
-                    cursor: None,
-                    settled_at_ms: now_ms(),
-                },
-                None,
-                0,
-            ) && res.settled_now
-            {
+                &turn,
+                now_ms(),
+            ) {
                 count += 1;
             }
         }

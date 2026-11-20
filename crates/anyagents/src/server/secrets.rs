@@ -110,9 +110,9 @@ fn load_agent_name_map(store: &Store) -> HashMap<String, String> {
 /// - Operator or `is_admin=true` root agent: any existing `deployment_secrets` on any agent.
 /// - Non-admin agent:
 ///   - Self-mutation is ALWAYS denied (`caller.id == target.id` -> 403 Forbidden).
-///   - Target MUST be a direct child (`target.parent_id == Some(caller.id)` -> else 403 Forbidden).
+///   - Target MUST be a direct child or descendant (`is_self_or_ancestor(caller, target)` -> else 403 Forbidden).
 ///   - Every requested secret AND every revoked secret MUST be held by the caller
-///     (`requested ⊆ parent_held` and `(existing \ requested) ⊆ parent_held` -> else 403 Forbidden).
+///     (`requested ⊆ caller_held` and `(existing \ requested) ⊆ caller_held` -> else 403 Forbidden).
 /// - All referenced secret names must exist in `deployment_secrets` (else 400 Bad Request).
 fn authorize_agent_secret_grants(
     store: &Store,
@@ -149,9 +149,9 @@ fn authorize_agent_secret_grants(
                     "an agent cannot modify its own secret grants",
                 ));
             }
-            if target.parent_id.as_ref() != Some(&caller.id) {
+            if !is_self_or_ancestor(store, &caller.id, target) {
                 return Err(ApiError::forbidden(
-                    "only the operator, an admin, or the target agent's direct parent may modify its secret grants",
+                    "only the operator, an admin, or an ancestor of the target agent may modify its secret grants",
                 ));
             }
             let requested = normalize_requested_secrets(requested_raw)?;
@@ -218,9 +218,15 @@ pub(crate) fn validate_create_agent_secrets(
             if requested.is_empty() {
                 return Ok(Vec::new());
             }
-            if parent_id != Some(&caller.id) {
+            let permitted_parent = parent_id.is_some_and(|pid| {
+                pid == &caller.id
+                    || store.agent(pid).is_ok_and(|parent_agent| {
+                        is_self_or_ancestor(store, &caller.id, &parent_agent)
+                    })
+            });
+            if !permitted_parent {
                 return Err(ApiError::forbidden(
-                    "a non-admin agent may only grant secrets to its own direct children",
+                    "a non-admin agent may only grant secrets to its own descendants",
                 ));
             }
             let parent_held: BTreeSet<String> = store

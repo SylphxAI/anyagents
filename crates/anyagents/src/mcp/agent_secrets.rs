@@ -210,6 +210,33 @@ pub(super) async fn switch_agent_harness_or_runtime(
         .await
 }
 
+pub(super) fn resolve_agents_action(args: &AgentsArgs) -> String {
+    if let Some(a) = args
+        .action
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return a.to_ascii_lowercase();
+    }
+    let no_spawn = args.prompt.is_none() && args.harness.is_none() && args.repo.is_none();
+    let has_loc = args.repo.is_some() || args.workdir.is_some() || args.branch.is_some();
+    let act = if args.new_name.is_some() {
+        "rename"
+    } else if args.verdict.is_some() {
+        "verdict"
+    } else if args.instructions.is_some() && no_spawn {
+        "describe"
+    } else if args.prompt.is_some() && has_loc {
+        "spawn"
+    } else if args.secrets.is_some() && args.name.is_some() && no_spawn {
+        "secrets"
+    } else {
+        "list"
+    };
+    act.to_string()
+}
+
 pub(super) async fn patch_agent(
     client: &Client,
     target: Option<&str>,
@@ -222,7 +249,11 @@ pub(super) async fn patch_agent(
     let clean = target.strip_prefix("agent:").unwrap_or(target);
     let body = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
     let updated: AgentView = client
-        .request_method("PATCH", &format!("/v1/agents/{clean}"), Some(body))
+        .request_method(
+            "PATCH",
+            &format!("/v1/agents/{}", super::urlencoding_simple(clean)),
+            Some(body),
+        )
         .await?;
     serde_json::to_value(updated).map_err(|e| e.to_string())
 }
@@ -237,16 +268,34 @@ pub(super) async fn agent_secrets(
         .filter(|s| !s.is_empty())
         .unwrap_or("self");
     let clean = target.strip_prefix("agent:").unwrap_or(target);
+    let path = format!("/v1/agents/{}/secrets", super::urlencoding_simple(clean));
     let resp: AgentSecretsResponse = if let Some(secrets) = secrets {
         let body = serde_json::to_vec(&serde_json::json!({ "secrets": secrets }))
             .map_err(|e| e.to_string())?;
-        client
-            .request_method("PUT", &format!("/v1/agents/{clean}/secrets"), Some(body))
-            .await?
+        client.request_method("PUT", &path, Some(body)).await?
     } else {
-        client
-            .get(&format!("/v1/agents/{clean}/secrets"), None)
-            .await?
+        client.get(&path, None).await?
     };
     serde_json::to_value(resp).map_err(|e| e.to_string())
+}
+
+pub(super) async fn record_agent_verdict(
+    client: &Client,
+    target: Option<&str>,
+    verdict: Option<&str>,
+    reason: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let target = target
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("verdict requires the agent `name` whose work is judged")?;
+    let verdict = verdict
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("verdict requires `verdict`: accepted, rework, rejected or abandoned")?;
+    let clean = target.strip_prefix("agent:").unwrap_or(target);
+    let body = serde_json::to_vec(&serde_json::json!({ "verdict": verdict, "reason": reason }))
+        .map_err(|e| e.to_string())?;
+    let path = format!("/v1/agents/{}/verdict", super::urlencoding_simple(clean));
+    client.get(&path, Some(body)).await
 }
