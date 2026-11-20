@@ -564,15 +564,16 @@ async fn dispatch_sandbox_turn(
                 &lease_env,
             )?;
 
-            // Hydrate persisted PostgreSQL `agent_files` (`config` + decrypted `secrets`)
-            // into the ephemeral config dir, stage any inbound Telegram media blobs referenced
-            // by the prompt into `<cfg_dir>/media/<file>` (rewriting coordinator paths to
-            // `<state_dir>/media/<file>`), ensure a live remote MCP session exists when
-            // public_url is configured, and sync the full bundle tar into `<state_dir>`.
+            // Hydrate PG config/secrets/memory, refresh `<learned_memory>`, stage media, and sync bundle tar.
             let _ = hydrate_agent_files_from_store(&store_ensure, &agent_ensure.id, &cfg_dir)?;
             let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(
                 &store_ensure,
                 &agent_ensure.id,
+            );
+            let _ = super::serverless_memory::refresh_hydrated_prompt_learned_memory(
+                &store_ensure,
+                &agent_ensure,
+                &cfg_dir,
             );
             if anyagents_harness::normalize_harness_name(&agent_ensure.harness) == "agy" {
                 let _ = crate::vendor::ensure_agy_steering_settings(
@@ -1136,28 +1137,8 @@ pub(crate) fn settle_remote_turn_and_deliver(
         }
     }
 
-    // 4. Advance durable mailbox delivery cursor & turn terminal ledger if `message_seq` was recorded.
-    if let Some(seq) = turn
-        .metadata_json
-        .as_ref()
-        .and_then(|m| m.get("message_seq").and_then(Value::as_i64))
-    {
-        if turn.status == "completed" {
-            let _ = store.mark_delivered_up_to(&turn.agent_id, seq);
-            let opener = turn
-                .metadata_json
-                .as_ref()
-                .and_then(|m| m.get("opener_id").and_then(Value::as_str));
-            let exact = opener.zip(turn.result_text.as_deref());
-            let _ = store.note_turn_completed_with_output_for(&turn.agent_id, seq, exact);
-        } else {
-            let err_text = turn
-                .error_text
-                .as_deref()
-                .unwrap_or("serverless turn failed");
-            let _ = store.note_turn_errored_for(&turn.agent_id, seq, err_text, false);
-        }
-    }
+    // 4. Advance durable mailbox delivery cursor & turn terminal ledger.
+    super::serverless_watches::settle_turn_mailbox_cursor(store, &turn);
     // Always close any remaining stale `turn_recovery` open-turn lock if no active
     // remote turns remain for this agent.
     if store
@@ -3222,15 +3203,16 @@ pub(crate) async fn run_tick_pass(
         ..TickSummary::default()
     };
 
-    // 1. Fire due schedules & reminders, then dispatch turns for woken agents in serverless mode.
-    let store_sched = Arc::clone(&store);
-    let health_sched = health.clone();
+    // 1. Fire due schedules, watches & reminders, then dispatch woken agents in serverless mode.
+    let (store_sched, health_sched) = (Arc::clone(&store), health.clone());
     let (schedules_fired, woken_agents) = spawn_store(move || {
-        Ok(crate::schedule::tick_serverless_schedules(
-            &store_sched,
-            &health_sched,
-            now,
-        ))
+        Ok(
+            super::serverless_watches::tick_serverless_watches_and_schedules(
+                &store_sched,
+                &health_sched,
+                now,
+            ),
+        )
     })
     .await?;
     summary.schedules_fired = schedules_fired;
@@ -4987,6 +4969,114 @@ done
         .unwrap();
         assert!(ok.settled_now);
         assert_eq!(store.delivered_cursor(&agent.id).unwrap(), m2.seq);
+        assert!(store.list_undelivered(&agent.id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mid_turn_inbox_read_advances_delivered_cursor_on_complete_not_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("inbox-watermark", "claude-code"))
+            .unwrap();
+        store.set_agent_running(&agent.id, "/work").unwrap();
+        let now = now_ms();
+
+        let ReceiveOutcome::New(m1) = store
+            .receive(&agent.id, anyagents_core::Incoming::new("initial prompt"))
+            .unwrap()
+        else {
+            panic!("expected new m1");
+        };
+        let ReceiveOutcome::New(m2) = store
+            .receive(&agent.id, anyagents_core::Incoming::new("mid-turn msg 2"))
+            .unwrap()
+        else {
+            panic!("expected new m2");
+        };
+        let ReceiveOutcome::New(m3) = store
+            .receive(&agent.id, anyagents_core::Incoming::new("mid-turn msg 3"))
+            .unwrap()
+        else {
+            panic!("expected new m3");
+        };
+
+        // Turn 1 dispatched for m1, agent reads up to m3 mid-turn via inbox(), then crashes -> cursor stays 0.
+        store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "turn_inbox_fail".into(),
+                agent_id: agent.id.clone(),
+                harness_kind: "sandbox".into(),
+                provider_kind: Some("sandbox".into()),
+                remote_run_id: None,
+                callback_token_hash: "h-fail".into(),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: Some(json!({ "message_seq": m1.seq })),
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+        store
+            .remote_turn_store()
+            .record_agent_inbox_read_seq(&agent.id, m3.seq, now + 5)
+            .unwrap();
+        settle_remote_turn_and_deliver(
+            &store,
+            "turn_inbox_fail",
+            SettleRemoteTurn {
+                status: "failed".into(),
+                result_text: None,
+                error_text: Some("process crashed".into()),
+                usage_json: None,
+                cursor: None,
+                settled_at_ms: now + 10,
+            },
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), 0);
+        assert_eq!(store.list_undelivered(&agent.id, 10).unwrap().len(), 3);
+
+        // Turn 2 dispatched for m1, agent reads up to m3 mid-turn via inbox(), then completes -> cursor jumps to m3.seq!
+        store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "turn_inbox_ok".into(),
+                agent_id: agent.id.clone(),
+                harness_kind: "sandbox".into(),
+                provider_kind: Some("sandbox".into()),
+                remote_run_id: None,
+                callback_token_hash: "h-ok".into(),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: Some(
+                    json!({ "message_seq": m1.seq, "opener_id": m1.id.to_string() }),
+                ),
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+        store
+            .remote_turn_store()
+            .record_agent_inbox_read_seq(&agent.id, m3.seq, now + 20)
+            .unwrap();
+        settle_remote_turn_and_deliver(
+            &store,
+            "turn_inbox_ok",
+            SettleRemoteTurn {
+                status: "completed".into(),
+                result_text: Some("answered all three".into()),
+                error_text: None,
+                usage_json: None,
+                cursor: None,
+                settled_at_ms: now + 30,
+            },
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), m3.seq);
         assert!(store.list_undelivered(&agent.id, 10).unwrap().is_empty());
     }
 }

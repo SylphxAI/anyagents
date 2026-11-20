@@ -44,11 +44,14 @@ mod messaging_conversation;
 mod messaging_delivery;
 mod ops;
 pub(crate) mod outbound_history;
+mod profile_models;
 mod profiles;
 mod quota_rotation;
 mod reap_queue;
 mod schedules;
 pub(crate) mod serverless;
+mod serverless_memory;
+mod serverless_watches;
 mod types;
 mod webhooks_mcp;
 

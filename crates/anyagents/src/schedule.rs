@@ -922,9 +922,10 @@ fn initial_agent_idle_baseline(
     };
     let errored = agent_errored_state(store, health, found, now);
     let error_at_ms = errored.as_ref().map_or(0, |(_, at)| (*at).max(1));
-    // Durable queued mail or an active non-errored open turn must advance
-    // `turn_seq` past `snap.turn_seq` (or enter a fresh error) before firing.
-    let await_turn = snap.pending_mail || (snap.open_turn && errored.is_none());
+    // Queued mail, live turns, or non-errored open turns must complete before firing.
+    let await_turn = snap.pending_mail
+        || in_live_turn(health, &found.id)
+        || (snap.open_turn && errored.is_none());
     IdleBaseline {
         await_turn,
         turn_seq: snap.turn_seq,
@@ -2527,7 +2528,6 @@ fn evaluate_agent_idle_watch(
         let next_base = if let Some(mut b) = base {
             if !b.await_turn
                 && let Ok(snap) = store.agent_turn_snapshot(&found.id)
-                && (snap.pending_mail || snap.open_turn)
             {
                 b.await_turn = true;
                 b.turn_seq = snap.turn_seq;

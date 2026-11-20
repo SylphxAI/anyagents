@@ -17,7 +17,7 @@ const DEFAULT_FETCH_MAX_CHARS: usize = 12_000;
 const HARD_FETCH_MAX_CHARS: usize = 65_536;
 const MAX_REDIRECT_HOPS: usize = 5;
 const MAX_DIRECT_FETCH_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_FAILOVER_ATTEMPTS: usize = 3;
+const MAX_FAILOVER_ATTEMPTS: usize = 4;
 
 /// Parameters for `web_fetch`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -47,7 +47,7 @@ pub struct WebFetchRequest {
 }
 
 /// Supported fetch backends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FetchEngine {
     Auto,
     Firecrawl,
@@ -129,6 +129,16 @@ pub fn execute_fetch(
     default_timeout_ms: u64,
     user_agent: &str,
 ) -> Result<JsonValue, String> {
+    execute_fetch_with_endpoints(keys, req, default_timeout_ms, user_agent, None)
+}
+
+fn execute_fetch_with_endpoints(
+    keys: &HashMap<String, String>,
+    req: &WebFetchRequest,
+    default_timeout_ms: u64,
+    user_agent: &str,
+    endpoints: Option<&HashMap<FetchEngine, String>>,
+) -> Result<JsonValue, String> {
     let url = req.url.trim();
     if url.is_empty() {
         return Err("`web_fetch` requires a non-empty `url`".to_string());
@@ -167,6 +177,7 @@ pub fn execute_fetch(
         max_chars,
         timeout_ms,
         user_agent,
+        endpoints,
     };
 
     for engine in plan {
@@ -235,6 +246,7 @@ struct FetchContext<'a> {
     max_chars: usize,
     timeout_ms: u64,
     user_agent: &'a str,
+    endpoints: Option<&'a HashMap<FetchEngine, String>>,
 }
 
 fn execute_single_fetch(
@@ -246,7 +258,7 @@ fn execute_single_fetch(
         return execute_direct_fetch(url, ctx.req, ctx.timeout_ms, ctx.user_agent);
     }
 
-    let (key_name, endpoint, header, bearer, body) = match engine {
+    let (key_name, default_endpoint, header, bearer, body) = match engine {
         FetchEngine::Firecrawl => (
             "FIRECRAWL_API_KEY",
             "https://api.firecrawl.dev/v2/scrape",
@@ -297,6 +309,12 @@ fn execute_single_fetch(
             });
         }
     };
+
+    let endpoint = ctx
+        .endpoints
+        .and_then(|map| map.get(&engine))
+        .map(String::as_str)
+        .unwrap_or(default_endpoint);
 
     let key = ctx.keys.get(key_name).cloned().ok_or_else(|| EngineError {
         status: None,
@@ -624,5 +642,92 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("SSRF guard"), "got: {err}");
+    }
+
+    fn spawn_mock_fetch_server(status_line: &'static str, body: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}/extract")
+    }
+
+    #[test]
+    fn auto_fetch_skips_firecrawl_402_cleanly_to_exa() {
+        let fc_url =
+            spawn_mock_fetch_server("402 Payment Required", r#"{"error":"credits exhausted"}"#);
+        let exa_url = spawn_mock_fetch_server(
+            "200 OK",
+            r#"{"results":[{"url":"https://93.184.216.34/doc","title":"Doc","text":"Recovered via Exa"}]}"#,
+        );
+        let mut keys = HashMap::new();
+        keys.insert("FIRECRAWL_API_KEY".into(), "fc_key".into());
+        keys.insert("EXA_API_KEY".into(), "exa_key".into());
+        let mut endpoints = HashMap::new();
+        endpoints.insert(FetchEngine::Firecrawl, fc_url);
+        endpoints.insert(FetchEngine::Exa, exa_url);
+
+        let req = WebFetchRequest {
+            url: "https://93.184.216.34/doc".into(),
+            engine: Some("auto".into()),
+            ..Default::default()
+        };
+        let out =
+            execute_fetch_with_endpoints(&keys, &req, 5_000, "test-ua", Some(&endpoints)).unwrap();
+        assert_eq!(out["engine"], "exa");
+        assert_eq!(out["fallback_used"], true);
+        assert_eq!(out["content"], "Recovered via Exa");
+        assert_eq!(out["attempts"][0]["engine"], "firecrawl");
+        assert_eq!(out["attempts"][0]["http_status"], 402);
+        assert_eq!(out["attempts"][1]["engine"], "exa");
+        assert_eq!(out["attempts"][1]["outcome"], "succeeded");
+    }
+
+    #[test]
+    fn auto_fetch_skips_firecrawl_429_through_all_four_providers_to_tavily() {
+        let fc_url = spawn_mock_fetch_server("429 Too Many Requests", r#"{"error":"rate limit"}"#);
+        let exa_url = spawn_mock_fetch_server("502 Bad Gateway", r#"{"error":"bad gateway"}"#);
+        let parallel_url =
+            spawn_mock_fetch_server("503 Service Unavailable", r#"{"error":"down"}"#);
+        let tavily_url = spawn_mock_fetch_server(
+            "200 OK",
+            r#"{"results":[{"url":"https://93.184.216.34/doc","title":"Doc","raw_content":"Recovered via Tavily"}]}"#,
+        );
+        let mut keys = HashMap::new();
+        keys.insert("FIRECRAWL_API_KEY".into(), "fc_key".into());
+        keys.insert("EXA_API_KEY".into(), "exa_key".into());
+        keys.insert("PARALLEL_API_KEY".into(), "par_key".into());
+        keys.insert("TAVILY_API_KEY".into(), "tav_key".into());
+        let mut endpoints = HashMap::new();
+        endpoints.insert(FetchEngine::Firecrawl, fc_url);
+        endpoints.insert(FetchEngine::Exa, exa_url);
+        endpoints.insert(FetchEngine::Parallel, parallel_url);
+        endpoints.insert(FetchEngine::Tavily, tavily_url);
+
+        let req = WebFetchRequest {
+            url: "https://93.184.216.34/doc".into(),
+            engine: Some("auto".into()),
+            ..Default::default()
+        };
+        let out =
+            execute_fetch_with_endpoints(&keys, &req, 5_000, "test-ua", Some(&endpoints)).unwrap();
+        assert_eq!(out["engine"], "tavily");
+        assert_eq!(out["fallback_used"], true);
+        assert_eq!(out["content"], "Recovered via Tavily");
+        assert_eq!(out["attempts"][0]["http_status"], 429);
+        assert_eq!(out["attempts"][1]["http_status"], 502);
+        assert_eq!(out["attempts"][2]["http_status"], 503);
+        assert_eq!(out["attempts"][3]["engine"], "tavily");
+        assert_eq!(out["attempts"][3]["outcome"], "succeeded");
     }
 }

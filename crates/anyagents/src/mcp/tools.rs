@@ -793,17 +793,8 @@ impl AgentMcp {
                     .filter(|s| !s.is_empty())
                     .unwrap_or("self");
                 let clean = target.strip_prefix("agent:").unwrap_or(target);
-                let resp: AgentsResponse = self.client.get_agents().await?;
-                let view = resp
-                    .agents
-                    .into_iter()
-                    .find(|a| {
-                        (clean.eq_ignore_ascii_case("self") && a.id == self.agent.id.as_str())
-                            || a.name.eq_ignore_ascii_case(clean)
-                            || a.id == clean
-                            || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(clean))
-                    })
-                    .ok_or_else(|| format!("agent `{clean}` not found"))?;
+                let agent_path = format!("/v1/agents/{}", urlencoding_simple(clean));
+                let view: AgentView = self.client.get(&agent_path, None).await?;
                 let limit = args.limit.unwrap_or(10);
                 let conv_path = format!("/v1/agents/{}/conversation?limit={limit}", view.id);
                 let conv: ConversationResponse =
@@ -1011,17 +1002,8 @@ impl AgentMcp {
                     .filter(|s| !s.is_empty())
                     .unwrap_or("self");
                 let clean = target.strip_prefix("agent:").unwrap_or(target);
-                let resp: AgentsResponse = self.client.get_agents().await?;
-                let view = resp
-                    .agents
-                    .into_iter()
-                    .find(|a| {
-                        (clean.eq_ignore_ascii_case("self") && a.id == self.agent.id.as_str())
-                            || a.name.eq_ignore_ascii_case(clean)
-                            || a.id == clean
-                            || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(clean))
-                    })
-                    .ok_or_else(|| format!("sub-agent `{clean}` not found"))?;
+                let agent_path = format!("/v1/agents/{}", urlencoding_simple(clean));
+                let view: AgentView = self.client.get(&agent_path, None).await?;
                 let limit = args.limit.unwrap_or(10);
                 let conv_path = format!("/v1/agents/{}/conversation?limit={limit}", view.id);
                 let conv: ConversationResponse =
@@ -1312,7 +1294,12 @@ impl AgentMcp {
             .filter(|s| !s.is_empty())
             .unwrap_or("list");
         if action == "list" {
-            let response = self.client.get("/v1/groups", None).await?;
+            let path = if args.include_archived.unwrap_or(false) {
+                "/v1/groups?include_archived=true"
+            } else {
+                "/v1/groups"
+            };
+            let response = self.client.get(path, None).await?;
             return Ok(rmcp::handler::server::wrapper::Json(response));
         }
         let group = args

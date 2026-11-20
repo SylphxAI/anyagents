@@ -15,7 +15,7 @@ use crate::ssrf::{normalize_domain, url_allowed_by_domain_policy};
 
 const DEFAULT_SEARCH_MAX_RESULTS: u32 = 8;
 const DEFAULT_SEARCH_BUDGET_CHARS: usize = 12_000;
-const MAX_FAILOVER_ATTEMPTS: usize = 3;
+const MAX_FAILOVER_ATTEMPTS: usize = 4;
 const MAX_DDG_HTML_BYTES: u64 = 1_048_576;
 
 /// Parameters for `web_search`.
@@ -52,7 +52,7 @@ pub struct WebSearchRequest {
 }
 
 /// Supported search providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SearchEngine {
     Auto,
     Brave,
@@ -173,6 +173,16 @@ pub fn execute_search(
     default_timeout_ms: u64,
     user_agent: &str,
 ) -> Result<JsonValue, String> {
+    execute_search_with_endpoints(keys, req, default_timeout_ms, user_agent, None)
+}
+
+fn execute_search_with_endpoints(
+    keys: &HashMap<String, String>,
+    req: &WebSearchRequest,
+    default_timeout_ms: u64,
+    user_agent: &str,
+    endpoints: Option<&HashMap<SearchEngine, String>>,
+) -> Result<JsonValue, String> {
     let query = req.query.trim();
     if query.is_empty() {
         return Err("`web_search` requires a non-empty `query`".to_string());
@@ -200,7 +210,7 @@ pub fn execute_search(
 
     for engine in plan {
         let started = Instant::now();
-        match execute_single_engine(engine, query, req, keys, timeout_ms, user_agent) {
+        match execute_single_engine(engine, query, req, keys, timeout_ms, user_agent, endpoints) {
             Ok(mut hits) => {
                 let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
                 hits.retain(|h| {
@@ -255,13 +265,14 @@ fn execute_single_engine(
     keys: &HashMap<String, String>,
     timeout_ms: u64,
     user_agent: &str,
+    endpoints: Option<&HashMap<SearchEngine, String>>,
 ) -> Result<Vec<JsonValue>, EngineError> {
     if engine == SearchEngine::DuckDuckGo {
         return execute_duckduckgo_search(query, req, timeout_ms, user_agent);
     }
 
     let payload = build_search_payload(engine, query, req);
-    let (key_opt, endpoint, header, bearer) = match engine {
+    let (key_opt, default_endpoint, header, bearer) = match engine {
         SearchEngine::Brave => (
             brave_api_key(keys).map(str::to_owned),
             "https://api.search.brave.com/res/v1/web/search",
@@ -306,6 +317,11 @@ fn execute_single_engine(
             });
         }
     };
+
+    let endpoint = endpoints
+        .and_then(|map| map.get(&engine))
+        .map(String::as_str)
+        .unwrap_or(default_endpoint);
 
     let key = key_opt.ok_or_else(|| EngineError {
         status: None,
@@ -734,5 +750,84 @@ mod tests {
         let exa_hits = parse_provider_hits(SearchEngine::Exa, &exa).unwrap();
         assert_eq!(exa_hits.len(), 1);
         assert_eq!(exa_hits[0]["title"], "Rust");
+    }
+
+    fn spawn_mock_json_server(status_line: &'static str, body: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}/search")
+    }
+
+    #[test]
+    fn auto_search_fails_over_from_parallel_502_to_exa() {
+        let parallel_url = spawn_mock_json_server("502 Bad Gateway", r#"{"error":"upstream 502"}"#);
+        let exa_url = spawn_mock_json_server(
+            "200 OK",
+            r#"{"results":[{"url":"https://docs.rs/anyagents","title":"AnyAgents","text":"OSS coordinator"}]}"#,
+        );
+        let mut keys = HashMap::new();
+        keys.insert("PARALLEL_API_KEY".into(), "par_key".into());
+        keys.insert("EXA_API_KEY".into(), "exa_key".into());
+        let mut endpoints = HashMap::new();
+        endpoints.insert(SearchEngine::Parallel, parallel_url);
+        endpoints.insert(SearchEngine::Exa, exa_url);
+
+        // `answer` cascade orders Parallel before Exa when Perplexity & Tavily are unset.
+        let req = WebSearchRequest {
+            query: "anyagents".into(),
+            engine: Some("auto".into()),
+            mode: Some("answer".into()),
+            ..Default::default()
+        };
+        let out =
+            execute_search_with_endpoints(&keys, &req, 5_000, "test-ua", Some(&endpoints)).unwrap();
+        assert_eq!(out["engine"], "exa");
+        assert_eq!(out["fallback_used"], true);
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["attempts"][0]["engine"], "parallel");
+        assert_eq!(out["attempts"][0]["outcome"], "failed");
+        assert_eq!(out["attempts"][0]["http_status"], 502);
+        assert_eq!(out["attempts"][1]["engine"], "exa");
+        assert_eq!(out["attempts"][1]["outcome"], "succeeded");
+    }
+
+    #[test]
+    fn auto_search_fails_over_from_exa_502_to_tavily() {
+        let exa_url = spawn_mock_json_server("502 Bad Gateway", r#"{"error":"bad gateway"}"#);
+        let tavily_url = spawn_mock_json_server(
+            "200 OK",
+            r#"{"results":[{"url":"https://rust-lang.org/","title":"Rust","content":"Systems language"}]}"#,
+        );
+        let mut keys = HashMap::new();
+        keys.insert("EXA_API_KEY".into(), "exa_key".into());
+        keys.insert("TAVILY_API_KEY".into(), "tav_key".into());
+        let mut endpoints = HashMap::new();
+        endpoints.insert(SearchEngine::Exa, exa_url);
+        endpoints.insert(SearchEngine::Tavily, tavily_url);
+
+        let req = WebSearchRequest {
+            query: "rust".into(),
+            engine: Some("auto".into()),
+            ..Default::default()
+        };
+        let out =
+            execute_search_with_endpoints(&keys, &req, 5_000, "test-ua", Some(&endpoints)).unwrap();
+        assert_eq!(out["engine"], "tavily");
+        assert_eq!(out["fallback_used"], true);
+        assert_eq!(out["attempts"][0]["http_status"], 502);
+        assert_eq!(out["attempts"][1]["engine"], "tavily");
+        assert_eq!(out["attempts"][1]["outcome"], "succeeded");
     }
 }
