@@ -33,7 +33,7 @@ pub const AGENT_FILE_NAMESPACES: &[&str] = &[
 ];
 
 pub const DEPLOYMENT_BLOB_NAMESPACES: &[&str] =
-    &["config", "secrets", "profiles", "skills", "media"];
+    &["config", "secrets", "profiles", "skills", "media", "roles"];
 
 /// Full blob entry including content bytes (decrypted when `encrypted == true`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -428,9 +428,7 @@ impl StateBlobStore for PgStateBlobStore {
         let pool = self.pool.clone();
         let path_c = clean.clone();
         let digest_c = digest.clone();
-        let (version, updated_at_ms): (i64, i64) = block_on_pg(async move {
-            sqlx::query_as(
-                "INSERT INTO public.deployment_blobs
+        const UPSERT_SQL: &str = "INSERT INTO public.deployment_blobs
                     (namespace, path, content, sha256, encrypted, version, updated_at_ms)
                  VALUES ($1, $2, $3, $4, $5, 1, $6)
                  ON CONFLICT (namespace, path) DO UPDATE
@@ -444,17 +442,48 @@ impl StateBlobStore for PgStateBlobStore {
                                        ELSE public.deployment_blobs.version
                                      END,
                      updated_at_ms = EXCLUDED.updated_at_ms
-                 RETURNING version, updated_at_ms",
-            )
-            .bind(ns)
-            .bind(&path_c)
-            .bind(&stored_bytes)
-            .bind(&digest_c)
-            .bind(encrypted)
-            .bind(now)
-            .fetch_one(&pool)
-            .await
-            .map_err(Error::from)
+                 RETURNING version, updated_at_ms";
+        let (version, updated_at_ms): (i64, i64) = block_on_pg(async move {
+            let attempt = sqlx::query_as::<_, (i64, i64)>(UPSERT_SQL)
+                .bind(ns)
+                .bind(&path_c)
+                .bind(&stored_bytes)
+                .bind(&digest_c)
+                .bind(encrypted)
+                .bind(now)
+                .fetch_one(&pool)
+                .await;
+            match attempt {
+                Ok(row) => Ok(row),
+                Err(sqlx::Error::Database(ref db_err))
+                    if ns == "roles" && db_err.code().as_deref() == Some("23514") =>
+                {
+                    let _ = sqlx::query(
+                        "ALTER TABLE public.deployment_blobs
+                         DROP CONSTRAINT IF EXISTS deployment_blobs_namespace_check",
+                    )
+                    .execute(&pool)
+                    .await;
+                    let _ = sqlx::query(
+                        "ALTER TABLE public.deployment_blobs
+                         ADD CONSTRAINT deployment_blobs_namespace_check
+                         CHECK (namespace IN ('config', 'secrets', 'profiles', 'skills', 'media', 'roles'))",
+                    )
+                    .execute(&pool)
+                    .await;
+                    sqlx::query_as::<_, (i64, i64)>(UPSERT_SQL)
+                        .bind(ns)
+                        .bind(&path_c)
+                        .bind(&stored_bytes)
+                        .bind(&digest_c)
+                        .bind(encrypted)
+                        .bind(now)
+                        .fetch_one(&pool)
+                        .await
+                        .map_err(Error::from)
+                }
+                Err(err) => Err(Error::from(err)),
+            }
         })?;
         Ok(BlobMeta {
             namespace: ns.to_string(),
@@ -637,6 +666,7 @@ impl FsStateBlobStore {
             "profiles" => self.data_dir.join("profiles"),
             "skills" => self.data_dir.join("skills"),
             "media" => self.data_dir.join("media"),
+            "roles" => self.data_dir.join("roles"),
             _ => unreachable!(),
         };
         Ok(dir)
@@ -870,5 +900,45 @@ impl CredentialStore for PgCredentialStore {
         self.blobs
             .put_deployment_blob("secrets", &clean, value, true)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fs_blob_store_supports_roles_namespace_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStateBlobStore::new(dir.path());
+        let body = b"---\nname: reviewer\ndescription: Code reviewer\n---\nReview carefully.\n";
+        let meta = store
+            .put_deployment_blob("roles", "reviewer.md", body, false)
+            .unwrap();
+        assert_eq!(meta.namespace, "roles");
+        assert_eq!(meta.path, "reviewer.md");
+        assert!(dir.path().join("roles/reviewer.md").is_file());
+
+        let loaded = store
+            .get_deployment_blob("roles", "reviewer.md")
+            .unwrap()
+            .expect("role blob must exist");
+        assert_eq!(loaded.content, body);
+
+        let listed = store.list_deployment_blobs("roles").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, "reviewer.md");
+
+        assert!(
+            store
+                .delete_deployment_blob("roles", "reviewer.md")
+                .unwrap()
+        );
+        assert!(
+            store
+                .get_deployment_blob("roles", "reviewer.md")
+                .unwrap()
+                .is_none()
+        );
     }
 }

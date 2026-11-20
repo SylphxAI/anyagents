@@ -1387,6 +1387,7 @@ pub(crate) fn build_guest_env(
         env.retain(|(ek, _)| ek != k);
         env.push((k.to_string(), v.to_string()));
     }
+    repo::ensure_gh_auth_setup_git_for_env(state_dir, &env);
     env
 }
 

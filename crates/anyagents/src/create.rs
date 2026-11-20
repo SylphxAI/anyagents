@@ -29,11 +29,14 @@ mod tests;
 pub use spawn::{CreateRequest, create, format_agent_display};
 
 pub(crate) use archetypes::{
-    DEFAULT_AGENT_ROLE, SubagentDefaultSpec, SubagentDefaultsConfig, ancestor_archetype_workdirs,
-    apply_archetype_defaults, backfill_historical_agent_roles, discover_available_archetype_slugs,
-    discover_available_archetype_templates, effective_agent_instructions, load_subagent_defaults,
+    ArchetypeSource, ArchetypeTemplate, DEFAULT_AGENT_ROLE, SubagentDefaultSpec,
+    SubagentDefaultsConfig, ancestor_archetype_workdirs, apply_archetype_defaults,
+    backfill_historical_agent_roles, discover_available_archetype_slugs,
+    discover_available_archetype_templates, effective_agent_instructions,
+    hydrate_roles_from_store_if_postgres, load_subagent_defaults,
     mark_instructions_rotated_if_changed, normalize_or_validate_agent_role,
-    resolve_subagent_defaults, save_subagent_defaults,
+    parse_archetype_markdown, resolve_archetype_template_with_source, resolve_subagent_defaults,
+    save_subagent_defaults, valid_template_stem,
 };
 pub(crate) use credentials::{
     propagate_profile_files_to_bound_agents, seed_harness_credentials, seeded_profile_name,
@@ -80,8 +83,7 @@ pub(crate) use workspace::{
 
 #[cfg(test)]
 pub(crate) use archetypes::{
-    BUILTIN_GENERAL_ROLE_BODY, INSTRUCTIONS_ROTATED_MARKER, parse_archetype_markdown,
-    resolve_archetype_template,
+    BUILTIN_GENERAL_ROLE_BODY, INSTRUCTIONS_ROTATED_MARKER, resolve_archetype_template,
 };
 #[cfg(all(test, unix))]
 pub(crate) use archetypes::{archetype_search_roots, resolve_archetype_template_with_ancestors};
@@ -98,8 +100,7 @@ pub(crate) use workspace::write_agent_instructions_with_continuity;
 // their owning submodules.
 #[allow(unused_imports)]
 pub(crate) use archetypes::{
-    ArchetypeTemplate, archetype_search_roots_with_ancestors,
-    discover_available_archetype_slugs_with_ancestors,
+    archetype_search_roots_with_ancestors, discover_available_archetype_slugs_with_ancestors,
     has_configured_archetype_roots_with_ancestors, resolve_role_template_for_agent,
 };
 #[allow(unused_imports)]

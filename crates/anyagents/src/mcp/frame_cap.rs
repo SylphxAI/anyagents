@@ -4,11 +4,50 @@ use super::*;
 
 pub(crate) const MCP_TEXT_SPILL_BYTES: usize = 56 * 1024;
 
-pub(super) fn agent_spill_dir(config: &Path, agent: &AgentId) -> PathBuf {
-    match anyagents_core::configured_scratch_dir() {
-        Some(scratch) => anyagents_core::agent_scratch_tmp_dir(&scratch, agent),
+pub(super) fn resolve_spill_dir(
+    config: &Path,
+    agent: &AgentId,
+    sandbox_data_dir: Option<&Path>,
+    scratch_dir: Option<&Path>,
+) -> PathBuf {
+    if let Some(data_dir) = sandbox_data_dir.filter(|p| !p.as_os_str().is_empty()) {
+        return data_dir.join("tmp");
+    }
+    match scratch_dir {
+        Some(scratch) => anyagents_core::agent_scratch_tmp_dir(scratch, agent),
         None => config.join("tmp"),
     }
+}
+
+fn configured_sandbox_data_dir() -> Option<PathBuf> {
+    for key in ["ANYAGENTS_AGENT_DATA_DIR", "ANYAGENTS_SANDBOX_DATA_DIR"] {
+        if let Ok(raw) = std::env::var(key) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed));
+            }
+        }
+    }
+    if let Ok(raw) = std::env::var("ANYAGENTS_GUEST_STATE_DIR") {
+        let trimmed = raw.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            let root = trimmed
+                .strip_suffix("/state")
+                .filter(|p| !p.is_empty())
+                .unwrap_or(trimmed);
+            return Some(PathBuf::from(root));
+        }
+    }
+    None
+}
+
+pub(super) fn agent_spill_dir(config: &Path, agent: &AgentId) -> PathBuf {
+    resolve_spill_dir(
+        config,
+        agent,
+        configured_sandbox_data_dir().as_deref(),
+        anyagents_core::configured_scratch_dir().as_deref(),
+    )
 }
 
 /// Exclusive, private artifacts. Compact JSON without a trailing newline is
@@ -558,5 +597,29 @@ mod stdio_frame_cap_tests {
         );
         assert_eq!(gated.inner, payload);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn resolve_spill_dir_prefers_sandbox_accessible_agent_data_tmp() {
+        let agent = AgentId::generate();
+        let host_config = PathBuf::from("/var/lib/anyagents/agents/agt_123/config");
+        let scratch = PathBuf::from("/var/tmp/anyagents-scratch");
+        let sandbox_data = PathBuf::from("/home/user/agent-data");
+
+        // In sandbox/serverless mode, offload artifacts land under `<sandbox_data>/tmp`,
+        // never under coordinator-host `/var/lib/anyagents/...`.
+        assert_eq!(
+            resolve_spill_dir(&host_config, &agent, Some(&sandbox_data), Some(&scratch)),
+            PathBuf::from("/home/user/agent-data/tmp")
+        );
+        // Without a sandbox data dir, fall back cleanly to scratch dir, then config/tmp.
+        assert_eq!(
+            resolve_spill_dir(&host_config, &agent, None, Some(&scratch)),
+            anyagents_core::agent_scratch_tmp_dir(&scratch, &agent)
+        );
+        assert_eq!(
+            resolve_spill_dir(&host_config, &agent, None, None),
+            host_config.join("tmp")
+        );
     }
 }

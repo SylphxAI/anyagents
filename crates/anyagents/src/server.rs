@@ -48,11 +48,13 @@ mod profile_models;
 mod profiles;
 mod quota_rotation;
 mod reap_queue;
+mod roles;
 pub(crate) mod s3_media_profiles;
 mod schedules;
 pub(crate) mod secrets;
 pub(crate) mod serverless;
 mod serverless_envelope;
+mod serverless_failure;
 mod serverless_memory;
 mod serverless_watches;
 mod types;
@@ -163,6 +165,7 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
         .merge(schedules::router())
         .merge(messaging::router())
         .merge(channels_groups::router())
+        .merge(roles::router())
         .merge(ops::router())
         .merge(s3_media_profiles::router())
 }

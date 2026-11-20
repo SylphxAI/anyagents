@@ -31,7 +31,7 @@ use anyagents_core::stateless::{
     verify_hmac_sha256_signature,
 };
 use anyagents_core::{
-    Agent, AgentId, BillingMode, Incoming, NewUsage, RuntimeHeartbeat, Store, now_ms, utc_day,
+    Agent, AgentId, BillingMode, NewUsage, RuntimeHeartbeat, Store, now_ms, utc_day,
 };
 use axum::Json;
 use axum::body::Bytes;
@@ -889,6 +889,7 @@ pub(crate) struct SettleAndDeliverResult {
     pub turn: PendingRemoteTurn,
     pub settled_now: bool,
     pub delivered_reply: bool,
+    pub notified_agent_id: Option<AgentId>,
 }
 
 async fn fail_remote_turn(
@@ -946,6 +947,7 @@ pub(crate) fn settle_remote_turn_and_deliver(
             turn: outcome.turn,
             settled_now: false,
             delivered_reply: false,
+            notified_agent_id: None,
         }));
     }
 
@@ -1064,6 +1066,17 @@ pub(crate) fn settle_remote_turn_and_deliver(
 
     // 4. Advance durable mailbox delivery cursor & turn terminal ledger.
     super::serverless_watches::settle_turn_mailbox_cursor(store, &turn);
+    if turn.status != "completed"
+        && let Some(seq) = turn
+            .metadata_json
+            .as_ref()
+            .and_then(|m| m.get("message_seq").and_then(Value::as_i64))
+        && super::serverless_failure::is_terminal_bootstrap_failure(
+            turn.error_text.as_deref().unwrap_or(""),
+        )
+    {
+        let _ = store.mark_delivered_up_to(&turn.agent_id, seq);
+    }
     // Always close any remaining stale `turn_recovery` open-turn lock if no active
     // remote turns remain for this agent.
     if store
@@ -1114,112 +1127,16 @@ pub(crate) fn settle_remote_turn_and_deliver(
         }
     }
 
-    // 6. Trigger outbound reply delivery if configured and turn completed with text.
-    // Skip automatic fallback delivery when the agent already sent an explicit
-    // outbound message via MCP during this turn (avoids double-posting internal
-    // turn summaries into Telegram chats or peer mailboxes), or when `result_text`
-    // is empty, a silent `NO_REPLY` sentinel, or a legacy guest `"completed"` placeholder.
-    let already_replied_via_mcp = store
-        .turn_ownership_snapshot(&turn.agent_id)
-        .ok()
-        .and_then(|snap| snap.last_outbound_at_ms)
-        .is_some_and(|ts| ts >= turn.created_at_ms);
-    let mut delivered_reply = false;
-    if !already_replied_via_mcp
-        && turn.status == "completed"
-        && let Some(ref reply_text) = turn.result_text
-        && !is_suppressed_fallback_reply(reply_text)
-        && let Some(rt_val) = turn
-            .metadata_json
-            .as_ref()
-            .and_then(|m| m.get("reply_target"))
-        && let Ok(reply_target) = serde_json::from_value::<ReplyTarget>(rt_val.clone())
-    {
-        match reply_target {
-            ReplyTarget::Agent { agent_id: target } => {
-                if let Ok(target_aid) = AgentId::parse(&target) {
-                    let mut incoming = Incoming::new(reply_text.clone());
-                    incoming.sender = Some(format!("agent:{}", turn.agent_id));
-                    incoming.source_key = Some(format!("serverless-reply:{}", turn.turn_id));
-                    if store.receive(&target_aid, incoming).is_ok() {
-                        delivered_reply = true;
-                    }
-                }
-            }
-            ReplyTarget::Telegram {
-                chat_id,
-                thread_id,
-                reply_to_message_id,
-                bot,
-            } => {
-                let from_name = agent
-                    .as_ref()
-                    .map(|a| a.name.as_str())
-                    .unwrap_or(turn.agent_id.as_str());
-                match crate::telegram::post_text(
-                    store,
-                    store.data_dir(),
-                    from_name,
-                    bot.as_deref(),
-                    chat_id,
-                    reply_text,
-                    reply_to_message_id,
-                    thread_id,
-                ) {
-                    Ok(_) => {
-                        delivered_reply = true;
-                    }
-                    Err(err) => {
-                        let err_str = err.to_string();
-                        if reply_to_message_id.is_some()
-                            && (err_str.contains("invalid_reply")
-                                || err_str.contains("message to be replied not found")
-                                || err_str.contains("replied message not found"))
-                        {
-                            match crate::telegram::post_text(
-                                store,
-                                store.data_dir(),
-                                from_name,
-                                bot.as_deref(),
-                                chat_id,
-                                reply_text,
-                                None,
-                                thread_id,
-                            ) {
-                                Ok(_) => {
-                                    delivered_reply = true;
-                                }
-                                Err(retry_err) => {
-                                    eprintln!(
-                                        "anyagents-serverless: telegram reply fallback delivery failed for {} (chat {}): {retry_err}",
-                                        turn.agent_id, chat_id
-                                    );
-                                }
-                            }
-                        } else {
-                            eprintln!(
-                                "anyagents-serverless: telegram reply delivery failed for {} (chat {}): {err}",
-                                turn.agent_id, chat_id
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // 6. Trigger outbound reply delivery or fail-closed parent error notification.
+    let (delivered_reply, notified_agent_id) =
+        super::serverless_failure::deliver_settled_turn_outcome(store, &turn, agent.as_ref());
 
     Ok(Some(SettleAndDeliverResult {
         turn,
         settled_now: true,
         delivered_reply,
+        notified_agent_id,
     }))
-}
-
-fn is_suppressed_fallback_reply(text: &str) -> bool {
-    let trimmed = text.trim();
-    trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("completed")
-        || trimmed.eq_ignore_ascii_case("NO_REPLY")
 }
 
 // ============================================================================
@@ -2296,218 +2213,227 @@ pub(crate) async fn guest_events_route(
             normalized_event.as_str(),
             "turn_failed" | "failed" | "turn_cancelled" | "cancelled" | "canceled"
         );
-    let (json_resp, settled_agent_id, synced_auth_updates) = spawn_store(move || {
-        let Some(turn) = store
-            .remote_turn_store()
-            .verify_callback_token(&payload.turn_id, &token)
-            .map_err(ApiError::from_store)?
-        else {
-            return Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "invalid callback token for turn",
-            ));
-        };
+    let (json_resp, settled_agent_id, notified_agent_id, synced_auth_updates) =
+        spawn_store(move || {
+            let Some(turn) = store
+                .remote_turn_store()
+                .verify_callback_token(&payload.turn_id, &token)
+                .map_err(ApiError::from_store)?
+            else {
+                return Err(ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid callback token for turn",
+                ));
+            };
 
-        if let Some(ref claimed_aid) = payload.agent_id
-            && claimed_aid.trim() != turn.agent_id.as_str()
-        {
-            return Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "agent_id mismatch for callback token",
-            ));
-        }
+            if let Some(ref claimed_aid) = payload.agent_id
+                && claimed_aid.trim() != turn.agent_id.as_str()
+            {
+                return Err(ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "agent_id mismatch for callback token",
+                ));
+            }
 
-        let synced_updates = if is_terminal_event
-            && let Some(ref encoded) = payload.synced_auth_files
-            && !encoded.is_empty()
-        {
-            let decoded = decode_synced_auth_files(encoded);
-            persist_synced_auth_files(&store, &turn.agent_id, &decoded)
-        } else {
-            0
-        };
+            let synced_updates = if is_terminal_event
+                && let Some(ref encoded) = payload.synced_auth_files
+                && !encoded.is_empty()
+            {
+                let decoded = decode_synced_auth_files(encoded);
+                persist_synced_auth_files(&store, &turn.agent_id, &decoded)
+            } else {
+                0
+            };
 
-        let ts = payload
-            .timestamp_ms
-            .filter(|&t| t > 0)
-            .unwrap_or_else(now_ms);
-        match payload.event_type.trim().to_ascii_lowercase().as_str() {
-            "heartbeat" => {
-                let _ = store
-                    .remote_turn_store()
-                    .record_event(
+            let ts = payload
+                .timestamp_ms
+                .filter(|&t| t > 0)
+                .unwrap_or_else(now_ms);
+            match payload.event_type.trim().to_ascii_lowercase().as_str() {
+                "heartbeat" => {
+                    let _ = store
+                        .remote_turn_store()
+                        .record_event(
+                            &turn.turn_id,
+                            &RemoteTurnEventUpdate {
+                                status: Some("running".to_string()),
+                                cursor: None,
+                                remote_run_id: None,
+                                last_event_at_ms: ts,
+                                next_poll_at_ms: None,
+                            },
+                        )
+                        .map_err(ApiError::from_store)?;
+
+                    let active_turns = payload.active_turns.unwrap_or(1);
+                    let queued_turns = payload.queued_turns.unwrap_or(0);
+                    let inflight_children = payload.inflight_children.unwrap_or(0).max(0);
+                    let turn_state = payload.turn_state.clone().unwrap_or_else(|| {
+                        if active_turns > 0 || queued_turns > 0 {
+                            "in_turn".to_string()
+                        } else {
+                            "idle".to_string()
+                        }
+                    });
+                    let busy = payload.busy.unwrap_or(false)
+                        || active_turns > 0
+                        || queued_turns > 0
+                        || inflight_children > 0
+                        || turn_state != "idle";
+                    let frame = GuestHeartbeatFrame {
+                        timestamp_ms: ts,
+                        turn_state,
+                        active_turns,
+                        queued_turns,
+                        inflight_children,
+                        busy,
+                    };
+                    apply_guest_heartbeat(&store, &turn.agent_id, &frame, ts)
+                        .map_err(ApiError::from_store)?;
+
+                    Ok((
+                        Json(json!({
+                            "ok": true,
+                            "turn_id": turn.turn_id,
+                            "event_type": "heartbeat",
+                        })),
+                        None::<AgentId>,
+                        None::<AgentId>,
+                        0usize,
+                    ))
+                }
+                "delta" => {
+                    let cursor = payload.seq.map(|s| format!("delta:{s}"));
+                    let _ = store
+                        .remote_turn_store()
+                        .record_event(
+                            &turn.turn_id,
+                            &RemoteTurnEventUpdate {
+                                status: Some("running".to_string()),
+                                cursor,
+                                remote_run_id: None,
+                                last_event_at_ms: ts,
+                                next_poll_at_ms: None,
+                            },
+                        )
+                        .map_err(ApiError::from_store)?;
+                    Ok((
+                        Json(json!({
+                            "ok": true,
+                            "turn_id": turn.turn_id,
+                            "event_type": "delta",
+                        })),
+                        None,
+                        None,
+                        0usize,
+                    ))
+                }
+                "turn_complete" | "completed" => {
+                    let settled = settle_remote_turn_and_deliver(
+                        &store,
                         &turn.turn_id,
-                        &RemoteTurnEventUpdate {
-                            status: Some("running".to_string()),
+                        SettleRemoteTurn {
+                            status: "completed".to_string(),
+                            result_text: payload.result_text,
+                            error_text: None,
+                            usage_json: payload.usage,
                             cursor: None,
-                            remote_run_id: None,
-                            last_event_at_ms: ts,
-                            next_poll_at_ms: None,
+                            settled_at_ms: ts,
                         },
+                        payload.session_id.as_deref(),
+                        payload.inflight_children.unwrap_or(0).max(0),
                     )
-                    .map_err(ApiError::from_store)?;
-
-                let active_turns = payload.active_turns.unwrap_or(1);
-                let queued_turns = payload.queued_turns.unwrap_or(0);
-                let inflight_children = payload.inflight_children.unwrap_or(0).max(0);
-                let turn_state = payload.turn_state.clone().unwrap_or_else(|| {
-                    if active_turns > 0 || queued_turns > 0 {
-                        "in_turn".to_string()
-                    } else {
-                        "idle".to_string()
-                    }
-                });
-                let busy = payload.busy.unwrap_or(false)
-                    || active_turns > 0
-                    || queued_turns > 0
-                    || inflight_children > 0
-                    || turn_state != "idle";
-                let frame = GuestHeartbeatFrame {
-                    timestamp_ms: ts,
-                    turn_state,
-                    active_turns,
-                    queued_turns,
-                    inflight_children,
-                    busy,
-                };
-                apply_guest_heartbeat(&store, &turn.agent_id, &frame, ts)
-                    .map_err(ApiError::from_store)?;
-
-                Ok((
-                    Json(json!({
-                        "ok": true,
-                        "turn_id": turn.turn_id,
-                        "event_type": "heartbeat",
-                    })),
-                    None::<AgentId>,
-                    0usize,
-                ))
-            }
-            "delta" => {
-                let cursor = payload.seq.map(|s| format!("delta:{s}"));
-                let _ = store
-                    .remote_turn_store()
-                    .record_event(
+                    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
+                    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
+                    let drain_aid = settled.settled_now.then(|| settled.turn.agent_id.clone());
+                    let notify_aid = settled.notified_agent_id;
+                    Ok((
+                        Json(json!({
+                            "ok": true,
+                            "turn_id": settled.turn.turn_id,
+                            "status": settled.turn.status,
+                            "settled": settled.settled_now,
+                            "idempotent_replay": !settled.settled_now,
+                            "delivered_reply": settled.delivered_reply,
+                        })),
+                        drain_aid,
+                        notify_aid,
+                        synced_updates,
+                    ))
+                }
+                "turn_failed" | "failed" => {
+                    let settled = settle_remote_turn_and_deliver(
+                        &store,
                         &turn.turn_id,
-                        &RemoteTurnEventUpdate {
-                            status: Some("running".to_string()),
-                            cursor,
-                            remote_run_id: None,
-                            last_event_at_ms: ts,
-                            next_poll_at_ms: None,
+                        SettleRemoteTurn {
+                            status: "failed".to_string(),
+                            result_text: None,
+                            error_text: payload
+                                .error_text
+                                .or_else(|| Some("guest turn failed".to_string())),
+                            usage_json: payload.usage,
+                            cursor: None,
+                            settled_at_ms: ts,
                         },
+                        payload.session_id.as_deref(),
+                        payload.inflight_children.unwrap_or(0).max(0),
                     )
-                    .map_err(ApiError::from_store)?;
-                Ok((
-                    Json(json!({
-                        "ok": true,
-                        "turn_id": turn.turn_id,
-                        "event_type": "delta",
-                    })),
-                    None,
-                    0usize,
-                ))
+                    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
+                    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
+                    let drain_aid = settled.settled_now.then(|| settled.turn.agent_id.clone());
+                    let notify_aid = settled.notified_agent_id;
+                    Ok((
+                        Json(json!({
+                            "ok": true,
+                            "turn_id": settled.turn.turn_id,
+                            "status": settled.turn.status,
+                            "settled": settled.settled_now,
+                            "idempotent_replay": !settled.settled_now,
+                            "delivered_reply": settled.delivered_reply,
+                        })),
+                        drain_aid,
+                        notify_aid,
+                        synced_updates,
+                    ))
+                }
+                "turn_cancelled" | "cancelled" | "canceled" => {
+                    let settled = settle_remote_turn_and_deliver(
+                        &store,
+                        &turn.turn_id,
+                        SettleRemoteTurn {
+                            status: "cancelled".to_string(),
+                            result_text: None,
+                            error_text: payload.error_text,
+                            usage_json: payload.usage,
+                            cursor: None,
+                            settled_at_ms: ts,
+                        },
+                        payload.session_id.as_deref(),
+                        payload.inflight_children.unwrap_or(0).max(0),
+                    )
+                    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
+                    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
+                    let drain_aid = settled.settled_now.then(|| settled.turn.agent_id.clone());
+                    Ok((
+                        Json(json!({
+                            "ok": true,
+                            "turn_id": settled.turn.turn_id,
+                            "status": settled.turn.status,
+                            "settled": settled.settled_now,
+                            "idempotent_replay": !settled.settled_now,
+                        })),
+                        drain_aid,
+                        None,
+                        synced_updates,
+                    ))
+                }
+                other => Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("unsupported guest event_type `{other}`"),
+                )),
             }
-            "turn_complete" | "completed" => {
-                let settled = settle_remote_turn_and_deliver(
-                    &store,
-                    &turn.turn_id,
-                    SettleRemoteTurn {
-                        status: "completed".to_string(),
-                        result_text: payload.result_text,
-                        error_text: None,
-                        usage_json: payload.usage,
-                        cursor: None,
-                        settled_at_ms: ts,
-                    },
-                    payload.session_id.as_deref(),
-                    payload.inflight_children.unwrap_or(0).max(0),
-                )
-                .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
-                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
-                let drain_aid = settled.settled_now.then(|| settled.turn.agent_id.clone());
-                Ok((
-                    Json(json!({
-                        "ok": true,
-                        "turn_id": settled.turn.turn_id,
-                        "status": settled.turn.status,
-                        "settled": settled.settled_now,
-                        "idempotent_replay": !settled.settled_now,
-                        "delivered_reply": settled.delivered_reply,
-                    })),
-                    drain_aid,
-                    synced_updates,
-                ))
-            }
-            "turn_failed" | "failed" => {
-                let settled = settle_remote_turn_and_deliver(
-                    &store,
-                    &turn.turn_id,
-                    SettleRemoteTurn {
-                        status: "failed".to_string(),
-                        result_text: None,
-                        error_text: payload
-                            .error_text
-                            .or_else(|| Some("guest turn failed".to_string())),
-                        usage_json: payload.usage,
-                        cursor: None,
-                        settled_at_ms: ts,
-                    },
-                    payload.session_id.as_deref(),
-                    payload.inflight_children.unwrap_or(0).max(0),
-                )
-                .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
-                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
-                let drain_aid = settled.settled_now.then(|| settled.turn.agent_id.clone());
-                Ok((
-                    Json(json!({
-                        "ok": true,
-                        "turn_id": settled.turn.turn_id,
-                        "status": settled.turn.status,
-                        "settled": settled.settled_now,
-                        "idempotent_replay": !settled.settled_now,
-                    })),
-                    drain_aid,
-                    synced_updates,
-                ))
-            }
-            "turn_cancelled" | "cancelled" | "canceled" => {
-                let settled = settle_remote_turn_and_deliver(
-                    &store,
-                    &turn.turn_id,
-                    SettleRemoteTurn {
-                        status: "cancelled".to_string(),
-                        result_text: None,
-                        error_text: payload.error_text,
-                        usage_json: payload.usage,
-                        cursor: None,
-                        settled_at_ms: ts,
-                    },
-                    payload.session_id.as_deref(),
-                    payload.inflight_children.unwrap_or(0).max(0),
-                )
-                .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
-                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
-                let drain_aid = settled.settled_now.then(|| settled.turn.agent_id.clone());
-                Ok((
-                    Json(json!({
-                        "ok": true,
-                        "turn_id": settled.turn.turn_id,
-                        "status": settled.turn.status,
-                        "settled": settled.settled_now,
-                        "idempotent_replay": !settled.settled_now,
-                    })),
-                    drain_aid,
-                    synced_updates,
-                ))
-            }
-            other => Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!("unsupported guest event_type `{other}`"),
-            )),
-        }
-    })
-    .await?;
+        })
+        .await?;
     if synced_auth_updates > 0 {
         state.profiles.invalidate(&state.store);
     }
@@ -2529,11 +2455,22 @@ pub(crate) async fn guest_events_route(
             // immediately would cause an unbounded tight retry storm; `/v1/internal/tick`
             // retries them after the failure backoff window instead.
             if is_completed_event
-                && let Err(err) =
-                    dispatch_next_mailbox_message_if_serverless(store_for_drain, &drain_aid).await
+                && let Err(err) = dispatch_next_mailbox_message_if_serverless(
+                    Arc::clone(&store_for_drain),
+                    &drain_aid,
+                )
+                .await
             {
                 eprintln!(
                     "anyagents-serverless: post-turn mailbox drain failed for {drain_aid}: {err}"
+                );
+            }
+            if let Some(notify_aid) = notified_agent_id
+                && let Err(err) =
+                    dispatch_next_mailbox_message_if_serverless(store_for_drain, &notify_aid).await
+            {
+                eprintln!(
+                    "anyagents-serverless: parent notification wake failed for {notify_aid}: {err}"
                 );
             }
         });
@@ -3409,11 +3346,12 @@ fn renew_binding_lease(store: &Store, binding: &anyagents_core::stateless::Sandb
 
 #[cfg(test)]
 mod tests {
+    use super::super::serverless_failure::is_suppressed_fallback_reply;
     use super::*;
     use crate::sandbox_providers::providers::{
         EnsureSandboxRequest, ExecOutput, ProviderHealth, SandboxCapabilities, SandboxHandle,
     };
-    use anyagents_core::{NewAgent, NewSchedule, hmac_sha256_hex};
+    use anyagents_core::{Incoming, NewAgent, NewSchedule, hmac_sha256_hex};
     use anyagents_supervisor::HealthBoard;
     use axum::body::Body;
     use axum::http::Request;

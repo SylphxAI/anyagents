@@ -382,6 +382,9 @@ async fn mcp_post(
     payload: serde_json::Value,
 ) -> Result<axum::response::Response, ApiError> {
     let (needs_lease, needs_memory) = mcp_hydration_needs(&payload);
+    let needs_roles = payload.get("method").and_then(serde_json::Value::as_str)
+        == Some("tools/list")
+        || needs_lease;
     let mcp = spawn_store(move || {
         let caller = authenticate_mcp_request(&state.store, &headers, listener)?;
         let McpCaller { agent, .. } = caller;
@@ -408,6 +411,9 @@ async fn mcp_post(
         };
         if needs_memory {
             let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(&state.store, &agent.id);
+        }
+        if needs_roles {
+            crate::create::hydrate_roles_from_store_if_postgres(&state.store, data_dir);
         }
         let effective_workdir = hydrated_workdir
             .map(PathBuf::from)

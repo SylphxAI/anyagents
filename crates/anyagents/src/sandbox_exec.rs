@@ -1886,45 +1886,9 @@ struct CollectedBundle {
     dirs: std::collections::BTreeSet<String>,
 }
 
-/// Filter per-agent `launch_env` pairs before forwarding them into a remote sandbox
-/// lease or `guest-config.json`. Preserves agent-scoped operational variables while
-/// failing closed against leaking coordinator host secrets or overriding protected
-/// sandbox runtime/gateway paths.
-pub(crate) fn filter_sandbox_launch_env(raw: &[(String, String)]) -> Vec<(String, String)> {
-    let mut out = Vec::with_capacity(raw.len());
-    for (k, v) in raw {
-        let key = k.trim();
-        if key.is_empty() || key.contains('=') || key.contains('\0') {
-            continue;
-        }
-        let upper = key.to_ascii_uppercase();
-        if matches!(
-            upper.as_str(),
-            "HOME"
-                | "ANYAGENTS_DATABASE_URL"
-                | "ANYAGENTS_DIRECT_DATABASE_URL"
-                | "ANYAGENTS_MASTER_KEY"
-                | "ANYAGENTS_CAPABILITY_KEY"
-                | "ANYAGENTS_SANDBOX_TOKEN"
-                | "ANYAGENTS_SYLPHX_TOKEN"
-                | "ANYAGENTS_CLOUD_WEBHOOK_SECRET"
-                | "ANYAGENTS_SPIRON_WEBHOOK_SECRET"
-                | "ANYAGENTS_GUEST_STATE_DIR"
-                | "ANYAGENTS_GUEST_WORKDIR"
-                | "ANYAGENTS_MCP_URL"
-                | "ANYAGENTS_MCP_TOKEN_FILE"
-                | "ANYAGENTS_GATEWAY_URL"
-                | "ANYAGENTS_GATEWAY_TOKEN"
-        ) || upper.starts_with("ANYAGENTS_OPERATOR_")
-            || upper.starts_with("ANYAGENTS_TICK_")
-            || upper.starts_with("ANYAGENTS_S3_")
-        {
-            continue;
-        }
-        out.push((key.to_string(), v.clone()));
-    }
-    out
-}
+#[path = "sandbox_exec_env.rs"]
+mod sandbox_exec_env;
+pub(crate) use sandbox_exec_env::filter_sandbox_launch_env;
 
 /// Collect relative `(rel_path, bytes)` bundle files + remote directories for
 /// syncing into `<state_root>` inside any remote sandbox provider.
@@ -2090,6 +2054,9 @@ fn collect_agent_bundle_entries(
     env_map.insert("XDG_CONFIG_HOME".into(), format!("{state_root}/.config"));
     env_map.insert("XDG_DATA_HOME".into(), format!("{state_root}/.local/share"));
     env_map.insert("XDG_CACHE_HOME".into(), format!("{state_root}/.cache"));
+    let sandbox_data_dir = sandbox_exec_env::sandbox_data_dir_from_state_root(state_root);
+    env_map.insert("ANYAGENTS_AGENT_DATA_DIR".into(), sandbox_data_dir.clone());
+    env_map.insert("ANYAGENTS_SANDBOX_DATA_DIR".into(), sandbox_data_dir);
     env_map.insert("ANYAGENTS_GUEST_STATE_DIR".into(), state_root.to_string());
     env_map.insert("ANYAGENTS_GUEST_WORKDIR".into(), workdir.to_string());
     env_map.insert("ANYAGENTS_MCP_URL".into(), mcp_url.clone());

@@ -24,6 +24,32 @@ pub use legacy::LegacyContext;
 pub use manifest::{Manifest, ToolSpec};
 pub use verify::sha256_file;
 
+/// Built-in harness CLI binaries recognized by the guest runtime.
+///
+/// Operators may still pin any of these explicitly in `toolchain.toml` (and
+/// `enforce_undeclared = true` still enforces explicit declarations), while
+/// default unpinned deployments avoid emitting spurious per-turn warnings when
+/// these known harness binaries resolve cleanly.
+pub const BUILTIN_HARNESS_TOOLS: &[&str] = &[
+    "agy", "claude", "codex", "opencode", "gemini", "muse", "omp", "spiron",
+];
+
+/// Default manifest locations searched by `anyagents-guest` inside sandboxes.
+pub const DEFAULT_GUEST_MANIFEST_PATHS: &[&str] = &[
+    "/var/lib/anyagents/toolchain.toml",
+    "/etc/anyagents/toolchain.toml",
+];
+
+/// Whether `name` is one of the built-in harness CLI binaries.
+pub fn is_builtin_harness_tool(name: &str) -> bool {
+    BUILTIN_HARNESS_TOOLS.contains(&name)
+}
+
+/// Whether a legacy lookup for `name` should emit a stderr declaration warning.
+pub fn should_warn_legacy(name: &str, found: Option<&Path>) -> bool {
+    !(is_builtin_harness_tool(name) && found.is_some())
+}
+
 /// Why a tool cannot be used.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -310,7 +336,7 @@ impl Toolchain {
                     "anyagents-toolchain: no {} is loaded, so {needed_by} helpers inherit the ambient PATH. Declare child_path_tail in it.",
                     manifest::FILE_NAME,
                 );
-            } else {
+            } else if should_warn_legacy(name, found) {
                 eprintln!(
                     "anyagents-toolchain: `{name}` is not declared; legacy lookup for {needed_by} resolved {}. Declare it in {}.",
                     found.map_or_else(|| "nothing".to_string(), |p| p.display().to_string()),
@@ -481,6 +507,25 @@ pub fn tool(name: &str, needed_by: &str) -> Result<ResolvedTool, ToolchainError>
 pub fn init_cli(data_dir: &Path, host_home: Option<PathBuf>) -> &'static Toolchain {
     let _ =
         install_global(Toolchain::load(data_dir).with_legacy_context(LegacyContext { host_home }));
+    global()
+}
+
+/// Load the first existing guest manifest from `candidates`, or return
+/// [`Toolchain::empty`] when none exist.
+pub fn load_default_guest_manifest(candidates: &[&Path]) -> Toolchain {
+    for path in candidates {
+        if path.is_file() {
+            return Toolchain::load_file(path);
+        }
+    }
+    Toolchain::empty()
+}
+
+/// Install the sandbox guest's toolchain from `/var/lib/anyagents/toolchain.toml`
+/// (falling back to `/etc/anyagents/toolchain.toml`) when present.
+pub fn init_guest() -> &'static Toolchain {
+    let paths: Vec<&Path> = DEFAULT_GUEST_MANIFEST_PATHS.iter().map(Path::new).collect();
+    let _ = install_global(load_default_guest_manifest(&paths));
     global()
 }
 

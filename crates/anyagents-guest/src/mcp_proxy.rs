@@ -1,13 +1,17 @@
 //! Stdio JSON-RPC to HTTPS Streamable MCP proxy (`anyagents-guest mcp-proxy`).
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use clap::Args;
 use serde_json::{Value, json};
 
+/// Maximum inline textual JSON-RPC frame size before offloading into the
+/// sandbox-accessible tmp directory (`$ANYAGENTS_AGENT_DATA_DIR/tmp`).
+const PROXY_TEXT_SPILL_BYTES: usize = 56 * 1024;
 const MAX_CONCURRENT_RPC: usize = 32;
 
 #[derive(Args, Clone, Debug)]
@@ -24,6 +28,36 @@ pub struct McpProxyArgs {
     /// Request timeout in seconds.
     #[arg(long, default_value_t = 120)]
     pub timeout_secs: u64,
+    /// Optional sandbox directory for offloading oversized textual MCP responses.
+    #[arg(long)]
+    pub spill_dir: Option<PathBuf>,
+}
+
+/// Resolve the sandbox-accessible offload directory (`<agent-data>/tmp`),
+/// guaranteeing returned artifact paths are directly readable inside the sandbox.
+pub(crate) fn resolve_proxy_spill_dir(explicit: Option<&Path>) -> PathBuf {
+    if let Some(dir) = explicit.filter(|p| !p.as_os_str().is_empty()) {
+        return dir.to_path_buf();
+    }
+    for key in ["ANYAGENTS_AGENT_DATA_DIR", "ANYAGENTS_SANDBOX_DATA_DIR"] {
+        if let Ok(raw) = std::env::var(key) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("tmp");
+            }
+        }
+    }
+    if let Ok(raw) = std::env::var("ANYAGENTS_GUEST_STATE_DIR") {
+        let trimmed = raw.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            let root = trimmed
+                .strip_suffix("/state")
+                .filter(|p| !p.is_empty())
+                .unwrap_or(trimmed);
+            return PathBuf::from(root).join("tmp");
+        }
+    }
+    PathBuf::from(crate::DEFAULT_DATA_MOUNT_DIR).join("tmp")
 }
 
 /// Run the stdio <-> HTTPS MCP proxy loop.
@@ -99,17 +133,26 @@ fn write_response_lines<W: Write>(writer: &Mutex<&mut W>, lines: &[String]) -> R
     guard.flush().map_err(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_single_rpc<W: Write>(
     http: &ureq::Agent,
     url: &str,
     token: Option<&str>,
     state: &Mutex<ProxyState>,
     writer: &Mutex<&mut W>,
+    spill_dir: &Path,
+    spill_seq: &AtomicU64,
     req_id: Option<Value>,
     body: &str,
 ) -> Result<(), String> {
     match forward_rpc(http, url, token, state, body) {
-        Ok(responses) => write_response_lines(writer, &responses),
+        Ok(responses) => {
+            let processed: Vec<String> = responses
+                .iter()
+                .map(|resp| maybe_offload_response(resp, spill_dir, spill_seq))
+                .collect();
+            write_response_lines(writer, &processed)
+        }
         Err(err_msg) => {
             if let Some(id) = req_id {
                 let err_resp = json!({
@@ -144,6 +187,8 @@ pub(crate) fn run_proxy_io<R: BufRead, W: Write + Send>(
         .build()
         .new_agent();
 
+    let spill_dir = resolve_proxy_spill_dir(args.spill_dir.as_deref());
+    let spill_seq = AtomicU64::new(0);
     let state = Mutex::new(ProxyState::default());
     let writer = Mutex::new(writer);
     let gate = InFlightGate::new(MAX_CONCURRENT_RPC);
@@ -196,7 +241,17 @@ pub(crate) fn run_proxy_io<R: BufRead, W: Write + Send>(
             let should_run_sync = method == "initialize"
                 || !state.lock().unwrap_or_else(|e| e.into_inner()).negotiated;
             if should_run_sync {
-                dispatch_single_rpc(&http, url, token.as_deref(), &state, &writer, req_id, &body)?;
+                dispatch_single_rpc(
+                    &http,
+                    url,
+                    token.as_deref(),
+                    &state,
+                    &writer,
+                    &spill_dir,
+                    &spill_seq,
+                    req_id,
+                    &body,
+                )?;
                 state.lock().unwrap_or_else(|e| e.into_inner()).negotiated = true;
                 continue;
             }
@@ -205,6 +260,8 @@ pub(crate) fn run_proxy_io<R: BufRead, W: Write + Send>(
             let http_ref = &http;
             let state_ref = &state;
             let writer_ref = &writer;
+            let spill_dir_ref = &spill_dir;
+            let spill_seq_ref = &spill_seq;
             let err_slot = Arc::clone(&first_write_err);
             scope.spawn(move || {
                 let _permit = permit;
@@ -214,6 +271,8 @@ pub(crate) fn run_proxy_io<R: BufRead, W: Write + Send>(
                     token.as_deref(),
                     state_ref,
                     writer_ref,
+                    spill_dir_ref,
+                    spill_seq_ref,
                     req_id,
                     &body,
                 ) {
@@ -430,6 +489,107 @@ fn extract_sse_data_lines(body: &str) -> Vec<String> {
     out
 }
 
+fn contains_media(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| matches!(t, "image" | "audio" | "resource" | "resource_link"))
+                || map.contains_key("visionImage")
+                || map.get("image_attached").and_then(Value::as_bool) == Some(true)
+                || (map.contains_key("mimeType") && map.contains_key("data"))
+                || map.values().any(contains_media)
+        }
+        Value::Array(items) => items.iter().any(contains_media),
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .filter(|v| v.is_object() || v.is_array())
+            .is_some_and(|v| contains_media(&v)),
+        _ => false,
+    }
+}
+
+fn maybe_offload_response(resp: &str, spill_dir: &Path, spill_seq: &AtomicU64) -> String {
+    let bytes = resp.as_bytes();
+    if bytes.len() < PROXY_TEXT_SPILL_BYTES {
+        return resp.to_string();
+    }
+    let Ok(original) = serde_json::from_slice::<Value>(bytes) else {
+        return resp.to_string();
+    };
+    let textual = !contains_media(&original)
+        && (original.get("error").is_some()
+            || original.get("result").is_some_and(|result| {
+                result
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_none_or(|blocks| blocks.iter().all(|block| block["type"] == "text"))
+            }));
+    if !textual {
+        return resp.to_string();
+    }
+    let seq = spill_seq.fetch_add(1, Ordering::Relaxed) + 1;
+    let Ok(path) = write_spill_file(bytes, spill_dir, seq) else {
+        return resp.to_string();
+    };
+    let sha256 = anyagents_toolchain::sha256_file(&path).unwrap_or_default();
+    let artifact = json!({
+        "path": path,
+        "bytes": bytes.len(),
+        "sha256": sha256,
+        "format": "json",
+        "mode": "0600",
+        "read": "Read the JSON file at `path` directly and verify `bytes` and `sha256` before parsing."
+    });
+    let Ok(text) = serde_json::to_string(&json!({"offloaded": true, "artifact": artifact})) else {
+        return resp.to_string();
+    };
+    let mut replacement = json!({"jsonrpc": "2.0", "id": original.get("id")});
+    if original.get("error").is_some() {
+        replacement["error"] = json!({
+            "code": original["error"]["code"],
+            "message": "Oversized JSON-RPC error preserved in artifact",
+            "data": artifact
+        });
+    } else {
+        replacement["result"] = json!({
+            "content": [{"type": "text", "text": text}],
+            "isError": original["result"]["isError"].as_bool().unwrap_or(false)
+        });
+    }
+    match serde_json::to_string(&replacement) {
+        Ok(compact) if compact.len() < PROXY_TEXT_SPILL_BYTES => compact,
+        _ => resp.to_string(),
+    }
+}
+
+fn write_spill_file(bytes: &[u8], dir: &Path, seq: u64) -> std::io::Result<PathBuf> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(dir)?;
+    let canon = std::fs::canonicalize(dir)?;
+    let path = canon.join(format!(
+        "anyagents-mcp-frame-{}-{seq}.json",
+        std::process::id()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +678,7 @@ mod tests {
             token_file: Some(tok_file.clone()),
             token: None,
             timeout_secs: 10,
+            spill_dir: Some(tmp.path().join("tmp")),
         };
         let input1 = concat!(
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n",
@@ -616,11 +777,13 @@ mod tests {
             }
         });
 
+        let tmp_waf = tempfile::tempdir().unwrap();
         let args = McpProxyArgs {
             url: Some(format!("http://{addr}/mcp?profile=full")),
             token_file: None,
             token: Some("cap-waf".into()),
             timeout_secs: 10,
+            spill_dir: Some(tmp_waf.path().join("tmp")),
         };
         let input = concat!(
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"cmd\":\"ls | head -n 5\"}}\n",
@@ -638,6 +801,49 @@ mod tests {
         assert_eq!(
             encs.as_slice(),
             &[None, Some("base64".to_string()), Some("base64".to_string())]
+        );
+    }
+
+    #[test]
+    fn mcp_proxy_offloads_oversized_response_into_sandbox_tmp_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill_dir = tmp.path().join("agent-data/tmp");
+        let huge_text = "x".repeat(120 * 1024);
+        let original = json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "result": {
+                "content": [{"type": "text", "text": huge_text}],
+                "isError": false
+            }
+        });
+        let raw = serde_json::to_string(&original).unwrap();
+        assert!(raw.len() > 100 * 1024);
+
+        let seq = AtomicU64::new(0);
+        let out = maybe_offload_response(&raw, &spill_dir, &seq);
+        assert!(out.len() <= PROXY_TEXT_SPILL_BYTES);
+
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["id"], 99);
+        let summary: Value =
+            serde_json::from_str(parsed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(summary["offloaded"], true);
+        let artifact_path = PathBuf::from(summary["artifact"]["path"].as_str().unwrap());
+        assert!(
+            artifact_path.starts_with(std::fs::canonicalize(&spill_dir).unwrap()),
+            "artifact must be stored inside sandbox tmp dir: {}",
+            artifact_path.display()
+        );
+        let on_disk = std::fs::read_to_string(&artifact_path).unwrap();
+        assert_eq!(on_disk, raw);
+        assert_eq!(
+            summary["artifact"]["bytes"].as_u64().unwrap() as usize,
+            raw.len()
+        );
+        assert_eq!(
+            summary["artifact"]["sha256"].as_str().unwrap(),
+            anyagents_toolchain::sha256_file(&artifact_path).unwrap()
         );
     }
 
@@ -697,11 +903,13 @@ mod tests {
             }
         });
 
+        let tmp = tempfile::tempdir().unwrap();
         let args = McpProxyArgs {
             url: Some(format!("http://{addr}/mcp")),
             token_file: None,
             token: Some("cap-conc".into()),
             timeout_secs: 10,
+            spill_dir: Some(tmp.path().join("tmp")),
         };
         let input = concat!(
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n",

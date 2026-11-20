@@ -320,6 +320,15 @@ pub fn tool_definitions_with_roles(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let role_examples: Vec<serde_json::Value> = templates
+        .iter()
+        .map(|(slug, _)| serde_json::Value::String(slug.clone()))
+        .collect();
+    let role_names = templates
+        .iter()
+        .map(|(slug, _)| slug.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     let append_note =
         format!(" Available roles (`general` is the built-in default): {role_catalog}.");
     for tool in &mut tools {
@@ -336,6 +345,23 @@ pub fn tool_definitions_with_roles(
             desc.push_str(&append_note);
             tool.description = Some(desc.into());
         }
+        let mut schema_obj = (*tool.input_schema).clone();
+        if let Some(role_prop) = schema_obj
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|props| props.get_mut("role"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            role_prop.insert(
+                "description".to_string(),
+                serde_json::Value::String(format!("Available roles: {role_names}")),
+            );
+            role_prop.insert(
+                "examples".to_string(),
+                serde_json::Value::Array(role_examples.clone()),
+            );
+        }
+        tool.input_schema = std::sync::Arc::new(schema_obj);
     }
     tools
 }

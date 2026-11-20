@@ -281,3 +281,48 @@ fn with_a_manifest_the_exec_path_is_constructed_and_not_a_legacy_use() {
     assert_eq!(tc.exec_path("repo"), "/usr/bin:/bin");
     assert!(tc.report().legacy.is_empty());
 }
+
+#[test]
+fn agy_is_registered_as_builtin_harness_tool_and_declared_manifest_resolves_cleanly() {
+    assert!(is_builtin_harness_tool("agy"));
+    assert!(!should_warn_legacy(
+        "agy",
+        Some(Path::new("/usr/local/bin/agy"))
+    ));
+    assert!(should_warn_legacy("agy", None));
+    assert!(should_warn_legacy(
+        "undeclared-custom-tool",
+        Some(Path::new("/usr/local/bin/undeclared-custom-tool"))
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let agy = fake_tool(dir.path(), "agy", "1.2.3");
+    let sha = sha256_file(&agy).unwrap();
+    let manifest_path = dir.path().join("toolchain.toml");
+    std::fs::write(
+        &manifest_path,
+        manifest(
+            &[("agy", &agy, "1.2.3", sha, "capability = \"harness\"")],
+            "",
+        ),
+    )
+    .unwrap();
+
+    let missing = dir.path().join("missing.toml");
+    let loaded = load_default_guest_manifest(&[missing.as_path(), manifest_path.as_path()]);
+    let resolved = loaded.tool("agy", "anyagents-guest.serve").unwrap();
+    assert_eq!(resolved.provenance, Provenance::Declared);
+    assert_eq!(resolved.path, std::fs::canonicalize(&agy).unwrap());
+    assert!(loaded.report().legacy.is_empty());
+
+    // Strict `enforce_undeclared = true` still fails closed when `agy` is absent.
+    let strict = toolchain(&manifest(&[], "enforce_undeclared = true"));
+    let err = strict.tool("agy", "anyagents-guest.serve").unwrap_err();
+    assert_eq!(
+        err,
+        ToolchainError::Undeclared {
+            tool: "agy".into(),
+            needed_by: "anyagents-guest.serve".into(),
+        }
+    );
+}

@@ -47,6 +47,7 @@ enum Command {
 
 /// Entry point for standalone `anyagents-guest` and multi-call `anyagents` dispatch.
 pub fn run_cli_exit_code() -> ExitCode {
+    anyagents_toolchain::init_guest();
     let cli = Cli::parse();
     let res = match cli.command {
         Command::Serve(args) => guest::run_serve(args),

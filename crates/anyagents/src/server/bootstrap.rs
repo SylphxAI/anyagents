@@ -136,10 +136,10 @@ impl Drop for Retaining {
     }
 }
 
-/// Materialize deployment-level config, secret, and profile blobs from
+/// Materialize deployment-level config, secret, profile, skill, and role blobs from
 /// PostgreSQL (`public.deployment_blobs`) into a stateless/serverless replica's
 /// local ephemeral data directory so `FileCredentialStore`, `Settings::load`,
-/// and profile lookups work identically across cold starts.
+/// profile lookups, skills, and custom role templates work identically across cold starts.
 fn hydrate_deployment_blobs_on_start(store: &Store, data: &Path) -> Result<usize, Error> {
     let master_key = anyagents_core::MasterKey::from_env()?;
     let blobs = store.blob_store_with_key(master_key);
@@ -151,7 +151,7 @@ fn hydrate_deployment_blobs_on_start(store: &Store, data: &Path) -> Result<usize
         use std::os::unix::fs::PermissionsExt as _;
         let _ = std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o700));
     }
-    for ns in ["config", "secrets", "profiles", "skills"] {
+    for ns in ["config", "secrets", "profiles", "skills", "roles"] {
         let entries = blobs.get_deployment_blobs_all(ns)?;
         for entry in entries {
             if anyagents_core::stateless::validate_blob_path(&entry.path).is_err() {
@@ -162,6 +162,7 @@ fn hydrate_deployment_blobs_on_start(store: &Store, data: &Path) -> Result<usize
                 "secrets" => data.join("secrets").join(&entry.path),
                 "profiles" => data.join("profiles").join(&entry.path),
                 "skills" => data.join("skills").join(&entry.path),
+                "roles" => data.join("roles").join(&entry.path),
                 _ => continue,
             };
             let mode = if entry.encrypted || ns == "secrets" {
