@@ -520,10 +520,11 @@ async fn set_subagent_defaults_route(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                cfg.agents.insert(ag.to_string(), spec);
-            } else {
-                cfg.default = spec;
+                return Err(ApiError::from_store(anyagents_core::Error::Message(format!(
+                    "per-agent defaults for {ag:?} are retired; use role template frontmatter or set the global deployment default"
+                ))));
             }
+            cfg.default = spec;
         }
         create::save_subagent_defaults(state.store.data_dir(), &cfg)
             .map_err(ApiError::from_store)?;

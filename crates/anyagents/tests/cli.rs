@@ -111,7 +111,15 @@ fn configured_owner_catalog_is_authoritative_for_create_discovery_and_updates() 
     };
     let workspace = workspace.to_str().unwrap();
     // Omitting --role automatically defaults to the built-in `general` role without any disk file.
-    let created = run(&["agents", "create", "plain", "--workdir", workspace]);
+    let created = run(&[
+        "agents",
+        "create",
+        "plain",
+        "--harness",
+        "claude-code",
+        "--workdir",
+        workspace,
+    ]);
     assert!(
         created.status.success(),
         "{}",
@@ -160,6 +168,8 @@ fn configured_owner_catalog_is_authoritative_for_create_discovery_and_updates() 
         "agents",
         "create",
         "current",
+        "--harness",
+        "claude-code",
         "--workdir",
         workspace,
         "--role",
@@ -642,7 +652,7 @@ fn plain_log_tail_keeps_the_bounded_conversation_route() {
 fn send_operator_reaches_the_operator_inbox_and_an_agent_cannot_read_it() {
     let dir = tempfile::tempdir().unwrap();
     let create = bin_in(dir.path())
-        .args(["agents", "create", "alpha"])
+        .args(["agents", "create", "alpha", "--harness", "claude-code"])
         .output()
         .unwrap();
     assert!(
@@ -707,7 +717,7 @@ fn send_operator_reaches_the_operator_inbox_and_an_agent_cannot_read_it() {
 fn create_send_inbox_and_usage() {
     let dir = tempfile::tempdir().unwrap();
     let create = bin_in(dir.path())
-        .args(["agents", "create", "alpha"])
+        .args(["agents", "create", "alpha", "--harness", "claude-code"])
         .output()
         .unwrap();
     assert!(
@@ -762,7 +772,7 @@ fn create_send_inbox_and_usage() {
 
     // A named group reaches its own members, and nobody else.
     let beta = bin_in(dir.path())
-        .args(["agents", "create", "beta"])
+        .args(["agents", "create", "beta", "--harness", "claude-code"])
         .output()
         .unwrap();
     assert!(
@@ -990,7 +1000,7 @@ fn usage_sums_by_agent_and_day() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["alpha", "beta"] {
         let created = bin_in(dir.path())
-            .args(["agents", "create", name])
+            .args(["agents", "create", name, "--harness", "claude-code"])
             .output()
             .unwrap();
         assert!(created.status.success());
@@ -1076,7 +1086,7 @@ fn add_telegram_copies_the_token_and_lists_no_secret() {
 
     let dir = tempfile::tempdir().unwrap();
     let created = bin_in(dir.path())
-        .args(["agents", "create", "alpha"])
+        .args(["agents", "create", "alpha", "--harness", "claude-code"])
         .output()
         .unwrap();
     assert!(
@@ -1192,7 +1202,15 @@ fn cli_create_defaults_omitted_and_empty_role_to_builtin_general_and_allows_disk
         ("empty-role", &["--role", ""][..]),
         ("explicit-general", &["--role", "general"][..]),
     ] {
-        let mut args = vec!["agents", "create", name, "--workdir", ws_str];
+        let mut args = vec![
+            "agents",
+            "create",
+            name,
+            "--harness",
+            "claude-code",
+            "--workdir",
+            ws_str,
+        ];
         args.extend_from_slice(extra_args);
         let out = run(&args);
         assert!(
@@ -1254,7 +1272,15 @@ fn cli_create_defaults_omitted_and_empty_role_to_builtin_general_and_allows_disk
         "---\nname: reviewer\ndescription: Workspace Reviewer\nscope: siblings\n---\nReviewer dynamic SSOT body.\n",
     )
     .unwrap();
-    let overridden = run(&["agents", "create", "disk-general", "--workdir", ws_str]);
+    let overridden = run(&[
+        "agents",
+        "create",
+        "disk-general",
+        "--harness",
+        "claude-code",
+        "--workdir",
+        ws_str,
+    ]);
     assert!(
         overridden.status.success(),
         "{}",
@@ -1263,6 +1289,8 @@ fn cli_create_defaults_omitted_and_empty_role_to_builtin_general_and_allows_disk
     let spawned_role = run(&[
         "spawn",
         "spawned-reviewer",
+        "--harness",
+        "claude-code",
         "--role",
         "reviewer",
         "--workdir",

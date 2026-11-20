@@ -479,7 +479,13 @@ async fn configured_owner_catalog_controls_mcp_discovery_after_removal() {
         .env("PATH", machine_path(dir.path()))
         .arg("--data")
         .arg(dir.path())
-        .args(["agents", "create", "catalog-reader"])
+        .args([
+            "agents",
+            "create",
+            "catalog-reader",
+            "--harness",
+            "claude-code",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -540,7 +546,7 @@ async fn canonical_conversation_raw_range_crosses_mcp_and_authenticated_socket()
             .env("PATH", machine_path(dir.path()))
             .arg("--data")
             .arg(dir.path())
-            .args(["agents", "create", name])
+            .args(["agents", "create", name, "--harness", "claude-code"])
             .output()
             .unwrap();
         assert!(
@@ -607,7 +613,7 @@ async fn mcp_tools_use_the_server_socket() {
             .env("PATH", machine_path(dir.path()))
             .arg("--data")
             .arg(dir.path())
-            .args(["agents", "create", name])
+            .args(["agents", "create", name, "--harness", "claude-code"])
             .output()
             .unwrap();
         assert!(
@@ -1663,7 +1669,7 @@ async fn describe_preserves_config_permissions_without_vendor_restart_writers() 
         .env("PATH", machine_path(dir.path()))
         .arg("--data")
         .arg(dir.path())
-        .args(["agents", "create", "alpha"])
+        .args(["agents", "create", "alpha", "--harness", "claude-code"])
         .output()
         .unwrap();
     assert!(
@@ -1724,7 +1730,7 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
             .env("PATH", machine_path(dir.path()))
             .arg("--data")
             .arg(dir.path())
-            .args(["agents", "create", name])
+            .args(["agents", "create", name, "--harness", "claude-code"])
             .output()
             .unwrap();
         assert!(created.status.success(), "{created:?}");
@@ -1867,7 +1873,7 @@ async fn tool_contracts_accept_the_shapes_agents_write() {
             .env("PATH", machine_path(dir.path()))
             .arg("--data")
             .arg(dir.path())
-            .args(["agents", "create", name])
+            .args(["agents", "create", name, "--harness", "claude-code"])
             .output()
             .unwrap();
         assert!(created.status.success(), "{created:?}");
@@ -2033,7 +2039,7 @@ async fn mcp_spawn_and_create_default_to_general_and_schema_lists_general_first(
         .env("PATH", machine_path(dir.path()))
         .arg("--data")
         .arg(dir.path())
-        .args(["agents", "create", "alpha"])
+        .args(["agents", "create", "alpha", "--harness", "claude-code"])
         .output()
         .unwrap();
     assert!(

@@ -153,22 +153,22 @@ enum Command {
         /// Show wide table including `agt_...` IDs without terminal truncation.
         #[arg(short = 'w', long)]
         wide: bool,
-        /// Set sub-agent default to inherit parent's harness, model, and profile (`subagents default --inherit`).
+        /// Clear the deployment fallback (legacy alias for --clear).
         #[arg(long)]
         inherit: bool,
-        /// Set sub-agent default harness (`subagents default --harness spiron`).
+        /// Set the deployment fallback harness.
         #[arg(long)]
         harness: Option<String>,
-        /// Set sub-agent default model (`subagents default --model sylphx/openai/gpt-6.1-sol#xhigh`).
+        /// Set the deployment fallback model.
         #[arg(long)]
         model: Option<String>,
-        /// Set sub-agent default profile (`subagents default --profile sylphx/default`).
+        /// Set the deployment fallback profile.
         #[arg(long)]
         profile: Option<String>,
-        /// Optional parent agent name to scope `subagents default --agent <name>`.
+        /// Legacy parent name, supported only with --clear to delete a retired override.
         #[arg(long)]
         agent: Option<String>,
-        /// Clear custom sub-agent default and revert to `inherit`.
+        /// Clear the deployment fallback or delete a retired per-agent override.
         #[arg(long)]
         clear: bool,
     },
@@ -2227,9 +2227,15 @@ fn subagents_default_cmd(
     clear: bool,
 ) -> Result<(), anyagents_core::Error> {
     use anyagents_core::Error;
-    let is_write = inherit || harness.is_some() || model.is_some() || profile.is_some() || clear;
+    let clear = clear || inherit;
+    let is_write = harness.is_some() || model.is_some() || profile.is_some() || clear;
+    if is_write && !clear && agent.is_some_and(|name| !name.trim().is_empty()) {
+        return Err(Error::Message(
+            "per-agent defaults are retired; use role template frontmatter or set the global deployment default".into(),
+        ));
+    }
     let cfg = if is_write {
-        let mode = if inherit || clear {
+        let mode = if clear {
             "inherit".to_string()
         } else {
             "preset".to_string()
@@ -2289,42 +2295,23 @@ fn subagents_default_cmd(
         println!("\n  {}\n", ui::bold_cyan("Sub-Agent Defaults"));
         let mut table = ui::Table::new(&[
             ("SCOPE", false),
-            ("MODE", false),
+            ("STATUS", false),
             ("HARNESS", false),
             ("MODEL", false),
             ("PROFILE", false),
         ]);
-        let fmt_row = |scope: &str, s: &create::SubagentDefaultSpec| -> Vec<String> {
-            let is_inh = s.mode.eq_ignore_ascii_case("inherit");
+        let fmt_row = |scope: &str, status: &str, s: &create::SubagentDefaultSpec| {
             vec![
                 ui::bold(scope),
-                if is_inh {
-                    ui::green("inherit (parent)")
-                } else {
-                    ui::cyan("preset")
-                },
-                if is_inh {
-                    ui::dim("inherit")
-                } else {
-                    s.harness.clone().unwrap_or_else(|| "inherit".to_string())
-                },
-                if is_inh {
-                    ui::dim("inherit")
-                } else {
-                    s.model.clone().unwrap_or_else(|| "inherit".to_string())
-                },
-                if is_inh {
-                    ui::dim("inherit")
-                } else {
-                    s.profile
-                        .clone()
-                        .unwrap_or_else(|| "auto / inherit".to_string())
-                },
+                status.to_string(),
+                s.harness.clone().unwrap_or_default(),
+                s.model.clone().unwrap_or_default(),
+                s.profile.clone().unwrap_or_default(),
             ]
         };
-        table.add_row(fmt_row("global (*)", &cfg.default));
+        table.add_row(fmt_row("global (*)", "deployment fallback", &cfg.default));
         for (ag, s) in &cfg.agents {
-            table.add_row(fmt_row(ag, s));
+            table.add_row(fmt_row(ag, "retired (ignored)", s));
         }
         table.print();
         println!();
@@ -2375,11 +2362,7 @@ fn apply_local_subagent_default(
             .filter(|s| !s.is_empty())
             .map(str::to_string),
     };
-    if let Some(ag) = agent.map(str::trim).filter(|s| !s.is_empty()) {
-        cfg.agents.insert(ag.to_string(), spec);
-    } else {
-        cfg.default = spec;
-    }
+    cfg.default = spec;
 }
 
 fn interact_cmd(

@@ -218,6 +218,108 @@ fn role_and_archetype_unify_on_canonical_template_slug_and_reject_unknown_roles(
 }
 
 #[test]
+fn spawn_selection_prefers_caller_then_role_then_pure_parent_then_deployment() {
+    let dir = crate::test_tempdir();
+    let data = dir.path();
+    let store = Store::open(data.join("state.db")).unwrap();
+    let mut agent = NewAgent::new("parent", "agy");
+    agent.model = Some("parent-model".into());
+    let parent = store.create_agent(agent).unwrap();
+    let config = agent_config_dir(data, &parent.id);
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join(".anyagents-profile"), "google-antigravity/team").unwrap();
+    std::fs::write(data.join("subagent-defaults.json"), serde_json::json!({
+        "default": {"mode": "preset", "harness": "codex", "model": "deploy-model", "profile": "openai/team"},
+        "agents": {"parent": {"mode": "preset", "harness": "spiron", "model": "ignored-model"}}
+    }).to_string()).unwrap();
+    let workdir = data.join("workspace");
+    let roles = workdir.join(".agents/agents");
+    std::fs::create_dir_all(&roles).unwrap();
+    for (name, template) in [
+        ("empty", ""),
+        (
+            "chosen",
+            "harness: codex\nmodel: role-model\nprofile: openai/team\n",
+        ),
+        (
+            "inherited",
+            "harness: inherit\nmodel: inherit\nprofile: inherit\n",
+        ),
+        ("same-parent", "harness: inherit\nmodel: role-model\n"),
+    ] {
+        std::fs::write(
+            roles.join(format!("{name}.md")),
+            format!("---\nrole: {name}\n{template}---\nRole body.\n"),
+        )
+        .unwrap();
+    }
+    let resolve = |role: &str, args: serde_json::Value, parent: Option<&anyagents_core::Agent>| {
+        let mut request: crate::api::CreateAgentRequest = serde_json::from_value(args).unwrap();
+        request.role = Some(role.to_string());
+        request.workdir = Some(workdir.display().to_string());
+        apply_archetype_defaults(None, data, parent, &mut request).unwrap();
+        assert!(
+            request.harness.is_some(),
+            "HTTP must forward absence instead of defaulting"
+        );
+        resolve_subagent_defaults(
+            data,
+            parent,
+            request.harness.as_deref().unwrap(),
+            request.model,
+            request.profile,
+        )
+    };
+    let args = || serde_json::json!({"name": "child"});
+    let expected = |h: &str, m: Option<&str>, p: Option<&str>| {
+        (h.to_string(), m.map(str::to_string), p.map(str::to_string))
+    };
+    assert_eq!(
+        resolve("empty", args(), None),
+        expected("codex", Some("deploy-model"), Some("openai/team"))
+    );
+    assert_eq!(
+        resolve("empty", args(), Some(&parent)),
+        expected("agy", Some("parent-model"), Some("google-antigravity/team"))
+    );
+    assert_eq!(
+        resolve("chosen", args(), Some(&parent)),
+        expected("codex", Some("role-model"), Some("openai/team"))
+    );
+    assert_eq!(
+        resolve("inherited", args(), Some(&parent)),
+        resolve("empty", args(), Some(&parent))
+    );
+    assert_eq!(resolve("inherited", args(), None), expected("", None, None));
+    assert_eq!(
+        resolve("same-parent", args(), Some(&parent)),
+        expected("agy", Some("role-model"), Some("google-antigravity/team"))
+    );
+    assert_eq!(
+        resolve(
+            "chosen",
+            serde_json::json!({"name":"child", "harness":"inherit", "model":"caller-model", "profile":"google-antigravity/caller"}),
+            Some(&parent)
+        ),
+        expected(
+            "agy",
+            Some("caller-model"),
+            Some("google-antigravity/caller")
+        )
+    );
+    std::fs::remove_file(data.join("subagent-defaults.json")).unwrap();
+    assert_eq!(resolve("empty", args(), None), expected("", None, None));
+    assert_eq!(
+        resolve(
+            "empty",
+            serde_json::json!({"name":"child", "harness":"codex"}),
+            None
+        ),
+        expected("codex", None, None)
+    );
+}
+
+#[test]
 fn builtin_general_role_resolves_private_without_disk_file_and_respects_disk_override() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");

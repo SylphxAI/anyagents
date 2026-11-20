@@ -152,7 +152,6 @@ fn legacy_harness_selectors_create_and_switch_to_spiron_without_renaming_gateway
     store
         .hold_capability_key("0123456789abcdef0123456789abcdef")
         .unwrap();
-    let model = crate::spiron::DEFAULT_SPIRON_MODEL;
     for (index, legacy) in ["sylphx", "sylphx-agent", "sylphx_agent", "sylphx/default"]
         .into_iter()
         .enumerate()
@@ -160,7 +159,8 @@ fn legacy_harness_selectors_create_and_switch_to_spiron_without_renaming_gateway
         let (harness, resolved_model, profile) =
             resolve_subagent_defaults(data, None, legacy, None, Some("sylphx/default".into()));
         assert_eq!(harness, "spiron");
-        assert_eq!(resolved_model.as_deref(), Some(model));
+        // No built-in spiron default is forced; only configured models apply.
+        assert_eq!(resolved_model, None);
         assert_eq!(profile.as_deref(), Some("sylphx/default"));
         let created = create(
             &store,
@@ -184,12 +184,20 @@ fn legacy_harness_selectors_create_and_switch_to_spiron_without_renaming_gateway
         )
         .unwrap();
         assert_eq!(created.harness, "spiron");
-        assert_eq!(created.model.as_deref(), Some(model));
+        assert_eq!(created.model, None);
         assert_eq!(upstream_provider_of(legacy, None), "sylphx");
-        let switched =
-            set_agent_harness(&store, data, "operator", &created.name, legacy, None, None).unwrap();
+        let switched = set_agent_harness(
+            &store,
+            data,
+            "operator",
+            &created.name,
+            legacy,
+            None,
+            Some("sylphx/default"),
+        )
+        .unwrap();
         assert_eq!(switched["harness"], "spiron");
-        assert_eq!(switched["model"], model);
+        assert!(switched["model"].is_null());
         assert_eq!(switched["profile"], "sylphx/default");
     }
 }
@@ -225,18 +233,17 @@ fn legacy_profile_compatibility_lists_expose_only_canonical_harnesses() {
 #[test]
 fn legacy_subagent_defaults_are_canonical_but_provider_profiles_are_preserved() {
     let dir = crate::test_tempdir();
+    // A configured default is preserved dynamically; nothing is forced by AnyAgents.
+    let configured_model = "example/lab/model#high";
     std::fs::write(dir.path().join("subagent-defaults.json"), serde_json::json!({
-        "default": {"mode": "custom", "harness": "sylphx/default", "model": "sylphx/openai/gpt-6.1-sol#medium", "profile": "sylphx/default"},
+        "default": {"mode": "custom", "harness": "sylphx/default", "model": configured_model, "profile": "sylphx/default"},
         "agents": {"parent": {"mode": "custom", "harness": "sylphx-agent", "profile": "sylphx/default"}}
     }).to_string()).unwrap();
     let cfg = load_subagent_defaults(dir.path());
     assert_eq!(cfg.default.harness.as_deref(), Some("spiron"));
     assert_eq!(cfg.agents["parent"].harness.as_deref(), Some("spiron"));
     assert_eq!(cfg.default.profile.as_deref(), Some("sylphx/default"));
-    assert_eq!(
-        cfg.default.model.as_deref(),
-        Some(crate::spiron::DEFAULT_SPIRON_MODEL)
-    );
+    assert_eq!(cfg.default.model.as_deref(), Some(configured_model));
     save_subagent_defaults(dir.path(), &cfg).unwrap();
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("subagent-defaults.json")).unwrap())
