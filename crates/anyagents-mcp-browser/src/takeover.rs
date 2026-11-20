@@ -165,7 +165,6 @@ impl BrowserSession {
             )
         {
             let mut g = self.inner.lock().await;
-            let alive = g.as_mut().is_some_and(BrowserInstance::is_alive);
             let cur_prof = g.as_ref().and_then(|i| i.active_profile.clone());
             let same_p = prof.is_none() || cur_prof == prof;
             let target_p = prof

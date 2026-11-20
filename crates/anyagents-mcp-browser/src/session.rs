@@ -451,7 +451,12 @@ pub fn build_launch_args(
         .and_then(|raw| BrowserProxy::parse(raw).ok())
         .filter(|p| !p.is_authenticated())
         .map(|p| p.direct_chromium_args());
-    build_launch_args_with_proxy(binary, user_data_dir, config, direct.as_deref())
+    build_launch_args_with_proxy(
+        binary,
+        user_data_dir,
+        config,
+        direct.as_ref().map(AsRef::as_ref),
+    )
 }
 
 /// Build Chromium launch flags using pre-resolved, credential-free proxy flags.
@@ -658,8 +663,12 @@ pub(crate) async fn launch_instance(
     })?;
 
     let proxy_args = proxy_handle.as_ref().map(ProxyHandle::chromium_args);
-    let args =
-        build_launch_args_with_proxy(&binary, &ws.user_data_dir, config, proxy_args.as_deref());
+    let args = build_launch_args_with_proxy(
+        &binary,
+        &ws.user_data_dir,
+        config,
+        proxy_args.as_ref().map(AsRef::as_ref),
+    );
     let mut cmd = Command::new(&binary);
     cmd.args(&args)
         .stdin(Stdio::null())
