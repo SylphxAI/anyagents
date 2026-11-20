@@ -278,10 +278,22 @@ pub struct Presented {
     route_agent: Option<String>,
 }
 
+/// Strict takeover tunnel session identifier validation (`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`).
+/// Rejects path traversal, slashes, dots, whitespace, and non-cookie-safe characters.
+pub(crate) fn is_valid_takeover_session_id(seg: &str) -> bool {
+    let bytes = seg.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
 /// Whether a request method and path are explicitly admitted for remote session
-/// tokens (`aars_*`): sandbox browser-profile sync and media retrieval only.
-/// Every other internal coordinator API route refuses remote session tokens
-/// fail-closed.
+/// tokens (`aars_*`): sandbox browser-profile sync, media retrieval, and
+/// outbound takeover reverse-tunnel registration only. Every other internal
+/// coordinator API route refuses remote session tokens fail-closed.
 fn allows_remote_session_path(method: &axum::http::Method, path: &str) -> bool {
     if path.contains("..") || path.contains('\\') {
         return false;
@@ -290,10 +302,15 @@ fn allows_remote_session_path(method: &axum::http::Method, path: &str) -> bool {
         .strip_prefix("/v1/browser-profiles/")
         .and_then(|rest| rest.strip_suffix("/archive"))
         .is_some_and(|seg| !seg.is_empty() && !seg.contains('/'));
+    let is_takeover_tunnel = path
+        .strip_prefix("/v1/takeover/")
+        .and_then(|rest| rest.strip_suffix("/tunnel"))
+        .is_some_and(is_valid_takeover_session_id);
     match *method {
         axum::http::Method::GET => {
             path == "/v1/browser-profiles"
                 || is_profile_archive
+                || is_takeover_tunnel
                 || path.strip_prefix("/v1/media/").is_some_and(|rest| {
                     let mut parts = rest.split('/');
                     let first = parts.next().is_some_and(|s| !s.is_empty());
@@ -1061,7 +1078,22 @@ mod tests {
             assert_eq!(err.0.status(), axum::http::StatusCode::UNAUTHORIZED);
         }
 
-        // 8. Internal API routes (outside browser-profiles and media) refuse remote session tokens (401).
+        // 8. Takeover reverse-tunnel (`GET /v1/takeover/{session_id}/tunnel`) admits valid
+        //    session IDs and rejects traversal, nested paths, and non-GET methods fail-closed.
+        let (mut parts, ()) = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/takeover/tk_0123456789abcdef/tunnel")
+            .header(operator::AGENT_HEADER, &tok)
+            .body(())
+            .unwrap()
+            .into_parts();
+        let p = Principal::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap();
+        assert_eq!(p, expected);
+
+        // 9. Internal API routes (outside browser-profiles, media, and takeover tunnel) refuse
+        //    remote session tokens (401).
         for (method, uri) in [
             ("GET", "/"),
             ("GET", "/v1/agents"),
@@ -1070,6 +1102,14 @@ mod tests {
             ("DELETE", "/v1/browser-profiles/team-site"),
             ("PUT", "/v1/agents/sandbox-agent/browser-profiles"),
             ("GET", "/v1/browser-profiles/../secrets"),
+            ("POST", "/v1/takeover/tk_0123456789abcdef/tunnel"),
+            ("PUT", "/v1/takeover/tk_0123456789abcdef/tunnel"),
+            ("DELETE", "/v1/takeover/tk_0123456789abcdef/tunnel"),
+            ("GET", "/v1/takeover/../secrets/tunnel"),
+            ("GET", "/v1/takeover/a/b/tunnel"),
+            ("GET", "/v1/takeover//tunnel"),
+            ("GET", "/v1/takeover/a%2Fb/tunnel"),
+            ("GET", "/v1/takeover/tk_0123456789abcdef/other"),
         ] {
             let (mut parts, ()) = axum::http::Request::builder()
                 .method(method)

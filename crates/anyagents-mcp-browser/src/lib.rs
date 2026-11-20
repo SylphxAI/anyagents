@@ -12,6 +12,7 @@ pub mod secrets;
 pub mod server;
 pub mod session;
 pub mod takeover;
+pub mod tunnel;
 pub mod url_guard;
 
 pub use config::BrowserServerConfig;
