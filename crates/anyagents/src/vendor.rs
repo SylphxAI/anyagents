@@ -1284,8 +1284,8 @@ fn vendor_launch_inner(
             )
         });
     let sandbox_mode = crate::sandbox_providers::SandboxMode::from_env();
-    let effective_cloud = is_effective_cloud_harness(
-        &request.agent.harness,
+    let effective_cloud = crate::remote::is_agent_cloud(
+        &request.agent,
         Some(&request.data_dir),
         Some(&request.config_dir),
     );
@@ -1339,12 +1339,12 @@ fn vendor_launch_inner(
     }
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
         if !sandbox_mode.is_remote_required() && !remote_sandbox_backed {
-            let install_target = if effective_cloud && is_spiron_harness(&request.agent.harness) {
-                "spiron-cloud"
+            let install_target = if effective_cloud {
+                crate::remote::agent_cloud_selector(&request.agent)
             } else {
-                &request.agent.harness
+                request.agent.harness.clone()
             };
-            let _ = crate::install::record(&root, install_target);
+            let _ = crate::install::record(&root, &install_target);
         }
         if let Some(store) = store_opt {
             crate::create::reconcile_agent_runtime_config_for_launch(
@@ -1565,8 +1565,8 @@ fn plan_adapter(
         ));
     }
     let sandbox_mode = crate::sandbox_providers::SandboxMode::from_env();
-    let effective_cloud = is_effective_cloud_harness(
-        &request.agent.harness,
+    let effective_cloud = crate::remote::is_agent_cloud(
+        &request.agent,
         Some(&request.data_dir),
         Some(&request.config_dir),
     );
@@ -1751,11 +1751,8 @@ fn plan_adapter(
             "omp",
         ))
     } else if effective_cloud {
-        let canonical = if is_spiron_harness(&request.agent.harness) {
-            "spiron-cloud"
-        } else {
-            anyagents_harness::normalize_harness_name(&request.agent.harness)
-        };
+        let canonical_owned = crate::remote::agent_cloud_selector(&request.agent);
+        let canonical = canonical_owned.as_str();
         let session_file = format!("{canonical}-session-id");
         let session = session_from_file(&request.config_dir, &session_file)?;
         let bin_override_var = format!(
@@ -2287,10 +2284,8 @@ fn begin_remote_session(
 }
 
 pub(crate) fn is_cloud_harness(harness: &str) -> bool {
-    matches!(
-        anyagents_harness::normalize_harness_name(harness),
-        "spiron-cloud" | "claude-cloud" | "openai-cloud" | "cursor-cloud"
-    )
+    anyagents_harness::decompose_harness_selector(harness)
+        .is_ok_and(|(_, rt)| rt.is_some_and(|r| r.is_cloud()))
 }
 
 /// Who a Spiron process runs as.

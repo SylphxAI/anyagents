@@ -11,6 +11,8 @@ pub(super) fn spawn_args_from_agents(args: AgentsArgs) -> SpawnArgs {
         name: args.name,
         role: args.role,
         harness: args.harness,
+        runtime: args.runtime,
+        budget_cap_micros: args.budget_cap_micros,
         model: args.model,
         profile: args.profile,
         repo: args.repo,
@@ -34,6 +36,8 @@ pub(super) fn spawn_args_from_subagents(args: SubagentsArgs) -> SpawnArgs {
         name: args.agent,
         role: args.role,
         harness: args.harness,
+        runtime: args.runtime,
+        budget_cap_micros: args.budget_cap_micros,
         model: args.model,
         profile: args.profile,
         repo: args.repo,
@@ -84,6 +88,8 @@ pub(super) fn create_request_from_agents(
         name,
         role: args.role,
         harness: Some(harness),
+        runtime: args.runtime,
+        budget_cap_micros: args.budget_cap_micros,
         model: args.model,
         profile: args.profile,
         repo: args.repo,
@@ -128,6 +134,8 @@ pub(super) fn create_request_from_spawn(
         name,
         role: args.role,
         harness: Some(harness),
+        runtime: args.runtime,
+        budget_cap_micros: args.budget_cap_micros,
         model: args.model,
         profile: args.profile,
         repo: args.repo,
@@ -147,6 +155,59 @@ pub(super) fn create_request_from_spawn(
         browser_profiles: args.browser_profiles,
         secrets: args.secrets,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn switch_agent_harness_or_runtime(
+    client: &Client,
+    tool_label: &str,
+    target_field: &str,
+    target: Option<&str>,
+    harness: Option<&str>,
+    runtime: Option<&str>,
+    budget_cap_micros: Option<u64>,
+    model: Option<String>,
+    profile: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let target = target
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("`{tool_label}` requires `{target_field}`"))?;
+    let clean = target.strip_prefix("agent:").unwrap_or(target);
+    let harness = harness.map(str::trim).filter(|s| !s.is_empty());
+    let runtime = runtime.map(str::trim).filter(|s| !s.is_empty());
+    if harness.is_none() && runtime.is_none() && budget_cap_micros.is_none() {
+        return Err(format!(
+            "`{tool_label}` requires `harness`, `runtime`, or `budget_cap_micros`"
+        ));
+    }
+    let (suffix, body) = if runtime.is_some() || budget_cap_micros.is_some() || harness.is_none() {
+        (
+            "runtime",
+            serde_json::json!({
+                "harness": harness,
+                "runtime": runtime,
+                "budget_cap_micros": budget_cap_micros,
+                "model": model,
+                "profile": profile,
+            }),
+        )
+    } else {
+        (
+            "harness",
+            serde_json::json!({
+                "harness": harness.unwrap_or_default(),
+                "model": model,
+                "profile": profile,
+            }),
+        )
+    };
+    client
+        .get(
+            &format!("/v1/agents/{clean}/{suffix}"),
+            Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+        )
+        .await
 }
 
 pub(super) async fn patch_agent(

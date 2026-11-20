@@ -456,30 +456,7 @@ fn extract_user_prompt(event: &Value) -> String {
 /// for an adapter run by hand. There is no loopback default: a remote vendor
 /// cannot reach this host's loopback, and a token sent there is wasted.
 pub fn resolve_public_mcp_url(config: &Path) -> Result<String, String> {
-    if let Ok(file_url) = std::fs::read_to_string(config.join(crate::remote::MCP_URL_FILE)) {
-        let trimmed = file_url.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
-    if let Ok(url) = std::env::var("ANYAGENTS_PUBLIC_MCP_URL") {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
-    if let Some(cloud_cfg) = read_cloud_json(config)
-        && let Some(url) = cloud_cfg.get("mcp_url").and_then(Value::as_str)
-        && !url.trim().is_empty()
-    {
-        return Ok(url.trim().to_string());
-    }
-    Err(format!(
-        "no MCP callback URL for this remote agent in {}: set `public_url` under `[server]` in \
-         the server's `{}` and start the agent again",
-        config.display(),
-        crate::remote::CONFIG_FILE
-    ))
+    crate::remote::resolve_public_mcp_url(config)
 }
 
 pub(super) fn validate_remote_mcp_url(config: &Path, url: &str) -> Result<String, String> {

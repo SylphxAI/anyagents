@@ -1148,11 +1148,7 @@ fn prepare_agent_wake_with_options(
     rotate_profile: bool,
 ) -> Result<(), ApiError> {
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &found.id);
-    if !crate::vendor::is_effective_cloud_harness(
-        &found.harness,
-        Some(store.data_dir()),
-        Some(&cfg),
-    ) {
+    if !crate::remote::is_agent_cloud(found, Some(store.data_dir()), Some(&cfg)) {
         let remote_workdir = resolve_remote_sandbox_workdir(store, found);
         match crate::sandbox_exec::ensure_sandbox_for_agent(
             store,

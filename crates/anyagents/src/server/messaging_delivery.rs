@@ -657,11 +657,7 @@ pub(super) fn deliver_agent_with_media(
         && !(agent.parent_id.is_none() && is_auto_subagent_lifecycle)
     {
         let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-        if !crate::vendor::is_effective_cloud_harness(
-            &agent.harness,
-            Some(store.data_dir()),
-            Some(&cfg),
-        ) {
+        if !crate::remote::is_agent_cloud(&agent, Some(store.data_dir()), Some(&cfg)) {
             let remote_workdir = resolve_remote_sandbox_workdir(store, &agent);
             match crate::sandbox_exec::ensure_sandbox_for_agent(
                 store,

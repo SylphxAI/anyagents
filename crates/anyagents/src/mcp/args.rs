@@ -262,6 +262,12 @@ pub(super) struct AgentsArgs {
     /// Harness catalog ID when `action` is `"spawn"`, `"create"`, or `"harness"` (`spiron`, `opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`, or `"inherit"`).
     #[serde(default)]
     pub(super) harness: Option<String>,
+    /// Execution runtime (`"local"`, `"sandbox"`, `"sandbox:<provider>"`, or `"cloud"`) when `action` is `"spawn"`, `"create"`, `"harness"`, or `"runtime"`.
+    #[serde(default)]
+    pub(super) runtime: Option<String>,
+    /// Optional hard remote spend cap in micro-USD (`1_000_000` = US$1.00) when `action` is `"spawn"`, `"create"`, `"harness"`, or `"runtime"`.
+    #[serde(default)]
+    pub(super) budget_cap_micros: Option<u64>,
     /// Optional model override when `action` is `"spawn"`, `"create"`, or `"harness"`.
     #[serde(default)]
     pub(super) model: Option<String>,
@@ -373,6 +379,12 @@ pub(super) struct SpawnArgs {
     /// Defaults to the caller's own harness (or `claude-code` when the caller runs on `agy`).
     #[serde(default)]
     pub(super) harness: Option<String>,
+    /// Execution runtime (`"local"`, `"sandbox"`, `"sandbox:<provider>"`, or `"cloud"`).
+    #[serde(default)]
+    pub(super) runtime: Option<String>,
+    /// Optional hard remote spend cap in micro-USD (`1_000_000` = US$1.00).
+    #[serde(default)]
+    pub(super) budget_cap_micros: Option<u64>,
     /// Optional model override (e.g. `sylphx/openai/gpt-6.1-sol#xhigh`, `claude-opus-5-5#high`).
     #[serde(default)]
     pub(super) model: Option<String>,
@@ -500,6 +512,12 @@ pub(super) struct SubagentsArgs {
     /// Harness catalog ID when `action = "spawn"` (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
     #[serde(default)]
     pub(super) harness: Option<String>,
+    /// Execution runtime (`"local"`, `"sandbox"`, `"sandbox:<provider>"`, or `"cloud"`) when `action` is `"spawn"`, `"harness"`, or `"runtime"`.
+    #[serde(default)]
+    pub(super) runtime: Option<String>,
+    /// Optional hard remote spend cap in micro-USD (`1_000_000` = US$1.00) when `action` is `"spawn"`, `"harness"`, or `"runtime"`.
+    #[serde(default)]
+    pub(super) budget_cap_micros: Option<u64>,
     /// Optional model override when `action = "spawn"`.
     #[serde(default)]
     pub(super) model: Option<String>,

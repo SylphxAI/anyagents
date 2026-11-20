@@ -226,7 +226,7 @@ pub(crate) async fn dispatch_serverless_turn(
         })?;
     let base_url = base_url.trim_end_matches('/').to_string();
 
-    if is_serverless_cloud_harness(&input.agent.harness) {
+    if input.agent.runtime.is_cloud() || is_serverless_cloud_harness(&input.agent.harness) {
         dispatch_cloud_turn(store, input, &base_url).await
     } else {
         dispatch_sandbox_turn(store, input, &base_url).await
@@ -238,8 +238,15 @@ async fn dispatch_cloud_turn(
     input: ServerlessDispatchInput,
     base_url: &str,
 ) -> Result<DispatchedRemoteTurn, String> {
-    let canonical = anyagents_harness::normalize_harness_name(&input.agent.harness);
-    let harness_kind = if canonical == "spiron-cloud" {
+    let store_budget = Arc::clone(&store);
+    let agent_budget = input.agent.clone();
+    run_store_blocking(move || {
+        super::runtime::check_remote_budget_cap(&store_budget, &agent_budget)
+    })
+    .await?;
+
+    let canonical = input.agent.canonical_harness();
+    let harness_kind = if canonical == "spiron" {
         "spiron"
     } else {
         "http_cloud"
@@ -286,28 +293,11 @@ async fn dispatch_cloud_turn(
             format!("no cloud endpoint configured for serverless harness `{harness_kind}`")
         })?;
 
-    let mut meta = serde_json::Map::new();
-    meta.insert("cloud_endpoint".into(), json!(cloud_endpoint));
-    meta.insert("agent_harness".into(), json!(input.agent.harness));
-    if let Some(ref model) = input.agent.model {
-        meta.insert("agent_model".into(), json!(model));
-    }
-    if let Some(ref rid) = saved_remote_agent {
-        meta.insert("remote_agent_id".into(), json!(rid));
-    }
-    if let Some(seq) = input.message_seq {
-        meta.insert("message_seq".into(), json!(seq));
-    }
-    if let Some(ref opener) = input.opener_id {
-        meta.insert("opener_id".into(), json!(opener));
-    }
-    if let Some(ref rt) = input.reply_target {
-        meta.insert(
-            "reply_target".into(),
-            serde_json::to_value(rt).unwrap_or(Value::Null),
-        );
-    }
-    let meta_val = Value::Object(meta.clone());
+    let meta_val = super::runtime::build_cloud_turn_metadata(
+        &input,
+        &cloud_endpoint,
+        saved_remote_agent.as_deref(),
+    );
 
     let now = now_ms();
     let store_create = Arc::clone(&store);
@@ -606,7 +596,7 @@ async fn dispatch_sandbox_turn(
                 )?;
             }
             if crate::remote::session_token(&cfg_dir).is_ok()
-                && crate::cloud_harness::resolve_public_mcp_url(&cfg_dir).is_ok()
+                && crate::remote::resolve_public_mcp_url(&cfg_dir).is_ok()
             {
                 sync_agent_bundle_tar_to_provider(
                     provider_ensure.as_ref(),

@@ -2,8 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyagents_core::{Agent, AgentId, Error, NewAgent, Store, agent_config_dir, agent_work_dir};
-use anyagents_harness::normalize_harness_name;
+use anyagents_core::{
+    Agent, AgentId, Error, ExecutionRuntime, NewAgent, Store, agent_config_dir, agent_work_dir,
+};
+use anyagents_harness::{normalize_harness_name, resolve_harness_and_runtime};
 
 use crate::install;
 
@@ -15,10 +17,13 @@ use super::{
     upstream_provider_of, write_profile_marker,
 };
 
+#[derive(Default)]
 pub struct CreateRequest {
     pub name: String,
     pub role: Option<String>,
     pub harness: String,
+    pub runtime: Option<String>,
+    pub budget_cap_micros: Option<u64>,
     pub model: Option<String>,
     pub profile: Option<String>,
     pub repo: Option<String>,
@@ -234,10 +239,33 @@ pub(super) fn create_with_seat_and_sandbox_mode(
     root_seat: Option<crate::sandbox::RootSeatRequest>,
     sandbox_mode: crate::sandbox_providers::SandboxMode,
 ) -> Result<Agent, Error> {
-    let normalized_harness = normalize_harness_name(&request.harness).to_string();
+    let default_runtime =
+        if sandbox_mode.is_remote_required() || crate::server::serverless::is_serverless_mode() {
+            ExecutionRuntime::Sandbox { provider: None }
+        } else {
+            ExecutionRuntime::Local
+        };
+    let resolved = resolve_harness_and_runtime(
+        &request.harness,
+        request.runtime.as_deref(),
+        default_runtime,
+    )
+    .map_err(|err| Error::Message(err.to_string()))?;
+    if sandbox_mode.is_remote_required() && resolved.runtime == ExecutionRuntime::Local {
+        return Err(Error::Message(
+            "runtime `local` is refused when ANYAGENTS_SANDBOX_MODE=remote_required; use `sandbox` or `cloud`"
+                .into(),
+        ));
+    }
+    let normalized_harness = resolved.harness.clone();
     // A harness is installed only if an adapter can start it.
-    install::adapter(&normalized_harness)?;
-    let mut new = NewAgent::new(request.name, normalized_harness.clone());
+    let adapter_selector = resolved.legacy_harness_selector();
+    install::adapter(&normalized_harness).or_else(|_| install::adapter(&adapter_selector))?;
+    let mut new = NewAgent::new(request.name, normalized_harness.clone())
+        .with_runtime(resolved.runtime.clone());
+    if let Some(cap) = request.budget_cap_micros {
+        new = new.with_budget_micros(cap);
+    }
     new.role = Some(
         request
             .role
@@ -315,15 +343,13 @@ pub(super) fn create_with_seat_and_sandbox_mode(
         // Nothing is installed until an agent needs it: this is that moment. A
         // failure is the reason the agent's first turn cannot start, reported here
         // and never retried in a loop.
-        let install_target = if crate::vendor::is_spiron_harness(&agent.harness)
-            && !crate::vendor::spiron_uses_local_execution(&agent.harness, Some(&data), None)
-        {
-            "spiron-cloud"
+        let install_target = if crate::remote::is_agent_cloud(&agent, Some(&data), None) {
+            crate::remote::agent_cloud_selector(&agent)
         } else {
-            agent.harness.as_str()
+            agent.harness.clone()
         };
         if !cfg!(test) && !sandbox_mode.is_remote_required() {
-            install::record(&data, install_target).map_err(Error::Message)?;
+            install::record(&data, &install_target).map_err(Error::Message)?;
         }
         // The gateway origin and this agent's own token, kept so a restart starts
         // the same agent the same way.
@@ -450,8 +476,7 @@ pub(super) fn create_with_seat_and_sandbox_mode(
                 .unwrap_or_else(|| "default".to_string());
             pairs.push(("SYLPHX_AGENT_ENV".to_string(), env_slug));
         }
-        let effective_cloud =
-            crate::vendor::is_effective_cloud_harness(&agent.harness, Some(&data), None);
+        let effective_cloud = crate::remote::is_agent_cloud(&agent, Some(&data), None);
         if sandbox_mode.is_remote_required()
             && !effective_cloud
             && !crate::sandbox_exec::has_remote_sandbox_provider(Some(&data))
@@ -470,7 +495,8 @@ pub(super) fn create_with_seat_and_sandbox_mode(
         let managed_abs = std::path::absolute(&managed)?;
         // Cloud harnesses run only a small HTTP launcher here, never a local checkout.
         // Explicit filesystem paths and explicit inheritance keep their local semantics.
-        let remote_placement = (crate::vendor::is_cloud_harness(&agent.harness)
+        let remote_placement = (agent.runtime.is_cloud()
+            || crate::vendor::is_cloud_harness(&agent.harness)
             || sandbox_mode.is_remote_required())
             && explicit_workdir.is_none()
             && !wd_is_inherit_keyword;

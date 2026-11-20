@@ -539,7 +539,7 @@ pub(crate) fn seed_harness_credentials(
             ".config/opencode/openrouter.key",
             ".config/opencode/opencode.json",
         ],
-        "cursor-cloud" => &["cursor-auth.json", "auth.json", "credentials.json"],
+        "cursor" | "cursor-cloud" => &["cursor-auth.json", "auth.json", "credentials.json"],
         _ => &[],
     };
     let mut rel_paths: Vec<String> = static_rel_paths.iter().map(|s| (*s).to_string()).collect();

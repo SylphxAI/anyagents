@@ -2,7 +2,7 @@
 //! the server owns when the boundary is in place, and through the store on a
 //! single-user machine.
 
-mod presentation;
+pub(crate) mod presentation;
 
 use std::path::Path;
 
@@ -41,6 +41,7 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
             name,
             role,
             harness,
+            runtime_args,
             model,
             profile,
             repo,
@@ -52,10 +53,13 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
             parent,
             prompt,
         } => {
+            let budget_cap_micros = runtime_args.budget_cap_micros()?;
             let body = serde_json::json!({
                 "name": name,
                 "role": role,
                 "harness": harness,
+                "runtime": runtime_args.runtime,
+                "budget_cap_micros": budget_cap_micros,
                 "model": model,
                 "profile": profile,
                 "repo": repo,
@@ -154,6 +158,7 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
             name,
             harness,
             harness_flag,
+            runtime_args,
             model,
             profile,
         } => {
@@ -161,17 +166,23 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
                 .as_deref()
                 .or(harness_flag.as_deref())
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    Error::Message(
-                        "usage: anyagents agents harness <agent> <harness> [--model ...] [--profile ...]"
-                            .into(),
-                    )
-                })?;
+                .filter(|s| !s.is_empty());
+            let budget_cap_micros = runtime_args.budget_cap_micros()?;
+            if target_harness.is_none()
+                && runtime_args.runtime.is_none()
+                && budget_cap_micros.is_none()
+            {
+                return Err(Error::Message(
+                    "usage: anyagents agents harness <agent> <harness> [--runtime ...] [--budget-usd ...] [--model ...] [--profile ...]"
+                        .into(),
+                ));
+            }
             harness_cmd(
                 data,
                 &name,
                 target_harness,
+                runtime_args.runtime.as_deref(),
+                budget_cap_micros,
                 model.as_deref(),
                 profile.as_deref(),
             )?;
@@ -351,76 +362,25 @@ pub fn role_cmd(data: &Path, agent: &str, role: Option<&str>, clear: bool) -> Re
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn harness_cmd(
     data: &Path,
     agent: &str,
-    harness: &str,
+    harness: Option<&str>,
+    runtime: Option<&str>,
+    budget_cap_micros: Option<u64>,
     model: Option<&str>,
     profile: Option<&str>,
 ) -> Result<(), Error> {
-    let clean_agent = agent.trim().strip_prefix("agent:").unwrap_or(agent.trim());
-    let body = serde_json::json!({
-        "harness": harness,
-        "model": model,
-        "profile": profile,
-    });
-    if client::can_call_server(data) {
-        match client::call::<serde_json::Value>(
-            data,
-            "POST",
-            &format!("/v1/agents/{clean_agent}/harness"),
-            Some(body.to_string().into_bytes()),
-            &client::authority(data),
-        ) {
-            Ok(result) => {
-                if client::agent_identity().is_none()
-                    && let Ok(store) = open(data)
-                {
-                    let _ = crate::create::set_agent_harness(
-                        &store,
-                        data,
-                        "operator",
-                        clean_agent,
-                        harness,
-                        model,
-                        profile,
-                    );
-                }
-                let result =
-                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?;
-                if crate::ui::is_pretty() {
-                    presentation::harness(&result, clean_agent);
-                } else {
-                    println!("{}", result);
-                }
-                return Ok(());
-            }
-            Err(err) if err.contains("404") && client::agent_identity().is_none() => {}
-            Err(err) => return Err(Error::Message(err)),
-        }
-    }
-    if client::agent_identity().is_some() {
-        return Err(Error::Message(
-            "administrative authority required (agent session cannot bypass server boundary)"
-                .into(),
-        ));
-    }
-    let store = open(data)?;
-    let out = crate::create::set_agent_harness(
-        &store,
+    crate::runtime_cli::harness_cmd(
         data,
-        "operator",
-        clean_agent,
+        agent,
         harness,
+        runtime,
+        budget_cap_micros,
         model,
         profile,
-    )?;
-    if crate::ui::is_pretty() {
-        presentation::harness(&out, clean_agent);
-    } else {
-        println!("{out}");
-    }
-    Ok(())
+    )
 }
 
 pub fn describe_cmd(
@@ -650,27 +610,17 @@ pub fn describe_cmd(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn spawn(
-    data: &Path,
-    name: Option<String>,
-    role: Option<String>,
-    harness: Option<String>,
-    model: Option<String>,
-    profile: Option<String>,
-    repo: Option<String>,
-    branch: Option<String>,
-    base: Option<String>,
-    workdir: Option<std::path::PathBuf>,
-    description: Option<String>,
-    instructions: Option<String>,
-    parent: Option<String>,
-    prompt: Option<String>,
-) -> Result<(), Error> {
-    let resolved_name = match name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+pub(crate) fn spawn(data: &Path, args: crate::runtime_cli::SpawnCliArgs) -> Result<(), Error> {
+    let budget_cap_micros = args.runtime_args.budget_cap_micros()?;
+    let resolved_name = match args
+        .name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         Some(n) => n,
         None => {
-            let prefix = parent
+            let prefix = args
+                .parent
                 .as_deref()
                 .or_else(|| client::agent_identity().map(|_| "sub"))
                 .unwrap_or("worker");
@@ -687,18 +637,20 @@ pub fn spawn(
     };
     let body = serde_json::json!({
         "name": resolved_name,
-        "role": role,
-        "harness": harness.unwrap_or_default(),
-        "model": model,
-        "profile": profile,
-        "repo": repo,
-        "branch": branch,
-        "base": base,
-        "workdir": workdir.map(|path| path.display().to_string()),
-        "description": description,
-        "instructions": instructions,
-        "parent": parent,
-        "prompt": prompt,
+        "role": args.role,
+        "harness": args.harness.unwrap_or_default(),
+        "runtime": args.runtime_args.runtime,
+        "budget_cap_micros": budget_cap_micros,
+        "model": args.model,
+        "profile": args.profile,
+        "repo": args.repo,
+        "branch": args.branch,
+        "base": args.base,
+        "workdir": args.workdir.map(|path| path.display().to_string()),
+        "description": args.description,
+        "instructions": args.instructions,
+        "parent": args.parent,
+        "prompt": args.prompt,
     });
     let view = create(data, body).map_err(Error::Message)?;
     if crate::ui::is_pretty() {
@@ -969,7 +921,7 @@ fn offline_agent_view(
     let scope_val = agent.scope().to_string();
     let lifecycle_val = agent.lifecycle().to_string();
     let delivery: crate::api::DeliveryView =
-        (&crate::vendor::declared_delivery(&agent.harness)).into();
+        (&crate::remote::declared_delivery_for_agent(&agent)).into();
     let effective_instructions =
         crate::create::effective_agent_instructions(Some(store), data, &agent);
     let schedules =
@@ -989,6 +941,8 @@ fn offline_agent_view(
         relationship: None,
         can_message: None,
         harness: agent.harness,
+        runtime: agent.runtime.as_canonical_string(),
+        remote_budget_micros: agent.remote_budget_micros,
         model: agent.model,
         live_harness: None,
         live_model: None,
@@ -1068,7 +1022,24 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         parsed.model,
         parsed.profile,
     );
-    if crate::vendor::is_effective_cloud_harness(&harness, Some(data), None) {
+    let has_explicit_runtime = parsed
+        .runtime
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        || anyagents_harness::decompose_harness_selector(&harness)
+            .ok()
+            .and_then(|(_, rt)| rt)
+            .is_some();
+    let needs_public_url = anyagents_harness::resolve_harness_and_runtime(
+        &harness,
+        parsed.runtime.as_deref(),
+        anyagents_core::ExecutionRuntime::Local,
+    )
+    .map(|r| r.runtime.is_cloud())
+    .unwrap_or(false)
+        || (!has_explicit_runtime
+            && crate::vendor::is_effective_cloud_harness(&harness, Some(data), None));
+    if needs_public_url {
         crate::remote::require_public_url(data)?;
     }
     let mut agent = crate::create::create(
@@ -1078,6 +1049,8 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
             name: parsed.name,
             role: parsed.role,
             harness,
+            runtime: parsed.runtime,
+            budget_cap_micros: parsed.budget_cap_micros,
             model,
             profile,
             repo: parsed.repo,

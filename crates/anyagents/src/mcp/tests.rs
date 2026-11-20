@@ -397,6 +397,8 @@ mod spawn_args_tests {
             relationship: Some("child".to_string()),
             can_message: Some(true),
             harness: "opencode".to_string(),
+            runtime: "local".to_string(),
+            remote_budget_micros: None,
             model: Some("gpt-5.4-mini".to_string()),
             live_harness: None,
             live_model: None,
