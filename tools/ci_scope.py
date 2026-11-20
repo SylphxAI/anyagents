@@ -1,26 +1,9 @@
 #!/usr/bin/env python3
-"""Cargo workspace crate-graph path-scoping for .github/workflows/ci.yml.
+"""Plan required CI jobs from the tested tree and its event base.
 
-Reads the root `Cargo.toml` and every workspace member's `Cargo.toml` via the
-Python standard library (`tomllib`), computes Cargo-accurate reverse dependents
-(transitive normal/build dependencies plus 1-hop dev-dependencies), and maps
-changed git paths to minimal, sound CI execution scopes:
-
-- Docs / markdown / `AGENTS.md` / `sylphx.toml` /
-  `tools/` / Python policy-only PRs -> `rust_scope=none`, `run_macos=false`.
-- `packages/` / `package.json`-only PRs -> `rust_scope=none`, `run_npm=true`,
-  `run_macos=false`.
-- Leaf-crate-only PRs (e.g. `crates/anyagents-guest/**`,
-  `crates/anyagents-mcp-*/**`, `crates/anyagents-gateway/**`, leaf harness
-  adapters) -> `rust_scope=crates:<pkg1>,<pkg2>,...` targeting only touched
-  crates + Cargo reverse dependents, skipping macOS and privileged Linux host
-  acceptance lanes when no macOS/host-platform crate is affected.
-- Core / coordinator / workspace-wide changes (`Cargo.toml`, `Cargo.lock`,
-  `rustfmt.toml`, `crates/anyagents-core/**`, `crates/anyagents/**`,
-  `crates/anyagents-harness/**`, `tests/invariants/**`,
-  `.github/workflows/ci.yml`), non-diff events (`push`, `workflow_dispatch`),
-  diff errors, or unrecognized paths -> fail-closed `rust_scope=workspace`,
-  `run_macos=true`, `run_host_acceptance=true`.
+Diff events run policy checks plus the affected lanes. No trustworthy diff or
+unrecognized input means full CI. Only explicit platform-neutral paths can
+skip macOS; main and manual runs always exercise the workspace on both OSes.
 """
 
 from __future__ import annotations
@@ -30,6 +13,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tomllib
 
@@ -38,7 +22,7 @@ PKG_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Paths validated directly in the fast `changes` job (no Rust build needed).
 NON_RUST_PATTERNS = (
-    re.compile(r"^docs/.+\.md$"),
+    re.compile(r"^docs/.+$"),
     re.compile(r"^[^/]+\.md$"),
     re.compile(r"^LICENSE[^/]*$"),
     re.compile(r"^\.github/ISSUE_TEMPLATE/.+$"),
@@ -54,28 +38,50 @@ NPM_PATTERNS = (
     re.compile(r"^package\.json$"),
 )
 
-# Paths that always require the full workspace Linux + macOS + host-acceptance gate.
+# Paths that affect CI itself or other workspace-wide inputs.
 WORKSPACE_TRIGGER_PATTERNS = (
     re.compile(r"^Cargo\.(toml|lock)$"),
     re.compile(r"^rustfmt\.toml$"),
+    re.compile(r"^rust-toolchain(?:\.toml)?$"),
+    re.compile(r"^tools/(?:test_)?ci_scope\.py$"),
     re.compile(r"^\.cargo/.+$"),
     re.compile(r"^\.github/workflows/ci\.yml$"),
     re.compile(r"^scripts/verify-host-memory-seat\.py$"),
     re.compile(r"^scripts/verify-harnesses\.sh$"),
-    re.compile(r"^crates/anyagents-core/.+$"),
-    re.compile(r"^crates/anyagents/.+$"),
     re.compile(r"^tests/invariants/.+$"),
 )
 
-# Crates owning macOS or host-OS platform-branching behavior (other than the root
-# `anyagents` binary, which links all leaf crates and is handled directly via
-# WORKSPACE_TRIGGER_PATTERNS when `crates/anyagents/**` is modified).
+CONSOLE_DIR = "crates/anyagents/src/server/console"
+CONSOLE_ASSETS = frozenset({
+    "index.html", "signin.html", "auth_recovery.html", "console.css", "console.js",
+})
+COORDINATOR_DIR = "crates/anyagents"
+SERVER_DIR = f"{COORDINATOR_DIR}/src/server"
+# Explicit HTTP/persistence modules; keep platform boundaries, unknown modules
+# and the composition root (server.rs) out of the Linux-only path.
+SERVER_ONLY_MODULES = frozenset({
+    "admin_auth", "admin_ui", "agents_roster", "channels_groups", "console_html",
+    "hybrid", "in_flight", "knowledge", "memory_backlog", "messaging",
+    "messaging_conversation", "messaging_delivery", "messaging_memory", "oidc_bearer",
+    "ops", "profile_models", "profiles", "reap_queue", "roles", "s3_media_profiles",
+    "schedules", "secrets", "secrets_tests", "serverless_envelope", "serverless_failure",
+    "serverless_maintenance", "serverless_memory", "serverless_steer", "serverless_watches",
+    "timer_fire", "types", "versions", "webhooks_mcp",
+})
+CORE_DB_ONLY = re.compile(
+    r"crates/anyagents-core/(?:migrations(?:_pg)?/[^/]+\.sql|"
+    r"src/db/(?:pg_migrations|sqlite_to_pg(?:_[a-z]+)?)\.rs|"
+    r"tests/(?:postgres_store|stateless_coordinator_pg)\.rs)"
+)
+
+# Crates with host-platform contracts (all anyagents-harness* crates too).
 MACOS_PLATFORM_CRATES = frozenset(
     {
         "anyagents-core",
-        "anyagents-harness",
-        "anyagents-harness-stream",
-        "anyagents-harness-opencode",
+        "anyagents-agent",
+        "anyagents-toolchain",
+        "anyagents-mcp-browser",
+        "anyagents-mcp-computer",
         "anyagents-installer",
         "anyagents-keeper",
         "anyagents-supervisor",
@@ -94,9 +100,8 @@ HOST_ACCEPTANCE_CRATES = frozenset(
     }
 )
 
-# Root binary package excluded when checking whether a leaf crate transitively
-# reaches macOS/host-only crates (changes to `crates/anyagents/**` directly
-# trigger full workspace scope above).
+# Linking the coordinator as a reverse dependent does not turn every leaf
+# input into a host change. Direct coordinator paths are classified separately.
 ROOT_COORDINATOR_PKG = "anyagents"
 CORE_PROMOTE_PKG = "anyagents-core"
 FAKE_OPENCODE_PKG = "anyagents-harness-opencode"
@@ -129,8 +134,10 @@ class ScopeResult:
     run_macos: bool
     run_host_acceptance: bool
     run_npm: bool
+    run_console: bool
     needs_fake_opencode: bool
     reason: str
+    linux_matrix: str
 
     def to_github_outputs(self) -> dict[str, str]:
         return {
@@ -141,6 +148,8 @@ class ScopeResult:
             "run_macos": "true" if self.run_macos else "false",
             "run_host_acceptance": "true" if self.run_host_acceptance else "false",
             "run_npm": "true" if self.run_npm else "false",
+            "run_console": "true" if self.run_console else "false",
+            "linux_matrix": self.linux_matrix,
             "needs_fake_opencode": "true" if self.needs_fake_opencode else "false",
             "reason": self.reason,
         }
@@ -277,23 +286,62 @@ def affected_packages(
     return sorted(affected), normal_reach
 
 
-def _full_workspace_scope(reason: str) -> ScopeResult:
-    return ScopeResult(
-        code=True,
-        rust_scope="workspace",
-        cargo_pkg_args="--workspace",
-        cargo_doc_args="--workspace",
-        run_macos=True,
-        run_host_acceptance=True,
-        run_npm=True,
-        needs_fake_opencode=True,
-        reason=reason,
+def _scope(
+    reason: str,
+    *,
+    graph: WorkspaceGraph | None = None,
+    affected: tuple[str, ...] | list[str] = (),
+    workspace: bool = False,
+    macos: bool = False,
+    host: bool = False,
+    npm: bool = False,
+    console: bool = False,
+) -> ScopeResult:
+    def pkg_args(names: list[str]) -> str:
+        return " ".join(f"-p {name}" for name in names)
+
+    coordinator = workspace or ROOT_COORDINATOR_PKG in affected
+    crates = [pkg for pkg in affected if pkg != ROOT_COORDINATOR_PKG]
+    crate_args = "--workspace --exclude anyagents" if workspace else pkg_args(crates)
+    doc_args = "--workspace" if workspace else pkg_args(
+        [pkg for pkg in crates if graph is not None and graph.packages[pkg].has_lib]
     )
+    scope = "workspace" if workspace else "crates:" + ",".join(affected) if affected else "none"
+    cargo_args = "--workspace" if workspace else pkg_args(list(affected))
+    # Each lane gets its exact Cargo scope. The complement of the identity
+    # binary stays in coordinator, so new coordinator tests are never omitted.
+    lanes = []
+    if cargo_args:
+        lanes.append({"lane": "lint", "packages": cargo_args, "docs": ""})
+    if crate_args:
+        lanes.append({"lane": "crates", "packages": crate_args, "docs": doc_args})
+    if coordinator:
+        lanes.extend({"lane": lane, "packages": "-p anyagents", "docs": ""}
+                     for lane in ("coordinator", "identity"))
+    if host:
+        lanes.append({"lane": "host", "packages": "-p anyagents", "docs": ""})
+    return ScopeResult(
+        code=bool(cargo_args),
+        rust_scope=scope,
+        cargo_pkg_args=cargo_args,
+        cargo_doc_args=doc_args,
+        run_macos=macos,
+        run_host_acceptance=host,
+        run_npm=npm,
+        run_console=console,
+        needs_fake_opencode=workspace or FAKE_OPENCODE_PKG in affected,
+        reason=reason,
+        linux_matrix=json.dumps({"include": lanes}, separators=(",", ":")),
+    )
+
+
+def _full_workspace_scope(reason: str, *, macos: bool = True) -> ScopeResult:
+    return _scope(reason, workspace=True, macos=macos, host=True, npm=True, console=True)
 
 
 def _match_member_crate(path: str, sorted_member_paths: list[tuple[str, str]]) -> str | None:
     for rel_prefix, pkg in sorted_member_paths:
-        if path == rel_prefix or path.startswith(rel_prefix + "/"):
+        if path.startswith(rel_prefix + "/"):
             return pkg
     return None
 
@@ -311,90 +359,153 @@ def compute_scope(
     if event not in ("pull_request", "merge_group"):
         return _full_workspace_scope(f"event:{event}")
 
-    cleaned = [p.strip().lstrip("./") for p in changed_paths if p.strip()]
-    if not cleaned:
-        return ScopeResult(
-            code=False,
-            rust_scope="none",
-            cargo_pkg_args="",
-            cargo_doc_args="",
-            run_macos=False,
-            run_host_acceptance=False,
-            run_npm=False,
-            needs_fake_opencode=False,
-            reason="empty-diff",
-        )
-
-    graph = load_workspace_graph(root)
-    # Match longest member path first so nested paths resolve unambiguously.
-    sorted_members = sorted(
-        graph.path_to_pkg.items(),
-        key=lambda item: (-len(item[0]), item[0]),
-    )
-
-    touched_crates: set[str] = set()
-    run_npm = False
-    for path in cleaned:
+    touched_paths: list[str] = []
+    run_npm = run_console = False
+    for path in changed_paths:
+        if any(ord(char) < 32 for char in path):
+            return _full_workspace_scope(f"control-character-in-path:{path!r}")
         if any(pat.fullmatch(path) for pat in WORKSPACE_TRIGGER_PATTERNS):
-            return _full_workspace_scope(f"workspace-trigger:{path}")
+            return _full_workspace_scope(f"workspace-trigger:{path!r}")
         if any(pat.fullmatch(path) for pat in NON_RUST_PATTERNS):
             continue
         if any(pat.fullmatch(path) for pat in NPM_PATTERNS):
             run_npm = True
-            continue
-        pkg = _match_member_crate(path, sorted_members)
-        if pkg is not None:
-            touched_crates.add(pkg)
-            continue
-        # Fail closed on unrecognized paths outside docs/tools/packages/members.
-        return _full_workspace_scope(f"unclassified-path:{path}")
+        elif path.startswith("apps/console/") or (
+            path.startswith(CONSOLE_DIR + "/") and path.removeprefix(CONSOLE_DIR + "/") in CONSOLE_ASSETS
+        ):
+            run_console = True
+        else:
+            touched_paths.append(path)
 
-    if not touched_crates:
-        reason = "npm-only" if run_npm else "non-rust-only"
-        return ScopeResult(
-            code=False,
-            rust_scope="none",
-            cargo_pkg_args="",
-            cargo_doc_args="",
-            run_macos=False,
-            run_host_acceptance=False,
-            run_npm=run_npm,
-            needs_fake_opencode=False,
-            reason=reason,
-        )
+    if not touched_paths:
+        return _scope("no-rust-inputs", npm=run_npm, console=run_console)
+    def server_only(path: str) -> bool:
+        if not path.startswith(SERVER_DIR + "/"):
+            return False
+        rel = Path(path.removeprefix(SERVER_DIR + "/"))
+        return bool(rel.parts and rel.suffix == ".rs" and Path(rel.parts[0]).stem in SERVER_ONLY_MODULES)
+
+    if any(CORE_DB_ONLY.fullmatch(path) for path in touched_paths) and all(
+        CORE_DB_ONLY.fullmatch(path) or server_only(path) for path in touched_paths
+    ):
+        # Shared store changes still exercise every Linux dependent. Shipped
+        # storage migrations don't change the workstation/platform contract.
+        return _full_workspace_scope("storage-only", macos=False)
+
+    graph = load_workspace_graph(root)
+    sorted_members = sorted(graph.path_to_pkg.items(), key=lambda item: -len(item[0]))
+    touched_crates: set[str] = set()
+    server = False
+    for path in touched_paths:
+        if server_only(path):
+            server = True
+            touched_crates.add(ROOT_COORDINATOR_PKG)
+            continue
+        if path.startswith(COORDINATOR_DIR + "/"):
+            return _full_workspace_scope(f"coordinator-platform:{path!r}")
+        pkg = _match_member_crate(path, sorted_members)
+        if pkg is None:
+            return _full_workspace_scope(f"unclassified-path:{path!r}")
+        # Manifest/build changes can add/remove and rewire dependencies.
+        if path in (f"{graph.packages[pkg].rel_path}/Cargo.toml", f"{graph.packages[pkg].rel_path}/build.rs"):
+            return _full_workspace_scope(f"crate-build-input:{path!r}")
+        touched_crates.add(pkg)
 
     affected, normal_reach = affected_packages(graph, touched_crates)
-
-    # Changes whose normal reverse dependents reach `anyagents-core` (e.g.
-    # `anyagents-harness`) span almost the entire workspace; run full workspace.
     if CORE_PROMOTE_PKG in normal_reach:
-        return _full_workspace_scope(
-            f"core-dependent:{','.join(sorted(touched_crates))}"
-        )
+        return _full_workspace_scope(f"core-dependent:{','.join(sorted(touched_crates))}")
 
     non_root_normal = normal_reach - {ROOT_COORDINATOR_PKG}
-    run_macos = any(
-        pkg in MACOS_PLATFORM_CRATES or graph.packages[pkg].has_macos_target_cfg
-        for pkg in non_root_normal
+    return _scope(
+        f"scoped-crates:{','.join(sorted(touched_crates))}",
+        graph=graph,
+        affected=affected,
+        macos=any(
+            pkg in MACOS_PLATFORM_CRATES or pkg.startswith("anyagents-harness")
+            or graph.packages[pkg].has_macos_target_cfg
+            for pkg in non_root_normal
+        ),
+        host=server or bool(non_root_normal & HOST_ACCEPTANCE_CRATES),
+        npm=run_npm,
+        console=run_console,
     )
-    run_host_acceptance = bool(non_root_normal & HOST_ACCEPTANCE_CRATES)
-    needs_fake_opencode = FAKE_OPENCODE_PKG in affected
 
-    cargo_pkg_args = " ".join(f"-p {pkg}" for pkg in affected)
-    doc_pkgs = [pkg for pkg in affected if graph.packages[pkg].has_lib]
-    cargo_doc_args = " ".join(f"-p {pkg}" for pkg in doc_pkgs)
 
-    return ScopeResult(
-        code=True,
-        rust_scope="crates:" + ",".join(affected),
-        cargo_pkg_args=cargo_pkg_args,
-        cargo_doc_args=cargo_doc_args,
-        run_macos=run_macos,
-        run_host_acceptance=run_host_acceptance,
-        run_npm=run_npm,
-        needs_fake_opencode=needs_fake_opencode,
-        reason=f"scoped-crates:{','.join(sorted(touched_crates))}",
+def changed_git_paths(root: Path, base: str, head: str) -> list[str]:
+    """Diff the event base against the checked-out candidate, including deletions."""
+    if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (base, head)):
+        raise ValueError("missing or invalid event SHA")
+    if subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root).decode().strip() != head:
+        raise ValueError("event head is not the checked-out commit")
+    subprocess.run(["git", "merge-base", "--is-ancestor", base, head], cwd=root, check=True)
+    raw = subprocess.check_output(
+        ["git", "diff", "--name-only", "--no-renames", "-z", base, head, "--"], cwd=root,
     )
+    # Git filenames are bytes, including whitespace. Never strip leading dots,
+    # split on newlines, or turn a malformed pathname into an excluded one.
+    return [p.decode("utf-8") for p in raw.split(b"\0")[:-1]]
+
+
+def check_purity(root: Path) -> None:
+    """Run the existing purity policy without building the Rust test binary."""
+    policy = root / COORDINATOR_DIR / "tests/open_source_purity.rs"
+    rules = re.search(r"let forbidden: [^=]+ = &\[(.*?)\];", policy.read_text(), re.S)
+    if not rules:
+        raise ValueError("missing Rust purity policy")
+    # Accept only the concat!("part", "part", ...) rule syntax in that test.
+    # Fail instead of silently dropping a rule if the Rust format changes.
+    literal = r'"[^"\\]*"'
+    entry = re.compile(rf"\(\s*({literal}),\s*concat!\(({literal}(?:,\s*{literal})*)\),?\s*\),")
+    remaining = rules[1].strip()
+    forbidden = []
+    while remaining:
+        match = entry.match(remaining)
+        if not match:
+            raise ValueError("unsupported Rust purity rule syntax")
+        forbidden.append((match[1][1:-1], "".join(part[1:-1] for part in re.findall(literal, match[2]))))
+        remaining = remaining[match.end():].lstrip()
+    if not forbidden:
+        raise ValueError("empty Rust purity policy")
+    raw = subprocess.check_output(["git", "ls-files", "-z"], cwd=root)
+    extensions = {".rs", ".md", ".toml", ".yml", ".yaml", ".sh"}
+    console_extensions = {".ts", ".tsx", ".js", ".css", ".html", ".mjs"}
+    violations = []
+    for path in map(Path, raw.decode().split("\0")[:-1]):
+        is_console = path.parts[:2] == ("apps", "console") or path.is_relative_to(CONSOLE_DIR)
+        if path.parts[0] == "docs" or path.suffix in extensions or (
+            is_console and path.suffix in console_extensions
+        ):
+            if path.is_absolute() or (root / path).is_symlink():
+                raise ValueError(f"expected regular purity input: {path}")
+            # Some documented diagrams/assets are binary; only scan UTF-8 text.
+            try:
+                content = (root / path).read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            for number, line in enumerate(content.splitlines(), 1):
+                violations.extend(
+                    f"{path}:{number}: {reason}" for reason, needle in forbidden if needle in line
+                )
+    if violations:
+        raise ValueError("open-source purity violations:\n" + "\n".join(violations))
+
+
+def check_console_assets(root: Path) -> None:
+    """Validate the same file/UTF-8 contract as the Rust include_str! calls."""
+    files = root / CONSOLE_DIR
+    if {p.name for p in files.iterdir()} != CONSOLE_ASSETS:
+        raise ValueError(f"expected exactly these embedded assets: {sorted(CONSOLE_ASSETS)}")
+    markers = {
+        "signin.html": {"{{COORDINATOR_URL}}"},
+        "auth_recovery.html": {"{{REASON}}", "{{LOGIN_URL}}", "{{HOME_URL}}"},
+    }
+    for path in sorted(files.iterdir()):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"expected regular embedded asset: {path}")
+        contents = path.read_text(encoding="utf-8")
+        placeholders = set(re.findall(r"\{\{[A-Z_]+\}\}", contents))
+        if not contents.strip() or not markers.get(path.name, set()) <= placeholders:
+            raise ValueError(f"empty asset or missing Rust substitution marker: {path}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -412,17 +523,8 @@ def main(argv: list[str] | None = None) -> int:
         default="pull_request",
         help="GitHub Actions event_name (default: pull_request).",
     )
-    parser.add_argument(
-        "--paths-file",
-        type=Path,
-        default=None,
-        help="Newline-delimited file of changed repository paths (from git diff --name-only).",
-    )
-    parser.add_argument(
-        "--diff-failed",
-        action="store_true",
-        help="Indicate git diff could not be computed (fails closed to workspace).",
-    )
+    parser.add_argument("--base", default="", help="Event base commit SHA.")
+    parser.add_argument("--head", default="", help="Tested event commit SHA.")
     parser.add_argument(
         "--github-output",
         type=Path,
@@ -434,18 +536,29 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print outputs as JSON to stdout.",
     )
+    checks = parser.add_mutually_exclusive_group()
+    checks.add_argument("--check-purity", action="store_true")
+    checks.add_argument("--check-console-assets", action="store_true")
     args = parser.parse_args(argv)
 
-    paths: list[str] = []
-    if args.paths_file is not None and not args.diff_failed:
-        paths = args.paths_file.read_text(encoding="utf-8").splitlines()
+    root = args.root.resolve()
+    if args.check_purity or args.check_console_assets:
+        try:
+            (check_purity if args.check_purity else check_console_assets)(root)
+        except (ValueError, OSError, subprocess.CalledProcessError) as err:
+            print(err, file=sys.stderr)
+            return 1
+        return 0
 
-    result = compute_scope(
-        args.root.resolve(),
-        paths,
-        event=args.event,
-        diff_failed=args.diff_failed,
-    )
+    paths: list[str] = []
+    diff_failed = False
+    if args.event in ("pull_request", "merge_group"):
+        try:
+            paths = changed_git_paths(root, args.base, args.head)
+        except (ValueError, OSError, subprocess.CalledProcessError) as err:
+            print(f"Unavailable candidate diff; using full CI: {err}", file=sys.stderr)
+            diff_failed = True
+    result = compute_scope(root, paths, event=args.event, diff_failed=diff_failed)
     outputs = result.to_github_outputs()
 
     if args.github_output is not None:

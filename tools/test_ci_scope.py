@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 TOOLS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOLS_DIR.parent
@@ -68,7 +70,7 @@ class RealWorkspaceScopeTests(unittest.TestCase):
                 self.assertEqual(res.rust_scope, f"crates:{pkg}")
                 self.assertEqual(res.cargo_pkg_args, f"-p {pkg}")
                 self.assertEqual(res.cargo_doc_args, f"-p {pkg}")
-                self.assertFalse(res.run_macos)
+                self.assertEqual(res.run_macos, pkg != "anyagents-mcp-web")
                 self.assertFalse(res.run_host_acceptance)
                 self.assertFalse(res.needs_fake_opencode)
 
@@ -87,7 +89,7 @@ class RealWorkspaceScopeTests(unittest.TestCase):
         self.assertFalse(res.run_host_acceptance)
         self.assertFalse(res.needs_fake_opencode)
 
-    def test_leaf_harness_codex_scopes_to_reverse_dependents_and_skips_macos(self) -> None:
+    def test_leaf_harness_codex_scopes_to_reverse_dependents_on_both_platforms(self) -> None:
         res = ci_scope.compute_scope(
             REPO_ROOT,
             ["crates/anyagents-harness-codex/src/lib.rs"],
@@ -102,11 +104,11 @@ class RealWorkspaceScopeTests(unittest.TestCase):
             res.cargo_doc_args,
             "-p anyagents-guest -p anyagents-harness-codex -p anyagents-invariants",
         )
-        self.assertFalse(res.run_macos)
+        self.assertTrue(res.run_macos)
         self.assertFalse(res.run_host_acceptance)
         self.assertFalse(res.needs_fake_opencode)
 
-    def test_leaf_harness_agy_dev_dep_does_not_trigger_macos_or_host_acceptance(self) -> None:
+    def test_leaf_harness_agy_dev_dep_does_not_trigger_host_acceptance(self) -> None:
         res = ci_scope.compute_scope(
             REPO_ROOT,
             ["crates/anyagents-harness-agy/src/lib.rs"],
@@ -117,7 +119,7 @@ class RealWorkspaceScopeTests(unittest.TestCase):
             res.rust_scope,
             "crates:anyagents,anyagents-agent,anyagents-guest,anyagents-harness-agy,anyagents-invariants",
         )
-        self.assertFalse(res.run_macos)
+        self.assertTrue(res.run_macos)
         self.assertFalse(res.run_host_acceptance)
 
     def test_opencode_harness_enables_macos_and_fake_opencode_helper(self) -> None:
@@ -152,6 +154,19 @@ class RealWorkspaceScopeTests(unittest.TestCase):
             "Cargo.lock",
             "crates/anyagents-core/src/store.rs",
             "crates/anyagents/src/server.rs",
+            "crates/anyagents/src/cli.rs",
+            "crates/anyagents/src/runtime_cli.rs",
+            "crates/anyagents/src/sandbox/setup.rs",
+            "crates/anyagents/src/local.rs",
+            "crates/anyagents/src/vendor/profile.rs",
+            "crates/anyagents/src/server/native_signin/identity.rs",
+            "crates/anyagents/src/server/file_cache.rs",
+            "crates/anyagents/src/server/console/unrecognized.rs",
+            "rust-toolchain.toml",
+            "tools/ci_scope.py",
+            ".cargo/config.toml",
+            " .github/workflows/ci.yml",
+            "unrecognized\nREADME.md",
             "crates/anyagents-harness/src/lib.rs",
             ".github/workflows/ci.yml",
             "tests/invariants/src/lib.rs",
@@ -167,12 +182,64 @@ class RealWorkspaceScopeTests(unittest.TestCase):
                 self.assertTrue(res.run_host_acceptance)
                 self.assertTrue(res.needs_fake_opencode)
 
+    def test_console_and_docs_select_only_console(self) -> None:
+        for event in ("pull_request", "merge_group"):
+            for paths in (
+                ["apps/console/src/main.tsx"],
+                ["crates/anyagents/src/server/console/index.html"],
+                ["apps/console/templates/signin.html", "docs/releases/audit.json", "sylphx.toml"],
+            ):
+                with self.subTest(event=event, paths=paths):
+                    res = ci_scope.compute_scope(REPO_ROOT, paths, event=event)
+                    self.assertTrue(res.run_console)
+                    self.assertFalse(res.run_npm)
+                    self.assertFalse(res.run_macos)
+                    self.assertFalse(res.run_host_acceptance)
+                    self.assertEqual(res.rust_scope, "none")
+                    self.assertEqual(json.loads(res.linux_matrix), {"include": []})
+
+    def test_server_route_keeps_coordinator_and_host_but_not_macos(self) -> None:
+        for event in ("pull_request", "merge_group"):
+            res = ci_scope.compute_scope(REPO_ROOT, [
+                "crates/anyagents/src/server/messaging.rs", "docs/architecture-audit.jsonl",
+                "apps/console/src/main.tsx",
+            ], event=event)
+            self.assertEqual(res.rust_scope, "crates:anyagents")
+            self.assertTrue(res.run_host_acceptance)
+            self.assertTrue(res.run_console)
+            self.assertFalse(res.run_macos)
+            self.assertEqual(res.cargo_doc_args, "")
+            self.assertEqual(json.loads(res.linux_matrix), {"include": [
+                {"lane": lane, "packages": "-p anyagents", "docs": ""}
+                for lane in ("lint", "coordinator", "identity", "host")
+            ]})
+
+    def test_storage_only_keeps_full_linux_including_host(self) -> None:
+        paths = ["crates/anyagents-core/migrations_pg/011_example.sql",
+                 "crates/anyagents-core/src/db/sqlite_to_pg.rs"]
+        res = ci_scope.compute_scope(REPO_ROOT, paths)
+        self.assertEqual(res.rust_scope, "workspace")
+        self.assertTrue(res.run_host_acceptance)
+        self.assertFalse(res.run_macos)
+        self.assertTrue(ci_scope.compute_scope(REPO_ROOT, [*paths, "Cargo.lock"]).run_macos)
+
+    def test_explicit_host_crates_include_macos(self) -> None:
+        for name in ("keeper", "agent", "toolchain", "harness-spiron"):
+            with self.subTest(name=name):
+                path = f"crates/anyagents-{name}/src/lib.rs"
+                self.assertTrue(ci_scope.compute_scope(REPO_ROOT, [path]).run_macos)
+
     def test_push_workflow_dispatch_and_diff_failed_run_full_workspace(self) -> None:
-        for event in ("push", "workflow_dispatch"):
+        for event in ("push", "workflow_dispatch", "release"):
             res = ci_scope.compute_scope(REPO_ROOT, ["README.md"], event=event)
             self.assertEqual(res.rust_scope, "workspace")
             self.assertTrue(res.run_macos)
             self.assertTrue(res.run_host_acceptance)
+            self.assertTrue(res.run_console)
+            lanes = {entry["lane"]: entry for entry in json.loads(res.linux_matrix)["include"]}
+            self.assertEqual(set(lanes), {"lint", "crates", "coordinator", "identity", "host"})
+            self.assertEqual(lanes["crates"]["packages"], "--workspace --exclude anyagents")
+            self.assertEqual(lanes["crates"]["docs"], "--workspace")
 
         failed = ci_scope.compute_scope(REPO_ROOT, [], event="pull_request", diff_failed=True)
         self.assertEqual(failed.rust_scope, "workspace")
@@ -213,38 +280,88 @@ class SyntheticWorkspaceScopeTests(unittest.TestCase):
             self.assertEqual(res.cargo_pkg_args, "-p anyagents-mcp-browser")
             # Bin-only standalone crate has empty cargo_doc_args.
             self.assertEqual(res.cargo_doc_args, "")
-            self.assertFalse(res.run_macos)
+            self.assertTrue(res.run_macos)
             self.assertFalse(res.run_host_acceptance)
 
-    def test_cli_writes_github_output_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            paths_file = Path(tmp) / "scope.txt"
-            gh_out = Path(tmp) / "github_output.txt"
-            paths_file.write_text("AGENTS.md\ntools/module_size_scan.py\n", encoding="utf-8")
 
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                rc = ci_scope.main(
-                    [
-                        "--root",
-                        str(REPO_ROOT),
-                        "--event",
-                        "pull_request",
-                        "--paths-file",
-                        str(paths_file),
-                        "--github-output",
-                        str(gh_out),
-                    ]
-                )
-            self.assertEqual(rc, 0)
-            written = dict(
-                line.split("=", 1)
-                for line in gh_out.read_text(encoding="utf-8").splitlines()
-                if "=" in line
-            )
-            self.assertEqual(written["code"], "false")
-            self.assertEqual(written["rust_scope"], "none")
-            self.assertEqual(written["run_macos"], "false")
+class GitRangeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = self.enterContext(tempfile.TemporaryDirectory())
+        self.root = Path(tmp)
+        self.git("init", "-q")
+        self.git("config", "user.name", "Fixture")
+        self.git("config", "user.email", "fixture@example.org")
+        self.git("config", "commit.gpgsign", "false")
+
+    def git(self, *args: str) -> str:
+        return subprocess.check_output(["git", *args], cwd=self.root, text=True).strip()
+
+    def commit(self, path: str, content: str) -> str:
+        file = self.root / path
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(content, encoding="utf-8")
+        self.git("add", "--", path)
+        self.git("commit", "-qm", "fixture")
+        return self.git("rev-parse", "HEAD")
+
+    def test_merge_group_includes_earlier_entry_and_uses_event_base(self) -> None:
+        base = self.commit("README.md", "base")
+        earlier = self.commit("Cargo.lock", "first queued entry changes the toolchain")
+        head = self.commit("docs/new.md", "second queued entry edits docs")
+        paths = ci_scope.changed_git_paths(self.root, base, head)
+        self.assertEqual(paths, ["Cargo.lock", "docs/new.md"])
+        self.assertTrue(ci_scope.compute_scope(self.root, paths, event="merge_group").run_macos)
+        docs_only = ci_scope.changed_git_paths(self.root, earlier, head)
+        self.assertFalse(ci_scope.compute_scope(self.root, docs_only, event="merge_group").run_macos)
+
+    def test_diff_preserves_path_bytes_and_deletions(self) -> None:
+        base = self.commit("Cargo.lock", "base")
+        path = " docs/with\nnewline.txt"
+        self.git("rm", "-q", "Cargo.lock")
+        head = self.commit(path, "still not docs")
+        paths = ci_scope.changed_git_paths(self.root, base, head)
+        self.assertEqual(paths, [path, "Cargo.lock"])
+        self.assertTrue(ci_scope.compute_scope(self.root, paths[:1]).run_macos)
+        self.assertTrue(ci_scope.compute_scope(self.root, paths[1:]).run_macos)
+        with self.assertRaisesRegex(ValueError, "not the checked-out commit"):
+            ci_scope.changed_git_paths(self.root, base, base)
+
+    def test_cli_writes_github_output_and_falls_back_when_range_is_unavailable(self) -> None:
+        base = self.commit("README.md", "base")
+        head = self.commit("docs/release.json", "{}")
+        for candidate, enabled in ((head, "false"), (base, "true"), ("", "true")):
+            with self.subTest(candidate=candidate):
+                out = self.root / "github_output.txt"
+                out.unlink(missing_ok=True)
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    rc = ci_scope.main([
+                        "--root", str(self.root), "--event", "merge_group",
+                        "--base", base, "--head", candidate, "--github-output", str(out),
+                    ])
+                self.assertEqual(rc, 0)
+                written = dict(line.split("=", 1) for line in out.read_text().splitlines())
+                self.assertEqual(written["code"], enabled)
+                self.assertEqual(written["run_macos"], enabled)
+
+    def test_purity_refuses_forbidden_text_in_docs_without_rust_build(self) -> None:
+        policy = "crates/anyagents/tests/open_source_purity.rs"
+        self.commit(policy, (REPO_ROOT / policy).read_text())
+        self.commit("docs/a.md", "safe public docs")
+        ci_scope.check_purity(self.root)
+        self.commit("docs/a.md", "/home/" + "kyle/fixture")
+        with self.assertRaisesRegex(ValueError, "docs/a.md:1: hardcoded user home"):
+            ci_scope.check_purity(self.root)
+
+    def test_console_assets_reject_missing_templates_and_substitution_markers(self) -> None:
+        assets = self.root / ci_scope.CONSOLE_DIR
+        assets.mkdir(parents=True)
+        ci_scope.check_console_assets(REPO_ROOT)
+        with self.assertRaisesRegex(ValueError, "expected exactly"):
+            ci_scope.check_console_assets(self.root)
+        for asset in ci_scope.CONSOLE_ASSETS:
+            (assets / asset).write_text("nonempty asset")
+        with self.assertRaisesRegex(ValueError, "missing Rust substitution marker"):
+            ci_scope.check_console_assets(self.root)
 
 
 if __name__ == "__main__":
