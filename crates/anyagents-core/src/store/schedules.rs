@@ -30,8 +30,66 @@ pub(super) fn cancel_archived_schedules(
     Ok(())
 }
 
+const RECURRING_JITTER_MIN_INTERVAL_MS: i64 = 15 * 60_000;
+const RECURRING_JITTER_MAX_MS: i64 = 180_000;
+const PHASE_CLOCK_SKEW_TOLERANCE_MS: i64 = 5_000;
+
 impl Store {
+    /// Deterministic stagger offset in `[0, min(interval_ms / 10, 180_000)]`
+    /// for recurring (`every`) schedules `>= 15m`, or `0` for shorter intervals.
+    pub fn recurring_schedule_jitter_ms(
+        schedule_id: &str,
+        agent_id: &str,
+        interval_ms: i64,
+    ) -> i64 {
+        if interval_ms < RECURRING_JITTER_MIN_INTERVAL_MS {
+            return 0;
+        }
+        let max_jitter = (interval_ms / 10).min(RECURRING_JITTER_MAX_MS);
+        if max_jitter <= 0 {
+            return 0;
+        }
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for part in [schedule_id.as_bytes(), b":", agent_id.as_bytes()] {
+            for &b in part {
+                hash ^= u64::from(b);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        (hash % (max_jitter as u64).saturating_add(1)) as i64
+    }
+
+    /// Next recurring fire timestamp strictly after `now_ms`, with one-time
+    /// deterministic phase alignment for `interval_ms >= 15m` and zero drift.
+    pub fn next_recurring_fire_ms(
+        schedule_id: &str,
+        agent_id: &str,
+        created_at_ms: i64,
+        due_ms: i64,
+        interval_ms: i64,
+        now_ms: i64,
+    ) -> Option<i64> {
+        let base = next_recurring_slot_raw(due_ms, interval_ms, now_ms)?;
+        let jitter = Self::recurring_schedule_jitter_ms(schedule_id, agent_id, interval_ms);
+        if jitter <= 0 || due_ms < created_at_ms.saturating_sub(PHASE_CLOCK_SKEW_TOLERANCE_MS) {
+            return Some(base);
+        }
+        phase_align_with_jitter(base, created_at_ms, interval_ms, jitter)
+    }
+
     pub fn create_schedule(&self, input: NewSchedule) -> Result<AgentSchedule, Error> {
+        self.create_schedule_inner(input, false)
+    }
+
+    pub fn create_schedule_jittered(&self, input: NewSchedule) -> Result<AgentSchedule, Error> {
+        self.create_schedule_inner(input, true)
+    }
+
+    fn create_schedule_inner(
+        &self,
+        input: NewSchedule,
+        apply_jitter: bool,
+    ) -> Result<AgentSchedule, Error> {
         let now = now_ms();
         let mut rand_bytes = [0u8; 8];
         if let Ok(mut f) = File::open("/dev/urandom") {
@@ -46,6 +104,21 @@ impl Store {
                     reason: format!("agent {} is archived", input.agent_id),
                 });
             }
+            let initial_next_fire = |sched_id: &str| {
+                if apply_jitter
+                    && input.kind == "every"
+                    && let Some(interval) = input.interval_ms.filter(|&iv| iv > 0)
+                {
+                    let j = Self::recurring_schedule_jitter_ms(
+                        sched_id,
+                        input.agent_id.as_str(),
+                        interval,
+                    );
+                    Some(now.saturating_add(interval).saturating_add(j))
+                } else {
+                    input.next_fire_at_ms
+                }
+            };
             // Deduplicate identical active recurring/watch schedules for the same agent.
             if (input.kind == "every" || input.kind == "watch")
                 && let Some(existing_id) = tx.db_query_opt(
@@ -56,6 +129,7 @@ impl Store {
                     |row| row.get::<String>(0),
                 )?
             {
+                let next_fire = initial_next_fire(&existing_id);
                 tx.db_execute(
                     "UPDATE agent_schedules
                      SET interval_ms = ?2, next_fire_at_ms = ?3, watch_baseline = COALESCE(?4, watch_baseline)
@@ -63,12 +137,13 @@ impl Store {
                     &db_params![
                         existing_id,
                         input.interval_ms,
-                        input.next_fire_at_ms,
+                        next_fire,
                         input.watch_baseline
                     ],
                 )?;
                 return schedule_by_id(tx, &existing_id);
             }
+            let next_fire = initial_next_fire(&id);
             tx.db_execute(
                 "INSERT INTO agent_schedules (
                     id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
@@ -81,7 +156,7 @@ impl Store {
                     input.spec,
                     input.prompt,
                     input.interval_ms,
-                    input.next_fire_at_ms,
+                    next_fire,
                     input.watch_baseline,
                     now,
                 ],
@@ -148,17 +223,9 @@ impl Store {
     ///   until strictly `> now_ms`.
     pub fn repair_null_schedule_next_fire(&self, now_ms: i64) -> Result<usize, Error> {
         let candidates = load_null_schedule_candidates(&self.read_conn())?;
-        let any_repairable = candidates.iter().any(|row| {
-            compute_repaired_next_fire(
-                &row.kind,
-                &row.spec,
-                row.interval_ms,
-                row.last_fired_at_ms,
-                row.created_at_ms,
-                now_ms,
-            )
-            .is_some()
-        });
+        let any_repairable = candidates
+            .iter()
+            .any(|row| compute_repaired_next_fire(row, now_ms).is_some());
         if !any_repairable {
             return Ok(0);
         }
@@ -462,8 +529,37 @@ fn claim_schedule_tick_on(
     Ok(updated == 1)
 }
 
+fn next_recurring_slot_raw(due: i64, interval: i64, now: i64) -> Option<i64> {
+    if interval <= 0 || due > now {
+        return None;
+    }
+    let interval = i128::from(interval);
+    let elapsed = i128::from(now) - i128::from(due);
+    i64::try_from(i128::from(now) + interval - elapsed % interval).ok()
+}
+
+fn phase_align_with_jitter(base: i64, created: i64, interval: i64, jitter: i64) -> Option<i64> {
+    if jitter <= 0 || interval <= 0 {
+        return Some(base);
+    }
+    let (iv, b, c, j, tol) = (
+        i128::from(interval),
+        i128::from(base),
+        i128::from(created),
+        i128::from(jitter),
+        i128::from(PHASE_CLOCK_SKEW_TOLERANCE_MS),
+    );
+    let off = (b - c).rem_euclid(iv);
+    if off > tol && off < iv - tol {
+        return Some(base);
+    }
+    let shift = (c + j - b).rem_euclid(iv);
+    i64::try_from(b + if shift <= j + tol { shift } else { 0 }).ok()
+}
+
 struct NullScheduleCandidate {
     id: String,
+    agent_id: String,
     kind: String,
     spec: String,
     interval_ms: Option<i64>,
@@ -475,7 +571,7 @@ fn load_null_schedule_candidates(
     conn: &(impl DbExec + ?Sized),
 ) -> Result<Vec<NullScheduleCandidate>, Error> {
     conn.db_query_vec(
-        "SELECT id, kind, spec, interval_ms, last_fired_at_ms, created_at_ms
+        "SELECT id, agent_id, kind, spec, interval_ms, last_fired_at_ms, created_at_ms
          FROM agent_schedules
          WHERE state = 'active'
            AND next_fire_at_ms IS NULL
@@ -484,40 +580,41 @@ fn load_null_schedule_candidates(
         |row| {
             Ok(NullScheduleCandidate {
                 id: row.get(0)?,
-                kind: row.get(1)?,
-                spec: row.get(2)?,
-                interval_ms: row.get(3)?,
-                last_fired_at_ms: row.get(4)?,
-                created_at_ms: row.get(5)?,
+                agent_id: row.get(1)?,
+                kind: row.get(2)?,
+                spec: row.get(3)?,
+                interval_ms: row.get(4)?,
+                last_fired_at_ms: row.get(5)?,
+                created_at_ms: row.get(6)?,
             })
         },
     )
 }
 
-fn compute_repaired_next_fire(
-    kind: &str,
-    spec: &str,
-    interval_ms: Option<i64>,
-    last_fired_at_ms: Option<i64>,
-    created_at_ms: i64,
-    now_ms: i64,
-) -> Option<i64> {
-    match kind {
+fn compute_repaired_next_fire(row: &NullScheduleCandidate, now_ms: i64) -> Option<i64> {
+    match row.kind.as_str() {
         "at" => {
-            let target_ms = chrono::DateTime::parse_from_rfc3339(spec.trim())
+            let target_ms = chrono::DateTime::parse_from_rfc3339(row.spec.trim())
                 .ok()?
                 .timestamp_millis();
             (target_ms > now_ms).then_some(target_ms)
         }
         "every" => {
-            let interval = interval_ms.filter(|&iv| iv > 0)?;
-            let base = last_fired_at_ms.unwrap_or(created_at_ms);
-            if base > now_ms {
-                Some(base)
+            let interval = row.interval_ms.filter(|&iv| iv > 0)?;
+            let jitter = Store::recurring_schedule_jitter_ms(&row.id, &row.agent_id, interval);
+            let base = row
+                .last_fired_at_ms
+                .unwrap_or_else(|| row.created_at_ms.saturating_add(jitter));
+            let next = if base > now_ms {
+                base
             } else {
-                let elapsed = now_ms.saturating_sub(base);
-                let steps = (elapsed / interval).saturating_add(1);
-                Some(base.saturating_add(steps.saturating_mul(interval)))
+                let steps = (now_ms.saturating_sub(base) / interval).saturating_add(1);
+                base.saturating_add(steps.saturating_mul(interval))
+            };
+            if row.last_fired_at_ms.is_some() && jitter > 0 {
+                phase_align_with_jitter(next, row.created_at_ms, interval, jitter)
+            } else {
+                Some(next)
             }
         }
         _ => None,
@@ -531,14 +628,7 @@ pub(crate) fn repair_null_schedule_next_fire(
     let candidates = load_null_schedule_candidates(tx)?;
     let mut repaired = 0usize;
     for row in candidates {
-        if let Some(next_ms) = compute_repaired_next_fire(
-            &row.kind,
-            &row.spec,
-            row.interval_ms,
-            row.last_fired_at_ms,
-            row.created_at_ms,
-            now_ms,
-        ) {
+        if let Some(next_ms) = compute_repaired_next_fire(&row, now_ms) {
             repaired += tx.db_execute(
                 "UPDATE agent_schedules
                  SET next_fire_at_ms = ?2
@@ -633,5 +723,38 @@ mod tests {
 
         // Second pass is an idempotent no-op.
         assert_eq!(store.repair_null_schedule_next_fire(now).unwrap(), 0);
+    }
+
+    #[test]
+    fn recurring_schedule_jitter_is_zero_under_15m_and_bounded_deterministic_for_hourly() {
+        let hour = 3_600_000i64;
+        for short in [1_000, 60_000, 300_000, 15 * 60_000 - 1] {
+            assert_eq!(
+                Store::recurring_schedule_jitter_ms("sch_a", "agt_1", short),
+                0
+            );
+        }
+        assert!((0..=90_000).contains(&Store::recurring_schedule_jitter_ms(
+            "sch_a",
+            "agt_1",
+            15 * 60_000
+        )));
+        let ja = Store::recurring_schedule_jitter_ms("sch_01aaaaaaaa", "agt_a", hour);
+        let jb = Store::recurring_schedule_jitter_ms("sch_01bbbbbbbb", "agt_b", hour);
+        assert!((0..=180_000).contains(&ja) && (0..=180_000).contains(&jb) && ja != jb);
+        assert_eq!(
+            ja,
+            Store::recurring_schedule_jitter_ms("sch_01aaaaaaaa", "agt_a", hour)
+        );
+
+        let created = 1_795_000_000_000i64;
+        let due1 = created + hour;
+        let n1 =
+            Store::next_recurring_fire_ms("sch_01aaaaaaaa", "agt_a", created, due1, hour, due1)
+                .unwrap();
+        assert_eq!(n1, due1 + hour + ja);
+        let n2 = Store::next_recurring_fire_ms("sch_01aaaaaaaa", "agt_a", created, n1, hour, n1)
+            .unwrap();
+        assert_eq!(n2, n1 + hour);
     }
 }

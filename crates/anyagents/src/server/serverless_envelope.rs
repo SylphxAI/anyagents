@@ -5,7 +5,8 @@ use std::path::Path;
 
 use anyagents_core::{AgentId, Message, Store, now_ms};
 use anyagents_harness::{
-    Context, GUEST_MESSAGE_B64_ENV, OutboundMessage, compose_message, encode_outbound_message_b64,
+    Context, GUEST_MESSAGE_B64_ENV, MESSAGE_MARKER_PREFIX, OutboundMessage, compose_message,
+    encode_outbound_message_b64,
 };
 
 use crate::sandbox_providers::providers::ExecRequest;
@@ -34,61 +35,90 @@ fn enrich_message_context(m: &Message) -> Context {
     ctx
 }
 
+fn render_message_element(id: &str, ctx: &Context, body: &str) -> String {
+    let mut c = ctx.clone();
+    c.topology = None;
+    c.workspace = None;
+    let rendered = compose_message(id, &c, body);
+    let marker = format!("{MESSAGE_MARKER_PREFIX}{id}\n");
+    rendered.strip_prefix(&marker).unwrap_or(&rendered).into()
+}
+
+fn split_topology_and_siblings(topo: &str) -> (Option<&str>, Option<&str>) {
+    if topo.starts_with("<message ") {
+        (None, Some(topo))
+    } else if let Some(i) = topo.find("\n\n<message ") {
+        (Some(&topo[..i]), Some(&topo[i + 2..]))
+    } else if let Some(i) = topo.find("\n<message ") {
+        (Some(&topo[..i]), Some(&topo[i + 1..]))
+    } else {
+        (Some(topo), None)
+    }
+}
+
+fn extract_body_from_message_tail(tail: &str) -> Option<&str> {
+    let start = tail.strip_prefix("<body>\n").or_else(|| {
+        tail.strip_prefix("<quoted_message ")?
+            .split_once("</quoted_message>\n<body>\n")
+            .map(|(_, r)| r)
+    })?;
+    start.strip_suffix("\n</body>\n</message>")
+}
+
 /// Build the full 6-dimension [`OutboundMessage`] (and matching prompt text)
 /// for a non-empty serverless mailbox batch.
 ///
 /// - Single-message batch: preserves the message's real `id`, `seq`, `sender`,
 ///   `reply_to`, `source_time_ms`, and enriched `Context` (with UTC `timestamp`).
-/// - Multi-message batch: keeps `last`'s real `id`, `seq`, `sender`, `reply_to`,
-///   `source_time_ms`, and `Context` (merging the first non-`None` `topology`
-///   across earlier messages if `last.context.topology` is `None`), while
-///   rendering messages `0..n-1` via [`compose_message`] before `last.text` so
-///   every message in the batch retains `<topology>`, `<message ...>`,
-///   `<quoted_message>`, and UTC `at` metadata.
+/// - Multi-message batch: emits every coalesced message as a **flat top-level
+///   sibling `<message ...><body>...</body></message>` element** (preserving
+///   each message's own `id`, `from`, `to`, `channel`, `reply_to`, `answer_to`,
+///   `at`, and `<quoted_message>`), placing earlier sibling `<message>` elements
+///   before `last`'s `<message>` via top-level `context.topology` so `last`'s
+///   `<body>` NEVER wraps or nests another sender's `<message>` envelope.
 pub(crate) fn build_serverless_outbound_message(msgs: &[Message]) -> (String, OutboundMessage) {
     let last = msgs.last().expect("non-empty batch");
-    if msgs.len() == 1 {
-        let ctx = enrich_message_context(last);
-        let outbound = OutboundMessage {
-            id: last.id.to_string(),
-            seq: last.seq,
-            text: last.text.clone(),
-            sender: last.sender.clone(),
-            reply_to: last.reply_to.clone(),
-            source_time_ms: last.source_time_ms.or(Some(last.received_at_ms)),
-            context: ctx,
-        };
-        return (last.text.clone(), outbound);
-    }
-
     let mut last_ctx = enrich_message_context(last);
-    if last_ctx.topology.is_none() {
-        last_ctx.topology = msgs.iter().find_map(|m| m.context.topology.clone());
-    }
-
-    let mut combined = String::new();
-    for m in &msgs[..msgs.len() - 1] {
-        let ctx = enrich_message_context(m);
-        if !combined.is_empty() {
-            combined.push_str("\n\n");
-        }
-        combined.push_str(&compose_message(m.id.as_str(), &ctx, &m.text));
-    }
-    if !combined.is_empty() {
-        combined.push_str("\n\n");
-    }
-    combined.push_str(&last.text);
-
-    let outbound = OutboundMessage {
+    let mut outbound = OutboundMessage {
         id: last.id.to_string(),
         seq: last.seq,
-        text: combined.clone(),
+        text: last.text.clone(),
         sender: last.sender.clone(),
         reply_to: last.reply_to.clone(),
         source_time_ms: last.source_time_ms.or(Some(last.received_at_ms)),
-        context: last_ctx,
+        context: last_ctx.clone(),
     };
-    (combined, outbound)
+    if msgs.len() == 1 {
+        return (last.text.clone(), outbound);
+    }
+
+    let mut topologies: Vec<String> = Vec::new();
+    for m in msgs {
+        if let Some(topo) = m
+            .context
+            .topology
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            && !topologies.iter().any(|seen| seen == topo)
+        {
+            topologies.push(topo.to_string());
+        }
+    }
+    let earlier_siblings = msgs[..msgs.len() - 1]
+        .iter()
+        .map(|m| render_message_element(m.id.as_str(), &enrich_message_context(m), &m.text))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let last_sibling = render_message_element(last.id.as_str(), &last_ctx, &last.text);
+    let flat_prompt = format!("{earlier_siblings}\n\n{last_sibling}");
+    last_ctx.topology = Some(if topologies.is_empty() {
+        earlier_siblings
+    } else {
+        format!("{}\n\n{earlier_siblings}", topologies.join("\n"))
+    });
+    outbound.context = last_ctx;
+    (flat_prompt, outbound)
 }
 
 fn xml_attr_escape(s: &str) -> String {
@@ -130,18 +160,27 @@ pub(crate) fn attach_deployment_skills_to_topology(
     let Some(ref topo) = outbound.context.topology else {
         return;
     };
-    if !topo.starts_with("<topology event=\"initial\"") || topo.contains(" skills=\"") {
+    let (first_line, rest) = match topo.split_once('\n') {
+        Some((first, r)) => (first, Some(r)),
+        None => (topo.as_str(), None),
+    };
+    if !first_line.starts_with("<topology event=\"initial\"") || first_line.contains(" skills=\"") {
         return;
     }
     let skills = list_deployment_skill_names(data_dir);
     if skills.is_empty() {
         return;
     }
-    if let Some(prefix) = topo.strip_suffix(" />") {
-        outbound.context.topology = Some(format!(
+    if let Some(prefix) = first_line.strip_suffix(" />") {
+        let updated = format!(
             "{prefix} skills=\"{}\" />",
             xml_attr_escape(&skills.join(", "))
-        ));
+        );
+        let new_topo = match rest {
+            Some(r) => format!("{updated}\n{r}"),
+            None => updated,
+        };
+        outbound.context.topology = Some(new_topo);
     }
 }
 
@@ -251,7 +290,8 @@ pub(crate) fn deduplicate_hydrated_system_prompts(cfg_dir: &Path) {
     }
 }
 
-/// Update `outbound.text` to the media-rewritten `effective_prompt` and attach
+/// Update `outbound` with the media-rewritten `effective_prompt` (preserving
+/// flat sibling `<message>` separation for multi-message batches) and attach
 /// the base64-encoded JSON [`OutboundMessage`] to `exec_req.env`.
 pub(crate) fn attach_outbound_message_env(
     exec_req: &mut ExecRequest,
@@ -261,7 +301,43 @@ pub(crate) fn attach_outbound_message_env(
     let Some(mut msg) = outbound else {
         return;
     };
-    msg.text = effective_prompt.to_string();
+    let is_multi_batch = msg
+        .context
+        .topology
+        .as_deref()
+        .is_some_and(|t| split_topology_and_siblings(t).1.is_some());
+    if is_multi_batch {
+        let last_open = msg.context.open_tag(&msg.id);
+        let separator = format!("\n\n{last_open}\n");
+        if let Some((rewritten_earlier, rewritten_last_tail)) =
+            effective_prompt.rsplit_once(&separator)
+        {
+            if let Some(existing_topo) = msg.context.topology.as_deref() {
+                let updated_topo = match split_topology_and_siblings(existing_topo).0 {
+                    Some(leading) if !leading.is_empty() => {
+                        format!("{leading}\n\n{rewritten_earlier}")
+                    }
+                    _ => rewritten_earlier.to_string(),
+                };
+                msg.context.topology = Some(updated_topo);
+            }
+            let expected_last = render_message_element(&msg.id, &msg.context, &msg.text);
+            let actual_last = format!("{last_open}\n{rewritten_last_tail}");
+            if actual_last != expected_last
+                && let Some(rewritten_body) = extract_body_from_message_tail(rewritten_last_tail)
+            {
+                const QUOTE_FENCE: &str = "\n\n----- quoted message -----\n";
+                msg.text = match msg.text.split_once(QUOTE_FENCE) {
+                    Some((_, quote_rest)) => {
+                        format!("{rewritten_body}{QUOTE_FENCE}{quote_rest}")
+                    }
+                    None => rewritten_body.to_string(),
+                };
+            }
+        }
+    } else {
+        msg.text = effective_prompt.to_string();
+    }
     if let Ok(encoded) = encode_outbound_message_b64(&msg) {
         exec_req
             .env
@@ -437,10 +513,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (multi_prompt, multi_out) =
+        let (multi_prompt, mut multi_out) =
             build_serverless_outbound_message(&[m1.clone(), m2.clone()]);
+        attach_deployment_skills_to_topology(&mut multi_out, dir.path());
         assert_eq!(multi_out.id, m2.id.as_str());
         assert_eq!(multi_out.seq, 2);
+        assert_eq!(multi_out.text, "please proceed now");
         assert_eq!(multi_out.context.sender.as_deref(), Some("agent:planner"));
         assert_eq!(
             multi_out.context.destination.as_deref(),
@@ -455,16 +533,155 @@ mod tests {
                 .context
                 .topology
                 .as_deref()
-                .is_some_and(|t| t.contains("event=\"initial\""))
+                .is_some_and(|t| t.contains("event=\"initial\"")
+                    && t.contains("skills=\"deploy-check, incident-triage\""))
         );
         assert!(multi_prompt.contains("<quoted_message author=\"Alex\""));
         assert!(multi_prompt.contains("chat_title=\"Release Ops\""));
         assert!(multi_prompt.contains("at=\"2026-11-20T01:23:06Z\""));
-        assert!(multi_prompt.ends_with("please proceed now"));
+        assert!(multi_prompt.contains("please proceed now"));
+        assert!(multi_prompt.ends_with("</message>"));
 
         let rendered_multi = compose_message(&multi_out.id, &multi_out.context, &multi_out.text);
         assert!(!rendered_multi.contains("from=\"unknown\""));
         assert!(!rendered_multi.contains("anyagents:reply:turn_"));
+        assert_eq!(extract_flat_message_blocks(&rendered_multi).len(), 2);
+    }
+
+    fn extract_flat_message_blocks(rendered: &str) -> Vec<(&str, &str)> {
+        let open_count = rendered.matches("<message ").count();
+        assert_eq!(
+            open_count,
+            rendered.matches("</message>").count(),
+            "{rendered}"
+        );
+        let (mut blocks, mut rest) = (Vec::new(), rendered);
+        while let Some(i) = rest.find("<message ") {
+            let after = &rest[i..];
+            let end = after.find('>').expect("open tag");
+            let close = after.find("</message>").expect("close tag");
+            let inner = &after[end + 1..close];
+            assert!(
+                !inner.contains("<message "),
+                "nested <message>:\n{rendered}"
+            );
+            let b0 = inner.find("<body>\n").expect("<body>") + "<body>\n".len();
+            let b1 = inner.rfind("\n</body>").expect("</body>");
+            let body = &inner[b0..b1];
+            assert!(
+                !body.contains("<message") && !body.contains("</message>"),
+                "{rendered}"
+            );
+            blocks.push((&after[..=end], body));
+            rest = &after[close + "</message>".len()..];
+        }
+        assert_eq!(blocks.len(), open_count);
+        blocks
+    }
+
+    #[test]
+    fn coalesced_multi_message_batch_emits_flat_siblings_without_nesting_private_bodies() {
+        let dir = crate::test_tempdir();
+        std::fs::create_dir_all(dir.path().join("skills/deploy-check")).unwrap();
+        let ts = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .timestamp_millis()
+        };
+        let mk = |id, seq, from: &str, reply: Option<&str>, text, at, mut ctx: Context| {
+            ctx.sender = Some(from.into());
+            ctx.recipient = Some("agent:coordinator".into());
+            ctx.destination = reply.map(str::to_string);
+            let mut m = sample_message(id, seq, from, reply.unwrap_or(""), text, ts(at), ctx);
+            m.reply_to = reply.map(str::to_string);
+            m
+        };
+        let render = |msgs: &[Message]| {
+            let (prompt, mut out) = build_serverless_outbound_message(msgs);
+            attach_deployment_skills_to_topology(&mut out, dir.path());
+            let eff = prompt.replace("/v1/media/agt_1/", "/home/user/agent-data/state/media/");
+            let mut req = ExecRequest::argv(vec!["anyagents-guest".into()]);
+            attach_outbound_message_env(&mut req, Some(out), &eff);
+            let dec =
+                anyagents_harness::decode_outbound_message_b64(&req.env[GUEST_MESSAGE_B64_ENV])
+                    .unwrap();
+            (prompt, compose_message(&dec.id, &dec.context, &dec.text))
+        };
+
+        let child = mk(
+            "msg_01cccccccccccccccccccccccccc",
+            10,
+            "agent:worker-child",
+            Some("agent:worker-child"),
+            "CONFIDENTIAL_INTERNAL_REPORT see /v1/media/agt_1/pic1.png",
+            "2026-11-20T08:00:01Z",
+            Context {
+                topology: Some("<topology event=\"initial\" self=\"agent:coordinator\" />".into()),
+                ..Default::default()
+            },
+        );
+        let tick = mk(
+            "msg_01dddddddddddddddddddddddddd",
+            11,
+            "schedule:sch_patrol_01",
+            None,
+            "Run hourly health patrol",
+            "2026-11-20T08:00:05Z",
+            Context::default(),
+        );
+        let tg = mk(
+            "msg_01eeeeeeeeeeeeeeeeeeeeeeeeee",
+            12,
+            "telegram:user:777",
+            Some("telegram:chat:-100998877:thread:4"),
+            "Hello group, check /v1/media/agt_1/pic3.png",
+            "2026-11-20T08:00:10Z",
+            Context {
+                channel: Some("telegram".into()),
+                chat_id: Some(-100998877),
+                chat_title: Some("Public Community".into()),
+                thread_id: Some(4),
+                ..Default::default()
+            },
+        );
+
+        let (prompt, rendered) = render(&[child, tick, tg.clone()]);
+        assert_eq!(extract_flat_message_blocks(&prompt).len(), 3);
+        assert!(rendered.contains("self=\"agent:coordinator\" skills=\"deploy-check\" />"));
+        let b = extract_flat_message_blocks(&rendered);
+        assert_eq!(b.len(), 3);
+        assert!(b[0].0.contains("from=\"agent:worker-child\"") && !b[0].0.contains("telegram"));
+        assert!(b[0].0.contains("answer_to=\"agent:worker-child\""));
+        assert_eq!(
+            b[0].1,
+            "CONFIDENTIAL_INTERNAL_REPORT see /home/user/agent-data/state/media/pic1.png"
+        );
+        assert!(
+            b[1].0.contains("from=\"schedule:sch_patrol_01\"") && !b[1].0.contains("answer_to=")
+        );
+        assert_eq!(b[1].1, "Run hourly health patrol");
+        assert!(
+            b[2].0.contains("from=\"telegram:user:777\"")
+                && b[2].0.contains("channel=\"telegram\"")
+        );
+        assert!(
+            b[2].0
+                .contains("answer_to=\"telegram:chat:-100998877:thread:4\"")
+        );
+        assert_eq!(
+            b[2].1,
+            "Hello group, check /home/user/agent-data/state/media/pic3.png"
+        );
+        assert!(!b[2].1.contains("CONFIDENTIAL_INTERNAL_REPORT") && !b[2].1.contains("patrol"));
+
+        let (_, single) = render(std::slice::from_ref(&tg));
+        let sb = extract_flat_message_blocks(&single);
+        assert_eq!(sb.len(), 1);
+        assert!(sb[0].0.contains("from=\"telegram:user:777\""));
+        assert_eq!(
+            sb[0].1,
+            "Hello group, check /home/user/agent-data/state/media/pic3.png"
+        );
     }
 
     #[test]

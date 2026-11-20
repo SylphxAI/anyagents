@@ -2,8 +2,8 @@
 //!
 //! Every agent on any harness can schedule its own one-off wake (`at`), recurring
 //! wake (`every`), or event watch (`watch`: generic webhook/event trigger
-//! `webhook:<topic>`, an AnyAgents agent going idle, a local process exiting, or
-//! a local file changing).
+//! `webhook:<topic>`, GitHub PR/check terminal state `github:pr:*`/`github:check:*`,
+//! an AnyAgents agent going idle, a local process exiting, or a local file changing).
 //!
 //! A due tick or a triggered watch is written to the owner's mailbox at once, like
 //! any other message. Mailbox delivery alone decides when the owner sees it: it is
@@ -31,10 +31,29 @@ use crate::api::ScheduleView;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WatchTarget {
-    Webhook { topic: String },
-    AgentIdle { target: String },
-    ProcessExit { pid: u32 },
-    PathChanged { path: String },
+    Webhook {
+        topic: String,
+    },
+    GitHubPr {
+        owner: String,
+        repo: String,
+        number: u64,
+    },
+    GitHubCheck {
+        owner: String,
+        repo: String,
+        reference: String,
+        check_name: Option<String>,
+    },
+    AgentIdle {
+        target: String,
+    },
+    ProcessExit {
+        pid: u32,
+    },
+    PathChanged {
+        path: String,
+    },
 }
 
 /// Parse a duration string such as `"1m"`, `"30s"`, `"2h"`, `"1d"`, `"daily"`, `"hourly"`.
@@ -121,8 +140,8 @@ pub fn parse_at_ms(raw: &str, now_ms: i64) -> Result<i64, String> {
     if s.is_empty() {
         return Err("`at` cannot be empty".to_string());
     }
-    if let Some(ms) = parse_rfc3339_ms(s) {
-        return Ok(ms);
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.timestamp_millis());
     }
     if s.chars().all(|c| c.is_ascii_digit())
         && let Ok(n) = s.parse::<i64>()
@@ -138,72 +157,15 @@ pub fn parse_at_ms(raw: &str, now_ms: i64) -> Result<i64, String> {
     Ok(now_ms.saturating_add(dur))
 }
 
-fn parse_rfc3339_ms(raw: &str) -> Option<i64> {
-    let (date_part, time_part) = raw.split_once('T').or_else(|| raw.split_once('t'))?;
-    let mut d_it = date_part.split('-');
-    let year: i64 = d_it.next()?.parse().ok()?;
-    let month: u32 = d_it.next()?.parse().ok()?;
-    let day: u32 = d_it.next()?.parse().ok()?;
-    if d_it.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    let (hms_frac, offset_secs): (&str, i64) = if let Some(stripped) = time_part
-        .strip_suffix('Z')
-        .or_else(|| time_part.strip_suffix('z'))
-    {
-        (stripped, 0)
-    } else if let Some((t, off)) = time_part.rsplit_once('+') {
-        let mut o_it = off.split(':');
-        let oh: i64 = o_it.next()?.parse().ok()?;
-        let om: i64 = o_it.next().unwrap_or("0").parse().ok()?;
-        (t, (oh * 3600) + (om * 60))
-    } else if let Some((t, off)) = time_part.rsplit_once('-') {
-        let mut o_it = off.split(':');
-        let oh: i64 = o_it.next()?.parse().ok()?;
-        let om: i64 = o_it.next().unwrap_or("0").parse().ok()?;
-        (t, -((oh * 3600) + (om * 60)))
-    } else {
-        return None;
-    };
-    let (hms, frac_ms) = match hms_frac.split_once('.') {
-        Some((h, f)) => {
-            let mut digits: String = f.chars().take(3).collect();
-            while digits.len() < 3 {
-                digits.push('0');
-            }
-            (h, digits.parse::<i64>().ok()?)
-        }
-        None => (hms_frac, 0),
-    };
-    let mut t_it = hms.split(':');
-    let hour: i64 = t_it.next()?.parse().ok()?;
-    let min: i64 = t_it.next()?.parse().ok()?;
-    let sec: i64 = t_it.next().unwrap_or("0").parse().ok()?;
-    if !(0..=23).contains(&hour) || !(0..=59).contains(&min) || !(0..=60).contains(&sec) {
-        return None;
-    }
-    let days = days_from_civil(year, month, day);
-    let total_secs = days * 86_400 + hour * 3_600 + min * 60 + sec - offset_secs;
-    Some(total_secs * 1_000 + frac_ms)
-}
-
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let m = i64::from(month);
-    let d = i64::from(day);
-    let y = if m <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
 /// Parse and validate a `watch` event specification.
 pub fn parse_watch_spec(raw: &str) -> Result<WatchTarget, String> {
     let s = raw.trim();
     if s.is_empty() {
         return Err("`watch` cannot be empty".to_string());
+    }
+
+    if let Some(parsed) = github::parse_github_watch_spec(s) {
+        return parsed;
     }
 
     // Generic webhook / event trigger forms:
@@ -290,7 +252,7 @@ pub fn parse_watch_spec(raw: &str) -> Result<WatchTarget, String> {
     }
 
     Err(format!(
-        "unsupported watch spec `{raw}`; expected `webhook:<topic>`, `event:<topic>`, `agent:idle:<name>`, `pid:<pid>`, or `file:<path>`"
+        "unsupported watch spec `{raw}`; expected `github:pr:<owner>/<repo>#<num>`, `github:check:<owner>/<repo>@<ref>`, `webhook:<topic>`, `event:<topic>`, `agent:idle:<name>`, `pid:<pid>`, or `file:<path>`"
     ))
 }
 
@@ -388,11 +350,12 @@ fn is_create_word(word: &str) -> bool {
 }
 
 fn is_watch_spec(value: &str) -> bool {
-    [
-        "webhook:", "event:", "agent:", "pid:", "process:", "file:", "path:",
-    ]
-    .iter()
-    .any(|scheme| value.starts_with(scheme))
+    github::is_github_watch_scheme(value)
+        || [
+            "webhook:", "event:", "agent:", "pid:", "process:", "file:", "path:",
+        ]
+        .iter()
+        .any(|scheme| value.starts_with(scheme))
 }
 
 #[cfg(test)]
@@ -576,7 +539,7 @@ pub fn create_agent_schedule(
     .collect();
     if set.is_empty() {
         return Err(format!(
-            "a schedule needs one trigger: `at` (\"20m\" or an ISO time), `every` (\"15m\") or `watch` (\"webhook:<topic>\", \"agent:idle:<name>\", \"pid:<pid>\", \"file:<path>\"), e.g. {SCHEDULE_EXAMPLE}"
+            "a schedule needs one trigger: `at` (\"20m\" or an ISO time), `every` (\"15m\") or `watch` (\"github:pr:<owner>/<repo>#<num>\", \"github:check:<owner>/<repo>@<ref>\", \"webhook:<topic>\", \"agent:idle:<name>\", \"pid:<pid>\", \"file:<path>\"), e.g. {SCHEDULE_EXAMPLE}"
         ));
     }
     if set.len() > 1 {
@@ -649,7 +612,7 @@ pub fn create_agent_schedule(
     };
 
     let created = store
-        .create_schedule(input)
+        .create_schedule_jittered(input)
         .map_err(|err| err.to_string())?;
     schedules_changed(store.data_dir());
     Ok(ScheduleView::from(created))
@@ -689,6 +652,9 @@ fn initial_watch_baseline(
 ) -> Option<String> {
     match target {
         WatchTarget::Webhook { .. } => Some("listening".to_string()),
+        WatchTarget::GitHubPr { .. } | WatchTarget::GitHubCheck { .. } => {
+            Some("pending".to_string())
+        }
         WatchTarget::AgentIdle { target } => {
             if let Ok(found) = store.agent_by_name(target) {
                 Some(initial_agent_idle_baseline(store, health, &found, now))
@@ -1984,14 +1950,6 @@ fn evaluate_entry(
     }
 }
 
-/// Skip missed ticks in constant time while preserving the original cadence.
-fn next_recurring_slot(due: i64, interval: i64, now: i64) -> Option<i64> {
-    debug_assert!(due <= now && interval > 0);
-    let interval = i128::from(interval);
-    let elapsed = i128::from(now) - i128::from(due);
-    i64::try_from(i128::from(now) + interval - elapsed % interval).ok()
-}
-
 fn evaluate_timer(store: &Store, entry: &mut Entry, now: i64) -> EntryOutcome {
     let sched = &entry.sched;
     let Some(due) = sched.next_fire_at_ms else {
@@ -2017,7 +1975,14 @@ fn evaluate_timer(store: &Store, entry: &mut Entry, now: i64) -> EntryOutcome {
         };
     }
     let interval = sched.interval_ms.unwrap_or(60_000).max(1_000);
-    let next_due = next_recurring_slot(due, interval, now);
+    let next_due = Store::next_recurring_fire_ms(
+        &sched.id,
+        sched.agent_id.as_str(),
+        sched.created_at_ms,
+        due,
+        interval,
+        now,
+    );
     // An occurrence can be delivered even if no later slot fits in the
     // stored timestamp type. Do not leave an active row with no deadline.
     let next_state = if next_due.is_some() {
@@ -2072,6 +2037,9 @@ fn watch_probe_at(
     match watch {
         // A spec never changes, and webhook watches are push-triggered only.
         None | Some(WatchTarget::Webhook { .. }) => i64::MAX,
+        Some(target @ (WatchTarget::GitHubPr { .. } | WatchTarget::GitHubCheck { .. })) => {
+            github::next_probe_at(target, now).max(now.saturating_add(RETRY_MS))
+        }
         Some(WatchTarget::AgentIdle { .. }) => {
             if event_driven {
                 i64::MAX
@@ -2330,6 +2298,9 @@ fn evaluate_watch(
     match target {
         WatchTarget::Webhook { .. } => {
             WatchEval::pending(sched.watch_baseline.clone(), sched.last_observed.clone())
+        }
+        WatchTarget::GitHubPr { .. } | WatchTarget::GitHubCheck { .. } => {
+            github::evaluate_github_watch(store, sched, target, now)
         }
         WatchTarget::AgentIdle { target } => {
             evaluate_agent_idle_watch(store, health, sched, target, idle_target, now)
@@ -2594,11 +2565,19 @@ fn evaluate_agent_idle_watch(
     }
 }
 
+mod github;
 mod local;
+
+#[cfg(test)]
+pub(crate) use github::{RestoreEnv, reset_probes_for_test, spawn_mock_github};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn next_recurring_slot(due: i64, interval: i64, now: i64) -> Option<i64> {
+        Store::next_recurring_fire_ms("test", "test", due, due, interval, now)
+    }
     use anyagents_core::NewAgent;
     use anyagents_harness::TurnState;
     use anyagents_supervisor::LiveState;
@@ -2652,7 +2631,23 @@ mod tests {
                 topic: "*".to_string(),
             }
         );
-        assert!(parse_watch_spec("github:pr:AnotherOrg/anyagents#41").is_err());
+        assert_eq!(
+            parse_watch_spec("github:pr:AnotherOrg/anyagents#41").unwrap(),
+            WatchTarget::GitHubPr {
+                owner: "AnotherOrg".to_string(),
+                repo: "anyagents".to_string(),
+                number: 41,
+            }
+        );
+        assert_eq!(
+            parse_watch_spec("github:check:AnotherOrg/anyagents@deadbeef").unwrap(),
+            WatchTarget::GitHubCheck {
+                owner: "AnotherOrg".to_string(),
+                repo: "anyagents".to_string(),
+                reference: "deadbeef".to_string(),
+                check_name: None,
+            }
+        );
         assert!(parse_watch_spec("spiron:promise:prm_12345").is_err());
         assert!(parse_watch_spec("webhook:").is_err());
         assert_eq!(
@@ -4332,5 +4327,53 @@ mod tests {
             fire_webhook_event(&store, "deploy/prod", "dlv-1", &payload, now + 1000).unwrap();
         assert_eq!(retry.matched, 0);
         assert_eq!(store.inbox(&exact_owner.id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_agent_schedule_accepts_github_watches_and_jitters_hourly_every_schedules() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let a = store
+            .create_agent(NewAgent::new("patrol-a", "codex"))
+            .unwrap();
+        let b = store
+            .create_agent(NewAgent::new("patrol-b", "codex"))
+            .unwrap();
+        store.set_agent_running(&a.id, "/work").unwrap();
+        store.set_agent_running(&b.id, "/work").unwrap();
+
+        let mk_w =
+            |w| create_agent_schedule(&store, &health, &a, None, None, Some(w), "w").unwrap();
+        assert_eq!(
+            mk_w("github:pr:owner/repo#123").watch_baseline.as_deref(),
+            Some("pending")
+        );
+        assert_eq!(
+            mk_w("github:check:owner/repo@abc1234")
+                .watch_baseline
+                .as_deref(),
+            Some("pending")
+        );
+
+        let hour = 3_600_000i64;
+        let sa = create_agent_schedule(&store, &health, &a, None, Some("1h"), None, "p").unwrap();
+        let sb = create_agent_schedule(&store, &health, &b, None, Some("1h"), None, "p").unwrap();
+        assert_ne!(sa.id, sb.id);
+        for (s, aid) in [(&sa, &a.id), (&sb, &b.id)] {
+            let raw = store.get_schedule(&s.id).unwrap().unwrap();
+            let off = raw.next_fire_at_ms.unwrap() - (raw.created_at_ms + hour);
+            assert_eq!(
+                off,
+                Store::recurring_schedule_jitter_ms(&raw.id, aid.as_str(), hour)
+            );
+            assert!((0..=180_000).contains(&off));
+        }
+        let fast = create_agent_schedule(&store, &health, &a, None, Some("5m"), None, "f").unwrap();
+        let raw_f = store.get_schedule(&fast.id).unwrap().unwrap();
+        assert_eq!(
+            raw_f.next_fire_at_ms.unwrap() - (raw_f.created_at_ms + 300_000),
+            0
+        );
     }
 }
