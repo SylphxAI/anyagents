@@ -626,14 +626,22 @@ fn load_scoped_media_bytes(
 ) -> Result<Option<Vec<u8>>, ApiError> {
     if let Some(s3) = S3Store::from_env().map_err(map_s3_crypto_error)? {
         let key = media_s3_key(agent_id.as_str(), media_id);
-        if let Some(raw) = s3.get_object(&key).map_err(map_s3_crypto_error)? {
-            let plain = if S3Store::is_encrypted_envelope(&raw) {
-                s3.decrypt_object_bytes(&key, &raw, None)
-                    .map_err(map_s3_crypto_error)?
-            } else {
-                raw
-            };
-            return Ok(Some(plain));
+        match s3.get_object(&key) {
+            Ok(Some(raw)) => {
+                let plain = if S3Store::is_encrypted_envelope(&raw) {
+                    s3.decrypt_object_bytes(&key, &raw, None)
+                        .map_err(map_s3_crypto_error)?
+                } else {
+                    raw
+                };
+                return Ok(Some(plain));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!(
+                    "anyagents-media: S3 GET failed for {key} ({err}); checking PostgreSQL/local media fallback"
+                );
+            }
         }
     }
 
@@ -718,7 +726,7 @@ pub(crate) fn hydrate_prompt_media_for_sandbox(
         let rest = &rewritten[start..];
         let end_offset = rest
             .find(|c: char| {
-                c.is_whitespace() || matches!(c, ']' | ')' | '"' | '\'' | '>' | ',' | ';')
+                c.is_whitespace() || matches!(c, ']' | ')' | '"' | '\'' | '<' | '>' | ',' | ';')
             })
             .unwrap_or(rest.len());
         let tail = rest[..end_offset].trim();
@@ -772,7 +780,7 @@ pub(crate) fn hydrate_prompt_media_for_sandbox(
             let rest = &rewritten[start..];
             let end_offset = rest
                 .find(|c: char| {
-                    c.is_whitespace() || matches!(c, ']' | ')' | '"' | '\'' | '>' | ',' | ';')
+                    c.is_whitespace() || matches!(c, ']' | ')' | '"' | '\'' | '<' | '>' | ',' | ';')
                 })
                 .unwrap_or(rest.len());
             let fname = rest[..end_offset].trim();
@@ -790,7 +798,7 @@ pub(crate) fn hydrate_prompt_media_for_sandbox(
         let _ = std::fs::create_dir_all(&stage_dir);
         for fname in legacy_names {
             let bytes_opt = store
-                .blob_store()
+                .blob_store_with_key(MasterKey::from_env().ok().flatten())
                 .get_deployment_blob("media", &fname)
                 .ok()
                 .flatten()
@@ -1391,5 +1399,158 @@ mod tests {
             .collect();
         assert_eq!(staged_files.len(), 1);
         assert_eq!(std::fs::read(staged_files[0].path()).unwrap(), img_bytes);
+    }
+
+    fn spawn_failing_s3_server(status_line: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind failing mock S3");
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0
+                        || line == "\r\n"
+                        || line == "\n"
+                    {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_length > 0 {
+                    let mut body = vec![0u8; content_length];
+                    let _ = reader.read_exact(&mut body);
+                }
+                let msg = "upstream transient failure";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{msg}",
+                    msg.len()
+                );
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn s3_get_5xx_falls_back_to_media_blobs_and_hydrates_quoted_docx_prompt() {
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(&[
+            S3_ENDPOINT_ENV,
+            S3_BUCKET_ENV,
+            S3_ACCESS_KEY_ID_ENV,
+            S3_SECRET_ACCESS_KEY_ENV,
+            S3_REGION_ENV,
+            S3_PREFIX_ENV,
+            S3_FORCE_PATH_STYLE_ENV,
+            MASTER_KEY_ENV,
+        ]);
+
+        let failing_endpoint = spawn_failing_s3_server("525 Origin SSL Handshake Error");
+        unsafe {
+            std::env::set_var(S3_ENDPOINT_ENV, &failing_endpoint);
+            std::env::set_var(S3_BUCKET_ENV, "media-fallback-test");
+            std::env::set_var(S3_ACCESS_KEY_ID_ENV, "TESTKEY000003");
+            std::env::set_var(S3_SECRET_ACCESS_KEY_ENV, "test-secret-000003");
+            std::env::set_var(S3_REGION_ENV, "us-east-1");
+            std::env::remove_var(S3_PREFIX_ENV);
+            std::env::set_var(S3_FORCE_PATH_STYLE_ENV, "true");
+            std::env::set_var(MASTER_KEY_ENV, "master-key-for-media-fallback-tests-123");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("docx-owner", "claude-code"))
+            .unwrap();
+
+        let media_id = "0123456789abcdef_proposal.docx";
+        let docx_bytes = b"PK\x03\x04QUOTED-DOCX-CONTENT-FALLBACK";
+        let master_key = MasterKey::from_env().unwrap();
+        store
+            .blob_store_with_key(master_key)
+            .put_deployment_blob(
+                "media",
+                &format!("{}/{media_id}", agent.id.as_str()),
+                docx_bytes,
+                true,
+            )
+            .unwrap();
+
+        // 1. Scoped HTTP route falls back cleanly on S3 525 and returns DOCX MIME type.
+        let app = make_test_app(Arc::clone(&store));
+        let uri = format!("/v1/media/{}/{media_id}", agent.id.as_str());
+        let resp = app
+            .clone()
+            .oneshot(request_as(
+                Principal::Agent {
+                    agent_id: agent.id.clone(),
+                    name: agent.name.clone(),
+                },
+                "GET",
+                &uri,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        );
+        let got = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(got.as_ref(), docx_bytes);
+
+        // 2. Quoted Telegram `.docx` refs inside `<quote>...</quote>` hydrate and rewrite cleanly.
+        let cfg_dir = dir.path().join("sandbox-quoted");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let quoted_prompt = format!(
+            "Please review this quoted document:\n<quote>[Media (document): /v1/media/{}/{media_id}]</quote>\nAlso inline: <quote>/v1/media/{}/{media_id}</quote>",
+            agent.id.as_str(),
+            agent.id.as_str(),
+        );
+        let hydrated = hydrate_prompt_media_for_sandbox(
+            &store,
+            &cfg_dir,
+            "/home/user/agent-data/state",
+            &quoted_prompt,
+        );
+        let expected_path = format!("/home/user/agent-data/state/media/{media_id}");
+        assert!(
+            hydrated.contains(&format!(
+                "<quote>[Media (document): {expected_path}]</quote>"
+            )),
+            "hydrated prompt: {hydrated}"
+        );
+        assert!(
+            hydrated.contains(&format!("<quote>{expected_path}</quote>")),
+            "hydrated prompt: {hydrated}"
+        );
+        assert!(!hydrated.contains("/v1/media/"), "rewrote ref: {hydrated}");
+        assert_eq!(
+            std::fs::read(cfg_dir.join("media").join(media_id)).unwrap(),
+            docx_bytes
+        );
+
+        // 3. Corrupted encrypted S3 payload still fails closed instead of falling back.
+        let (good_endpoint, s3_objects) = spawn_mock_s3("media-corrupt-test");
+        unsafe {
+            std::env::set_var(S3_ENDPOINT_ENV, &good_endpoint);
+            std::env::set_var(S3_BUCKET_ENV, "media-corrupt-test");
+        }
+        s3_objects.lock().unwrap().insert(
+            media_s3_key(agent.id.as_str(), media_id),
+            b"AAENC1corrupted-ciphertext-bytes".to_vec(),
+        );
+        assert!(load_scoped_media_bytes(&store, &agent.id, media_id).is_err());
     }
 }

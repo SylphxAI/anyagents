@@ -278,6 +278,19 @@ pub(crate) fn merge_sandbox_toml_config(
     text
 }
 
+/// Strip MCP/webhook endpoint suffixes so `ANYAGENTS_API_URL` always points at
+/// the coordinator's HTTP origin root.
+pub(crate) fn normalize_api_base_url(raw: &str) -> String {
+    let mut url = raw.trim().trim_end_matches('/');
+    for suffix in ["/v1/webhooks/mcp", "/v1/mcp", "/mcp", "/v1/webhooks"] {
+        if let Some(stripped) = url.strip_suffix(suffix) {
+            url = stripped.trim_end_matches('/');
+            break;
+        }
+    }
+    url.to_string()
+}
+
 /// Populate unified sandbox data/media/screenshot/API environment variables.
 pub(crate) fn enrich_sandbox_guest_env(
     env_map: &mut BTreeMap<String, String>,
@@ -293,10 +306,9 @@ pub(crate) fn enrich_sandbox_guest_env(
         "ANYAGENTS_BROWSER_SCREENSHOT_DIR".into(),
         format!("{data_dir}/tmp/screenshots"),
     );
-    let trimmed = mcp_url.trim().trim_end_matches('/');
-    let api_url = trimmed.strip_suffix("/mcp").unwrap_or(trimmed);
+    let api_url = normalize_api_base_url(mcp_url);
     if !api_url.is_empty() {
-        env_map.insert("ANYAGENTS_API_URL".into(), api_url.to_string());
+        env_map.insert("ANYAGENTS_API_URL".into(), api_url);
     }
     if !agent_id_str.trim().is_empty() {
         env_map.insert("ANYAGENTS_AGENT_ID".into(), agent_id_str.to_string());
@@ -609,5 +621,30 @@ mod tests {
             ),
             (Some("c1m2".into()), Some(10))
         );
+    }
+
+    #[test]
+    fn api_url_strips_webhook_and_mcp_suffixes_to_origin_root() {
+        for raw in [
+            "https://coord.example/v1/webhooks/mcp",
+            "https://coord.example/v1/webhooks/mcp/",
+            "https://coord.example/v1/webhooks",
+            "https://coord.example/v1/mcp",
+            "https://coord.example/mcp",
+            "https://coord.example/",
+        ] {
+            assert_eq!(
+                normalize_api_base_url(raw),
+                "https://coord.example",
+                "{raw}"
+            );
+            let mut env = BTreeMap::new();
+            enrich_sandbox_guest_env(&mut env, "/home/user/agent-data/state", "agent_01", raw);
+            assert_eq!(
+                env.get("ANYAGENTS_API_URL").map(String::as_str),
+                Some("https://coord.example"),
+                "{raw}"
+            );
+        }
     }
 }

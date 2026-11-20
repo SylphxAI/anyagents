@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyagents_core::{AgentId, Channel, ChannelId, FileCredentialStore, Store, Wake};
+use anyagents_core::{AgentId, Channel, ChannelId, Store, StoreCredentialStore, Wake};
 
 use super::channel::{
     CHANGES, LONG_POLL_S, Signal, changed, delete_webhook, ensure_webhook, poll_channel_once,
@@ -339,7 +339,7 @@ impl GroupWorker {
             return;
         }
         let store = Arc::clone(store);
-        let secrets = FileCredentialStore::new(data_dir);
+        let data_dir = data_dir.to_path_buf();
         let channel = channel.clone();
         let cancel = [
             Arc::clone(&self.cancel),
@@ -349,6 +349,7 @@ impl GroupWorker {
         let started = std::thread::Builder::new()
             .name(format!("anyagents-telegram-groups-{}", channel.id))
             .spawn(move || {
+                let secrets = StoreCredentialStore::with_data_dir(&store, &data_dir);
                 reconcile_channel_groups(&store, &secrets, &channel, &|| {
                     cancel.iter().any(|flag| flag.load(Ordering::SeqCst))
                 });
@@ -382,7 +383,7 @@ fn run_channel(
     signal: &'static Signal,
 ) {
     let stops = [&*stop, &*global_stop];
-    let secrets = FileCredentialStore::new(&data_dir);
+    let secrets = StoreCredentialStore::with_data_dir(&store, &data_dir);
     let mut webhook_registered_for: Option<String> = None;
     let mut groups = GroupWorker::default();
     while !stop.load(Ordering::SeqCst) && !global_stop.load(Ordering::SeqCst) {
@@ -504,7 +505,6 @@ pub fn release_every_bot(
         if !channel_has_running_agent(store, &channel).map_err(|err| err.to_string())? {
             continue;
         }
-        let secrets = FileCredentialStore::new(data_dir);
         let done = done_tx.clone();
         let id = channel.id.to_string();
         // One pass per bot, on its own thread: every bot is released at the
@@ -518,6 +518,7 @@ pub fn release_every_bot(
                     return;
                 }
             };
+            let secrets = StoreCredentialStore::with_data_dir(&store, &data_dir);
             let result = poll_channel_once(&store, &secrets, &channel, RELEASE_POLL_S);
             let _ = done.send((id, result.map_err(|err| err.to_string())));
         });
