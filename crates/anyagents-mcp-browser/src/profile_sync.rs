@@ -1505,8 +1505,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("agent-data");
         std::fs::create_dir_all(&real).unwrap();
-        let picked = pick_existing_data_dir(&[Some(&tmp.path().join("missing")), Some(&real)]);
-        assert_eq!(picked, Some(real.as_path()));
+        assert_eq!(
+            pick_existing_data_dir(&[Some(&tmp.path().join("missing")), Some(&real)]),
+            Some(real.as_path())
+        );
 
         let cfg = BrowserServerConfig {
             screenshot_dir: Some(PathBuf::from("/home/user/agent-data/tmp/screenshots")),

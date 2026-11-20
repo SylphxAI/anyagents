@@ -214,7 +214,7 @@ impl LiveWebGuard<'_> {
         pub async fn current_url(&mut self) -> Result<String, BrowserError>;
     }
 
-    pub async fn history(&mut self, delta: i32) -> Result<String, BrowserError> {
+    pub async fn history(&mut self, delta: i64) -> Result<String, BrowserError> {
         match &mut self.instance()?.backend {
             BrowserBackend::Headless { web, .. } => Ok(web.history(delta).await?),
             BrowserBackend::Desktop { session, .. } => {
