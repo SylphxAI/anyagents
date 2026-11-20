@@ -250,11 +250,11 @@ mod spawn_args_tests {
         }
         let send_tool = tools.iter().find(|t| t.name == "send").unwrap();
         assert!(
-            send_tool
+            !send_tool
                 .description
                 .as_deref()
                 .unwrap_or_default()
-                .contains("Use `operator` to report a defect in AnyAgents")
+                .contains("operator")
         );
         assert!(
             !send_tool
@@ -1113,7 +1113,7 @@ mod spawn_args_tests {
     }
 
     #[test]
-    fn universal_mcp_surface_exposes_exact_seven_tools_and_blocks_removed_tools() {
+    fn universal_mcp_surface_exposes_exact_tools_and_blocks_removed_tools() {
         let tools = tool_definitions();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert_eq!(names, UNIVERSAL_MCP_TOOLS);

@@ -14,13 +14,32 @@ mod send_tool;
 #[tool_router(vis = "pub(super)")]
 impl AgentMcp {
     #[tool(
-        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`planner`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`). For Telegram chat administration, use `set_chat_title`, `set_chat_description`, or `set_chat_photo` with one `telegram:chat:<chat_id>` in `target` or `to`. The selected `bot` must have admin rights to change chat info. Supply `text` for title or description or `media: {kind: \"photo\", source: ...}` (local JPEG/PNG or direct public HTTP(S) image URL) for photo. Use `operator` to report a defect in AnyAgents, the harness, or the host environment that you cannot fix within your own work. Include the exact error and what you tried. Do not work around it silently."
+        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`planner`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`). For Telegram chat administration, use `set_chat_title`, `set_chat_description`, or `set_chat_photo` with one `telegram:chat:<chat_id>` in `target` or `to`. The selected `bot` must have admin rights to change chat info. Supply `text` for title or description or `media: {kind: \"photo\", source: ...}` (local JPEG/PNG or direct public HTTP(S) image URL) for photo."
     )]
     pub(super) async fn send(
         &self,
         Parameters(args): Parameters<SendArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
         send_tool::send(self, args).await
+    }
+
+    #[tool(
+        description = "ONE-WAY fire-and-forget telemetry for genuine AnyAgents, sandbox, or harness runtime bugs ONLY. NEVER call for task blockers, missing kubeconfig/secrets/permissions, CI/test failures, third-party API errors, or requests for an operator to run commands; send those to your parent or ops peer via send. Include the exact error with secrets removed. Returns an issue_id only; no human replies to unblock your task."
+    )]
+    pub(super) async fn report_bug(
+        &self,
+        Parameters(args): Parameters<crate::server::runtime_issues::ReportBug>,
+    ) -> Result<
+        rmcp::handler::server::wrapper::Json<crate::server::runtime_issues::ReportReceipt>,
+        String,
+    > {
+        self.client
+            .get(
+                "/v1/runtime-issues",
+                Some(serde_json::to_vec(&args).map_err(|err| err.to_string())?),
+            )
+            .await
+            .map(rmcp::handler::server::wrapper::Json)
     }
 
     #[tool(
@@ -1430,7 +1449,7 @@ impl AgentMcp {
         Ok(parent.name)
     }
 
-    /// The universal 7-tool surface every agent sees on every harness.
+    /// The universal surface every agent sees on every harness.
     pub(super) fn listed_tools(&self) -> Vec<rmcp::model::Tool> {
         let wd = self.resolve_workdir();
         tool_definitions_with_roles(Some(&wd), self.client.socket.parent())
@@ -1647,6 +1666,12 @@ impl AgentMcp {
                 let parsed: SendArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `send` arguments: {e}"))?;
                 Ok(self.send(Parameters(parsed)).await?.0)
+            }
+            "report_bug" => {
+                let parsed = serde_json::from_value(args)
+                    .map_err(|e| format!("invalid report_bug arguments: {e}"))?;
+                serde_json::to_value(self.report_bug(Parameters(parsed)).await?.0)
+                    .map_err(|e| e.to_string())
             }
             "conversation" | "search" => {
                 let parsed: ConversationArgs = serde_json::from_value(args)

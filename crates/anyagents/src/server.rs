@@ -53,6 +53,7 @@ mod quota_rotation;
 mod reap_queue;
 mod roles;
 mod runtime;
+pub(crate) mod runtime_issues;
 pub(crate) mod s3_media_profiles;
 mod schedules;
 pub(crate) mod secrets;
@@ -183,6 +184,7 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
         .merge(secrets::router())
         .merge(schedules::router())
         .merge(messaging::router())
+        .merge(runtime_issues::agent_router())
         .merge(channels_groups::router())
         .merge(roles::router())
         .merge(ops::router())

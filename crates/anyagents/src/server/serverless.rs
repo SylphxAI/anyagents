@@ -2500,6 +2500,19 @@ pub(crate) async fn guest_events_route(
                     )
                     .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
                     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
+                    if settled.settled_now
+                        && super::runtime_issues::missing_guest_harness(
+                            settled.turn.error_text.as_deref(),
+                        )
+                    {
+                        super::runtime_issues::capture(
+                            Arc::clone(&store),
+                            Some(settled.turn.agent_id.clone()),
+                            anyagents_core::RuntimeComponent::Harness,
+                            "Guest harness could not start",
+                            "No such file or directory (os error 2)",
+                        );
+                    }
                     super::serverless_maintenance::cancel_turn_timers_on_close(
                         &store,
                         timer_for_close.as_ref(),

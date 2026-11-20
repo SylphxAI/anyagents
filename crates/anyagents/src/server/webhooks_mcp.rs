@@ -479,6 +479,7 @@ async fn mcp_post(
     let needs_roles = payload.get("method").and_then(serde_json::Value::as_str)
         == Some("tools/list")
         || needs_lease;
+    let capture_store = Arc::clone(&state.store);
     let mcp = spawn_store(move || {
         let caller = authenticate_mcp_request(&state.store, &headers, listener)?;
         let McpCaller { agent, .. } = caller;
@@ -524,18 +525,39 @@ async fn mcp_post(
             router,
         ))
     })
-    .await?;
+    .await
+    .inspect_err(|err| {
+        if err.status.is_server_error() {
+            super::runtime_issues::capture(
+                Arc::clone(&capture_store),
+                None,
+                anyagents_core::RuntimeComponent::McpTool,
+                "MCP transport unavailable",
+                "Coordinator could not prepare an authenticated MCP request",
+            );
+        }
+    })?;
     // A tool call mixes file, process and socket work into its async steps
     // (`crate::mcp`), so the whole call is driven from a blocking-pool thread:
     // whatever it waits on holds that thread, never an async worker.
     let runtime = tokio::runtime::Handle::current();
+    let agent_id = mcp.agent.id.clone();
     let call = in_flight::carry();
     let answered = tokio::task::spawn_blocking(move || {
         let _call = call;
         runtime.block_on(mcp.handle_jsonrpc_request(payload))
     })
     .await
-    .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    .map_err(|err| {
+        super::runtime_issues::capture(
+            capture_store,
+            Some(agent_id),
+            anyagents_core::RuntimeComponent::McpTool,
+            "MCP dispatch failed",
+            "Coordinator MCP request worker did not complete",
+        );
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+    })?;
     let mut resp = match answered {
         Some(response_json) => {
             axum::response::IntoResponse::into_response((StatusCode::OK, Json(response_json)))

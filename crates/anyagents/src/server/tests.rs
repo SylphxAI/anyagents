@@ -5544,7 +5544,7 @@ fn streamable_http_mcp_enforces_bearer_auth_and_three_mode_profiles() {
                 .starts_with("text/event-stream")
         );
 
-        // 3. POST /mcp with valid Bearer token exposes the exact 7 universal MCP tools.
+        // 3. POST /mcp with valid Bearer token exposes the exact universal MCP tools.
         let (status, init_json) = post_mcp(
             &cloud_cap,
             serde_json::json!({
@@ -5670,7 +5670,7 @@ fn streamable_http_mcp_enforces_bearer_auth_and_three_mode_profiles() {
             "{mem_res}"
         );
 
-        // 4. `spiron` receives the exact same 7-tool universal MCP surface as every other harness,
+        // 4. `spiron` receives the exact same universal MCP surface as every other harness,
         // and removed/non-core tools are blocked uniformly.
         let (_, spiron_default_json) = post_mcp(
             &spiron_cap,
@@ -5965,7 +5965,7 @@ fn remote_session_tokens_get_universal_mcp_surface() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(listed_tools(&list), expected_universal);
 
-        // Nothing outside the 7 canonical tools can be called, even by vendor prefix.
+        // Nothing outside the canonical tools can be called, even by vendor prefix.
         for host_tool in [
             "browser",
             "computer",
@@ -6022,7 +6022,7 @@ fn remote_session_tokens_get_universal_mcp_surface() {
             inbox[0].sender
         );
 
-        // The GET route names the session, its expiry, and the 7 universal tools.
+        // The GET route names the session, its expiry, and the universal tools.
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -6876,7 +6876,7 @@ fn a_remote_token_stops_authenticating_once_its_agent_runs_on_the_host() {
 }
 
 #[test]
-fn http_mcp_serves_only_universal_seven_tools_and_blocks_host_tools() {
+fn http_mcp_serves_only_universal_tools_and_blocks_host_tools() {
     let _env = env_lock();
     let dir = crate::test_tempdir();
     let state = archetype_validation_state(dir.path());
@@ -9008,7 +9008,7 @@ fn webhook_router_serves_mcp_profile_full_for_sandboxed_only_and_gateway_prefix(
         });
         let list = tools_list().to_string();
 
-        // 1) Both sandboxed and cloud agents receive the identical 7-tool universal MCP surface
+        // 1) Both sandboxed and cloud agents receive the identical universal MCP surface
         // on `/mcp`, `/v1/webhooks/mcp`, and legacy `?profile=...` URLs.
         for (tok, path) in [
             (sbx_remote.clone(), "/mcp"),
@@ -9386,7 +9386,7 @@ fn stateless_two_replicas_mcp_and_gateway_never_revoke_capabilities_or_overwrite
         assert_eq!(
             listed_tools(&parsed),
             crate::mcp::UNIVERSAL_MCP_TOOLS,
-            "replica B must expose the universal 7-tool MCP surface"
+            "replica B must expose the universal MCP surface"
         );
 
         // Also call an MCP tool (`inbox`) to verify the in-process router accepts

@@ -12,7 +12,7 @@
 //!   MCP URL, into the agent's config directory, where the adapter reads both
 //!   before each turn. The maintenance pass rotates the token before it
 //!   expires. The long-lived local mailbox capability never leaves this host.
-//! * Every remote session receives the exact same universal 7-tool MCP surface
+//! * Every remote session receives the exact same universal MCP surface
 //!   ([`crate::mcp::UNIVERSAL_MCP_TOOLS`]) as local sessions.
 //! * `public_listen` in the same table binds the public listener: its own port,
 //!   serving readiness, Telegram webhooks and MCP for remote session tokens
