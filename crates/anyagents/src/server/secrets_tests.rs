@@ -574,8 +574,8 @@ async fn sandbox_env_resolution_and_turn_output_masking_scrub_granted_secrets() 
     );
 
     // 2. Process-wide masking automatically scrubs registered secret values.
-    let masked_line =
-        anyagents_core::masking::mask_known_secrets(&format!("running deploy with {canary} done"));
+    let raw_line = format!("running deploy with {canary} done");
+    let masked_line = anyagents_core::masking::mask_known_secrets(&raw_line);
     assert_eq!(masked_line, "running deploy with [redacted] done");
     assert!(!masked_line.contains(canary));
 
