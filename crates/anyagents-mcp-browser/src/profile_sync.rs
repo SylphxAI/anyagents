@@ -361,11 +361,11 @@ fn run_zstd_pipe(args: &[&str], input: &[u8], max_output: u64) -> Result<Vec<u8>
         .stdin
         .take()
         .ok_or_else(|| ZstdPipeError::Failed("zstd stdin pipe unavailable".into()))?;
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| ZstdPipeError::Failed("zstd stdout pipe unavailable".into()))?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| ZstdPipeError::Failed("zstd stderr pipe unavailable".into()))?;
