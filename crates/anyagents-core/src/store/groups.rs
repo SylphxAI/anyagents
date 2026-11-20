@@ -266,13 +266,11 @@ impl Store {
             |row| Ok((row.get(0)?, row.get::<i64>(1)? != 0, row.get(2)?)),
         )?;
         let member_rows: Vec<(String, Agent)> = conn.db_query_vec(
-            concat!(
-                "SELECT g.group_name, a.id, a.name, a.harness, a.model, a.workdir, a.instructions, \
-                 a.state, a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role, a.description \
-                 FROM group_agents AS g \
-                 JOIN agents AS a ON a.id = g.agent_id \
-                 ORDER BY g.group_name, a.name"
-            ),
+            "SELECT g.group_name, a.id, a.name, a.harness, a.model, a.workdir, a.instructions, \
+             a.state, a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role, a.description \
+             FROM group_agents AS g \
+             JOIN agents AS a ON a.id = g.agent_id \
+             ORDER BY g.group_name, a.name",
             &[],
             |row| {
                 let group_name: String = row.get(0)?;
