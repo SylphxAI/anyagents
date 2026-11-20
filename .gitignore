@@ -9,3 +9,6 @@ node_modules/
 .sylphx/
 pr-body.md
 target-release/
+
+__pycache__/
+*.pyc
