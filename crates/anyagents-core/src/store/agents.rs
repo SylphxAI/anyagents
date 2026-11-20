@@ -746,6 +746,10 @@ impl Store {
             .remote_turn_store()
             .list_active_fresh_by_agent(fresh_since)
             .unwrap_or_default();
+        metadata.latest_remote_turn_errors = self
+            .remote_turn_store()
+            .list_latest_failed_by_agent()
+            .unwrap_or_default();
         metadata.active_proc_locks = self.active_agent_proc_locks();
         Ok(metadata)
     }

@@ -940,8 +940,45 @@ pub(super) async fn dispatch_next_mailbox_message_inner(
                 input.reply_target = reply_target;
                 input.sandbox_provider = sandbox_provider;
                 input.callback_base_url = callback_base_url;
+                let retry_timer = timer_backend.clone();
                 input.timer_backend = timer_backend;
-                return dispatch_serverless_turn_opt(store, input).await;
+                let result = dispatch_serverless_turn_opt(Arc::clone(&store), input).await;
+                let tb = super::serverless_maintenance::resolve_timer_backend(
+                    retry_timer.as_ref(),
+                    store.data_dir(),
+                );
+                let aid_done = agent_id.clone();
+                match result {
+                    Ok(Some(dispatched)) => {
+                        let store_clr = Arc::clone(&store);
+                        let _ = run_store_blocking(move || {
+                            super::serverless_maintenance::clear_dispatch_retry_state(
+                                &store_clr,
+                                Some(tb.as_ref()),
+                                &aid_done,
+                            );
+                            Ok(())
+                        })
+                        .await;
+                        return Ok(Some(dispatched));
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(err) => {
+                        let store_err = Arc::clone(&store);
+                        let err_copy = err.clone();
+                        let _ = run_store_blocking(move || {
+                            super::serverless_maintenance::record_dispatch_failure_and_arm_retry(
+                                &store_err,
+                                tb.as_ref(),
+                                &aid_done,
+                                &err_copy,
+                            );
+                            Ok(())
+                        })
+                        .await;
+                        return Err(err);
+                    }
+                }
             }
         }
     }
@@ -1147,6 +1184,9 @@ pub(crate) fn settle_remote_turn_and_deliver(
         now,
         inflight_children,
     );
+    if turn.status == "completed" {
+        super::serverless_maintenance::clear_dispatch_retry_state(store, None, &turn.agent_id);
+    }
 
     // 6. Trigger outbound reply delivery or fail-closed parent error notification.
     let (delivered_reply, notified_agent_id) =

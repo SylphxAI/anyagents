@@ -25,6 +25,8 @@ pub struct AgentQueryMetadata {
     pub open_turns: HashMap<String, i64>,
     /// Active non-terminal serverless remote turns (`agent_id -> earliest created_at_ms`).
     pub active_remote_turns: HashMap<String, i64>,
+    /// Latest unrecovered failed remote turns (`agent_id -> LatestRemoteTurnError`).
+    pub latest_remote_turn_errors: HashMap<String, crate::stateless::LatestRemoteTurnError>,
     /// Active non-expired PostgreSQL `agent:proc:*` lease holders (`agent_id`).
     pub active_proc_locks: HashSet<String>,
     pub schedules: HashMap<String, Vec<AgentSchedule>>,
