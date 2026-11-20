@@ -3,13 +3,15 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-/// Candidate binary names searched on `$PATH`.
+/// Candidate binary names searched in system binary directories. Official
+/// branded Google Chrome is preferred over unbranded Chromium builds, which
+/// remain the fallback where Chrome is not installed (e.g. Linux arm64).
 const PATH_BINARY_NAMES: &[&str] = &[
-    "chromium",
-    "chromium-browser",
     "google-chrome-stable",
     "google-chrome",
     "chrome",
+    "chromium",
+    "chromium-browser",
 ];
 
 /// Relative executable paths inside a Playwright browser directory (`chromium-*` or
@@ -30,7 +32,7 @@ const PLAYWRIGHT_RELATIVE_BINS: &[&str] = &[
 /// Discover a usable Chromium executable using:
 /// 1. Explicit CLI/env override (`--chromium-bin` / `ANYAGENTS_CHROMIUM_BIN`, parsed by
 ///    `BrowserServerConfig` and passed as `explicit`).
-/// 2. Standard system binary directories (`/usr/local/bin`, `/usr/bin`, `/opt/homebrew/bin`,
+/// 2. Standard system binary directories (Google Chrome before Chromium) (`/usr/local/bin`, `/usr/bin`, `/opt/homebrew/bin`,
 ///    `/snap/bin`) and well-known system application paths for Linux, macOS, and Windows.
 /// 3. Playwright browser installations (`PLAYWRIGHT_BROWSERS_PATH`, `/opt/playwright`,
 ///    `$HOME/.cache/ms-playwright`, `$HOME/Library/Caches/ms-playwright`).
@@ -114,10 +116,11 @@ pub fn is_headless_shell_binary(binary: &Path) -> bool {
 
 fn default_system_paths() -> Vec<PathBuf> {
     let mut paths = vec![
-        PathBuf::from("/usr/bin/chromium"),
-        PathBuf::from("/usr/bin/chromium-browser"),
         PathBuf::from("/usr/bin/google-chrome-stable"),
         PathBuf::from("/usr/bin/google-chrome"),
+        PathBuf::from("/opt/google/chrome/chrome"),
+        PathBuf::from("/usr/bin/chromium"),
+        PathBuf::from("/usr/bin/chromium-browser"),
         PathBuf::from("/usr/local/bin/chromium"),
         PathBuf::from("/snap/bin/chromium"),
         PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
@@ -250,6 +253,39 @@ mod tests {
 
         let found = discover_chromium_in(None, &[bin_dir], &[], &[pw_root]).unwrap();
         assert_eq!(found, path_chrome);
+    }
+
+    #[test]
+    fn prefers_branded_google_chrome_over_chromium_with_chromium_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local-bin");
+        let usr = dir.path().join("usr-bin");
+        let chromium = local.join("chromium");
+        create_exec(&chromium);
+        create_exec(&usr.join("chromium-browser"));
+        let dirs = [local.clone(), usr.clone()];
+
+        // Only unbranded Chromium installed: it is used.
+        assert_eq!(
+            discover_chromium_in(None, &dirs, &[], &[]).unwrap(),
+            chromium
+        );
+
+        // Branded Chrome wins even from a later directory.
+        let chrome = usr.join("google-chrome-stable");
+        create_exec(&chrome);
+        assert_eq!(discover_chromium_in(None, &dirs, &[], &[]).unwrap(), chrome);
+
+        // An explicit override still beats everything.
+        assert_eq!(
+            discover_chromium_in(Some(&chromium), &dirs, &[], &[]).unwrap(),
+            chromium
+        );
+
+        // Well-known system paths list Chrome before Chromium.
+        let paths = default_system_paths();
+        let pos = |p: &str| paths.iter().position(|x| x == Path::new(p)).unwrap();
+        assert!(pos("/usr/bin/google-chrome-stable") < pos("/usr/bin/chromium"));
     }
 
     #[test]

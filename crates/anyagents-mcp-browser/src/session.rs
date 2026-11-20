@@ -1,4 +1,5 @@
-//! Headless Chromium process lifecycle and CDP `Web` session management.
+//! Browser process lifecycle (direct headless CDP child or headful browser in a
+//! private `sway` Wayland session) and CDP `Web` session management.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,10 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::chromium::{discover_chromium, is_headless_shell_binary};
-use crate::config::BrowserServerConfig;
+use crate::config::{BrowserMode, BrowserServerConfig};
+use crate::desktop::{
+    LaunchPlan, default_bin_dirs, find_desktop_tools_in, launch_desktop_instance, plan_launch,
+};
 use crate::profile_sync::{
     RemoteProfileSync, resolve_sync_config, sync_down_profile, sync_up_profile,
     validate_profile_name,
@@ -116,7 +120,8 @@ impl SecretResolver for PreResolvedSecret {
     }
 }
 
-/// Active browser process backend (headless Chromium CDP or Wayland desktop takeover).
+/// Active browser process backend: a directly launched CDP child (headless, or
+/// `--headful` on the host display) or a headful browser in a private `sway` session.
 pub enum BrowserBackend {
     Headless {
         child: Child,
@@ -485,6 +490,11 @@ pub fn build_launch_args_with_proxy(
     args.push("--no-default-browser-check".to_string());
     args.push("--password-store=basic".to_string());
     args.push("--disable-blink-features=AutomationControlled".to_string());
+    let languages = config.languages();
+    if let Some(first) = languages.first() {
+        args.push(format!("--lang={first}"));
+        args.push(format!("--accept-lang={}", languages.join(",")));
+    }
     args.push(format!(
         "--window-size={},{}",
         config.viewport_width.max(320),
@@ -635,6 +645,43 @@ pub(crate) async fn launch_instance(
 ) -> Result<BrowserInstance, BrowserError> {
     let binary = discover_chromium(config.chromium_bin.as_deref())
         .map_err(BrowserError::browser_not_found)?;
+    let tools = match config.browser_mode {
+        BrowserMode::Headless => None,
+        BrowserMode::Auto | BrowserMode::Desktop => find_desktop_tools_in(&default_bin_dirs()),
+    };
+    match plan_launch(config.browser_mode, config.headful, &binary, tools)? {
+        LaunchPlan::Desktop(tools) => {
+            let launched = launch_desktop_instance(
+                config,
+                requested_profile,
+                proxy.clone(),
+                binary.clone(),
+                &tools,
+                None,
+            )
+            .await;
+            match launched {
+                Ok(inst) => return Ok(inst),
+                Err(err) if config.browser_mode == BrowserMode::Auto => eprintln!(
+                    "anyagents-mcp-browser: headful desktop browser failed to start ({err}); falling back to headless"
+                ),
+                Err(err) => return Err(err),
+            }
+        }
+        LaunchPlan::Direct {
+            fallback_reason: Some(reason),
+        } => eprintln!("anyagents-mcp-browser: using headless browser: {reason}"),
+        LaunchPlan::Direct { .. } => {}
+    }
+    launch_direct_instance(config, requested_profile, proxy, binary).await
+}
+
+async fn launch_direct_instance(
+    config: &BrowserServerConfig,
+    requested_profile: Option<&str>,
+    proxy: Option<BrowserProxy>,
+    binary: PathBuf,
+) -> Result<BrowserInstance, BrowserError> {
     let ws = prepare_profile_workspace(config, requested_profile).await?;
     let proxy_handle = match &proxy {
         Some(p) => Some(ProxyHandle::start(p).await?),
@@ -677,6 +724,9 @@ pub(crate) async fn launch_instance(
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_stderr))
         .kill_on_drop(true);
+    if let Some(tz) = config.resolved_timezone() {
+        cmd.env("TZ", tz);
+    }
     #[cfg(unix)]
     cmd.process_group(0);
 
@@ -719,6 +769,13 @@ pub(crate) async fn finalize_instance(inst: &mut BrowserInstance) -> (bool, Opti
         tunnel.stop().await;
     }
     shutdown_backend(&mut inst.backend).await;
+    // Flush cookie stores (incl. SQLite WAL/shm sidecars) and `Local State`
+    // to disk before any sync-up: the browser may have been killed mid-write,
+    // leaving WAL frames or a racing `Local State` (incl. DBSC keys) that must
+    // not be archived into the cross-container S3 profile.
+    if let Err(err) = crate::profile_sync::fsync_profile_files(&inst.user_data_dir) {
+        eprintln!("anyagents-mcp-browser: failed flushing profile files after shutdown: {err}");
+    }
     inst._proxy_handle = None;
     let Some(sync) = inst.remote_sync.take() else {
         return (false, None);
@@ -885,6 +942,19 @@ mod tests {
         );
         assert!(!args.iter().any(|a| a.starts_with("--headless")));
         assert!(!args.contains(&"--disable-gpu".to_string()));
+        assert!(!args.iter().any(|a| a.starts_with("--lang=")));
+
+        let localized = BrowserServerConfig {
+            locale: Some("en-GB,en".into()),
+            ..Default::default()
+        };
+        let args = build_launch_args(
+            Path::new("/usr/bin/chromium"),
+            Path::new("/tmp/ud"),
+            &localized,
+        );
+        assert!(args.contains(&"--lang=en-GB".to_string()));
+        assert!(args.contains(&"--accept-lang=en-GB,en".to_string()));
 
         let headless_shell_args = build_launch_args(
             Path::new("/opt/playwright/chromium_headless_shell-1180/chrome-linux/headless_shell"),
