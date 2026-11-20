@@ -6,6 +6,7 @@
 
 pub mod chromium;
 pub mod config;
+pub mod profile_sync;
 pub mod server;
 pub mod session;
 pub mod url_guard;

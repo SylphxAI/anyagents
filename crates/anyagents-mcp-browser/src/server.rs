@@ -68,7 +68,10 @@ impl BrowserMcpServer {
             }
         };
 
-        let mut live = self.session.acquire().await?;
+        let mut live = self
+            .session
+            .acquire_with_profile(args.profile.as_deref())
+            .await?;
         let web = live.web();
         select_explicit_target(web, args.target_id.as_deref()).await?;
         let final_url = match action.as_str() {
@@ -423,6 +426,10 @@ pub struct BrowserNavigateArgs {
     /// When `true`, also capture and return the accessibility snapshot in the response.
     #[serde(default)]
     pub include_snapshot: Option<bool>,
+    /// Optional named persistent browser profile synced with the AnyAgents coordinator
+    /// (`GET/PUT <ANYAGENTS_API_URL>/v1/browser-profiles/<profile>/archive`).
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// Parameters for `browser_snapshot`.
@@ -672,12 +679,17 @@ impl BrowserMcpServer {
         &self,
         Parameters(_args): Parameters<BrowserCloseArgs>,
     ) -> CallToolResult {
-        let (was_running, profile_preserved) = self.session.close().await;
-        CallToolResult::structured(json!({
+        let outcome = self.session.close_with_sync().await;
+        let mut payload = json!({
             "status": "closed",
-            "was_running": was_running,
-            "profile_preserved": profile_preserved,
-        }))
+            "was_running": outcome.was_running,
+            "profile_preserved": outcome.profile_preserved,
+            "profile_synced": outcome.profile_synced,
+        });
+        if let Some(err) = outcome.sync_error {
+            payload["sync_error"] = json!(err);
+        }
+        CallToolResult::structured(payload)
     }
 }
 

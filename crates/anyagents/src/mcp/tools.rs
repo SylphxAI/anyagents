@@ -512,6 +512,7 @@ impl AgentMcp {
                         public: args.public,
                         group: args.group,
                         prompt: args.prompt,
+                        browser_profiles: args.browser_profiles,
                     }))
                     .await?
                     .0;
@@ -519,63 +520,8 @@ impl AgentMcp {
                     serde_json::to_value(spawned).map_err(|e| e.to_string())?,
                 ))
             }
-            "create" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "`agents create` requires `name`".to_string())?
-                    .to_string();
-                let harness = args
-                    .harness
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("")
-                    .to_string();
-                let parent_val = match args
-                    .parent
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    Some(p) if p.eq_ignore_ascii_case("self") => Some(self.agent.id.to_string()),
-                    Some(p) => Some(p.to_string()),
-                    None => Some("root".to_string()),
-                };
-                let body = CreateAgentRequest {
-                    name,
-                    role: args.role,
-                    harness: Some(harness),
-                    model: args.model,
-                    profile: args.profile,
-                    repo: args.repo,
-                    branch: args.branch,
-                    base: args.base,
-                    workdir: args.workdir,
-                    seat_user: None,
-                    seat_uid: None,
-                    description: args.description,
-                    instructions: args.instructions,
-                    parent: parent_val,
-                    scope: args.scope,
-                    lifecycle: args.lifecycle,
-                    public: args.public,
-                    group: args.group,
-                    prompt: args.prompt,
-                };
-                let created: AgentView = self
-                    .client
-                    .get(
-                        "/v1/agents",
-                        Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
-                    )
-                    .await?;
-                Ok(rmcp::handler::server::wrapper::Json(
-                    serde_json::to_value(created).map_err(|e| e.to_string())?,
-                ))
-            }
+            "create" => self.handle_agents_create(args).await,
+            "update" | "browser_profiles" => self.handle_agents_update(action.as_str(), args).await,
             "describe" => {
                 self.describe(Parameters(DescribeArgs {
                     agent: args.name,
@@ -586,6 +532,7 @@ impl AgentMcp {
                     lifecycle: args.lifecycle,
                     public: args.public,
                     clear: args.clear,
+                    browser_profiles: args.browser_profiles,
                 }))
                 .await
             }
@@ -915,6 +862,7 @@ impl AgentMcp {
             public: args.public,
             group: args.group,
             prompt: args.prompt,
+            browser_profiles: args.browser_profiles,
         };
         let response = self
             .client
@@ -1058,6 +1006,7 @@ impl AgentMcp {
                         public: args.public,
                         group: args.group,
                         prompt: args.prompt,
+                        browser_profiles: args.browser_profiles,
                     }))
                     .await?
                     .0;
@@ -1460,14 +1409,31 @@ impl AgentMcp {
                 "public": args.public,
                 "clear": args.clear.unwrap_or(false),
             });
-            let updated: serde_json::Value = self
+            let mut updated: serde_json::Value = self
                 .client
                 .get(
                     &format!("/v1/agents/{resolved_target}/description"),
                     Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
                 )
                 .await?;
+            if let Some(profiles) = args.browser_profiles {
+                let bp = self
+                    .set_agent_browser_profiles(&resolved_target, profiles)
+                    .await?;
+                if let Some(obj) = updated.as_object_mut() {
+                    obj.insert(
+                        "browser_profiles".to_string(),
+                        bp["browser_profiles"].clone(),
+                    );
+                }
+            }
             return Ok(rmcp::handler::server::wrapper::Json(updated));
+        }
+        if let Some(profiles) = args.browser_profiles {
+            let bp = self
+                .set_agent_browser_profiles(&resolved_target, profiles)
+                .await?;
+            return Ok(rmcp::handler::server::wrapper::Json(bp));
         }
         let current: serde_json::Value = self
             .client

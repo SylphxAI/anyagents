@@ -366,6 +366,10 @@ pub struct CreateAgentRequest {
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Optional persistent browser profile grants to delegate to the new agent
+    /// (enforcing exact `child ⊆ parent` capability attenuation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_profiles: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

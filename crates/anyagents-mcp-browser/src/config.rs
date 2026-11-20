@@ -10,7 +10,7 @@ pub const DEFAULT_VIEWPORT_WIDTH: u32 = 1280;
 pub const DEFAULT_VIEWPORT_HEIGHT: u32 = 800;
 
 /// CLI arguments and environment configuration for `anyagents-mcp-browser`.
-#[derive(Clone, Debug, Parser)]
+#[derive(Clone, Parser)]
 #[command(
     name = "anyagents-mcp-browser",
     version,
@@ -25,6 +25,22 @@ pub struct BrowserServerConfig {
     /// When omitted, an ephemeral temporary directory is created per browser session.
     #[arg(long, env = "ANYAGENTS_BROWSER_PROFILE_DIR")]
     pub profile_dir: Option<PathBuf>,
+
+    /// Optional named browser profile synced with the AnyAgents coordinator
+    /// (`GET/PUT <ANYAGENTS_API_URL>/v1/browser-profiles/<profile>/archive`).
+    #[arg(long, env = "ANYAGENTS_BROWSER_PROFILE")]
+    pub profile: Option<String>,
+
+    /// Optional coordinator HTTP API base URL used for remote persistent browser
+    /// profile sync-down on open and sync-up on close.
+    #[arg(long, env = "ANYAGENTS_API_URL")]
+    pub api_url: Option<String>,
+
+    /// Optional agent capability token presented as `x-anyagents-agent` when
+    /// syncing named profiles with the coordinator (also checks `ANYAGENTS_CAPABILITY`
+    /// and `ANYAGENTS_MCP_TOKEN_FILE`).
+    #[arg(long, env = "ANYAGENTS_AGENT_TOKEN")]
+    pub agent_token: Option<String>,
 
     /// Optional proxy URL (e.g. `http://127.0.0.1:8080` or `socks5://127.0.0.1:1080`).
     #[arg(long, env = "ANYAGENTS_BROWSER_PROXY")]
@@ -47,11 +63,34 @@ pub struct BrowserServerConfig {
     pub viewport_height: u32,
 }
 
+impl std::fmt::Debug for BrowserServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserServerConfig")
+            .field("chromium_bin", &self.chromium_bin)
+            .field("profile_dir", &self.profile_dir)
+            .field("profile", &self.profile)
+            .field("api_url", &self.api_url)
+            .field(
+                "agent_token",
+                &self.agent_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("proxy", &self.proxy)
+            .field("headful", &self.headful)
+            .field("extra_args", &self.extra_args)
+            .field("viewport_width", &self.viewport_width)
+            .field("viewport_height", &self.viewport_height)
+            .finish()
+    }
+}
+
 impl Default for BrowserServerConfig {
     fn default() -> Self {
         Self {
             chromium_bin: None,
             profile_dir: None,
+            profile: None,
+            api_url: None,
+            agent_token: None,
             proxy: None,
             headful: false,
             extra_args: None,

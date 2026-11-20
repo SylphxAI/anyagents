@@ -801,67 +801,7 @@ fn hydrate_prompt_media_for_sandbox(
     state_dir: &str,
     prompt: &str,
 ) -> String {
-    let media_dir = store.data_dir().join(anyagents_harness::media::MEDIA_DIR);
-    let mut prefixes = Vec::new();
-    let dir_str = media_dir
-        .to_string_lossy()
-        .trim_end_matches('/')
-        .to_string();
-    if !dir_str.is_empty() {
-        prefixes.push(format!("{dir_str}/"));
-    }
-    if dir_str != "/var/lib/anyagents/media" {
-        prefixes.push("/var/lib/anyagents/media/".to_string());
-    }
-    let remote_media_prefix = format!("{}/media", state_dir.trim_end_matches('/'));
-    let mut rewritten = prompt.to_string();
-    let mut hydrated_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for prefix in &prefixes {
-        let mut search_from = 0usize;
-        while let Some(rel_idx) = rewritten[search_from..].find(prefix.as_str()) {
-            let start = search_from + rel_idx + prefix.len();
-            let rest = &rewritten[start..];
-            let end_offset = rest
-                .find(|c: char| {
-                    c.is_whitespace() || matches!(c, ']' | ')' | '"' | '\'' | '>' | ',' | ';')
-                })
-                .unwrap_or(rest.len());
-            let fname = rest[..end_offset].trim();
-            if !fname.is_empty()
-                && !fname.contains('/')
-                && !fname.contains('\\')
-                && !fname.contains("..")
-            {
-                hydrated_names.insert(fname.to_string());
-            }
-            search_from = start + end_offset;
-        }
-    }
-    if hydrated_names.is_empty() {
-        return rewritten;
-    }
-    let stage_dir = cfg_dir.join("media");
-    let _ = std::fs::create_dir_all(&stage_dir);
-    for fname in hydrated_names {
-        let bytes_opt = store
-            .blob_store()
-            .get_deployment_blob("media", &fname)
-            .ok()
-            .flatten()
-            .map(|b| b.content)
-            .or_else(|| std::fs::read(media_dir.join(&fname)).ok());
-        if let Some(bytes) = bytes_opt
-            && !bytes.is_empty()
-            && std::fs::write(stage_dir.join(&fname), &bytes).is_ok()
-        {
-            for prefix in &prefixes {
-                let from = format!("{prefix}{fname}");
-                let to = format!("{remote_media_prefix}/{fname}");
-                rewritten = rewritten.replace(&from, &to);
-            }
-        }
-    }
-    rewritten
+    super::s3_media_profiles::hydrate_prompt_media_for_sandbox(store, cfg_dir, state_dir, prompt)
 }
 
 /// When `ANYAGENTS_SERVERLESS=true`, synchronously dispatch all pending undelivered
