@@ -1,75 +1,42 @@
-import { useCallback, useState } from 'react';
-import { CircleAlert, CircleCheck, Gauge, Layers, Plus, RefreshCw, Zap } from 'lucide-react';
-import { api, useResource } from '../api';
-import { ActionForm, Badge, Empty, Field, Heading, Options, Panel, Problem, Refresh, formText } from '../ui';
-import { NativeDialog, nativeProviders } from './NativeDialog';
-import { LOW_QUOTA, quotaState } from './profileQuota';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { FormEvent } from 'react';
+import { ExternalLink, KeyRound, Plus, Zap } from 'lucide-react';
+import { api, errorMessage, request, useResource } from '../api';
+import { ActionForm, Badge, CopyButton, Dialog, Empty, Field, Heading, Metrics, Options, Panel, Problem, Refresh, formText } from '../ui';
 
 type Profile = { provider: string; profile: string; kind: string; account?: string; usage?: string; usage_age_ms?: number; compatible_harnesses?: string[]; assigned_agents?: string[]; subagent_count?: number };
-type DialogState = { kind: 'key' } | { kind: 'native'; initialProvider?: string };
 const presets = ['deepseek', 'glm-code-plan', 'google-gemini', 'kimi-code-plan', 'minimax-code-plan', 'openrouter', 'qwen-token-plan', 'custom'];
-const metrics = [
-  { key: 'all', label: 'Total', icon: Layers },
-  { key: 'healthy', label: 'Healthy', icon: CircleCheck },
-  { key: 'expired', label: 'OAuth Expired', icon: CircleAlert },
-  { key: 'low', label: 'Low / Zero Quota', icon: Gauge },
-] as const;
-
+function quotas(usage = '') {
+  return Array.from(usage.matchAll(/\b(5h|7d|3p|daily|weekly|monthly|quota)\s*:\s*(\d{1,3})%\s*(left|used)?([^,;]*)/gi), ([, label, count, mode, detail]) => {
+    const percent = Math.min(100, Number(count));
+    return { label, left: mode?.toLowerCase() === 'used' ? 100 - percent : percent, detail: detail.trim() };
+  });
+}
 export function ProfilesView() {
   const [live, setLive] = useState(false);
   const load = useCallback((signal: AbortSignal) => api<Profile[]>('/v1/profiles' + (live ? '?fresh=1' : ''), { signal }), [live]);
   const profiles = useResource(load);
-  const [dialog, setDialog] = useState<DialogState>();
+  const [dialog, setDialog] = useState<'key' | 'native'>();
   const [provider, setProvider] = useState(presets[0]);
-  const [filter, setFilter] = useState<typeof metrics[number]['key']>('all');
-  const list = (profiles.data ?? []).map(p => ({ ...p, ...quotaState(p.usage) }));
-  const groups = new Map<string, typeof list>();
-  for (const profile of list) {
-    if (filter !== 'all' && !profile[filter]) continue;
-    const group = groups.get(profile.provider);
-    if (group) group.push(profile);
-    else groups.set(profile.provider, [profile]);
-  }
+  const list = profiles.data ?? [];
+  const constrained = list.filter(p => quotas(p.usage).some(q => q.left <= 35)).length;
   const fresh = () => { setLive(true); profiles.refresh(); };
-  return <><Heading eyebrow="CONTROL PLANE / CAPACITY" title="Profiles & quota" blurb="Connect provider accounts and see what capacity is available.">
-      <Refresh onClick={() => { setLive(false); profiles.refresh(); }} />
-      <button className="button" onClick={fresh}><Zap size={15} /> Live quota</button>
-      <button className="button" onClick={() => { setProvider(presets[0]); setDialog({ kind: 'key' }); }}>Add API key</button>
-      <button className="button primary" onClick={() => setDialog({ kind: 'native' })}><Plus size={16} /> Connect Account</button>
+  return <><Heading eyebrow="CONTROL PLANE / CAPACITY" title="Profiles & quota" blurb="Manage provider credentials, harness sign-ins, and available quota.">
+      <Refresh onClick={() => { setLive(false); profiles.refresh(); }} /><button className="button" onClick={fresh}><Zap size={15} /> Live quota</button>
+      <button className="button primary" onClick={() => { setProvider(presets[0]); setDialog('key'); }}><Plus size={16} /> Add profile</button>
+      <button className="button" onClick={() => setDialog('native')}>Native sign-in</button>
     </Heading>
     {profiles.error && <Problem retry={profiles.refresh}>{profiles.error}</Problem>}
-    <section className="profile-pulse" aria-label="Profile filters">{metrics.map(({ key, label, icon: Icon }) =>
-      <button key={key} className={'pulse-card profile-metric ' + key} type="button" aria-pressed={key === filter} onClick={() => setFilter(key)}>
-        <span className="pulse-label"><Icon size={15} /> {label}</span>
-        <strong>{profiles.data ? key === 'all' ? list.length : list.filter(p => p[key]).length : '—'}</strong>
-      </button>)}</section>
-    {!groups.size && <Empty>{list.length ? 'No profiles match this filter.' : profiles.data ? 'Connect an account or add an API key to get started.' : profiles.error ? 'Profiles unavailable.' : 'Loading profiles…'}</Empty>}
-    {[...groups].sort(([a], [b]) => a.localeCompare(b)).map(([name, group]) => <section key={name} className="profile-group" aria-label={name}>
-      <header><h2>{name}</h2><Badge>{group.length} {group.length === 1 ? 'profile' : 'profiles'}</Badge></header>
-      <div className="profile-grid">{group.sort((a, b) => Number(b.expired) - Number(a.expired) || Number(b.low) - Number(a.low) || a.profile.localeCompare(b.profile)).map(p => {
-        const subscription = p.kind === 'subscription' || p.kind === 'oauth';
-        const supported = nativeProviders.some(provider => provider.id === p.provider);
-        return <div key={p.profile} className={'profile-card' + (p.expired ? ' expired' : '')}><Panel title={p.profile} actions={<Badge>{p.kind}</Badge>}>
-          <div className="profile-content">
-            <div className="profile-context"><p>{p.account || 'No account label'}</p>{p.usage_age_ms != null && <small className="muted">Checked {Math.round(p.usage_age_ms / 1000)}s ago</small>}</div>
-            {(p.expired || p.low || p.healthy) && <div className="chip-row">
-              {p.expired && <Badge tone="danger">OAuth expired</Badge>}
-              {p.low && <Badge tone="warning">{p.windows.some(q => q.left === 0) ? 'Quota exhausted' : 'Low quota'}</Badge>}
-              {p.healthy && <Badge tone="success">Healthy</Badge>}
-            </div>}
-            {p.windows.length ? p.windows.map((q, index) => <div key={index} className={'quota' + (q.left <= LOW_QUOTA ? ' low' : '')}>
-              <span>{q.label}</span><strong>{q.left}% left</strong><progress max={100} value={q.left} aria-label={q.label + ' remaining quota'} />{q.detail && <small className="muted">{q.detail}</small>}
-            </div>) : !p.expired && <p className="muted">{p.usage || 'No quota snapshot available'}</p>}
-            <div className="chip-row">{p.compatible_harnesses?.map(h => <Badge key={h}>{h}</Badge>)}</div>
-            <div className="muted">Assigned roots: {p.assigned_agents?.join(', ') || 'none'} · Subagents: {p.subagent_count ?? 0}</div>
-            {subscription && <div className="profile-card-action"><button className={'button' + (p.expired ? ' danger' : '')} type="button"
-              aria-label={'Refresh ' + p.provider + '/' + p.profile} onClick={() => setDialog({ kind: 'native', initialProvider: p.provider })}>
-              <RefreshCw size={14} /> Refresh</button>{!supported && <small className="muted">Native sign-in unavailable</small>}</div>}
-          </div>
-        </Panel></div>;
-      })}</div>
-    </section>)}
-    {dialog?.kind === 'key' && <ActionForm title="Add an API key profile" action="Save profile" close={() => setDialog(undefined)} submit={async (form, node) => {
+    <Metrics items={[{ label: 'Configured profiles', value: list.length }, { label: 'Constrained quota', value: constrained },
+      { label: 'Subscription seats', value: list.filter(p => p.kind === 'subscription').length }]} />
+    {!list.length && <Empty>{profiles.data ? 'Add a profile to connect a provider.' : 'Loading profiles…'}</Empty>}
+    <div className="profile-grid">{list.map(p => <Panel key={p.provider + '/' + p.profile} title={p.provider + '/' + p.profile} icon={<KeyRound size={16} />} actions={<Badge>{p.kind}</Badge>}>
+      <div className="profile-content"><div className="muted">{p.account || 'No account label'}{p.usage_age_ms != null && ' · checked ' + Math.round(p.usage_age_ms / 1000) + 's ago'}</div>
+        {quotas(p.usage).length ? quotas(p.usage).map(q => <div key={q.label} className="quota"><span>{q.label}</span><strong>{q.left}% left</strong><progress max={100} value={q.left} aria-label={q.label + ' remaining quota'} />{q.detail && <small>{q.detail}</small>}</div>) : <p>{p.usage || 'No quota snapshot available'}</p>}
+        <div className="chip-row">{p.compatible_harnesses?.map(h => <Badge key={h}>{h}</Badge>)}</div>
+        <div className="muted">Assigned roots: {p.assigned_agents?.join(', ') || 'none'} · Subagents: {p.subagent_count ?? 0}</div>
+      </div></Panel>)}</div>
+    {dialog === 'key' && <ActionForm title="Add an API key profile" action="Save profile" close={() => setDialog(undefined)} submit={async (form, node) => {
       const chosen = provider === 'custom' ? formText(form, 'custom') : provider;
       const key = formText(form, 'key'); const input = node.elements.namedItem('key');
       if (input instanceof HTMLInputElement) input.value = '';
@@ -79,6 +46,61 @@ export function ProfilesView() {
       <Field label="Profile name"><input required name="profile" defaultValue="default" /></Field>
       <Field label="API key"><input required name="key" type="password" autoComplete="off" /></Field>
     </ActionForm>}
-    {dialog?.kind === 'native' && <NativeDialog initialProvider={dialog.initialProvider} close={() => setDialog(undefined)} updated={fresh} />}
+    {dialog === 'native' && <NativeDialog close={() => setDialog(undefined)} updated={fresh} />}
   </>;
+}
+
+type NativeEvent = { kind: string; text?: string };
+function safeLink(value?: string) {
+  try { return value && /^https?:$/.test(new URL(value).protocol) ? value : undefined; } catch { return undefined; }
+}
+function NativeDialog({ close, updated }: { close: () => void; updated: () => void }) {
+  const controller = useRef<AbortController | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [events, setEvents] = useState<NativeEvent[]>([]);
+  const [error, setError] = useState('');
+  useEffect(() => () => controller.current?.abort(), []);
+  async function start(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (controller.current) return;
+    const form = new FormData(event.currentTarget);
+    const run = new AbortController(); controller.current = run;
+    setEvents([]); setError(''); setBusy(true);
+    let terminal = false;
+    function handle(line: string) {
+      if (!line.trim() || run.signal.aborted) return;
+      let message: NativeEvent;
+      try { message = JSON.parse(line) as NativeEvent; } catch { message = { kind: 'prompt', text: line }; }
+      setEvents(previous => [...previous, message].slice(-100));
+      if (message.kind === 'done') { terminal = true; updated(); }
+      if (message.kind === 'error') { terminal = true; setError(message.text || 'Native sign-in failed.'); }
+    }
+    try {
+      const response = await request('/v1/profiles/native-signin', { method: 'POST', signal: run.signal, accept: 'application/x-ndjson', body: { harness: formText(form, 'harness'), profile: formText(form, 'profile') } });
+      if (!response.body) throw new Error('Sign-in stream unavailable.');
+      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+      let tail = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const lines = (tail + value).split('\n'); tail = lines.pop() ?? '';
+        for (const line of lines) handle(line);
+      }
+      handle(tail);
+      if (!terminal && !run.signal.aborted) throw new Error('The sign-in stream ended before confirmation.');
+    } catch (cause) { if (!run.signal.aborted) setError(errorMessage(cause)); }
+    finally { controller.current = null; setBusy(false); }
+  }
+  return <Dialog title="Native subscription sign-in" close={close}>
+    <form className="dialog-body" onSubmit={start}>
+      <p className="muted">Start the harness login, then follow the sign-in link and device instructions here.</p>
+      <fieldset className="form-fields" disabled={busy}><div className="two-cols"><Field label="Harness"><select name="harness"><Options items={['agy', 'claude-code', 'codex']} /></select></Field><Field label="Profile name"><input required name="profile" defaultValue="default" /></Field></div></fieldset>
+      {events.length > 0 && <div className="native-events" aria-live="polite">{events.map((event, index) => {
+        const link = event.kind === 'link' ? safeLink(event.text) : undefined;
+        return <div key={index}>{link ? <a className="button" href={link} target="_blank" rel="noopener noreferrer"><ExternalLink size={15} /> Open sign-in page</a> : event.kind === 'code' && event.text ? <span className="cluster"><code>{event.text}</code><CopyButton value={event.text} label="Copy device code" /></span> : event.kind === 'done' ? 'Signed in successfully.' : event.text}</div>;
+      })}</div>}
+      {error && <Problem>{error}</Problem>}
+      <div className="dialog-footer">{busy && <button type="button" className="button" onClick={() => controller.current?.abort()}>Cancel sign-in</button>}<button className="button primary" disabled={busy}>{busy ? 'Waiting for sign-in…' : 'Start native sign-in'}</button></div>
+    </form>
+  </Dialog>;
 }

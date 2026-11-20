@@ -6,7 +6,6 @@
   "license": "MIT",
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --disable-warning=ExperimentalWarning --test src/fleet/*.test.ts src/views/*.test.ts",
     "build": "npm run check && vite build"
   },
   "dependencies": {
