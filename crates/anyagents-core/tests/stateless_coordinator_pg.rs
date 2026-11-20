@@ -738,7 +738,7 @@ fn pg_remote_turn_store_survives_replica_handoff_and_settles_idempotently() {
         .expect("open replica B");
 
     const {
-        assert!(anyagents_core::db::PG_LATEST_VERSION >= 5);
+        assert!(anyagents_core::db::PG_LATEST_VERSION >= 8);
     }
 
     let agent = store_a
@@ -771,6 +771,26 @@ fn pg_remote_turn_store_survives_replica_handoff_and_settles_idempotently() {
         })
         .expect("replica A inserts pending remote turn");
     assert_eq!(created.status, "dispatched");
+
+    // Partial UNIQUE index rejects a second concurrent active turn for the same agent.
+    let dup_err = turns_b
+        .create_turn(&NewRemoteTurn {
+            turn_id: generate_turn_id(),
+            agent_id: agent.id.clone(),
+            harness_kind: "spiron".to_string(),
+            provider_kind: Some("cloud".to_string()),
+            remote_run_id: None,
+            callback_token_hash: hash_callback_token(&generate_callback_token()),
+            cursor: None,
+            status: "running".to_string(),
+            next_poll_at_ms: None,
+            metadata_json: None,
+        })
+        .expect_err("duplicate active turn must fail closed via partial UNIQUE index");
+    assert!(
+        dup_err.is_active_turn_conflict(),
+        "expected active-turn conflict, got {dup_err:?}"
+    );
 
     // Replica B verifies constant-time callback token and rejects wrong tokens.
     assert!(
@@ -871,7 +891,26 @@ fn pg_remote_turn_store_survives_replica_handoff_and_settles_idempotently() {
     );
     assert!(turns_b.list_active_for_agent(&agent.id).unwrap().is_empty());
 
+    // Once settled, a subsequent active turn for the same agent succeeds cleanly.
+    let next_turn_id = generate_turn_id();
+    let next_turn = turns_b
+        .create_turn(&NewRemoteTurn {
+            turn_id: next_turn_id.clone(),
+            agent_id: agent.id.clone(),
+            harness_kind: "spiron".to_string(),
+            provider_kind: Some("cloud".to_string()),
+            remote_run_id: None,
+            callback_token_hash: hash_callback_token(&generate_callback_token()),
+            cursor: None,
+            status: "dispatched".to_string(),
+            next_poll_at_ms: None,
+            metadata_json: None,
+        })
+        .expect("new active turn must succeed after previous turn settled");
+    assert_eq!(next_turn.turn_id, next_turn_id);
+
     // Clean up test rows.
+    turns_b.delete_turn(&next_turn_id).unwrap();
     turns_b.delete_turn(&turn_id).unwrap();
     store_b.delete_agent(&agent.id).unwrap();
 }

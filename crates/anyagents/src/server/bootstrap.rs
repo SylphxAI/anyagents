@@ -683,6 +683,11 @@ async fn serve(
             state.health.clone(),
             stopping.subscribe(),
         );
+    } else if serverless
+        && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+        && !crate::sandbox::is_isolated_test_env()
+    {
+        spawn_serverless_startup_backlog_drain(Arc::clone(&store), stopping.subscribe());
     }
     // `public_listen` decides whether the local TCP listener is also the
     // public one. A configuration file that cannot be read fails closed: no
@@ -1232,4 +1237,87 @@ fn set_socket_mode(path: &Path) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+/// Spawn a lightweight one-shot startup backlog drain in serverless mode so
+/// undelivered messages queued across coordinator restarts are dispatched promptly
+/// without waiting for the next external tick. Cancels cleanly on shutdown.
+fn spawn_serverless_startup_backlog_drain(
+    store: Arc<Store>,
+    stop: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(run_serverless_startup_backlog_drain(
+        store,
+        stop,
+        std::time::Duration::from_secs(2),
+    ));
+}
+
+async fn run_serverless_startup_backlog_drain(
+    store: Arc<Store>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    delay: std::time::Duration,
+) {
+    tokio::select! {
+        biased;
+        _ = stop.wait_for(|stopped| *stopped) => return,
+        _ = tokio::time::sleep(delay) => {}
+    }
+    let store_scan = Arc::clone(&store);
+    let pending = tokio::task::spawn_blocking(move || {
+        if let Err(err) = store_scan.reconcile_all_stale_serverless_open_turns()
+            && !err.is_missing_schema_object()
+        {
+            eprintln!("anyagents-serverless: startup open-turn reconcile failed: {err}");
+        }
+        match store_scan.list_running_agents_with_undelivered(24) {
+            Ok(agents) => agents,
+            Err(err) => {
+                eprintln!("anyagents-serverless: startup backlog scan failed: {err}");
+                Vec::new()
+            }
+        }
+    })
+    .await
+    .unwrap_or_default();
+
+    for aid in pending {
+        if *stop.borrow() {
+            break;
+        }
+        let store_disp = Arc::clone(&store);
+        let call = in_flight::carry();
+        tokio::spawn(async move {
+            let _call = call;
+            if let Err(err) =
+                serverless::dispatch_next_mailbox_message_if_serverless(store_disp, &aid).await
+            {
+                eprintln!(
+                    "anyagents-serverless: startup backlog dispatch failed for `{aid}`: {err}"
+                );
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn serverless_startup_backlog_drain_cancels_cleanly_on_shutdown() {
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_serverless_startup_backlog_drain(
+            store,
+            stop_rx,
+            std::time::Duration::from_secs(60),
+        ));
+        let _ = stop_tx.send(true);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("startup drain must exit immediately on shutdown")
+            .unwrap();
+    }
 }

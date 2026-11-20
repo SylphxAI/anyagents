@@ -450,7 +450,14 @@ impl RemoteTurnStore for PgRemoteTurnStore {
                 .bind(next_poll_at_ms)
                 .fetch_one(&pool)
                 .await
-                .map_err(Error::from)
+                .map_err(|err| {
+                    let mapped = Error::from(err);
+                    if mapped.is_active_turn_conflict() {
+                        Error::TurnAlreadyActive(aid.clone())
+                    } else {
+                        mapped
+                    }
+                })
         })?;
         Self::decode_row(row)
     }
@@ -941,6 +948,14 @@ impl RemoteTurnStore for FsRemoteTurnStore {
                 "remote turn `{turn_id}` already exists"
             )));
         }
+        if !is_terminal_remote_turn_status(&status)
+            && self
+                .list_all_unlocked()?
+                .iter()
+                .any(|t| t.agent_id == input.agent_id && !t.is_terminal())
+        {
+            return Err(Error::TurnAlreadyActive(input.agent_id.to_string()));
+        }
         let now = now_ms();
         let turn = PendingRemoteTurn {
             turn_id,
@@ -1393,5 +1408,106 @@ mod tests {
         // Settled turn no longer appears in due polls or active turns.
         assert!(store.list_due_polls(now + 100_000, 10).unwrap().is_empty());
         assert!(store.list_active_for_agent(&agent_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_turn_fails_closed_on_duplicate_active_agent_turn_and_recovers_after_settle() {
+        let dir = crate::test_tempdir();
+        let fs_store = Arc::new(FsRemoteTurnStore::new(dir.path()));
+        let mem_store = Arc::new(InMemoryRemoteTurnStore::new());
+        let mk_input = |turn_id: &str, agent_id: &AgentId, status: &str| NewRemoteTurn {
+            turn_id: turn_id.to_string(),
+            agent_id: agent_id.clone(),
+            harness_kind: "sandbox".to_string(),
+            provider_kind: Some("http".to_string()),
+            remote_run_id: None,
+            callback_token_hash: hash_callback_token(&format!("tok-{turn_id}")),
+            cursor: None,
+            status: status.to_string(),
+            metadata_json: None,
+            next_poll_at_ms: None,
+        };
+
+        for store in [
+            Arc::clone(&fs_store) as Arc<dyn RemoteTurnStore>,
+            Arc::clone(&mem_store) as Arc<dyn RemoteTurnStore>,
+        ] {
+            let aid = AgentId::generate();
+            let other = AgentId::generate();
+
+            // Concurrent race across 8 threads: strictly one active turn wins.
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let mut handles = Vec::new();
+            for i in 0..8usize {
+                let s = Arc::clone(&store);
+                let b = Arc::clone(&barrier);
+                let a = aid.clone();
+                let st = if i.is_multiple_of(2) {
+                    "dispatched"
+                } else {
+                    "running"
+                };
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    s.create_turn(&mk_input(&format!("turn_race_{i}"), &a, st))
+                }));
+            }
+            let mut winners = Vec::new();
+            let mut conflicts = 0usize;
+            for h in handles {
+                match h.join().unwrap() {
+                    Ok(t) => winners.push(t.turn_id),
+                    Err(err) => {
+                        assert!(err.is_active_turn_conflict(), "unexpected error: {err:?}");
+                        assert!(matches!(err, Error::TurnAlreadyActive(_)));
+                        conflicts += 1;
+                    }
+                }
+            }
+            assert_eq!(winners.len(), 1);
+            assert_eq!(conflicts, 7);
+            assert_eq!(store.list_active_for_agent(&aid).unwrap().len(), 1);
+
+            // Different agent can still create an active turn concurrently.
+            store
+                .create_turn(&mk_input("turn_other_agent", &other, "running"))
+                .unwrap();
+
+            // Back-to-back active turn for same agent fails closed while winner is active.
+            let dup = store
+                .create_turn(&mk_input("turn_dup_after_race", &aid, "running"))
+                .unwrap_err();
+            assert!(dup.is_active_turn_conflict());
+
+            // Once settled (completed / failed / cancelled), a new active turn succeeds.
+            for (idx, terminal) in ["completed", "failed", "cancelled"].iter().enumerate() {
+                let current_id = if idx == 0 {
+                    winners[0].clone()
+                } else {
+                    format!("turn_after_{idx}")
+                };
+                let settled = store
+                    .settle_turn(
+                        &current_id,
+                        &SettleRemoteTurn {
+                            status: (*terminal).to_string(),
+                            result_text: None,
+                            error_text: None,
+                            usage_json: None,
+                            cursor: None,
+                            settled_at_ms: now_ms(),
+                        },
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert!(settled.transitioned);
+
+                let next_id = format!("turn_after_{}", idx + 1);
+                let next = store
+                    .create_turn(&mk_input(&next_id, &aid, "dispatched"))
+                    .expect("new active turn must succeed once previous is settled");
+                assert_eq!(next.turn_id, next_id);
+            }
+        }
     }
 }

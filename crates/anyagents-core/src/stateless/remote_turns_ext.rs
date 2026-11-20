@@ -166,6 +166,13 @@ impl RemoteTurnStore for InMemoryRemoteTurnStore {
                 "remote turn `{turn_id}` already exists"
             )));
         }
+        if !is_terminal_remote_turn_status(&status)
+            && map
+                .values()
+                .any(|t| t.agent_id == input.agent_id && !t.is_terminal())
+        {
+            return Err(Error::TurnAlreadyActive(input.agent_id.to_string()));
+        }
         let now = now_ms();
         let turn = PendingRemoteTurn {
             turn_id: turn_id.clone(),

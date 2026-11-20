@@ -1,18 +1,27 @@
 //! Serverless turn message-envelope assembly, deployment-skill hydration, and
 //! non-revoking remote MCP session token reuse.
 
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
-use anyagents_core::{AgentId, Message, Store, now_ms};
+use anyagents_core::{Agent, AgentId, Message, Store, now_ms};
 use anyagents_harness::{
     Context, GUEST_MESSAGE_B64_ENV, MESSAGE_MARKER_PREFIX, OutboundMessage, compose_message,
     encode_outbound_message_b64,
 };
 
-use crate::sandbox_providers::providers::ExecRequest;
+use crate::sandbox_providers::providers::{
+    ExecRequest, ImageSpec, LeasePolicy, SandboxHandle, SandboxProvider, build_bundle_tar_gz,
+};
 
 const SERVERLESS_REMOTE_SESSION_TTL_MS: i64 = 3_782_000;
 const SERVERLESS_TOKEN_REUSE_MARGIN_MS: i64 = 600_000;
+/// Maximum byte length of base64-encoded `ANYAGENTS_GUEST_MESSAGE_B64` placed
+/// in `execve` environment variables. Payloads above this threshold are staged
+/// into `<state_dir>/turns/<turn_id>.message.json` and passed via
+/// `--message-file` to stay safely below Linux's 128 KiB `MAX_ARG_STRLEN`.
+pub(crate) const MAX_INLINE_GUEST_MESSAGE_B64_BYTES: usize = 64 * 1024;
 
 /// Format Unix epoch milliseconds as an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`).
 pub(crate) fn format_utc_timestamp_ms(ms: i64) -> Option<String> {
@@ -292,15 +301,17 @@ pub(crate) fn deduplicate_hydrated_system_prompts(cfg_dir: &Path) {
 
 /// Update `outbound` with the media-rewritten `effective_prompt` (preserving
 /// flat sibling `<message>` separation for multi-message batches) and attach
-/// the base64-encoded JSON [`OutboundMessage`] to `exec_req.env`.
+/// the base64-encoded JSON [`OutboundMessage`] to `exec_req.env` when small.
+///
+/// When the base64 payload exceeds [`MAX_INLINE_GUEST_MESSAGE_B64_BYTES`], omits
+/// `ANYAGENTS_GUEST_MESSAGE_B64` from `exec_req.env` (preventing Linux `E2BIG`)
+/// and returns the raw JSON bytes so the caller can stage `--message-file`.
 pub(crate) fn attach_outbound_message_env(
     exec_req: &mut ExecRequest,
     outbound: Option<OutboundMessage>,
     effective_prompt: &str,
-) {
-    let Some(mut msg) = outbound else {
-        return;
-    };
+) -> Option<Vec<u8>> {
+    let mut msg = outbound?;
     let is_multi_batch = msg
         .context
         .topology
@@ -339,10 +350,185 @@ pub(crate) fn attach_outbound_message_env(
         msg.text = effective_prompt.to_string();
     }
     if let Ok(encoded) = encode_outbound_message_b64(&msg) {
-        exec_req
-            .env
-            .insert(GUEST_MESSAGE_B64_ENV.to_string(), encoded);
+        if encoded.len() <= MAX_INLINE_GUEST_MESSAGE_B64_BYTES {
+            exec_req
+                .env
+                .insert(GUEST_MESSAGE_B64_ENV.to_string(), encoded);
+            return None;
+        }
+        exec_req.env.remove(GUEST_MESSAGE_B64_ENV);
+        return serde_json::to_vec(&msg).ok();
     }
+    None
+}
+
+/// Upload an oversized JSON-serialized [`OutboundMessage`] into
+/// `<state_dir>/turns/<turn_id>.message.json` inside the sandbox and return its
+/// absolute remote path for `anyagents-guest turn --message-file`.
+pub(crate) async fn stage_oversized_outbound_message_file(
+    provider: &dyn SandboxProvider,
+    handle: &SandboxHandle,
+    turn_id: &str,
+    json_bytes: &[u8],
+) -> Result<String, String> {
+    let rel = format!("turns/{turn_id}.message.json");
+    let tar_gz = build_bundle_tar_gz(&[(rel.clone(), json_bytes.to_vec())])?;
+    provider
+        .sync_bundle_tar(handle, &handle.state_dir, &tar_gz)
+        .await?;
+    Ok(format!("{}/{rel}", handle.state_dir.trim_end_matches('/')))
+}
+
+/// Build the `anyagents-guest turn --detached` argument vector for a sandbox turn.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_detached_guest_turn_argv(
+    guest_bin: String,
+    turn_id: &str,
+    agent: &anyagents_core::Agent,
+    callback_url: &str,
+    callback_token: &str,
+    handle: &SandboxHandle,
+    guest_program: Option<&str>,
+    heartbeat_interval_ms: Option<u64>,
+    message_file: Option<&str>,
+    guest_extra_args: &[String],
+) -> Vec<String> {
+    let mut argv = vec![
+        guest_bin,
+        "turn".to_string(),
+        "--detached".to_string(),
+        "--turn-id".to_string(),
+        turn_id.to_string(),
+        "--agent-id".to_string(),
+        agent.id.as_str().to_string(),
+        "--harness".to_string(),
+        agent.harness.clone(),
+        "--prompt-stdin".to_string(),
+        "--callback-url".to_string(),
+        callback_url.to_string(),
+        "--callback-token".to_string(),
+        callback_token.to_string(),
+        "--state-dir".to_string(),
+        handle.state_dir.clone(),
+        "--workdir".to_string(),
+        handle.workdir.clone(),
+    ];
+    if let Some(mf) = message_file {
+        argv.push("--message-file".to_string());
+        argv.push(mf.to_string());
+    }
+    if let Some(prog) = guest_program {
+        argv.push("--program".to_string());
+        argv.push(prog.to_string());
+    }
+    if let Some(ref model) = agent.model
+        && !model.trim().is_empty()
+    {
+        argv.push("--model".to_string());
+        argv.push(model.clone());
+    }
+    if let Some(hb) = heartbeat_interval_ms {
+        argv.push("--heartbeat-interval-ms".to_string());
+        argv.push(hb.to_string());
+    }
+    if !guest_extra_args.is_empty() {
+        argv.push("--".to_string());
+        argv.extend(guest_extra_args.iter().cloned());
+    }
+    argv
+}
+
+/// Ensure a remote sandbox lease for `agent` (resolving code-tier shape/volume
+/// overrides for repo-backed agents), hydrate durable config/secrets/memory/media,
+/// and sync the agent bundle archive into the sandbox.
+///
+/// Returns `Err((Some(handle), msg))` if preparation or tar sync fails after
+/// `ensure_sandbox_with_provider` succeeded so the caller can release/retry.
+pub(crate) async fn ensure_and_prepare_sandbox_for_turn(
+    store: Arc<Store>,
+    provider: Arc<dyn SandboxProvider>,
+    agent: Agent,
+    prompt_for_media: String,
+    base_url: String,
+    extra_args: Vec<String>,
+) -> Result<(crate::sandbox_exec::EnsuredSandbox, String), (Option<Box<SandboxHandle>>, String)> {
+    tokio::task::spawn_blocking(move || {
+        let cfg_dir = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+        let remote_workdir = super::resolve_remote_sandbox_workdir(&store, &agent);
+        let lease_env: BTreeMap<String, String> =
+            crate::sandbox_exec::filter_sandbox_launch_env(&agent.launch_env)
+                .into_iter()
+                .collect();
+        let (shape, vol_gib) = crate::sandbox_exec::resolve_sandbox_shape_and_volume_for_agent(
+            &store,
+            &agent.id,
+            crate::sandbox_exec::read_synced_repo_spec(&cfg_dir).is_some(),
+            None,
+            None,
+        );
+        let ensured = crate::sandbox_exec::ensure_sandbox_with_provider(
+            &store,
+            Arc::clone(&provider),
+            &ImageSpec::default(),
+            &LeasePolicy::default(),
+            shape,
+            vol_gib,
+            &agent.id,
+            Some(&agent.name),
+            &cfg_dir,
+            Some(&remote_workdir),
+            &lease_env,
+        )
+        .map_err(|e| (None, e))?;
+
+        let prep: Result<String, String> = (|| {
+            let _ =
+                crate::sandbox_exec::hydrate_agent_files_from_store(&store, &agent.id, &cfg_dir)?;
+            ensure_deployment_skills_hydrated(&store);
+            let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(&store, &agent.id);
+            let _ = super::serverless_memory::refresh_hydrated_prompt_learned_memory(
+                &store, &agent, &cfg_dir,
+            );
+            deduplicate_hydrated_system_prompts(&cfg_dir);
+            if anyagents_harness::normalize_harness_name(&agent.harness) == "agy" {
+                let _ = crate::vendor::ensure_agy_steering_settings(
+                    &cfg_dir,
+                    Path::new(&ensured.handle.workdir),
+                    &store.data_dir().join(anyagents_harness::media::MEDIA_DIR),
+                );
+            }
+            let rewritten_prompt = super::s3_media_profiles::hydrate_prompt_media_for_sandbox(
+                &store,
+                &cfg_dir,
+                &ensured.handle.state_dir,
+                &prompt_for_media,
+            );
+            if crate::remote::require_public_url(store.data_dir()).is_ok() {
+                let _ = ensure_serverless_remote_session_token(&store, &agent.id, &base_url)?;
+            }
+            if crate::remote::session_token(&cfg_dir).is_ok()
+                && crate::remote::resolve_public_mcp_url(&cfg_dir).is_ok()
+            {
+                crate::sandbox_exec::sync_agent_bundle_tar_to_provider(
+                    provider.as_ref(),
+                    &ensured.handle,
+                    Some(&store),
+                    Some(store.data_dir()),
+                    &cfg_dir,
+                    agent.id.as_str(),
+                    &agent.harness,
+                    &extra_args,
+                )?;
+            }
+            Ok(rewritten_prompt)
+        })();
+        match prep {
+            Ok(rewritten) => Ok((ensured, rewritten)),
+            Err(e) => Err((Some(Box::new(ensured.handle)), e)),
+        }
+    })
+    .await
+    .map_err(|e| (None, format!("sandbox ensure join error: {e}")))?
 }
 
 /// Obtain a live remote MCP session token for `agent_id` in serverless dispatch
@@ -734,5 +920,29 @@ mod tests {
         assert!(deduped.contains("Keep replies concise."));
         // Idempotent on already-clean markdown.
         assert_eq!(deduplicate_markdown_sections(&deduped), deduped);
+    }
+
+    #[test]
+    fn oversized_outbound_message_omits_env_and_returns_json_for_message_file() {
+        let big_body = "A".repeat(MAX_INLINE_GUEST_MESSAGE_B64_BYTES + 16 * 1024);
+        let msg = sample_message(
+            "msg_big_1",
+            1,
+            "operator",
+            "operator",
+            &big_body,
+            1_700_000_000_000,
+            Context::default(),
+        );
+        let (prompt, outbound) = build_serverless_outbound_message(&[msg]);
+        let mut req = ExecRequest::argv(["anyagents-guest", "turn"]);
+        let staged = attach_outbound_message_env(&mut req, Some(outbound), &prompt)
+            .expect("oversized outbound message must return JSON bytes for --message-file");
+        assert!(
+            !req.env.contains_key(GUEST_MESSAGE_B64_ENV),
+            "oversized message must NEVER be placed into ANYAGENTS_GUEST_MESSAGE_B64 env var"
+        );
+        let decoded: OutboundMessage = serde_json::from_slice(&staged).unwrap();
+        assert_eq!(decoded.text, big_body);
     }
 }

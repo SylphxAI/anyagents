@@ -41,8 +41,9 @@ pub const TEST_POSTGRES_URL_ENV: &str = "ANYAGENTS_TEST_POSTGRES_URL";
 mod pg_migrations;
 pub mod sqlite_to_pg;
 pub use pg_migrations::{
-    PG_AGENT_RUNTIME_SQL, PG_BROWSER_PROFILE_GRANTS_SQL, PG_DEPLOYMENT_SECRETS_SQL, PG_INIT_SQL,
-    PG_LATEST_VERSION, PG_SERVERLESS_TURNS_SQL, PG_STATELESS_SQL,
+    PG_ACTIVE_TURN_UNIQUE_SQL, PG_AGENT_RUNTIME_SQL, PG_BROWSER_PROFILE_GRANTS_SQL,
+    PG_DEPLOYMENT_SECRETS_SQL, PG_INIT_SQL, PG_LATEST_VERSION, PG_SERVERLESS_TURNS_SQL,
+    PG_STATELESS_SQL,
 };
 pub use sqlite_to_pg::{
     MigrateToPostgresOptions, MigrateToPostgresReport, TableMigrationStat,
@@ -238,7 +239,7 @@ pub fn redact_database_url(url: &str) -> String {
 /// `Store` / `HostIndex` / CLI callers never panic or starve an outer Tokio task.
 static PG_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(8)
         .thread_name("anyagents-pg-io")
         .enable_all()
         .build()
@@ -282,7 +283,7 @@ pub(crate) fn build_pg_pool(url: &str, max_connections: Option<u32>) -> Result<P
         .or_else(|| {
             non_empty_trimmed_env(PG_MAX_CONNECTIONS_ENV).and_then(|v| v.parse::<u32>().ok())
         })
-        .unwrap_or(24)
+        .unwrap_or(64)
         .max(2);
     block_on_pg(async move {
         PgPoolOptions::new()
@@ -446,7 +447,6 @@ pub fn migrate_postgres(url: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Convert SQLite `?N` and anonymous `?` bind placeholders to PostgreSQL `$N`
 /// Translate SQLite `?` / `?N` placeholders into PostgreSQL `$N` placeholders
 /// and schema-qualify `memory_index.*` / `host_index.*` tables so queries stay
 /// independent of session `search_path` under transaction-mode PgBouncer, while

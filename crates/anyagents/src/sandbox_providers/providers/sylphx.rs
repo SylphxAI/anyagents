@@ -48,6 +48,10 @@ use super::{
 
 const DEFAULT_SYLPHX_ENDPOINT: &str = "https://api.sylphx.com";
 const LEASE_READY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Maximum raw stdin size inlined via `printf '%s' '<b64>'` in `argv`.
+/// Larger payloads are uploaded via `:writeFile` to stay well below Linux's
+/// 128 KiB `MAX_ARG_STRLEN` limit per `argv`/`envp` string.
+const INLINE_STDIN_MAX_BYTES: usize = 24 * 1024;
 
 /// Configuration for [`SylphxProvider`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -350,24 +354,45 @@ impl SandboxProvider for SylphxProvider {
             .unwrap_or_else(|| handle.workdir.clone());
         let env = req.env.clone();
         let timeout_ms = req.timeout_ms;
-        let command = if let Some(ref stdin_bytes) = req.stdin {
-            let b64 = base64_encode(stdin_bytes);
-            let inner = req
-                .command
-                .iter()
-                .map(|a| shell_single_quote(a))
-                .collect::<Vec<_>>()
-                .join(" ");
-            vec![
-                "/bin/sh".to_string(),
-                "-lc".to_string(),
-                format!("printf '%s' '{b64}' | base64 -d | {inner}"),
-            ]
-        } else {
-            req.command.clone()
-        };
+        let stdin_bytes = req.stdin.clone();
+        let base_command = req.command.clone();
 
-        run_blocking(move || client.exec(&resource, &command, Some(&cwd), &env, timeout_ms)).await
+        run_blocking(move || {
+            let command = match stdin_bytes {
+                Some(bytes) if bytes.len() > INLINE_STDIN_MAX_BYTES => {
+                    let seq = TAR_UPLOAD_SEQ.fetch_add(1, Ordering::Relaxed);
+                    let tmp_stdin = format!("/tmp/.anyagents-stdin-{}-{seq}", std::process::id());
+                    client.write_file(&resource, &tmp_stdin, &bytes)?;
+                    let inner = base_command
+                        .iter()
+                        .map(|a| shell_single_quote(a))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let q = shell_single_quote(&tmp_stdin);
+                    vec![
+                        "/bin/sh".to_string(),
+                        "-lc".to_string(),
+                        format!("exec 3<{q}; rm -f {q}; {inner} <&3 3<&-"),
+                    ]
+                }
+                Some(bytes) => {
+                    let b64 = base64_encode(&bytes);
+                    let inner = base_command
+                        .iter()
+                        .map(|a| shell_single_quote(a))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    vec![
+                        "/bin/sh".to_string(),
+                        "-lc".to_string(),
+                        format!("printf '%s' '{b64}' | base64 -d | {inner}"),
+                    ]
+                }
+                None => base_command,
+            };
+            client.exec(&resource, &command, Some(&cwd), &env, timeout_ms)
+        })
+        .await
     }
 
     async fn sync_bundle_tar(
@@ -502,4 +527,132 @@ fn resolve_data_plane_resource(parent: &str, handle: &SandboxHandle) -> String {
         .get("data_plane_resource")
         .cloned()
         .unwrap_or_else(|| resolve_lease_resource(parent, handle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::State;
+    use axum::http::Uri;
+    use axum::{Json, Router};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde_json::{Value, json};
+
+    type RecordedBytes = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+    #[derive(Clone, Default)]
+    struct MockSylphxState {
+        write_files: RecordedBytes,
+        exec_commands: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    async fn mock_sylphx_handler(
+        State(state): State<MockSylphxState>,
+        uri: Uri,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let path = uri.path();
+        if path.ends_with(":writeFile") {
+            let file_path = body
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let b64 = body
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let decoded = STANDARD
+                .decode(b64)
+                .expect("valid base64 writeFile payload");
+            state.write_files.lock().unwrap().push((file_path, decoded));
+            return Json(json!({}));
+        }
+        if path.ends_with(":exec") {
+            let cmd = body
+                .get("command")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            state.exec_commands.lock().unwrap().push(cmd);
+            return Json(json!({ "exit_code": 0, "stdout": "", "stderr": "" }));
+        }
+        Json(json!({}))
+    }
+
+    #[tokio::test]
+    async fn sylphx_exec_stages_oversized_stdin_via_write_file_instead_of_argv() {
+        let state = MockSylphxState::default();
+        let app = Router::new()
+            .fallback(mock_sylphx_handler)
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = SylphxConfig::new("orgs/o/projects/p/envs/e");
+        cfg.endpoint = format!("http://{addr}");
+        let provider = SylphxProvider::new(cfg).unwrap();
+        let handle = SandboxHandle {
+            provider: ProviderKind::Sylphx,
+            sandbox_id: "sbx-stdin-test".to_string(),
+            volume_id: Some("vol-stdin-test".to_string()),
+            mount_path: DEFAULT_MOUNT_PATH.to_string(),
+            state_dir: "/home/user/agent-data/state".to_string(),
+            workdir: "/home/user/agent-data/workspace".to_string(),
+            transport_url: None,
+            transport_token: None,
+            expires_at: None,
+            metadata: BTreeMap::new(),
+        };
+
+        // 1. Small stdin (<= 24 KiB) stays inline without an extra :writeFile round-trip.
+        let small_req = ExecRequest::argv(["/usr/local/bin/anyagents-guest", "turn"])
+            .with_stdin(b"small prompt".to_vec());
+        let out_small = provider.exec(&handle, &small_req).await.unwrap();
+        assert_eq!(out_small.exit_code, 0);
+        assert!(state.write_files.lock().unwrap().is_empty());
+        {
+            let cmds = state.exec_commands.lock().unwrap();
+            assert_eq!(cmds.len(), 1);
+            assert!(cmds[0][2].contains("printf '%s'"));
+            assert!(cmds[0][2].contains("base64 -d"));
+        }
+
+        // 2. Oversized stdin (> 24 KiB) uploads via :writeFile and keeps argv tiny.
+        let big_payload = vec![b'X'; INLINE_STDIN_MAX_BYTES + 8 * 1024];
+        let big_req = ExecRequest::argv(["/usr/local/bin/anyagents-guest", "turn"])
+            .with_stdin(big_payload.clone());
+        let out_big = provider.exec(&handle, &big_req).await.unwrap();
+        assert_eq!(out_big.exit_code, 0);
+        {
+            let writes = state.write_files.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            assert!(writes[0].0.starts_with("/tmp/.anyagents-stdin-"));
+            assert_eq!(writes[0].1, big_payload);
+        }
+        {
+            let cmds = state.exec_commands.lock().unwrap();
+            assert_eq!(cmds.len(), 2);
+            let script = &cmds[1][2];
+            assert!(script.contains("exec 3<"), "{script}");
+            assert!(script.contains("rm -f"), "{script}");
+            assert!(script.contains("<&3"), "{script}");
+            assert!(
+                script.len() < 1024,
+                "oversized stdin must not be inlined into argv (got {} bytes)",
+                script.len()
+            );
+        }
+
+        server.abort();
+    }
 }
