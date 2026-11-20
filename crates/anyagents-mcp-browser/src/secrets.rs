@@ -91,6 +91,16 @@ pub fn resolve_secret(secret_ref: &str) -> Result<Secret, BrowserError> {
     resolve_secret_with(secret_ref, None, |k| std::env::var(k).ok())
 }
 
+pub(crate) fn resolve_secret_raw(secret_ref: &str) -> Result<String, BrowserError> {
+    match parse_secret_ref(secret_ref)? {
+        SecretSource::OpRead(r) => run_op_read(None, &r),
+        SecretSource::Env(var) => std::env::var(&var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| res_err("environment secret reference is unset or empty")),
+    }
+}
+
 pub fn resolve_secret_with<F>(
     secret_ref: &str,
     op_bin: Option<&Path>,

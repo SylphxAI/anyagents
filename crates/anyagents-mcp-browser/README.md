@@ -24,7 +24,7 @@ Optional standalone stdio MCP server providing headless Chromium CDP browser aut
 |---|---|---|---|
 | `--chromium-bin` | `ANYAGENTS_CHROMIUM_BIN` | Auto-discovered | Explicit Chromium / Chrome / Playwright binary path |
 | `--profile-dir` | `ANYAGENTS_BROWSER_PROFILE_DIR` | Ephemeral tempdir | Persistent Chromium profile directory |
-| `--proxy` | `ANYAGENTS_BROWSER_PROXY` | Direct | Optional HTTP/SOCKS5 proxy URL |
+| `--proxy` | `ANYAGENTS_BROWSER_PROXY` | Direct | Optional browser-only HTTP/HTTPS/SOCKS5/SOCKS5H proxy URL (also supports per-profile `ANYAGENTS_BROWSER_PROXY_<PROFILE>` and per-call `proxy`/`proxy_env`; never reads global `HTTP_PROXY`) |
 | `--headful` | `ANYAGENTS_BROWSER_HEADFUL` | `false` | Launch with a visible window instead of `--headless=new` |
 | `--extra-args` | `ANYAGENTS_BROWSER_ARGS` | None | Extra whitespace-separated Chromium flags |
 | `--viewport-width` | — | `1280` | Initial viewport width in CSS pixels |

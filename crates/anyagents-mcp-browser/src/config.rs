@@ -81,7 +81,10 @@ impl std::fmt::Debug for BrowserServerConfig {
                 &self.agent_token.as_ref().map(|_| "[redacted]"),
             )
             .field("screenshot_dir", &self.screenshot_dir)
-            .field("proxy", &self.proxy)
+            .field(
+                "proxy",
+                &self.proxy.as_deref().map(crate::proxy::redact_proxy_url),
+            )
             .field("headful", &self.headful)
             .field("extra_args", &self.extra_args)
             .field("viewport_width", &self.viewport_width)
@@ -159,5 +162,19 @@ mod tests {
         assert_eq!(cfg.chromium_bin, Some(PathBuf::from("/usr/bin/chromium")));
         assert_eq!(cfg.profile_dir, Some(PathBuf::from("/tmp/profile")));
         assert!(cfg.headful);
+    }
+
+    #[test]
+    fn debug_redacts_proxy_and_agent_token_credentials() {
+        let cfg = BrowserServerConfig {
+            agent_token: Some("tok-secret".into()),
+            proxy: Some("http://user:pw-secret@proxy.example:8080".into()),
+            ..Default::default()
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("tok-secret"));
+        assert!(!dbg.contains("pw-secret"));
+        assert!(!dbg.contains("user:"));
+        assert!(dbg.contains("proxy.example:8080"));
     }
 }
