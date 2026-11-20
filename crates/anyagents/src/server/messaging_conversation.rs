@@ -932,59 +932,57 @@ pub(super) async fn conversation_route(
                 .max(1),
             visible_agent_ids: visible_agent_ids.clone(),
         };
-        let authorized = match visible_agent_ids.as_ref() {
-            Some(ids) => ids.clone(),
-            None => every_agent_id(&state.store)?,
+        let resolved_target = if is_all {
+            None
+        } else {
+            Some(state.store.agent_by_name(&name))
         };
-        // On PostgreSQL with thousands of archived agents, never walk archived
-        // agent directories on disk during `conversation(agent="all")` queries.
-        let host_file_authorized: Vec<String> = if is_all && state.store.is_postgres() {
-            let live_ids: std::collections::HashSet<String> = state
+        // Narrow host-file authorization strictly to the target agent on single-agent
+        // queries (never enumerating all 10K+ agent IDs) and to live agents on PG
+        // fleet-wide queries.
+        let host_file_authorized: Vec<String> = if !is_all {
+            match resolved_target.as_ref() {
+                Some(Ok(target))
+                    if visible_agent_ids
+                        .as_ref()
+                        .is_none_or(|ids| ids.iter().any(|id| id == target.id.as_str())) =>
+                {
+                    vec![target.id.to_string()]
+                }
+                _ => Vec::new(),
+            }
+        } else if state.store.is_postgres() {
+            let live_ids: Vec<String> = state
                 .store
                 .agent_summaries(false)
                 .map_err(ApiError::from_store)?
                 .into_iter()
                 .map(|a| a.id.to_string())
                 .collect();
-            authorized
-                .iter()
-                .filter(|id| live_ids.contains(id.as_str()))
-                .cloned()
-                .collect()
+            match visible_agent_ids.as_ref() {
+                Some(ids) => {
+                    let live_set: std::collections::HashSet<&str> =
+                        live_ids.iter().map(String::as_str).collect();
+                    ids.iter()
+                        .filter(|id| live_set.contains(id.as_str()))
+                        .cloned()
+                        .collect()
+                }
+                None => live_ids,
+            }
         } else {
-            authorized.clone()
+            match visible_agent_ids.as_ref() {
+                Some(ids) => ids.clone(),
+                None => every_agent_id(&state.store)?,
+            }
         };
         let should_search_host_files = has_structured_search
             || query.scope != anyagents_core::host_index::MemoryScope::All
             || std::env::var_os("ANYAGENTS_TESTS").is_some();
-        if should_search_host_files
-            && state.store.is_postgres()
-            && query.scope != anyagents_core::host_index::MemoryScope::Transcripts
-        {
-            if !is_all {
-                if let Ok(target) = state.store.agent_by_name(&name)
-                    && authorized.iter().any(|id| id == target.id.as_str())
-                {
-                    let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(
-                        &state.store,
-                        &target.id,
-                    );
-                }
-            } else if host_file_authorized.len() <= 64 {
-                for aid_str in &host_file_authorized {
-                    if let Ok(aid) = anyagents_core::AgentId::parse(aid_str) {
-                        let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(
-                            &state.store,
-                            &aid,
-                        );
-                    }
-                }
-            }
-        }
         // A search indexes only a bounded amount of new history before it
         // answers; the background indexer takes the rest, and the response
         // says the history it searched was partial.
-        let (file_hits, pending) = if should_search_host_files {
+        let (file_hits, pending) = if should_search_host_files && !host_file_authorized.is_empty() {
             state
                 .store
                 .search_host_files_reporting(&host_file_authorized, query.scope, &file_request)
@@ -1004,25 +1002,13 @@ pub(super) async fn conversation_route(
         let mut retrieval = None;
         let file_hits = match text_query.as_deref().filter(|_| ranks_by_relevance) {
             Some(text) => {
-                let owners: Vec<String> = if is_all {
-                    host_file_authorized.clone()
-                } else {
-                    let selected = state
-                        .store
-                        .agent_by_name(&name)
-                        .map_err(ApiError::from_store)?
-                        .id
-                        .to_string();
-                    authorized
-                        .iter()
-                        .filter(|id| **id == selected)
-                        .cloned()
-                        .collect()
-                };
+                if let Some(Err(err)) = resolved_target {
+                    return Err(ApiError::from_store(err));
+                }
                 let hybrid = hybrid::search(
                     &state.store,
                     text,
-                    &owners,
+                    &host_file_authorized,
                     query.scope,
                     &file_request,
                     file_hits,

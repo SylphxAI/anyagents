@@ -559,25 +559,7 @@ impl Store {
         let mut request = query.clone();
         request.agent = None;
         let hits = index.search(&visible, scope, &request)?;
-        let mut out = Vec::with_capacity(hits.len());
-        for hit in hits {
-            let owner_id = crate::AgentId::parse(&hit.metadata.agent_id).map_err(store_error)?;
-            let _guard = self.lock_agent_lifecycle(&owner_id).map_err(store_error)?;
-            let Some(current) =
-                index.document(std::slice::from_ref(&hit.metadata.agent_id), scope, &hit.id)?
-            else {
-                continue;
-            };
-            if current.raw.sha256 != hit.raw.sha256
-                || self.is_host_path_redacted(&hit.metadata.agent_id, &hit.window.segment)?
-            {
-                continue;
-            }
-            // Return the matching bounded window, not an unbounded tool payload.
-            // The whole-event coordinate remains available for explicit readback.
-            let bytes = self.read_coordinate_bytes(&hit.metadata.agent_id, &hit.window)?;
-            out.push((hit, bytes));
-        }
+        let out = batch::verify_and_read_search_hits(self, &index, scope, hits, &unresolved)?;
         Ok((out, pending))
     }
 
@@ -738,7 +720,7 @@ impl Store {
         let root = self.data_dir().join("agents").join(owner.id.as_str());
         if let Some((recorded, tree)) = index.agent_tree(owner.id.as_str(), class_name)?
             && recorded == self.effective_tree_policy(owner, class, unresolved)?
-            && serde_json::from_str::<Tree>(&tree).is_ok_and(|t| t.is_current(&root, agents))
+            && batch::is_tree_current_for_store(self, class, &root, agents, &tree)
         {
             return Ok(ClassRefresh::complete());
         }

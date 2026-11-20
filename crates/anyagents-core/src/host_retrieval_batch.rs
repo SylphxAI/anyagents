@@ -262,6 +262,16 @@ pub(super) fn refresh_pg_memory_blobs(
     let has_topic_files = visible_metas
         .iter()
         .any(|m| !m.path.eq_ignore_ascii_case("MEMORY.md") && m.path.ends_with(".md"));
+    // Load all existing cursors for this agent in ONE query instead of N per-file queries.
+    let existing_cursors: HashMap<String, SourceCursor> = index
+        .agent_sources(owner.id.as_str())?
+        .into_iter()
+        .filter_map(|(seg, raw)| {
+            serde_json::from_str::<SourceCursor>(&raw)
+                .ok()
+                .map(|c| (seg, c))
+        })
+        .collect();
     let mut changed_metas = Vec::new();
     for meta in visible_metas {
         if has_topic_files && meta.path.eq_ignore_ascii_case("MEMORY.md") {
@@ -271,13 +281,14 @@ pub(super) fn refresh_pg_memory_blobs(
         if blocked(&seg) {
             continue;
         }
-        keep.insert(seg.to_string_lossy().into_owned());
+        let seg_key = seg.to_string_lossy().into_owned();
+        keep.insert(seg_key.clone());
         let metadata = memory_metadata(owner, Some(meta.updated_at_ms));
         let stamp =
             FileStamp::virtual_blob(meta.size_bytes as u64, meta.version, meta.updated_at_ms);
         let policy = serde_json::to_string(&metadata)?;
-        let unchanged = index
-            .source_cursor(&metadata.agent_id, &seg)?
+        let unchanged = existing_cursors
+            .get(&seg_key)
             .is_some_and(|old| old.stamp == stamp && old.policy == policy);
         if !unchanged {
             changed_metas.push((meta, seg, metadata, stamp, policy));
@@ -326,4 +337,155 @@ pub(super) fn refresh_pg_memory_blobs(
         }
     }
     flush_pg_memory_batch(index, owner.id.as_str(), &mut pg_batch, refresh, gate)
+}
+
+/// Check whether a recorded `host_agent_trees` entry is still current for this store.
+///
+/// On PostgreSQL stateless replicas, container overlayfs `(dev, ino)` values differ
+/// across restarts:
+/// - For `Memory`, local disk memory files are ignored and `policy` already embeds the
+///   SHA-256 fingerprint of every `(path, sha256, version)` row in `agent_files`, so a
+///   policy match is authoritative without comparing container inodes.
+/// - For `Transcripts`, when the local agent root does not exist on this replica and
+///   the recorded tree also observed no local files, skip redundant re-walks and tree
+///   rewrites.
+pub(super) fn is_tree_current_for_store(
+    store: &Store,
+    class: MemoryScope,
+    root: &Path,
+    agents: Option<(u64, u64)>,
+    tree_json: &str,
+) -> bool {
+    if store.is_postgres() {
+        if class == MemoryScope::Memory {
+            return true;
+        }
+        if class == MemoryScope::Transcripts
+            && fs::symlink_metadata(root).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        {
+            return serde_json::from_str::<Tree>(tree_json)
+                .is_ok_and(|t| t.entries.iter().all(|(_, stamp)| stamp.is_none()));
+        }
+    }
+    serde_json::from_str::<Tree>(tree_json).is_ok_and(|t| t.is_current(root, agents))
+}
+
+fn is_pg_blob_segment(owner: &str, segment: &Path) -> bool {
+    parse_pg_agent_file_segment(segment).is_some_and(|(seg_agent, _, _)| seg_agent == owner)
+        || extract_migrated_agent_blob_ref(owner, segment).is_some()
+}
+
+fn slice_verified_window(
+    bytes: &[u8],
+    coord: &crate::raw_segment::RawCoordinate,
+) -> Option<Vec<u8>> {
+    let start = usize::try_from(coord.offset).ok()?;
+    let len = usize::try_from(coord.length).ok()?;
+    let end = start.checked_add(len)?;
+    let slice = bytes.get(start..end)?;
+    if sha256(slice) != coord.sha256 {
+        return None;
+    }
+    Some(slice.to_vec())
+}
+
+/// Verify authorization/redaction/digests and read bounded hit windows.
+///
+/// For PostgreSQL `agent_files` blob hits, avoids acquiring/releasing per-hit
+/// distributed write leases and re-querying redaction receipts: uses the already-loaded
+/// per-owner redaction map, caches blob bytes per `(owner, segment)` within the request,
+/// and verifies the window SHA-256 directly against the live blob bytes.
+pub(super) fn verify_and_read_search_hits(
+    store: &Store,
+    index: &HostIndex,
+    scope: MemoryScope,
+    hits: Vec<IndexHit>,
+    unresolved: &HashMap<String, Vec<PathBuf>>,
+) -> Result<HostHits, IndexError> {
+    let mut out = Vec::with_capacity(hits.len());
+    let mut blob_cache: HashMap<(String, PathBuf), Option<Vec<u8>>> = HashMap::new();
+    for hit in hits {
+        if store.is_postgres() && is_pg_blob_segment(&hit.metadata.agent_id, &hit.window.segment) {
+            if unresolved
+                .get(hit.metadata.agent_id.as_str())
+                .is_some_and(|paths| paths.iter().any(|p| hit.window.segment.starts_with(p)))
+            {
+                continue;
+            }
+            let key = (hit.metadata.agent_id.clone(), hit.window.segment.clone());
+            let cached = match blob_cache.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    let loaded = store
+                        .read_blob_bytes_for_segment(&hit.metadata.agent_id, &hit.window.segment)?;
+                    v.insert(loaded)
+                }
+            };
+            let Some(blob_bytes) = cached.as_deref() else {
+                continue;
+            };
+            let Some(bytes) = slice_verified_window(blob_bytes, &hit.window) else {
+                continue;
+            };
+            out.push((hit, bytes));
+            continue;
+        }
+        let owner_id = crate::AgentId::parse(&hit.metadata.agent_id).map_err(store_error)?;
+        let _guard = store.lock_agent_lifecycle(&owner_id).map_err(store_error)?;
+        let Some(current) =
+            index.document(std::slice::from_ref(&hit.metadata.agent_id), scope, &hit.id)?
+        else {
+            continue;
+        };
+        if current.raw.sha256 != hit.raw.sha256
+            || store.is_host_path_redacted(&hit.metadata.agent_id, &hit.window.segment)?
+        {
+            continue;
+        }
+        // Return the matching bounded window, not an unbounded tool payload.
+        // The whole-event coordinate remains available for explicit readback.
+        match store.read_coordinate_bytes(&hit.metadata.agent_id, &hit.window) {
+            Ok(bytes) => out.push((hit, bytes)),
+            Err(IndexError::Io(err))
+                if store.is_postgres() && err.kind() == io::ErrorKind::NotFound =>
+            {
+                // Skip migrated host-filesystem transcript rows absent on stateless pods.
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pg_blob_segment_detection_enforces_owner_and_verifies_window_digest() {
+        let own = pg_agent_file_segment("agt_owner", "memory", "notes.md");
+        assert!(is_pg_blob_segment("agt_owner", &own));
+        assert!(!is_pg_blob_segment("agt_other", &own));
+        let migrated = PathBuf::from("/var/lib/anyagents/agents/agt_owner/memory/notes.md");
+        assert!(is_pg_blob_segment("agt_owner", &migrated));
+        assert!(!is_pg_blob_segment("agt_other", &migrated));
+
+        let payload = b"prefix HOLD order suffix";
+        let window_bytes = &payload[7..17];
+        let coord = crate::raw_segment::RawCoordinate {
+            segment: own,
+            offset: 7,
+            length: 10,
+            sha256: sha256(window_bytes),
+            seq: 1,
+        };
+        assert_eq!(
+            slice_verified_window(payload, &coord).as_deref(),
+            Some(window_bytes)
+        );
+        // Modified blob fails closed on digest mismatch.
+        let tampered = b"prefix DONE order suffix";
+        assert!(slice_verified_window(tampered, &coord).is_none());
+    }
 }

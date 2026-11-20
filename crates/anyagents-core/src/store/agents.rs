@@ -567,19 +567,32 @@ impl Store {
         Ok((agents, archived as usize))
     }
 
+    /// Load all agent aliases in a single query (`agent_id -> sorted aliases`).
+    pub fn agent_aliases_map(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, Error> {
+        let conn = self.read_conn();
+        let mut aliases: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (id, alias) in conn.db_query_vec(
+            "SELECT agent_id, alias FROM agent_aliases ORDER BY alias",
+            &[],
+            |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)),
+        )? {
+            aliases.entry(id).or_default().push(alias);
+        }
+        Ok(aliases)
+    }
+
     /// Load roster metadata with a fixed number of SQL statements. Indexed range
     /// seeks avoid scanning the message history of archived agents.
     pub fn agent_query_metadata(&self) -> Result<AgentQueryMetadata, Error> {
-        let mut metadata = AgentQueryMetadata::default();
+        let mut metadata = AgentQueryMetadata {
+            aliases: self.agent_aliases_map()?,
+            ..AgentQueryMetadata::default()
+        };
         {
             let conn = self.read_conn();
-            for (id, alias) in conn.db_query_vec(
-                "SELECT agent_id, alias FROM agent_aliases ORDER BY alias",
-                &[],
-                |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)),
-            )? {
-                metadata.aliases.entry(id).or_default().push(alias);
-            }
             let not_passive = conn.backend().sql_not_passive_reaction("m.context");
             let oldest_sql = format!(
                 "SELECT a.id, (SELECT m.received_at_ms FROM messages m
@@ -626,6 +639,7 @@ impl Store {
             .remote_turn_store()
             .list_active_fresh_by_agent(fresh_since)
             .unwrap_or_default();
+        metadata.active_proc_locks = self.active_agent_proc_locks();
         Ok(metadata)
     }
 
