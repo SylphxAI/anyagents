@@ -1678,10 +1678,25 @@ mod tests {
             dir.path(),
             TurnWatchdog::new(Some(Duration::from_secs(60)), Some(Duration::from_secs(60))),
         );
-        // Simulate a blocking phase (e.g. long clone or silent startup).
-        std::thread::sleep(Duration::from_millis(180));
+        let wait_until = |pred: &dyn Fn(&[Value]) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if pred(&events.lock().unwrap()) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        };
+        // Wait for at least one cloning heartbeat before transitioning phase so
+        // slower macOS runners (`ps` process sampling) never race `drop(guard)`.
+        wait_until(&|ev| ev.iter().any(|v| v["turn_state"] == "cloning"));
         guard.set_phase(Some("sess-9".into()), "in_turn");
-        std::thread::sleep(Duration::from_millis(90));
+        wait_until(&|ev| {
+            ev.len() >= 2
+                && ev
+                    .iter()
+                    .any(|v| v["turn_state"] == "in_turn" && v["session_id"] == "sess-9")
+        });
         drop(guard);
 
         let count_after_drop = events.lock().unwrap().len();
