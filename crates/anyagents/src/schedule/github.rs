@@ -696,6 +696,7 @@ mod tests {
             last_observed: Some("pending".into()),
             state: "active".into(),
             created_at_ms: 1_000,
+            external_timer_id: None,
         }
     }
 

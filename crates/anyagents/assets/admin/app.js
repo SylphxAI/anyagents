@@ -1272,10 +1272,10 @@
 
   function renderTickStatus(overview) {
     const authText = [];
-    if (overview.tick_token_configured) authText.push("ANYAGENTS_TICK_TOKEN");
-    if (overview.tick_jwks_configured) authText.push("ANYAGENTS_TICK_JWKS_URL");
+    if (overview.timer_jwks_configured) authText.push("ANYAGENTS_TIMER_JWKS_URL");
+    if (overview.timer_token_configured) authText.push("ANYAGENTS_TIMER_TOKEN");
     $("tick-auth-status").textContent =
-      authText.length > 0 ? `Tick auth: ${authText.join(" + ")}` : "External /v1/internal/tick auth unconfigured";
+      authText.length > 0 ? `Timer fire auth (/v1/internal/fire/{id}): ${authText.join(" + ")}` : "Event-driven /v1/internal/fire/{id} auth unconfigured";
 
     const body = $("tick-status-body");
     clearNode(body);

@@ -227,10 +227,17 @@ pub(super) async fn archive_agent_route(
             .store
             .lock_agent_lifecycle(&found.id)
             .map_err(ApiError::from_store)?;
+        let prev_schedules = state
+            .store
+            .list_schedules(Some(&found.id), true)
+            .unwrap_or_default();
         let agent = state
             .store
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
+        for sched in &prev_schedules {
+            crate::timer::cancel_schedule_timer(state.timer_backend.as_ref(), sched);
+        }
         finish_agent_archive_locked(&state, &agent, is_self)?;
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
@@ -271,6 +278,7 @@ pub(super) async fn verdict_route(
             Principal::Operator => None,
             Principal::Agent { agent_id, .. } => Some(agent_id),
         };
+        let prev_schedules = s.list_schedules(Some(&target.id), true).unwrap_or_default();
         let prof = create::bound_profile_name(&cfg);
         let (outcome, changed) = s
             .apply_verdict(actor, &target.id, kind, body.reason, prof)
@@ -278,6 +286,9 @@ pub(super) async fn verdict_route(
         let mut rework_id = None;
         if let Some(agent) = changed {
             if agent.state == "archived" {
+                for sched in &prev_schedules {
+                    crate::timer::cancel_schedule_timer(state.timer_backend.as_ref(), sched);
+                }
                 finish_agent_archive_locked(&state, &agent, false)?;
             } else {
                 clear_explicitly_archived(s.data_dir(), &agent.id);
@@ -893,10 +904,17 @@ pub(super) async fn delete_agent_route(
         ) {
             require_operator_audited(&state.store, &principal, "agents.delete", &found.name)?;
         }
+        let prev_schedules = state
+            .store
+            .list_schedules(Some(&found.id), true)
+            .unwrap_or_default();
         state
             .store
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
+        for sched in &prev_schedules {
+            crate::timer::cancel_schedule_timer(state.timer_backend.as_ref(), sched);
+        }
         let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
         // Health is a projection: the supervisor may publish stopped before
         // its worker exits. Allow that normal shutdown to release actual

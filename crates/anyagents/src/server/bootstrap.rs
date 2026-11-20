@@ -463,6 +463,11 @@ async fn serve(
     if !serverless && auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&data.join("wake.sock"));
     }
+    let timer_backend = crate::timer::build_timer_backend(
+        Arc::clone(&store),
+        health.clone(),
+        tokio::runtime::Handle::current(),
+    );
     let state = AppState {
         store: Arc::clone(&store),
         health,
@@ -470,6 +475,7 @@ async fn serve(
         auth,
         identity,
         profiles: Default::default(),
+        timer_backend,
     };
     let _ = boundary;
     let listener = api_listener;
@@ -660,7 +666,7 @@ async fn serve(
                 }
             });
         }
-        crate::schedule::start_loops(
+        crate::schedule::start_watch_loops(
             Arc::clone(&store),
             state.health.clone(),
             stopping.subscribe(),

@@ -54,6 +54,7 @@ fn make_confined_app() -> (tempfile::TempDir, Arc<Store>, Router) {
         },
         identity: Arc::new(crate::identity::ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     let app = build_router(state);
     (dir, store, app)
@@ -723,6 +724,7 @@ async fn admin_ui_serves_secrets_tab_and_enforces_csrf_on_secret_mutations() {
         auth,
         identity: Arc::new(crate::identity::ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     });
 
     // 1. /admin HTML includes Secrets tab and loads /admin/assets/secrets.js with zero inline scripts.

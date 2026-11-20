@@ -37,7 +37,8 @@ macro_rules! agent_cols {
 macro_rules! schedule_cols {
     () => {
         "id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms, \
-         last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms"
+         last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms, \
+         external_timer_id"
     };
 }
 

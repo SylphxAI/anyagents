@@ -11,16 +11,13 @@
 //!     heartbeat + `inflight_children` updates, and idempotent turn settlement.
 //!   - `POST /v1/internal/cloud/events`: constant-time per-turn bearer or HMAC-SHA256
 //!     webhook verification, `CloudTurnDriver::parse_webhook`, and idempotent settlement.
-//!   - `POST /v1/internal/tick`: fail-closed `ANYAGENTS_TICK_TOKEN` and/or neutral
-//!     JWS/JWKS (`EdDSA` / `Ed25519`) authentication driving one bounded (<5s) pass of
-//!     due schedules, cloud turn polling, stale sandbox timeout detection, active
-//!     sandbox lease renewals, and singleton idle sandbox sweeping.
+//!   - `POST /v1/internal/fire/{id}` & `POST /v1/internal/fire`: event-driven
+//!     single-schedule fire endpoints (implemented in `server/timer_fire.rs`).
 
-use std::collections::{BTreeMap, HashMap};
-use std::io::Read as _;
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::sandbox_providers::providers::{
     ExecRequest, ImageSpec, LeasePolicy, ProviderKind, SandboxProvider as AsyncSandboxProvider,
@@ -39,11 +36,9 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use ring::signature::{ED25519, UnparsedPublicKey};
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use super::{ApiError, AppState, resolve_remote_sandbox_workdir, spawn_store};
 use crate::sandbox_exec::{
@@ -61,8 +56,6 @@ const MAX_CLOUD_POLL_BACKOFF_MS: i64 = 30_000;
 const DEFAULT_SANDBOX_STALE_MS: i64 = 120_000;
 const DEFAULT_LEASE_RENEW_WINDOW_MS: i64 = 300_000;
 const DETACHED_EXEC_TIMEOUT_MS: u64 = 15_000;
-const JWKS_CACHE_TTL: Duration = Duration::from_secs(3600);
-const JWS_CLOCK_SKEW_SECS: i64 = 60;
 const TICK_CLOUD_POLL_LIMIT: usize = 32;
 const TICK_STALE_SANDBOX_LIMIT: usize = 32;
 const SYNCABLE_AUTH_FILES: &[&str] = &[
@@ -111,11 +104,6 @@ pub(crate) fn guest_events_callback_url(data_dir: &Path) -> Option<String> {
 #[allow(dead_code)]
 pub(crate) fn cloud_events_callback_url(data_dir: &Path) -> Option<String> {
     resolve_public_url(data_dir).map(|base| format!("{base}/v1/internal/cloud/events"))
-}
-
-/// Return `ANYAGENTS_TICK_TOKEN` when configured and non-empty.
-pub(crate) fn configured_tick_token() -> Option<String> {
-    env_non_empty("ANYAGENTS_TICK_TOKEN")
 }
 
 fn sandbox_stale_threshold_ms() -> i64 {
@@ -2641,345 +2629,10 @@ pub(crate) async fn cloud_events_route(
 }
 
 // ============================================================================
-// Neutral JWS / JWKS (EdDSA / OKP Ed25519) Verification for /v1/internal/tick
+// Manual Operator Maintenance Pass (`POST /admin/api/tick`)
 // ============================================================================
 
-#[derive(Clone, Debug)]
-struct Ed25519Jwk {
-    kid: Option<String>,
-    public_key_bytes: [u8; 32],
-}
-
-#[derive(Clone, Debug)]
-struct CachedJwks {
-    fetched_at: Instant,
-    keys: Vec<Ed25519Jwk>,
-}
-
-static JWKS_CACHE: LazyLock<Mutex<HashMap<String, CachedJwks>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[cfg(test)]
-pub(crate) fn clear_jwks_cache() {
-    if let Ok(mut guard) = JWKS_CACHE.lock() {
-        guard.clear();
-    }
-}
-
-fn parse_jwks_ed25519_keys(raw: &[u8]) -> Result<Vec<Ed25519Jwk>, String> {
-    let doc: Value = serde_json::from_slice(raw).map_err(|e| format!("invalid JWKS JSON: {e}"))?;
-    let keys = doc
-        .get("keys")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "JWKS missing `keys` array".to_string())?;
-    let mut parsed = Vec::new();
-    for entry in keys {
-        let kty = entry.get("kty").and_then(Value::as_str).unwrap_or("");
-        let crv = entry.get("crv").and_then(Value::as_str).unwrap_or("");
-        if kty != "OKP" || crv != "Ed25519" {
-            continue;
-        }
-        if let Some(key_use) = entry.get("use").and_then(Value::as_str)
-            && key_use != "sig"
-        {
-            continue;
-        }
-        if let Some(alg) = entry.get("alg").and_then(Value::as_str)
-            && alg != "EdDSA"
-        {
-            continue;
-        }
-        let Some(x_b64) = entry.get("x").and_then(Value::as_str) else {
-            continue;
-        };
-        let Ok(decoded) = URL_SAFE_NO_PAD.decode(x_b64.trim()) else {
-            continue;
-        };
-        if decoded.len() != 32 {
-            continue;
-        }
-        let mut pk = [0u8; 32];
-        pk.copy_from_slice(&decoded);
-        let kid = entry
-            .get("kid")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        parsed.push(Ed25519Jwk {
-            kid,
-            public_key_bytes: pk,
-        });
-    }
-    Ok(parsed)
-}
-
-async fn fetch_jwks_keys(jwks_url: &str, force_refresh: bool) -> Result<Vec<Ed25519Jwk>, String> {
-    if !force_refresh {
-        let guard = JWKS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = guard.get(jwks_url)
-            && cached.fetched_at.elapsed() < JWKS_CACHE_TTL
-        {
-            return Ok(cached.keys.clone());
-        }
-    }
-
-    let url = jwks_url.to_string();
-    let keys = tokio::task::spawn_blocking(move || -> Result<Vec<Ed25519Jwk>, String> {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(5)))
-            .http_status_as_error(false)
-            .build()
-            .into();
-        let mut resp = agent
-            .get(&url)
-            .header("accept", "application/json")
-            .call()
-            .map_err(|e| format!("JWKS fetch failed ({url}): {e}"))?;
-        let status = resp.status().as_u16();
-        if !(200..300).contains(&status) {
-            return Err(format!("JWKS endpoint returned HTTP {status}"));
-        }
-        let mut raw = Vec::new();
-        let _ = resp
-            .body_mut()
-            .as_reader()
-            .take(512 * 1024)
-            .read_to_end(&mut raw);
-        parse_jwks_ed25519_keys(&raw)
-    })
-    .await
-    .map_err(|e| format!("JWKS fetch join error: {e}"))??;
-
-    let mut guard = JWKS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    guard.insert(
-        jwks_url.to_string(),
-        CachedJwks {
-            fetched_at: Instant::now(),
-            keys: keys.clone(),
-        },
-    );
-    Ok(keys)
-}
-
-fn extract_tick_jws(headers: &HeaderMap) -> Option<String> {
-    if let Some(hdr_name) = env_non_empty("ANYAGENTS_TICK_SIGNATURE_HEADER") {
-        let val = headers
-            .get(hdr_name.as_str())
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())?;
-        let cleaned = val
-            .strip_prefix("Bearer ")
-            .or_else(|| val.strip_prefix("bearer "))
-            .map(str::trim)
-            .unwrap_or(val);
-        return (!cleaned.is_empty()).then(|| cleaned.to_string());
-    }
-    // When no custom signature header is set, accept `Authorization: Bearer <jws>` if it
-    // looks like a 3-part compact JWS (`header.payload.signature`).
-    let tok = extract_bearer_token(headers)?;
-    let parts: Vec<&str> = tok.split('.').collect();
-    if parts.len() == 3 && parts.iter().all(|p| !p.is_empty()) {
-        Some(tok)
-    } else {
-        None
-    }
-}
-
-async fn verify_tick_jws_jwks(
-    jwks_url: &str,
-    headers: &HeaderMap,
-    raw_body: &[u8],
-) -> Result<(), String> {
-    let jws =
-        extract_tick_jws(headers).ok_or_else(|| "missing tick JWS signature header".to_string())?;
-    let parts: Vec<&str> = jws.split('.').collect();
-    if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
-        return Err("malformed compact JWS".to_string());
-    }
-    let (header_b64, payload_b64, sig_b64) = (parts[0], parts[1], parts[2]);
-
-    let header_bytes = URL_SAFE_NO_PAD
-        .decode(header_b64)
-        .map_err(|_| "invalid JWS header base64url".to_string())?;
-    let header_json: Value =
-        serde_json::from_slice(&header_bytes).map_err(|_| "invalid JWS header JSON".to_string())?;
-    if header_json.get("alg").and_then(Value::as_str) != Some("EdDSA") {
-        return Err("JWS header alg must be EdDSA".to_string());
-    }
-    let kid = header_json
-        .get("kid")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    let sig_bytes = URL_SAFE_NO_PAD
-        .decode(sig_b64)
-        .map_err(|_| "invalid JWS signature base64url".to_string())?;
-    if sig_bytes.len() != 64 {
-        return Err("invalid EdDSA signature length".to_string());
-    }
-    let signing_input = format!("{header_b64}.{payload_b64}");
-
-    let mut keys = fetch_jwks_keys(jwks_url, false).await?;
-    let mut candidates: Vec<&Ed25519Jwk> = match kid {
-        Some(want_kid) => keys
-            .iter()
-            .filter(|k| k.kid.as_deref() == Some(want_kid))
-            .collect(),
-        None => keys.iter().collect(),
-    };
-    if candidates.is_empty() {
-        // Refetch JWKS once on unknown `kid` (key rotation support).
-        keys = fetch_jwks_keys(jwks_url, true).await?;
-        candidates = match kid {
-            Some(want_kid) => keys
-                .iter()
-                .filter(|k| k.kid.as_deref() == Some(want_kid))
-                .collect(),
-            None => keys.iter().collect(),
-        };
-    }
-    if candidates.is_empty() {
-        return Err("no matching Ed25519 JWK found for kid".to_string());
-    }
-
-    let sig_valid = candidates.iter().any(|jwk| {
-        UnparsedPublicKey::new(&ED25519, &jwk.public_key_bytes)
-            .verify(signing_input.as_bytes(), &sig_bytes)
-            .is_ok()
-    });
-    if !sig_valid {
-        return Err("EdDSA signature verification failed".to_string());
-    }
-
-    let payload_bytes = URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .map_err(|_| "invalid JWS payload base64url".to_string())?;
-    let claims: Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|_| "invalid JWS payload JSON".to_string())?;
-    let claims_obj = claims
-        .as_object()
-        .ok_or_else(|| "JWS payload must be a JSON object".to_string())?;
-
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    // `exp` is mandatory (±60s clock skew).
-    let exp = claims_obj
-        .get("exp")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| "JWS missing numeric `exp` claim".to_string())?;
-    if now_secs > exp.saturating_add(JWS_CLOCK_SKEW_SECS) {
-        return Err("JWS token expired".to_string());
-    }
-    if let Some(nbf) = claims_obj.get("nbf").and_then(Value::as_i64)
-        && now_secs.saturating_add(JWS_CLOCK_SKEW_SECS) < nbf
-    {
-        return Err("JWS token not yet valid".to_string());
-    }
-
-    if let Some(expected_iss) = env_non_empty("ANYAGENTS_TICK_ISS") {
-        let got_iss = claims_obj.get("iss").and_then(Value::as_str).unwrap_or("");
-        if got_iss != expected_iss {
-            return Err("JWS `iss` claim mismatch".to_string());
-        }
-    }
-    if let Some(expected_aud) = env_non_empty("ANYAGENTS_TICK_AUD") {
-        let aud_ok = match claims_obj.get("aud") {
-            Some(Value::String(s)) => s == &expected_aud,
-            Some(Value::Array(arr)) => arr
-                .iter()
-                .any(|v| v.as_str() == Some(expected_aud.as_str())),
-            _ => false,
-        };
-        if !aud_ok {
-            return Err("JWS `aud` claim mismatch".to_string());
-        }
-    }
-    if let Some(expected_sub) = env_non_empty("ANYAGENTS_TICK_SUB") {
-        let got_sub = claims_obj.get("sub").and_then(Value::as_str).unwrap_or("");
-        if got_sub != expected_sub {
-            return Err("JWS `sub` claim mismatch".to_string());
-        }
-    }
-
-    // If `bh` (body hash) claim is present, verify `bh == base64url_nopad(sha256(raw_body))`.
-    if let Some(bh_val) = claims_obj.get("bh") {
-        let Some(bh_str) = bh_val.as_str() else {
-            return Err("JWS `bh` claim must be a string".to_string());
-        };
-        let expected_bh = URL_SAFE_NO_PAD.encode(Sha256::digest(raw_body));
-        if !constant_time_eq(expected_bh.as_bytes(), bh_str.as_bytes()) {
-            return Err("JWS `bh` body hash mismatch".to_string());
-        }
-    }
-
-    Ok(())
-}
-
-fn verify_tick_shared_token(expected: &str, headers: &HeaderMap, raw_body: &[u8]) -> bool {
-    if let Some(tok) = extract_bearer_token(headers)
-        && constant_time_eq(expected.as_bytes(), tok.as_bytes())
-    {
-        return true;
-    }
-    if let Some(hdr_tok) = headers
-        .get("x-anyagents-tick-token")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        && constant_time_eq(expected.as_bytes(), hdr_tok.as_bytes())
-    {
-        return true;
-    }
-    if let Some(sig) = headers
-        .get("x-anyagents-tick-signature")
-        .and_then(|v| v.to_str().ok())
-        && verify_hmac_sha256_signature(expected.as_bytes(), raw_body, sig)
-    {
-        return true;
-    }
-    false
-}
-
-async fn authenticate_tick_request(headers: &HeaderMap, raw_body: &[u8]) -> Result<(), ApiError> {
-    let tick_token = configured_tick_token();
-    let jwks_url = env_non_empty("ANYAGENTS_TICK_JWKS_URL");
-
-    if tick_token.is_none() && jwks_url.is_none() {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "tick endpoint disabled: configure ANYAGENTS_TICK_TOKEN or ANYAGENTS_TICK_JWKS_URL",
-        ));
-    }
-
-    if let Some(ref expected) = tick_token
-        && verify_tick_shared_token(expected, headers, raw_body)
-    {
-        return Ok(());
-    }
-
-    if let Some(ref url) = jwks_url
-        && verify_tick_jws_jwks(url, headers, raw_body).await.is_ok()
-    {
-        return Ok(());
-    }
-
-    Err(ApiError::new(
-        StatusCode::UNAUTHORIZED,
-        "invalid tick authentication credentials",
-    ))
-}
-
-// ============================================================================
-// HTTP Endpoint 3: POST /v1/internal/tick
-// ============================================================================
-
-/// Structured JSON summary returned by `POST /v1/internal/tick`.
+/// Structured JSON summary returned by `POST /admin/api/tick`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TickSummary {
     pub ok: bool,
@@ -2992,25 +2645,6 @@ pub(crate) struct TickSummary {
     pub backlog_dispatched: usize,
     pub leases_renewed: usize,
     pub sandboxes_swept: usize,
-}
-
-/// `POST /v1/internal/tick`: bounded (<5s) stateless maintenance & polling pass.
-///
-/// Authenticates via `ANYAGENTS_TICK_TOKEN` and/or neutral `ANYAGENTS_TICK_JWKS_URL`
-/// (fail-closed `503` when neither is configured, `401` on invalid credentials), then:
-/// 1. Fires due schedules/reminders (dispatching turns asynchronously in serverless mode).
-/// 2. Polls due `pending_remote_turns` via `CloudTurnDriver::poll_turn` and marks stale
-///    sandbox turns failed when heartbeats exceed the timeout threshold.
-/// 3. Renews leases for active non-idle sandbox bindings.
-/// 4. Runs `sweep_idle_sandboxes` under the `maint:singleton` PG lease.
-pub(crate) async fn tick_route(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, ApiError> {
-    authenticate_tick_request(&headers, &body).await?;
-    let summary = run_tick_pass(Arc::clone(&state.store), state.health.clone()).await?;
-    Ok(Json(summary))
 }
 
 pub(crate) async fn run_tick_pass(
@@ -3304,6 +2938,7 @@ fn renew_binding_lease(store: &Store, binding: &anyagents_core::stateless::Sandb
 #[cfg(test)]
 mod tests {
     use super::super::serverless_failure::is_suppressed_fallback_reply;
+    use super::super::timer_fire::clear_jwks_cache;
     use super::*;
     use crate::sandbox_providers::providers::{
         EnsureSandboxRequest, ExecOutput, ProviderHealth, SandboxCapabilities, SandboxHandle,
@@ -3312,9 +2947,13 @@ mod tests {
     use anyagents_supervisor::HealthBoard;
     use axum::body::Body;
     use axum::http::Request;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use http_body_util::BodyExt as _;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    use sha2::{Digest, Sha256};
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tower::ServiceExt as _;
 
     fn test_pg_url() -> Option<String> {
@@ -3335,6 +2974,7 @@ mod tests {
             },
             identity: Arc::new(crate::identity::ServingIdentity::capture()),
             profiles: Default::default(),
+            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         }
     }
 
@@ -3947,21 +3587,22 @@ done
                 .unwrap();
         assert_eq!(wh_json["settled"], true);
 
-        // 2. Also create a due schedule on Router B to prove `/v1/internal/tick` fires schedules
-        //    AND polls the due Spiron turn in ONE bounded HTTP call!
-        store_b
+        // 2. Create a due schedule on Router B and fire it via event-driven
+        //    `POST /v1/internal/fire/{id}` (confirming legacy `/v1/internal/tick` is 404),
+        //    then settle the due Spiron cloud turn via `run_tick_pass`.
+        let due_sched = store_b
             .create_schedule(NewSchedule {
                 agent_id: spiron_agent.id.clone(),
                 kind: "at".into(),
                 spec: "now".into(),
-                prompt: "tick reminder".into(),
+                prompt: "event-driven reminder".into(),
                 interval_ms: None,
                 next_fire_at_ms: Some(now_ms() - 1_000),
                 watch_baseline: None,
             })
             .unwrap();
 
-        let tick_resp = router_b
+        let retired_tick = router_b
             .clone()
             .oneshot(
                 Request::builder()
@@ -3973,14 +3614,33 @@ done
             )
             .await
             .unwrap();
-        assert_eq!(tick_resp.status(), StatusCode::OK);
-        let tick_json: Value =
-            serde_json::from_slice(&tick_resp.into_body().collect().await.unwrap().to_bytes())
+        assert_eq!(retired_tick.status(), StatusCode::NOT_FOUND);
+
+        let fire_resp = router_b
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/internal/fire/{}", due_sched.id))
+                    .header("authorization", "Bearer tick-secret-cloud-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fire_resp.status(), StatusCode::OK);
+        let fire_json: Value =
+            serde_json::from_slice(&fire_resp.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
-        assert_eq!(tick_json["ok"], true);
-        assert!(tick_json["schedules_fired"].as_u64().unwrap() >= 1);
-        assert_eq!(tick_json["cloud_turns_polled"], 1);
-        assert_eq!(tick_json["turns_settled"], 1);
+        assert_eq!(fire_json["fired"], true);
+        assert_eq!(fire_json["schedule_id"], due_sched.id);
+
+        let summary = run_tick_pass(Arc::clone(&store_b), HealthBoard::default())
+            .await
+            .unwrap();
+        assert!(summary.ok);
+        assert_eq!(summary.cloud_turns_polled, 1);
+        assert_eq!(summary.turns_settled, 1);
 
         // 3. Verify BOTH turns settled cleanly with exact results & idempotency!
         let spiron_settled = store_b
@@ -4147,8 +3807,14 @@ done
             "running"
         );
 
-        // Save env vars before testing tick fail-closed + JWKS.
+        // Save env vars before testing timer fire fail-closed + JWKS (including backward-compat aliases).
         let env_keys = [
+            "ANYAGENTS_TIMER_TOKEN",
+            "ANYAGENTS_TIMER_JWKS_URL",
+            "ANYAGENTS_TIMER_SIGNATURE_HEADER",
+            "ANYAGENTS_TIMER_ISS",
+            "ANYAGENTS_TIMER_AUD",
+            "ANYAGENTS_TIMER_SUB",
             "ANYAGENTS_TICK_TOKEN",
             "ANYAGENTS_TICK_JWKS_URL",
             "ANYAGENTS_TICK_SIGNATURE_HEADER",
@@ -4162,13 +3828,13 @@ done
             unsafe { std::env::remove_var(k) };
         }
 
-        // 2. `/v1/internal/tick` fails closed with 503 when neither token nor JWKS is set!
+        // 2. `/v1/internal/fire/{id}` fails closed with 503 when neither token nor JWKS is set!
         let resp_503 = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/internal/tick")
+                    .uri("/v1/internal/fire/sch_missing")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4176,14 +3842,14 @@ done
             .unwrap();
         assert_eq!(resp_503.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        // 3. With `ANYAGENTS_TICK_TOKEN` set, wrong/missing bearer gets 401, valid gets 200!
+        // 3. With `ANYAGENTS_TICK_TOKEN` alias set, wrong/missing bearer gets 401, valid gets 200!
         unsafe { std::env::set_var("ANYAGENTS_TICK_TOKEN", "expected-tick-secret") };
         let resp_401 = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/internal/tick")
+                    .uri("/v1/internal/fire/sch_missing")
                     .header("authorization", "Bearer wrong-tick-secret")
                     .body(Body::empty())
                     .unwrap(),
@@ -4197,7 +3863,7 @@ done
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/internal/tick")
+                    .uri("/v1/internal/fire/sch_missing")
                     .header("authorization", "Bearer expected-tick-secret")
                     .body(Body::empty())
                     .unwrap(),
@@ -4238,16 +3904,16 @@ done
             std::env::set_var("ANYAGENTS_TICK_ISS", "https://scheduler.example.test");
             std::env::set_var(
                 "ANYAGENTS_TICK_AUD",
-                "https://coord.example.test/v1/internal/tick",
+                "https://coord.example.test/v1/internal/fire",
             );
-            std::env::set_var("ANYAGENTS_TICK_SUB", "tick-job-1");
+            std::env::set_var("ANYAGENTS_TICK_SUB", "timer-job-1");
         }
 
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let body_bytes = br#"{"trigger":"cron"}"#;
+        let body_bytes = br#"{"trigger":"timer"}"#;
         let bh = URL_SAFE_NO_PAD.encode(Sha256::digest(body_bytes));
 
         let valid_jws = sign_ed25519_jws(
@@ -4255,8 +3921,8 @@ done
             "k1",
             &json!({
                 "iss": "https://scheduler.example.test",
-                "aud": "https://coord.example.test/v1/internal/tick",
-                "sub": "tick-job-1",
+                "aud": "https://coord.example.test/v1/internal/fire",
+                "sub": "timer-job-1",
                 "exp": now_secs + 300,
                 "bh": bh,
             }),
@@ -4266,7 +3932,7 @@ done
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/internal/tick")
+                    .uri("/v1/internal/fire/sch_missing")
                     .header("x-webhook-signature", valid_jws.clone())
                     .body(Body::from(body_bytes.as_slice()))
                     .unwrap(),
@@ -4281,7 +3947,7 @@ done
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/internal/tick")
+                    .uri("/v1/internal/fire/sch_missing")
                     .header("x-webhook-signature", valid_jws)
                     .body(Body::from(&b"{\"trigger\":\"tampered\"}"[..]))
                     .unwrap(),
@@ -4296,8 +3962,8 @@ done
             "k1",
             &json!({
                 "iss": "https://scheduler.example.test",
-                "aud": "https://coord.example.test/v1/internal/tick",
-                "sub": "tick-job-1",
+                "aud": "https://coord.example.test/v1/internal/fire",
+                "sub": "timer-job-1",
                 "exp": now_secs - 120,
             }),
         );
@@ -4306,7 +3972,7 @@ done
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/internal/tick")
+                    .uri("/v1/internal/fire/sch_missing")
                     .header("x-webhook-signature", expired_jws)
                     .body(Body::empty())
                     .unwrap(),
@@ -4322,8 +3988,8 @@ done
             "k2",
             &json!({
                 "iss": "https://scheduler.example.test",
-                "aud": "https://coord.example.test/v1/internal/tick",
-                "sub": "tick-job-1",
+                "aud": "https://coord.example.test/v1/internal/fire",
+                "sub": "timer-job-1",
                 "exp": now_secs + 300,
             }),
         );
@@ -4332,7 +3998,7 @@ done
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/internal/tick")
+                    .uri("/v1/internal/fire/sch_missing")
                     .header("x-webhook-signature", rotated_jws)
                     .body(Body::empty())
                     .unwrap(),
@@ -4373,6 +4039,7 @@ done
             auth,
             identity: Arc::new(crate::identity::ServingIdentity::capture()),
             profiles: Default::default(),
+            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         };
 
         unsafe {

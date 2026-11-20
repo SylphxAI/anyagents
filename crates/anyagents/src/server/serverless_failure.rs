@@ -527,6 +527,7 @@ mod tests {
             auth,
             identity: Arc::new(crate::identity::ServingIdentity::capture()),
             profiles: Default::default(),
+            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         };
         let caller = Principal::Agent {
             agent_id: p.id.clone(),

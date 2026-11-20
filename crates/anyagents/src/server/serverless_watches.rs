@@ -11,7 +11,7 @@ use anyagents_harness::TurnState;
 use anyagents_supervisor::{HealthBoard, LiveState};
 
 use crate::schedule::{
-    WatchTarget, parse_at_ms, parse_watch_spec, schedules_changed, tick_serverless_schedules,
+    WatchTarget, evaluate_maintenance_schedules, parse_at_ms, parse_watch_spec, schedules_changed,
 };
 
 /// Build a [`HealthBoard`] overlay projecting fresh active `pending_remote_turns`
@@ -312,7 +312,7 @@ pub(crate) fn tick_serverless_watches_and_schedules(
     let _ = sweep_watches_targeting_archived_agents(store);
     let (at_fired, at_woken) = catch_up_orphaned_at_schedules(store, now);
     let (effective_health, active_remote) = effective_health_with_remote_turns(store, health, now);
-    let (sched_fired, sched_woken) = tick_serverless_schedules(store, &effective_health, now);
+    let (sched_fired, sched_woken) = evaluate_maintenance_schedules(store, &effective_health, now);
     let (cron_fired, cron_woken) = unstick_stale_coalesced_crons(store, &active_remote, now);
 
     let mut seen = HashSet::new();
