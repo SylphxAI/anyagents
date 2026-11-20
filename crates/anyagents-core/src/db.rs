@@ -241,7 +241,7 @@ pub fn redact_database_url(url: &str) -> String {
 /// `Store` / `HostIndex` / CLI callers never panic or starve an outer Tokio task.
 static PG_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(4)
         .thread_name("anyagents-pg-io")
         .enable_all()
         .build()

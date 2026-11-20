@@ -367,19 +367,37 @@ pub(crate) fn roster_views(
     {
         selected_agents.truncate(lim);
     }
-    let mut metadata = store.agent_query_metadata().map_err(ApiError::from_store)?;
+    let all_archived = selected_agents.iter().all(|a| a.state == "archived");
+    let mut metadata = if all_archived {
+        anyagents_core::AgentQueryMetadata {
+            aliases: store.agent_aliases_map().map_err(ApiError::from_store)?,
+            ..Default::default()
+        }
+    } else {
+        store.agent_query_metadata().map_err(ApiError::from_store)?
+    };
     let files = file_cache::cache();
     files.catch_up();
-    let seats = view_seats(files);
+    let seats = if all_archived {
+        std::sync::Arc::new(HashMap::new())
+    } else {
+        view_seats(files)
+    };
     let mut unsettled_by_agent: HashMap<String, Vec<crate::api::UnsettledOutboundView>> =
         HashMap::new();
-    for held in outbound_history::unsettled(store) {
-        unsettled_by_agent
-            .entry(held.agent_id.as_str().to_string())
-            .or_default()
-            .push(unsettled_view(&held));
+    if !all_archived {
+        for held in outbound_history::unsettled(store) {
+            unsettled_by_agent
+                .entry(held.agent_id.as_str().to_string())
+                .or_default()
+                .push(unsettled_view(&held));
+        }
     }
-    let mut secrets_by_agent = store.all_agent_secret_grants().unwrap_or_default();
+    let mut secrets_by_agent = if all_archived {
+        HashMap::new()
+    } else {
+        store.all_agent_secret_grants().unwrap_or_default()
+    };
     let mut agents = Vec::with_capacity(selected_agents.len());
     for agent in selected_agents {
         let mut view = agent_view_preloaded(
@@ -539,8 +557,7 @@ pub(super) fn persisted_fault(
 }
 
 pub(super) fn archived_agent_view_fast(agent: &Agent) -> AgentView {
-    let delivery: crate::api::DeliveryView =
-        (&crate::vendor::declared_delivery(&agent.harness)).into();
+    let delivery: crate::api::DeliveryView = (&declared_delivery_for_mode(&agent.harness)).into();
     AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
@@ -759,10 +776,15 @@ fn agent_view_preloaded(
                     None,
                 )
             } else {
-                let lock_busy = matches!(
-                    store.try_lock_agent(&agent.id),
-                    Err(anyagents_core::Error::AgentBusy)
-                );
+                let lock_busy = if store.is_postgres() {
+                    if let Some(metadata) = metadata.as_ref() {
+                        metadata.active_proc_locks.contains(agent.id.as_str())
+                    } else {
+                        store.is_agent_proc_locked(&agent.id)
+                    }
+                } else {
+                    store.is_agent_proc_locked(&agent.id)
+                };
                 let proc_str = if lock_busy { "alive" } else { "down" };
                 let turn_str = if lock_busy { "working" } else { "idle" };
                 (
@@ -1148,5 +1170,40 @@ mod tests {
         let view = crate::api::DeliveryView::from(&delivery);
         assert_eq!(view.legacy_mode(), "followup");
         assert_eq!(view.legacy_steer(), "no");
+    }
+
+    #[test]
+    fn archived_roster_fast_path_preserves_aliases_and_proc_lock_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let live = store
+            .create_agent(NewAgent::new("live-proc", "codex"))
+            .unwrap();
+        store.set_agent_running(&live.id, "/work").unwrap();
+        let arch = store
+            .create_agent(NewAgent::new("arch-alias", "codex"))
+            .unwrap();
+        store.rename_agent(&arch.id, "arch-one").unwrap();
+        store.set_agent_state(&arch.id, "archived").unwrap();
+        let arch = store.agent(&arch.id).unwrap();
+
+        assert!(!store.is_agent_proc_locked(&live.id));
+        let _lock = store.try_lock_agent(&live.id).unwrap();
+        assert!(store.is_agent_proc_locked(&live.id));
+
+        let listed = roster_views(
+            &store,
+            &health,
+            &[&arch],
+            1,
+            &ListAgentsQuery {
+                state: Some("archived".into()),
+                ..ListAgentsQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(listed.agents.len(), 1);
+        assert_eq!(listed.agents[0].aliases, vec!["arch-alias".to_string()]);
     }
 }

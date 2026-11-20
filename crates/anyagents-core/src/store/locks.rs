@@ -1,5 +1,6 @@
 //! Process and lifecycle locks for agents (flock and PostgreSQL coordinator leases).
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::os::unix::io::AsRawFd;
@@ -146,6 +147,56 @@ impl Drop for AgentLock {
 }
 
 impl Store {
+    /// Read-only probe for whether an agent's vendor-process lock is currently held.
+    ///
+    /// On PostgreSQL this performs a single read-only lease lookup instead of acquiring
+    /// and immediately releasing a lease (which would incur two write round-trips and
+    /// spawn a background heartbeat task per call). On SQLite it preserves the existing
+    /// non-blocking `flock` probe.
+    pub fn is_agent_proc_locked(&self, agent_id: &AgentId) -> bool {
+        if let registry::Backend::Postgres(pg) = &self.backend {
+            let pool = pg.handle.pool.clone();
+            let key = format!("agent:proc:{}", agent_id.as_str());
+            let now = crate::now_ms();
+            let held: Result<Option<i32>, sqlx::Error> = crate::db::block_on_pg(async move {
+                sqlx::query_scalar(
+                    "SELECT 1 FROM public.coordinator_leases
+                     WHERE lease_key = $1 AND expires_at_ms > $2
+                     LIMIT 1",
+                )
+                .bind(&key)
+                .bind(now)
+                .fetch_optional(&pool)
+                .await
+            });
+            return matches!(held, Ok(Some(_)));
+        }
+        matches!(self.try_lock_agent(agent_id), Err(Error::AgentBusy))
+    }
+
+    /// Batched read-only snapshot of all currently held PostgreSQL `agent:proc:*`
+    /// leases (`agent_id`), avoiding per-agent queries when assembling roster views.
+    pub(crate) fn active_agent_proc_locks(&self) -> HashSet<String> {
+        let registry::Backend::Postgres(pg) = &self.backend else {
+            return HashSet::new();
+        };
+        let pool = pg.handle.pool.clone();
+        let now = crate::now_ms();
+        let rows: Result<Vec<String>, sqlx::Error> = crate::db::block_on_pg(async move {
+            sqlx::query_scalar(
+                "SELECT lease_key FROM public.coordinator_leases
+                 WHERE lease_key LIKE 'agent:proc:%' AND expires_at_ms > $1",
+            )
+            .bind(now)
+            .fetch_all(&pool)
+            .await
+        });
+        rows.unwrap_or_default()
+            .into_iter()
+            .filter_map(|key| key.strip_prefix("agent:proc:").map(str::to_string))
+            .collect()
+    }
+
     /// Exclusive lock for this agent's vendor process. A second caller gets [`Error::AgentBusy`].
     pub fn try_lock_agent(&self, agent_id: &AgentId) -> Result<AgentLock, Error> {
         if let registry::Backend::Postgres(pg) = &self.backend {

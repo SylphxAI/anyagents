@@ -1,6 +1,6 @@
 //! Domain data types persisted and returned by [`Store`](super::Store).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::TurnErrors;
 use crate::error::Error;
@@ -23,6 +23,8 @@ pub struct AgentQueryMetadata {
     pub open_turns: HashMap<String, i64>,
     /// Active non-terminal serverless remote turns (`agent_id -> earliest created_at_ms`).
     pub active_remote_turns: HashMap<String, i64>,
+    /// Active non-expired PostgreSQL `agent:proc:*` lease holders (`agent_id`).
+    pub active_proc_locks: HashSet<String>,
     pub schedules: HashMap<String, Vec<AgentSchedule>>,
     /// Agents with a run of errored turns in progress, or parked for one.
     pub turn_errors: HashMap<String, TurnErrors>,

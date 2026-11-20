@@ -239,6 +239,7 @@ pub(crate) struct DirectSearchSpec<'a> {
     pub ascending: bool,
     pub include_in: bool,
     pub include_out: bool,
+    pub agent_id: Option<&'a str>,
     pub agent_name: Option<&'a str>,
     pub sender_like: Option<&'a str>,
     pub from_seq: Option<i64>,
@@ -256,7 +257,12 @@ pub(crate) fn build_direct_search_sql(spec: &DirectSearchSpec<'_>) -> (String, V
     let p_until = sp.push(spec.until);
     let p_limit = sp.push(spec.fetch_limit);
 
-    let p_agent = spec.agent_name.map(|name| sp.push(name));
+    let p_agent_id = spec.agent_id.map(|id| sp.push(id));
+    let p_agent = if p_agent_id.is_none() {
+        spec.agent_name.map(|name| sp.push(name))
+    } else {
+        None
+    };
     let p_sender = spec.sender_like.map(|s| sp.push(s));
     let p_from_seq = spec.from_seq.map(|s| sp.push(s));
     let p_to_seq = spec.to_seq.map(|s| sp.push(s));
@@ -314,7 +320,9 @@ pub(crate) fn build_direct_search_sql(spec: &DirectSearchSpec<'_>) -> (String, V
             format!("m.received_at_ms > ?{p_since}"),
             format!("m.received_at_ms <= ?{p_until}"),
         ];
-        if let Some(p) = p_agent {
+        if let Some(p) = p_agent_id {
+            conds.push(format!("m.agent_id = ?{p}"));
+        } else if let Some(p) = p_agent {
             conds.push(format!("LOWER(a.name) = ?{p}"));
         }
         if let Some(p) = p_sender {
@@ -356,7 +364,9 @@ pub(crate) fn build_direct_search_sql(spec: &DirectSearchSpec<'_>) -> (String, V
             format!("o.sent_at_ms > ?{p_since}"),
             format!("o.sent_at_ms <= ?{p_until}"),
         ];
-        if let Some(p) = p_agent {
+        if let Some(p) = p_agent_id {
+            conds.push(format!("o.agent_id = ?{p}"));
+        } else if let Some(p) = p_agent {
             conds.push(format!("LOWER(a.name) = ?{p}"));
         }
         if let Some(p) = p_sender {
@@ -423,20 +433,26 @@ pub(super) fn pg_search_history(
     let since = req.since_ms.unwrap_or(0);
     let until = req.until_ms.unwrap_or(i64::MAX);
 
-    let agent_name_filter = req
+    let (agent_id_filter, agent_name_filter) = match req
         .agent
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all") && *s != "*")
-        .map(|s| {
-            let stripped = s.strip_prefix("agent:").unwrap_or(s);
+    {
+        Some(raw) => {
+            let stripped = raw.strip_prefix("agent:").unwrap_or(raw);
             if let Ok(aid) = AgentId::parse(stripped)
                 && let Ok(found) = agent_by_id(&conn, &aid)
             {
-                return found.name.to_lowercase();
+                (Some(found.id.to_string()), None)
+            } else if let Ok(found) = store.agent_by_name(stripped) {
+                (Some(found.id.to_string()), None)
+            } else {
+                (None, Some(stripped.to_lowercase()))
             }
-            stripped.to_lowercase()
-        });
+        }
+        None => (None, None),
+    };
 
     let dir_filter = req
         .direction
@@ -499,6 +515,7 @@ pub(super) fn pg_search_history(
         ascending,
         include_in,
         include_out,
+        agent_id: agent_id_filter.as_deref(),
         agent_name: agent_name_filter.as_deref(),
         sender_like: sender_like.as_deref(),
         from_seq: req.from_seq,
@@ -639,6 +656,7 @@ mod tests {
             ascending: false,
             include_in: true,
             include_out: true,
+            agent_id: None,
             agent_name: None,
             sender_like: None,
             from_seq: None,
@@ -662,6 +680,7 @@ mod tests {
             ascending: false,
             include_in: true,
             include_out: false,
+            agent_id: Some("agt_01test"),
             agent_name: Some("alpha"),
             sender_like: None,
             from_seq: None,
@@ -671,6 +690,8 @@ mod tests {
             exclude: &["noise".to_string()],
             backend: DbBackend::Postgres,
         });
+        assert!(sql_cjk.contains("m.agent_id = ?"));
+        assert!(!sql_cjk.contains("LOWER(a.name)"));
         assert!(sql_cjk.contains("m.body ILIKE"));
         assert!(!sql_cjk.contains("plainto_tsquery"));
         assert!(!sql_cjk.contains("outbound_messages"));
