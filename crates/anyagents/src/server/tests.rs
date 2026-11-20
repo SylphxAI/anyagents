@@ -4716,10 +4716,22 @@ fn http_spawn_uses_deployment_harness_for_roots_but_parent_for_children() {
         .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
         .unwrap();
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let unconfigured = create_agent_route(
-            Principal::Operator, State(state.clone()), axum::http::HeaderMap::new(),
-            Json(serde_json::from_value(serde_json::json!({"name": "unconfigured", "parent": "root"})).unwrap()),
-        ).await.err().expect("root without a harness or deployment default must be refused");
+        let Err(unconfigured) = create_agent_route(
+            Principal::Operator,
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(
+                serde_json::from_value(serde_json::json!({
+                    "name": "unconfigured",
+                    "parent": "root",
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        else {
+            panic!("root without a harness or deployment default must be refused");
+        };
         assert_eq!(unconfigured.status, StatusCode::BAD_REQUEST);
         assert!(state.store.agent_by_name("unconfigured").is_err());
         std::fs::write(dir.path().join("subagent-defaults.json"), r#"{"default":{"mode":"preset","harness":"codex"}}"#).unwrap();
