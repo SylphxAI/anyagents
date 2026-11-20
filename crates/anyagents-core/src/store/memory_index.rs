@@ -33,20 +33,29 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior};
 
-use super::{
-    classify_chunk_kind_and_tool, clean_rag_text, rag_content_hash, tokenize_hybrid_search_tokens,
-    tune_connection,
-};
+use super::{clean_rag_text, rag_content_hash, tune_connection};
 use crate::db::{DbBackend, DbExec, DbExecExt, DbParam, DbTx, PgTx};
 use crate::db_params;
 use crate::error::Error;
+
+mod postgres;
+mod projection;
+
+use postgres::sync_on_postgres;
+#[cfg(test)]
+pub(super) use projection::{
+    FTS_DELETE_AGENT_ROWS, FTS_DELETE_CHUNK, fts_chunk_lookup, fts_exact_phrase,
+};
+pub(super) use projection::{remove_chunk, rewrite_agent_fts_rows, upsert_chunk};
 
 /// The index file beside a state database named `state.db`.
 pub const FILE_NAME: &str = "memory-index.db";
 /// The schema name state readers attach the index under.
 pub(crate) const ATTACHED: &str = "memory_index";
 /// Layout version; a file with any other version is rebuilt from state.
-const LAYOUT: i64 = 2;
+// Kana and Hangul now have the same auxiliary tokens as Han. Existing
+// SQLite indexes need a rebuild to index them in older mailbox rows.
+const LAYOUT: i64 = 3;
 /// Rows projected per index transaction.
 const BATCH: usize = 512;
 /// Rows a reader projects before answering; the rest is left to the
@@ -349,7 +358,7 @@ impl MemoryIndex {
                 let deferred =
                     std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|p| p.into_inner()));
                 let res = sync_on_postgres(pool, state, &deferred, wait, budget);
-                if res.is_err() && !deferred.is_empty() {
+                if !matches!(res, Ok(Some(_))) && !deferred.is_empty() {
                     self.deferred
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -548,7 +557,7 @@ impl MemoryIndex {
         self.run_read(|conn| {
             for (id, body) in &merged {
                 let cleaned = clean_rag_text(body);
-                if cleaned.chars().count() < 2 {
+                if cleaned.chars().take(2).count() < 2 {
                     continue;
                 }
                 let hash: Option<String> = conn.db_query_opt(
@@ -622,6 +631,11 @@ impl MemoryIndex {
     pub(super) fn far_behind(&self, state: &(impl DbExec + ?Sized)) -> Result<bool, Error> {
         let marks = self.run_read(|c| marks(c))?;
         let (messages, outbound) = max_rowids(state)?;
+        if let MemoryIndexBackend::Postgres { pool } = &self.backend
+            && (marks.0 > messages || marks.1 > outbound || postgres::reset_cursor(pool)?.is_some())
+        {
+            return Ok(true);
+        }
         Ok((messages - marks.0).max(0) + (outbound - marks.1).max(0) > READ_BUDGET as i64)
     }
 }
@@ -1021,36 +1035,6 @@ pub(super) fn reset(
     Ok(())
 }
 
-fn reset_postgres(tx: &DbTx<'_>, state: &(impl DbExec + ?Sized)) -> Result<(), Error> {
-    tx.db_execute(
-        "DELETE FROM memory_index.rag_chunks WHERE chunk_id NOT LIKE 'tool\\_%' ESCAPE '\\'",
-        &[],
-    )?;
-    let tool_agents: Vec<String> = tx.db_query_vec(
-        "SELECT DISTINCT agent_id FROM memory_index.rag_chunks",
-        &[],
-        |r| r.get(0),
-    )?;
-    for agent_id in tool_agents {
-        let alive: Option<i64> = state.db_query_opt(
-            "SELECT 1 FROM agents WHERE id = ?1",
-            &db_params![agent_id],
-            |r| r.get(0),
-        )?;
-        if alive.is_none() {
-            tx.db_execute(
-                "DELETE FROM memory_index.rag_chunks WHERE agent_id = ?1",
-                &db_params![agent_id],
-            )?;
-        }
-    }
-    tx.db_execute(
-        "UPDATE memory_index.index_meta SET value = 0 WHERE key IN ('messages_rowid', 'outbound_rowid')",
-        &[],
-    )?;
-    Ok(())
-}
-
 /// A chunk read back from an index or legacy table, with its own kind.
 struct StandaloneRow {
     id: String,
@@ -1338,137 +1322,6 @@ fn sync_on_sqlite(conn: &mut Connection, state: &dyn DbExec, budget: usize) -> R
     Ok(true)
 }
 
-fn sync_on_postgres(
-    pool: &sqlx::PgPool,
-    state: &(impl DbExec + ?Sized),
-    deferred: &[String],
-    wait: bool,
-    budget: usize,
-) -> Result<Option<bool>, Error> {
-    if deferred.is_empty() {
-        let (messages, outbound) = marks(pool)?;
-        let (max_messages, max_outbound) = max_rowids(state)?;
-        let pending: bool =
-            pool.db_query_one("SELECT EXISTS(SELECT 1 FROM index_pending)", &[], |r| {
-                r.get(0)
-            })?;
-        if !pending && messages == max_messages && outbound == max_outbound {
-            return Ok(Some(true));
-        }
-    }
-    // Acquire advisory sync lock per-batch so other pods aren't blocked for the whole rebuild.
-    if !deferred.is_empty() {
-        let queued = with_pg_sync_lock(pool, wait, |tx| queue_chunks(tx, deferred))?;
-        if queued.is_none() {
-            return Ok(None);
-        }
-    }
-    loop {
-        let Some(drained_more) = with_pg_sync_lock(pool, wait, |tx| drain_pending_step(tx, state))?
-        else {
-            return Ok(None);
-        };
-        if !drained_more {
-            break;
-        }
-    }
-    let Some(()) = with_pg_sync_lock(pool, wait, |tx| {
-        let (messages, outbound) = marks(tx)?;
-        let (max_messages, max_outbound) = max_rowids(state)?;
-        if messages > max_messages || outbound > max_outbound {
-            reset_postgres(tx, state)?;
-        }
-        Ok(())
-    })?
-    else {
-        return Ok(None);
-    };
-
-    let mut left = budget;
-    for (key, rowid, direction) in [
-        ("messages_rowid", "m.rowid", "in"),
-        ("outbound_rowid", "o.rowid", "out"),
-    ] {
-        loop {
-            if left == 0 {
-                return Ok(Some(false));
-            }
-            let take = left.min(BATCH);
-            let Some(advanced) = with_pg_sync_lock(pool, wait, |tx| {
-                let mark: i64 = tx
-                    .db_query_opt(
-                        "SELECT value FROM index_meta WHERE key = ?1",
-                        &db_params![key],
-                        |r| r.get(0),
-                    )?
-                    .unwrap_or(0);
-                let max: i64 = state.db_query_one(
-                    &format!(
-                        "SELECT COALESCE(MAX(rowid), 0) FROM (SELECT rowid FROM {} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2) AS _batch",
-                        if direction == "in" {
-                            "messages"
-                        } else {
-                            "outbound_messages"
-                        }
-                    ),
-                    &db_params![mark, take as i64],
-                    |r| r.get(0),
-                )?;
-                if max <= mark {
-                    return Ok(false);
-                }
-                let rows = read_source_rows(
-                    state,
-                    direction,
-                    &format!("WHERE {rowid} > ?1 AND {rowid} <= ?2 ORDER BY {rowid}"),
-                    &db_params![mark, max],
-                )?;
-                for row in &rows {
-                    upsert_chunk(tx, &row.chunk())?;
-                }
-                tx.db_execute(
-                    "UPDATE index_meta SET value = ?2 WHERE key = ?1",
-                    &db_params![key, max],
-                )?;
-                Ok(true)
-            })?
-            else {
-                return Ok(None);
-            };
-            if !advanced {
-                break;
-            }
-            left = left.saturating_sub(take);
-        }
-    }
-    Ok(Some(true))
-}
-
-fn with_pg_sync_lock<T>(
-    pool: &sqlx::PgPool,
-    wait: bool,
-    f: impl FnOnce(&DbTx<'_>) -> Result<T, Error>,
-) -> Result<Option<T>, Error> {
-    let tx = PgTx::begin(pool)?;
-    if !wait {
-        let got: bool =
-            tx.db_query_one("SELECT pg_try_advisory_xact_lock(78697969)", &[], |r| {
-                r.get(0)
-            })?;
-        if !got {
-            return Ok(None);
-        }
-    } else {
-        let _: () = tx.db_query_one("SELECT pg_advisory_xact_lock(78697969)", &[], |_| Ok(()))?;
-    }
-    let wrapped = DbTx::Postgres(tx);
-    let res = f(&wrapped)?;
-    if let DbTx::Postgres(tx) = wrapped {
-        tx.commit()?;
-    }
-    Ok(Some(res))
-}
-
 fn queue_chunks(tx: &(impl DbExec + ?Sized), chunks: &[String]) -> Result<(), Error> {
     if chunks.is_empty() {
         return Ok(());
@@ -1568,304 +1421,4 @@ fn forget_agent(conn: &(impl DbExec + ?Sized), agent_id: &str) -> Result<(), Err
         &db_params![agent_id],
     )?;
     Ok(())
-}
-
-/// Write one chunk and its full-text row, replacing any earlier projection.
-/// A turn with fewer than two characters of text is not searchable and
-/// leaves no row.
-pub(super) fn upsert_chunk(conn: &(impl DbExec + ?Sized), chunk: &Chunk<'_>) -> Result<(), Error> {
-    let cleaned = clean_rag_text(chunk.text);
-    if conn.backend() == DbBackend::Postgres {
-        if cleaned.chars().count() < 2 {
-            return remove_chunk(conn, chunk.id);
-        }
-        let (kind, tool_name) = classify_chunk_kind_and_tool(
-            chunk.kind,
-            chunk.tool,
-            chunk.sender,
-            chunk.destination,
-            &cleaned,
-        );
-        let search_tokens = tokenize_hybrid_search_tokens(&cleaned).join(" ");
-        conn.db_execute(
-            "INSERT INTO memory_index.rag_chunks (
-                chunk_id, agent_id, agent_name, direction, sender, destination,
-                timestamp_ms, content_hash, text, kind, tool_name, seq,
-                search_tokens, search_tsv
-             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                to_tsvector(
-                    'simple',
-                    coalesce(?1, '') || ' ' || coalesce(?3, '') || ' ' || coalesce(?5, '')
-                    || ' ' || coalesce(?6, '') || ' ' || coalesce(?10, '') || ' '
-                    || coalesce(?11, '') || ' ' || coalesce(?9, '') || ' ' || coalesce(?13, '')
-                )
-             )
-             ON CONFLICT (chunk_id) DO UPDATE SET
-                agent_id = excluded.agent_id,
-                agent_name = excluded.agent_name,
-                direction = excluded.direction,
-                sender = excluded.sender,
-                destination = excluded.destination,
-                timestamp_ms = excluded.timestamp_ms,
-                content_hash = excluded.content_hash,
-                text = excluded.text,
-                kind = excluded.kind,
-                tool_name = excluded.tool_name,
-                seq = excluded.seq,
-                search_tokens = excluded.search_tokens,
-                search_tsv = excluded.search_tsv",
-            &db_params![
-                chunk.id,
-                chunk.agent_id,
-                chunk.agent_name,
-                chunk.direction,
-                chunk.sender,
-                chunk.destination,
-                chunk.timestamp_ms,
-                rag_content_hash(&cleaned),
-                cleaned,
-                kind,
-                tool_name,
-                chunk.seq,
-                search_tokens,
-            ],
-        )?;
-        if chunk.seq <= 0 {
-            conn.db_execute(
-                "UPDATE memory_index.rag_chunks SET seq = rowid WHERE chunk_id = ?1 AND seq <= 0",
-                &db_params![chunk.id],
-            )?;
-        }
-        return Ok(());
-    }
-
-    let existed: bool = conn.db_query_one(
-        "SELECT EXISTS(SELECT 1 FROM rag_chunks WHERE chunk_id = ?1)",
-        &db_params![chunk.id],
-        |r| r.get(0),
-    )?;
-    if existed {
-        remove_chunk(conn, chunk.id)?;
-    }
-    if cleaned.chars().count() < 2 {
-        return Ok(());
-    }
-    let (kind, tool_name) = classify_chunk_kind_and_tool(
-        chunk.kind,
-        chunk.tool,
-        chunk.sender,
-        chunk.destination,
-        &cleaned,
-    );
-    conn.db_execute(
-        "INSERT INTO rag_chunks (
-            chunk_id, agent_id, agent_name, direction, sender, destination,
-            timestamp_ms, content_hash, text, kind, tool_name, seq
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        &db_params![
-            chunk.id,
-            chunk.agent_id,
-            chunk.agent_name,
-            chunk.direction,
-            chunk.sender,
-            chunk.destination,
-            chunk.timestamp_ms,
-            rag_content_hash(&cleaned),
-            cleaned,
-            kind,
-            tool_name,
-            chunk.seq,
-        ],
-    )?;
-    if chunk.seq <= 0 {
-        conn.db_execute(
-            "UPDATE rag_chunks SET seq = rowid WHERE chunk_id = ?1 AND seq <= 0",
-            &db_params![chunk.id],
-        )?;
-    }
-    conn.db_execute(
-        "INSERT INTO rag_chunks_fts (
-            chunk_id, agent_name, sender, destination, kind, tool_name, text, search_tokens
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        &db_params![
-            chunk.id,
-            chunk.agent_name,
-            chunk.sender,
-            chunk.destination,
-            kind,
-            tool_name,
-            cleaned,
-            tokenize_hybrid_search_tokens(&cleaned).join(" "),
-        ],
-    )?;
-    Ok(())
-}
-
-/// Remove one chunk and its full-text row (and any duplicate of it).
-pub(super) fn remove_chunk(conn: &(impl DbExec + ?Sized), chunk_id: &str) -> Result<(), Error> {
-    if conn.backend() == DbBackend::Sqlite {
-        match fts_chunk_lookup(chunk_id) {
-            Some(lookup) => conn.db_execute(FTS_DELETE_CHUNK, &db_params![chunk_id, lookup])?,
-            None => conn.db_execute(
-                "DELETE FROM rag_chunks_fts WHERE chunk_id = ?1",
-                &db_params![chunk_id],
-            )?,
-        };
-    }
-    conn.db_execute(
-        "DELETE FROM rag_chunks WHERE chunk_id = ?1",
-        &db_params![chunk_id],
-    )?;
-    Ok(())
-}
-
-/// The full-text index (`rag_chunks_fts`, FTS5) answers only `rowid` and
-/// `MATCH` constraints from its index: a plain `column = ?` filter reads every
-/// row. Every statement that maintains it finds its rows through `MATCH` and
-/// keeps the result exact with `=`.
-///
-/// One chunk's row, through the chunk id's own token (see
-/// [`fts_chunk_lookup`]). `?1` the chunk id, `?2` its lookup phrase.
-pub(crate) const FTS_DELETE_CHUNK: &str =
-    "DELETE FROM rag_chunks_fts WHERE chunk_id MATCH ?2 AND chunk_id = ?1";
-
-/// One agent's rows filed under one name: `MATCH` on the name, `=` for the
-/// exact name, and only chunks `rag_chunks` gives the agent. `?1` the name,
-/// `?2` its phrase, `?3` the agent id.
-pub(crate) const FTS_DELETE_AGENT_ROWS: &str = "DELETE FROM rag_chunks_fts \
-     WHERE agent_name MATCH ?2 AND agent_name = ?1 \
-       AND chunk_id IN (SELECT chunk_id FROM rag_chunks WHERE agent_id = ?3)";
-
-/// [`FTS_DELETE_AGENT_ROWS`]' rows renamed to `?4`.
-pub(crate) const FTS_RENAME_AGENT_ROWS: &str = "UPDATE rag_chunks_fts SET agent_name = ?4 \
-     WHERE agent_name MATCH ?2 AND agent_name = ?1 \
-       AND chunk_id IN (SELECT chunk_id FROM rag_chunks WHERE agent_id = ?3)";
-
-/// One chunk's row renamed to `?3`, found as in [`FTS_DELETE_CHUNK`].
-pub(crate) const FTS_RENAME_CHUNK: &str =
-    "UPDATE rag_chunks_fts SET agent_name = ?3 WHERE chunk_id MATCH ?2 AND chunk_id = ?1";
-
-/// `value` as one FTS5 phrase: quoted, with any quote doubled.
-pub(crate) fn fts_exact_phrase(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
-/// The tokens the index's `unicode61` tokenizer makes of `value`: runs of
-/// letters and digits (everything else separates).
-fn fts_tokens(value: &str) -> impl Iterator<Item = &str> {
-    value
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-}
-
-/// The phrase that finds one chunk's row: intersecting its non-prefix tokens
-/// (`"tok1" AND "tok2"`), or all tokens when only prefix markers exist.
-/// Skipping shared leading markers (`msg`, `out`, `tool`) avoids reading those
-/// whole-index doclists, while intersecting remaining tokens keeps composite ids
-/// narrow even when one component token is shared across many chunks.
-/// `None` for an id without a token, which only a full scan can find.
-pub(crate) fn fts_chunk_lookup(chunk_id: &str) -> Option<String> {
-    let mut all = Vec::new();
-    for token in fts_tokens(chunk_id) {
-        if !all.contains(&token) {
-            all.push(token);
-        }
-    }
-    if all.is_empty() {
-        return None;
-    }
-    let mut chosen: Vec<&str> = all
-        .iter()
-        .copied()
-        .filter(|token| !matches!(*token, "msg" | "out" | "tool"))
-        .collect();
-    if chosen.is_empty() {
-        chosen = all;
-    }
-    chosen.truncate(16);
-    Some(
-        chosen
-            .into_iter()
-            .map(fts_exact_phrase)
-            .collect::<Vec<_>>()
-            .join(" AND "),
-    )
-}
-
-/// Remove an agent's full-text rows, or (`rename_to`) refile them under a
-/// new name. Work is proportional to the agent's own rows: one indexed
-/// statement per name its chunks are filed under, chunk by chunk only for a
-/// name that has no token to match.
-pub(super) fn rewrite_agent_fts_rows(
-    conn: &(impl DbExec + ?Sized),
-    agent_id: &str,
-    rename_to: Option<&str>,
-) -> Result<usize, Error> {
-    if conn.backend() == DbBackend::Postgres {
-        return match rename_to {
-            None => Ok(0),
-            Some(new) => conn.db_execute(
-                "UPDATE memory_index.rag_chunks
-                 SET agent_name = ?2,
-                     search_tsv = to_tsvector(
-                         'simple',
-                         coalesce(chunk_id, '') || ' ' || coalesce(?2, '') || ' ' || coalesce(sender, '')
-                         || ' ' || coalesce(destination, '') || ' ' || coalesce(kind, '') || ' '
-                         || coalesce(tool_name, '') || ' ' || coalesce(text, '') || ' ' || coalesce(search_tokens, '')
-                     )
-                 WHERE agent_id = ?1 AND agent_name != ?2",
-                &db_params![agent_id, new],
-            ),
-        };
-    }
-
-    let names: Vec<String> = conn.db_query_vec(
-        "SELECT DISTINCT agent_name FROM rag_chunks WHERE agent_id = ?1",
-        &db_params![agent_id],
-        |row| row.get(0),
-    )?;
-    let mut changed = 0;
-    for name in names {
-        if rename_to == Some(name.as_str()) {
-            continue;
-        }
-        if fts_tokens(&name).next().is_some() {
-            let phrase = fts_exact_phrase(&name);
-            changed += match rename_to {
-                None => {
-                    conn.db_execute(FTS_DELETE_AGENT_ROWS, &db_params![name, phrase, agent_id])?
-                }
-                Some(new) => conn.db_execute(
-                    FTS_RENAME_AGENT_ROWS,
-                    &db_params![name, phrase, agent_id, new],
-                )?,
-            };
-            continue;
-        }
-        let ids: Vec<String> = conn.db_query_vec(
-            "SELECT chunk_id FROM rag_chunks WHERE agent_id = ?1 AND agent_name = ?2",
-            &db_params![agent_id, name],
-            |row| row.get(0),
-        )?;
-        for chunk_id in ids {
-            changed += match (rename_to, fts_chunk_lookup(&chunk_id)) {
-                (None, Some(lookup)) => {
-                    conn.db_execute(FTS_DELETE_CHUNK, &db_params![chunk_id, lookup])?
-                }
-                (None, None) => conn.db_execute(
-                    "DELETE FROM rag_chunks_fts WHERE chunk_id = ?1",
-                    &db_params![chunk_id],
-                )?,
-                (Some(new), Some(lookup)) => {
-                    conn.db_execute(FTS_RENAME_CHUNK, &db_params![chunk_id, lookup, new])?
-                }
-                (Some(new), None) => conn.db_execute(
-                    "UPDATE rag_chunks_fts SET agent_name = ?2 WHERE chunk_id = ?1",
-                    &db_params![chunk_id, new],
-                )?,
-            };
-        }
-    }
-    Ok(changed)
 }

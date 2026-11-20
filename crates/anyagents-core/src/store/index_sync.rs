@@ -194,7 +194,7 @@ pub fn rag_content_hash(text: &str) -> String {
     format!("{h1:016x}{h2:016x}")
 }
 
-fn is_cjk_char(c: char) -> bool {
+pub(super) fn is_cjk_char(c: char) -> bool {
     matches!(
         c as u32,
         0x3400..=0x4DBF
@@ -203,8 +203,43 @@ fn is_cjk_char(c: char) -> bool {
             | 0x20000..=0x2A6DF
             | 0x2A700..=0x2B73F
             | 0x2B740..=0x2B81F
-            | 0x2B820..=0x2CEAF
+            | 0x2B820..=0x2EE5F
+            | 0x2F800..=0x2FA1F
+            | 0x30000..=0x323AF
+            | 0x3041..=0x3096 // Hiragana
+            | 0x3099..=0x309F // Hiragana marks and iteration signs
+            | 0x30A1..=0x30FA // Katakana
+            | 0x30FC..=0x30FF // Katakana prolonged sound and iteration signs
+            | 0x31F0..=0x31FF
+            | 0xFF66..=0xFF9F // Half-width Katakana
+            | 0x1100..=0x11FF // Hangul jamo
+            | 0x3131..=0x318E
+            | 0xA960..=0xA97C
+            | 0xAC00..=0xD7A3 // Hangul syllables
+            | 0xD7B0..=0xD7FF
     )
+}
+
+pub(super) fn cjk_runs(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|ch| !is_cjk_char(ch))
+        .filter(|run| !run.is_empty())
+}
+
+fn cjk_bigrams(run: &str) -> impl Iterator<Item = String> + '_ {
+    run.chars()
+        .zip(run.chars().skip(1))
+        .map(|(a, b)| [a, b].into_iter().collect())
+}
+
+/// Keep single characters only for single-character queries; otherwise use
+/// ordered, overlapping bigrams from the same tokenizer as the index.
+pub(super) fn cjk_phrase_tokens(run: &str) -> Vec<String> {
+    let bigrams: Vec<_> = cjk_bigrams(run).collect();
+    if bigrams.is_empty() {
+        vec![run.to_owned()]
+    } else {
+        bigrams
+    }
 }
 
 /// Hybrid ASCII + CJK tokenizer: emits lowercased alphanumeric/identifier tokens
@@ -214,7 +249,7 @@ fn is_cjk_char(c: char) -> bool {
 pub fn tokenize_hybrid_search_tokens(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut ascii_buf = String::new();
-    let mut cjk_run: Vec<char> = Vec::new();
+    let mut cjk_run = String::new();
 
     let flush_ascii = |buf: &mut String, out: &mut Vec<String>| {
         let trimmed = buf.trim_matches(['-', '_']);
@@ -231,16 +266,9 @@ pub fn tokenize_hybrid_search_tokens(text: &str) -> Vec<String> {
         }
         buf.clear();
     };
-    let flush_cjk = |run: &mut Vec<char>, out: &mut Vec<String>| {
-        for &ch in run.iter() {
-            out.push(ch.to_string());
-        }
-        for pair in run.windows(2) {
-            let mut s = String::with_capacity(6);
-            s.push(pair[0]);
-            s.push(pair[1]);
-            out.push(s);
-        }
+    let flush_cjk = |run: &mut String, out: &mut Vec<String>| {
+        out.extend(run.chars().map(|ch| ch.to_string()));
+        out.extend(cjk_bigrams(run));
         run.clear();
     };
 

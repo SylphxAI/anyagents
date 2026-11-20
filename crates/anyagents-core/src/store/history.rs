@@ -1,11 +1,11 @@
 //! Conversation history reading and scoped hybrid full-text search.
 
 use super::helpers::{agent_by_id, message_from_row_with_cursor_db};
-use super::index_sync::tokenize_hybrid_search_tokens;
+use super::index_sync::{cjk_phrase_tokens, cjk_runs, is_cjk_char, tokenize_hybrid_search_tokens};
 use super::mailbox::cursor;
 use super::types::{ConversationTurn, HistorySearchQuery, HistorySort};
 use super::{MESSAGE_COLS, Store};
-use crate::db::{DbBackend, DbExec, DbExecExt, DbParam, ToDbParam, build_pg_tsquery};
+use crate::db::{DbBackend, DbExec, DbExecExt, DbParam, ToDbParam};
 use crate::db_params;
 use crate::error::Error;
 use crate::id::AgentId;
@@ -461,7 +461,7 @@ impl Store {
             std::collections::HashMap::new();
 
         if !all_queries.is_empty() {
-            // 1. Lexical FTS5 / PostgreSQL GIN tsvector leg with filter pushdown.
+            // 1. SQLite FTS5 leg with filter pushdown.
             let fts_limit = i64::try_from((limit * 8).max(120)).unwrap_or(120);
             type FtsChunkRow = (
                 String,
@@ -476,28 +476,27 @@ impl Store {
                 i64,
                 f64,
             );
-            let fts_rows: Option<Vec<FtsChunkRow>> = match conn.backend() {
-                DbBackend::Sqlite => {
-                    let fts_query = build_fts5_query_with_filters(
-                        &all_queries,
-                        agent_name_filter.as_deref(),
-                        kind_sql_filter,
-                        tool_filter.as_deref(),
+            let fts_rows: Option<Vec<FtsChunkRow>> = {
+                let fts_query = build_fts5_query_with_filters(
+                    &all_queries,
+                    agent_name_filter.as_deref(),
+                    kind_sql_filter,
+                    tool_filter.as_deref(),
+                );
+                let visibility_sql = visible_agent_ids_sql("agent_id", visible_agent_ids, 5);
+                if fts_query.is_empty() {
+                    None
+                } else {
+                    let mut pp = Vec::new();
+                    let off = 4 + visible_agent_ids.map_or(0, |v| v.len());
+                    let peer_sql = build_peer_sql_at(
+                        &peer_forms,
+                        PeerTarget::RagChunks,
+                        conn.backend(),
+                        off,
+                        &mut pp,
                     );
-                    let visibility_sql = visible_agent_ids_sql("agent_id", visible_agent_ids, 5);
-                    if fts_query.is_empty() {
-                        None
-                    } else {
-                        let mut pp = Vec::new();
-                        let off = 4 + visible_agent_ids.map_or(0, |v| v.len());
-                        let peer_sql = build_peer_sql_at(
-                            &peer_forms,
-                            PeerTarget::RagChunks,
-                            conn.backend(),
-                            off,
-                            &mut pp,
-                        );
-                        let sql = format!(
+                    let sql = format!(
                                 "SELECT c.chunk_id, c.direction, c.sender, c.destination,
                                         COALESCE(
                                             (SELECT m.body FROM messages m WHERE m.agent_id = c.agent_id AND m.id = c.chunk_id),
@@ -520,85 +519,30 @@ impl Store {
                                  WHERE c.timestamp_ms > ?2 AND c.timestamp_ms <= ?3
                                  ORDER BY f.score ASC"
                             );
-                        let mut p = scoped_params(
-                            db_params![fts_query, since, until, fts_limit],
-                            visible_agent_ids,
-                        );
-                        p.extend(pp);
-                        conn.db_query_vec(&sql, &p, |r| {
-                            let direction: String = r.get(1)?;
-                            let origin_raw: Option<String> = r.get(11)?;
-                            let to =
-                                resolve_inbound_dest(&direction, r.get(3)?, origin_raw.as_deref());
-                            Ok((
-                                r.get(0)?,
-                                direction,
-                                r.get(2)?,
-                                to,
-                                r.get(4)?,
-                                r.get(5)?,
-                                r.get(6)?,
-                                r.get(7)?,
-                                r.get(8)?,
-                                r.get(9)?,
-                                r.get::<Option<f64>>(10)?.unwrap_or(0.0),
-                            ))
-                        })
-                        .ok()
-                    }
-                }
-                DbBackend::Postgres => {
-                    let pg_query = build_pg_tsquery(&all_queries);
-                    let visibility_sql = visible_agent_ids_sql("c.agent_id", visible_agent_ids, 8);
-                    pg_query.and_then(|fts_query| {
-                            let sql = format!(
-                                "SELECT c.chunk_id, c.direction, c.sender, c.destination,
-                                        COALESCE(
-                                            (SELECT m.body FROM messages m WHERE m.agent_id = c.agent_id AND m.id = c.chunk_id),
-                                            (SELECT o.body FROM outbound_messages o WHERE o.agent_id = c.agent_id AND o.id = c.chunk_id),
-                                            c.text
-                                        ),
-                                        c.timestamp_ms, c.agent_name, c.kind, c.tool_name, c.seq,
-                                        -ts_rank_cd(c.search_tsv, to_tsquery('simple', ?1))::float8 AS score
-                                 FROM memory_index.rag_chunks c
-                                 WHERE c.search_tsv @@ to_tsquery('simple', ?1)
-                                   AND c.timestamp_ms > ?2 AND c.timestamp_ms <= ?3
-                                   AND (?5 IS NULL OR LOWER(c.agent_name) = ?5)
-                                   AND (?6 IS NULL OR c.kind = ?6)
-                                   AND (?7 IS NULL OR LOWER(c.tool_name) = ?7)
-                                   {visibility_sql}
-                                 ORDER BY score ASC
-                                 LIMIT ?4"
-                            );
-                            let p = scoped_params(
-                                db_params![
-                                    fts_query,
-                                    since,
-                                    until,
-                                    fts_limit,
-                                    agent_name_filter.as_deref(),
-                                    kind_sql_filter,
-                                    tool_filter.as_deref(),
-                                ],
-                                visible_agent_ids,
-                            );
-                            conn.db_query_vec(&sql, &p, |r| {
-                                Ok((
-                                    r.get(0)?,
-                                    r.get(1)?,
-                                    r.get(2)?,
-                                    r.get(3)?,
-                                    r.get(4)?,
-                                    r.get(5)?,
-                                    r.get(6)?,
-                                    r.get(7)?,
-                                    r.get(8)?,
-                                    r.get(9)?,
-                                    r.get::<Option<f64>>(10)?.unwrap_or(0.0),
-                                ))
-                            })
-                            .ok()
-                        })
+                    let mut p = scoped_params(
+                        db_params![fts_query, since, until, fts_limit],
+                        visible_agent_ids,
+                    );
+                    p.extend(pp);
+                    conn.db_query_vec(&sql, &p, |r| {
+                        let direction: String = r.get(1)?;
+                        let origin_raw: Option<String> = r.get(11)?;
+                        let to = resolve_inbound_dest(&direction, r.get(3)?, origin_raw.as_deref());
+                        Ok((
+                            r.get(0)?,
+                            direction,
+                            r.get(2)?,
+                            to,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                            r.get(8)?,
+                            r.get(9)?,
+                            r.get::<Option<f64>>(10)?.unwrap_or(0.0),
+                        ))
+                    })
+                    .ok()
                 }
             };
             if let Some(rows) = fts_rows {
@@ -1060,7 +1004,6 @@ impl Store {
     }
 }
 
-#[allow(dead_code)]
 fn build_fts5_query_with_filters(
     queries: &[String],
     agent_name: Option<&str>,
@@ -1069,12 +1012,32 @@ fn build_fts5_query_with_filters(
 ) -> String {
     let mut terms = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut add = |term: String| {
+        if seen.insert(term.clone()) {
+            terms.push(term);
+        }
+    };
     for raw in queries {
-        for tok in tokenize_hybrid_search_tokens(raw) {
-            let clean = tok.replace('"', "");
-            if !clean.is_empty() && seen.insert(clean.clone()) {
-                terms.push(format!("\"{clean}\""));
+        let ascii = tokenize_hybrid_search_tokens(raw)
+            .into_iter()
+            .filter(|tok| !tok.starts_with(is_cjk_char))
+            .map(|tok| format!("\"{tok}\""));
+        let mut phrases: Vec<_> = cjk_runs(raw)
+            .map(|run| {
+                let phrase = cjk_phrase_tokens(run).join(" ");
+                format!("search_tokens : \"{phrase}\"")
+            })
+            .collect();
+        if phrases.is_empty() {
+            ascii.for_each(&mut add);
+        } else {
+            // Keep each CJK run mandatory, even in a mixed query; Latin
+            // alternatives must not turn partial CJK matches into hits.
+            let ascii: Vec<_> = ascii.collect();
+            if !ascii.is_empty() {
+                phrases.push(format!("({})", ascii.join(" OR ")));
             }
+            add(format!("({})", phrases.join(" AND ")));
         }
     }
     if terms.is_empty() {

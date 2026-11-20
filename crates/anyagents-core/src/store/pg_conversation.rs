@@ -13,7 +13,7 @@ use super::history::{
     PeerTarget, build_peer_sql, matches_conversation_peer, resolve_inbound_dest,
     visible_agent_ids_sql,
 };
-use super::index_sync::tokenize_hybrid_search_tokens;
+use super::index_sync::{cjk_phrase_tokens, cjk_runs, is_cjk_char, tokenize_hybrid_search_tokens};
 use super::types::{ConversationTurn, HistorySearchQuery, HistorySort};
 use crate::db::{DbBackend, DbExec as _, DbExecExt as _, DbParam, ToDbParam};
 use crate::error::Error;
@@ -107,6 +107,10 @@ pub(crate) fn query_uses_pg_fts(query: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c.is_ascii_whitespace() || c == '_')
         && trimmed.chars().any(|c| c.is_ascii_alphanumeric())
+}
+
+fn like_pred(column: &str, op: &str, param: usize) -> String {
+    format!("{column} {op} ?{param} ESCAPE '\\'")
 }
 
 fn escape_like_pattern(raw: &str) -> String {
@@ -280,6 +284,8 @@ pub(crate) struct DirectSearchSpec<'a> {
     pub ascending: bool,
     pub include_in: bool,
     pub include_out: bool,
+    pub include_tools: bool,
+    pub tool_name: Option<&'a str>,
     pub agent_id: Option<&'a str>,
     pub agent_name: Option<&'a str>,
     pub sender_like: Option<&'a str>,
@@ -292,7 +298,7 @@ pub(crate) struct DirectSearchSpec<'a> {
     pub backend: DbBackend,
 }
 
-/// Build the direct `messages` + `outbound_messages` search SQL and bind parameters.
+/// Search canonical mailbox rows and, when requested, standalone tool summaries.
 pub(crate) fn build_direct_search_sql(spec: &DirectSearchSpec<'_>) -> (String, Vec<DbParam>) {
     let mut sp = SqlParams::new();
     let p_since = sp.push(spec.since);
@@ -318,16 +324,72 @@ pub(crate) fn build_direct_search_sql(spec: &DirectSearchSpec<'_>) -> (String, V
         }
     }
 
+    let p_tool = spec.tool_name.map(|name| sp.push(name));
+    let vis_tool = visible_agent_ids_sql("rag_chunks.agent_id", spec.visible_agent_ids, vis_first);
     let like_kw = spec.backend.sql_like_ci();
     let use_fts_engine = spec.backend == DbBackend::Postgres;
     let mut query_preds_in: Vec<String> = Vec::new();
     let mut query_preds_out: Vec<String> = Vec::new();
+    let mut query_preds_tool = Vec::new();
     for q in spec.queries {
         let trimmed = q.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if use_fts_engine && query_uses_pg_fts(trimmed) {
+        let runs = cjk_runs(trimmed).collect::<Vec<_>>();
+        if use_fts_engine && !runs.is_empty() {
+            // Canonical PostgreSQL mailbox rows do not carry CJK token vectors.
+            // Search every contiguous run in the full body, even past the
+            // projection cap or before a projection is caught up.
+            let pats: Vec<_> = runs
+                .iter()
+                .map(|run| sp.push(escape_like_pattern(run)))
+                .collect();
+            let ascii = trimmed
+                .split(is_cjk_char)
+                .filter(|part| query_uses_pg_fts(part))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ascii_q = (!ascii.trim().is_empty()).then(|| sp.push(ascii.trim()));
+            let literal = |col: &str| {
+                pats.iter()
+                    .map(|p| like_pred(col, like_kw, *p))
+                    .collect::<Vec<_>>()
+            };
+            for (col, preds) in [
+                ("m.body", &mut query_preds_in),
+                ("o.body", &mut query_preds_out),
+            ] {
+                let mut and = literal(col);
+                if let Some(p) = ascii_q {
+                    and.push(format!(
+                        "to_tsvector('simple', {col}) @@ plainto_tsquery('simple', ?{p})"
+                    ));
+                }
+                preds.push(format!("({})", and.join(" AND ")));
+            }
+            if spec.include_tools {
+                let mut fallback = literal("rag_chunks.text");
+                let mut phrases = Vec::new();
+                for run in &runs {
+                    let p = sp.push(cjk_phrase_tokens(run).join(" "));
+                    phrases.push(format!("phraseto_tsquery('simple', ?{p})"));
+                }
+                if let Some(p) = ascii_q {
+                    phrases.push(format!("plainto_tsquery('simple', ?{p})"));
+                    fallback.push(format!(
+                        "to_tsvector('simple', rag_chunks.text) @@ plainto_tsquery('simple', ?{p})"
+                    ));
+                }
+                // Older vectors and out-of-prefix summaries can still match
+                // against the full standalone body rather than losing recall.
+                query_preds_tool.push(format!(
+                    "(rag_chunks.search_tsv @@ ({}) OR ({}))",
+                    phrases.join(" && "),
+                    fallback.join(" AND ")
+                ));
+            }
+        } else if use_fts_engine && query_uses_pg_fts(trimmed) {
             let p_q = sp.push(trimmed);
             query_preds_in.push(format!(
                 "to_tsvector('simple', m.body) @@ plainto_tsquery('simple', ?{p_q})"
@@ -335,15 +397,26 @@ pub(crate) fn build_direct_search_sql(spec: &DirectSearchSpec<'_>) -> (String, V
             query_preds_out.push(format!(
                 "to_tsvector('simple', o.body) @@ plainto_tsquery('simple', ?{p_q})"
             ));
+            if spec.include_tools {
+                let p_pat = sp.push(escape_like_pattern(trimmed));
+                query_preds_tool.push(format!(
+                    "(rag_chunks.search_tsv @@ plainto_tsquery('simple', ?{p_q}) OR {})",
+                    like_pred("rag_chunks.text", like_kw, p_pat)
+                ));
+            }
         } else {
             let p_pat = sp.push(escape_like_pattern(trimmed));
-            query_preds_in.push(format!("m.body {like_kw} ?{p_pat} ESCAPE '\\'"));
-            query_preds_out.push(format!("o.body {like_kw} ?{p_pat} ESCAPE '\\'"));
+            query_preds_in.push(like_pred("m.body", like_kw, p_pat));
+            query_preds_out.push(like_pred("o.body", like_kw, p_pat));
+            if spec.include_tools {
+                query_preds_tool.push(like_pred("rag_chunks.text", like_kw, p_pat));
+            }
         }
     }
 
     let mut excl_preds_in: Vec<String> = Vec::new();
     let mut excl_preds_out: Vec<String> = Vec::new();
+    let mut excl_preds_tool = Vec::new();
     for ex in spec.exclude {
         let trimmed = ex.trim();
         if trimmed.is_empty() {
@@ -352,6 +425,12 @@ pub(crate) fn build_direct_search_sql(spec: &DirectSearchSpec<'_>) -> (String, V
         let p_ex = sp.push(escape_like_pattern(trimmed));
         excl_preds_in.push(format!("NOT (m.body {like_kw} ?{p_ex} ESCAPE '\\')"));
         excl_preds_out.push(format!("NOT (o.body {like_kw} ?{p_ex} ESCAPE '\\')"));
+        if spec.include_tools {
+            excl_preds_tool.push(format!(
+                "NOT ({})",
+                like_pred("rag_chunks.text", like_kw, p_ex)
+            ));
+        }
     }
 
     let dir_kw = if spec.ascending { "ASC" } else { "DESC" };
@@ -452,6 +531,53 @@ pub(crate) fn build_direct_search_sql(spec: &DirectSearchSpec<'_>) -> (String, V
         ));
     }
 
+    if spec.include_tools {
+        let mut conds = vec![
+            format!("timestamp_ms > ?{p_since}"),
+            format!("timestamp_ms <= ?{p_until}"),
+            "left(chunk_id, 5) = 'tool_'".into(),
+            "kind = 'tool'".into(),
+        ];
+        if let Some(p) = p_agent_id {
+            conds.push(format!("agent_id = ?{p}"));
+        } else if let Some(p) = p_agent {
+            conds.push(format!("LOWER(agent_name) = ?{p}"));
+        }
+        if let Some(p) = p_tool {
+            conds.push(format!("tool_name = ?{p}"));
+        }
+        if let Some(p) = p_sender {
+            conds.push(like_pred("LOWER(sender)", like_kw, p));
+        }
+        if let Some(p) = p_from_seq {
+            conds.push(format!("seq >= ?{p}"));
+        }
+        if let Some(p) = p_to_seq {
+            conds.push(format!("seq <= ?{p}"));
+        }
+        if !query_preds_tool.is_empty() {
+            conds.push(format!("({})", query_preds_tool.join(" OR ")));
+        }
+        conds.extend(excl_preds_tool);
+        let peer = build_peer_sql(
+            spec.peer_forms,
+            PeerTarget::RagChunks,
+            spec.backend,
+            &mut sp.params,
+        );
+        let where_clause = format!("{}{vis_tool}{peer}", conds.join(" AND "));
+        arms.push(format!(
+            "SELECT * FROM (
+                 SELECT chunk_id AS id, direction, sender, destination, NULL::text AS reply_to,
+                        text AS body, timestamp_ms, seq, agent_name, NULL::text AS origin_raw
+                 FROM memory_index.rag_chunks
+                 WHERE {where_clause}
+                 ORDER BY timestamp_ms {dir_kw}, chunk_id {dir_kw}
+                 LIMIT ?{p_limit}
+             ) AS _tool"
+        ));
+    }
+
     let union_body = arms.join("\nUNION ALL\n");
     let sql = format!(
         "SELECT id, direction, sender, destination, reply_to, body, timestamp_ms, seq, agent_name, origin_raw
@@ -478,12 +604,9 @@ pub(super) fn pg_search_history(
         .tool_name
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty());
-    if req.only_tools || tool_filter.is_some() {
-        // Synthetic tool rows are stored in host transcripts, not `messages`/`outbound_messages`.
-        return Ok(Vec::new());
-    }
-
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase);
+    let only_tools = req.only_tools || tool_filter.is_some();
     let conn = store.read_conn();
     let limit = if req.limit == 0 { 500 } else { req.limit };
     let since = req.since_ms.unwrap_or(0);
@@ -516,9 +639,13 @@ pub(super) fn pg_search_history(
         .map(str::trim)
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
         .map(str::to_ascii_lowercase);
-    let include_in = dir_filter.as_deref().is_none_or(|d| d == "in");
-    let include_out = dir_filter.as_deref().is_none_or(|d| d == "out");
-    if !include_in && !include_out {
+    let in_direction = dir_filter.as_deref().is_none_or(|d| d == "in");
+    let out_direction = dir_filter.as_deref().is_none_or(|d| d == "out");
+    let include_tools =
+        conn.backend() == DbBackend::Postgres && out_direction && (req.include_tools || only_tools);
+    let include_in = in_direction && !only_tools;
+    let include_out = out_direction && !only_tools;
+    if !include_in && !include_out && !include_tools {
         return Ok(Vec::new());
     }
 
@@ -571,6 +698,8 @@ pub(super) fn pg_search_history(
         ascending,
         include_in,
         include_out,
+        include_tools,
+        tool_name: tool_filter.as_deref(),
         agent_id: agent_id_filter.as_deref(),
         agent_name: agent_name_filter.as_deref(),
         sender_like: sender_like.as_deref(),
@@ -679,8 +808,13 @@ pub(super) fn pg_search_history(
             continue;
         }
         let seq = turn.seq;
+        let kind = if turn.id.starts_with("tool_") {
+            "tool"
+        } else {
+            "message"
+        };
         turn.reply_to = Some(format!(
-            "score={score:.4} (pg_direct:agent={aname}:kind=message:seq={seq})"
+            "score={score:.4} (pg_direct:agent={aname}:kind={kind}:seq={seq})"
         ));
         hits.push(turn);
         if hits.len() >= limit {
@@ -718,6 +852,8 @@ mod tests {
             ascending: false,
             include_in: true,
             include_out: true,
+            include_tools: false,
+            tool_name: None,
             agent_id: None,
             agent_name: None,
             sender_like: None,
@@ -743,6 +879,8 @@ mod tests {
             ascending: false,
             include_in: true,
             include_out: false,
+            include_tools: false,
+            tool_name: None,
             agent_id: Some("agt_01test"),
             agent_name: Some("alpha"),
             sender_like: None,

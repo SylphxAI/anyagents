@@ -4354,3 +4354,82 @@ fn list_running_agents_with_undelivered_orders_oldest_first_and_skips_active_tur
     let ranked_after = store.list_running_agents_with_undelivered(10).unwrap();
     assert_eq!(ranked_after, vec![newer.id]);
 }
+
+#[test]
+fn history_han_phrase_beats_character_noise_outside_the_substring_window() {
+    let (_dir, store) = setup();
+    let alice = agent(&store, "alice");
+    let target = "城市生活方式探索";
+    let mut exact = Incoming::new(target);
+    exact.received_at_ms = Some(100);
+    store.receive(&alice.id, exact).unwrap();
+
+    // Use a single fixture transaction; the actual index is populated by
+    // the same bounded projection path as an existing mailbox on reopen.
+    {
+        let writer = store.sqlite_shared().writer();
+        writer.execute(
+            "WITH RECURSIVE sample(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM sample WHERE n < 2001)
+             INSERT INTO messages (id, agent_id, seq, received_at_ms, body)
+             SELECT 'msg_noise_' || n, ?1, n + 1, n + 100,
+                    CASE WHEN n % 2 = 0 THEN '生，活方式' ELSE '生活環境另有活方' END
+             FROM sample",
+            [alice.id.as_str()],
+        ).unwrap();
+    }
+    for (query, limit) in [("生活方式", 2), ("生活", 1)] {
+        let hits = store
+            .search_conversation(Some("alice"), None, None, Some(limit), query)
+            .unwrap();
+        assert_eq!(hits[0].text, target, "query: {query}");
+        if query == "生活方式" {
+            assert_eq!(
+                hits.len(),
+                1,
+                "disjoint bigrams must not appear in the results"
+            );
+        }
+    }
+    let hits = store
+        .search_conversation(Some("alice"), None, None, Some(10), "活")
+        .unwrap();
+    assert!(
+        !hits.is_empty(),
+        "single-character queries still find Han text"
+    );
+}
+
+#[test]
+fn history_cjk_bigrams_cover_han_kana_hangul_and_mixed_queries() {
+    let (_dir, store) = setup();
+    let alice = agent(&store, "alice");
+    let target = "Telegram 新頭像風格 ひらがな カタカナ 한국어";
+    for text in [
+        target,
+        "Telegram 由頭跟到尾 ひ、ら カ、タ 한、국",
+        "由頭像到像風但沒有連續三字",
+    ] {
+        store.receive(&alice.id, Incoming::new(text)).unwrap();
+    }
+    for query in ["頭像風", "ひら", "カタ", "한국", "Telegram 頭像"] {
+        let hits = store
+            .search_conversation(Some("alice"), None, None, Some(10), query)
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.text.as_str()).collect::<Vec<_>>(),
+            [target],
+            "{query}"
+        );
+    }
+    let hits = store
+        .search_conversation(Some("alice"), None, None, Some(10), "頭像")
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(hits.iter().all(|hit| hit.text.contains("頭像")));
+    for query in ["頭", "Telegram"] {
+        let hits = store
+            .search_conversation(Some("alice"), None, None, Some(10), query)
+            .unwrap();
+        assert!(hits.len() >= 2, "{query}");
+    }
+}
