@@ -199,6 +199,30 @@ pub struct AgentView {
 }
 
 impl AgentView {
+    /// Convert an HTTP/socket `AgentView` back into a client-side [`anyagents_core::Agent`].
+    pub fn into_agent(self) -> Result<anyagents_core::Agent, anyagents_core::Error> {
+        let runtime = anyagents_harness::resolve_stored_runtime(&self.harness, &[]);
+        Ok(anyagents_core::Agent {
+            is_admin: false,
+            id: anyagents_core::AgentId::parse(&self.id)?,
+            name: self.name,
+            role: self.role,
+            parent_id: self
+                .parent
+                .and_then(|p| anyagents_core::AgentId::parse(&p).ok()),
+            harness: self.harness,
+            runtime,
+            remote_budget_micros: None,
+            model: self.model,
+            workdir: self.workdir,
+            description: self.description,
+            instructions: self.instructions,
+            state: self.state,
+            created_at_ms: 0,
+            launch_env: Vec::new(),
+        })
+    }
+
     /// The lifecycle a listing shows: `faulted` for an agent parked because
     /// its turns kept ending in an error (its `state` is `paused`).
     pub fn display_state(&self) -> &str {

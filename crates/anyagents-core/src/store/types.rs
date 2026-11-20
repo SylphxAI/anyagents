@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use anyagents_harness::ExecutionRuntime;
+
 use super::TurnErrors;
 use crate::error::Error;
 use crate::id::{AgentId, ChannelId, MessageId, UsageId};
@@ -49,6 +51,10 @@ pub struct Agent {
     /// Public capability/charter summary shared in team and group rosters (Layer 1).
     pub description: Option<String>,
     pub harness: String,
+    /// Canonical execution runtime (`local`, `sandbox`, `sandbox:<provider>`, or `cloud`).
+    pub runtime: ExecutionRuntime,
+    /// Optional hard remote spend cap in micro-USD (`1_000_000` = US$1.00).
+    pub remote_budget_micros: Option<u64>,
     pub model: Option<String>,
     pub workdir: Option<String>,
     /// Private operating instructions injected only into this agent's system prompt (Layer 2).
@@ -187,6 +193,21 @@ impl Agent {
     pub fn is_task_subagent(&self) -> bool {
         self.parent_id.is_some() && self.lifecycle() == "task"
     }
+
+    /// Canonical harness name with any legacy `-cloud`/`-local` runtime suffix removed.
+    pub fn canonical_harness(&self) -> String {
+        anyagents_harness::decompose_legacy_selector(&self.harness).0
+    }
+
+    /// Canonical execution runtime (`local`, `sandbox[:provider]`, or `cloud`).
+    pub fn execution_runtime(&self) -> ExecutionRuntime {
+        self.runtime.clone()
+    }
+
+    /// Optional hard remote spend cap in micro-USD (`1_000_000` = US$1.00).
+    pub fn remote_budget_micros(&self) -> Option<u64> {
+        self.remote_budget_micros
+    }
 }
 
 /// An agent's identity, lifecycle state and place in the tree, without its
@@ -198,6 +219,8 @@ pub struct AgentSummary {
     pub id: AgentId,
     pub name: String,
     pub harness: String,
+    pub runtime: ExecutionRuntime,
+    pub remote_budget_micros: Option<u64>,
     pub model: Option<String>,
     pub state: String,
     pub parent_id: Option<AgentId>,
@@ -213,6 +236,8 @@ pub struct NewAgent {
     pub role: Option<String>,
     pub description: Option<String>,
     pub harness: String,
+    pub runtime: Option<ExecutionRuntime>,
+    pub remote_budget_micros: Option<u64>,
     pub model: Option<String>,
     pub workdir: Option<String>,
     pub instructions: Option<String>,
@@ -226,11 +251,23 @@ impl NewAgent {
             role: None,
             description: None,
             harness: harness.into(),
+            runtime: None,
+            remote_budget_micros: None,
             model: None,
             workdir: None,
             instructions: None,
             parent_id: None,
         }
+    }
+
+    pub fn with_runtime(mut self, runtime: ExecutionRuntime) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    pub fn with_budget_micros(mut self, cap_micros: u64) -> Self {
+        self.remote_budget_micros = (cap_micros > 0).then_some(cap_micros);
+        self
     }
 }
 

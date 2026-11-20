@@ -1443,22 +1443,7 @@ pub fn named(data: &Path, agent: &str) -> Result<Agent, Error> {
     if !client::can_call_server(data) && client::agent_identity().is_none() {
         return open(data)?.agent_by_name(agent);
     }
-    let found = view_named(data, agent)?;
-    Ok(Agent {
-        is_admin: false,
-        id: AgentId::parse(&found.id)?,
-        name: found.name,
-        role: found.role,
-        parent_id: found.parent.and_then(|p| AgentId::parse(&p).ok()),
-        harness: found.harness,
-        model: found.model,
-        workdir: found.workdir,
-        description: found.description,
-        instructions: found.instructions,
-        state: found.state,
-        created_at_ms: 0,
-        launch_env: Vec::new(),
-    })
+    view_named(data, agent)?.into_agent()
 }
 
 pub fn list_groups(data: &Path) -> Result<Vec<(String, Vec<String>)>, Error> {

@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use anyagents_harness::{ExecutionRuntime, resolve_stored_budget_micros, resolve_stored_runtime};
+
 use super::agents::agent_config_dir;
 use super::types::{Ack, Agent, AgentSummary, Message};
 use crate::db::{DbExec, DbExecExt, DbRow};
@@ -201,37 +203,72 @@ fn read_string(bytes: &[u8], at: usize) -> Option<(String, usize)> {
     None
 }
 
+pub(super) fn decode_runtime_column(
+    raw: Option<&str>,
+    harness: &str,
+    launch_env: &[(String, String)],
+) -> ExecutionRuntime {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| ExecutionRuntime::parse(s).ok())
+        .unwrap_or_else(|| resolve_stored_runtime(harness, launch_env))
+}
+
+pub(super) fn decode_budget_column(
+    raw: Option<i64>,
+    launch_env: &[(String, String)],
+) -> Option<u64> {
+    raw.and_then(|v| u64::try_from(v).ok())
+        .filter(|&cap| cap > 0)
+        .or_else(|| resolve_stored_budget_micros(launch_env))
+}
+
 pub(super) fn agent_from_row_db(row: &DbRow<'_>) -> Result<Agent, Error> {
     let agent_id = row.parse_str(0)?;
+    let harness: String = row.get(2)?;
+    let launch_env = row
+        .get::<Option<String>>(8)?
+        .map(|json| decode_env(&json))
+        .unwrap_or_default();
     let parent_id = match row.get::<Option<String>>(9)? {
         Some(raw) if !raw.is_empty() => Some(AgentId::parse(&raw)?),
         _ => None,
     };
+    let runtime_raw: Option<String> = row.get(13)?;
+    let budget_raw: Option<i64> = row.get(14)?;
+    let runtime = decode_runtime_column(runtime_raw.as_deref(), &harness, &launch_env);
+    let remote_budget_micros = decode_budget_column(budget_raw, &launch_env);
     Ok(Agent {
         is_admin: row.get(10)?,
         id: agent_id,
         name: row.get(1)?,
         role: row.get(11)?,
         description: row.get(12)?,
-        harness: row.get(2)?,
+        harness,
+        runtime,
+        remote_budget_micros,
         model: row.get(3)?,
         workdir: row.get(4)?,
         instructions: row.get(5)?,
         state: row.get(6)?,
         created_at_ms: row.get(7)?,
-        launch_env: row
-            .get::<Option<String>>(8)?
-            .map(|json| decode_env(&json))
-            .unwrap_or_default(),
+        launch_env,
         parent_id,
     })
 }
 
 pub(super) fn agent_summary_from_row_db(row: &DbRow<'_>) -> Result<AgentSummary, Error> {
+    let harness: String = row.get(2)?;
+    let runtime_raw: Option<String> = row.get(9)?;
+    let budget_raw: Option<i64> = row.get(10)?;
+    let runtime = decode_runtime_column(runtime_raw.as_deref(), &harness, &[]);
+    let remote_budget_micros = decode_budget_column(budget_raw, &[]);
     Ok(AgentSummary {
         id: row.parse_str(0)?,
         name: row.get(1)?,
-        harness: row.get(2)?,
+        harness,
+        runtime,
+        remote_budget_micros,
         model: row.get(3)?,
         state: row.get(4)?,
         parent_id: match row.get::<Option<String>>(5)? {
