@@ -13,6 +13,7 @@ mod gemini;
 mod guest;
 mod mcp_proxy;
 pub mod turn;
+mod workspace_delta;
 
 pub use guest::{DEFAULT_DATA_MOUNT_DIR, DEFAULT_STATE_DIR, DEFAULT_WORKDIR};
 

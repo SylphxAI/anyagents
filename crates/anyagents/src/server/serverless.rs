@@ -155,6 +155,7 @@ pub(crate) enum ReplyTarget {
 pub(crate) struct ServerlessDispatchInput {
     pub agent: Agent,
     pub prompt: String,
+    pub outbound_message: Option<anyagents_harness::OutboundMessage>,
     pub message_seq: Option<i64>,
     pub opener_id: Option<String>,
     pub reply_target: Option<ReplyTarget>,
@@ -173,6 +174,7 @@ impl ServerlessDispatchInput {
         Self {
             agent,
             prompt: prompt.into(),
+            outbound_message: None,
             message_seq: None,
             opener_id: None,
             reply_target: None,
@@ -328,18 +330,21 @@ async fn dispatch_cloud_turn(
             .remote_turn_store()
             .create_turn(&new_turn)
             .map_err(|e| format!("failed to persist pending cloud turn: {e}"))?;
-        // Build per-turn Streamable HTTP MCP attachment (#5421) from a fresh remote session token.
-        let mcp_servers = store_create
-            .begin_remote_session(&aid_mcp, 3_782_000)
-            .ok()
-            .map(|issued| {
-                let mcp_url = format!("{base_url_mcp}{}", crate::remote::MCP_PATH);
-                json!([{
-                    "name": "anyagents",
-                    "url": mcp_url,
-                    "bearer_token": issued.token,
-                }])
-            });
+        // Build per-turn Streamable HTTP MCP attachment without revoking sibling live tokens.
+        let mcp_servers = super::serverless_envelope::ensure_serverless_remote_session_token(
+            &store_create,
+            &aid_mcp,
+            &base_url_mcp,
+        )
+        .ok()
+        .map(|token| {
+            let mcp_url = format!("{base_url_mcp}{}", crate::remote::MCP_PATH);
+            json!([{
+                "name": "anyagents",
+                "url": mcp_url,
+                "bearer_token": token,
+            }])
+        });
         Ok((created, mcp_servers))
     })
     .await?;
@@ -541,6 +546,7 @@ async fn dispatch_sandbox_turn(
     let agent_ensure = input.agent.clone();
     let extra_args_ensure = input.guest_extra_args.clone();
     let prompt_for_media = input.prompt.clone();
+    let base_url_ensure = base_url.to_string();
     let ensured: Result<(crate::sandbox_exec::EnsuredSandbox, String), String> =
         tokio::task::spawn_blocking(move || {
             let cfg_dir =
@@ -570,6 +576,8 @@ async fn dispatch_sandbox_turn(
             // `<state_dir>/media/<file>`), ensure a live remote MCP session exists when
             // public_url is configured, and sync the full bundle tar into `<state_dir>`.
             let _ = hydrate_agent_files_from_store(&store_ensure, &agent_ensure.id, &cfg_dir)?;
+            super::serverless_envelope::deduplicate_hydrated_system_prompts(&cfg_dir);
+            super::serverless_envelope::ensure_deployment_skills_hydrated(&store_ensure);
             let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(
                 &store_ensure,
                 &agent_ensure.id,
@@ -583,16 +591,18 @@ async fn dispatch_sandbox_turn(
                         .join(anyagents_harness::media::MEDIA_DIR),
                 );
             }
-            let rewritten_prompt = hydrate_prompt_media_for_sandbox(
+            let rewritten_prompt = super::serverless_envelope::hydrate_prompt_media_for_sandbox(
                 &store_ensure,
                 &cfg_dir,
                 &ensured.handle.state_dir,
                 &prompt_for_media,
             );
-            if crate::remote::session_token(&cfg_dir).is_err()
-                && crate::remote::require_public_url(store_ensure.data_dir()).is_ok()
-            {
-                crate::remote::begin_session(&store_ensure, &agent_ensure)?;
+            if crate::remote::require_public_url(store_ensure.data_dir()).is_ok() {
+                let _ = super::serverless_envelope::ensure_serverless_remote_session_token(
+                    &store_ensure,
+                    &agent_ensure.id,
+                    &base_url_ensure,
+                )?;
             }
             if crate::remote::session_token(&cfg_dir).is_ok()
                 && crate::cloud_harness::resolve_public_mcp_url(&cfg_dir).is_ok()
@@ -685,13 +695,18 @@ async fn dispatch_sandbox_turn(
 
     let mut exec_req = ExecRequest::argv(argv)
         .with_cwd(ensured.handle.workdir.clone())
-        .with_stdin(effective_prompt.into_bytes())
         .with_timeout_ms(DETACHED_EXEC_TIMEOUT_MS);
     exec_req
         .env
         .extend(crate::sandbox_exec::filter_sandbox_launch_env(
             &input.agent.launch_env,
         ));
+    super::serverless_envelope::attach_outbound_message_env(
+        &mut exec_req,
+        input.outbound_message,
+        &effective_prompt,
+    );
+    exec_req = exec_req.with_stdin(effective_prompt.into_bytes());
 
     let out = match provider.exec(&ensured.handle, &exec_req).await {
         Ok(o) => o,
@@ -791,79 +806,6 @@ async fn dispatch_sandbox_turn(
     })
 }
 
-/// Hydrate any coordinator-side `<data_dir>/media/<file_name>` references in `prompt`
-/// from PostgreSQL `deployment_blobs(namespace = 'media')` (or local fallback) into
-/// `<cfg_dir>/media/<file_name>` so the sandbox tar sync uploads them to
-/// `<state_dir>/media/<file_name>`, and rewrite the paths in the returned prompt.
-fn hydrate_prompt_media_for_sandbox(
-    store: &Store,
-    cfg_dir: &Path,
-    state_dir: &str,
-    prompt: &str,
-) -> String {
-    let media_dir = store.data_dir().join(anyagents_harness::media::MEDIA_DIR);
-    let mut prefixes = Vec::new();
-    let dir_str = media_dir
-        .to_string_lossy()
-        .trim_end_matches('/')
-        .to_string();
-    if !dir_str.is_empty() {
-        prefixes.push(format!("{dir_str}/"));
-    }
-    if dir_str != "/var/lib/anyagents/media" {
-        prefixes.push("/var/lib/anyagents/media/".to_string());
-    }
-    let remote_media_prefix = format!("{}/media", state_dir.trim_end_matches('/'));
-    let mut rewritten = prompt.to_string();
-    let mut hydrated_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for prefix in &prefixes {
-        let mut search_from = 0usize;
-        while let Some(rel_idx) = rewritten[search_from..].find(prefix.as_str()) {
-            let start = search_from + rel_idx + prefix.len();
-            let rest = &rewritten[start..];
-            let end_offset = rest
-                .find(|c: char| {
-                    c.is_whitespace() || matches!(c, ']' | ')' | '"' | '\'' | '>' | ',' | ';')
-                })
-                .unwrap_or(rest.len());
-            let fname = rest[..end_offset].trim();
-            if !fname.is_empty()
-                && !fname.contains('/')
-                && !fname.contains('\\')
-                && !fname.contains("..")
-            {
-                hydrated_names.insert(fname.to_string());
-            }
-            search_from = start + end_offset;
-        }
-    }
-    if hydrated_names.is_empty() {
-        return rewritten;
-    }
-    let stage_dir = cfg_dir.join("media");
-    let _ = std::fs::create_dir_all(&stage_dir);
-    for fname in hydrated_names {
-        let bytes_opt = store
-            .blob_store()
-            .get_deployment_blob("media", &fname)
-            .ok()
-            .flatten()
-            .map(|b| b.content)
-            .or_else(|| std::fs::read(media_dir.join(&fname)).ok());
-        if let Some(bytes) = bytes_opt
-            && !bytes.is_empty()
-            && std::fs::write(stage_dir.join(&fname), &bytes).is_ok()
-        {
-            for prefix in &prefixes {
-                let from = format!("{prefix}{fname}");
-                let to = format!("{remote_media_prefix}/{fname}");
-                rewritten = rewritten.replace(&from, &to);
-            }
-        }
-    }
-    rewritten
-}
-
 /// When `ANYAGENTS_SERVERLESS=true`, synchronously dispatch all pending undelivered
 /// mailbox messages (batched up to 20) for `agent_id` once no live remote turn is running.
 /// Automatically settles timed-out remote turns and clears orphaned `turn_recovery` locks
@@ -932,22 +874,12 @@ pub(crate) async fn dispatch_next_mailbox_message_if_serverless(
     };
 
     let last = msgs.last().expect("non-empty batch");
-    let prompt = if msgs.len() == 1 {
-        last.text.clone()
-    } else {
-        let mut combined = String::new();
-        for (idx, m) in msgs.iter().enumerate() {
-            if idx > 0 {
-                combined.push_str("\n\n---\n\n");
-            }
-            let sender = m.sender.as_deref().unwrap_or("unknown");
-            combined.push_str(&format!(
-                "[Message seq={} from {}]\n{}",
-                m.seq, sender, m.text
-            ));
-        }
-        combined
-    };
+    let (prompt, mut outbound) =
+        super::serverless_envelope::build_serverless_outbound_message(&msgs);
+    super::serverless_envelope::attach_deployment_skills_to_topology(
+        &mut outbound,
+        store.data_dir(),
+    );
     // Prefer the latest human/Telegram reply target in the batch over older scheduled reminders.
     let reply_target = msgs
         .iter()
@@ -959,6 +891,7 @@ pub(crate) async fn dispatch_next_mailbox_message_if_serverless(
         .or_else(|| msgs.iter().rev().find_map(infer_reply_target_from_message));
 
     let mut input = ServerlessDispatchInput::for_agent(agent, prompt);
+    input.outbound_message = Some(outbound);
     input.message_seq = Some(last.seq);
     input.opener_id = Some(last.id.to_string());
     input.reply_target = reply_target;
@@ -1050,10 +983,11 @@ pub(crate) fn settle_remote_turn_and_deliver(
 
     // 1. Persist vendor session ID pin into `agent_files` (shared across all replicas).
     if let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        let canonical = anyagents_harness::normalize_harness_name(&harness_label);
         let _ = store.blob_store().put_agent_file(
             &turn.agent_id,
             "session_pin",
-            &format!("{harness_label}-session-id"),
+            &format!("{canonical}-session-id"),
             format!("{sid}\n").as_bytes(),
             false,
         );

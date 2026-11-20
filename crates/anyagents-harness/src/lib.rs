@@ -57,25 +57,31 @@ pub fn ref_message(reference: &str) -> Option<&str> {
 
 /// The text one stored message becomes for every harness: the ID line, then an
 /// optional `<topology>` event envelope (initial snapshot or incremental delta),
-/// followed by the structured `<message>` XML envelope containing optional
-/// `<quoted_message>` context and the `<body>`.
+/// an optional `<workspace>` git/file-change snapshot or delta, followed by the
+/// structured `<message>` XML envelope containing optional `<quoted_message>`
+/// context and the `<body>`.
 pub fn compose_message(id: &str, context: &Context, body: &str) -> String {
     let (main_body, quoted_xml) = extract_quoted_xml(body, context.reply_to_author.as_deref());
     let open_tag = context.open_tag(id);
-    match (context.topology.as_deref(), quoted_xml) {
-        (Some(topo), Some(q)) => format!(
-            "{MESSAGE_MARKER_PREFIX}{id}\n{topo}\n{open_tag}\n{q}\n<body>\n{main_body}\n</body>\n</message>"
-        ),
-        (Some(topo), None) => format!(
-            "{MESSAGE_MARKER_PREFIX}{id}\n{topo}\n{open_tag}\n<body>\n{main_body}\n</body>\n</message>"
-        ),
-        (None, Some(q)) => format!(
-            "{MESSAGE_MARKER_PREFIX}{id}\n{open_tag}\n{q}\n<body>\n{main_body}\n</body>\n</message>"
-        ),
-        (None, None) => format!(
-            "{MESSAGE_MARKER_PREFIX}{id}\n{open_tag}\n<body>\n{main_body}\n</body>\n</message>"
-        ),
+    let mut out = format!("{MESSAGE_MARKER_PREFIX}{id}\n");
+    if let Some(topo) = context.topology.as_deref() {
+        out.push_str(topo);
+        out.push('\n');
     }
+    if let Some(ws) = context.workspace.as_deref() {
+        out.push_str(ws);
+        out.push('\n');
+    }
+    out.push_str(&open_tag);
+    out.push('\n');
+    if let Some(q) = quoted_xml {
+        out.push_str(&q);
+        out.push('\n');
+    }
+    out.push_str("<body>\n");
+    out.push_str(main_body);
+    out.push_str("\n</body>\n</message>");
+    out
 }
 
 fn xml_attr_escape(s: &str) -> String {
@@ -194,6 +200,12 @@ pub struct Context {
     /// covers, which the mailbox holds and a reply can bind to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to_message: Option<String>,
+    /// ISO-8601 UTC timestamp (for example `2026-11-20T01:23:06Z`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    /// Compact `<workspace .../>` git/file-change snapshot or delta emitted by the guest runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 impl Context {
@@ -267,6 +279,9 @@ impl Context {
         ));
         if let Some(destination) = &self.destination {
             out.push_str(&format!(" answer_to=\"{}\"", xml_attr_escape(destination)));
+        }
+        if let Some(timestamp) = &self.timestamp {
+            out.push_str(&format!(" at=\"{}\"", xml_attr_escape(timestamp)));
         }
         out.push('>');
         out
@@ -854,6 +869,10 @@ pub struct HarnessHealth {
     pub sign_in_fault: Option<String>,
 }
 
+/// Environment variable carrying a base64-encoded JSON [`OutboundMessage`]
+/// from the serverless coordinator into `anyagents-guest turn`.
+pub const GUEST_MESSAGE_B64_ENV: &str = "ANYAGENTS_GUEST_MESSAGE_B64";
+
 /// One mailbox message handed to a harness. The id is what a replay is deduped on.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OutboundMessage {
@@ -866,6 +885,23 @@ pub struct OutboundMessage {
     /// The server's trusted header for this message: author, channel, chat,
     /// topic, the reply a bare answer names and where it goes.
     pub context: Context,
+}
+
+/// Serialize `msg` as JSON and encode with standard base64 for transport via
+/// [`GUEST_MESSAGE_B64_ENV`].
+pub fn encode_outbound_message_b64(msg: &OutboundMessage) -> Result<String, serde_json::Error> {
+    use base64::Engine as _;
+    let raw = serde_json::to_vec(msg)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(raw))
+}
+
+/// Decode a standard-base64 JSON [`OutboundMessage`] carried via [`GUEST_MESSAGE_B64_ENV`].
+pub fn decode_outbound_message_b64(encoded: &str) -> Result<OutboundMessage, String> {
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|err| format!("invalid base64 outbound message: {err}"))?;
+    serde_json::from_slice(&raw).map_err(|err| format!("invalid JSON outbound message: {err}"))
 }
 
 /// Result of one `deliver` call.
@@ -1172,6 +1208,50 @@ mod tests {
         assert_eq!(message_id_in_text(&text), Some("msg_1"));
         assert_eq!(message_id_in_text("hello"), None);
         assert_eq!(message_id_in_text("anyagents-message:"), None);
+    }
+
+    #[test]
+    fn compose_message_emits_optional_timestamp_workspace_and_b64_roundtrip() {
+        let plain = Context {
+            sender: Some("agent:alpha".into()),
+            ..Default::default()
+        };
+        assert!(!plain.open_tag("msg_1").contains(" at="));
+
+        let rich = Context {
+            sender: Some("telegram:user:42".into()),
+            chat_title: Some("Ops Room".into()),
+            thread_id: Some(7),
+            destination: Some("telegram:chat:-1001:thread:7".into()),
+            topology: Some("<topology event=\"initial\" />".into()),
+            timestamp: Some("2026-11-20T01:23:06Z".into()),
+            workspace: Some(
+                "<workspace event=\"initial\" branch=\"main\" head=\"abc1234\" dirty=\"0\" />"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        let rendered = compose_message("msg_42", &rich, "ship it");
+        assert!(rendered.contains("at=\"2026-11-20T01:23:06Z\""));
+        assert!(rendered.contains("<topology event=\"initial\" />"));
+        assert!(rendered.contains(
+            "<workspace event=\"initial\" branch=\"main\" head=\"abc1234\" dirty=\"0\" />"
+        ));
+        assert!(rendered.contains("chat_title=\"Ops Room\""));
+        assert!(rendered.contains("topic=\"7\""));
+
+        let outbound = OutboundMessage {
+            id: "msg_42".into(),
+            seq: 9,
+            text: "ship it".into(),
+            sender: Some("telegram:user:42".into()),
+            reply_to: Some("telegram:chat:-1001:thread:7".into()),
+            source_time_ms: Some(1_795_137_786_000),
+            context: rich,
+        };
+        let encoded = encode_outbound_message_b64(&outbound).unwrap();
+        let decoded = decode_outbound_message_b64(&encoded).unwrap();
+        assert_eq!(decoded, outbound);
     }
 
     #[cfg(unix)]

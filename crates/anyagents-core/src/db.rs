@@ -332,6 +332,10 @@ impl PgHandle {
             has_direct_override,
         };
         handle.ensure_schema()?;
+        let direct = handle
+            .has_direct_override
+            .then_some(handle.direct_url.as_str());
+        crate::store::ensure_pg_conversation_indexes(&handle.pool, direct, PG_MIGRATION_LOCK_KEY)?;
         Ok(handle)
     }
 
@@ -415,29 +419,18 @@ impl PgHandle {
                     .execute(&mut *conn)
                     .await?;
                 }
-                if current < 2 {
-                    sqlx::raw_sql(PG_STATELESS_SQL).execute(&mut *conn).await?;
-                    let now = now_ms();
-                    sqlx::query(
-                        "INSERT INTO public.pg_schema_migrations (version, applied_at_ms)
-                         VALUES (2, $1) ON CONFLICT (version) DO NOTHING",
-                    )
-                    .bind(now)
-                    .execute(&mut *conn)
-                    .await?;
-                }
-                if current < 3 {
-                    sqlx::raw_sql(PG_SERVERLESS_TURNS_SQL)
+                for (ver, sql) in [(2, PG_STATELESS_SQL), (3, PG_SERVERLESS_TURNS_SQL)] {
+                    if current < ver {
+                        sqlx::raw_sql(sql).execute(&mut *conn).await?;
+                        sqlx::query(
+                            "INSERT INTO public.pg_schema_migrations (version, applied_at_ms)
+                             VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
+                        )
+                        .bind(ver)
+                        .bind(now_ms())
                         .execute(&mut *conn)
                         .await?;
-                    let now = now_ms();
-                    sqlx::query(
-                        "INSERT INTO public.pg_schema_migrations (version, applied_at_ms)
-                         VALUES (3, $1) ON CONFLICT (version) DO NOTHING",
-                    )
-                    .bind(now)
-                    .execute(&mut *conn)
-                    .await?;
+                    }
                 }
                 Ok(())
             }

@@ -17,11 +17,15 @@ use super::messaging::{can_sender_message_agent_with, unsettled_view};
 use super::types::{ApiError, AppState, is_self_or_ancestor};
 use super::{file_cache, outbound_history, quota_rotation, serverless};
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub(crate) struct ListAgentsQuery {
     pub state: Option<String>,
     pub parent: Option<String>,
     pub name: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    #[serde(default, alias = "subtree")]
+    pub include_descendants: Option<bool>,
 }
 
 pub(super) fn compute_caller_relationship(store: &Store, caller: &Agent, target: &Agent) -> String {
@@ -145,12 +149,42 @@ pub(super) fn list_agents_sync_for_principal(
                 .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?,
         ),
     };
-    // Only the selected state and its ancestors are read; the archive is
-    // counted by index instead of being deserialized row by row.
-    let (roster, archived_count) = state
-        .store
-        .roster_agents(query.state.as_deref())
-        .map_err(ApiError::from_store)?;
+    // For unbounded `"all"` / `"archived"` queries by non-isolated callers without
+    // an explicit `name` filter, push LIMIT/OFFSET, non-archived-first ordering,
+    // NULL archived `instructions`, and recursive descendant traversal into SQL
+    // so 10K-agent archives never deserialize megabytes of unused rows.
+    let caller_is_isolated = caller_agent.as_ref().is_some_and(Agent::is_isolated);
+    let can_sql_page = !caller_is_isolated
+        && query.name.is_none()
+        && matches!(query.state.as_deref(), Some("all" | "archived"));
+    let (roster, archived_count, sql_paged) = if can_sql_page {
+        let root_only = matches!(query.parent.as_deref(), Some("root" | "none"));
+        let parent_agent = query
+            .parent
+            .as_deref()
+            .filter(|p| !matches!(*p, "root" | "none" | "all" | "subagents"))
+            .map(|p| state.store.agent_by_name(p))
+            .transpose()
+            .map_err(ApiError::from_store)?;
+        let (rows, archived) = state
+            .store
+            .roster_agents_paged(anyagents_core::RosterPageQuery {
+                state: query.state.as_deref(),
+                parent_id: parent_agent.as_ref().map(|a| &a.id),
+                root_only,
+                include_descendants: query.include_descendants.unwrap_or(false),
+                limit: query.limit,
+                offset: query.offset.unwrap_or(0),
+            })
+            .map_err(ApiError::from_store)?;
+        (rows, archived, true)
+    } else {
+        let (rows, archived) = state
+            .store
+            .roster_agents(query.state.as_deref())
+            .map_err(ApiError::from_store)?;
+        (rows, archived, false)
+    };
     let caller = caller_agent
         .as_ref()
         .map(|caller| RosterCaller::new(&state.store, caller, &roster));
@@ -158,7 +192,26 @@ pub(super) fn list_agents_sync_for_principal(
         .iter()
         .filter(|agent| caller.as_ref().is_none_or(|caller| caller.sees(agent)))
         .collect();
-    let mut listed = roster_views(&state.store, &state.health, &visible, archived_count, query)?;
+    let effective_query = if sql_paged {
+        ListAgentsQuery {
+            offset: None,
+            parent: if query.include_descendants.unwrap_or(false) {
+                None
+            } else {
+                query.parent.clone()
+            },
+            ..query.clone()
+        }
+    } else {
+        query.clone()
+    };
+    let mut listed = roster_views(
+        &state.store,
+        &state.health,
+        &visible,
+        archived_count,
+        &effective_query,
+    )?;
     if let Some(caller) = &caller {
         let by_id: HashMap<&str, &Agent> = visible.iter().map(|a| (a.id.as_str(), *a)).collect();
         for view in &mut listed.agents {
@@ -205,6 +258,33 @@ pub(crate) fn roster_views(
         .map(|p| store.agent_by_name(p))
         .transpose()
         .map_err(ApiError::from_store)?;
+    let include_descendants = query.include_descendants.unwrap_or(false);
+    let descendant_ids: Option<HashSet<&str>> = if include_descendants && let Some(ref p) = parent {
+        let mut children_by_parent: HashMap<&str, Vec<&str>> = HashMap::new();
+        for a in all_agents {
+            if let Some(ref pid) = a.parent_id {
+                children_by_parent
+                    .entry(pid.as_str())
+                    .or_default()
+                    .push(a.id.as_str());
+            }
+        }
+        let mut out: HashSet<&str> = HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(p.id.as_str());
+        while let Some(curr) = queue.pop_front() {
+            if let Some(kids) = children_by_parent.get(curr) {
+                for &kid in kids {
+                    if out.insert(kid) {
+                        queue.push_back(kid);
+                    }
+                }
+            }
+        }
+        Some(out)
+    } else {
+        None
+    };
     let mut selected = HashSet::new();
     for agent in all_agents {
         let state_matches = match query.state.as_deref() {
@@ -214,9 +294,11 @@ pub(crate) fn roster_views(
         };
         let parent_matches = match query.parent.as_deref() {
             Some("root" | "none") => agent.parent_id.is_none(),
-            _ => parent
-                .as_ref()
-                .is_none_or(|p| agent.parent_id.as_ref() == Some(&p.id)),
+            _ => match (&parent, &descendant_ids) {
+                (Some(_), Some(desc)) => desc.contains(agent.id.as_str()),
+                (Some(p), None) => agent.parent_id.as_ref() == Some(&p.id),
+                (None, _) => true,
+            },
         };
         if state_matches
             && parent_matches
@@ -247,6 +329,43 @@ pub(crate) fn roster_views(
             }
         }
     }
+    let mut selected_agents: Vec<&Agent> = all_agents
+        .iter()
+        .copied()
+        .filter(|a| selected.contains(a.id.as_str()))
+        .collect();
+    let is_archive_inclusive = matches!(query.state.as_deref(), Some("all" | "archived"));
+    if is_archive_inclusive {
+        selected_agents.sort_by(|a, b| {
+            (a.state == "archived")
+                .cmp(&(b.state == "archived"))
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+    }
+    let page_limit = if is_archive_inclusive {
+        Some(
+            query
+                .limit
+                .unwrap_or(anyagents_core::DEFAULT_ARCHIVE_ROSTER_LIMIT)
+                .max(1),
+        )
+    } else {
+        query.limit.map(|l| l.max(1))
+    };
+    let page_offset = query.offset.unwrap_or(0);
+    if page_offset > 0 {
+        if page_offset >= selected_agents.len() {
+            selected_agents.clear();
+        } else {
+            selected_agents.drain(..page_offset);
+        }
+    }
+    if let Some(lim) = page_limit
+        && selected_agents.len() > lim
+    {
+        selected_agents.truncate(lim);
+    }
     let mut metadata = store.agent_query_metadata().map_err(ApiError::from_store)?;
     let files = file_cache::cache();
     files.catch_up();
@@ -259,11 +378,8 @@ pub(crate) fn roster_views(
             .or_default()
             .push(unsettled_view(&held));
     }
-    let mut agents = Vec::with_capacity(selected.len());
-    for agent in all_agents {
-        if !selected.contains(agent.id.as_str()) {
-            continue;
-        }
+    let mut agents = Vec::with_capacity(selected_agents.len());
+    for agent in selected_agents {
         let view = agent_view_preloaded(
             store,
             health,
@@ -452,7 +568,7 @@ pub(super) fn archived_agent_view_fast(agent: &Agent) -> AgentView {
         oldest_undelivered_age_ms: None,
         install: "archived".to_string(),
         description: agent.public_description(),
-        instructions: agent.instructions.clone(),
+        instructions: None,
         seat_user: None,
         seat_uid: None,
         seat_gid: None,
@@ -506,8 +622,9 @@ fn agent_view_preloaded(
                 .aliases
                 .remove(agent.id.as_str())
                 .unwrap_or_default();
-            // Avoid O(N) parent-chain DB queries across thousands of archived agents.
-            view.instructions = agent.instructions.clone();
+            // Keep archived list views compact (`instructions: None`); full
+            // instructions are returned on single-agent `GET /v1/agents/{name}`.
+            view.instructions = None;
         } else {
             view.aliases = store.agent_aliases(&agent.id).unwrap_or_default();
             view.instructions =

@@ -922,6 +922,24 @@ pub(super) async fn conversation_route(
             Some(ids) => ids.clone(),
             None => every_agent_id(&state.store)?,
         };
+        // On PostgreSQL with thousands of archived agents, never walk archived
+        // agent directories on disk during `conversation(agent="all")` queries.
+        let host_file_authorized: Vec<String> = if is_all && state.store.is_postgres() {
+            let live_ids: std::collections::HashSet<String> = state
+                .store
+                .agent_summaries(false)
+                .map_err(ApiError::from_store)?
+                .into_iter()
+                .map(|a| a.id.to_string())
+                .collect();
+            authorized
+                .iter()
+                .filter(|id| live_ids.contains(id.as_str()))
+                .cloned()
+                .collect()
+        } else {
+            authorized.clone()
+        };
         let should_search_host_files = has_structured_search
             || query.scope != anyagents_core::host_index::MemoryScope::All
             || std::env::var_os("ANYAGENTS_TESTS").is_some();
@@ -938,8 +956,8 @@ pub(super) async fn conversation_route(
                         &target.id,
                     );
                 }
-            } else if authorized.len() <= 64 {
-                for aid_str in &authorized {
+            } else if host_file_authorized.len() <= 64 {
+                for aid_str in &host_file_authorized {
                     if let Ok(aid) = anyagents_core::AgentId::parse(aid_str) {
                         let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(
                             &state.store,
@@ -955,7 +973,7 @@ pub(super) async fn conversation_route(
         let (file_hits, pending) = if should_search_host_files {
             state
                 .store
-                .search_host_files_reporting(&authorized, query.scope, &file_request)
+                .search_host_files_reporting(&host_file_authorized, query.scope, &file_request)
                 .map_err(|e| ApiError::from_store(Error::Message(e.to_string())))?
         } else {
             (Vec::new(), Default::default())
@@ -973,7 +991,7 @@ pub(super) async fn conversation_route(
         let file_hits = match text_query.as_deref().filter(|_| ranks_by_relevance) {
             Some(text) => {
                 let owners: Vec<String> = if is_all {
-                    authorized.clone()
+                    host_file_authorized.clone()
                 } else {
                     let selected = state
                         .store

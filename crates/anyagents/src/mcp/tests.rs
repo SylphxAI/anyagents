@@ -602,8 +602,10 @@ mod spawn_args_tests {
                 "compact roster {key}: pages (rows, row bytes, CallToolResult bytes) = {page_sizes:?}"
             );
         }
-        let oversized =
-            serde_json::json!({"agents": [{"id": "x".repeat(31000)}], "summary": {"matched": 1}});
+        let oversized = serde_json::json!({
+            "agents": [{"id": "x".repeat(AGENT_LIST_RESULT_BUDGET + 1_000)}],
+            "summary": {"matched": 1}
+        });
         assert!(
             bound_agent_list(oversized, "agents", None)
                 .unwrap_err()
@@ -1297,5 +1299,201 @@ mod tool_server_runtime_tests {
             assert!(quick < Duration::from_secs(1), "quick call took {quick:?}");
             server.abort();
         });
+    }
+
+    #[tokio::test]
+    async fn agents_list_include_descendants_traverses_three_generations_and_respects_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let root_id = AgentId::generate();
+        let child_id = AgentId::generate();
+        let grandchild_id = AgentId::generate();
+
+        let mut population = vec![
+            dummy_agent_view(root_id.as_str(), "root", "running", "idle", None),
+            dummy_agent_view(
+                child_id.as_str(),
+                "child-lead",
+                "running",
+                "idle",
+                Some(root_id.as_str()),
+            ),
+            dummy_agent_view(
+                grandchild_id.as_str(),
+                "grandchild-worker",
+                "running",
+                "working",
+                Some(child_id.as_str()),
+            ),
+            dummy_agent_view(
+                "agt_great_grandchild",
+                "great-grandchild",
+                "idle",
+                "idle",
+                Some(grandchild_id.as_str()),
+            ),
+            dummy_agent_view("agt_unrelated", "other-root", "running", "idle", None),
+        ];
+        // Add 35 more direct children so total descendants = 38 (> old 18-row budget cap).
+        for idx in 0..35 {
+            population.push(dummy_agent_view(
+                &format!("agt_sub_{idx:02}"),
+                &format!("sub-{idx:02}"),
+                "running",
+                "idle",
+                Some(root_id.as_str()),
+            ));
+        }
+        let body = serde_json::to_vec(&AgentsResponse {
+            archived_count: 0,
+            agents: population,
+            gateway: None,
+        })
+        .unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                loop {
+                    req.push(stream.read_u8().await.unwrap());
+                    if req.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(hdr.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        });
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: root_id,
+                name: "root".into(),
+                workdir: None,
+            },
+            client: Client::new(socket, dir.path().join("config"), "test-cap".into()),
+        };
+
+        // `include_descendants=true` traverses child -> grandchild -> great-grandchild and returns all 38 rows.
+        let with_desc = mcp
+            .agents(Parameters(
+                serde_json::from_value(json!({
+                    "action": "list",
+                    "parent": "self",
+                    "include_descendants": true,
+                    "limit": 50
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        let rows = with_desc["agents"].as_array().unwrap();
+        assert_eq!(rows.len(), 38);
+        assert!(rows.iter().any(|r| r["name"] == "child-lead"));
+        assert!(rows.iter().any(|r| r["name"] == "grandchild-worker"));
+        assert!(rows.iter().any(|r| r["name"] == "great-grandchild"));
+        assert!(!rows.iter().any(|r| r["name"] == "other-root"));
+
+        // Without `include_descendants`, only the 36 direct children appear.
+        let direct_only = mcp
+            .agents(Parameters(
+                serde_json::from_value(json!({
+                    "action": "list",
+                    "parent": "self",
+                    "limit": 50
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        let direct_rows = direct_only["agents"].as_array().unwrap();
+        assert_eq!(direct_rows.len(), 36);
+        assert!(!direct_rows.iter().any(|r| r["name"] == "grandchild-worker"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inspect_falls_back_to_single_agent_route_for_archived_agents() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let parent_id = AgentId::generate();
+        let mut archived_child = dummy_agent_view(
+            "agt_archived_1",
+            "archived-worker",
+            "archived",
+            "idle",
+            Some(parent_id.as_str()),
+        );
+        archived_child.instructions = Some("ARCHIVED_INSTRUCTIONS".into());
+        let empty_live = serde_json::to_vec(&AgentsResponse {
+            archived_count: 1,
+            agents: Vec::new(),
+            gateway: None,
+        })
+        .unwrap();
+        let single_body = serde_json::to_vec(&archived_child).unwrap();
+        let conv_body = serde_json::to_vec(&ConversationResponse {
+            retrieval: None,
+            agent_id: "agt_archived_1".into(),
+            agent: "archived-worker".into(),
+            turns: Vec::new(),
+        })
+        .unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                loop {
+                    req.push(stream.read_u8().await.unwrap());
+                    if req.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let line = std::str::from_utf8(&req).unwrap().lines().next().unwrap();
+                let path = line.split_whitespace().nth(1).unwrap();
+                let body = if path == "/v1/agents" {
+                    &empty_live
+                } else if path == "/v1/agents/archived-worker" {
+                    &single_body
+                } else {
+                    &conv_body
+                };
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(hdr.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+        let mcp = AgentMcp {
+            agent: AgentRef {
+                id: parent_id,
+                name: "parent".into(),
+                workdir: None,
+            },
+            client: Client::new(socket, dir.path().join("config"), "test-cap".into()),
+        };
+        let inspected = mcp
+            .agents(Parameters(
+                serde_json::from_value(json!({"action": "inspect", "name": "archived-worker"}))
+                    .unwrap(),
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(inspected["agent"]["id"], "agt_archived_1");
+        assert_eq!(inspected["agent"]["state"], "archived");
+        assert_eq!(inspected["agent"]["instructions"], "ARCHIVED_INSTRUCTIONS");
+        server.await.unwrap();
     }
 }

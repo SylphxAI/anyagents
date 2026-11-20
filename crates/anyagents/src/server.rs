@@ -49,6 +49,7 @@ mod quota_rotation;
 mod reap_queue;
 mod schedules;
 pub(crate) mod serverless;
+mod serverless_envelope;
 mod types;
 mod webhooks_mcp;
 

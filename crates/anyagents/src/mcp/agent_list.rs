@@ -56,6 +56,43 @@ pub(super) fn agent_list_priority(agent: &AgentView) -> u8 {
     }
 }
 
+/// Retain either direct children of `root_id` (`include_descendants == false`)
+/// or all causal descendants at every depth (`include_descendants == true`, via
+/// breadth-first traversal across children, grandchildren, great-grandchildren, ...).
+pub(super) fn retain_parent_or_descendants(
+    agents: &mut Vec<AgentView>,
+    root_id: &str,
+    include_descendants: bool,
+) {
+    if !include_descendants {
+        agents.retain(|a| a.parent.as_deref() == Some(root_id));
+        return;
+    }
+    let mut children_by_parent: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for a in agents.iter() {
+        if let Some(pid) = a.parent.as_deref() {
+            children_by_parent
+                .entry(pid)
+                .or_default()
+                .push(a.id.as_str());
+        }
+    }
+    let mut descendants: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
+    queue.push_back(root_id);
+    while let Some(curr) = queue.pop_front() {
+        if let Some(kids) = children_by_parent.get(curr) {
+            for &kid in kids {
+                if descendants.insert(kid.to_string()) {
+                    queue.push_back(kid);
+                }
+            }
+        }
+    }
+    agents.retain(|a| descendants.contains(&a.id));
+}
+
 pub(super) const DEFAULT_LIST_LIMIT: usize = 100;
 pub(super) const MAX_LIST_LIMIT: usize = 100;
 
@@ -125,7 +162,9 @@ pub(crate) fn filter_and_summarize_agent_list(
 // A row-count limit alone cannot bound arbitrary descriptions or JSON escaping.
 // Budget the encoded rmcp result (including its backward-compatible JSON text
 // fallback AND structuredContent), not only the row JSON. HTTP AgentView is unchanged.
-pub(super) const AGENT_LIST_RESULT_BUDGET: usize = 30_000;
+// 180 KiB fits a full page of 100 compact agent summaries without prematurely
+// truncating caller-requested limits down to ~18 rows.
+pub(super) const AGENT_LIST_RESULT_BUDGET: usize = 180_000;
 
 pub(super) fn compact_agent_row(row: &mut serde_json::Value) {
     let Some(row) = row.as_object_mut() else {
@@ -203,7 +242,9 @@ pub(super) fn bound_agent_list(
             return Ok(value);
         }
         if returned <= 1 {
-            return Err("one agent summary exceeds the 30000-byte MCP result budget; use agents inspect with its name or ID".into());
+            return Err(format!(
+                "one agent summary exceeds the {AGENT_LIST_RESULT_BUDGET}-byte MCP result budget; use agents inspect with its name or ID"
+            ));
         }
         value[key].as_array_mut().unwrap().pop();
     }

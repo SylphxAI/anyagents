@@ -839,8 +839,7 @@ pub fn resume_faulted(data: &Path) -> Result<(), Error> {
     }
     let query = server::ListAgentsQuery {
         state: Some("paused".to_string()),
-        parent: None,
-        name: None,
+        ..Default::default()
     };
     let listed = match client::get::<AgentsResponse>(data, "/v1/agents?state=paused")
         .map_err(Error::Message)?
@@ -1353,8 +1352,7 @@ fn list_filtered(
     let query = server::ListAgentsQuery {
         state: state_filter.map(str::to_string),
         // Parent filtering below preserves the CLI's subtree/depth semantics.
-        parent: None,
-        name: None,
+        ..Default::default()
     };
     let path = state_filter
         .map(|s| format!("/v1/agents?state={s}"))

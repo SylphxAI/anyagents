@@ -518,6 +518,8 @@ impl Store {
             participants,
             topology,
             reply_to_message: None,
+            timestamp: None,
+            workspace: None,
         };
         let message = Message {
             id: MessageId::generate(),

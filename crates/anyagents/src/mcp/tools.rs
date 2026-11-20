@@ -408,18 +408,6 @@ impl AgentMcp {
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
                 let mut response = self.client.get_agents_for_state(state_trimmed).await?;
-                match state_trimmed {
-                    Some(state_filter) if !state_filter.eq_ignore_ascii_case("all") => {
-                        response.agents.retain(|a| {
-                            a.state.eq_ignore_ascii_case(state_filter)
-                                || a.turn_state.eq_ignore_ascii_case(state_filter)
-                        });
-                    }
-                    Some(_) => {}
-                    None => {
-                        response.agents.retain(|a| a.state != "archived");
-                    }
-                }
                 if let Some(parent_filter) = args
                     .parent
                     .as_deref()
@@ -470,10 +458,21 @@ impl AgentMcp {
                                 .or_else(|| Some(cleaned.to_string()))
                         };
                         if let Some(wid) = wanted_id {
-                            response
-                                .agents
-                                .retain(|a| a.parent.as_deref() == Some(wid.as_str()));
+                            let sub = args.include_descendants.unwrap_or(false);
+                            retain_parent_or_descendants(&mut response.agents, &wid, sub);
                         }
+                    }
+                }
+                match state_trimmed {
+                    Some(state_filter) if !state_filter.eq_ignore_ascii_case("all") => {
+                        response.agents.retain(|a| {
+                            a.state.eq_ignore_ascii_case(state_filter)
+                                || a.turn_state.eq_ignore_ascii_case(state_filter)
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        response.agents.retain(|a| a.state != "archived");
                     }
                 }
                 let summary = filter_and_summarize_agent_list(
@@ -793,17 +792,10 @@ impl AgentMcp {
                     .filter(|s| !s.is_empty())
                     .unwrap_or("self");
                 let clean = target.strip_prefix("agent:").unwrap_or(target);
-                let resp: AgentsResponse = self.client.get_agents().await?;
-                let view = resp
-                    .agents
-                    .into_iter()
-                    .find(|a| {
-                        (clean.eq_ignore_ascii_case("self") && a.id == self.agent.id.as_str())
-                            || a.name.eq_ignore_ascii_case(clean)
-                            || a.id == clean
-                            || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(clean))
-                    })
-                    .ok_or_else(|| format!("agent `{clean}` not found"))?;
+                let view = self
+                    .client
+                    .resolve_agent_for_inspect(self.agent.id.as_str(), clean, "agent")
+                    .await?;
                 let limit = args.limit.unwrap_or(10);
                 let conv_path = format!("/v1/agents/{}/conversation?limit={limit}", view.id);
                 let conv: ConversationResponse =
@@ -972,8 +964,11 @@ impl AgentMcp {
                             .map(|a| a.id.clone())
                             .unwrap_or_else(|| cleaned.to_string())
                     };
-                    resp.agents
-                        .retain(|a| a.parent.as_deref() == Some(wanted_id.as_str()));
+                    retain_parent_or_descendants(
+                        &mut resp.agents,
+                        &wanted_id,
+                        args.include_descendants.unwrap_or(false),
+                    );
                 }
                 if let Some(st) = args
                     .state
@@ -1011,17 +1006,10 @@ impl AgentMcp {
                     .filter(|s| !s.is_empty())
                     .unwrap_or("self");
                 let clean = target.strip_prefix("agent:").unwrap_or(target);
-                let resp: AgentsResponse = self.client.get_agents().await?;
-                let view = resp
-                    .agents
-                    .into_iter()
-                    .find(|a| {
-                        (clean.eq_ignore_ascii_case("self") && a.id == self.agent.id.as_str())
-                            || a.name.eq_ignore_ascii_case(clean)
-                            || a.id == clean
-                            || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(clean))
-                    })
-                    .ok_or_else(|| format!("sub-agent `{clean}` not found"))?;
+                let view = self
+                    .client
+                    .resolve_agent_for_inspect(self.agent.id.as_str(), clean, "sub-agent")
+                    .await?;
                 let limit = args.limit.unwrap_or(10);
                 let conv_path = format!("/v1/agents/{}/conversation?limit={limit}", view.id);
                 let conv: ConversationResponse =

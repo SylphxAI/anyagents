@@ -185,12 +185,19 @@ fn authenticate_mcp_request(
                 "invalid, expired or revoked remote session token",
             )
         };
+        let map_auth_err = |err: anyagents_core::Error| match err {
+            anyagents_core::Error::Db(_)
+            | anyagents_core::Error::Postgres(_)
+            | anyagents_core::Error::Io(_) => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily unable to verify remote session token; retry shortly",
+            ),
+            _ => unauthenticated(),
+        };
         let grant = store
             .authenticate_remote_session(token)
-            .map_err(|_| unauthenticated())?;
-        let agent = store
-            .agent(&grant.agent_id)
-            .map_err(|_| unauthenticated())?;
+            .map_err(map_auth_err)?;
+        let agent = store.agent(&grant.agent_id).map_err(map_auth_err)?;
         // A remote token is for an agent that runs off this host. Consult
         // PostgreSQL `agent_sandbox_bindings` (plus local config fallback) so
         // peer replicas without pod-local `sandbox*.json` admit requests cleanly

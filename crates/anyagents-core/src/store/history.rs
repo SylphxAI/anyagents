@@ -175,6 +175,15 @@ impl Store {
         limit: Option<usize>,
         visible_agent_ids: Option<&[String]>,
     ) -> Result<Vec<ConversationTurn>, Error> {
+        if self.is_postgres() {
+            return super::pg_conversation::pg_conversation_all_scoped(
+                self,
+                with_peer,
+                since_ms,
+                limit,
+                visible_agent_ids,
+            );
+        }
         self.sync_memory_index()?;
         let conn = self.read_conn();
         let since = since_ms.unwrap_or(0);
@@ -246,6 +255,9 @@ impl Store {
     /// `from_seq`, `to_seq`), ordering (`Relevance`, `Newest`, `Oldest`), and contiguous episode
     /// context expansion (`radius`).
     pub fn search_history(&self, req: &HistorySearchQuery) -> Result<Vec<ConversationTurn>, Error> {
+        if self.is_postgres() {
+            return super::pg_conversation::pg_search_history(self, req);
+        }
         self.sync_memory_index()?;
         let conn = self.read_conn();
         let limit = if req.limit == 0 {
@@ -1008,7 +1020,7 @@ fn build_fts5_query_with_filters(
 
 /// SQL fragment for the visibility predicate shared by recent and Raw-RAG
 /// reads. Immutable IDs are exact matches; an empty set fails closed.
-fn visible_agent_ids_sql(
+pub(super) fn visible_agent_ids_sql(
     column: &str,
     visible_agent_ids: Option<&[String]>,
     first_param: usize,
@@ -1037,7 +1049,7 @@ impl Store {
     /// A peer as written, plus the name and id of the agent it names: a
     /// message records its sender by id and its recipient as addressed, so
     /// either form alone misses half an exchange.
-    fn conversation_peer_forms(&self, peer: &str) -> Vec<String> {
+    pub(super) fn conversation_peer_forms(&self, peer: &str) -> Vec<String> {
         let mut forms = vec![peer.to_string()];
         let bare = peer.strip_prefix("agent:").unwrap_or(peer);
         if !bare.contains(':')
@@ -1053,7 +1065,7 @@ impl Store {
     }
 }
 
-fn matches_conversation_peer(turn: &ConversationTurn, peer: &str) -> bool {
+pub(super) fn matches_conversation_peer(turn: &ConversationTurn, peer: &str) -> bool {
     let bare = peer
         .strip_prefix("agent:")
         .or_else(|| peer.strip_prefix("group:"))

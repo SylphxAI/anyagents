@@ -98,6 +98,7 @@ mod mcp_ops;
 pub mod memory_index;
 mod operator_inbox;
 mod origin;
+mod pg_conversation;
 mod registry;
 mod remote_sessions;
 mod retired_search;
@@ -121,8 +122,9 @@ mod types;
 mod usage;
 
 pub use agents::{
-    agent_config_dir, agent_lock_path, agent_work_dir, legacy_agent_work_dir,
-    parse_agent_lifecycle, parse_agent_scope, read_children_roster, read_root_roster,
+    DEFAULT_ARCHIVE_ROSTER_LIMIT, RosterPageQuery, agent_config_dir, agent_lock_path,
+    agent_work_dir, legacy_agent_work_dir, parse_agent_lifecycle, parse_agent_scope,
+    read_children_roster, read_root_roster,
 };
 pub use credentials::{
     CredentialBinding, CredentialBindingAudit, CredentialKind, CredentialObservation,
@@ -139,6 +141,7 @@ pub use operator_inbox::{
     OperatorMessage, OperatorReceipt, OperatorReport,
 };
 pub(crate) use origin::origin_namespace;
+pub(crate) use pg_conversation::ensure_pg_conversation_indexes;
 pub use registry::holds_store_writer;
 pub use remote_sessions::{
     REMOTE_SESSION_TOKEN_PREFIX, RemoteSession, RemoteSessionGrant, RemoteSessionToken,

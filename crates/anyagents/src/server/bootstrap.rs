@@ -151,7 +151,7 @@ fn hydrate_deployment_blobs_on_start(store: &Store, data: &Path) -> Result<usize
         use std::os::unix::fs::PermissionsExt as _;
         let _ = std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o700));
     }
-    for ns in ["config", "secrets", "profiles"] {
+    for ns in ["config", "secrets", "profiles", "skills"] {
         let entries = blobs.get_deployment_blobs_all(ns)?;
         for entry in entries {
             if anyagents_core::stateless::validate_blob_path(&entry.path).is_err() {
@@ -161,6 +161,7 @@ fn hydrate_deployment_blobs_on_start(store: &Store, data: &Path) -> Result<usize
                 "config" => data.join(&entry.path),
                 "secrets" => data.join("secrets").join(&entry.path),
                 "profiles" => data.join("profiles").join(&entry.path),
+                "skills" => data.join("skills").join(&entry.path),
                 _ => continue,
             };
             let mode = if entry.encrypted || ns == "secrets" {
