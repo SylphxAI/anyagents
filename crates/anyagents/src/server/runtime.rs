@@ -14,7 +14,7 @@ use crate::create;
 use super::serverless::ServerlessDispatchInput;
 use super::types::{
     ApiError, AppState, is_self_or_ancestor, refuse_host_placement_over_http,
-    require_admin_or_operator, require_remote_callback_for_runtime, spawn_store, via_http_mcp,
+    require_operator_audited, require_remote_callback_for_runtime, spawn_store, via_http_mcp,
 };
 
 #[derive(Deserialize)]
@@ -58,7 +58,7 @@ pub(super) async fn runtime_route(
                 format!("agent:{caller_name}")
             }
             _ => {
-                require_admin_or_operator(&state.store, &principal, "agents.runtime", &found.name)?
+                require_operator_audited(&state.store, &principal, "agents.runtime", &found.name)?
             }
         };
 

@@ -166,10 +166,10 @@ fn apply(
             Some(owner) => supervises(conn, &caller.id, owner)?,
             None => false,
         };
-        if !owner_authority && !(caller.parent_id.is_none() && caller.is_admin) {
+        if !owner_authority {
             return Err(forbidden(
                 name,
-                "changing visibility requires the owner, its ancestor, the operator, or a root admin",
+                "changing visibility requires the owner, its ancestor, or the operator",
             ));
         }
     }
@@ -588,17 +588,16 @@ mod tests {
             ),
             "changing visibility",
         );
-        store.set_agent_admin(&other.id, true).unwrap();
+        // Operator may always change visibility; unrelated peers never may.
         store
             .group_action_as(
-                &actor(&other),
+                &GroupActor::Operator,
                 "private-room",
                 GroupAction::Members,
                 &[],
                 Some(true),
             )
             .unwrap();
-        store.set_agent_admin(&other.id, false).unwrap();
         denied(
             store.group_action_as(
                 &actor(&other),

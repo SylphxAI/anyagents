@@ -42,6 +42,7 @@ mod memory_backlog;
 mod messaging;
 mod messaging_conversation;
 mod messaging_delivery;
+pub(crate) mod oidc_bearer;
 mod ops;
 pub(crate) mod outbound_history;
 mod profile_models;
@@ -108,6 +109,7 @@ use types::{SignInLine, require_operator, spawn_store};
 /// or a forwarding header.
 pub(crate) fn build_public_router(state: AppState) -> Router {
     ops::public_health_router()
+        .merge(oidc_bearer::discovery_router())
         .merge(channels_groups::webhook_router())
         .merge(webhooks_mcp::public_router())
         .route(
@@ -129,6 +131,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
 
 fn build_webhook_router(state: AppState) -> Router {
     let base = ops::public_health_router()
+        .merge(oidc_bearer::discovery_router())
         .merge(channels_groups::webhook_router())
         .merge(webhooks_mcp::local_router())
         .route(
@@ -173,6 +176,7 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
 
 pub(crate) fn build_router(state: AppState) -> Router {
     admin_ui::mount_admin_routes(mount_authenticated_api_routes(Router::new()))
+        .merge(oidc_bearer::discovery_router())
         .route("/v1/webhooks/healthz", get(ops::webhook_healthz))
         .merge(channels_groups::webhook_router())
         .merge(webhooks_mcp::local_router())

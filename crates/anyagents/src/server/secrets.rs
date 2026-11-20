@@ -7,7 +7,7 @@ use std::path::Path;
 use anyagents_core::{Agent, AgentId, DeploymentSecretMetadata, SettleRemoteTurn, Store};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
-use axum::routing::{get, put};
+use axum::routing::get;
 use axum::{Json, Router};
 
 use crate::api::{
@@ -20,7 +20,7 @@ use crate::create;
 use super::agents_roster::agent_view;
 use super::messaging::can_actor_read_agent_private;
 use super::types::{
-    ApiError, AppState, is_self_or_ancestor, require_admin_or_operator, spawn_store,
+    ApiError, AppState, is_self_or_ancestor, require_operator_audited, spawn_store,
 };
 
 #[cfg(test)]
@@ -30,21 +30,23 @@ mod tests;
 /// Sub-router for deployment secrets (`/v1/secrets*`) and agent secret grants
 /// (`/v1/agents/{name}/secrets`). `PATCH /v1/agents/{name}` is wired on
 /// `agents::router()` to avoid overlapping path merges.
+///
+/// Strictly write-only for ALL callers (including operator): NO endpoint ever
+/// returns raw secret values; GET routes return metadata (names, env keys,
+/// grants) only.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/secrets", get(list_secrets_route))
         .route(
             "/v1/secrets/{name}",
-            put(upsert_secret_route).delete(delete_secret_route),
+            get(get_secret_metadata_route)
+                .put(upsert_secret_route)
+                .delete(delete_secret_route),
         )
         .route(
             "/v1/agents/{name}/secrets",
             get(get_agent_secrets_route).put(set_agent_secrets_route),
         )
-}
-
-fn is_admin_agent(agent: &Agent) -> bool {
-    agent.is_admin && agent.parent_id.is_none()
 }
 
 fn resolve_target_agent(
@@ -107,8 +109,8 @@ fn load_agent_name_map(store: &Store) -> HashMap<String, String> {
 
 /// Enforce the exact pure Capability Delegation Law for replacing `target`'s
 /// granted secrets:
-/// - Operator or `is_admin=true` root agent: any existing `deployment_secrets` on any agent.
-/// - Non-admin agent:
+/// - Operator: any existing `deployment_secrets` on any agent.
+/// - Agent:
 ///   - Self-mutation is ALWAYS denied (`caller.id == target.id` -> 403 Forbidden).
 ///   - Target MUST be a direct child or descendant (`is_self_or_ancestor(caller, target)` -> else 403 Forbidden).
 ///   - Every requested secret AND every revoked secret MUST be held by the caller
@@ -133,17 +135,6 @@ fn authorize_agent_secret_grants(
         }
         Principal::Agent { agent_id, name } => {
             let caller = store.agent(agent_id).map_err(ApiError::from_store)?;
-            if is_admin_agent(&caller) {
-                let requested = normalize_requested_secrets(requested_raw)?;
-                store
-                    .check_deployment_secrets_exist(&requested)
-                    .map_err(ApiError::from_store)?;
-                let actor = format!("agent:{name}");
-                store
-                    .record_admin_audit(&actor, "secrets.set_grants", &target.name)
-                    .map_err(ApiError::from_store)?;
-                return Ok((actor, requested));
-            }
             if caller.id == target.id {
                 return Err(ApiError::forbidden(
                     "an agent cannot modify its own secret grants",
@@ -151,7 +142,7 @@ fn authorize_agent_secret_grants(
             }
             if !is_self_or_ancestor(store, &caller.id, target) {
                 return Err(ApiError::forbidden(
-                    "only the operator, an admin, or an ancestor of the target agent may modify its secret grants",
+                    "only the operator or an ancestor of the target agent may modify its secret grants",
                 ));
             }
             let requested = normalize_requested_secrets(requested_raw)?;
@@ -209,12 +200,6 @@ pub(crate) fn validate_create_agent_secrets(
         }
         Principal::Agent { agent_id, .. } => {
             let caller = store.agent(agent_id).map_err(ApiError::from_store)?;
-            if is_admin_agent(&caller) {
-                store
-                    .check_deployment_secrets_exist(&requested)
-                    .map_err(ApiError::from_store)?;
-                return Ok(requested);
-            }
             if requested.is_empty() {
                 return Ok(Vec::new());
             }
@@ -226,7 +211,7 @@ pub(crate) fn validate_create_agent_secrets(
             });
             if !permitted_parent {
                 return Err(ApiError::forbidden(
-                    "a non-admin agent may only grant secrets to its own descendants",
+                    "an agent may only grant secrets to its own descendants",
                 ));
             }
             let parent_held: BTreeSet<String> = store
@@ -267,13 +252,13 @@ pub(crate) fn apply_create_agent_secrets(
 }
 
 /// `GET /v1/secrets`: list write-only metadata for every deployment secret.
-/// Operator or `is_admin=true` root agent only. NEVER returns plaintext values.
+/// Operator only. NEVER returns plaintext values.
 async fn list_secrets_route(
     principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<SecretsListResponse>, ApiError> {
     spawn_store(move || {
-        require_admin_or_operator(&state.store, &principal, "secrets.list", "*")?;
+        require_operator_audited(&state.store, &principal, "secrets.list", "*")?;
         let items = state
             .store
             .list_deployment_secrets()
@@ -288,8 +273,37 @@ async fn list_secrets_route(
     .await
 }
 
+/// `GET /v1/secrets/{name}`: return write-only metadata for one deployment secret.
+/// Operator only. NEVER returns plaintext values.
+async fn get_secret_metadata_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<SecretMetadataView>, ApiError> {
+    spawn_store(move || {
+        require_operator_audited(&state.store, &principal, "secrets.get", &name)?;
+        anyagents_core::validate_secret_name(&name).map_err(ApiError::from_store)?;
+        let items = state
+            .store
+            .list_deployment_secrets()
+            .map_err(ApiError::from_store)?;
+        let meta = items
+            .into_iter()
+            .find(|item| item.name == name)
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    format!("deployment secret `{name}` not found"),
+                )
+            })?;
+        let names = load_agent_name_map(&state.store);
+        Ok(Json(metadata_to_view(meta, &names)))
+    })
+    .await
+}
+
 /// `PUT /v1/secrets/{name}`: write-only encrypted upsert of a named secret bundle.
-/// Operator or `is_admin=true` root agent only. NEVER returns plaintext values.
+/// Operator only. NEVER returns plaintext values.
 async fn upsert_secret_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -297,7 +311,7 @@ async fn upsert_secret_route(
     Json(body): Json<UpsertSecretRequest>,
 ) -> Result<Json<SecretMetadataView>, ApiError> {
     spawn_store(move || {
-        require_admin_or_operator(&state.store, &principal, "secrets.upsert", &name)?;
+        require_operator_audited(&state.store, &principal, "secrets.upsert", &name)?;
         let meta = state
             .store
             .upsert_deployment_secret(&name, &body.env)
@@ -309,14 +323,14 @@ async fn upsert_secret_route(
 }
 
 /// `DELETE /v1/secrets/{name}`: delete a secret bundle and cascade its grants.
-/// Operator or `is_admin=true` root agent only.
+/// Operator only.
 async fn delete_secret_route(
     principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<DeleteSecretResponse>, ApiError> {
     spawn_store(move || {
-        require_admin_or_operator(&state.store, &principal, "secrets.delete", &name)?;
+        require_operator_audited(&state.store, &principal, "secrets.delete", &name)?;
         let deleted = state
             .store
             .delete_deployment_secret(&name)
@@ -336,7 +350,7 @@ async fn delete_secret_route(
 }
 
 /// `GET /v1/agents/{name}/secrets`: list secret bundle names granted to an agent.
-/// Allowed for operator, `is_admin=true` root agent, self, or ancestor.
+/// Allowed for operator, self, or ancestor.
 /// Returns secret names ONLY, NEVER plaintext values.
 async fn get_agent_secrets_route(
     principal: Principal,
@@ -417,7 +431,7 @@ pub(super) async fn patch_agent_route(
 
         if !has_meta && !has_secrets && !has_browser_profiles {
             if !is_strict_ancestor {
-                require_admin_or_operator(&state.store, &principal, "agents.update", &target.name)?;
+                require_operator_audited(&state.store, &principal, "agents.update", &target.name)?;
             }
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -427,7 +441,7 @@ pub(super) async fn patch_agent_route(
 
         // Pre-validate all permissions before performing any mutation.
         if has_meta && !is_strict_ancestor {
-            require_admin_or_operator(&state.store, &principal, "agents.update", &target.name)?;
+            require_operator_audited(&state.store, &principal, "agents.update", &target.name)?;
         }
         let prepared_secrets = if let Some(ref requested) = body.secrets {
             Some(authorize_agent_secret_grants(

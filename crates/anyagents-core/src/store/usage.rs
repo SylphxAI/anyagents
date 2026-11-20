@@ -180,6 +180,7 @@ pub enum UsageGroupBy {
     Day,
     Model,
     Harness,
+    Profile,
 }
 
 impl UsageGroupBy {
@@ -190,8 +191,9 @@ impl UsageGroupBy {
             "day" => Ok(Self::Day),
             "model" => Ok(Self::Model),
             "harness" => Ok(Self::Harness),
+            "profile" => Ok(Self::Profile),
             other => Err(format!(
-                "unsupported group_by `{other}`: expected agent, day, model or harness"
+                "unsupported group_by `{other}`: expected agent, day, model, harness, or profile"
             )),
         }
     }
@@ -202,6 +204,7 @@ impl UsageGroupBy {
             Self::Day => "day",
             Self::Model => "model",
             Self::Harness => "harness",
+            Self::Profile => "profile",
         }
     }
 }
@@ -287,7 +290,7 @@ impl UsageTotals {
 }
 
 /// One grouped usage bucket. Buckets are always per-agent; the optional
-/// `day`/`model`/`harness` fields carry the extra grouping dimension.
+/// `day`/`model`/`harness`/`profile` fields carry the extra grouping dimension.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageBucket {
     pub agent_id: AgentId,
@@ -298,18 +301,34 @@ pub struct UsageBucket {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(flatten)]
+    pub totals: UsageTotals,
+}
+
+/// Per-profile usage rollup across all agents bound to the same provider profile.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProfileUsageBucket {
+    pub profile: String,
+    pub agent_ids: Vec<AgentId>,
+    pub agent_names: Vec<String>,
     #[serde(flatten)]
     pub totals: UsageTotals,
 }
 
 /// A structured usage aggregation: grand totals plus grouped buckets,
-/// deterministically sorted by agent, then day/model/harness.
+/// deterministically sorted by agent, then day/model/harness/profile.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageReport {
     pub group_by: UsageGroupBy,
     pub agent_ids: Vec<AgentId>,
     pub totals: UsageTotals,
     pub buckets: Vec<UsageBucket>,
+    /// Populated when `group_by == UsageGroupBy::Profile`: per-profile rollups
+    /// summing all agents bound to each profile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<ProfileUsageBucket>,
 }
 
 /// Aggregate `records` for `agent_ids` in the filter window.
@@ -323,12 +342,34 @@ pub fn aggregate_usage(
     filter: UsageFilter,
     now_ms: i64,
 ) -> Result<UsageReport, String> {
+    aggregate_usage_with_profiles(
+        records,
+        agent_ids,
+        agent_names,
+        &std::collections::HashMap::new(),
+        filter,
+        now_ms,
+    )
+}
+
+/// Aggregate `records` for `agent_ids` in the filter window, resolving bound
+/// provider profiles from `agent_profiles` when `group_by == UsageGroupBy::Profile`.
+pub fn aggregate_usage_with_profiles(
+    records: &[UsageRecord],
+    agent_ids: &[AgentId],
+    agent_names: &std::collections::HashMap<AgentId, String>,
+    agent_profiles: &std::collections::HashMap<AgentId, String>,
+    filter: UsageFilter,
+    now_ms: i64,
+) -> Result<UsageReport, String> {
     use std::collections::{BTreeMap, HashSet};
     let (since, until) = filter.window(now_ms)?;
     let allowed: HashSet<&AgentId> = agent_ids.iter().collect();
-    // Key: (agent id, day, model, harness); only the grouped dimension is set.
-    type Key = (String, String, String, String);
+    // Key: (agent id, day, model, harness, profile); only the grouped dimension is set.
+    type Key = (String, String, String, String, String);
     let mut buckets: BTreeMap<Key, UsageBucket> = BTreeMap::new();
+    let mut profile_rollups: BTreeMap<String, (BTreeMap<String, AgentId>, UsageTotals)> =
+        BTreeMap::new();
     let mut totals = UsageTotals::default();
     for record in records {
         if !allowed.contains(&record.agent_id) {
@@ -339,17 +380,26 @@ pub fn aggregate_usage(
         {
             continue;
         }
-        let (day, model, harness) = match filter.group_by {
-            UsageGroupBy::Agent => (None, None, None),
-            UsageGroupBy::Day => (Some(record.day.clone()), None, None),
-            UsageGroupBy::Model => (None, record.model.clone(), None),
-            UsageGroupBy::Harness => (None, None, Some(record.harness.clone())),
+        let (day, model, harness, profile) = match filter.group_by {
+            UsageGroupBy::Agent => (None, None, None, None),
+            UsageGroupBy::Day => (Some(record.day.clone()), None, None, None),
+            UsageGroupBy::Model => (None, record.model.clone(), None, None),
+            UsageGroupBy::Harness => (None, None, Some(record.harness.clone()), None),
+            UsageGroupBy::Profile => {
+                let resolved = agent_profiles
+                    .get(&record.agent_id)
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| "unbound".to_string());
+                (None, None, None, Some(resolved))
+            }
         };
         let key: Key = (
             record.agent_id.as_str().to_string(),
             day.clone().unwrap_or_default(),
             model.clone().unwrap_or_default(),
             harness.clone().unwrap_or_default(),
+            profile.clone().unwrap_or_default(),
         );
         let bucket = buckets.entry(key).or_insert_with(|| UsageBucket {
             agent_id: record.agent_id.clone(),
@@ -357,12 +407,42 @@ pub fn aggregate_usage(
             day: day.clone(),
             model: model.clone(),
             harness: harness.clone(),
+            profile: profile.clone(),
             totals: UsageTotals::default(),
         });
         bucket.totals.add_record(record);
+        if let Some(ref prof_name) = profile {
+            let entry = profile_rollups.entry(prof_name.clone()).or_default();
+            entry
+                .0
+                .entry(record.agent_id.as_str().to_string())
+                .or_insert_with(|| record.agent_id.clone());
+            entry.1.add_record(record);
+        }
         totals.add_record(record);
     }
     let bucket_values: Vec<UsageBucket> = buckets.into_values().collect();
+    let profiles: Vec<ProfileUsageBucket> = profile_rollups
+        .into_iter()
+        .map(|(profile, (ids, prof_totals))| {
+            let agent_ids: Vec<AgentId> = ids.into_values().collect();
+            let agent_names: Vec<String> = agent_ids
+                .iter()
+                .map(|id| {
+                    agent_names
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| id.to_string())
+                })
+                .collect();
+            ProfileUsageBucket {
+                profile,
+                agent_ids,
+                agent_names,
+                totals: prof_totals,
+            }
+        })
+        .collect();
     // Fold the grand total from the buckets so the two can never diverge.
     let mut folded = UsageTotals::default();
     for bucket in &bucket_values {
@@ -374,6 +454,7 @@ pub fn aggregate_usage(
         agent_ids: agent_ids.to_vec(),
         totals,
         buckets: bucket_values,
+        profiles,
     })
 }
 

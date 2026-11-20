@@ -746,6 +746,8 @@ fn rebalance_does_not_move_unknown_profiles_when_other_profiles_are_measured() {
         profile: profile.into(),
         kind: "subscription".into(),
         usage: usage.map(str::to_string),
+        quota_5h: None,
+        quota_weekly: None,
         account: None,
         compatible_harnesses: vec!["codex".into()],
         assigned_agents: vec![],

@@ -30,7 +30,7 @@ macro_rules! message_cols {
 macro_rules! agent_cols {
     () => {
         "id, name, harness, model, workdir, instructions, state, \
-         created_at_ms, launch_env, parent_id, is_admin, role, description, \
+         created_at_ms, launch_env, parent_id, role, description, \
          runtime, remote_budget_micros"
     };
 }
@@ -72,7 +72,7 @@ macro_rules! idle_release_predicate {
 
 macro_rules! agent_summary_cols {
     () => {
-        "id, name, harness, model, state, parent_id, role, is_admin, created_at_ms, \
+        "id, name, harness, model, state, parent_id, role, created_at_ms, \
          runtime, remote_budget_micros"
     };
 }
@@ -170,8 +170,9 @@ pub use types::{
     ReceiveOutcome, RejectedMessage, TurnOwnershipSnapshot, UsageRecord, Wake, WalCheckpoint,
 };
 pub use usage::{
-    UsageAccessError, UsageBucket, UsageFilter, UsageGroupBy, UsageReport, UsageTotal, UsageTotals,
-    aggregate_usage, resolve_usage_agents, sum_usage, utc_day,
+    ProfileUsageBucket, UsageAccessError, UsageBucket, UsageFilter, UsageGroupBy, UsageReport,
+    UsageTotal, UsageTotals, aggregate_usage, aggregate_usage_with_profiles, resolve_usage_agents,
+    sum_usage, utc_day,
 };
 
 // Re-exports kept at `store` root for existing sibling submodules (`use super::...`).

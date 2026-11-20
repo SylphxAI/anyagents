@@ -21,7 +21,7 @@ use crate::id::AgentId;
 const AGENT_COLS: &str = agent_cols!();
 const AGENT_LIST_COLS: &str = "id, name, harness, model, workdir, \
      CASE WHEN state = 'archived' THEN NULL ELSE instructions END AS instructions, \
-     state, created_at_ms, launch_env, parent_id, is_admin, role, description, \
+     state, created_at_ms, launch_env, parent_id, role, description, \
      runtime, remote_budget_micros";
 
 fn budget_micros_to_db(cap_micros: Option<u64>) -> Result<Option<i64>, Error> {
@@ -144,7 +144,6 @@ impl Store {
             });
         let runtime_str = resolved.runtime.as_canonical_string();
         let mut agent = Agent {
-            is_admin: false,
             id: AgentId::generate(),
             name: new.name,
             role: clean_role,
@@ -205,22 +204,6 @@ impl Store {
 
     pub fn agent(&self, id: &AgentId) -> Result<Agent, Error> {
         agent_by_id(&self.read_conn(), id)
-    }
-
-    pub fn set_agent_admin(&self, agent_id: &AgentId, is_admin: bool) -> Result<(), Error> {
-        self.write_tx(|tx| {
-            let agent = agent_by_id(tx, agent_id)?;
-            if is_admin && agent.parent_id.is_some() {
-                return Err(Error::Message(
-                    "a subagent cannot hold administrative authority".into(),
-                ));
-            }
-            tx.db_execute(
-                "UPDATE agents SET is_admin = ?2 WHERE id = ?1",
-                &db_params![agent_id.as_str(), is_admin],
-            )?;
-            Ok(())
-        })
     }
 
     pub fn set_agent_model(&self, agent_id: &AgentId, model: &str) -> Result<(), Error> {
@@ -530,7 +513,7 @@ impl Store {
         }
         let aliased = conn.db_query_opt(
             "SELECT a.id, a.name, a.harness, a.model, a.workdir, a.instructions, a.state, \
-                    a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role, \
+                    a.created_at_ms, a.launch_env, a.parent_id, a.role, \
                     a.description, a.runtime, a.remote_budget_micros \
              FROM agent_aliases al \
              JOIN agents a ON a.id = al.agent_id \
@@ -1081,7 +1064,7 @@ impl Store {
         let released = self.write_tx(|tx| {
             let changed = tx.db_execute(
                 "UPDATE agents SET name = id, state = 'archived', workdir = NULL
-                 WHERE id = ?1 AND (workdir IS NULL OR state = 'created') AND is_admin = 0",
+                 WHERE id = ?1 AND (workdir IS NULL OR state = 'created')",
                 &db_params![id.as_str()],
             )?;
             if changed == 0 {
@@ -1121,7 +1104,6 @@ impl Store {
                  FROM agents a
                  LEFT JOIN agent_runtime r ON r.agent_id = a.id
                  WHERE (a.workdir IS NULL OR a.state = 'created')
-                   AND a.is_admin = 0
                    AND a.name != a.id
                    AND a.state IN ('created', 'archived')
                    AND a.created_at_ms <= ?1
@@ -1132,7 +1114,7 @@ impl Store {
         } else if min_age_ms > 0 {
             self.read_conn().db_query_vec(
                 "SELECT id, name FROM agents
-                 WHERE (workdir IS NULL OR state = 'created') AND is_admin = 0 AND name != id
+                 WHERE (workdir IS NULL OR state = 'created') AND name != id
                    AND state IN ('created', 'archived')
                    AND created_at_ms <= ?1",
                 &db_params![cutoff],
@@ -1141,7 +1123,7 @@ impl Store {
         } else {
             self.read_conn().db_query_vec(
                 "SELECT id, name FROM agents
-                 WHERE (workdir IS NULL OR state = 'created') AND is_admin = 0 AND name != id
+                 WHERE (workdir IS NULL OR state = 'created') AND name != id
                    AND state IN ('created', 'archived')",
                 &[],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -1344,7 +1326,6 @@ fn roster_entry(
         workdir: None,
         description,
         instructions,
-        is_admin: false,
         state: "running".to_string(),
         created_at_ms: 0,
         launch_env: Vec::new(),
