@@ -298,8 +298,17 @@ pub(crate) fn ensure_repo_checked_out(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
+    // Always run `git clone` from the parent directory (or `/`), never from `work_dir`
+    // itself: when a first `git clone --branch <missing>` fails or cleans up `work_dir`,
+    // inheriting `work_dir` as CWD unlinks the child's CWD inode and causes the fallback
+    // clone to abort with `fatal: Unable to read current working directory`.
+    let clone_cwd = work_dir
+        .parent()
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| Path::new("/"));
+
     let mut cmd = configure_git_command(&git_bin, &repo, gh_token.as_deref())?;
-    cmd.arg("clone");
+    cmd.current_dir(clone_cwd).arg("clone");
     if let Some(branch) = wanted_branch {
         cmd.arg("--branch").arg(branch);
     }
@@ -321,7 +330,7 @@ pub(crate) fn ensure_repo_checked_out(
                 let _ = std::fs::create_dir_all(work_dir);
             }
             let mut fallback = configure_git_command(&git_bin, &repo, gh_token.as_deref())?;
-            fallback.arg("clone");
+            fallback.current_dir(clone_cwd).arg("clone");
             if let Some(base) = base_branch {
                 fallback.arg("--branch").arg(base);
             }
@@ -340,6 +349,11 @@ pub(crate) fn ensure_repo_checked_out(
         } else {
             return Err(format_clone_error(&repo, &stderr, gh_token.as_deref()));
         }
+    }
+    // If our own process CWD was unlinked when `work_dir` was recreated during clone,
+    // re-anchor it to the freshly cloned `work_dir` so downstream commands inherit a valid CWD.
+    if std::env::current_dir().is_err() {
+        let _ = std::env::set_current_dir(work_dir);
     }
     if let Some(branch) = create_local_branch {
         let mut co = spawn_command(&git_bin, &[]).map_err(|e| format!("git spawn: {e}"))?;
