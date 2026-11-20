@@ -44,11 +44,15 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/usage", get(usage_report))
 }
 
-pub(super) fn public_health_router() -> Router<AppState> {
+pub(super) fn health_probe_router() -> Router<AppState> {
     Router::new()
-        .route("/", get(public_healthz))
         .route("/healthz", get(public_healthz))
+        .route("/readyz", get(public_healthz))
         .route("/v1/webhooks/healthz", get(public_healthz))
+}
+
+pub(super) fn public_health_router() -> Router<AppState> {
+    health_probe_router().route("/", get(public_healthz))
 }
 
 /// Mint an agent's capability after its instance was made (a create, a new
@@ -139,11 +143,11 @@ pub(super) async fn webhook_healthz(State(state): State<AppState>) -> impl IntoR
     )
 }
 
-/// `GET /`, `/healthz` and `/v1/webhooks/healthz` on the public TCP listener:
-/// readiness only. The build identity names the exact binary this server
-/// runs, which tells a scanner which advisories apply, so it stays on the
-/// Unix socket.
-async fn public_healthz() -> impl IntoResponse {
+/// `GET /`, `/healthz`, `/readyz` and `/v1/webhooks/healthz` on the public TCP
+/// listener: readiness only. The build identity names the exact binary this
+/// server runs, which tells a scanner which advisories apply, so it stays on
+/// the Unix socket.
+pub(super) async fn public_healthz() -> impl IntoResponse {
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(serde_json::json!({ "ok": true })),

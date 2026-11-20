@@ -33,6 +33,7 @@ mod agents_lifecycle;
 mod agents_roster;
 mod bootstrap;
 mod channels_groups;
+mod console_html;
 mod file_cache;
 mod hybrid;
 mod in_flight;
@@ -132,26 +133,30 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
 }
 
 fn build_webhook_router(state: AppState) -> Router {
-    let base = ops::public_health_router()
-        .merge(oidc_bearer::discovery_router())
-        .merge(channels_groups::webhook_router())
-        .merge(webhooks_mcp::local_router())
-        .route(
-            "/v1/internal/guest/events",
-            post(serverless::guest_events_route),
-        )
-        .route(
-            "/v1/internal/cloud/events",
-            post(serverless::cloud_events_route),
-        )
-        .merge(timer_fire::router());
     // In Pure Serverless mode there is no reachable host Unix socket, so expose
-    // the full authenticated control/agent API and embedded `/admin` console on
-    // the HTTP listener strictly when fail-closed operator auth
-    // (`ANYAGENTS_OPERATOR_TOKEN`) or Admin OIDC is configured.
-    let router = if serverless::is_serverless_mode()
-        && (state.auth.has_operator() || admin_auth::is_oidc_configured())
-    {
+    // the full authenticated control/agent API and embedded Web Console on `/`
+    // strictly when fail-closed operator auth (`ANYAGENTS_OPERATOR_TOKEN`) or
+    // Admin OIDC is configured.
+    let expose_console = serverless::is_serverless_mode()
+        && (state.auth.has_operator() || admin_auth::is_oidc_configured());
+    let base = if expose_console {
+        ops::health_probe_router()
+    } else {
+        ops::public_health_router()
+    }
+    .merge(oidc_bearer::discovery_router())
+    .merge(channels_groups::webhook_router())
+    .merge(webhooks_mcp::local_router())
+    .route(
+        "/v1/internal/guest/events",
+        post(serverless::guest_events_route),
+    )
+    .route(
+        "/v1/internal/cloud/events",
+        post(serverless::cloud_events_route),
+    )
+    .merge(timer_fire::router());
+    let router = if expose_console {
         admin_ui::mount_admin_routes(mount_authenticated_api_routes(base))
     } else {
         base
@@ -179,6 +184,8 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
 pub(crate) fn build_router(state: AppState) -> Router {
     admin_ui::mount_admin_routes(mount_authenticated_api_routes(Router::new()))
         .merge(oidc_bearer::discovery_router())
+        .route("/healthz", get(ops::public_healthz))
+        .route("/readyz", get(ops::public_healthz))
         .route("/v1/webhooks/healthz", get(ops::webhook_healthz))
         .merge(channels_groups::webhook_router())
         .merge(webhooks_mcp::local_router())

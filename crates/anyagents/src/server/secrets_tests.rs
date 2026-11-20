@@ -727,38 +727,8 @@ async fn admin_ui_serves_secrets_tab_and_enforces_csrf_on_secret_mutations() {
         timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     });
 
-    // 1. /admin HTML includes Secrets tab and loads /admin/assets/secrets.js with zero inline scripts.
-    let html_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/admin")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(html_resp.status(), StatusCode::OK);
-    let html = String::from_utf8_lossy(&html_resp.into_body().collect().await.unwrap().to_bytes())
-        .to_string();
-    assert!(html.contains(r#"data-tab="secrets""#));
-    assert!(html.contains(r#"src="/admin/assets/secrets.js""#));
-    assert!(!html.contains("<script>"));
-
-    let js_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/admin/assets/secrets.js")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(js_resp.status(), StatusCode::OK);
-    assert!(js_resp.headers().contains_key("content-security-policy"));
-
-    // 2. OIDC cookie mutations require X-Anyagents-Admin-Csrf: 1.
+    // 1. /admin redirects to /, and authenticated / HTML includes Secrets tab and loads
+    //    /assets/secrets.js with zero inline scripts (legacy /admin/assets/secrets.js also serves).
     let key = admin_auth::session_signing_key_from_env().unwrap();
     let now_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -776,6 +746,58 @@ async fn admin_ui_serves_secrets_tab_and_enforces_csrf_on_secret_mutations() {
     )
     .unwrap();
     let cookie_hdr = format!("{}={cookie_val}", admin_auth::ADMIN_SESSION_COOKIE);
+
+    let admin_redir = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_redir.status(), StatusCode::FOUND);
+    assert_eq!(
+        admin_redir
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/")
+    );
+
+    let html_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header(axum::http::header::COOKIE, &cookie_hdr)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(html_resp.status(), StatusCode::OK);
+    let html = String::from_utf8_lossy(&html_resp.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+    assert!(html.contains(r#"data-tab="secrets""#));
+    assert!(html.contains(r#"src="/assets/secrets.js""#));
+    assert!(!html.contains("<script>"));
+
+    for js_path in ["/assets/secrets.js", "/admin/assets/secrets.js"] {
+        let js_resp = app
+            .clone()
+            .oneshot(Request::builder().uri(js_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(js_resp.status(), StatusCode::OK, "{js_path}");
+        assert!(
+            js_resp.headers().contains_key("content-security-policy"),
+            "{js_path}"
+        );
+    }
+
+    // 2. OIDC cookie mutations require X-Anyagents-Admin-Csrf: 1.
 
     let no_csrf = app
         .clone()
