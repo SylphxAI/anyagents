@@ -109,6 +109,14 @@ fn discover_in(
         if let Some(s) = shot {
             senv.insert("ANYAGENTS_BROWSER_SCREENSHOT_DIR".into(), s);
         }
+        for (k, v) in std::env::vars().chain(env.iter().cloned()) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty()
+                && (k == "ANYAGENTS_BROWSER_PROXY" || k.starts_with("ANYAGENTS_BROWSER_PROXY_"))
+            {
+                senv.insert(k, trimmed.to_string());
+            }
+        }
         out.push(LocalMcpServer {
             name: "browser",
             command: bin.display().to_string(),
@@ -388,6 +396,14 @@ mod tests {
         let env = vec![
             ("TAVILY_API_KEY".into(), "tv-key".into()),
             (
+                "ANYAGENTS_BROWSER_PROXY".into(),
+                "http://proxy.example.invalid:8080".into(),
+            ),
+            (
+                "ANYAGENTS_BROWSER_PROXY_US".into(),
+                "socks5://us.example.invalid:1080".into(),
+            ),
+            (
                 "ANYAGENTS_AGENT_DATA_DIR".into(),
                 tmp.path().display().to_string(),
             ),
@@ -413,6 +429,14 @@ mod tests {
         assert_eq!(
             agy["mcpServers"]["browser"]["env"]["ANYAGENTS_AGENT_TOKEN"],
             "tok-1"
+        );
+        assert_eq!(
+            agy["mcpServers"]["browser"]["env"]["ANYAGENTS_BROWSER_PROXY"],
+            "http://proxy.example.invalid:8080"
+        );
+        assert_eq!(
+            agy["mcpServers"]["browser"]["env"]["ANYAGENTS_BROWSER_PROXY_US"],
+            "socks5://us.example.invalid:1080"
         );
         assert_eq!(agy["mcpServers"]["web"]["env"]["TAVILY_API_KEY"], "tv-key");
         assert_eq!(agy["mcpServers"]["code"]["args"][0], "code-mcp");
