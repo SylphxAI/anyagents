@@ -23,7 +23,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::sandbox_providers::providers::{
-    ExecRequest, ProviderKind, SandboxProvider as AsyncSandboxProvider,
+    ExecRequest, LeasePolicy, ProviderKind, SandboxProvider as AsyncSandboxProvider,
 };
 use anyagents_core::stateless::{
     NewRemoteTurn, PendingRemoteTurn, RemoteTurnEventUpdate, SettleRemoteTurn, constant_time_eq,
@@ -606,7 +606,7 @@ async fn dispatch_sandbox_turn(
             Ok(env)
         })
         .await;
-        let mut exec_req = ExecRequest::argv(Vec::new())
+        let mut exec_req = ExecRequest::argv(Vec::<String>::new())
             .with_cwd(ensured.handle.workdir.clone())
             .with_timeout_ms(DETACHED_EXEC_TIMEOUT_MS);
         match resolved_env {

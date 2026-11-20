@@ -613,9 +613,8 @@ mod tests {
         };
 
         // 1. Small stdin (<= 24 KiB) stays inline without an extra :writeFile round-trip.
-        let small_req =
-            ExecRequest::argv(vec!["/usr/local/bin/anyagents-guest".into(), "turn".into()])
-                .with_stdin(b"small prompt".to_vec());
+        let small_req = ExecRequest::argv(["/usr/local/bin/anyagents-guest", "turn"])
+            .with_stdin(b"small prompt".to_vec());
         let out_small = provider.exec(&handle, &small_req).await.unwrap();
         assert_eq!(out_small.exit_code, 0);
         assert!(state.write_files.lock().unwrap().is_empty());
@@ -628,9 +627,8 @@ mod tests {
 
         // 2. Oversized stdin (> 24 KiB) uploads via :writeFile and keeps argv tiny.
         let big_payload = vec![b'X'; INLINE_STDIN_MAX_BYTES + 8 * 1024];
-        let big_req =
-            ExecRequest::argv(vec!["/usr/local/bin/anyagents-guest".into(), "turn".into()])
-                .with_stdin(big_payload.clone());
+        let big_req = ExecRequest::argv(["/usr/local/bin/anyagents-guest", "turn"])
+            .with_stdin(big_payload.clone());
         let out_big = provider.exec(&handle, &big_req).await.unwrap();
         assert_eq!(out_big.exit_code, 0);
         {

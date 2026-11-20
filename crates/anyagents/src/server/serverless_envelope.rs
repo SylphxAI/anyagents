@@ -928,13 +928,14 @@ mod tests {
         let msg = sample_message(
             "msg_big_1",
             1,
+            "operator",
+            "operator",
             &big_body,
-            Some("operator"),
-            None,
             1_700_000_000_000,
+            Context::default(),
         );
         let (prompt, outbound) = build_serverless_outbound_message(&[msg]);
-        let mut req = ExecRequest::argv(vec!["anyagents-guest".into(), "turn".into()]);
+        let mut req = ExecRequest::argv(["anyagents-guest", "turn"]);
         let staged = attach_outbound_message_env(&mut req, Some(outbound), &prompt)
             .expect("oversized outbound message must return JSON bytes for --message-file");
         assert!(
