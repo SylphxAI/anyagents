@@ -63,36 +63,23 @@ pub(crate) fn browser_profile_s3_key(profile: &str) -> String {
     format!("{BROWSER_PROFILES_PREFIX}{profile}{BROWSER_PROFILE_SUFFIX}")
 }
 
-fn principal_is_admin_or_operator(store: &Store, principal: &Principal) -> Result<bool, ApiError> {
-    match principal {
-        Principal::Operator => Ok(true),
-        Principal::Agent { agent_id, .. } => {
-            let agent = store.agent(agent_id).map_err(ApiError::from_store)?;
-            Ok(agent.is_admin && agent.parent_id.is_none())
-        }
-    }
+fn principal_is_operator(_store: &Store, principal: &Principal) -> Result<bool, ApiError> {
+    Ok(principal.is_operator())
 }
 
-fn require_admin_or_operator_local(
+fn require_operator_audited_local(
     store: &Store,
     principal: &Principal,
     action: &str,
     target: &str,
 ) -> Result<String, ApiError> {
-    let actor = match principal {
-        Principal::Operator => "operator".to_string(),
-        Principal::Agent { agent_id, name } => {
-            let agent = store.agent(agent_id).map_err(ApiError::from_store)?;
-            if agent.parent_id.is_some() || !agent.is_admin {
-                return Err(ApiError::forbidden("administrative authority required"));
-            }
-            format!("agent:{name}")
-        }
-    };
+    if !principal.is_operator() {
+        return Err(ApiError::forbidden("administrative authority required"));
+    }
     store
-        .record_admin_audit(&actor, action, target)
+        .record_admin_audit("operator", action, target)
         .map_err(ApiError::from_store)?;
-    Ok(actor)
+    Ok("operator".to_string())
 }
 
 fn is_self_or_ancestor_local(store: &Store, caller_id: &AgentId, target: &Agent) -> bool {
@@ -172,7 +159,7 @@ fn authorize_profile_archive_access(
     principal: &Principal,
     profile: &str,
 ) -> Result<(), ApiError> {
-    if principal_is_admin_or_operator(store, principal)? {
+    if principal_is_operator(store, principal)? {
         return Ok(());
     }
     match principal {
@@ -245,7 +232,7 @@ pub(crate) fn validate_patch_browser_profiles(
         normalized.insert(validate_browser_profile_name(raw).map_err(ApiError::from_store)?);
     }
     let normalized: Vec<String> = normalized.into_iter().collect();
-    if principal_is_admin_or_operator(store, principal)? {
+    if principal_is_operator(store, principal)? {
         return Ok(normalized);
     }
     let Principal::Agent { agent_id, .. } = principal else {
@@ -296,7 +283,7 @@ async fn list_browser_profiles_route(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
-        let is_privileged = principal_is_admin_or_operator(&state.store, &principal)?;
+        let is_privileged = principal_is_operator(&state.store, &principal)?;
         if !is_privileged {
             let Principal::Agent { agent_id, name } = &principal else {
                 return Err(ApiError::forbidden("administrative authority required"));
@@ -324,7 +311,7 @@ async fn list_browser_profiles_route(
             })));
         }
 
-        require_admin_or_operator_local(
+        require_operator_audited_local(
             &state.store,
             &principal,
             "browser_profiles.list",
@@ -426,7 +413,7 @@ async fn get_agent_browser_profiles_route(
             Principal::Operator => true,
             Principal::Agent { agent_id, .. } => {
                 is_self_or_ancestor_local(&state.store, agent_id, &target)
-                    || principal_is_admin_or_operator(&state.store, &principal)?
+                    || principal_is_operator(&state.store, &principal)?
             }
         };
         if !allowed {
@@ -466,7 +453,7 @@ async fn put_agent_browser_profiles_route(
             .store
             .set_agent_browser_profiles_as(&actor, &target.id, &body.browser_profiles)
             .map_err(ApiError::from_store)?;
-        if principal_is_admin_or_operator(&state.store, &principal).unwrap_or(false) {
+        if principal_is_operator(&state.store, &principal).unwrap_or(false) {
             let audit_actor = match &principal {
                 Principal::Operator => "operator".to_string(),
                 Principal::Agent { name, .. } => format!("agent:{name}"),
@@ -575,7 +562,7 @@ async fn delete_browser_profile_route(
     let valid = validate_browser_profile_name(&profile).map_err(ApiError::from_store)?;
     let store = Arc::clone(&state.store);
     let (deleted_from_s3, revoked_grants) = spawn_store(move || {
-        require_admin_or_operator_local(&store, &principal, "browser_profiles.delete", &valid)?;
+        require_operator_audited_local(&store, &principal, "browser_profiles.delete", &valid)?;
         let deleted = match S3Store::from_env() {
             Ok(Some(s3)) => s3
                 .delete_object(&browser_profile_s3_key(&valid))
@@ -683,7 +670,7 @@ async fn scoped_media_file_route(
             Principal::Operator => true,
             Principal::Agent { agent_id, .. } => {
                 is_self_or_ancestor_local(&store, agent_id, &target)
-                    || principal_is_admin_or_operator(&store, &principal)?
+                    || principal_is_operator(&store, &principal)?
             }
         };
         if !allowed {

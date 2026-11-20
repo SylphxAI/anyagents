@@ -19,7 +19,7 @@ use super::agents_roster::{
 };
 use super::messaging::{Actor, can_actor_message_agent};
 use super::types::{
-    ApiError, AppState, is_self_or_ancestor, require_admin_or_operator,
+    ApiError, AppState, is_self_or_ancestor, require_operator_audited,
     resolve_remote_sandbox_workdir, runs_off_host, spawn_store, via_http_mcp,
 };
 use super::{file_cache, in_flight, reap_queue, serverless, serverless_failure};
@@ -215,18 +215,13 @@ pub(super) async fn archive_agent_route(
         let is_self =
             matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id);
         if found.parent_id.is_none() && !is_self {
-            require_admin_or_operator(
-                &state.store,
-                &principal,
-                "agents.archive_root",
-                &found.name,
-            )?;
+            require_operator_audited(&state.store, &principal, "agents.archive_root", &found.name)?;
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
                 if agent_id != &found.id && !is_self_or_ancestor(&state.store, agent_id, &found)
         ) {
-            require_admin_or_operator(&state.store, &principal, "agents.archive", &found.name)?;
+            require_operator_audited(&state.store, &principal, "agents.archive", &found.name)?;
         }
         let _lifecycle = state
             .store
@@ -817,13 +812,13 @@ pub(super) async fn pause_agent_route(
                     "a root agent cannot pause itself; pass a target agent name or id in `agent`",
                 ));
             }
-            require_admin_or_operator(&state.store, &principal, "agents.pause_root", &found.name)?;
+            require_operator_audited(&state.store, &principal, "agents.pause_root", &found.name)?;
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
                 if agent_id != &found.id && !is_self_or_ancestor(&state.store, agent_id, &found)
         ) {
-            require_admin_or_operator(&state.store, &principal, "agents.pause", &found.name)?;
+            require_operator_audited(&state.store, &principal, "agents.pause", &found.name)?;
         }
         // Serialized with this agent's harness, profile, wake and archive
         // transitions, as the command-line pause is.
@@ -890,13 +885,13 @@ pub(super) async fn delete_agent_route(
                     "a root agent cannot delete itself",
                 ));
             }
-            require_admin_or_operator(&state.store, &principal, "agents.delete_root", &found.name)?;
+            require_operator_audited(&state.store, &principal, "agents.delete_root", &found.name)?;
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
                 if agent_id != &found.id && !is_self_or_ancestor(&state.store, agent_id, &found)
         ) {
-            require_admin_or_operator(&state.store, &principal, "agents.delete", &found.name)?;
+            require_operator_audited(&state.store, &principal, "agents.delete", &found.name)?;
         }
         state
             .store
@@ -1031,12 +1026,7 @@ pub(super) async fn wake_agent_route(
                 if !is_self_or_ancestor(&state.store, caller_id, &found)
                     && can_actor_message_agent(&state.store, &actor, &found).is_err()
                 {
-                    require_admin_or_operator(
-                        &state.store,
-                        &principal,
-                        "agents.wake",
-                        &found.name,
-                    )?;
+                    require_operator_audited(&state.store, &principal, "agents.wake", &found.name)?;
                 }
             }
             let _lifecycle = state

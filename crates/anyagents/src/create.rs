@@ -49,17 +49,20 @@ pub(crate) use model_defaults::{
 pub(crate) use profile_identity::{extract_profile_account_identity, update_profile_json_identity};
 pub(crate) use profile_rotation::{force_refresh_provider_profiles, try_rotate_exhausted_profile};
 pub(crate) use profiles::{
-    ProviderProfileEntry, bound_profile_name, bound_profile_of_provider, compatible_harnesses_for,
-    ensure_harness_runs_profile, ensure_profile_compatible_and_mapped,
+    ProviderProfileEntry, QuotaWindow, bound_profile_name, bound_profile_of_provider,
+    compatible_harnesses_for, ensure_harness_runs_profile, ensure_profile_compatible_and_mapped,
     hydrate_profiles_from_store_if_postgres, list_harness_profiles, list_provider_profiles_fast,
-    set_provider_profile, sync_and_list_provider_profiles,
+    list_provider_profiles_fresh, set_provider_profile,
     sync_and_list_provider_profiles_with_options, upstream_provider_of,
 };
+#[cfg(test)]
+pub(crate) use quota::format_openai_usage_summary;
 pub(crate) use quota::{
-    clear_stale_agy_quota_error_steps, enrich_profiles_usage, parse_remaining_pct_from_usage,
-    probe_profile_models_catalog, probe_profile_remaining_pct, record_profile_quota_reset,
+    clear_stale_agy_quota_error_steps, enrich_profiles_usage_with_options,
+    parse_quota_windows_from_usage, parse_remaining_pct_from_usage, probe_profile_models_catalog,
+    probe_profile_remaining_pct, record_profile_quota_reset,
 };
-pub(crate) use quota_probe::probe_one_profile_usage;
+pub(crate) use quota_probe::{probe_one_profile_usage, probe_one_profile_usage_with_options};
 #[cfg(test)]
 pub(crate) use runtime::set_agent_harness;
 pub(crate) use runtime::{

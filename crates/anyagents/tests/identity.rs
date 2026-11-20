@@ -107,32 +107,38 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     let request = |method: &str, path: &str, body: Value| {
         support::call_raw(&server.socket, method, path, &body.to_string(), &auth)
     };
-    assert!(request("GET", "/v1/profiles", json!(null)).starts_with("HTTP/1.1 403"));
+    // Legacy bespoke `/v1/agents/{name}/admin` endpoint is removed (404), and agents
+    // never hold cross-tree/control-plane admin privileges.
     let (status, _) = support::call(
         &server.socket,
         "POST",
         "/v1/agents/coordinator/admin",
         r#"{"admin":true}"#,
     );
-    assert!(status.contains("200"), "{status}");
+    assert!(status.contains("404"), "{status}");
+    for path in ["/v1/profiles", "/v1/channels"] {
+        assert!(request("GET", path, json!(null)).starts_with("HTTP/1.1 403"));
+    }
     assert!(
         request(
             "POST",
-            "/v1/agents/coordinator/admin",
-            json!({"admin":true})
+            "/v1/agents",
+            json!({"name":"builder", "harness":"claude-code", "parent":"root"}),
         )
         .starts_with("HTTP/1.1 403")
     );
-    let root = request(
+
+    // Operator creates root agents and configures models/channels without ever returning secrets.
+    let (root_status, _) = support::call(
+        &server.socket,
         "POST",
         "/v1/agents",
-        json!({"name":"builder", "harness":"claude-code", "parent":"root"}),
+        &json!({"name":"builder", "harness":"claude-code", "parent":"root"}).to_string(),
     );
-    assert!(root.starts_with("HTTP/1.1 201"), "{root}");
+    assert!(root_status.contains("201"), "{root_status}");
     let store = anyagents_core::Store::open(data.join("state.db")).unwrap();
     let builder = store.agent_by_name("builder").unwrap();
     assert!(builder.parent_id.is_none());
-    assert!(!builder.is_admin);
     let builder_auth = format!(
         "x-anyagents-agent: {}\r\n",
         capability(&data, builder.id.as_str())
@@ -143,56 +149,50 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
                 .starts_with("HTTP/1.1 403")
         );
     }
+    // Coordinator can still spawn its own child sub-agent.
     let child = request("POST", "/v1/agents", json!({"name":"child"}));
     assert!(child.starts_with("HTTP/1.1 201"), "{child}");
-    assert!(!store.agent_by_name("child").unwrap().is_admin);
-    let (status, _) = support::call(
-        &server.socket,
-        "POST",
-        "/v1/agents/child/admin",
-        r#"{"admin":true}"#,
-    );
-    assert!(status.contains("400"), "{status}");
     let key = "test-provider-secret-never-return";
     let token = "123:test-channel-secret-never-return";
     let mut responses = Vec::new();
-    responses.push(request(
-        "POST",
-        "/v1/agents/builder/model",
-        json!({"model":"test-model", "base_url":"https://api.example.test", "key":key}),
-    ));
-    responses.push(request(
-        "POST",
-        "/v1/channels",
-        json!({"kind":"telegram", "agent":"builder", "token":token}),
-    ));
-    for response in &responses {
-        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    }
-    responses.push(request("GET", "/v1/channels", json!(null)));
-    responses.push(request("GET", "/v1/profiles", json!(null)));
-    // Unknown path fields are rejected rather than read in the daemon's seat.
-    let rejected = request(
-        "POST",
-        "/v1/agents/builder/model",
-        json!({"model":"test", "key_file":"/etc/passwd"}),
-    );
-    assert!(rejected.starts_with("HTTP/1.1 422"), "{rejected}");
-    responses.push(request(
-        "POST",
-        "/v1/channels",
-        json!({"kind":"invalid", "agent":"builder", "token":token}),
-    ));
-    let (status, _) = support::call(
+    let (m_status, m_body) = support::call(
         &server.socket,
         "POST",
-        "/v1/agents/coordinator/admin",
-        r#"{"admin":false}"#,
+        "/v1/agents/builder/model",
+        &json!({"model":"test-model", "base_url":"https://api.example.test", "key":key})
+            .to_string(),
     );
-    assert!(status.contains("200"));
-    for path in ["/v1/profiles", "/v1/channels"] {
-        assert!(request("GET", path, json!(null)).starts_with("HTTP/1.1 403"));
-    }
+    assert!(m_status.contains("200"), "{m_status} {m_body}");
+    responses.push(m_body.to_string());
+    let (c_status, c_body) = support::call(
+        &server.socket,
+        "POST",
+        "/v1/channels",
+        &json!({"kind":"telegram", "agent":"builder", "token":token}).to_string(),
+    );
+    assert!(c_status.contains("200"), "{c_status} {c_body}");
+    responses.push(c_body.to_string());
+    let (cl_status, cl_body) = support::call(&server.socket, "GET", "/v1/channels", "");
+    assert!(cl_status.contains("200"), "{cl_status}");
+    responses.push(cl_body.to_string());
+    let (pl_status, pl_body) = support::call(&server.socket, "GET", "/v1/profiles", "");
+    assert!(pl_status.contains("200"), "{pl_status}");
+    responses.push(pl_body.to_string());
+    // Unknown path fields are rejected rather than read in the daemon's seat.
+    let (rej_status, _) = support::call(
+        &server.socket,
+        "POST",
+        "/v1/agents/builder/model",
+        &json!({"model":"test", "key_file":"/etc/passwd"}).to_string(),
+    );
+    assert!(rej_status.contains("422"), "{rej_status}");
+    let (_, bad_chan) = support::call(
+        &server.socket,
+        "POST",
+        "/v1/channels",
+        &json!({"kind":"invalid", "agent":"builder", "token":token}).to_string(),
+    );
+    responses.push(bad_chan.to_string());
     let conn = rusqlite::Connection::open(data.join("state.db")).unwrap();
     let mut stmt = conn
         .prepare("SELECT actor || ':' || action || ':' || target FROM admin_audit")
@@ -205,12 +205,7 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     assert!(
         audit
             .iter()
-            .any(|r| r == "agent:coordinator:agents.create_root:builder")
-    );
-    assert!(
-        audit
-            .iter()
-            .any(|r| r == "operator:agents.revoke_admin:coordinator")
+            .any(|r| r == "operator:agents.create_root:builder")
     );
     for text in responses.iter().chain(audit.iter()) {
         assert!(!text.contains(key));
@@ -886,11 +881,8 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
         "{text}"
     );
 
-    // Explicit root-admin and operator reads are broad and auditable; a
-    // non-admin root is not privileged merely because it is a root.
+    // Operator reads are broad and auditable; no agent (even a root) may read outside its tree.
     assert!(!as_agent(0, "all", "?query=C").contains("fixture outsider"));
-    store.set_agent_admin(&aids[0], true).unwrap();
-    assert!(as_agent(0, "all", "?query=C").contains("fixture outsider"));
     assert!(as_agent(0, "self", "?query=C").contains("fixture coordinator"));
     let (status, body) = support::call(
         &server.socket,
@@ -901,10 +893,8 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     assert!(status.contains("200"), "{status} {body}");
     assert!(body.to_string().contains("fixture outsider"));
     let db = rusqlite::Connection::open(data.join("state.db")).unwrap();
-    for actor in ["operator", "agent:coordinator"] {
-        let count: i64 = db.query_row("SELECT COUNT(*) FROM admin_audit WHERE action = 'conversation.read' AND target = 'all' AND actor = ?1", [actor], |row| row.get(0)).unwrap();
-        assert!(count > 0, "{actor} read must have an audit row");
-    }
+    let count: i64 = db.query_row("SELECT COUNT(*) FROM admin_audit WHERE action = 'conversation.read' AND target = 'all' AND actor = 'operator'", [], |row| row.get(0)).unwrap();
+    assert!(count > 0, "operator read must have an audit row");
     drop(server);
     // Existing fixture SQLite data must not make a failed socket read succeed.
     for target in ["all", "coordinator", "planner"] {
@@ -1323,14 +1313,14 @@ fn group_permissions_bind_ownership_and_refuse_both_reported_payloads_atomically
             .as_str(),
         owner
     );
-    // A root admin has explicit visibility authority; revocation is immediate.
-    let outsider_id = store.agent_by_name("outsider").unwrap().id;
-    store.set_agent_admin(&outsider_id, true).unwrap();
-    good(
-        &outsider,
-        json!({"action":"members","group":"private-room","public":true}),
+    // Operator has explicit visibility authority; unrelated agents never do.
+    let (vis_status, _) = support::call(
+        &server.socket,
+        "POST",
+        "/v1/groups",
+        &json!({"action":"members","group":"private-room","public":true}).to_string(),
     );
-    store.set_agent_admin(&outsider_id, false).unwrap();
+    assert!(vis_status.contains("200"), "{vis_status}");
     forbidden(
         &outsider,
         json!({"action":"members","group":"private-room","public":false}),
@@ -1574,12 +1564,10 @@ fn three_tier_agent_authority_separates_worker_parent_subtree_and_admin() {
     let h2a_id = AgentId::parse(&h2_dept_a).unwrap();
     let h2b_id = AgentId::parse(&h2_dept_b).unwrap();
     let h3_id = AgentId::parse(&h3_worker).unwrap();
-    let admin_id = AgentId::parse(&sys_admin).unwrap();
 
     store.set_agent_parent(&h2a_id, Some(&h1_id)).unwrap();
     store.set_agent_parent(&h2b_id, Some(&h1_id)).unwrap();
     store.set_agent_parent(&h3_id, Some(&h2a_id)).unwrap();
-    store.set_agent_admin(&admin_id, true).unwrap();
 
     let call_as = |caller_id: &str, method: &str, path: &str, body: Value| {
         let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, caller_id));
@@ -1759,41 +1747,41 @@ fn three_tier_agent_authority_separates_worker_parent_subtree_and_admin() {
         .starts_with("HTTP/1.1 403")
     );
 
-    // 3. Tier 3 (Admin `is_admin = 1` on `sys-admin`):
-    //    Can access `/v1/operator/agents/{name}/inbox` and `/v1/operator/agents/{name}/capability`,
-    //    and can delete `worker-leaf-v2` (or `tree-root` can delete its own grandchild).
-    assert!(
-        call_as(
-            &h1_root,
-            "GET",
-            "/v1/operator/agents/outsider-root/inbox",
-            json!(null)
-        )
-        .starts_with("HTTP/1.1 403")
-    );
-    assert!(
-        call_as(
-            &h1_root,
-            "POST",
-            "/v1/operator/agents/outsider-root/capability",
-            json!({})
-        )
-        .starts_with("HTTP/1.1 403")
-    );
-    let admin_inbox = call_as(
-        &sys_admin,
+    // 3. Tier 3 (Operator only — no agent, even a root like `sys-admin`, may call operator routes):
+    for caller in [&h1_root, &sys_admin] {
+        assert!(
+            call_as(
+                caller,
+                "GET",
+                "/v1/operator/agents/outsider-root/inbox",
+                json!(null)
+            )
+            .starts_with("HTTP/1.1 403")
+        );
+        assert!(
+            call_as(
+                caller,
+                "POST",
+                "/v1/operator/agents/outsider-root/capability",
+                json!({})
+            )
+            .starts_with("HTTP/1.1 403")
+        );
+    }
+    let (op_inbox_status, _) = support::call(
+        &server.socket,
         "GET",
         "/v1/operator/agents/outsider-root/inbox",
-        json!(null),
+        "",
     );
-    assert!(admin_inbox.starts_with("HTTP/1.1 200"), "{admin_inbox}");
-    let admin_mint = call_as(
-        &sys_admin,
+    assert!(op_inbox_status.contains("200"), "{op_inbox_status}");
+    let (op_mint_status, _) = support::call(
+        &server.socket,
         "POST",
         "/v1/operator/agents/outsider-root/capability",
-        json!({}),
+        "{}",
     );
-    assert!(admin_mint.starts_with("HTTP/1.1 200"), "{admin_mint}");
+    assert!(op_mint_status.contains("200"), "{op_mint_status}");
 
     // Multi-hop ancestor `tree-root` can delete grandchild `worker-leaf-v2`.
     let deleted = call_as(&h1_root, "DELETE", "/v1/agents/worker-leaf-v2", json!(null));

@@ -692,12 +692,7 @@ pub(super) fn can_actor_read_agent_private(
 ) -> bool {
     match principal {
         Principal::Operator => true,
-        Principal::Agent { agent_id, .. } => {
-            is_self_or_ancestor(store, agent_id, target)
-                || store
-                    .agent(agent_id)
-                    .is_ok_and(|caller| caller.is_admin && caller.parent_id.is_none())
-        }
+        Principal::Agent { agent_id, .. } => is_self_or_ancestor(store, agent_id, target),
     }
 }
 
@@ -846,7 +841,6 @@ pub(super) fn check_targets(
                         && clean_room != "peers"
                         && !clean_room.starts_with("telegram:")
                         && !store.is_group_public(clean_room)
-                        && !sender.is_admin
                         && let Ok(Some(members)) = store.room_members(room)
                     {
                         let is_member_or_parent = members.iter().any(|m| {

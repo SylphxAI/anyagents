@@ -12,7 +12,7 @@ use serde::Deserialize;
 use crate::auth::Principal;
 
 use super::types::{
-    ApiError, AppState, is_self_or_ancestor, require_admin_or_operator, spawn_store,
+    ApiError, AppState, is_self_or_ancestor, require_operator_audited, spawn_store,
 };
 
 pub(super) fn router() -> Router<AppState> {
@@ -85,7 +85,7 @@ pub(super) fn authorize_schedule_target(
             {
                 return Ok(found);
             }
-            require_admin_or_operator(store, principal, "agents.schedule", &found.name)?;
+            require_operator_audited(store, principal, "agents.schedule", &found.name)?;
             Ok(found)
         }
         (Principal::Operator, Some(name)) => {
@@ -121,7 +121,6 @@ pub(super) fn list_fleet_schedules(
             Some(store.agent(agent_id).map_err(ApiError::from_store)?)
         }
     };
-    let caller_is_admin = caller_agent.as_ref().is_some_and(|a| a.is_admin);
     // Load active schedules and live agents in 2 batched queries instead of N+1
     // per-owner ancestry lookups.
     let all_schedules = store
@@ -170,7 +169,6 @@ pub(super) fn list_fleet_schedules(
             let resolved = match (&caller_agent, owner_opt) {
                 (_, None) => None,
                 (None, Some(agent)) => Some(agent.name),
-                (Some(_), Some(agent)) if caller_is_admin => Some(agent.name),
                 (Some(caller), Some(agent)) if is_descendant_in_map(&caller.id, &agent) => {
                     Some(agent.name)
                 }

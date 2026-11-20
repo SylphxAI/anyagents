@@ -96,11 +96,10 @@ async fn write_only_secret_crud_encryption_at_rest_and_admin_access() {
     let (dir, store, app) = make_confined_app();
 
     let op = Some((crate::operator::HEADER, TEST_OPERATOR_TOKEN));
-    let root_admin = store
-        .create_agent(NewAgent::new("root-admin", "claude-code"))
+    let root_peer = store
+        .create_agent(NewAgent::new("root-peer", "claude-code"))
         .unwrap();
-    store.set_agent_admin(&root_admin.id, true).unwrap();
-    let admin_cap = store.issue_capability(&root_admin.id).unwrap();
+    let root_cap = store.issue_capability(&root_peer.id).unwrap();
 
     let non_admin = store
         .create_agent(NewAgent::new("regular-agent", "claude-code"))
@@ -217,21 +216,46 @@ async fn write_only_secret_crud_encryption_at_rest_and_admin_access() {
         StatusCode::FORBIDDEN
     );
 
-    // 7. Root admin agent (`is_admin=true`) can manage /v1/secrets.
-    let admin_hdr = Some((crate::operator::AGENT_HEADER, admin_cap.as_str()));
-    let (st, raw, _) = send_json(
-        &app,
-        "PUT",
-        "/v1/secrets/admin-created",
-        admin_hdr,
-        Some(json!({ "env": { "STRIPE_KEY": "canary_admin_secret_000111" } })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "admin upsert failed: {raw}");
-    assert!(!raw.contains("canary_admin_secret_000111"));
+    // 7. Even a root agent has ZERO admin privilege on /v1/secrets (strictly operator-only).
+    let root_hdr = Some((crate::operator::AGENT_HEADER, root_cap.as_str()));
+    assert_eq!(
+        send_json(&app, "GET", "/v1/secrets", root_hdr, None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send_json(&app, "GET", "/v1/secrets/ci-github", root_hdr, None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send_json(
+            &app,
+            "PUT",
+            "/v1/secrets/root-denied",
+            root_hdr,
+            Some(json!({ "env": { "STRIPE_KEY": "canary_root_denied_000111" } })),
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send_json(&app, "DELETE", "/v1/secrets/ci-github", root_hdr, None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
 
-    let (st, _, _) = send_json(&app, "DELETE", "/v1/secrets/admin-created", admin_hdr, None).await;
-    assert_eq!(st, StatusCode::OK);
+    // 8. Operator detail GET /v1/secrets/{name} is strictly write-only (metadata only, NEVER raw values).
+    let (st, raw, detail) = send_json(&app, "GET", "/v1/secrets/ci-github", op, None).await;
+    assert_eq!(st, StatusCode::OK, "operator detail failed: {raw}");
+    assert_eq!(detail["name"], json!("ci-github"));
+    assert_eq!(detail["env_keys"], json!(["DEPLOY_KEY", "GH_TOKEN"]));
+    assert!(!raw.contains("canary_gh_"));
+    assert!(!raw.contains("canary_deploy_"));
 }
 
 #[tokio::test]

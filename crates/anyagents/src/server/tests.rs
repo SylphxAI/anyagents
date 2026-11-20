@@ -386,7 +386,6 @@ fn roster_authorization_matches_the_single_agent_checks() {
     };
     let root = make("root", None, None);
     let admin = make("admin", None, None);
-    store.set_agent_admin(&admin.id, true).unwrap();
     let peer = make("peer", None, None);
     let lead = make("lead", Some(&root), Some("siblings"));
     let sib = make("sib", Some(&root), Some("siblings"));
@@ -2424,16 +2423,15 @@ fn describe_preserves_scope_and_audits_authorized_policy_updates() {
         }
         assert_eq!(store.agent(&mind.id).unwrap(), before);
 
-        // An admin's self update is allowed and has the same atomic audit.
-        store.set_agent_admin(&parent.id, true).unwrap();
-        let _ = set_description_route(caller(&parent), State(state.clone()), AxumPath("self".into()), Json(serde_json::from_value(serde_json::json!({"scope":"isolated", "description":"Admin self charter"})).unwrap()))
+        // Operator update on a root agent is allowed and leaves an atomic audit row.
+        let _ = set_description_route(Principal::Operator, State(state.clone()), AxumPath("parent".into()), Json(serde_json::from_value(serde_json::json!({"scope":"isolated", "description":"Operator charter"})).unwrap()))
             .await.unwrap_or_else(|e| panic!("{}", e.message));
         let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
         let mut stmt = conn.prepare("SELECT actor,before_scope,after_scope,source FROM admin_audit WHERE target='mind' AND source IS NOT NULL ORDER BY id").unwrap();
         let rows: Vec<(String,String,String,String)> = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect();
         assert_eq!(rows, expected_audit);
-        let self_audit: (String,String,String,String) = conn.query_row("SELECT actor,before_scope,after_scope,source FROM admin_audit WHERE target='parent' AND source IS NOT NULL", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
-        assert_eq!(self_audit, ("agent:parent".into(),"public".into(),"isolated".into(),"scope".into()));
+        let op_audit: (String,String,String,String) = conn.query_row("SELECT actor,before_scope,after_scope,source FROM admin_audit WHERE target='parent' AND source IS NOT NULL", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(op_audit, ("operator".into(),"public".into(),"isolated".into(),"scope".into()));
         assert_eq!(store.agent(&mind.id).unwrap().description.as_deref(), Some("Public charter"));
         // Every runtime-config pass reads the store's policy; none owns it.
         for _ in 0..2 {
@@ -5796,8 +5794,7 @@ async fn fleet_schedules_enforce_owner_authority_and_reject_all_mutations() {
     }
     assert_eq!(store.list_schedules(None, true).unwrap().len(), 3);
     assert!(authorize_schedule_target(store, &Principal::Operator, None).is_err());
-    // Only top-level agents can hold administrative authority.
-    assert!(store.set_agent_admin(&child.id, true).is_err());
+    // Child sees only its own schedule (1), parent sees itself + child (2), operator sees all (3).
     assert_eq!(
         list_fleet_schedules(store, &child_principal).unwrap()["schedules"]
             .as_array()
@@ -5805,15 +5802,13 @@ async fn fleet_schedules_enforce_owner_authority_and_reject_all_mutations() {
             .len(),
         1
     );
-    store.set_agent_admin(&parent.id, true).unwrap();
     assert_eq!(
-        list_fleet_schedules(store, &principal).unwrap()["schedules"]
+        list_fleet_schedules(store, &Principal::Operator).unwrap()["schedules"]
             .as_array()
             .unwrap()
             .len(),
         3
     );
-    store.set_agent_admin(&parent.id, false).unwrap();
     assert_eq!(
         list_fleet_schedules(store, &principal).unwrap()["schedules"]
             .as_array()
@@ -7051,7 +7046,6 @@ async fn agents_report_to_the_operator_and_only_the_operator_reads_it() {
         .store
         .create_agent(anyagents_core::NewAgent::new("report-root", "opencode"))
         .unwrap();
-    state.store.set_agent_admin(&root.id, true).unwrap();
     let mut new = anyagents_core::NewAgent::new("report-child", "opencode");
     new.parent_id = Some(root.id.clone());
     let child = state.store.create_agent(new).unwrap();

@@ -7,11 +7,21 @@ use anyagents_harness::normalize_harness_name;
 
 use super::profile_rotation::rebalance_provider_profiles;
 use super::{
-    chmod_seat_file_readable, deduplicate_same_account_profiles, enrich_profiles_usage,
-    extract_file_tilde_refs, extract_profile_account_identity,
+    chmod_seat_file_readable, deduplicate_same_account_profiles,
+    enrich_profiles_usage_with_options, extract_file_tilde_refs, extract_profile_account_identity,
     propagate_profile_files_to_bound_agents, seeded_profile_name, write_profile_marker,
     write_required_file, write_seat_shared_file,
 };
+
+/// Structured quota reading for a single rate-limit window (e.g. 5-hour or 7-day weekly).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct QuotaWindow {
+    /// Remaining capacity percentage (`0..=100`).
+    pub remaining_pct: i64,
+    /// Human-readable reset ETA (e.g. `"2h15m"`, `"3d04h"`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_eta: Option<String>,
+}
 
 /// One Upstream Provider Profile in the server's centralized profile pool
 /// (`<data>/profiles/<provider>/<profile>`).
@@ -28,6 +38,12 @@ pub(crate) struct ProviderProfileEntry {
     pub subagent_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<String>,
+    /// Structured 5-hour rolling window quota reading, when reported by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_5h: Option<QuotaWindow>,
+    /// Structured 7-day weekly window quota reading, when reported by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_weekly: Option<QuotaWindow>,
 }
 
 /// Create or update a named provider profile in `<data>/profiles/<provider>/<profile>`.
@@ -658,15 +674,16 @@ pub(super) fn ensure_provider_profile_meta(
 /// Discovers and imports existing upstream provider credentials from active seats
 /// and host config into `<data>/profiles/<provider>/<profile>`, and returns all
 /// upstream provider profiles sorted by provider and profile name.
-pub(crate) fn sync_and_list_provider_profiles(
+pub(crate) fn list_provider_profiles_fast(store: &Store, data: &Path) -> Vec<ProviderProfileEntry> {
+    sync_and_list_provider_profiles_inner(store, data, true, true, false)
+}
+
+/// Probe live upstream quotas across all providers, bypassing stale on-disk usage caches.
+pub(crate) fn list_provider_profiles_fresh(
     store: &Store,
     data: &Path,
 ) -> Vec<ProviderProfileEntry> {
-    sync_and_list_provider_profiles_inner(store, data, true, true)
-}
-
-pub(crate) fn list_provider_profiles_fast(store: &Store, data: &Path) -> Vec<ProviderProfileEntry> {
-    sync_and_list_provider_profiles_inner(store, data, true, true)
+    sync_and_list_provider_profiles_inner(store, data, true, true, true)
 }
 
 pub(crate) fn sync_and_list_provider_profiles_with_options(
@@ -674,7 +691,7 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
     data: &Path,
     probe_usage: bool,
 ) -> Vec<ProviderProfileEntry> {
-    sync_and_list_provider_profiles_inner(store, data, probe_usage, probe_usage)
+    sync_and_list_provider_profiles_inner(store, data, probe_usage, probe_usage, false)
 }
 
 /// Re-hydrate any newly created or updated profile blobs from PostgreSQL
@@ -743,6 +760,7 @@ pub(super) fn sync_and_list_provider_profiles_inner(
     data: &Path,
     probe_usage: bool,
     rebalance: bool,
+    bypass_usage_cache: bool,
 ) -> Vec<ProviderProfileEntry> {
     hydrate_profiles_from_store_if_postgres(store, data);
     let agents = store.list_agents().unwrap_or_default();
@@ -959,6 +977,8 @@ pub(super) fn sync_and_list_provider_profiles_inner(
                     assigned_agents: Vec::new(),
                     subagent_count: 0,
                     usage: None,
+                    quota_5h: None,
+                    quota_weekly: None,
                 });
             }
         }
@@ -966,7 +986,7 @@ pub(super) fn sync_and_list_provider_profiles_inner(
 
     entries.sort_by(|a, b| (&a.provider, &a.profile).cmp(&(&b.provider, &b.profile)));
     if probe_usage {
-        enrich_profiles_usage(data, &mut entries);
+        enrich_profiles_usage_with_options(data, &mut entries, bypass_usage_cache);
     }
 
     if rebalance

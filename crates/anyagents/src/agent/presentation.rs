@@ -89,17 +89,6 @@ pub(super) fn reset(value: &Value, name: &str) {
     }
 }
 
-pub(super) fn admin(value: &Value, name: &str, granted: bool) {
-    receipt(
-        if granted {
-            "Admin granted"
-        } else {
-            "Admin revoked"
-        },
-        text(value, "agent", name),
-    );
-}
-
 pub(super) fn revoked(value: &Value, name: &str) {
     receipt("Remote sessions revoked", text(value, "agent", name));
     if let Some(count) = value.get("revoked").and_then(Value::as_u64) {

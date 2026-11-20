@@ -203,7 +203,7 @@ fn legacy_profile_compatibility_lists_expose_only_canonical_harnesses() {
         "compatible_harnesses": ["sylphx", "sylphx-agent", "sylphx_agent", "sylphx/default", "spiron", "codex"]
     }).to_string()).unwrap();
     let store = Store::open(dir.path().join("state.db")).unwrap();
-    let profiles = sync_and_list_provider_profiles_inner(&store, dir.path(), false, false);
+    let profiles = sync_and_list_provider_profiles_inner(&store, dir.path(), false, false, false);
     let entry = profiles
         .iter()
         .find(|entry| entry.provider == "sylphx")
@@ -263,6 +263,8 @@ fn rebalance_test_profiles(data: &Path, busy_pct: i64) -> Vec<ProviderProfileEnt
                 assigned_agents: Vec::new(),
                 subagent_count: 0,
                 usage: Some(format!("5h: {pct}% left · 7d: {pct}% left")),
+                quota_5h: None,
+                quota_weekly: None,
             }
         })
         .collect()
@@ -2518,7 +2520,7 @@ fn switching_a_bound_agent_to_sylphx_never_creates_a_sylphx_profile_of_its_old_n
     seat("was-claude", Some("anthropic/bar"));
     seat("unbound", None);
 
-    let profiles = sync_and_list_provider_profiles_inner(&store, data, false, false);
+    let profiles = sync_and_list_provider_profiles_inner(&store, data, false, false, false);
     sync_fresher_bound_agent_credentials_in(&store, data);
 
     assert!(!data.join("profiles/sylphx/foo").exists());

@@ -71,7 +71,7 @@ pub(crate) async fn styles_css_route() -> Response {
 }
 
 /// `GET /admin/api/overview`: operator-only summary supplementing `/v1/agents` with
-/// per-agent `is_admin`, `unread_count`, `sandbox_lease`, and serverless tick status.
+/// per-agent `unread_count`, `sandbox_lease`, and serverless tick status.
 pub(crate) async fn overview_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -107,7 +107,6 @@ pub(crate) async fn overview_route(
             agents_meta.insert(
                 agent.id.as_str().to_string(),
                 json!({
-                    "is_admin": agent.is_admin,
                     "unread_count": unread_count,
                     "sandbox_lease": sandbox_lease,
                 }),
