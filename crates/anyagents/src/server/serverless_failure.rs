@@ -532,7 +532,7 @@ mod tests {
             agent_id: p.id.clone(),
             name: p.name.clone(),
         };
-        archive_agent_route(caller, State(state), AxumPath(c.name))
+        let _ = archive_agent_route(caller, State(state), AxumPath(c.name))
             .await
             .unwrap();
         assert_eq!(s.agent(&c.id).unwrap().state, "archived");
