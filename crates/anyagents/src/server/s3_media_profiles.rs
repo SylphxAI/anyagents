@@ -1541,4 +1541,265 @@ mod tests {
         );
         assert!(load_scoped_media_bytes(&store, &agent.id, media_id).is_err());
     }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn remote_session_token_authenticates_browser_profiles_and_scoped_media_end_to_end() {
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(&[
+            S3_ENDPOINT_ENV,
+            S3_BUCKET_ENV,
+            S3_ACCESS_KEY_ID_ENV,
+            S3_SECRET_ACCESS_KEY_ENV,
+            S3_REGION_ENV,
+            S3_PREFIX_ENV,
+            S3_FORCE_PATH_STYLE_ENV,
+            MASTER_KEY_ENV,
+            "ANYAGENTS_SERVERLESS",
+            "ANYAGENTS_SANDBOX_MODE",
+            "ANYAGENTS_SANDBOX_PROVIDER",
+            "ANYAGENTS_SANDBOX_ENDPOINT",
+            "ANYAGENTS_SANDBOX_API_KEY",
+            "E2B_API_KEY",
+            "MODAL_TOKEN_ID",
+            "DAYTONA_API_KEY",
+            "SPRITES_TOKEN",
+            "ANYAGENTS_ADMIN_OIDC_ISSUER",
+        ]);
+        for key in [
+            "ANYAGENTS_SERVERLESS",
+            "ANYAGENTS_SANDBOX_MODE",
+            "ANYAGENTS_SANDBOX_PROVIDER",
+            "ANYAGENTS_SANDBOX_ENDPOINT",
+            "ANYAGENTS_SANDBOX_API_KEY",
+            "E2B_API_KEY",
+            "MODAL_TOKEN_ID",
+            "DAYTONA_API_KEY",
+            "SPRITES_TOKEN",
+            "ANYAGENTS_ADMIN_OIDC_ISSUER",
+        ] {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+
+        let (endpoint, _s3_objects) = spawn_mock_s3("remote-auth-test");
+        unsafe {
+            std::env::set_var(S3_ENDPOINT_ENV, &endpoint);
+            std::env::set_var(S3_BUCKET_ENV, "remote-auth-test");
+            std::env::set_var(S3_ACCESS_KEY_ID_ENV, "TESTKEY000004");
+            std::env::set_var(S3_SECRET_ACCESS_KEY_ENV, "test-secret-000004");
+            std::env::set_var(S3_REGION_ENV, "us-east-1");
+            std::env::remove_var(S3_PREFIX_ENV);
+            std::env::set_var(S3_FORCE_PATH_STYLE_ENV, "true");
+            std::env::set_var(MASTER_KEY_ENV, "master-key-for-remote-auth-tests-123456");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let store = Arc::new(Store::open(&db_path).unwrap());
+        let off_host_a = store
+            .create_agent(
+                NewAgent::new("sandbox-a", "claude-code")
+                    .with_runtime(anyagents_core::ExecutionRuntime::Sandbox { provider: None }),
+            )
+            .unwrap();
+        let off_host_b = store
+            .create_agent(
+                NewAgent::new("sandbox-b", "claude-code")
+                    .with_runtime(anyagents_core::ExecutionRuntime::Sandbox { provider: None }),
+            )
+            .unwrap();
+        let local_agent = store
+            .create_agent(
+                NewAgent::new("host-local", "claude-code")
+                    .with_runtime(anyagents_core::ExecutionRuntime::Local),
+            )
+            .unwrap();
+
+        store
+            .set_agent_browser_profiles_as(
+                &BrowserProfileActor::Operator,
+                &off_host_a.id,
+                &["team-site".to_string()],
+            )
+            .unwrap();
+        store
+            .set_agent_browser_profiles_as(
+                &BrowserProfileActor::Operator,
+                &local_agent.id,
+                &["team-site".to_string()],
+            )
+            .unwrap();
+
+        let img_bytes = b"PNG-REMOTE-SESSION-MEDIA-PAYLOAD-98765";
+        let note =
+            persist_inbound_media_bytes(&store, &off_host_a.id, "photo", "shot.png", img_bytes)
+                .expect("persist media");
+        let media_uri = note
+            .trim_start_matches("[Media (photo): ")
+            .trim_end_matches(']')
+            .to_string();
+
+        let sess_a = store.begin_remote_session(&off_host_a.id, 60_000).unwrap();
+        let sess_b = store.begin_remote_session(&off_host_b.id, 60_000).unwrap();
+        let sess_local = store.begin_remote_session(&local_agent.id, 60_000).unwrap();
+
+        let app = make_test_app(Arc::clone(&store));
+
+        // 1. `GET /v1/browser-profiles` with single `x-anyagents-agent` remote session token -> 200.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(crate::operator::AGENT_HEADER, &sess_a.token)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["browser_profiles"], serde_json::json!(["team-site"]));
+
+        // 2. `GET /v1/browser-profiles` with legacy matching `x-anyagents-agent` + `Authorization: Bearer` -> 200.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(crate::operator::AGENT_HEADER, &sess_a.token)
+            .header(header::AUTHORIZATION, format!("Bearer {}", sess_a.token))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 3. `PUT` and `GET /v1/browser-profiles/{profile}/archive` via remote session token -> 200.
+        let archive_payload = b"\x28\xb5\x2f\xfdremote-session-browser-profile-archive".to_vec();
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/v1/browser-profiles/team-site/archive")
+            .header(crate::operator::AGENT_HEADER, &sess_a.token)
+            .header(header::CONTENT_TYPE, "application/zstd")
+            .body(Body::from(archive_payload.clone()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles/team-site/archive")
+            .header(crate::operator::AGENT_HEADER, &sess_a.token)
+            .header(header::AUTHORIZATION, format!("Bearer {}", sess_a.token))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(got.as_ref(), archive_payload.as_slice());
+
+        // 4. `GET /v1/media/{agent_id}/{media_id}` with fixed guest headers (`x-anyagents-agent` + `x-anyagents-agent-id`) and pure Bearer -> 200.
+        let req = Request::builder()
+            .method("GET")
+            .uri(&media_uri)
+            .header(crate::operator::AGENT_HEADER, &sess_a.token)
+            .header(crate::auth::AGENT_ID_HEADER, off_host_a.id.as_str())
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(got.as_ref(), img_bytes);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(&media_uri)
+            .header(header::AUTHORIZATION, format!("Bearer {}", sess_a.token))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 5. Cross-agent unauthorized profile/media access and operator-only delete fail closed with 403.
+        for (method, uri, tok) in [
+            (
+                "GET",
+                "/v1/browser-profiles/team-site/archive",
+                sess_b.token.as_str(),
+            ),
+            (
+                "PUT",
+                "/v1/browser-profiles/team-site/archive",
+                sess_b.token.as_str(),
+            ),
+            ("GET", media_uri.as_str(), sess_b.token.as_str()),
+            (
+                "DELETE",
+                "/v1/browser-profiles/team-site",
+                sess_a.token.as_str(),
+            ),
+        ] {
+            let body = if method == "PUT" {
+                Body::from(archive_payload.clone())
+            } else {
+                Body::empty()
+            };
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(crate::operator::AGENT_HEADER, tok)
+                .body(body)
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+
+        // 6. Distinct dual-authority (`x-anyagents-agent: A` + `Authorization: Bearer B`) fails closed with 401.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(crate::operator::AGENT_HEADER, &sess_a.token)
+            .header(header::AUTHORIZATION, format!("Bearer {}", sess_b.token))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 7. Non-off-host local agent remote session token fails closed with 401.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(crate::operator::AGENT_HEADER, &sess_local.token)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 8. Revoked remote session token fails closed with 401.
+        store.revoke_remote_sessions(&off_host_a.id, None).unwrap();
+        for uri in ["/v1/browser-profiles", media_uri.as_str()] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header(crate::operator::AGENT_HEADER, &sess_a.token)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "revoked {uri}");
+        }
+
+        // 9. Expired remote session token fails closed with 401.
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE remote_session_tokens SET expires_at_ms = 1 WHERE session_id = ?1",
+                [sess_b.session_id.as_str()],
+            )
+            .unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(crate::operator::AGENT_HEADER, &sess_b.token)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
 }
