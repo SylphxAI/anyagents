@@ -62,6 +62,7 @@ pub(crate) mod serverless_maintenance;
 mod serverless_memory;
 pub(crate) mod serverless_steer;
 pub(crate) mod serverless_watches;
+mod takeover_tunnel;
 pub(crate) mod timer_fire;
 mod types;
 mod webhooks_mcp;
@@ -116,6 +117,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
         .merge(oidc_bearer::discovery_router())
         .merge(channels_groups::webhook_router())
         .merge(webhooks_mcp::public_router())
+        .merge(takeover_tunnel::router())
         .route(
             "/v1/internal/guest/events",
             post(serverless::guest_events_route),
@@ -148,6 +150,7 @@ fn build_webhook_router(state: AppState) -> Router {
     .merge(oidc_bearer::discovery_router())
     .merge(channels_groups::webhook_router())
     .merge(webhooks_mcp::local_router())
+    .merge(takeover_tunnel::router())
     .route(
         "/v1/internal/guest/events",
         post(serverless::guest_events_route),
@@ -190,6 +193,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/webhooks/healthz", get(ops::webhook_healthz))
         .merge(channels_groups::webhook_router())
         .merge(webhooks_mcp::local_router())
+        .merge(takeover_tunnel::router())
         .route(
             "/v1/internal/guest/events",
             post(serverless::guest_events_route),

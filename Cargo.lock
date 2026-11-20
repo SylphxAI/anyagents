@@ -220,6 +220,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite 0.29.0",
  "toml",
  "tower",
  "ureq",
@@ -451,18 +452,29 @@ name = "anyagents-mcp-browser"
 version = "0.1.9"
 dependencies = [
  "agent-workstation",
+ "axum",
  "base64 0.22.1",
+ "bytes",
  "clap",
  "flate2",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "rmcp",
+ "rustls",
+ "rustls-pki-types",
  "schemars",
  "serde",
  "serde_json",
  "tar",
  "tempfile",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite 0.29.0",
  "ureq",
  "url",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

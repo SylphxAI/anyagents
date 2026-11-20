@@ -13,9 +13,16 @@ path = "src/main.rs"
 [dependencies]
 agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "c4470c9a095f46f6bdb6af2f1fc39359104f2fe4" }
 base64 = "0.22"
+bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 flate2 = "1"
+futures-util = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 rmcp = { version = "3.5", features = ["macros", "schemars", "server", "transport-io"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,6 +30,7 @@ tar = { version = "0.4", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = [
     "fs",
+    "io-util",
     "macros",
     "net",
     "process",
@@ -30,5 +38,11 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = "0.29"
 ureq = "3"
 url = "2"
+webpki-roots = "1"
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["json", "ws"] }

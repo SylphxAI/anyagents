@@ -17,12 +17,13 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::chromium::{discover_chromium, is_executable_file};
-use crate::profile_sync::validate_profile_name;
+use crate::profile_sync::{resolve_api_url, resolve_coordinator_auth, validate_profile_name};
 use crate::proxy::{ProxyHandle, ProxyOverride};
 use crate::session::{
     BrowserBackend, BrowserError, BrowserInstance, BrowserSession, DESKTOP_PRINCIPAL,
     finalize_instance, prepare_profile_workspace, resolve_session_proxy,
 };
+use crate::tunnel::{TakeoverTunnelHandle, TunnelConfig};
 use crate::url_guard::navigable_url;
 
 const BIN_DIRS: &str = "/usr/local/bin /usr/bin /opt/homebrew/bin /bin /snap/bin";
@@ -240,17 +241,81 @@ impl BrowserSession {
                     user_data_dir: ws.user_data_dir,
                     remote_sync: ws.remote_sync,
                     takeover: TakeoverState::default(),
+                    takeover_tunnel: None,
                     _proxy_handle: proxy_handle,
                     _ephemeral_dir: ws.ephemeral_dir,
                 });
+            }
+            let mut tunnel_error: Option<String> = None;
+            if let Some(u) = pub_url {
+                let old_tunnel = g.as_mut().and_then(|i| i.takeover_tunnel.take());
+                if let Some(inst) = g.as_mut()
+                    && let BrowserBackend::Desktop { ref session, .. } = inst.backend
+                {
+                    let _ = session.set_takeover_public_url(u);
+                }
+                if let Some(old_tunnel) = old_tunnel {
+                    drop(g);
+                    old_tunnel.stop().await;
+                    g = self.inner.lock().await;
+                }
+            } else {
+                let needs_tunnel = g.as_ref().is_some_and(|i| i.takeover_tunnel.is_none());
+                if needs_tunnel
+                    && let Ok(Some(api_url)) = resolve_api_url(&self.config)
+                    && let Some(auth) = resolve_coordinator_auth(self.config.agent_token.as_deref())
+                {
+                    let target = g.as_ref().and_then(|inst| {
+                        let BrowserBackend::Desktop { ref session, .. } = inst.backend else {
+                            return None;
+                        };
+                        let addr = session.takeover_addr()?;
+                        let tok = session
+                            .takeover_url()
+                            .and_then(|u| extract_takeover_token(u.as_str()))?;
+                        Some((Arc::clone(session), addr, tok))
+                    });
+                    if let Some((session_ref, local_addr, takeover_token)) = target {
+                        drop(g);
+                        let cfg = TunnelConfig::new(api_url, auth, local_addr, takeover_token);
+                        match TakeoverTunnelHandle::start(cfg).await {
+                            Ok(handle) => {
+                                g = self.inner.lock().await;
+                                let same_session = g.as_ref().is_some_and(|inst| {
+                                    matches!(
+                                        &inst.backend,
+                                        BrowserBackend::Desktop { session, .. }
+                                            if Arc::ptr_eq(session, &session_ref)
+                                    )
+                                });
+                                if same_session {
+                                    if let Ok(base_url) = Url::parse(handle.public_base_url()) {
+                                        let _ = session_ref.set_takeover_public_url(base_url);
+                                    }
+                                    if let Some(inst) = g.as_mut() {
+                                        inst.takeover_tunnel = Some(handle);
+                                    }
+                                } else {
+                                    drop(g);
+                                    handle.stop().await;
+                                    g = self.inner.lock().await;
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "anyagents-mcp-browser: takeover reverse-tunnel unavailable ({err}); falling back to local URL"
+                                );
+                                tunnel_error = Some(err);
+                                g = self.inner.lock().await;
+                            }
+                        }
+                    }
+                }
             }
             let inst = g.as_mut().expect("desktop ready");
             let BrowserBackend::Desktop { ref session, .. } = inst.backend else {
                 unreachable!()
             };
-            if let Some(u) = pub_url {
-                let _ = session.set_takeover_public_url(u);
-            }
             if session.takeover_url().is_none() {
                 return Err(BrowserError::new(
                     "TAKEOVER_UNAVAILABLE",
@@ -273,6 +338,13 @@ impl BrowserSession {
             let mut p = desktop_payload(&session.takeover_status(), &inst.takeover, false);
             p["profile"] = json!(inst.active_profile);
             p["url"] = json!(cur);
+            p["tunnel_active"] = json!(inst.takeover_tunnel.is_some());
+            if let Some(ref tunnel) = inst.takeover_tunnel {
+                p["tunnel_session_id"] = json!(tunnel.session_id());
+            }
+            if let Some(err) = tunnel_error {
+                p["tunnel_error"] = json!(err);
+            }
             return Ok(p);
         }
         if self.config.headful {
@@ -363,6 +435,10 @@ impl BrowserSession {
                 let st = session.takeover_status();
                 let mut p = desktop_payload(&st, &inst.takeover, done);
                 p["profile"] = json!(inst.active_profile);
+                p["tunnel_active"] = json!(inst.takeover_tunnel.is_some());
+                if let Some(ref tunnel) = inst.takeover_tunnel {
+                    p["tunnel_session_id"] = json!(tunnel.session_id());
+                }
                 if st.holder == "agent"
                     && let Ok(a) = session.lease(DESKTOP_PRINCIPAL)
                 {

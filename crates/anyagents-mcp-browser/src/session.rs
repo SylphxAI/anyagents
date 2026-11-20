@@ -22,6 +22,7 @@ use crate::profile_sync::{
 };
 use crate::proxy::{BrowserProxy, ProxyHandle, ProxyOverride, resolve_browser_proxy};
 use crate::takeover::{TakeoverMode, TakeoverState};
+use crate::tunnel::TakeoverTunnelHandle;
 
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
@@ -137,6 +138,7 @@ pub struct BrowserInstance {
     pub user_data_dir: PathBuf,
     pub remote_sync: Option<RemoteProfileSync>,
     pub takeover: TakeoverState,
+    pub(crate) takeover_tunnel: Option<TakeoverTunnelHandle>,
     pub(crate) _proxy_handle: Option<ProxyHandle>,
     pub(crate) _ephemeral_dir: Option<tempfile::TempDir>,
 }
@@ -706,12 +708,16 @@ pub(crate) async fn launch_instance(
         user_data_dir: ws.user_data_dir,
         remote_sync: ws.remote_sync,
         takeover: TakeoverState::default(),
+        takeover_tunnel: None,
         _proxy_handle: proxy_handle,
         _ephemeral_dir: ws.ephemeral_dir,
     })
 }
 
 pub(crate) async fn finalize_instance(inst: &mut BrowserInstance) -> (bool, Option<String>) {
+    if let Some(tunnel) = inst.takeover_tunnel.take() {
+        tunnel.stop().await;
+    }
     shutdown_backend(&mut inst.backend).await;
     inst._proxy_handle = None;
     let Some(sync) = inst.remote_sync.take() else {
