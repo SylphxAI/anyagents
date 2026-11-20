@@ -54,21 +54,27 @@ mod webhooks_mcp;
 
 pub(crate) use profiles::ServedProfile;
 
+#[allow(unused_imports)]
+pub use bootstrap::not_confined_note;
 #[cfg(test)]
 pub use bootstrap::run_with;
-pub use bootstrap::{
-    listen_on_loopback, not_confined_note, run, run_with_port, serve_gateway, socket_path,
-};
+pub use bootstrap::{listen_on_loopback, run, run_with_port, serve_gateway, socket_path};
 pub use types::owner_workdir;
 
 #[cfg(test)]
 pub(crate) use agents_lifecycle::reap_subagent_ephemeral_dirs;
 pub(crate) use agents_lifecycle::{
-    clear_explicitly_archived, has_explicit_archive_marker, is_explicitly_archived,
-    is_git_worktree_safe_to_reap, mark_explicitly_archived_locked, reap_archived_agent_locked,
-    reap_archived_agents,
+    clear_explicitly_archived, is_explicitly_archived, mark_explicitly_archived_locked,
+    reap_archived_agent_locked,
 };
-pub(crate) use agents_roster::{ListAgentsQuery, agent_view, compute_block_reason, roster_views};
+#[allow(unused_imports)]
+pub(crate) use agents_lifecycle::{
+    has_explicit_archive_marker, is_git_worktree_safe_to_reap, reap_archived_agents,
+};
+#[allow(unused_imports)]
+pub(crate) use agents_roster::compute_block_reason;
+pub(crate) use agents_roster::{ListAgentsQuery, agent_view, roster_views};
+#[allow(unused_imports)]
 pub(crate) use bootstrap::{STOP_WITHIN, release_stale_unadmitted_names_on_start};
 pub(crate) use messaging::unsettled_view;
 pub(crate) use types::{ApiError, AppState, resolve_remote_sandbox_workdir};

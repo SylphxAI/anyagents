@@ -20,7 +20,7 @@ use crate::operator;
 use super::types::{
     ApiError, AppState, SignInLine, require_admin_or_operator, require_operator, spawn_store,
 };
-use super::{in_flight, quota_rotation, serverless};
+use super::{ServedProfile, in_flight, quota_rotation, serverless};
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
