@@ -4982,19 +4982,19 @@ done
         store.set_agent_running(&agent.id, "/work").unwrap();
         let now = now_ms();
 
-        let ReceiveOutcome::New(m1) = store
+        let anyagents_core::ReceiveOutcome::New(m1) = store
             .receive(&agent.id, anyagents_core::Incoming::new("initial prompt"))
             .unwrap()
         else {
             panic!("expected new m1");
         };
-        let ReceiveOutcome::New(m2) = store
+        let anyagents_core::ReceiveOutcome::New(m2) = store
             .receive(&agent.id, anyagents_core::Incoming::new("mid-turn msg 2"))
             .unwrap()
         else {
             panic!("expected new m2");
         };
-        let ReceiveOutcome::New(m3) = store
+        let anyagents_core::ReceiveOutcome::New(m3) = store
             .receive(&agent.id, anyagents_core::Incoming::new("mid-turn msg 3"))
             .unwrap()
         else {
