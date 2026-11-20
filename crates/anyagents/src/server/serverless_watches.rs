@@ -1,6 +1,7 @@
 //! Serverless watch & schedule tick evaluation: remote-turn-aware `agent:idle` watches,
+//! pure-OSS GitHub REST API (`github:pr:*`, `github:check:*`) watch polling,
 //! past-due one-shot `at` catch-up, archived-target watch sweeping, and stale `coalesced`
-//! recurring cron recovery.
+//! recurring cron recovery with deterministic stagger jitter.
 
 use std::collections::{HashMap, HashSet};
 
@@ -266,7 +267,10 @@ fn fire_coalesced_catchup_tick(
     let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&owner.id) else {
         return false;
     };
-    let next_due = now.checked_add(interval);
+    let jitter = Store::recurring_schedule_jitter_ms(&sched.id, sched.agent_id.as_str(), interval);
+    let next_due = now
+        .checked_add(interval)
+        .and_then(|t| t.checked_add(jitter));
     let source_key = format!("schedule:{}:catchup:{now}", sched.id);
     let delivered = store
         .claim_schedule_tick_with_wake(
@@ -568,6 +572,163 @@ mod tests {
         assert_eq!(woken, vec![owner.id.clone()]);
         let after = store.get_schedule(&sched.id).unwrap().unwrap();
         assert_eq!(after.last_observed.as_deref(), Some("fired"));
+        let expected_jitter =
+            Store::recurring_schedule_jitter_ms(&sched.id, owner.id.as_str(), interval);
+        assert_eq!(
+            after.next_fire_at_ms,
+            Some(now + interval + expected_jitter)
+        );
         assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn serverless_tick_evaluates_github_pr_and_check_watches_with_granted_secret() {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+
+        let _env = crate::server::tests::env_lock();
+        let _restore = crate::schedule::RestoreEnv::capture(&[
+            anyagents_core::MASTER_KEY_ENV,
+            "ANYAGENTS_GITHUB_API_BASE",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+        ]);
+        crate::schedule::reset_probes_for_test();
+
+        let step = Arc::new(Mutex::new(0u32));
+        let tokens = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let etags = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let (sc, tc, ec) = (Arc::clone(&step), Arc::clone(&tokens), Arc::clone(&etags));
+        let (base, server) = crate::schedule::spawn_mock_github(Arc::new(move |path, hdrs| {
+            tc.lock().unwrap().push(hdrs.get("authorization").cloned());
+            ec.lock().unwrap().push(hdrs.get("if-none-match").cloned());
+            let s = *sc.lock().unwrap();
+            let inm = hdrs.get("if-none-match").map(String::as_str);
+            let run = |st, c| {
+                (
+                    200,
+                    None,
+                    format!(
+                        r#"{{"total_count":1,"check_runs":[{{"name":"ci","status":"{st}","conclusion":{c}}}]}}"#
+                    ),
+                )
+            };
+            match path {
+                "/repos/octocat/app/pulls/55" if s == 0 => (
+                    200,
+                    Some(("ETag", "\"v1\"")),
+                    r#"{"state":"open","merged":false,"head":{"sha":"cafebabe"}}"#.into(),
+                ),
+                "/repos/octocat/app/pulls/55" if (s == 1 || s == 2) && inm == Some("\"v1\"") => {
+                    (304, None, String::new())
+                }
+                "/repos/octocat/app/pulls/55" => (
+                    200,
+                    None,
+                    r#"{"state":"closed","merged":true,"head":{"sha":"cafebabe"}}"#.into(),
+                ),
+                p if p.contains("/cafebabe/check-runs") && s <= 1 => run("in_progress", "null"),
+                p if p.contains("/cafebabe/check-runs") && s == 2 => {
+                    (429, Some(("Retry-After", "60")), "rate limit".into())
+                }
+                p if p.contains("/cafebabe/check-runs") => run("completed", "\"success\""),
+                _ => (200, None, r#"{"state":"pending","statuses":[]}"#.into()),
+            }
+        }));
+        // SAFETY: serialized under `crate::server::tests::env_lock()`.
+        unsafe {
+            std::env::set_var(
+                anyagents_core::MASTER_KEY_ENV,
+                "serverless-gh-watch-master-key-0123456789abcdef",
+            );
+            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", &base);
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("GH_TOKEN");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("coord", "claude-code"))
+            .unwrap();
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        let sec = BTreeMap::from([("GITHUB_TOKEN".into(), "test-serverless-github-token".into())]);
+        store.upsert_deployment_secret("gh-patrol", &sec).unwrap();
+        store
+            .set_agent_secrets(&owner.id, &["gh-patrol".into()], Some("op"))
+            .unwrap();
+
+        let mk = |w: &str, p: &str| {
+            crate::schedule::create_agent_schedule(&store, &health, &owner, None, None, Some(w), p)
+                .unwrap()
+        };
+        let pr = mk("github:pr:octocat/app#55", "PR 55 merged");
+        let chk = mk("github:check:octocat/app@cafebabe", "CI done");
+        let get = |id: &str| store.get_schedule(id).unwrap().unwrap();
+
+        let t0 = anyagents_core::now_ms();
+        assert_eq!(
+            tick_serverless_watches_and_schedules(&store, &health, t0),
+            (0, vec![])
+        );
+        assert_eq!(
+            get(&pr.id).last_observed.as_deref(),
+            Some("checks_in_progress")
+        );
+        assert_eq!(get(&chk.id).last_observed.as_deref(), Some("pending"));
+
+        // Step 1: PR hits 304 ETag cache while checks remain in progress.
+        *step.lock().unwrap() = 1;
+        assert_eq!(
+            tick_serverless_watches_and_schedules(&store, &health, t0 + 35_000),
+            (0, vec![])
+        );
+        assert!(
+            etags
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|h| h.as_deref() == Some("\"v1\""))
+        );
+
+        // Step 2: 429 Retry-After pauses polling cleanly without firing.
+        *step.lock().unwrap() = 2;
+        assert_eq!(
+            tick_serverless_watches_and_schedules(&store, &health, t0 + 100_000),
+            (0, vec![])
+        );
+        assert_eq!(
+            get(&chk.id).last_observed.as_deref(),
+            Some("probe_error:rate_limited")
+        );
+
+        // Step 3 (after Retry-After backoff): PR merges & check succeeds -> both fire.
+        *step.lock().unwrap() = 3;
+        assert_eq!(
+            tick_serverless_watches_and_schedules(&store, &health, t0 + 165_000),
+            (2, vec![owner.id.clone()])
+        );
+        assert_eq!(get(&pr.id).state, "fired");
+        assert_eq!(get(&chk.id).state, "fired");
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert!(inbox.iter().any(|m| m.text.contains("transition=merged")));
+        assert!(inbox.iter().any(|m| m.text.contains("transition=success")));
+        assert!(
+            tokens
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|t| t.as_deref() == Some("Bearer test-serverless-github-token"))
+        );
+
+        let shutdown = format!("{base}/__shutdown");
+        let _ = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .new_agent()
+            .get(&shutdown)
+            .call();
+        let _ = server.join();
+        crate::schedule::reset_probes_for_test();
     }
 }
