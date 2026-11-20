@@ -265,9 +265,10 @@ fn probe(base: &str, token: Option<&str>, target: &WatchTarget, now: i64) -> Obs
     let Some(key) = target_key(base, target) else {
         return (false, "invalid_spec".into(), None);
     };
-    let Ok(mut cache) = PROBES.lock() else {
+    let Ok(mut guard) = PROBES.lock() else {
         return (false, "probe_error:cache".into(), None);
     };
+    let cache = &mut *guard;
     if cache.targets.len() > 512 {
         cache.targets.clear();
     }

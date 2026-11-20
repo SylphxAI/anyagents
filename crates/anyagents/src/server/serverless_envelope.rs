@@ -600,7 +600,7 @@ mod tests {
             let (prompt, mut out) = build_serverless_outbound_message(msgs);
             attach_deployment_skills_to_topology(&mut out, dir.path());
             let eff = prompt.replace("/v1/media/agt_1/", "/home/user/agent-data/state/media/");
-            let mut req = ExecRequest::argv(vec!["anyagents-guest".into()]);
+            let mut req = ExecRequest::argv(["anyagents-guest"]);
             attach_outbound_message_env(&mut req, Some(out), &eff);
             let dec =
                 anyagents_harness::decode_outbound_message_b64(&req.env[GUEST_MESSAGE_B64_ENV])
