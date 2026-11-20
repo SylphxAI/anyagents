@@ -100,7 +100,7 @@ pub fn mask_with_secrets<'a, S: AsRef<str>>(text: &'a str, secrets: &[S]) -> Cow
                 && !matches!(*s, "true" | "false" | "null")
         })
         .collect();
-    refs.sort_by(|a, b| b.len().cmp(&a.len()));
+    refs.sort_by_key(|a| std::cmp::Reverse(a.len()));
     refs.dedup();
     mask_known_secrets_inner(text, &refs)
 }
