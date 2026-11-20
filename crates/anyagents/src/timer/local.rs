@@ -106,6 +106,10 @@ impl LocalTokioTimerBackend {
 }
 
 impl TimerBackend for LocalTokioTimerBackend {
+    fn backend_kind(&self) -> &'static str {
+        "local_tokio"
+    }
+
     fn schedule_one_shot(
         &self,
         schedule_id: &str,

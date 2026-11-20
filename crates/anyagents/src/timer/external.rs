@@ -36,6 +36,13 @@ pub enum ExternalSchedulerMode {
 }
 
 impl ExternalSchedulerMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DelayedRun => "delayed_run",
+            Self::Webhook => "webhook",
+        }
+    }
+
     pub fn resolve(mode_override: Option<&str>, scheduler_url: &str) -> Self {
         if let Some(raw) = mode_override.map(str::trim).filter(|s| !s.is_empty()) {
             match raw.to_ascii_lowercase().as_str() {
@@ -106,9 +113,22 @@ impl ExternalWebhookTimerBackend {
         Some(Self::new(scheduler_url, token, mode, public_url))
     }
 
-    #[allow(dead_code)]
     pub fn mode(&self) -> ExternalSchedulerMode {
         self.mode
+    }
+
+    /// Extract `host[:port]` from the configured scheduler URL for safe startup
+    /// diagnostic logging without exposing paths, query strings, or credentials.
+    pub fn scheduler_host(&self) -> String {
+        Url::parse(&self.scheduler_url)
+            .ok()
+            .and_then(|u| {
+                u.host_str().map(|host| match u.port() {
+                    Some(port) => format!("{host}:{port}"),
+                    None => host.to_string(),
+                })
+            })
+            .unwrap_or_else(|| "<invalid-url>".to_string())
     }
 
     fn fire_url(&self, schedule_id: &str) -> Result<String, String> {
@@ -150,6 +170,10 @@ impl ExternalWebhookTimerBackend {
 }
 
 impl TimerBackend for ExternalWebhookTimerBackend {
+    fn backend_kind(&self) -> &'static str {
+        "external_webhook"
+    }
+
     fn schedule_one_shot(
         &self,
         schedule_id: &str,

@@ -1257,7 +1257,10 @@ pub(crate) fn configure_agent_runtime_with_options(
         )));
     }
 
-    let open_turn = store.has_open_turn(&existing.id).unwrap_or(false);
+    let open_turn = crate::server::serverless_maintenance::reconcile_agent_open_turn_serverless(
+        store,
+        &existing.id,
+    );
     let lock_busy = matches!(store.try_lock_agent(&existing.id), Err(Error::AgentBusy));
     let in_progress_turn = existing.state == "running" && (open_turn || lock_busy);
 
@@ -1410,5 +1413,192 @@ pub(crate) fn poke_agent_wake_socket(data: &Path, agent_id: &AgentId) {
             let msg = format!("a{}", agent_id.as_str());
             let _ = sock.send_to(msg.as_bytes(), &sock_path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyagents_core::stateless::{NewRemoteTurn, hash_callback_token};
+    use anyagents_core::{Incoming, NewAgent, ReceiveOutcome};
+
+    use super::*;
+
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(keys.iter().map(|&k| (k, std::env::var_os(k))).collect())
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(val) => unsafe { std::env::set_var(k, val) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn serverless_cutover_reconciles_orphaned_and_stale_turns_but_preserves_live_turn() {
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(&[
+            "ANYAGENTS_SERVERLESS",
+            "ANYAGENTS_SERVERLESS_SANDBOX_STALE_MS",
+        ]);
+        unsafe {
+            std::env::set_var("ANYAGENTS_SERVERLESS", "true");
+            std::env::set_var("ANYAGENTS_SERVERLESS_SANDBOX_STALE_MS", "20");
+        }
+
+        let dir = crate::test_tempdir();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+
+        // 1. Orphaned `has_open_turn` with 0 active remote turns clears -> `ready_on_next_wake`.
+        let orphan = store
+            .create_agent(NewAgent::new("serverless-orphan-cutover", "codex"))
+            .unwrap();
+        store.set_agent_running(&orphan.id, "/work").unwrap();
+        let ReceiveOutcome::New(m1) = store
+            .receive(&orphan.id, Incoming::new("orphaned turn msg"))
+            .unwrap()
+        else {
+            panic!("expected new message");
+        };
+        store.note_delivered(&orphan.id, m1.seq).unwrap();
+        assert!(store.has_open_turn(&orphan.id).unwrap());
+
+        let orphan_receipt = set_agent_harness_with_options(
+            &store,
+            data,
+            "operator",
+            "serverless-orphan-cutover",
+            "claude",
+            Some("sandbox"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(orphan_receipt["cutover_status"], "ready_on_next_wake");
+        assert_eq!(orphan_receipt["in_progress_turn"], false);
+        assert!(!store.has_open_turn(&orphan.id).unwrap());
+
+        // 2. Stale/dead sandbox remote turn settles & clears -> `ready_on_next_wake`.
+        let stale_agent = store
+            .create_agent(NewAgent::new("serverless-stale-cutover", "codex"))
+            .unwrap();
+        store.set_agent_running(&stale_agent.id, "/work").unwrap();
+        let ReceiveOutcome::New(m2) = store
+            .receive(&stale_agent.id, Incoming::new("stale turn msg"))
+            .unwrap()
+        else {
+            panic!("expected new message");
+        };
+        store.note_delivered(&stale_agent.id, m2.seq).unwrap();
+        store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "turn_cutover_stale".into(),
+                agent_id: stale_agent.id.clone(),
+                harness_kind: "sandbox".into(),
+                provider_kind: Some("http".into()),
+                remote_run_id: Some("pid:401".into()),
+                callback_token_hash: hash_callback_token("tok-stale"),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: Some(serde_json::json!({ "message_seq": m2.seq })),
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+
+        let stale_receipt = set_agent_harness_with_options(
+            &store,
+            data,
+            "operator",
+            "serverless-stale-cutover",
+            "claude",
+            Some("sandbox"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stale_receipt["cutover_status"], "ready_on_next_wake");
+        assert_eq!(stale_receipt["in_progress_turn"], false);
+        assert!(!store.has_open_turn(&stale_agent.id).unwrap());
+        assert_eq!(
+            store
+                .remote_turn_store()
+                .get_turn("turn_cutover_stale")
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+
+        // 3. Genuinely active fresh non-stale remote turn stays `pending_active_turn`.
+        unsafe {
+            std::env::set_var("ANYAGENTS_SERVERLESS_SANDBOX_STALE_MS", "600000");
+        }
+        let live_agent = store
+            .create_agent(NewAgent::new("serverless-live-cutover", "codex"))
+            .unwrap();
+        store.set_agent_running(&live_agent.id, "/work").unwrap();
+        let ReceiveOutcome::New(m3) = store
+            .receive(&live_agent.id, Incoming::new("live turn msg"))
+            .unwrap()
+        else {
+            panic!("expected new message");
+        };
+        store.note_delivered(&live_agent.id, m3.seq).unwrap();
+        store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "turn_cutover_live".into(),
+                agent_id: live_agent.id.clone(),
+                harness_kind: "sandbox".into(),
+                provider_kind: Some("http".into()),
+                remote_run_id: Some("pid:402".into()),
+                callback_token_hash: hash_callback_token("tok-live"),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: Some(serde_json::json!({ "message_seq": m3.seq })),
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+
+        let live_receipt = set_agent_harness_with_options(
+            &store,
+            data,
+            "operator",
+            "serverless-live-cutover",
+            "claude",
+            Some("sandbox"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(live_receipt["cutover_status"], "pending_active_turn");
+        assert_eq!(live_receipt["in_progress_turn"], true);
+        assert!(store.has_open_turn(&live_agent.id).unwrap());
+        assert_eq!(
+            store
+                .remote_turn_store()
+                .get_turn("turn_cutover_live")
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
     }
 }
