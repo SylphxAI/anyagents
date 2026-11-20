@@ -6887,14 +6887,85 @@ async fn agent_memory_route(
             .join("agents")
             .join(target.id.as_str());
         let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(&state.store, &target.id);
-        let topics =
-            anyagents_core::learned_memory::list_memory_topics(&agent_root).unwrap_or_default();
-        let index_path = agent_root.join("memory/MEMORY.md");
-        let needs_index_rebuild = !topics.is_empty()
-            && (!index_path.is_file()
-                || std::fs::read_to_string(&index_path)
+        let mem_dir = agent_root.join("memory");
+        let mem_dir_safe = std::fs::symlink_metadata(&mem_dir)
+            .ok()
+            .is_some_and(|m| m.file_type().is_dir());
+        let read_no_follow = |path: &Path| -> Option<String> {
+            use std::io::Read as _;
+            if !mem_dir_safe
+                || state
+                    .store
+                    .is_host_path_redacted(target.id.as_str(), path)
+                    .unwrap_or(true)
+            {
+                return None;
+            }
+            let mut f = anyagents_core::raw_segment::open_readonly(path).ok()?;
+            let mut bytes = Vec::new();
+            f.read_to_end(&mut bytes).ok()?;
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let mut topics: Vec<anyagents_core::learned_memory::MemoryTopicEntry> = Vec::new();
+        if mem_dir_safe && let Ok(entries) = std::fs::read_dir(&mem_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if fname.starts_with('.')
+                    || fname.eq_ignore_ascii_case("MEMORY.md")
+                    || !fname.ends_with(".md")
+                {
+                    continue;
+                }
+                let Ok(smeta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if !smeta.file_type().is_file() {
+                    continue;
+                }
+                let Some(raw) = read_no_follow(&path) else {
+                    continue;
+                };
+                let slug = fname.strip_suffix(".md").unwrap_or(fname).to_string();
+                let (_, description, _, fm_updated_ms) =
+                    anyagents_core::learned_memory::parse_topic_frontmatter_full(&slug, &raw);
+                let fs_mtime_ms = smeta
+                    .modified()
                     .ok()
-                    .is_some_and(|s| s.contains("No topic files recorded yet.")));
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
+                    .unwrap_or(0);
+                topics.push(anyagents_core::learned_memory::MemoryTopicEntry {
+                    slug,
+                    filename: fname.to_string(),
+                    description,
+                    updated_at_ms: fm_updated_ms.filter(|&ts| ts > 0).unwrap_or(fs_mtime_ms),
+                    bytes: raw.len(),
+                });
+            }
+            topics.sort_by(|a, b| {
+                b.updated_at_ms
+                    .cmp(&a.updated_at_ms)
+                    .then_with(|| a.slug.cmp(&b.slug))
+            });
+        }
+        let index_path = mem_dir.join("MEMORY.md");
+        let index_is_symlink = std::fs::symlink_metadata(&index_path)
+            .ok()
+            .is_some_and(|m| m.file_type().is_symlink());
+        let existing_index = if index_is_symlink {
+            None
+        } else {
+            read_no_follow(&index_path)
+        };
+        let needs_index_rebuild = mem_dir_safe
+            && !index_is_symlink
+            && !topics.is_empty()
+            && existing_index
+                .as_deref()
+                .is_none_or(|s| s.contains("No topic files recorded yet."));
         if needs_index_rebuild
             && let Ok(index) = anyagents_core::learned_memory::rebuild_memory_index(
                 &agent_root,
@@ -6909,13 +6980,20 @@ async fn agent_memory_route(
                 index.as_bytes(),
             );
         }
-        let index_text = std::fs::read_to_string(&index_path).unwrap_or_else(|_| {
-            format!(
-                "# {} — Learned Memory Index\n- No topic files recorded yet.\n",
-                target.name
-            )
-        });
-        let sleep_state = anyagents_core::learned_memory::read_sleep_state(&agent_root);
+        let index_text = if index_is_symlink {
+            String::new()
+        } else {
+            read_no_follow(&index_path).unwrap_or_else(|| {
+                format!(
+                    "# {} — Learned Memory Index\n- No topic files recorded yet.\n",
+                    target.name
+                )
+            })
+        };
+        let sleep_path = mem_dir.join(".sleep-state.json");
+        let sleep_state: anyagents_core::learned_memory::SleepState = read_no_follow(&sleep_path)
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
         let topic_count = topics.len();
         Ok(Json(serde_json::json!({
             "agent": target.name,
