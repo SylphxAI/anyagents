@@ -734,6 +734,7 @@ mod tests {
             &c.id,
             Some(Arc::clone(&provider)),
             cb.clone(),
+            None,
         )
         .await;
         assert!(first.is_err());
@@ -752,10 +753,11 @@ mod tests {
                 .is_none_or(|hb| hb.turn_state == "idle")
         );
 
-        let woken = dispatch_next_mailbox_message_inner(Arc::clone(&s), &c.id, Some(provider), cb)
-            .await
-            .unwrap()
-            .expect("must wake on fresh sandbox");
+        let woken =
+            dispatch_next_mailbox_message_inner(Arc::clone(&s), &c.id, Some(provider), cb, None)
+                .await
+                .unwrap()
+                .expect("must wake on fresh sandbox");
         assert_eq!(woken.turn.status, "running");
         assert_eq!(
             s.sandbox_binding(&c.id)

@@ -149,19 +149,28 @@ impl TimerBackend for LocalTokioTimerBackend {
             let store = Arc::clone(&inner.store);
             let health = inner.health.clone();
             let sid = task_id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Err(err) = fire_schedule_by_id(
-                    &store,
-                    &health,
-                    &backend,
-                    &sid,
-                    Some(fire_at_ms),
-                    anyagents_core::now_ms(),
-                ) {
-                    eprintln!("anyagents-timer: local fire failed for {sid}: {err}");
+            if crate::server::serverless_maintenance::is_system_timer_id(&sid) {
+                let tb: Arc<dyn TimerBackend> = Arc::new(backend);
+                if let Err(err) =
+                    crate::server::serverless_maintenance::fire_system_timer(store, tb, &sid).await
+                {
+                    eprintln!("anyagents-timer: local system timer failed for {sid}: {err}");
                 }
-            })
-            .await;
+            } else {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(err) = fire_schedule_by_id(
+                        &store,
+                        &health,
+                        &backend,
+                        &sid,
+                        Some(fire_at_ms),
+                        anyagents_core::now_ms(),
+                    ) {
+                        eprintln!("anyagents-timer: local fire failed for {sid}: {err}");
+                    }
+                })
+                .await;
+            }
         });
 
         let abort_handle = join.abort_handle();

@@ -1070,12 +1070,17 @@ pub(super) async fn create_agent_route(
     .await?;
     if created.1 && serverless::is_serverless_mode() {
         let store_wake = Arc::clone(&state_for_wake.store);
+        let timer_wake = Arc::clone(&state_for_wake.timer_backend);
         let aid_wake = created.0;
         let call = super::in_flight::carry();
         tokio::spawn(async move {
             let _call = call;
-            if let Err(err) =
-                serverless::dispatch_next_mailbox_message_if_serverless(store_wake, &aid_wake).await
+            if let Err(err) = serverless::dispatch_next_mailbox_message_with_timer(
+                store_wake,
+                &aid_wake,
+                Some(timer_wake),
+            )
+            .await
             {
                 eprintln!(
                     "anyagents-serverless: initial prompt dispatch failed for {aid_wake}: {err}"

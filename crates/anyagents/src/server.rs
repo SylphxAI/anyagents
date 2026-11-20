@@ -57,6 +57,7 @@ pub(crate) mod secrets;
 pub(crate) mod serverless;
 mod serverless_envelope;
 mod serverless_failure;
+pub(crate) mod serverless_maintenance;
 mod serverless_memory;
 pub(crate) mod serverless_watches;
 pub(crate) mod timer_fire;

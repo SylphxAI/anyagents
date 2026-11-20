@@ -50,9 +50,23 @@ impl TimerBackend for NoopTimerBackend {
     }
 }
 
-/// Build the deterministic run/timer ID for a `(schedule_id, fire_at_ms)` slot.
+/// Build the URL-safe deterministic run/timer ID for a `(schedule_id, fire_at_ms)` slot.
+/// Sanitizes non-`[a-zA-Z0-9_-]` characters (such as `:` in `sys:*` timer IDs) into `-`
+/// so external delayed-run endpoints with strict `runId` grammar and `/{runId}:cancel`
+/// suffix parsing handle both user schedules and system maintenance timers cleanly.
 pub fn deterministic_run_id(schedule_id: &str, fire_at_ms: i64) -> String {
-    format!("{schedule_id}-{fire_at_ms}")
+    let safe: String = schedule_id
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("{safe}-{fire_at_ms}")
 }
 
 /// Format a Unix epoch millisecond timestamp as RFC 3339 UTC with millisecond

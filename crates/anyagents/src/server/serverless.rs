@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::sandbox_providers::providers::{
-    ExecRequest, ImageSpec, LeasePolicy, ProviderKind, SandboxProvider as AsyncSandboxProvider,
+    ExecRequest, ImageSpec, LeasePolicy, SandboxProvider as AsyncSandboxProvider,
 };
 use anyagents_core::stateless::{
     NewRemoteTurn, PendingRemoteTurn, RemoteTurnEventUpdate, SettleRemoteTurn, constant_time_eq,
@@ -51,10 +51,10 @@ use crate::serverless_cloud::{
     resolve_cloud_driver_from_metadata,
 };
 
-const DEFAULT_CLOUD_POLL_DELAY_MS: i64 = 5_000;
-const MAX_CLOUD_POLL_BACKOFF_MS: i64 = 30_000;
+pub(super) const DEFAULT_CLOUD_POLL_DELAY_MS: i64 = 5_000;
+pub(super) const MAX_CLOUD_POLL_BACKOFF_MS: i64 = 30_000;
 const DEFAULT_SANDBOX_STALE_MS: i64 = 120_000;
-const DEFAULT_LEASE_RENEW_WINDOW_MS: i64 = 300_000;
+pub(super) const DEFAULT_LEASE_RENEW_WINDOW_MS: i64 = 300_000;
 const DETACHED_EXEC_TIMEOUT_MS: u64 = 15_000;
 const TICK_CLOUD_POLL_LIMIT: usize = 32;
 const TICK_STALE_SANDBOX_LIMIT: usize = 32;
@@ -106,7 +106,7 @@ pub(crate) fn cloud_events_callback_url(data_dir: &Path) -> Option<String> {
     resolve_public_url(data_dir).map(|base| format!("{base}/v1/internal/cloud/events"))
 }
 
-fn sandbox_stale_threshold_ms() -> i64 {
+pub(super) fn sandbox_stale_threshold_ms() -> i64 {
     env_non_empty("ANYAGENTS_SERVERLESS_SANDBOX_STALE_MS")
         .and_then(|v| v.parse::<i64>().ok())
         .filter(|&ms| ms > 0)
@@ -155,6 +155,7 @@ pub(crate) struct ServerlessDispatchInput {
     pub guest_program: Option<String>,
     pub guest_extra_args: Vec<String>,
     pub heartbeat_interval_ms: Option<u64>,
+    pub timer_backend: Option<Arc<dyn crate::timer::TimerBackend>>,
 }
 
 impl ServerlessDispatchInput {
@@ -174,6 +175,7 @@ impl ServerlessDispatchInput {
             guest_program: None,
             guest_extra_args: Vec::new(),
             heartbeat_interval_ms: None,
+            timer_backend: None,
         }
     }
 }
@@ -380,6 +382,10 @@ async fn dispatch_cloud_turn(
     let aid_upd = input.agent.id.clone();
     let tid_upd = turn_id.clone();
     let seq_upd = input.message_seq;
+    let tb_upd = super::serverless_maintenance::resolve_timer_backend(
+        input.timer_backend.as_ref(),
+        store.data_dir(),
+    );
     let final_turn = run_store_blocking(move || {
         if let Some(ref remote_aid) = submission.remote_agent_id {
             let _ = store_upd.blob_store().put_agent_file(
@@ -438,6 +444,17 @@ async fn dispatch_cloud_turn(
             )?;
             return Ok(settled.map(|s| s.turn).unwrap_or(updated));
         }
+
+        // Event-driven Step 2a: arm exact cloud turn poll timer on TimerBackend.
+        let poll_at =
+            next_poll.unwrap_or_else(|| now_ms().saturating_add(DEFAULT_CLOUD_POLL_DELAY_MS));
+        super::serverless_maintenance::arm_cloud_poll_timer(
+            &store_upd,
+            tb_upd.as_ref(),
+            &aid_upd,
+            &tid_upd,
+            poll_at,
+        );
 
         Ok(updated)
     })
@@ -709,7 +726,12 @@ async fn dispatch_sandbox_turn(
     let aid_upd = input.agent.id.clone();
     let tid_upd = turn_id.clone();
     let seq_upd = input.message_seq;
+    let tb_upd = super::serverless_maintenance::resolve_timer_backend(
+        input.timer_backend.as_ref(),
+        store.data_dir(),
+    );
     let updated = run_store_blocking(move || {
+        let now = now_ms();
         let updated = store_upd
             .remote_turn_store()
             .update_remote_run(
@@ -731,10 +753,32 @@ async fn dispatch_sandbox_turn(
                 owner_replica_id: Some(store_upd.replica_id().to_string()),
                 turn_state: "in_turn".to_string(),
                 retry_at_ms: None,
-                heartbeat_at_ms: Some(now_ms()),
+                heartbeat_at_ms: Some(now),
                 idle_since_ms: None,
                 inflight_children: 0,
             },
+        );
+
+        // Event-driven Step 2b: arm exact stale sandbox timeout deadline timer.
+        super::serverless_maintenance::arm_turn_timeout_timer(
+            &store_upd,
+            tb_upd.as_ref(),
+            &aid_upd,
+            &tid_upd,
+            now.saturating_add(sandbox_stale_threshold_ms()),
+        );
+        // Event-driven Step 3: arm active sandbox lease-renewal timer before lease expiry.
+        let binding_exp = store_upd
+            .sandbox_binding(&aid_upd)
+            .ok()
+            .flatten()
+            .and_then(|b| b.lease_expires_at_ms);
+        super::serverless_maintenance::arm_lease_renew_timer(
+            &store_upd,
+            tb_upd.as_ref(),
+            &aid_upd,
+            binding_exp,
+            now,
         );
         Ok(updated)
     })
@@ -754,10 +798,20 @@ pub(crate) async fn dispatch_next_mailbox_message_if_serverless(
     store: Arc<Store>,
     agent_id: &AgentId,
 ) -> Result<Option<DispatchedRemoteTurn>, String> {
+    dispatch_next_mailbox_message_with_timer(store, agent_id, None).await
+}
+
+/// Same as [`dispatch_next_mailbox_message_if_serverless`], passing an explicit
+/// [`crate::timer::TimerBackend`] so dispatched turns arm their event-driven timers directly.
+pub(crate) async fn dispatch_next_mailbox_message_with_timer(
+    store: Arc<Store>,
+    agent_id: &AgentId,
+    timer_backend: Option<Arc<dyn crate::timer::TimerBackend>>,
+) -> Result<Option<DispatchedRemoteTurn>, String> {
     if !is_serverless_mode() {
         return Ok(None);
     }
-    dispatch_next_mailbox_message_inner(store, agent_id, None, None).await
+    dispatch_next_mailbox_message_inner(store, agent_id, None, None, timer_backend).await
 }
 
 pub(super) async fn dispatch_next_mailbox_message_inner(
@@ -765,6 +819,7 @@ pub(super) async fn dispatch_next_mailbox_message_inner(
     agent_id: &AgentId,
     sandbox_provider: Option<Arc<dyn AsyncSandboxProvider>>,
     callback_base_url: Option<String>,
+    timer_backend: Option<Arc<dyn crate::timer::TimerBackend>>,
 ) -> Result<Option<DispatchedRemoteTurn>, String> {
     let store_r = Arc::clone(&store);
     let aid = agent_id.clone();
@@ -834,6 +889,7 @@ pub(super) async fn dispatch_next_mailbox_message_inner(
     input.reply_target = reply_target;
     input.sandbox_provider = sandbox_provider;
     input.callback_base_url = callback_base_url;
+    input.timer_backend = timer_backend;
     dispatch_serverless_turn(store, input).await.map(Some)
 }
 
@@ -2146,6 +2202,8 @@ pub(crate) async fn guest_events_route(
     let store = Arc::clone(&state.store);
     let store_for_drain = Arc::clone(&state.store);
     let profiles_for_sync = Arc::clone(&state.profiles);
+    let timer_for_close = Arc::clone(&state.timer_backend);
+    let timer_for_drain = Arc::clone(&state.timer_backend);
     let normalized_event = payload.event_type.trim().to_ascii_lowercase();
     let is_completed_event = matches!(normalized_event.as_str(), "turn_complete" | "completed");
     let is_terminal_event = is_completed_event
@@ -2269,6 +2327,7 @@ pub(crate) async fn guest_events_route(
                     ))
                 }
                 "turn_complete" | "completed" => {
+                    let inflight = payload.inflight_children.unwrap_or(0).max(0);
                     let settled = settle_remote_turn_and_deliver(
                         &store,
                         &turn.turn_id,
@@ -2281,10 +2340,18 @@ pub(crate) async fn guest_events_route(
                             settled_at_ms: ts,
                         },
                         payload.session_id.as_deref(),
-                        payload.inflight_children.unwrap_or(0).max(0),
+                        inflight,
                     )
                     .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
                     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
+                    super::serverless_maintenance::cancel_turn_timers_on_close(
+                        &store,
+                        timer_for_close.as_ref(),
+                        &settled.turn.agent_id,
+                        &settled.turn.turn_id,
+                        false,
+                        inflight,
+                    );
                     let drain_aid = settled
                         .settled_now
                         .then(|| (settled.turn.agent_id.clone(), true));
@@ -2304,6 +2371,7 @@ pub(crate) async fn guest_events_route(
                     ))
                 }
                 "turn_failed" | "failed" => {
+                    let inflight = payload.inflight_children.unwrap_or(0).max(0);
                     let settled = settle_remote_turn_and_deliver(
                         &store,
                         &turn.turn_id,
@@ -2318,10 +2386,18 @@ pub(crate) async fn guest_events_route(
                             settled_at_ms: ts,
                         },
                         payload.session_id.as_deref(),
-                        payload.inflight_children.unwrap_or(0).max(0),
+                        inflight,
                     )
                     .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
                     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
+                    super::serverless_maintenance::cancel_turn_timers_on_close(
+                        &store,
+                        timer_for_close.as_ref(),
+                        &settled.turn.agent_id,
+                        &settled.turn.turn_id,
+                        false,
+                        inflight,
+                    );
                     let drain_aid = settled.settled_now.then(|| {
                         let drain_now = super::serverless_failure::should_drain_after_failed_turn(
                             &store,
@@ -2345,6 +2421,7 @@ pub(crate) async fn guest_events_route(
                     ))
                 }
                 "turn_cancelled" | "cancelled" | "canceled" => {
+                    let inflight = payload.inflight_children.unwrap_or(0).max(0);
                     let settled = settle_remote_turn_and_deliver(
                         &store,
                         &turn.turn_id,
@@ -2357,10 +2434,18 @@ pub(crate) async fn guest_events_route(
                             settled_at_ms: ts,
                         },
                         payload.session_id.as_deref(),
-                        payload.inflight_children.unwrap_or(0).max(0),
+                        inflight,
                     )
                     .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
                     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
+                    super::serverless_maintenance::cancel_turn_timers_on_close(
+                        &store,
+                        timer_for_close.as_ref(),
+                        &settled.turn.agent_id,
+                        &settled.turn.turn_id,
+                        false,
+                        inflight,
+                    );
                     let drain_aid = settled
                         .settled_now
                         .then(|| (settled.turn.agent_id.clone(), false));
@@ -2400,24 +2485,21 @@ pub(crate) async fn guest_events_route(
                 )
                 .await;
             }
-            if should_drain
-                && let Err(err) = dispatch_next_mailbox_message_if_serverless(
+            if should_drain {
+                super::serverless_maintenance::pump_agent_backlog_after_settlement(
                     Arc::clone(&store_for_drain),
+                    Arc::clone(&timer_for_drain),
                     &drain_aid,
                 )
-                .await
-            {
-                eprintln!(
-                    "anyagents-serverless: post-turn mailbox drain failed for {drain_aid}: {err}"
-                );
+                .await;
             }
-            if let Some(notify_aid) = notified_agent_id
-                && let Err(err) =
-                    dispatch_next_mailbox_message_if_serverless(store_for_drain, &notify_aid).await
-            {
-                eprintln!(
-                    "anyagents-serverless: parent notification wake failed for {notify_aid}: {err}"
-                );
+            if let Some(notify_aid) = notified_agent_id {
+                super::serverless_maintenance::pump_agent_backlog_after_settlement(
+                    store_for_drain,
+                    timer_for_drain,
+                    &notify_aid,
+                )
+                .await;
             }
         });
     }
@@ -2472,7 +2554,10 @@ pub(crate) async fn cloud_events_route(
         .map(|s| s.trim().to_ascii_lowercase());
 
     let store = Arc::clone(&state.store);
-    spawn_store(move || {
+    let store_for_drain = Arc::clone(&state.store);
+    let timer_for_close = Arc::clone(&state.timer_backend);
+    let timer_for_drain = Arc::clone(&state.timer_backend);
+    let (json_resp, settled_drain_aid) = spawn_store(move || {
         // Choose driver parser: explicit hint, or infer Spiron when Spiron signature header
         // or Spiron `message.*` event / `task_id` / `receipt_id` is present.
         let use_spiron = match driver_hint.as_deref() {
@@ -2594,15 +2679,27 @@ pub(crate) async fn cloud_events_route(
             )
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
             .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "turn not found"))?;
-            Ok(Json(json!({
-                "ok": true,
-                "turn_id": settled.turn.turn_id,
-                "remote_run_id": event.remote_run_id,
-                "status": settled.turn.status,
-                "settled": settled.settled_now,
-                "idempotent_replay": !settled.settled_now,
-                "delivered_reply": settled.delivered_reply,
-            })))
+            super::serverless_maintenance::cancel_turn_timers_on_close(
+                &store,
+                timer_for_close.as_ref(),
+                &settled.turn.agent_id,
+                &settled.turn.turn_id,
+                true,
+                0,
+            );
+            let drain_aid = settled.settled_now.then(|| settled.turn.agent_id.clone());
+            Ok((
+                Json(json!({
+                    "ok": true,
+                    "turn_id": settled.turn.turn_id,
+                    "remote_run_id": event.remote_run_id,
+                    "status": settled.turn.status,
+                    "settled": settled.settled_now,
+                    "idempotent_replay": !settled.settled_now,
+                    "delivered_reply": settled.delivered_reply,
+                })),
+                drain_aid,
+            ))
         } else {
             let _ = rts
                 .record_event(
@@ -2616,16 +2713,33 @@ pub(crate) async fn cloud_events_route(
                     },
                 )
                 .map_err(ApiError::from_store)?;
-            Ok(Json(json!({
-                "ok": true,
-                "turn_id": turn.turn_id,
-                "remote_run_id": event.remote_run_id,
-                "status": "running",
-                "settled": false,
-            })))
+            Ok((
+                Json(json!({
+                    "ok": true,
+                    "turn_id": turn.turn_id,
+                    "remote_run_id": event.remote_run_id,
+                    "status": "running",
+                    "settled": false,
+                })),
+                None,
+            ))
         }
     })
-    .await
+    .await?;
+
+    if is_serverless_mode()
+        && let Some(aid) = settled_drain_aid
+    {
+        tokio::spawn(async move {
+            super::serverless_maintenance::pump_agent_backlog_after_settlement(
+                store_for_drain,
+                timer_for_drain,
+                &aid,
+            )
+            .await;
+        });
+    }
+    Ok(json_resp)
 }
 
 // ============================================================================
@@ -2677,7 +2791,7 @@ pub(crate) async fn run_tick_pass(
         }
     }
 
-    // 2a. Poll due cloud turns (`next_poll_at_ms <= now`).
+    // 2a. Poll due cloud turns (`next_poll_at_ms <= now`) via canonical maintenance helper.
     let store_due = Arc::clone(&store);
     let due_turns = spawn_store(move || {
         store_due
@@ -2687,86 +2801,28 @@ pub(crate) async fn run_tick_pass(
     })
     .await?;
 
+    let maint_timer = super::serverless_maintenance::resolve_timer_backend(None, store.data_dir());
     for turn in due_turns {
-        let Some(ref remote_run_id) = turn.remote_run_id else {
-            continue;
-        };
-        let Ok(driver) = resolve_cloud_driver_from_metadata(
-            &turn.harness_kind,
-            turn.metadata_json.as_ref(),
-            None,
-        ) else {
-            continue;
-        };
-        let poll_res = tokio::time::timeout(
-            Duration::from_secs(4),
-            driver.poll_turn(remote_run_id, turn.cursor.as_deref()),
+        match super::serverless_maintenance::poll_cloud_turn_once(
+            Arc::clone(&store),
+            Arc::clone(&maint_timer),
+            turn,
+            true,
         )
-        .await;
-        summary.cloud_turns_polled += 1;
-
-        match poll_res {
-            Ok(Ok(polled)) if polled.status.is_terminal() => {
-                let store_settle = Arc::clone(&store);
-                let tid = turn.turn_id.clone();
-                let res = spawn_store(move || {
-                    settle_remote_turn_and_deliver(
-                        &store_settle,
-                        &tid,
-                        SettleRemoteTurn {
-                            status: polled.status.as_str().to_string(),
-                            result_text: polled.result_text,
-                            error_text: polled.error_text,
-                            usage_json: polled.usage,
-                            cursor: polled.cursor,
-                            settled_at_ms: now_ms(),
-                        },
-                        None,
-                        0,
-                    )
-                    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))
-                })
-                .await?;
-                if res.is_some_and(|r| r.settled_now) {
+        .await
+        {
+            Ok(super::serverless_maintenance::CloudPollOutcome::Skipped) => {}
+            Ok(super::serverless_maintenance::CloudPollOutcome::Settled { settled_now }) => {
+                summary.cloud_turns_polled += 1;
+                if settled_now {
                     summary.turns_settled += 1;
                 }
             }
-            Ok(Ok(polled)) => {
-                let next_delay = polled
-                    .next_poll_after_ms
-                    .map(|ms| i64::try_from(ms).unwrap_or(DEFAULT_CLOUD_POLL_DELAY_MS))
-                    .unwrap_or(DEFAULT_CLOUD_POLL_DELAY_MS)
-                    .clamp(DEFAULT_CLOUD_POLL_DELAY_MS, MAX_CLOUD_POLL_BACKOFF_MS);
-                let next_at = now_ms().saturating_add(next_delay);
-                let store_next = Arc::clone(&store);
-                let tid = turn.turn_id.clone();
-                let cur = polled.cursor;
-                let _ = spawn_store(move || {
-                    let _ = store_next.remote_turn_store().schedule_next_poll(
-                        &tid,
-                        Some(next_at),
-                        cur.as_deref(),
-                        now_ms(),
-                    );
-                    Ok(())
-                })
-                .await;
+            Ok(super::serverless_maintenance::CloudPollOutcome::StillRunning { .. }) => {
+                summary.cloud_turns_polled += 1;
             }
-            Ok(Err(_)) | Err(_) => {
-                // Transient poll failure/timeout: push next poll forward with bounded backoff.
-                let next_at = now_ms().saturating_add(DEFAULT_CLOUD_POLL_DELAY_MS * 2);
-                let store_next = Arc::clone(&store);
-                let tid = turn.turn_id.clone();
-                let _ = spawn_store(move || {
-                    let _ = store_next.remote_turn_store().schedule_next_poll(
-                        &tid,
-                        Some(next_at),
-                        None,
-                        now_ms(),
-                    );
-                    Ok(())
-                })
-                .await;
+            Err(err) => {
+                return Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err));
             }
         }
     }
@@ -2821,8 +2877,6 @@ pub(crate) async fn run_tick_pass(
 
         for aid in pending_agents {
             let store_disp = Arc::clone(&store);
-            // Bound each tick backlog dispatch so `/v1/internal/tick` responds promptly;
-            // slow cold-start sandbox ensures continue running in the spawned task.
             let handle = tokio::spawn(async move {
                 dispatch_next_mailbox_message_if_serverless(store_disp, &aid).await
             });
@@ -2843,19 +2897,7 @@ pub(crate) async fn run_tick_pass(
             .map_err(ApiError::from_store)?;
         let mut count = 0usize;
         for binding in ready {
-            let has_active_turn = store_renew
-                .remote_turn_store()
-                .list_active_for_agent(&binding.agent_id)
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
-            let has_inflight_children = store_renew
-                .runtime_heartbeat(&binding.agent_id)
-                .ok()
-                .flatten()
-                .is_some_and(|hb| hb.inflight_children > 0);
-            let is_active =
-                binding.idle_since_ms.is_none() || has_active_turn || has_inflight_children;
-            if !is_active {
+            if !super::serverless_maintenance::binding_is_active(&store_renew, &binding) {
                 continue;
             }
             let due_for_renew = binding
@@ -2864,7 +2906,7 @@ pub(crate) async fn run_tick_pass(
             if !due_for_renew {
                 continue;
             }
-            if renew_binding_lease(&store_renew, &binding) {
+            if super::serverless_maintenance::renew_binding_lease(&store_renew, &binding) {
                 count += 1;
             }
         }
@@ -2897,51 +2939,14 @@ pub(crate) async fn run_tick_pass(
     Ok(summary)
 }
 
-fn renew_binding_lease(store: &Store, binding: &anyagents_core::stateless::SandboxBinding) -> bool {
-    let cfg_dir = anyagents_core::agent_config_dir(store.data_dir(), &binding.agent_id);
-    if crate::sandbox_providers::renew_lease_for_config_dir(&cfg_dir).is_ok_and(|renewed| renewed) {
-        let mut updated = binding.clone();
-        updated.lease_expires_at_ms =
-            Some(now_ms().saturating_add(
-                crate::sandbox_providers::providers::DEFAULT_MAX_LEASE_TTL_MS as i64,
-            ));
-        let _ = store.sandbox_binding_store().upsert(&updated);
-        return true;
-    }
-    if binding.provider != "legacy_http"
-        && binding.provider != "local"
-        && let Ok(reg) = resolve_registry_for_binding(Some(store.data_dir()), binding)
-        && reg.active_kind() != ProviderKind::Local
-        && let Some(existing_handle) = sandbox_handle_from_binding(binding)
-    {
-        let mut req = reg.default_ensure_request(binding.agent_id.as_str());
-        req.existing = Some(existing_handle);
-        if let Ok(refreshed) = crate::sandbox_exec::block_on_provider(reg.active().ensure(&req)) {
-            let mut updated = binding.clone();
-            updated.lease_expires_at_ms = refreshed
-                .expires_at
-                .as_deref()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.timestamp_millis())
-                .or_else(|| {
-                    Some(now_ms().saturating_add(
-                        crate::sandbox_providers::providers::DEFAULT_MAX_LEASE_TTL_MS as i64,
-                    ))
-                });
-            let _ = store.sandbox_binding_store().upsert(&updated);
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::serverless_failure::is_suppressed_fallback_reply;
     use super::super::timer_fire::clear_jwks_cache;
     use super::*;
     use crate::sandbox_providers::providers::{
-        EnsureSandboxRequest, ExecOutput, ProviderHealth, SandboxCapabilities, SandboxHandle,
+        EnsureSandboxRequest, ExecOutput, ProviderHealth, ProviderKind, SandboxCapabilities,
+        SandboxHandle,
     };
     use anyagents_core::{Incoming, NewAgent, NewSchedule, hmac_sha256_hex};
     use anyagents_supervisor::HealthBoard;

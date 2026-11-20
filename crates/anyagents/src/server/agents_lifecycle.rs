@@ -231,6 +231,11 @@ pub(super) async fn archive_agent_route(
             .store
             .list_schedules(Some(&found.id), true)
             .unwrap_or_default();
+        let prev_turns = state
+            .store
+            .remote_turn_store()
+            .list_active_for_agent(&found.id)
+            .unwrap_or_default();
         let agent = state
             .store
             .set_agent_state(&found.id, "archived")
@@ -238,6 +243,12 @@ pub(super) async fn archive_agent_route(
         for sched in &prev_schedules {
             crate::timer::cancel_schedule_timer(state.timer_backend.as_ref(), sched);
         }
+        super::serverless_maintenance::cancel_all_agent_system_timers(
+            &state.store,
+            state.timer_backend.as_ref(),
+            &found.id,
+            &prev_turns,
+        );
         finish_agent_archive_locked(&state, &agent, is_self)?;
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
@@ -260,6 +271,7 @@ pub(super) async fn verdict_route(
     Json(body): Json<VerdictRequest>,
 ) -> Result<Json<anyagents_core::Outcome>, ApiError> {
     let dispatch_store = Arc::clone(&state.store);
+    let dispatch_timer = Arc::clone(&state.timer_backend);
     let (outcome, rework_id) = spawn_store(move || {
         let kind = anyagents_core::OutcomeKind::parse_verdict(&body.verdict).ok_or_else(|| {
             ApiError::new(
@@ -279,6 +291,10 @@ pub(super) async fn verdict_route(
             Principal::Agent { agent_id, .. } => Some(agent_id),
         };
         let prev_schedules = s.list_schedules(Some(&target.id), true).unwrap_or_default();
+        let prev_turns = s
+            .remote_turn_store()
+            .list_active_for_agent(&target.id)
+            .unwrap_or_default();
         let prof = create::bound_profile_name(&cfg);
         let (outcome, changed) = s
             .apply_verdict(actor, &target.id, kind, body.reason, prof)
@@ -289,6 +305,12 @@ pub(super) async fn verdict_route(
                 for sched in &prev_schedules {
                     crate::timer::cancel_schedule_timer(state.timer_backend.as_ref(), sched);
                 }
+                super::serverless_maintenance::cancel_all_agent_system_timers(
+                    &state.store,
+                    state.timer_backend.as_ref(),
+                    &target.id,
+                    &prev_turns,
+                );
                 finish_agent_archive_locked(&state, &agent, false)?;
             } else {
                 clear_explicitly_archived(s.data_dir(), &agent.id);
@@ -304,8 +326,12 @@ pub(super) async fn verdict_route(
         let call = in_flight::carry();
         tokio::spawn(async move {
             let _call = call;
-            if let Err(err) =
-                serverless::dispatch_next_mailbox_message_if_serverless(dispatch_store, &id).await
+            if let Err(err) = serverless::dispatch_next_mailbox_message_with_timer(
+                dispatch_store,
+                &id,
+                Some(dispatch_timer),
+            )
+            .await
             {
                 eprintln!("anyagents-serverless: verdict rework dispatch failed for `{id}`: {err}");
             }
@@ -908,6 +934,11 @@ pub(super) async fn delete_agent_route(
             .store
             .list_schedules(Some(&found.id), true)
             .unwrap_or_default();
+        let prev_turns = state
+            .store
+            .remote_turn_store()
+            .list_active_for_agent(&found.id)
+            .unwrap_or_default();
         state
             .store
             .set_agent_state(&found.id, "archived")
@@ -915,6 +946,12 @@ pub(super) async fn delete_agent_route(
         for sched in &prev_schedules {
             crate::timer::cancel_schedule_timer(state.timer_backend.as_ref(), sched);
         }
+        super::serverless_maintenance::cancel_all_agent_system_timers(
+            &state.store,
+            state.timer_backend.as_ref(),
+            &found.id,
+            &prev_turns,
+        );
         let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
         // Health is a projection: the supervisor may publish stopped before
         // its worker exits. Allow that normal shutdown to release actual
@@ -1022,6 +1059,7 @@ pub(super) async fn wake_agent_route(
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_guard = CancelWakeOnDrop(Arc::clone(&cancelled));
     let dispatch_store = Arc::clone(&state.store);
+    let dispatch_timer = Arc::clone(&state.timer_backend);
     let out: Result<(Json<AgentView>, anyagents_core::AgentId), ApiError> =
         spawn_store(move || {
             use std::sync::atomic::Ordering;
@@ -1198,8 +1236,12 @@ pub(super) async fn wake_agent_route(
     drop(cancel_guard);
     let (view, agent_id) = out?;
     if serverless::is_serverless_mode()
-        && let Err(err) =
-            serverless::dispatch_next_mailbox_message_if_serverless(dispatch_store, &agent_id).await
+        && let Err(err) = serverless::dispatch_next_mailbox_message_with_timer(
+            dispatch_store,
+            &agent_id,
+            Some(dispatch_timer),
+        )
+        .await
     {
         eprintln!(
             "anyagents-serverless: wake dispatch failed for `{}`: {err}",

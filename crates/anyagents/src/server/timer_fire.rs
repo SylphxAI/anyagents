@@ -429,6 +429,17 @@ async fn execute_fire(
     schedule_id: String,
     intended_at_ms: Option<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if super::serverless_maintenance::is_system_timer_id(&schedule_id) {
+        let result = super::serverless_maintenance::fire_system_timer(
+            Arc::clone(&state.store),
+            Arc::clone(&state.timer_backend),
+            &schedule_id,
+        )
+        .await
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        return Ok(Json(result));
+    }
+
     let store = Arc::clone(&state.store);
     let health = state.health.clone();
     let timer_backend = Arc::clone(&state.timer_backend);
@@ -450,9 +461,10 @@ async fn execute_fire(
         && let Some(ref aid_str) = result.agent_id
         && let Ok(aid) = AgentId::parse(aid_str)
     {
-        let _ = super::serverless::dispatch_next_mailbox_message_if_serverless(
+        let _ = super::serverless::dispatch_next_mailbox_message_with_timer(
             Arc::clone(&state.store),
             &aid,
+            Some(Arc::clone(&state.timer_backend)),
         )
         .await;
     }

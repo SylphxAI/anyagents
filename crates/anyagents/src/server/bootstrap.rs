@@ -477,6 +477,18 @@ async fn serve(
         profiles: Default::default(),
         timer_backend,
     };
+    if serverless || crate::server::timer_fire::configured_timer_scheduler_url().is_some() {
+        let rec_store = Arc::clone(&store);
+        let rec_timer = Arc::clone(&state.timer_backend);
+        tokio::spawn(async move {
+            if let Err(err) =
+                super::serverless_maintenance::startup_reconcile_serverless(rec_store, rec_timer)
+                    .await
+            {
+                eprintln!("anyagents-serverless: startup reconciliation warning: {err}");
+            }
+        });
+    }
     let _ = boundary;
     let listener = api_listener;
     let poller = if serverless {
