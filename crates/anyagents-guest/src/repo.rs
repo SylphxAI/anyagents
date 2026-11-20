@@ -1,5 +1,9 @@
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+const DEFAULT_GIT_CLONE_TIMEOUT_SECS: u64 = 120;
 
 use super::{
     GuestRepoSpec, REPO_SPEC_FILE, load_guest_config, resolve_default_state_dir, spawn_command,
@@ -217,6 +221,7 @@ fn resolve_gh_binary() -> Option<PathBuf> {
 /// Non-interactively run `gh auth setup-git` once for `state_dir` when a GitHub
 /// token is present and `gh` is installed, ignoring errors cleanly.
 pub(crate) fn ensure_gh_auth_setup_git(state_dir: &Path, gh_token: Option<&str>) {
+    sanitize_stale_credential_helpers(state_dir);
     let Some(tok) = gh_token.map(str::trim).filter(|t| !t.is_empty()) else {
         return;
     };
@@ -242,7 +247,93 @@ pub(crate) fn ensure_gh_auth_setup_git(state_dir: &Path, gh_token: Option<&str>)
     }
 }
 
+/// Strip stale `helper = ...` lines in `<state_dir>/.gitconfig` referencing
+/// nonexistent absolute binary paths (e.g. host paths from another machine).
+pub(crate) fn sanitize_stale_credential_helpers(state_dir: &Path) {
+    let path = state_dir.join(".gitconfig");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let mut changed = false;
+    let kept: Vec<&str> = raw
+        .lines()
+        .filter(|line| {
+            let t = line.trim();
+            if let Some(val) = t
+                .strip_prefix("helper")
+                .and_then(|r| r.trim_start().strip_prefix('='))
+            {
+                let cmd = val.trim().trim_start_matches('!').trim().trim_matches('"');
+                let bin = cmd.split_whitespace().next().unwrap_or("");
+                if bin.starts_with('/') && !Path::new(bin).exists() {
+                    changed = true;
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+    if changed {
+        let mut out = kept.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let _ = anyagents_harness::atomic_write_file(&path, out.as_bytes(), 0o644);
+    }
+}
+
+/// Ensure `[user] name` and `email` are persisted in `<state_dir>/.gitconfig`
+/// from `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` (or `ANYAGENTS_SANDBOX_ENV_*`).
+pub(crate) fn ensure_git_user_identity(state_dir: &Path, env: &[(String, String)]) {
+    let lookup = |keys: &[&str]| -> Option<String> {
+        for k in keys {
+            if let Some((_, v)) = env.iter().rev().find(|(ek, _)| ek == k)
+                && !v.trim().is_empty()
+            {
+                return Some(v.trim().to_string());
+            }
+            if let Ok(v) = std::env::var(k)
+                && !v.trim().is_empty()
+            {
+                return Some(v.trim().to_string());
+            }
+        }
+        None
+    };
+    let name = lookup(&[
+        "GIT_AUTHOR_NAME",
+        "GIT_COMMITTER_NAME",
+        "ANYAGENTS_SANDBOX_ENV_GIT_AUTHOR_NAME",
+    ]);
+    let email = lookup(&[
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_EMAIL",
+        "ANYAGENTS_SANDBOX_ENV_GIT_AUTHOR_EMAIL",
+    ]);
+    if name.is_none() && email.is_none() {
+        return;
+    }
+    let git_bin = anyagents_toolchain::tool("git", "anyagents-guest.repo")
+        .map(|r| r.path)
+        .unwrap_or_else(|_| PathBuf::from("/usr/bin/git"));
+    for (key, val) in [("user.name", name), ("user.email", email)] {
+        if let Some(v) = val
+            && let Ok(mut cmd) = spawn_command(&git_bin, &[])
+        {
+            let _ = cmd
+                .args(["config", "--global", key, &v])
+                .env("HOME", state_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
 pub(crate) fn ensure_gh_auth_setup_git_for_env(state_dir: &Path, env: &[(String, String)]) {
+    sanitize_stale_credential_helpers(state_dir);
+    ensure_git_user_identity(state_dir, env);
     let tok = find_token_in_pairs(env).or_else(|| {
         std::env::var("GH_TOKEN")
             .ok()
@@ -251,6 +342,63 @@ pub(crate) fn ensure_gh_auth_setup_git_for_env(state_dir: &Path, env: &[(String,
             .filter(|s| !s.is_empty())
     });
     ensure_gh_auth_setup_git(state_dir, tok.as_deref());
+}
+
+fn clone_timeout() -> Duration {
+    let secs = std::env::var("ANYAGENTS_GIT_CLONE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_GIT_CLONE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+fn run_git_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_t = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(ref mut p) = out_pipe {
+            let _ = p.read_to_end(&mut b);
+        }
+        b
+    });
+    let err_t = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(ref mut p) = err_pipe {
+            let _ = p.read_to_end(&mut b);
+        }
+        b
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(st) => break st,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = String::from_utf8_lossy(&err_t.join().unwrap_or_default())
+                    .trim()
+                    .to_string();
+                let _ = out_t.join();
+                return Err(if stderr.is_empty() {
+                    format!("git clone timed out after {}s", timeout.as_secs())
+                } else {
+                    format!("git clone timed out after {}s: {stderr}", timeout.as_secs())
+                });
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: out_t.join().unwrap_or_default(),
+        stderr: err_t.join().unwrap_or_default(),
+    })
 }
 
 fn is_missing_remote_branch_error(stderr: &str) -> bool {
@@ -307,37 +455,40 @@ pub(crate) fn ensure_repo_checked_out(
         .filter(|p| p.is_dir())
         .unwrap_or_else(|| Path::new("/"));
 
+    let timeout = clone_timeout();
+    let shallow = std::env::var("ANYAGENTS_GIT_CLONE_FULL").ok().as_deref() != Some("1");
     let mut cmd = configure_git_command(&git_bin, &repo, gh_token.as_deref())?;
     cmd.current_dir(clone_cwd).arg("clone");
-    if let Some(branch) = wanted_branch {
+    if shallow {
+        cmd.args(["--depth", "1", "--single-branch"]);
+    }
+    if let Some(branch) = wanted_branch.or(base_branch) {
         cmd.arg("--branch").arg(branch);
     }
     cmd.arg(&repo).arg(work_dir);
-    let out = cmd
-        .output()
-        .map_err(|e| format_clone_error(&repo, &e.to_string(), gh_token.as_deref()))?;
+    let out = run_git_with_timeout(&mut cmd, timeout)
+        .map_err(|e| format_clone_error(&repo, &e, gh_token.as_deref()))?;
     let mut create_local_branch: Option<&str> = None;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         if let Some(branch) = wanted_branch
             && is_missing_remote_branch_error(&stderr)
         {
-            // Agent branch does not exist on the remote yet (common for fresh
-            // agent worktree branches). Clone the base/default branch and create
-            // the local branch cleanly.
             if work_dir.exists() && !work_dir.join(".git").exists() {
                 let _ = std::fs::remove_dir_all(work_dir);
                 let _ = std::fs::create_dir_all(work_dir);
             }
             let mut fallback = configure_git_command(&git_bin, &repo, gh_token.as_deref())?;
             fallback.current_dir(clone_cwd).arg("clone");
+            if shallow {
+                fallback.args(["--depth", "1", "--single-branch"]);
+            }
             if let Some(base) = base_branch {
                 fallback.arg("--branch").arg(base);
             }
             fallback.arg(&repo).arg(work_dir);
-            let fb_out = fallback
-                .output()
-                .map_err(|e| format_clone_error(&repo, &e.to_string(), gh_token.as_deref()))?;
+            let fb_out = run_git_with_timeout(&mut fallback, timeout)
+                .map_err(|e| format_clone_error(&repo, &e, gh_token.as_deref()))?;
             if !fb_out.status.success() {
                 return Err(format_clone_error(
                     &repo,
@@ -581,5 +732,33 @@ mod tests {
             std::fs::read_to_string(work.join("README.md")).unwrap(),
             "hello\n"
         );
+    }
+
+    #[test]
+    fn sanitizes_stale_helpers_sets_git_identity_and_enforces_clone_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        std::fs::write(
+            state.join(".gitconfig"),
+            "[credential \"https://github.com\"]\n\thelper = !/nonexistent/bin/gh auth git-credential\n\thelper = !/bin/sh -c true\n",
+        )
+        .unwrap();
+        let env = vec![
+            ("GIT_AUTHOR_NAME".into(), "OSS Bot".into()),
+            ("GIT_AUTHOR_EMAIL".into(), "bot@example.invalid".into()),
+        ];
+        sanitize_stale_credential_helpers(state);
+        ensure_git_user_identity(state, &env);
+        let cfg = std::fs::read_to_string(state.join(".gitconfig")).unwrap();
+        assert!(!cfg.contains("/nonexistent/bin/gh"), "{cfg}");
+        assert!(
+            cfg.contains("OSS Bot") && cfg.contains("bot@example.invalid"),
+            "{cfg}"
+        );
+
+        let mut slow = Command::new("/bin/sh");
+        slow.args(["-c", "sleep 5"]);
+        let err = run_git_with_timeout(&mut slow, Duration::from_millis(120)).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
     }
 }

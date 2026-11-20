@@ -56,6 +56,15 @@ pub fn write_claude(path: &Path, command: &Path, args: &[String]) -> Result<(), 
             "env": {},
         }),
     );
+    let local = anyagents_guest::mcp_bootstrap::discover_local_mcp_servers(
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+    );
+    anyagents_guest::mcp_bootstrap::insert_stdio_servers_json(servers, &local);
     let bytes = serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
     atomic_write_shared(path, &bytes)?;
     Ok(())
@@ -240,6 +249,15 @@ pub fn write_codex_with_model(
         existing = upsert_top_key(&existing, "web_search", "\"disabled\"");
     }
     let mut updated = upsert_table(&existing, &body);
+    let local = anyagents_guest::mcp_bootstrap::discover_local_mcp_servers(
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+    );
+    updated = anyagents_guest::mcp_bootstrap::upsert_codex_toml_servers(&updated, &local);
     if use_sylphx {
         let (base_url, api_key) = resolve_sylphx_codex_provider(config_dir);
         let provider_table = match api_key {

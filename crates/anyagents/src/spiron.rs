@@ -56,15 +56,25 @@ pub fn write_spiron_config(
     mcp_command: &Path,
     mcp_args: &[String],
 ) -> Result<(), Error> {
-    let value = serde_json::json!({
-        "mcpServers": {
-            "anyagents": {
-                "command": mcp_command.display().to_string(),
-                "args": mcp_args,
-                "env": {},
-            }
-        }
-    });
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        "anyagents".to_string(),
+        serde_json::json!({
+            "command": mcp_command.display().to_string(),
+            "args": mcp_args,
+            "env": {},
+        }),
+    );
+    let local = anyagents_guest::mcp_bootstrap::discover_local_mcp_servers(
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+    );
+    anyagents_guest::mcp_bootstrap::insert_stdio_servers_json(&mut servers, &local);
+    let value = serde_json::json!({ "mcpServers": servers });
     let mcp_path = config_dir.join("spiron-mcp.json");
     let bytes = serde_json::to_vec_pretty(&value).map_err(|err| Error::Message(err.to_string()))?;
     anyagents_harness::atomic_write_nonempty_file(&mcp_path, &bytes, 0o664)?;

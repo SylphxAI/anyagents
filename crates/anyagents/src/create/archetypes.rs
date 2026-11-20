@@ -944,6 +944,11 @@ pub(crate) fn effective_agent_instructions(
     }
     // Execution discipline is a runtime baseline, not a role-name policy.
     // Role templates stay caller-owned and are reloaded from their source.
+    let role_body = role_body.filter(|rb| {
+        !custom
+            .as_deref()
+            .is_some_and(|c| super::workspace::instructions_overlap_role_headings(c, rb))
+    });
     let mut sections = vec![BUILTIN_GENERAL_ROLE_BODY.to_string()];
     for section in [role_body, custom.as_deref()].into_iter().flatten() {
         let section = strip_role_prefix_match(section, BUILTIN_GENERAL_ROLE_BODY)

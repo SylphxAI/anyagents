@@ -9,9 +9,13 @@
 //! - `health`: readiness & live activity probe.
 
 pub mod activity;
+mod auth_bootstrap;
+mod code_mcp;
 mod gemini;
 mod guest;
+pub mod mcp_bootstrap;
 mod mcp_proxy;
+mod media;
 pub mod turn;
 mod workspace_delta;
 
@@ -41,6 +45,9 @@ enum Command {
     /// Bridge stdio MCP JSON-RPC requests to the coordinator HTTPS `/mcp` endpoint.
     #[command(name = "mcp-proxy")]
     McpProxy(mcp_proxy::McpProxyArgs),
+    /// Serve sandbox `agent-code-mode` as a stdio MCP server (`code_run`, `code_types`).
+    #[command(name = "code-mcp")]
+    CodeMcp(code_mcp::CodeMcpArgs),
     /// Print readiness & live activity JSON for container/sandbox healthchecks.
     Health(guest::HealthArgs),
 }
@@ -53,6 +60,7 @@ pub fn run_cli_exit_code() -> ExitCode {
         Command::Serve(args) => guest::run_serve(args),
         Command::Turn(args) => turn::run_turn(args),
         Command::McpProxy(args) => mcp_proxy::run_mcp_proxy(args),
+        Command::CodeMcp(args) => code_mcp::run_code_mcp(args),
         Command::Health(args) => {
             let state_dir = guest::resolve_default_state_dir(args.state_dir);
             let workdir = guest::resolve_default_workdir(args.workdir);

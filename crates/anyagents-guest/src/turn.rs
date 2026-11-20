@@ -53,6 +53,7 @@ const SYNCABLE_AUTH_FILES: &[&str] = &[
     ".claude/.credentials.json",
     ".credentials.json",
     ".codex/auth.json",
+    "auth.json",
 ];
 const MAX_SYNCABLE_AUTH_FILE_BYTES: usize = 64 * 1024;
 
@@ -439,6 +440,7 @@ fn execute_turn_foreground(
     );
 
     let mut msg = resolve_outbound_message(args, prompt);
+    msg.text = crate::media::hydrate_turn_media_refs(&msg.text, state_dir, &env, file_cfg.as_ref());
     if msg.context.workspace.is_none() {
         msg.context.workspace = crate::workspace_delta::capture_and_diff(
             &work_dir,
@@ -563,10 +565,12 @@ fn execute_turn_foreground(
             );
             let done_by_turns =
                 adapter.turns_served() > base_turns && health.turn_state == TurnState::Idle;
-            let done_by_failure = adapter.failure_for_id(&delivery_id).is_some();
+            let failure = adapter
+                .failure_for_id(&delivery_id)
+                .or_else(|| health.sign_in_fault.clone());
 
-            if done_by_proof || done_by_turns || done_by_failure || !health.process_alive {
-                err_override = adapter.failure_for_id(&delivery_id).or_else(|| {
+            if done_by_proof || done_by_turns || failure.is_some() || !health.process_alive {
+                err_override = failure.or_else(|| {
                     (!health.process_alive && !done_by_proof && !done_by_turns).then(|| {
                         adapter
                             .exit_diagnostic()

@@ -1367,13 +1367,20 @@ pub(crate) fn ensure_sandbox_with_registry(
     extra_env: &BTreeMap<String, String>,
 ) -> Result<EnsuredSandbox, String> {
     let template_req = registry.default_ensure_request(agent_id.as_str());
+    let (shape, vol_gib) = sandbox_exec_env::resolve_sandbox_shape_and_volume_for_agent(
+        store,
+        agent_id,
+        read_synced_repo_spec(config_dir).is_some(),
+        template_req.shape,
+        template_req.volume.and_then(|v| v.size_gib),
+    );
     ensure_sandbox_with_provider(
         store,
         registry.active(),
         registry.default_image_spec(),
         registry.default_lease_policy(),
-        template_req.shape,
-        template_req.volume.and_then(|v| v.size_gib),
+        shape,
+        vol_gib,
         agent_id,
         agent_name,
         config_dir,
@@ -1939,36 +1946,16 @@ fn collect_agent_bundle_entries(
     ));
 
     let guest_bin = guest_binary_path();
-    let proxy_args = vec![
-        "mcp-proxy".to_string(),
-        "--url".to_string(),
-        mcp_url.clone(),
-        "--token-file".to_string(),
-        token_path_in_vm.clone(),
-    ];
-    let mut stdio_mcp_bytes = serde_json::to_vec_pretty(&json!({
-        "mcpServers": {
-            "anyagents": {
-                "command": guest_bin,
-                "args": proxy_args,
-            }
-        }
-    }))
-    .map_err(|e| e.to_string())?;
-    stdio_mcp_bytes.push(b'\n');
-    for target in [".mcp.json", ".claude.json", "mcp.json", "spiron-mcp.json"] {
-        uploads.push((target.to_string(), stdio_mcp_bytes.clone()));
-    }
-    dirs_to_create.insert(format!("{state_root}/.gemini/config"));
-    uploads.push((
-        ".gemini/config/mcp_config.json".to_string(),
-        stdio_mcp_bytes.clone(),
-    ));
-    dirs_to_create.insert(format!("{state_root}/.omp/agent"));
-    uploads.push((".omp/agent/mcp.json".to_string(), stdio_mcp_bytes));
-
-    let toml_cfg = build_sandbox_toml_config(&guest_bin, &mcp_url, &token_path_in_vm);
-    uploads.push(("config.toml".to_string(), toml_cfg.as_bytes().to_vec()));
+    sandbox_exec_env::append_sandbox_mcp_bundle(
+        state_root,
+        config_dir,
+        harness,
+        &guest_bin,
+        &mcp_url,
+        &token_path_in_vm,
+        &mut uploads,
+        &mut dirs_to_create,
+    )?;
 
     let opencode_mcp_entry = json!({
         "type": "local",
@@ -2054,9 +2041,14 @@ fn collect_agent_bundle_entries(
     env_map.insert("XDG_CONFIG_HOME".into(), format!("{state_root}/.config"));
     env_map.insert("XDG_DATA_HOME".into(), format!("{state_root}/.local/share"));
     env_map.insert("XDG_CACHE_HOME".into(), format!("{state_root}/.cache"));
-    let sandbox_data_dir = sandbox_exec_env::sandbox_data_dir_from_state_root(state_root);
-    env_map.insert("ANYAGENTS_AGENT_DATA_DIR".into(), sandbox_data_dir.clone());
-    env_map.insert("ANYAGENTS_SANDBOX_DATA_DIR".into(), sandbox_data_dir);
+    let sandbox_data_dir = sandbox_exec_env::enrich_sandbox_guest_env(
+        &mut env_map,
+        state_root,
+        agent_id_str,
+        &mcp_url,
+    );
+    dirs_to_create.insert(format!("{sandbox_data_dir}/media"));
+    dirs_to_create.insert(format!("{sandbox_data_dir}/tmp/screenshots"));
     env_map.insert("ANYAGENTS_GUEST_STATE_DIR".into(), state_root.to_string());
     env_map.insert("ANYAGENTS_GUEST_WORKDIR".into(), workdir.to_string());
     env_map.insert("ANYAGENTS_MCP_URL".into(), mcp_url.clone());
@@ -2414,15 +2406,6 @@ fn run_provider_sandbox<R: BufRead + Send + 'static>(
         }
     }
     Ok(())
-}
-
-fn build_sandbox_toml_config(guest_bin: &str, mcp_url: &str, token_path: &str) -> String {
-    format!(
-        "always_approve = true\n\n[mcp_servers.anyagents]\ncommand = {cmd}\nargs = [\"mcp-proxy\", \"--url\", {url}, \"--token-file\", {tok}]\n",
-        cmd = serde_json::to_string(guest_bin).unwrap_or_else(|_| "\"anyagents-guest\"".into()),
-        url = serde_json::to_string(mcp_url).unwrap_or_default(),
-        tok = serde_json::to_string(token_path).unwrap_or_default(),
-    )
 }
 
 fn read_synced_repo_spec(config_dir: &Path) -> Option<SyncedRepoSpec> {

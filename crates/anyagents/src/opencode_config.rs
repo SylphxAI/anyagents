@@ -107,13 +107,25 @@ pub fn write(
             }
         }
     }
-    root["mcp"] = serde_json::json!({
-        "anyagents": {
+    let mut mcp_map = serde_json::Map::new();
+    mcp_map.insert(
+        "anyagents".to_string(),
+        serde_json::json!({
             "type": "local",
             "command": command_args(command, args),
             "enabled": true,
-        }
-    });
+        }),
+    );
+    let local = anyagents_guest::mcp_bootstrap::discover_local_mcp_servers(
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+    );
+    anyagents_guest::mcp_bootstrap::insert_opencode_servers_json(&mut mcp_map, &local);
+    root["mcp"] = serde_json::Value::Object(mcp_map);
     let bytes = serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
     write_atomic(&dir.join("opencode.json"), &bytes)?;
     let xdg_opencode_dir = dir.join("opencode");

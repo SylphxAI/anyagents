@@ -23,7 +23,7 @@ use anyagents_harness_codex::CodexHarness;
 use anyagents_harness_muse::MuseHarness;
 use anyagents_harness_omp::OmpHarness;
 use anyagents_harness_opencode::OpenCodeHarness;
-use anyagents_harness_spiron::{SpironHarness, SpironLaunch};
+use anyagents_harness_spiron::SpironHarness;
 use anyagents_harness_stream::StreamSpec;
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -287,6 +287,11 @@ impl GuestHarness for CodexAdapter {
     fn usage_for_id(&self, id: &str) -> Option<TurnUsage> {
         self.0.usage_for(id)
     }
+    fn failure_for_id(&self, id: &str) -> Option<String> {
+        self.0
+            .failure_for(id)
+            .or_else(|| self.0.health().sign_in_fault)
+    }
 }
 
 struct OpenCodeAdapter(OpenCodeHarness);
@@ -519,6 +524,9 @@ impl GuestHarness for SpironAdapter {
     }
     fn usage_for_id(&self, id: &str) -> Option<TurnUsage> {
         self.0.usage_for(id)
+    }
+    fn failure_for_id(&self, id: &str) -> Option<String> {
+        self.0.failure_for(id)
     }
 }
 
@@ -847,7 +855,13 @@ pub(crate) fn run_serve_io<R: BufRead + Send + 'static, W: Write>(
 
         // Offer queued inputs (supports immediate mid-turn steer when underlying harness admits).
         let mut remaining = VecDeque::new();
-        while let Some((msg, uuid, raw_message)) = queued.pop_front() {
+        while let Some((mut msg, uuid, raw_message)) = queued.pop_front() {
+            msg.text = crate::media::hydrate_turn_media_refs(
+                &msg.text,
+                &state_dir,
+                &env,
+                file_cfg.as_ref(),
+            );
             let prev_usage = adapter.served_usage();
             let prev_turns = adapter.turns_served();
             match adapter.deliver(&msg) {
@@ -993,9 +1007,11 @@ pub(crate) fn run_serve_io<R: BufRead + Send + 'static, W: Write>(
             );
             let done_by_turns =
                 adapter.turns_served() > turn.base_turns && health.turn_state == TurnState::Idle;
-            let done_by_failure = adapter.failure_for_id(&turn.id).is_some();
-            if done_by_proof || done_by_turns || done_by_failure || !health.process_alive {
-                let err_override = adapter.failure_for_id(&turn.id).or_else(|| {
+            let failure = adapter
+                .failure_for_id(&turn.id)
+                .or_else(|| health.sign_in_fault.clone());
+            if done_by_proof || done_by_turns || failure.is_some() || !health.process_alive {
+                let err_override = failure.or_else(|| {
                     (!health.process_alive && !done_by_proof && !done_by_turns).then(|| {
                         adapter
                             .exit_diagnostic()
@@ -1157,6 +1173,8 @@ pub(crate) fn launch_guest_harness(
     env: &[(String, String)],
     file_cfg: Option<&GuestConfig>,
 ) -> Result<Box<dyn GuestHarness>, HarnessError> {
+    crate::auth_bootstrap::prepare_harness_auth(harness_name, state_dir, model);
+    crate::mcp_bootstrap::sync_local_mcp_configs(harness_name, state_dir, work_dir, env, file_cfg);
     let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     match harness_name {
         "claude-code" => {
@@ -1192,7 +1210,14 @@ pub(crate) fn launch_guest_harness(
             Ok(Box::new(ClaudeAdapter(h)))
         }
         "codex" => {
+            crate::auth_bootstrap::check_codex_auth_preflight(program, state_dir, env)
+                .map_err(HarnessError::Failed)?;
             let h = CodexHarness::start_in(program, session, &pairs, Some(work_dir))?;
+            if !h.health().process_alive {
+                return Err(HarnessError::Failed(h.exit_diagnostic().unwrap_or_else(
+                    || "codex app-server exited during startup".into(),
+                )));
+            }
             Ok(Box::new(CodexAdapter(h)))
         }
         "opencode" => {
@@ -1237,56 +1262,10 @@ pub(crate) fn launch_guest_harness(
             Ok(Box::new(OmpAdapter(h)))
         }
         "spiron" => {
-            let mcp_config = state_dir.join("spiron-mcp.json");
-            let skills = state_dir.join(".agents/skills");
-            let mut args = vec![
-                "--headless".to_string(),
-                "--json".to_string(),
-                "--workdir".to_string(),
-                work_dir.display().to_string(),
-                "--state-dir".to_string(),
-                state_dir.display().to_string(),
-            ];
-            if mcp_config.is_file() {
-                args.extend(["--mcp-config".to_string(), mcp_config.display().to_string()]);
-            }
-            if skills.is_dir() {
-                args.extend(["--skills-dir".to_string(), skills.display().to_string()]);
-            }
-            let sys_prompt = state_dir.join("SYSTEM_PROMPT.md");
-            if sys_prompt.is_file() {
-                args.extend([
-                    "--instructions-file".to_string(),
-                    sys_prompt.display().to_string(),
-                ]);
-            }
-            if let Some(id) = file_cfg.and_then(|c| c.agent_id.as_deref()) {
-                args.extend(["--agent-id".to_string(), id.to_string()]);
-            }
-            if let Some(name) = file_cfg.and_then(|c| c.agent_name.as_deref()) {
-                args.extend(["--agent-name".to_string(), name.to_string()]);
-            }
-            if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
-                args.extend(["--model".to_string(), m.to_string()]);
-            }
-            args.extend(extra_args.iter().cloned());
-            let h = SpironHarness::launch_listening(
-                SpironLaunch {
-                    program: program.to_path_buf(),
-                    args,
-                    environment: env.to_vec(),
-                    work_dir: work_dir.to_path_buf(),
-                    session: session.map(str::to_string),
-                    state_dir: state_dir.to_path_buf(),
-                },
-                &state_dir.join("spiron.sock"),
-                &state_dir.join("spiron.log"),
-                Duration::from_secs(60),
-                |_pid| Ok(()),
-            )
-            .map_err(|anyagents_harness_spiron::ListenError::Failed(msg)| {
-                HarnessError::Failed(msg)
-            })?;
+            let launch = crate::auth_bootstrap::build_spiron_launch(
+                program, model, session, extra_args, state_dir, work_dir, env, file_cfg,
+            );
+            let h = SpironHarness::launch(launch)?;
             Ok(Box::new(SpironAdapter(h)))
         }
         "gemini" => {
@@ -1387,6 +1366,7 @@ pub(crate) fn build_guest_env(
         env.retain(|(ek, _)| ek != k);
         env.push((k.to_string(), v.to_string()));
     }
+    crate::media::enrich_guest_env(state_dir, file_cfg, &mut env);
     repo::ensure_gh_auth_setup_git_for_env(state_dir, &env);
     env
 }
