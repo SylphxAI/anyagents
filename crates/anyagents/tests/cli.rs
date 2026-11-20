@@ -77,12 +77,12 @@ fn offline_fixture_rejects_tampered_and_undeclared_sources() {
     // An explicit empty declaration keeps the production fail-closed default.
     std::fs::write(dir.path().join("harnesses.toml"), "").unwrap();
     let out = bin_in(dir.path())
-        .args(["agents", "create", "undeclared", "--harness", "codex"])
+        .args(["agents", "create", "undeclared", "--harness", "muse"])
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("unverifiable source for codex"));
-    assert!(!dir.path().join("harnesses/codex/current.json").exists());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unverifiable source for muse"));
+    assert!(!dir.path().join("harnesses/muse/current.json").exists());
 }
 
 #[test]

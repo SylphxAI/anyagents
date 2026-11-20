@@ -4756,17 +4756,10 @@ fn agent_view_preloaded(
             };
             let effective_quota = live.quota_reset_at_ms.or(session_quota);
             let effective_err = live.last_error.clone().or(session_error);
-            let lock_busy = !live.process_alive
-                && matches!(
-                    store.try_lock_agent(&agent.id),
-                    Err(anyagents_core::Error::AgentBusy)
-                );
-            let alive = live.process_alive || lock_busy;
-            let working = (live.process_alive
+            let working = live.process_alive
                 && effective_quota.is_none()
                 && effective_err.is_none()
-                && (live.turn_state == anyagents_harness::TurnState::InTurn || has_open_turn))
-                || lock_busy;
+                && (live.turn_state == anyagents_harness::TurnState::InTurn || has_open_turn);
             let switch_pending = live.process_alive
                 && (live
                     .live_harness
@@ -4777,7 +4770,7 @@ fn agent_view_preloaded(
                         .process_started_at_ms
                         .is_some_and(|s| rotated_ms > s || instructions_rotated_ms > s));
             (
-                if alive { "alive" } else { "down" },
+                if live.process_alive { "alive" } else { "down" },
                 if working { "working" } else { "idle" },
                 live.delivery
                     .clone()

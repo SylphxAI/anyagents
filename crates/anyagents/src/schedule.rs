@@ -215,12 +215,12 @@ pub fn parse_watch_spec(raw: &str) -> Result<WatchTarget, String> {
         let clean = topic.trim();
         if clean.is_empty()
             || clean.len() > 128
-            || !clean
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+            || !clean.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/' | b'*')
+            })
         {
             return Err(format!(
-                "invalid webhook topic `{clean}`; expected 1-128 ASCII letters, digits, or `-`, `_`, `.`, `:`"
+                "invalid webhook topic `{clean}`; expected 1-128 ASCII letters, digits, or `-`, `_`, `.`, `:`, `/`, `*`"
             ));
         }
         return Ok(WatchTarget::Webhook {

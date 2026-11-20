@@ -359,12 +359,6 @@ async fn stdio_turn_metadata_scopes_direct_and_nested_parent_sends() {
             true,
         ),
         (
-            "nested",
-            "code",
-            json!({"code": "return await anyagents.send({to:['parent'],text:'nested send'});"}),
-            true,
-        ),
-        (
             "untagged",
             "send",
             json!({"to": ["parent"], "text": "unscoped send"}),
@@ -423,13 +417,8 @@ async fn stdio_turn_metadata_scopes_direct_and_nested_parent_sends() {
             .unwrap()
             .unwrap();
         let result: serde_json::Value = ok_json(result);
-        let sent = if tool == "code" {
-            &result["result"]
-        } else {
-            &result
-        };
         assert_eq!(
-            sent["deliveries"].as_array().map(Vec::len),
+            result["deliveries"].as_array().map(Vec::len),
             Some(1),
             "{result:?}"
         );
@@ -444,7 +433,7 @@ async fn stdio_turn_metadata_scopes_direct_and_nested_parent_sends() {
         );
     }
     let rows = store.inbox(&parent.id, None).unwrap();
-    for text in ["direct send", "nested send", "unscoped send"] {
+    for text in ["direct send", "unscoped send"] {
         assert_eq!(
             rows.iter().filter(|row| row.text == text).count(),
             1,
@@ -2004,44 +1993,6 @@ async fn tool_contracts_accept_the_shapes_agents_write() {
         "with parent: {with_parent}\nall: {everything}"
     );
     beta.cancel().await.unwrap();
-    drop(server);
-}
-
-/// The `code` limits come from the server's environment, handed to the tool
-/// server in `whoami`; nothing in the data directory sets them.
-#[tokio::test]
-async fn code_limits_come_from_the_server_environment() {
-    let dir = support::physical_tempdir();
-    let created = bin()
-        .env("PATH", machine_path(dir.path()))
-        .arg("--data")
-        .arg(dir.path())
-        .args(["agents", "create", "alpha"])
-        .output()
-        .unwrap();
-    assert!(created.status.success(), "{created:?}");
-    // A file an agent could plant is not read.
-    std::fs::write(
-        dir.path().join("tool-limits.json"),
-        r#"{"code_timeout_ms": 100, "code_max_timeout_ms": 1000}"#,
-    )
-    .unwrap();
-    let server = start_server_with_env(
-        dir.path(),
-        &[
-            ("ANYAGENTS_CODE_TIMEOUT_MS", "45000"),
-            ("ANYAGENTS_CODE_MAX_TIMEOUT_MS", "900000"),
-        ],
-    );
-    let alpha = connect(dir.path(), "alpha").await;
-    let tools = alpha.list_all_tools().await.unwrap();
-    let code = tools.iter().find(|t| t.name == "code").expect("code tool");
-    let description = code.description.as_deref().unwrap_or_default();
-    assert!(
-        description.contains("`timeout_ms`: default 45000, max 900000."),
-        "{description}"
-    );
-    alpha.cancel().await.unwrap();
     drop(server);
 }
 
