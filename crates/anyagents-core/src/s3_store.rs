@@ -878,8 +878,7 @@ fn parse_list_objects_v2_xml(xml: &str) -> ListObjectsV2Page {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::fmt::Write as _;
-    use std::io::{BufRead, BufReader, Read as _, Write as _};
+    use std::io::{BufRead, BufReader, Write as _};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 

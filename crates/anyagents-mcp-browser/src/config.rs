@@ -42,6 +42,12 @@ pub struct BrowserServerConfig {
     #[arg(long, env = "ANYAGENTS_AGENT_TOKEN")]
     pub agent_token: Option<String>,
 
+    /// Optional directory where `browser_screenshot` writes PNG files when no
+    /// explicit absolute `path` is provided (defaults to `$ANYAGENTS_AGENT_DATA_DIR/tmp/screenshots`
+    /// or `$ANYAGENTS_SANDBOX_DATA_DIR/tmp/screenshots`).
+    #[arg(long, env = "ANYAGENTS_BROWSER_SCREENSHOT_DIR")]
+    pub screenshot_dir: Option<PathBuf>,
+
     /// Optional proxy URL (e.g. `http://127.0.0.1:8080` or `socks5://127.0.0.1:1080`).
     #[arg(long, env = "ANYAGENTS_BROWSER_PROXY")]
     pub proxy: Option<String>,
@@ -74,6 +80,7 @@ impl std::fmt::Debug for BrowserServerConfig {
                 "agent_token",
                 &self.agent_token.as_ref().map(|_| "[redacted]"),
             )
+            .field("screenshot_dir", &self.screenshot_dir)
             .field("proxy", &self.proxy)
             .field("headful", &self.headful)
             .field("extra_args", &self.extra_args)
@@ -91,6 +98,7 @@ impl Default for BrowserServerConfig {
             profile: None,
             api_url: None,
             agent_token: None,
+            screenshot_dir: None,
             proxy: None,
             headful: false,
             extra_args: None,

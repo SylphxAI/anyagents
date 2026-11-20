@@ -32,6 +32,82 @@ pub const API_URL_ENV: &str = "ANYAGENTS_API_URL";
 pub const AGENT_TOKEN_ENV: &str = "ANYAGENTS_AGENT_TOKEN";
 pub const CAPABILITY_ENV: &str = "ANYAGENTS_CAPABILITY";
 pub const MCP_TOKEN_FILE_ENV: &str = "ANYAGENTS_MCP_TOKEN_FILE";
+pub const AGENT_DATA_DIR_ENV: &str = "ANYAGENTS_AGENT_DATA_DIR";
+pub const SANDBOX_DATA_DIR_ENV: &str = "ANYAGENTS_SANDBOX_DATA_DIR";
+pub const GUEST_WORKDIR_ENV: &str = "ANYAGENTS_GUEST_WORKDIR";
+pub const SANDBOX_WORKDIR_ENV: &str = "ANYAGENTS_SANDBOX_WORKDIR";
+
+/// Pure, testable sandbox-aligned directory resolution for `browser_screenshot`.
+///
+/// Prefers explicit config -> `<ANYAGENTS_AGENT_DATA_DIR>/tmp/screenshots` ->
+/// `<ANYAGENTS_SANDBOX_DATA_DIR>/tmp/screenshots` -> `<workdir>/.tmp/screenshots`
+/// -> OS temp dir, never returning coordinator-only host paths.
+pub fn resolve_screenshot_dir_from(
+    explicit_dir: Option<&Path>,
+    agent_data_dir: Option<&Path>,
+    sandbox_data_dir: Option<&Path>,
+    workdir: Option<&Path>,
+    fallback_tmp: &Path,
+) -> PathBuf {
+    if let Some(dir) = explicit_dir.filter(|p| !p.as_os_str().is_empty()) {
+        return dir.to_path_buf();
+    }
+    if let Some(data) = agent_data_dir.filter(|p| !p.as_os_str().is_empty()) {
+        return data.join("tmp").join("screenshots");
+    }
+    if let Some(data) = sandbox_data_dir.filter(|p| !p.as_os_str().is_empty()) {
+        return data.join("tmp").join("screenshots");
+    }
+    if let Some(wd) = workdir.filter(|p| !p.as_os_str().is_empty()) {
+        return wd.join(".tmp").join("screenshots");
+    }
+    fallback_tmp.join("anyagents-screenshots")
+}
+
+/// Resolve the default sandbox-accessible directory for `browser_screenshot`.
+pub fn default_screenshot_dir(config: &BrowserServerConfig) -> PathBuf {
+    let agent_data = non_empty_env(AGENT_DATA_DIR_ENV).map(PathBuf::from);
+    let sandbox_data = non_empty_env(SANDBOX_DATA_DIR_ENV).map(PathBuf::from);
+    let workdir = non_empty_env(GUEST_WORKDIR_ENV)
+        .or_else(|| non_empty_env(SANDBOX_WORKDIR_ENV))
+        .map(PathBuf::from);
+    resolve_screenshot_dir_from(
+        config.screenshot_dir.as_deref(),
+        agent_data.as_deref(),
+        sandbox_data.as_deref(),
+        workdir.as_deref(),
+        &std::env::temp_dir(),
+    )
+}
+
+/// Resolve the destination file path for `browser_screenshot`.
+///
+/// - Absolute requested paths are preserved as-is.
+/// - Relative requested paths are placed inside [`default_screenshot_dir`].
+/// - Omitted paths generate a unique `shot-<epoch_ms>-<seq>.png` inside
+///   [`default_screenshot_dir`] so sandbox scripts and `send(media)` resolve
+///   the exact returned path inside the sandbox.
+pub fn resolve_screenshot_path(config: &BrowserServerConfig, requested: Option<&str>) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+
+    let dir = default_screenshot_dir(config);
+    if let Some(raw) = requested.map(str::trim).filter(|s| !s.is_empty()) {
+        let p = Path::new(raw);
+        return if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            dir.join(p)
+        };
+    }
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("shot-{ms}-{seq}.png"))
+}
 
 /// Coordinator remote sync target for a named browser profile.
 #[derive(Clone, PartialEq, Eq)]
@@ -806,7 +882,7 @@ pub fn sync_up_profile(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::io::{BufRead, BufReader, Read as _, Write as _};
+    use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
@@ -1090,5 +1166,44 @@ mod tests {
         let err = sync_down_profile(&denied_sync, &fresh_ud).unwrap_err();
         assert_eq!(err.code, "PROFILE_FORBIDDEN");
         assert!(err.message.contains("not granted"));
+    }
+
+    #[test]
+    fn screenshot_dir_aligns_with_sandbox_agent_data_dir() {
+        let fallback = Path::new("/tmp");
+        let agent_data = Path::new("/home/user/agent-data");
+        assert_eq!(
+            resolve_screenshot_dir_from(None, Some(agent_data), None, None, fallback),
+            PathBuf::from("/home/user/agent-data/tmp/screenshots")
+        );
+        assert_eq!(
+            resolve_screenshot_dir_from(None, None, Some(agent_data), None, fallback),
+            PathBuf::from("/home/user/agent-data/tmp/screenshots")
+        );
+        let explicit = Path::new("/custom/shots");
+        assert_eq!(
+            resolve_screenshot_dir_from(Some(explicit), Some(agent_data), None, None, fallback),
+            PathBuf::from("/custom/shots")
+        );
+
+        let cfg = BrowserServerConfig {
+            screenshot_dir: Some(PathBuf::from("/home/user/agent-data/tmp/screenshots")),
+            ..Default::default()
+        };
+        let auto = resolve_screenshot_path(&cfg, None);
+        assert!(auto.starts_with("/home/user/agent-data/tmp/screenshots"));
+        assert!(
+            auto.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("shot-") && n.ends_with(".png"))
+        );
+        assert_eq!(
+            resolve_screenshot_path(&cfg, Some("page.png")),
+            PathBuf::from("/home/user/agent-data/tmp/screenshots/page.png")
+        );
+        assert_eq!(
+            resolve_screenshot_path(&cfg, Some("/tmp/abs.png")),
+            PathBuf::from("/tmp/abs.png")
+        );
     }
 }

@@ -1,6 +1,5 @@
 //! Standalone `rmcp` stdio MCP server exposing browser automation tools.
 
-use std::path::Path;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -243,12 +242,10 @@ impl BrowserMcpServer {
         args: BrowserScreenshotArgs,
     ) -> Result<(Value, String), BrowserError> {
         let full_page = args.full_page.unwrap_or(false);
-        let save_path = args
-            .path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
+        let dest_path = crate::profile_sync::resolve_screenshot_path(
+            self.session.config(),
+            args.path.as_deref(),
+        );
 
         let mut live = self.session.acquire().await?;
         let web = live.web();
@@ -256,28 +253,26 @@ impl BrowserMcpServer {
         let url = ensure_readable_page(web).await?;
         let (target_id, title) = active_tab_meta(web).await;
         let shot = web.page_screenshot(full_page).await?;
-        if let Some(ref dest) = save_path {
-            let path = Path::new(dest);
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                    BrowserError::new(
-                        "IO_ERROR",
-                        format!(
-                            "failed creating screenshot directory `{}`: {e}",
-                            parent.display()
-                        ),
-                    )
-                })?;
-            }
-            tokio::fs::write(path, &shot.png).await.map_err(|e| {
+        if let Some(parent) = dest_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 BrowserError::new(
                     "IO_ERROR",
-                    format!("failed writing screenshot `{dest}`: {e}"),
+                    format!(
+                        "failed creating screenshot directory `{}`: {e}",
+                        parent.display()
+                    ),
                 )
             })?;
         }
+        tokio::fs::write(&dest_path, &shot.png).await.map_err(|e| {
+            BrowserError::new(
+                "IO_ERROR",
+                format!("failed writing screenshot `{}`: {e}", dest_path.display()),
+            )
+        })?;
+        let save_path = dest_path.display().to_string();
         let encoded = base64::engine::general_purpose::STANDARD.encode(&shot.png);
         let metadata = json!({
             "url": url,

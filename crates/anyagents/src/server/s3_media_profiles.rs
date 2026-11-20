@@ -239,6 +239,34 @@ async fn list_browser_profiles_route(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
+        let is_privileged = principal_is_admin_or_operator(&state.store, &principal)?;
+        if !is_privileged {
+            let Principal::Agent { agent_id, name } = &principal else {
+                return Err(ApiError::forbidden("administrative authority required"));
+            };
+            let s3_configured = anyagents_core::S3Config::from_env().is_some();
+            let granted = state
+                .store
+                .list_agent_browser_profiles(agent_id)
+                .map_err(ApiError::from_store)?;
+            let profiles: Vec<serde_json::Value> = granted
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "profile": p,
+                        "granted": true,
+                    })
+                })
+                .collect();
+            return Ok(Json(serde_json::json!({
+                "s3_configured": s3_configured,
+                "agent_id": agent_id.as_str(),
+                "agent": name,
+                "profiles": profiles,
+                "browser_profiles": granted,
+            })));
+        }
+
         require_admin_or_operator_local(
             &state.store,
             &principal,
@@ -1326,6 +1354,43 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let got = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(got.as_ref(), payload.as_slice());
+
+        // 5b. Non-admin GET /v1/browser-profiles NEVER leaks other agents' profiles.
+        let resp = app
+            .clone()
+            .oneshot(request_as(
+                child_p.clone(),
+                "GET",
+                "/v1/browser-profiles",
+                Vec::new(),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let child_list: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(
+            child_list["browser_profiles"],
+            serde_json::json!(["team-site"])
+        );
+        assert!(child_list.get("stored_profiles").is_none());
+
+        let resp = app
+            .clone()
+            .oneshot(request_as(
+                other_p.clone(),
+                "GET",
+                "/v1/browser-profiles",
+                Vec::new(),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let other_list: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(other_list["browser_profiles"], serde_json::json!([]));
 
         // 6. Operator lists profiles and deletes team-site (removing S3 object + grants).
         let resp = app
