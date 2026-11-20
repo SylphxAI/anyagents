@@ -694,6 +694,7 @@ pub(crate) fn declared_delivery(harness: &str) -> anyagents_harness::Delivery {
         "omp" => anyagents_harness_omp::DELIVERY,
         "spiron" => anyagents_harness_stream::SPIRON,
         "claude-code" => anyagents_harness_claude::DELIVERY,
+        "gemini" | "gemini-cli" => anyagents_harness_stream::LINE_PER_TURN,
         name if is_cloud_harness(name) => anyagents_harness_claude::CLOUD_DELIVERY,
         _ => anyagents_harness_stream::LINE_PER_TURN,
     }
@@ -4770,5 +4771,38 @@ mod stale_hold_tests {
         let path = hold(&store, &agent, &[&id]);
         assert_eq!(super::settle_stale_spiron_holds(&store), 0);
         assert!(path.exists());
+    }
+
+    #[test]
+    fn seven_harness_declared_delivery_truth_matrix() {
+        use anyagents_harness::DeliveryLevel;
+
+        let matrix = [
+            ("agy", DeliveryLevel::NextStep, true, "yes"),
+            ("claude-code", DeliveryLevel::NextStep, true, "yes"),
+            ("codex", DeliveryLevel::NextStep, true, "yes"),
+            ("gemini", DeliveryLevel::TurnEnd, false, "no"),
+            ("gemini-cli", DeliveryLevel::TurnEnd, false, "no"),
+            ("omp", DeliveryLevel::NextStep, true, "yes"),
+            ("opencode", DeliveryLevel::NextStep, true, "yes"),
+            ("spiron", DeliveryLevel::NextStep, true, "yes"),
+        ];
+        for (harness, expected_level, expected_idempotent, expected_steer) in matrix {
+            let delivery = super::declared_delivery(harness);
+            assert_eq!(
+                delivery.level, expected_level,
+                "{harness}: expected level {expected_level:?}, got {:?}",
+                delivery.level
+            );
+            assert_eq!(
+                delivery.idempotent, expected_idempotent,
+                "{harness}: expected idempotent={expected_idempotent}"
+            );
+            assert_eq!(
+                crate::api::DeliveryView::from(&delivery).legacy_steer(),
+                expected_steer,
+                "{harness}: expected steer_support={expected_steer}"
+            );
+        }
     }
 }

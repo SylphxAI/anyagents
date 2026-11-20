@@ -447,7 +447,7 @@ impl SpironHarness {
     pub fn proves_consumption(&self) -> bool {
         match &self.backend {
             SpironBackend::Stream(s) => s.proves_consumption(),
-            SpironBackend::Stdio(_) => true,
+            SpironBackend::Stdio(s) => s.proves_consumption(),
         }
     }
 
@@ -483,7 +483,7 @@ impl Harness for SpironHarness {
     fn supports_turn_tool_context(&self) -> bool {
         match &self.backend {
             SpironBackend::Stream(s) => s.supports_turn_tool_context(),
-            SpironBackend::Stdio(_) => true,
+            SpironBackend::Stdio(s) => s.supports_turn_tool_context(),
         }
     }
 
@@ -524,7 +524,7 @@ impl Harness for SpironHarness {
     fn background(&mut self) -> Result<(), HarnessError> {
         match &mut self.backend {
             SpironBackend::Stream(s) => s.background(),
-            SpironBackend::Stdio(_) => Ok(()),
+            SpironBackend::Stdio(s) => s.background(),
         }
     }
 

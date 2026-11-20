@@ -101,7 +101,14 @@ impl AgyHarness {
         let agy_rpc = if work_dir.is_some() && !fake_mode {
             environment
                 .iter()
-                .find(|(k, _)| k == "ANYAGENTS_AGENT_CONFIG" || k == "AGY_CONFIG_DIR")
+                .rev()
+                .find(|(k, _)| k == "ANYAGENTS_AGENT_CONFIG")
+                .or_else(|| {
+                    environment
+                        .iter()
+                        .rev()
+                        .find(|(k, _)| k == "AGY_CONFIG_DIR")
+                })
                 .map(|(_, v)| {
                     let csrf_token = environment
                         .iter()
@@ -123,7 +130,7 @@ impl AgyHarness {
                         .find(|(k, _)| k == "ANYAGENTS_AGY_HTTP_PORT")
                         .and_then(|(_, val)| val.parse::<u16>().ok());
                     AgyRpcConfig {
-                        config_dir: PathBuf::from(v),
+                        config_dir: normalize_agy_config_root(Path::new(v)),
                         csrf_token,
                         port_override,
                     }
@@ -246,4 +253,19 @@ impl Harness for AgyHarness {
     fn watch_activity(&self, notify: std::sync::Arc<dyn Fn() + Send + Sync>) {
         self.inner.watch_activity(notify);
     }
+}
+
+/// Normalize `<root>/.gemini/antigravity-cli` back to `<root>` so both
+/// `ANYAGENTS_AGENT_CONFIG=<root>` and `AGY_CONFIG_DIR=<root>/.gemini/antigravity-cli`
+/// resolve `cli.log` and `brain/<cascade>/.system_generated` without double-nesting.
+fn normalize_agy_config_root(path: &Path) -> PathBuf {
+    if path.file_name().and_then(|n| n.to_str()) == Some("antigravity-cli")
+        && let Some(gemini_dir) = path.parent()
+        && gemini_dir.file_name().and_then(|n| n.to_str()) == Some(".gemini")
+        && let Some(root) = gemini_dir.parent()
+        && !root.as_os_str().is_empty()
+    {
+        return root.to_path_buf();
+    }
+    path.to_path_buf()
 }

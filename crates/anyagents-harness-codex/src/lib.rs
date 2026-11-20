@@ -1252,9 +1252,6 @@ impl Harness for CodexHarness {
             (rpc, line, start)
         };
         if write_stdin(&self.stdin, &line).is_err() {
-            // A broken pipe took no whole line: nothing was applied. The
-            // process counts as gone once its output ends, after every proof
-            // it printed is read; that end wakes the host.
             let mut state = lock(&self.shared);
             state.requests.remove(&rpc);
             state.inflight.remove(id);
@@ -1262,7 +1259,10 @@ impl Harness for CodexHarness {
             if start {
                 state.turns_started -= 1;
             }
-            return Ok(DeliverOutcome::Deferred);
+            let alive = state.alive;
+            return alive
+                .then_some(DeliverOutcome::Deferred)
+                .ok_or(HarnessError::Dead);
         }
         // The answer may already be in: a refusal hands the message back.
         lock(&self.shared)

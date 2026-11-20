@@ -1045,10 +1045,9 @@ impl StreamHarness {
             }
             // A steer under way is in flight until the language server
             // settles it; one its cascade holds, until the cascade takes it.
-            if state.agy_steer.as_ref().is_some_and(|steer| steer.id == id) {
-                return Ok(DeliverOutcome::InFlight);
-            }
-            if state.agy_queued.iter().any(|queued| queued.id == id) {
+            if state.agy_steer.as_ref().is_some_and(|steer| steer.id == id)
+                || state.agy_queued.iter().any(|queued| queued.id == id)
+            {
                 return if state.alive {
                     Ok(DeliverOutcome::InFlight)
                 } else {

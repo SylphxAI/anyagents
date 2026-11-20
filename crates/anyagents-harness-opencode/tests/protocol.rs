@@ -1521,3 +1521,309 @@ fn a_process_serves_only_what_it_added_to_the_session() {
         "the session's earlier totals were counted as this process's"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn opencode_multi_step_next_step_steer_incorporates_into_step2_and_fails_closed() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let config = root.join("config");
+    std::fs::create_dir_all(&config).unwrap();
+
+    let py = root.join("mock_opencode.py");
+    let sh = root.join("mock_opencode");
+    std::fs::write(
+        &py,
+        r#"
+import json, os, pathlib, socket, sys, threading, time, urllib.error, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+state_dir = pathlib.Path(os.environ["MOCK_STATE_DIR"])
+trace_path = state_dir / "oc_trace.jsonl"
+
+def trace(event, **fields):
+    with trace_path.open("a") as f:
+        f.write(json.dumps({"event": event, **fields}) + "\n")
+
+def run_serve(args):
+    port = int(args[args.index("--port") + 1])
+    lock = threading.Lock()
+    sse_clients = []
+    delivered = set()
+    messages = []
+    turn_open = False
+    m2_payload = None
+    step2_done = threading.Event()
+
+    def push_sse(payload):
+        frame = f"data: {json.dumps(payload)}\n\n".encode()
+        with lock:
+            alive = []
+            for wfile in sse_clients:
+                try:
+                    wfile.write(frame)
+                    wfile.flush()
+                    alive.append(wfile)
+                except Exception:
+                    pass
+            sse_clients[:] = alive
+
+    def step2_watcher():
+        nonlocal turn_open
+        gate = state_dir / "allow_step2"
+        while True:
+            if gate.exists() and m2_payload is not None and not step2_done.is_set():
+                gate.unlink(missing_ok=True)
+                now = int(time.time() * 1000)
+                with lock:
+                    delivered.add("msg_m2")
+                    out = f"step2:incorporated:{m2_payload}"
+                    messages.insert(0, {
+                        "type": "assistant",
+                        "content": [{"type": "text", "text": out}],
+                        "finish": "stop",
+                        "time": {"created": now + 10},
+                        "tokens": {"input": 11, "output": 7, "cache": {"read": 0, "write": 0}},
+                        "cost": 0.0001,
+                    })
+                    messages.append({"type": "idle", "outcome": "succeeded", "time": {"created": now + 20}})
+                    turn_open = False
+                push_sse({"type": "session.inbox.delivered", "data": {"sessionID": "ses_multi", "inboxID": "msg_m2"}})
+                trace("consumed_before_wait_ends", out=out)
+                step2_done.set()
+            time.sleep(0.01)
+
+    threading.Thread(target=step2_watcher, daemon=True).start()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *a): pass
+        def send_json(self, status, obj):
+            raw = json.dumps(obj).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            if self.path == "/api/event":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(b'data: {"type":"server.connected","data":{}}\n\n')
+                self.wfile.flush()
+                with lock:
+                    sse_clients.append(self.wfile)
+                while True:
+                    time.sleep(1.0)
+            elif self.path == "/api/info":
+                self.send_json(200, {"version": "2.3.2", "pid": os.getpid(), "urls": [f"http://127.0.0.1:{port}"], "capabilities": {}})
+            elif self.path == "/api/session":
+                self.send_json(200, {"data": [{"id": "ses_multi"}]})
+            elif self.path == "/api/session/active":
+                with lock:
+                    data = {"ses_multi": {"type": "running"}} if turn_open else {}
+                self.send_json(200, {"data": data})
+            elif self.path == "/api/session/ses_multi":
+                self.send_json(200, {"data": {"id": "ses_multi", "title": "multi"}})
+            elif self.path == "/api/session/ses_multi/message":
+                with lock:
+                    snap = list(messages)
+                self.send_json(200, {"data": snap})
+            elif self.path.startswith("/api/session/ses_multi/message/"):
+                mid = self.path.rsplit("/", 1)[-1]
+                with lock:
+                    ok = mid in delivered
+                if ok:
+                    self.send_json(200, {"data": {"id": mid, "type": "user", "text": "", "time": {"created": 1}}})
+                else:
+                    self.send_json(404, {"_tag": "MessageNotFoundError", "message": "not found"})
+            else:
+                self.send_json(404, {"message": "not found"})
+
+        def do_POST(self):
+            nonlocal turn_open, m2_payload
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            if self.path == "/api/session":
+                self.send_json(200, {"data": {"id": "ses_multi"}})
+            elif self.path == "/api/session/ses_multi/prompt":
+                pid = body.get("id", "")
+                text = body.get("text", "")
+                delivery = body.get("delivery")
+                trace("prompt_post", id=pid, delivery=delivery)
+                if pid == "msg_m_413":
+                    self.send_json(413, {"_tag": "PayloadTooLargeError", "message": "prompt too large"})
+                    return
+                now = int(time.time() * 1000)
+                if pid == "msg_m1":
+                    with lock:
+                        turn_open = True
+                        delivered.add(pid)
+                        messages.insert(0, {"id": pid, "type": "user", "text": text, "time": {"created": now}})
+                    push_sse({"type": "session.inbox.delivered", "data": {"sessionID": "ses_multi", "inboxID": pid}})
+                elif pid == "msg_m2":
+                    with lock:
+                        m2_payload = "opencode-steer-payload" if "opencode-steer-payload" in text else text.splitlines()[-1]
+                        messages.insert(0, {"id": pid, "type": "user", "text": text, "time": {"created": now + 1}})
+                    # Do NOT emit session.inbox.delivered yet: hold behind allow_step2 gate!
+                self.send_json(200, {"data": {"id": pid, "sessionID": "ses_multi", "time": {"created": now}, "type": "user", "delivery": delivery}})
+            elif self.path == "/api/experimental/session/ses_multi/wait":
+                step2_done.wait(timeout=15.0)
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self.send_json(200, {})
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server.daemon_threads = True
+    print(f"server listening on http://127.0.0.1:{port}", flush=True)
+    print("server password mock-pass", flush=True)
+    server.serve_forever()
+
+def run_api(args):
+    idx = args.index("--server")
+    endpoint = args[idx + 1]
+    rest = args[:idx] + args[idx + 2:]
+    method, path = rest[0], rest[1]
+    data = None
+    if "-d" in rest:
+        data = rest[rest.index("-d") + 1].encode()
+    req = urllib.request.Request(endpoint + path, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            out = resp.read()
+            if out:
+                sys.stdout.buffer.write(out)
+                sys.stdout.buffer.flush()
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        if body:
+            sys.stdout.buffer.write(body)
+            sys.stdout.buffer.flush()
+        print(f"HTTP {e.code} {e.reason}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+if sys.argv[1] == "serve":
+    run_serve(sys.argv[2:])
+elif sys.argv[1] == "api":
+    run_api(sys.argv[2:])
+else:
+    sys.exit(2)
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &sh,
+        format!("#!/bin/sh\nexec python3 -u '{}' \"$@\"\n", py.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut harness = OpenCodeHarness::start_in_config(
+        &sh,
+        Some("ses_multi"),
+        &[("MOCK_STATE_DIR", root.to_str().unwrap())],
+        Some(root),
+        &config,
+    )
+    .expect("opencode mock starts");
+
+    assert_eq!(harness.health().delivery.level, DeliveryLevel::NextStep);
+    assert!(harness.health().delivery.idempotent);
+
+    let mk = |id: &str, text: &str| OutboundMessage {
+        id: id.to_string(),
+        seq: 1,
+        text: text.to_string(),
+        sender: Some("agent:owner".to_string()),
+        reply_to: None,
+        source_time_ms: None,
+        context: Context::default(),
+    };
+
+    // Step 1 opens turn and holds /wait open mid-turn.
+    let m1 = mk("m1", "step-1-work");
+    assert_eq!(settle(&mut harness, &m1).unwrap(), accepted());
+    assert_eq!(harness.health().turn_state, TurnState::InTurn);
+
+    // Mid-turn steer m2: HTTP 200 admission MUST remain InFlight until SSE `session.inbox.delivered`.
+    let m2 = mk("m2", "opencode-steer-payload");
+    assert_eq!(harness.deliver(&m2).unwrap(), DeliverOutcome::InFlight);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(root.join("oc_trace.jsonl"))
+        .unwrap_or_default()
+        .contains("\"id\": \"msg_m2\", \"delivery\": \"steer\"")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "m2 prompt POST timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(80));
+    assert_eq!(
+        harness.proven("m2"),
+        None,
+        "HTTP 200 admission alone must not prove m2 before session.inbox.delivered"
+    );
+    assert_eq!(harness.deliver(&m2).unwrap(), DeliverOutcome::InFlight);
+
+    // Step 2 emits `session.inbox.delivered`, records Step 2 answer, and releases `/wait`.
+    std::fs::write(root.join("allow_step2"), "1").unwrap();
+    assert_eq!(settle(&mut harness, &m2).unwrap(), accepted());
+    assert!(harness.wait_answered("m2", Duration::from_secs(10)));
+    assert_eq!(
+        harness.answer("m2").as_deref(),
+        Some("step2:incorporated:opencode-steer-payload")
+    );
+    assert_eq!(harness.turns_served(), 1);
+
+    // HTTP 413 returns Rejected immediately (single POST, no retry, service stays healthy).
+    let m_413 = mk("m_413", "oversized");
+    let rejected = settle(&mut harness, &m_413).unwrap();
+    assert!(
+        matches!(
+            rejected,
+            DeliverOutcome::Rejected {
+                message_specific: true,
+                ..
+            }
+        ),
+        "expected permanent Rejected for HTTP 413, got {rejected:?}"
+    );
+    assert_eq!(harness.proven("m_413"), None);
+    let trace = std::fs::read_to_string(root.join("oc_trace.jsonl")).unwrap();
+    assert_eq!(
+        trace.matches("\"id\": \"msg_m_413\"").count(),
+        1,
+        "HTTP 413 must fail closed on first attempt without retrying: {trace}"
+    );
+    assert!(harness.health().process_alive);
+
+    // Killed service fail-closed: deliver, background, and cancel all return Err(Dead).
+    let pid = std::fs::read_to_string(config.join("opencode-service-pid")).unwrap();
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-KILL", pid.trim()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    eventually(&harness, "mock opencode killed", |h| {
+        !h.health().process_alive
+    });
+    assert_eq!(
+        harness.deliver(&mk("m_after_death", "nope")),
+        Err(HarnessError::Dead)
+    );
+    assert_eq!(harness.background(), Err(HarnessError::Dead));
+    assert_eq!(harness.cancel(), Err(HarnessError::Dead));
+}
