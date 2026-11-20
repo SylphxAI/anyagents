@@ -732,3 +732,53 @@ fn backfill_historical_agent_roles_losslessly_normalizes_roles_and_strips_baked_
 
     assert_eq!(backfill_historical_agent_roles(&store, &data).unwrap(), 0);
 }
+
+#[test]
+fn hydrated_roles_dir_injects_template_verbatim_and_unknown_explicit_role_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let store = Store::open(data.join("state.db")).unwrap();
+
+    // Even with zero disk templates, an unknown explicit role must fail closed
+    // listing available roles rather than silently falling back to `general`.
+    let mut missing_req: crate::api::CreateAgentRequest =
+        serde_json::from_value(serde_json::json!({"name": "bad-role-agent", "role": "auditor"}))
+            .unwrap();
+    let err = apply_archetype_defaults(Some(&store), &data, None, &mut missing_req)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown role 'auditor'"), "{err}");
+    assert!(err.contains("available roles: [general]"), "{err}");
+
+    // Hydrating `<data>/roles/auditor.md` makes `auditor` discoverable and
+    // injects its markdown body verbatim into effective agent instructions.
+    std::fs::create_dir_all(data.join("roles")).unwrap();
+    std::fs::write(
+        data.join("roles/auditor.md"),
+        "---\nname: auditor\ndescription: Security auditor\nscope: private\n---\nAudit every change against policy invariants verbatim.\n",
+    )
+    .unwrap();
+    assert_eq!(
+        discover_available_archetype_slugs(None, None, &data),
+        vec!["general".to_string(), "auditor".to_string()]
+    );
+
+    let mut ok_req: crate::api::CreateAgentRequest =
+        serde_json::from_value(serde_json::json!({"name": "auditor-agent", "role": "auditor"}))
+            .unwrap();
+    apply_archetype_defaults(Some(&store), &data, None, &mut ok_req).unwrap();
+    assert_eq!(ok_req.role.as_deref(), Some("auditor"));
+    assert_eq!(ok_req.description.as_deref(), Some("Security auditor"));
+
+    let mut preview = store
+        .create_agent(NewAgent::new("auditor-preview", "codex"))
+        .unwrap();
+    preview.role = ok_req.role.clone();
+    preview.instructions = ok_req.instructions.clone();
+    let effective = effective_agent_instructions(Some(&store), &data, &preview).unwrap();
+    assert!(
+        effective.contains("Audit every change against policy invariants verbatim."),
+        "{effective}"
+    );
+}

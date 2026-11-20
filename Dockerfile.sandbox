@@ -8,14 +8,17 @@
 #                     binaries from `Cargo.lock`
 #   - sandbox-base  : minimal Debian Bookworm developer sandbox with `anyagents-guest`,
 #                     `agent-code-mode`, persistent
-#                     `/home/user/agent-data/{state,workspace}` layout, and standard CLI
-#                     utilities (git, rg, fd, jq, python3, node/npm, gh, tini)
-#   - sandbox-dev   : extends `sandbox-base` with open-source `rustc`/`cargo` (via rustup),
-#                     `bun`, and the standalone `anyagents-mcp-web` MCP server
+#                     `/home/user/agent-data/{state,workspace,tmp}` layout, CJK fonts,
+#                     and standard CLI utilities (git, rg, fd, jq, python3, node/npm, gh, tini)
+#   - sandbox-dev   : extends `sandbox-base` with open-source `rustc`/`cargo` (via rustup,
+#                     including `wasm32-unknown-unknown`), `wasm-bindgen-cli`, `binaryen`,
+#                     `bun`, `pnpm`, `uv`, `go`, `helm`, `ffmpeg`, `python3-pil`, `atlas`,
+#                     `protobuf-compiler`, `buf`, and the standalone `anyagents-mcp-web` MCP server
 #   - sandbox-full  : extends `sandbox-dev` with the standalone `anyagents-mcp-browser`
 #                     MCP server and optional CLI harnesses selected via
-#                     `--build-arg INSTALL_HARNESSES="..."` (including opt-in `spiron` via
-#                     `SPIRON_INSTALL_URL` or `SPIRON_NPM_PKG`)
+#                     `--build-arg INSTALL_HARNESSES="..."` (including OpenCode 2.x via
+#                     `@opencode/cli` and opt-in `spiron` via `SPIRON_INSTALL_URL` or
+#                     `SPIRON_NPM_PKG`)
 #
 # Example builds:
 #   docker build -f Dockerfile.sandbox --target sandbox-base -t ghcr.io/<org>/anyagents-sandbox:base .
@@ -89,6 +92,7 @@ RUN apt-get update \
         chromium \
         curl \
         fd-find \
+        fontconfig \
         fonts-noto-cjk \
         fonts-noto-core \
         git \
@@ -109,22 +113,8 @@ RUN apt-get update \
         unzip \
         wayvnc \
         xz-utils \
+    && fc-cache -f \
     && mkdir -p /etc/apt/keyrings /etc/anyagents /var/lib/anyagents \
-    && CHROMIUM_PATH="$(readlink -f /usr/bin/chromium)" \
-    && CHROMIUM_SHA="$(sha256sum "$CHROMIUM_PATH" | awk '{print $1}')" \
-    && CHROMIUM_VER="$(/usr/bin/chromium --version | head -n 1 | tr -d '"')" \
-    && SWAY_PATH="$(readlink -f /usr/bin/sway)" \
-    && SWAY_SHA="$(sha256sum "$SWAY_PATH" | awk '{print $1}')" \
-    && SWAY_VER="$(/usr/bin/sway --version | head -n 1 | tr -d '"')" \
-    && WAYVNC_PATH="$(readlink -f /usr/bin/wayvnc)" \
-    && WAYVNC_SHA="$(sha256sum "$WAYVNC_PATH" | awk '{print $1}')" \
-    && WAYVNC_VER="$(/usr/bin/wayvnc --version 2>&1 | head -n 1 | tr -d '"')" \
-    && printf 'schema = 1\nchild_path_tail = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]\n\n[tool.chromium]\npath = "/usr/bin/chromium"\nversion = "%s"\nsha256 = "%s"\ncapability = "browser"\n\n[tool.sway]\npath = "/usr/bin/sway"\nversion = "%s"\nsha256 = "%s"\ncapability = "browser"\n\n[tool.wayvnc]\npath = "/usr/bin/wayvnc"\nversion = "%s"\nsha256 = "%s"\ncapability = "browser.takeover"\n' \
-        "$CHROMIUM_VER" "$CHROMIUM_SHA" \
-        "$SWAY_VER" "$SWAY_SHA" \
-        "$WAYVNC_VER" "$WAYVNC_SHA" \
-        > /var/lib/anyagents/toolchain.toml \
-    && cp /var/lib/anyagents/toolchain.toml /etc/anyagents/toolchain.toml \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
     && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
@@ -139,6 +129,29 @@ RUN apt-get update \
     && npm install -g --no-audit --no-fund playwright-core \
     && npm cache clean --force \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
+    && CHROMIUM_PATH="$(readlink -f /usr/bin/chromium)" \
+    && CHROMIUM_SHA="$(sha256sum "$CHROMIUM_PATH" | awk '{print $1}')" \
+    && CHROMIUM_VER="$(/usr/bin/chromium --version | head -n 1 | tr -d '"')" \
+    && SWAY_PATH="$(readlink -f /usr/bin/sway)" \
+    && SWAY_SHA="$(sha256sum "$SWAY_PATH" | awk '{print $1}')" \
+    && SWAY_VER="$(/usr/bin/sway --version | head -n 1 | tr -d '"')" \
+    && WAYVNC_PATH="$(readlink -f /usr/bin/wayvnc)" \
+    && WAYVNC_SHA="$(sha256sum "$WAYVNC_PATH" | awk '{print $1}')" \
+    && WAYVNC_VER="$(/usr/bin/wayvnc --version 2>&1 | head -n 1 | tr -d '"')" \
+    && GIT_PATH="$(readlink -f /usr/bin/git)" \
+    && GIT_SHA="$(sha256sum "$GIT_PATH" | awk '{print $1}')" \
+    && GIT_VER="$(/usr/bin/git --version | head -n 1 | tr -d '"')" \
+    && GH_PATH="$(readlink -f /usr/bin/gh)" \
+    && GH_SHA="$(sha256sum "$GH_PATH" | awk '{print $1}')" \
+    && GH_VER="$(/usr/bin/gh --version | head -n 1 | tr -d '"')" \
+    && printf 'schema = 1\nchild_path_tail = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]\n\n[tool.chromium]\npath = "/usr/bin/chromium"\nversion = "%s"\nsha256 = "%s"\ncapability = "browser"\n\n[tool.sway]\npath = "/usr/bin/sway"\nversion = "%s"\nsha256 = "%s"\ncapability = "browser"\n\n[tool.wayvnc]\npath = "/usr/bin/wayvnc"\nversion = "%s"\nsha256 = "%s"\ncapability = "browser.takeover"\n\n[tool.git]\npath = "/usr/bin/git"\nversion = "%s"\nsha256 = "%s"\ncapability = "checkout"\n\n[tool.gh]\npath = "/usr/bin/gh"\nversion = "%s"\nsha256 = "%s"\ncapability = "checkout"\n' \
+        "$CHROMIUM_VER" "$CHROMIUM_SHA" \
+        "$SWAY_VER" "$SWAY_SHA" \
+        "$WAYVNC_VER" "$WAYVNC_SHA" \
+        "$GIT_VER" "$GIT_SHA" \
+        "$GH_VER" "$GH_SHA" \
+        > /var/lib/anyagents/toolchain.toml \
+    && cp /var/lib/anyagents/toolchain.toml /etc/anyagents/toolchain.toml \
     && rm -rf /var/lib/apt/lists/*
 
 # Install `anyagents-guest` runtime supervisor + MCP proxy alongside
@@ -155,13 +168,20 @@ RUN chmod 0755 \
 # Symlinks at `/home/user/agent-state` and `/home/user/workspace` retain backwards compatibility.
 RUN groupadd --gid "${USER_GID}" user \
     && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home --home-dir /home/user --shell /bin/bash user \
-    && mkdir -p /home/user/agent-data/state /home/user/agent-data/workspace /home/user/.local/bin \
+    && mkdir -p \
+        /home/user/agent-data/state \
+        /home/user/agent-data/workspace \
+        /home/user/agent-data/tmp \
+        /home/user/.config/opencode \
+        /home/user/.cache \
+        /home/user/.local/bin \
     && ln -sfn /home/user/agent-data/state /home/user/agent-state \
     && ln -sfn /home/user/agent-data/workspace /home/user/workspace \
     && chown -R "${USER_UID}:${USER_GID}" /home/user
 
 ENV HOME=/home/user \
     PATH="/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    ANYAGENTS_AGENT_DATA_DIR=/home/user/agent-data \
     ANYAGENTS_SANDBOX_DATA_DIR=/home/user/agent-data \
     ANYAGENTS_GUEST_STATE_DIR=/home/user/agent-data/state \
     ANYAGENTS_GUEST_WORKDIR=/home/user/agent-data/workspace \
@@ -179,50 +199,112 @@ CMD ["/usr/local/bin/anyagents-guest", "health"]
 
 # ------------------------------------------------------------------------------
 # Stage 3: Developer toolchain sandbox (`sandbox-dev`)
-# Extends `sandbox-base` with open-source Rust (`rustup`/`rustc`/`cargo`) + `bun`.
+# Extends `sandbox-base` with Rust (+ wasm32 target & wasm-bindgen-cli), binaryen,
+# bun, pnpm, uv, go, helm, ffmpeg, python3-pil, atlas, protoc, buf, and anyagents-mcp-web.
 # ------------------------------------------------------------------------------
 FROM ${BUN_IMAGE} AS bun-bin
 
 FROM sandbox-base AS sandbox-dev
 
+ARG TARGETARCH
 ARG RUST_TOOLCHAIN=stable
+ARG GO_VERSION=1.27.4
+ARG HELM_VERSION=4.3.2
+ARG UV_VERSION=0.13.9
+ARG BUF_VERSION=1.75.0
+ARG WASM_BINDGEN_VERSION=0.2.130
 ARG USER_UID=1000
 ARG USER_GID=1000
 
 LABEL org.opencontainers.image.title="anyagents-sandbox-dev" \
-      org.opencontainers.image.description="Vendor-neutral open-source AnyAgents developer sandbox image with rustc/cargo (rustup) and bun" \
+      org.opencontainers.image.description="Vendor-neutral open-source AnyAgents developer sandbox image with Rust/WASM, Go, Bun, pnpm, uv, Helm, Protobuf/Buf, Atlas, FFmpeg, and Pillow" \
       org.opencontainers.image.licenses="MIT"
 
 USER root
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
-    PATH="/usr/local/cargo/bin:/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    GOPATH=/home/user/go \
+    PATH="/usr/local/cargo/bin:/usr/local/go/bin:/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        binaryen \
         build-essential \
+        ffmpeg \
         libssl-dev \
         pkg-config \
+        protobuf-compiler \
+        python3-pil \
     && rm -rf /var/lib/apt/lists/* \
     && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
         | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}" --component clippy,rustfmt --no-modify-path \
+    && "${CARGO_HOME}/bin/rustup" target add wasm32-unknown-unknown \
     && chmod -R a+rX "${RUSTUP_HOME}" "${CARGO_HOME}" \
     && chown -R "${USER_UID}:${USER_GID}" "${CARGO_HOME}" \
     && for bin in rustc cargo rustfmt cargo-fmt cargo-clippy clippy-driver rustup; do \
         if [ -x "${CARGO_HOME}/bin/${bin}" ]; then ln -sf "${CARGO_HOME}/bin/${bin}" "/usr/local/bin/${bin}"; fi; \
     done \
-    && printf 'export RUSTUP_HOME=%s\nexport CARGO_HOME=%s\nexport PATH="%s/bin:$PATH"\n' "${RUSTUP_HOME}" "${CARGO_HOME}" "${CARGO_HOME}" > /etc/profile.d/rust.sh \
+    && printf 'export RUSTUP_HOME=%s\nexport CARGO_HOME=%s\nexport PATH="%s/bin:/usr/local/go/bin:$PATH"\n' "${RUSTUP_HOME}" "${CARGO_HOME}" "${CARGO_HOME}" > /etc/profile.d/rust.sh \
     && chmod 0644 /etc/profile.d/rust.sh \
     && rustc --version \
     && cargo --version
+
+# Install multi-arch open-source developer CLIs (pnpm, uv, go, helm, atlas, buf, wasm-bindgen-cli).
+RUN set -eu; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch" in \
+        amd64) rust_arch="x86_64" ;; \
+        arm64) rust_arch="aarch64" ;; \
+        *) echo "Unsupported TARGETARCH: $arch" >&2; exit 1 ;; \
+    esac; \
+    npm install -g --no-audit --no-fund pnpm; \
+    npm cache clean --force; \
+    tmpd="$(mktemp -d)"; \
+    mkdir -p "$tmpd/uv"; \
+    curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${rust_arch}-unknown-linux-gnu.tar.gz" \
+        | tar -xz -C "$tmpd/uv"; \
+    install -m 0755 "$(find "$tmpd/uv" -type f -name uv | head -n 1)" /usr/local/bin/uv; \
+    install -m 0755 "$(find "$tmpd/uv" -type f -name uvx | head -n 1)" /usr/local/bin/uvx; \
+    rm -rf /usr/local/go; \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" | tar -xz -C /usr/local; \
+    ln -sf /usr/local/go/bin/go /usr/local/bin/go; \
+    ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt; \
+    mkdir -p "$tmpd/helm"; \
+    curl -fsSL "https://get.helm.sh/helm-v${HELM_VERSION}-linux-${arch}.tar.gz" \
+        | tar -xz -C "$tmpd/helm"; \
+    install -m 0755 "$(find "$tmpd/helm" -type f -name helm | head -n 1)" /usr/local/bin/helm; \
+    curl -fsSL "https://release.ariga.io/atlas/atlas-community-linux-${arch}-latest" -o /usr/local/bin/atlas; \
+    chmod 0755 /usr/local/bin/atlas; \
+    curl -fsSL "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-${rust_arch}" -o /usr/local/bin/buf; \
+    chmod 0755 /usr/local/bin/buf; \
+    mkdir -p "$tmpd/wasm-bindgen"; \
+    curl -fsSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WASM_BINDGEN_VERSION}/wasm-bindgen-${WASM_BINDGEN_VERSION}-${rust_arch}-unknown-linux-musl.tar.gz" \
+        | tar -xz -C "$tmpd/wasm-bindgen"; \
+    for wb_bin in wasm-bindgen wasm-bindgen-test-runner wasm2es6js; do \
+        found="$(find "$tmpd/wasm-bindgen" -type f -name "$wb_bin" | head -n 1 || true)"; \
+        if [ -n "$found" ]; then install -m 0755 "$found" "/usr/local/bin/$wb_bin"; fi; \
+    done; \
+    rm -rf "$tmpd"; \
+    pnpm --version; \
+    uv --version; \
+    go version; \
+    helm version --short; \
+    atlas version; \
+    protoc --version; \
+    buf --version; \
+    wasm-bindgen --version; \
+    wasm-opt --version; \
+    ffmpeg -version | head -n 1; \
+    python3 -c "import PIL; print('Pillow', PIL.__version__)"
 
 COPY --from=bun-bin /usr/local/bin/bun /usr/local/bin/bun
 COPY --from=guest-builder /src/target/release/anyagents-mcp-web /usr/local/bin/anyagents-mcp-web
 RUN ln -sf /usr/local/bin/bun /usr/local/bin/bunx \
     && chmod 0755 /usr/local/bin/anyagents-mcp-web \
-    && chown -R "${USER_UID}:${USER_GID}" /home/user \
-    && bun --version
+    && bun --version \
+    && mkdir -p /home/user/.config/opencode /home/user/.cache /home/user/.local/bin /home/user/agent-data/tmp \
+    && chown -R "${USER_UID}:${USER_GID}" /home/user
 
 WORKDIR /home/user/agent-data/workspace
 USER ${USER_UID}:${USER_GID}
@@ -235,6 +317,8 @@ FROM sandbox-dev AS sandbox-full
 
 ARG USER_UID=1000
 ARG USER_GID=1000
+# OpenCode 2.x CLI version (must stay >= 2.1.4; legacy `opencode-ai` 1.x is unsupported).
+ARG OPENCODE_VERSION=2.3.2
 # Space- or comma-separated list of CLI harnesses to pre-install.
 # Supported values: claude-code, codex, opencode, gemini, omp, spiron, none
 ARG INSTALL_HARNESSES="claude-code codex opencode gemini omp"
@@ -256,12 +340,13 @@ RUN set -eu; \
     raw="$(printf '%s' "${INSTALL_HARNESSES}" | tr ',' ' ')"; \
     npm_pkgs=""; \
     install_spiron=0; \
+    install_opencode=0; \
     for item in $raw; do \
         case "$item" in \
             ""|"none") ;; \
             "claude"|"claude-code") npm_pkgs="$npm_pkgs @anthropic-ai/claude-code" ;; \
             "codex") npm_pkgs="$npm_pkgs @openai/codex" ;; \
-            "opencode") npm_pkgs="$npm_pkgs opencode-ai" ;; \
+            "opencode") npm_pkgs="$npm_pkgs @opencode/cli@${OPENCODE_VERSION}"; install_opencode=1 ;; \
             "gemini") npm_pkgs="$npm_pkgs @google/gemini-cli" ;; \
             "omp") npm_pkgs="$npm_pkgs @oh-my-pi/pi-coding-agent" ;; \
             "spiron") install_spiron=1 ;; \
@@ -293,7 +378,26 @@ RUN set -eu; \
         npm install -g --no-audit --no-fund $npm_pkgs; \
         npm cache clean --force; \
     fi; \
-    mkdir -p /home/user/.config /home/user/.cache /home/user/.local/bin; \
+    if [ "$install_opencode" = "1" ]; then \
+        opencode --version; \
+    fi; \
+    for hbin in claude codex opencode gemini omp spiron agy; do \
+        resolved=""; \
+        for dir in /usr/local/bin /usr/bin; do \
+            if [ -x "${dir}/${hbin}" ]; then resolved="${dir}/${hbin}"; break; fi; \
+        done; \
+        if [ -n "$resolved" ] && ! grep -q "^\[tool\.${hbin}\]" /var/lib/anyagents/toolchain.toml; then \
+            canon="$(readlink -f "$resolved" || true)"; \
+            sha="$( [ -f "$canon" ] && sha256sum "$canon" | awk '{print $1}' || true )"; \
+            ver="$(HOME=/tmp timeout 10 "$resolved" --version 2>&1 | tr -d '\r' | sed -n '/[^[:space:]]/{p;q;}' | tr -d '"\\' || true)"; \
+            if [ -n "$ver" ] && [ "${#sha}" = "64" ]; then \
+                printf '\n[tool.%s]\npath = "%s"\nversion = "%s"\nsha256 = "%s"\ncapability = "harness"\n' \
+                    "$hbin" "$resolved" "$ver" "$sha" >> /var/lib/anyagents/toolchain.toml; \
+            fi; \
+        fi; \
+    done; \
+    cp /var/lib/anyagents/toolchain.toml /etc/anyagents/toolchain.toml; \
+    mkdir -p /home/user/.config/opencode /home/user/.cache /home/user/.local/bin /home/user/agent-data/tmp; \
     chown -R "${USER_UID}:${USER_GID}" /home/user
 
 WORKDIR /home/user/agent-data/workspace

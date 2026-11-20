@@ -289,6 +289,35 @@ mod spawn_args_tests {
             role_doc.find("general").unwrap() < role_doc.find("planner").unwrap(),
             "{role_doc}"
         );
+
+        // Hydrated `<data>/roles/<role>.md` roles populate both the `agents` tool
+        // description and the dynamic `role` input_schema property (`examples` + `description`).
+        let hydrated_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(hydrated_dir.path().join("roles")).unwrap();
+        std::fs::write(
+            hydrated_dir.path().join("roles/auditor.md"),
+            "---\nname: auditor\ndescription: Security auditor\n---\nReview security.\n",
+        )
+        .unwrap();
+        let hydrated_tools = tool_definitions_with_roles(None, Some(hydrated_dir.path()));
+        let agents_tool = hydrated_tools.iter().find(|t| t.name == "agents").unwrap();
+        let agents_desc = agents_tool.description.as_deref().unwrap_or_default();
+        assert!(
+            agents_desc.contains("`auditor` (Security auditor)"),
+            "{agents_desc}"
+        );
+        let role_prop = &agents_tool.input_schema["properties"]["role"];
+        assert_eq!(
+            role_prop["examples"],
+            serde_json::json!(["general", "auditor"])
+        );
+        assert!(
+            role_prop["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("auditor"),
+            "{role_prop}"
+        );
     }
 
     #[test]

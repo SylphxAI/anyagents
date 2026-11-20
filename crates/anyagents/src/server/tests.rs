@@ -2467,6 +2467,12 @@ fn spawn_defaults_to_private_regardless_of_role() {
             data_dir: dir.path().into(),
         },
     };
+    std::fs::create_dir_all(dir.path().join("roles")).unwrap();
+    std::fs::write(
+        dir.path().join("roles/researcher.md"),
+        "---\nname: researcher\ndescription: Research specialist\n---\nResearch deeply.\n",
+    )
+    .unwrap();
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         for (name, role, scope) in [("labelled", Some("Researcher"), "private"), ("task", None, "private")] {
             let body = serde_json::from_value(serde_json::json!({"name":name,"role":role,"harness":"codex","model":"test-model","workdir":"private"})).unwrap();
@@ -4699,17 +4705,15 @@ fn archetype_absence_preserves_http_harness_defaults_and_explicit_inheritance() 
         .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
         .unwrap();
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        for (name, parent_ref, harness, role, expected) in [
-            ("root-default", "root", None, None, "claude-code"),
-            ("child-default", parent.id.as_str(), None, None, "claude-code"),
-            ("unmatched-label", parent.id.as_str(), None, Some("nonexistent-display-label-134"), "claude-code"),
-            ("child-empty", parent.id.as_str(), Some(""), None, "opencode"),
-            ("child-inherit", parent.id.as_str(), Some("inherit"), None, "opencode"),
-            ("child-explicit", parent.id.as_str(), Some("codex"), None, "codex"),
+        for (name, parent_ref, harness, expected) in [
+            ("root-default", "root", None, "claude-code"),
+            ("child-default", parent.id.as_str(), None, "claude-code"),
+            ("child-empty", parent.id.as_str(), Some(""), "opencode"),
+            ("child-inherit", parent.id.as_str(), Some("inherit"), "opencode"),
+            ("child-explicit", parent.id.as_str(), Some("codex"), "codex"),
         ] {
             let mut body = serde_json::json!({"name": name, "parent": parent_ref, "workdir": dir.path().join(name), "scope": "team"});
             if let Some(harness) = harness { body["harness"] = serde_json::json!(harness); }
-            if let Some(role) = role { body["role"] = serde_json::json!(role); }
             let (status, Json(created)) = create_agent_route(
                 Principal::Operator, State(state.clone()), axum::http::HeaderMap::new(), Json(serde_json::from_value(body).unwrap()),
             ).await.unwrap_or_else(|e| panic!("{}", e.message));
@@ -4717,6 +4721,19 @@ fn archetype_absence_preserves_http_harness_defaults_and_explicit_inheritance() 
             assert_eq!(created.harness, expected, "{name}");
             assert_eq!(created.scope, "siblings");
         }
+        // An explicit unknown role must fail closed even when no custom catalog exists on disk.
+        let unknown_body = serde_json::json!({
+            "name": "unmatched-label",
+            "parent": parent.id.as_str(),
+            "role": "nonexistent-display-label-134",
+            "workdir": dir.path().join("unmatched-label"),
+        });
+        assert_archetype_create_refused(
+            &state,
+            unknown_body,
+            "unknown role 'nonexistent-display-label-134'",
+        )
+        .await;
     });
     unsafe {
         std::env::remove_var("ANYAGENTS_FAKE_MODE");

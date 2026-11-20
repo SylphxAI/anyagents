@@ -1364,10 +1364,9 @@ pub(crate) fn build_guest_env(
     let data_home = state_dir.join("data-home");
     let state_home = state_dir.join("state-home");
     let omp_dir = state_dir.join(".omp/agent");
-    let _ = std::fs::create_dir_all(&data_home);
-    let _ = std::fs::create_dir_all(&state_home);
-    let _ = std::fs::create_dir_all(&omp_dir);
-
+    for d in [&data_home, &state_home, &omp_dir] {
+        let _ = std::fs::create_dir_all(d);
+    }
     for (k, v) in [
         ("HOME", state_str.as_str()),
         ("CLAUDE_CONFIG_DIR", state_str.as_str()),
@@ -1385,6 +1384,7 @@ pub(crate) fn build_guest_env(
         env.retain(|(ek, _)| ek != k);
         env.push((k.to_string(), v.to_string()));
     }
+    repo::ensure_gh_auth_setup_git_for_env(state_dir, &env);
     env
 }
 

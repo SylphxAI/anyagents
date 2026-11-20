@@ -47,8 +47,10 @@ pub(crate) mod outbound_history;
 mod profiles;
 mod quota_rotation;
 mod reap_queue;
+mod roles;
 mod schedules;
 pub(crate) mod serverless;
+mod serverless_failure;
 mod types;
 mod webhooks_mcp;
 
@@ -156,6 +158,7 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
         .merge(schedules::router())
         .merge(messaging::router())
         .merge(channels_groups::router())
+        .merge(roles::router())
         .merge(ops::router())
 }
 

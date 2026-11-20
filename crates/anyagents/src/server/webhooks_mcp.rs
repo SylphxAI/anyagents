@@ -364,6 +364,7 @@ async fn mcp_post(
             &config_dir,
         );
         let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(&state.store, &agent.id);
+        crate::create::hydrate_roles_from_store_if_postgres(&state.store, data_dir);
         let effective_workdir = hydrated_workdir
             .map(PathBuf::from)
             .or_else(|| agent.workdir.as_deref().map(PathBuf::from));

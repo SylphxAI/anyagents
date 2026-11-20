@@ -351,6 +351,11 @@ pub(super) fn archetype_search_roots_for_owner(
     push_unique_search_root(
         &mut search_roots,
         data_dir.to_path_buf(),
+        PathBuf::from("roles"),
+    );
+    push_unique_search_root(
+        &mut search_roots,
+        data_dir.to_path_buf(),
         PathBuf::from("agents-templates"),
     );
     push_unique_search_root(
@@ -479,7 +484,7 @@ pub(crate) fn resolve_archetype_template(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum ArchetypeSource {
+pub(crate) enum ArchetypeSource {
     Disk,
     Builtin,
 }
@@ -499,7 +504,7 @@ pub(crate) fn resolve_archetype_template_with_ancestors(
     .map(|(tpl, _)| tpl))
 }
 
-fn resolve_archetype_template_with_source(
+pub(crate) fn resolve_archetype_template_with_source(
     archetype: &str,
     explicit_workdir: Option<&Path>,
     ancestor_workdirs: &[PathBuf],
@@ -804,11 +809,72 @@ fn canonical_template_role(slug: &str, tpl: &ArchetypeTemplate) -> String {
         .to_string()
 }
 
+/// Re-hydrate custom role templates from PostgreSQL
+/// `deployment_blobs(namespace = 'roles')` into `<data_dir>/roles/` so
+/// stateless multi-replica coordinators observe role uploads and deletions
+/// immediately without a pod restart.
+pub(crate) fn hydrate_roles_from_store_if_postgres(store: &Store, data_dir: &Path) {
+    if !store.is_postgres() {
+        return;
+    }
+    let blobs = store.blob_store();
+    let Ok(metas) = blobs.list_deployment_blobs("roles") else {
+        return;
+    };
+    let roles_root = data_dir.join("roles");
+    let mut remote_paths = std::collections::BTreeSet::new();
+    for meta in metas {
+        if anyagents_core::stateless::validate_blob_path(&meta.path).is_err() {
+            continue;
+        }
+        remote_paths.insert(meta.path.clone());
+        let dest = roles_root.join(&meta.path);
+        let local_mtime_ms = std::fs::metadata(&dest)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        if local_mtime_ms.is_some_and(|local_ms| local_ms >= meta.updated_at_ms) {
+            continue;
+        }
+        let Ok(Some(entry)) = blobs.get_deployment_blob("roles", &meta.path) else {
+            continue;
+        };
+        if std::fs::read(&dest)
+            .ok()
+            .is_some_and(|existing| existing == entry.content)
+        {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = anyagents_harness::atomic_write_file(&dest, &entry.content, 0o644);
+    }
+    if let Ok(entries) = std::fs::read_dir(&roles_root) {
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".md") && !remote_paths.contains(&name) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 pub(crate) fn resolve_role_template_for_agent(
     store: Option<&Store>,
     data_dir: &Path,
     agent: &Agent,
 ) -> Option<(String, ArchetypeTemplate)> {
+    if let Some(st) = store {
+        hydrate_roles_from_store_if_postgres(st, data_dir);
+    }
     let raw_role = agent
         .role
         .as_deref()
@@ -1004,6 +1070,9 @@ pub(crate) fn apply_archetype_defaults(
     parent: Option<&Agent>,
     body: &mut crate::api::CreateAgentRequest,
 ) -> Result<(), Error> {
+    if let Some(st) = store {
+        hydrate_roles_from_store_if_postgres(st, data_dir);
+    }
     let explicit_wd = body
         .workdir
         .as_deref()
@@ -1017,45 +1086,24 @@ pub(crate) fn apply_archetype_defaults(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_AGENT_ROLE);
-    let resolved = match resolve_role_template_with_ancestors(
+    let (resolved_slug, tpl, source) = match resolve_role_template_with_ancestors(
         role,
         explicit_wd.as_deref(),
         &ancestor_wds,
         data_dir,
     )? {
-        Some(matched) => Some(matched),
+        Some(matched) => matched,
         None => {
-            let disk_slugs = discover_disk_archetype_slugs_with_ancestors(
+            let available = discover_available_archetype_slugs_with_ancestors(
                 explicit_wd.as_deref(),
                 &ancestor_wds,
                 data_dir,
             );
-            if !disk_slugs.is_empty()
-                || has_configured_archetype_roots_with_ancestors(
-                    explicit_wd.as_deref(),
-                    &ancestor_wds,
-                    data_dir,
-                )
-            {
-                let available = discover_available_archetype_slugs_with_ancestors(
-                    explicit_wd.as_deref(),
-                    &ancestor_wds,
-                    data_dir,
-                );
-                let suffix = if available.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (available: {})", available.join(", "))
-                };
-                return Err(Error::Message(format!(
-                    "unknown archetype template {role:?}{suffix}"
-                )));
-            }
-            None
+            return Err(Error::Message(format!(
+                "unknown role '{role}' (unknown archetype template {role:?}); available roles: [{}]",
+                available.join(", ")
+            )));
         }
-    };
-    let Some((resolved_slug, tpl, source)) = resolved else {
-        return Ok(());
     };
 
     let caller_description = body
@@ -1210,7 +1258,7 @@ pub(crate) fn normalize_or_validate_agent_role(
     Ok(role.to_string())
 }
 
-fn valid_template_stem(value: &str) -> bool {
+pub(crate) fn valid_template_stem(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty()
         && value
